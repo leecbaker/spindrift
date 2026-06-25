@@ -1,0 +1,236 @@
+use super::*;
+
+pub(super) fn shape_text_with_document_font(
+    font: &DocumentFont,
+    text: &str,
+    font_size: f32,
+    letter_spacing: f32,
+    word_spacing: f32,
+) -> Option<Vec<RenderedGlyph>> {
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+    let face = ttf_parser::Face::parse(&font.data, font.face_index).ok()?;
+    let units_per_em = face.units_per_em().max(1) as f32;
+    let scale = font_size / units_per_em;
+    let used_letter_spacing = used_letter_spacing_for_text(text, letter_spacing);
+    let characters = text
+        .chars()
+        .filter(|character| !character_is_bidi_format_control(*character))
+        .collect::<Vec<_>>();
+    let mut glyphs = Vec::with_capacity(characters.len());
+    for (index, character) in characters.iter().copied().enumerate() {
+        let glyph_id = if character == '\t' {
+            face.glyph_index(' ')?
+        } else {
+            css_space_separator_blank_glyph(&face, character)
+                .or_else(|| face.glyph_index(character))?
+        };
+        let mut x_advance = css_space_separator_advance(&face, character, font_size, scale)
+            .or_else(|| {
+                face.glyph_hor_advance(glyph_id)
+                    .map(|advance| advance as f32 * scale)
+            })
+            .unwrap_or(0.0);
+        if used_letter_spacing != 0.0 && index + 1 < characters.len() {
+            x_advance += used_letter_spacing;
+        }
+        if word_spacing != 0.0 && character == ' ' {
+            x_advance += word_spacing;
+        }
+        glyphs.push(RenderedGlyph {
+            id: glyph_id.0,
+            x_advance,
+            nominal_x_advance: face
+                .glyph_hor_advance(glyph_id)
+                .map(|advance| advance as f32 * scale)
+                .unwrap_or(x_advance),
+            x_offset: 0.0,
+            y_offset: 0.0,
+            unicode: character.to_string(),
+        });
+    }
+    Some(glyphs)
+}
+
+/// Return a blank glyph for a Unicode space separator.
+///
+/// CSS Text treats Unicode space separators as visible text with advance, but
+/// they are spacing characters rather than inked fallback glyphs. When a
+/// selected font exposes a visible `.notdef` or missing-glyph outline for
+/// characters such as U+2002 EN SPACE, PDF emission should preserve the
+/// separator advance and ToUnicode mapping while painting a blank space glyph:
+/// <https://www.w3.org/TR/css-text-3/#white-space-processing> and
+/// <https://www.unicode.org/reports/tr44/#General_Category_Values>.
+pub(super) fn css_space_separator_blank_glyph(
+    face: &ttf_parser::Face<'_>,
+    character: char,
+) -> Option<ttf_parser::GlyphId> {
+    character_is_css_other_space_separator(character)
+        .then(|| face.glyph_index(' '))
+        .flatten()
+}
+
+/// Return the typographic advance for fixed Unicode space separators.
+///
+/// Unicode defines several `Space_Separator` characters by their nominal em
+/// width. CSS Text keeps these characters in the text stream, so the renderer
+/// synthesizes their blank advance when the selected font lacks a reliable
+/// glyph-specific metric:
+/// <https://www.w3.org/TR/css-text-3/#white-space-processing> and
+/// <https://www.unicode.org/charts/PDF/U2000.pdf>.
+pub(super) fn css_space_separator_advance(
+    face: &ttf_parser::Face<'_>,
+    character: char,
+    font_size: f32,
+    scale: f32,
+) -> Option<f32> {
+    match character {
+        '\u{00a0}' | '\u{1680}' => face
+            .glyph_index(' ')
+            .and_then(|glyph| face.glyph_hor_advance(glyph))
+            .map(|advance| advance as f32 * scale)
+            .or(Some(font_size * 0.25)),
+        '\u{2000}' | '\u{2002}' => Some(font_size * 0.5),
+        '\u{2001}' | '\u{2003}' | '\u{3000}' => Some(font_size),
+        '\u{2004}' => Some(font_size / 3.0),
+        '\u{2005}' => Some(font_size / 4.0),
+        '\u{2006}' => Some(font_size / 6.0),
+        '\u{2007}' => face
+            .glyph_index('0')
+            .and_then(|glyph| face.glyph_hor_advance(glyph))
+            .map(|advance| advance as f32 * scale)
+            .or(Some(font_size * 0.5)),
+        '\u{2008}' => face
+            .glyph_index('.')
+            .and_then(|glyph| face.glyph_hor_advance(glyph))
+            .map(|advance| advance as f32 * scale)
+            .or(Some(font_size * 0.25)),
+        '\u{2009}' | '\u{202f}' => Some(font_size / 5.0),
+        '\u{200a}' => Some(font_size / 10.0),
+        '\u{205f}' => Some(font_size * 4.0 / 18.0),
+        _ => None,
+    }
+}
+
+/// Returns the spacing that should affect glyph advances for this text.
+///
+/// CSS Text requires cursive scripts to remain connected under `letter-spacing`.
+/// Unicode `Joining_Type` data identifies runs where inserting tracking would
+/// disturb cursive shaping:
+/// <https://www.w3.org/TR/css-text-3/#letter-spacing-property> and
+/// <https://www.unicode.org/reports/tr44/#Joining_Type>.
+pub(super) fn used_letter_spacing_for_text(text: &str, letter_spacing: f32) -> f32 {
+    if letter_spacing == 0.0 || text.chars().any(character_has_joining_behavior) {
+        0.0
+    } else {
+        letter_spacing
+    }
+}
+
+pub(super) fn visual_ranges_for_line<B: parley::style::Brush>(
+    line: parley::Line<'_, B>,
+) -> Vec<Range<usize>> {
+    let mut ranges = Vec::<Range<usize>>::new();
+    for run in line.runs() {
+        for cluster in run.visual_clusters() {
+            push_visual_range(&mut ranges, cluster.text_range());
+        }
+    }
+    if ranges.is_empty() {
+        ranges.push(line.text_range());
+    }
+    ranges
+}
+
+pub(super) fn push_visual_range(ranges: &mut Vec<Range<usize>>, range: Range<usize>) {
+    if range.is_empty() {
+        return;
+    }
+    if let Some(previous) = ranges.last_mut()
+        && previous.end == range.start
+    {
+        previous.end = range.end;
+        return;
+    }
+    ranges.push(range);
+}
+
+pub(super) fn visual_text_from_ranges(text: &str, ranges: &[Range<usize>]) -> String {
+    let mut output = String::new();
+    for range in ranges {
+        output.push_str(&text[range.clone()]);
+    }
+    output
+}
+
+/// Return whether `break-spaces` creates a CSS preserved-space soft wrap.
+///
+/// CSS Text says `break-spaces` preserves white space and creates a soft wrap
+/// opportunity after every preserved document white-space character. Other
+/// Unicode space separators remain visible text whose break opportunities come
+/// from UAX #14 instead of this CSS-only preserved-space rule:
+/// <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces>.
+pub(super) fn character_is_break_spaces_preserved_space(character: char) -> bool {
+    is_css_collapsible_whitespace(character)
+}
+
+/// Return whether an "other space separator" allows a break after itself.
+///
+/// CSS Text says `break-spaces` does not hang or discard other Unicode space
+/// separators; they keep their UAX #14 line-breaking properties. ICU's line
+/// segmenter may omit an overfull break after a BA-class separator when it is
+/// not treated as CSS document whitespace, so the break-after class is applied
+/// directly for preserved `break-spaces` line fitting:
+/// <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces> and
+/// <https://www.unicode.org/reports/tr14/#BA>.
+pub(super) fn break_spaces_other_space_separator_allows_break_after(character: char) -> bool {
+    character_is_css_other_space_separator(character)
+        && matches!(
+            line_break_class(character),
+            LineBreak::BreakAfter | LineBreak::Space | LineBreak::ZWSpace
+        )
+}
+
+/// Return whether UAX #14 suppresses a break before this character.
+///
+/// The `break-spaces` value preserves other space separators but does not turn
+/// them into ordinary CSS spaces. UAX #14 classes such as BA and GL therefore
+/// still suppress the break before the separator while allowing their own
+/// class-specific behavior after it:
+/// <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces> and
+/// <https://www.unicode.org/reports/tr14/#Properties>.
+pub(super) fn break_spaces_character_suppresses_break_before(character: char) -> bool {
+    matches!(
+        line_break_class(character),
+        LineBreak::BreakAfter | LineBreak::Glue | LineBreak::WordJoiner
+    )
+}
+
+/// Return whether a `break-spaces` line may use an emergency character break at
+/// this character boundary.
+///
+/// CSS Text defines `white-space: break-spaces` preserved-space break
+/// opportunities after preserved spaces, while `word-break: break-all` adds
+/// breaks inside otherwise unbreakable non-space text. `line-break: anywhere`
+/// is stronger and allows breaks around preserved spaces too:
+/// <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces>,
+/// <https://www.w3.org/TR/css-text-3/#valdef-word-break-break-all>, and
+/// <https://www.w3.org/TR/css-text-3/#valdef-line-break-anywhere>.
+pub(super) fn break_spaces_anywhere_break_allowed(
+    line_break_anywhere: bool,
+    characters: &[(usize, usize, bool, bool, bool)],
+    index: usize,
+    line_start: usize,
+) -> bool {
+    if line_break_anywhere {
+        return true;
+    }
+    if characters[index].0 <= line_start {
+        return false;
+    }
+    let Some(previous) = index.checked_sub(1).and_then(|index| characters.get(index)) else {
+        return false;
+    };
+    !previous.2 && !characters[index].2
+}

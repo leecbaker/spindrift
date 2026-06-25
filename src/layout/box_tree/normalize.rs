@@ -1,0 +1,546 @@
+use super::*;
+use crate::text::{trim_end_css_collapsible_whitespace, trim_start_css_collapsible_whitespace};
+
+pub(crate) fn normalize_block_container_children<'a>(
+    children: Vec<FormattingBox<'a>>,
+    parent_style: &ComputedStyle,
+) -> Vec<FormattingBox<'a>> {
+    let children = normalize_orphan_table_internal_boxes(children, parent_style);
+    if parent_style.display.is_table()
+        || parent_style.display.is_table_row_group()
+        || parent_style.display.is_table_row()
+        || parent_style.display.is_flex()
+    {
+        return children;
+    }
+    if !parent_style.display.establishes_block_formatting_context()
+        && !parent_style.display.is_block_level()
+    {
+        return children;
+    }
+    let children = normalize_run_in_children(children, parent_style);
+    let children = split_block_in_inline_children(children);
+
+    let has_inline = children
+        .iter()
+        .filter(|child| !is_out_of_flow_box(child))
+        .any(is_inline_level_box);
+    let has_block = children
+        .iter()
+        .filter(|child| !is_out_of_flow_box(child))
+        .any(is_block_level_box);
+    if !has_inline || !has_block {
+        return children;
+    }
+
+    let mut normalized = Vec::new();
+    let mut inline_run = Vec::new();
+    for child in children {
+        if is_out_of_flow_box(&child) || is_inline_level_box(&child) {
+            inline_run.push(child);
+        } else {
+            flush_anonymous_block(&mut normalized, &mut inline_run, parent_style);
+            normalized.push(child);
+        }
+    }
+    flush_anonymous_block(&mut normalized, &mut inline_run, parent_style);
+    normalized
+}
+
+/// Resolves CSS Display run-in boxes before anonymous block wrapping.
+///
+/// CSS Display defines a run-in sequence as consecutive run-in siblings plus
+/// intervening whitespace and out-of-flow boxes. The sequence runs into a
+/// following in-flow block that does not establish a new BFC, otherwise it
+/// falls back into an anonymous block with following inline-level content:
+/// <https://www.w3.org/TR/css-display-3/#run-in-layout>.
+fn normalize_run_in_children<'a>(
+    children: Vec<FormattingBox<'a>>,
+    parent_style: &ComputedStyle,
+) -> Vec<FormattingBox<'a>> {
+    if !children.iter().any(is_run_in_box) {
+        return children;
+    }
+
+    let mut input = children.into_iter().peekable();
+    let mut output = Vec::new();
+    while let Some(child) = input.next() {
+        if !is_run_in_box(&child) {
+            output.push(child);
+            continue;
+        }
+
+        let mut sequence = vec![inlinified_run_in_box(child)];
+        while input.peek().is_some_and(|child| {
+            formatting_box_is_collapsible_space(child)
+                || is_out_of_flow_box(child)
+                || is_run_in_box(child)
+        }) {
+            let child = input.next().expect("peeked child");
+            sequence.push(inlinified_run_in_box(child));
+        }
+
+        if let Some(next) = input.peek()
+            && run_in_target_is_eligible(next)
+        {
+            let mut target = input.next().expect("peeked target");
+            insert_run_in_sequence(&mut target, sequence);
+            output.push(target);
+            continue;
+        }
+
+        let mut fallback_children = sequence;
+        while input.peek().is_some_and(|child| {
+            !is_run_in_box(child)
+                && (is_out_of_flow_box(child)
+                    || formatting_box_is_collapsible_space(child)
+                    || is_inline_level_box(child))
+        }) {
+            fallback_children.push(input.next().expect("peeked inline fallback child"));
+        }
+        flush_anonymous_block(&mut output, &mut fallback_children, parent_style);
+    }
+    output
+}
+
+fn is_run_in_box(box_: &FormattingBox<'_>) -> bool {
+    let Some((_, _, style, _)) = box_.element_parts() else {
+        return false;
+    };
+    style.display.is_run_in() && !is_out_of_flow_box(box_)
+}
+
+fn inlinified_run_in_box(mut box_: FormattingBox<'_>) -> FormattingBox<'_> {
+    inlinify_run_in_box(&mut box_);
+    box_
+}
+
+fn inlinify_run_in_box(box_: &mut FormattingBox<'_>) {
+    match box_ {
+        FormattingBox::Block(box_) => {
+            box_.style.display = box_.style.display.run_in_inlinified();
+            for child in &mut box_.run_in_children {
+                inlinify_run_in_box(child);
+            }
+            inlinify_run_in_children(&mut box_.children);
+        }
+        FormattingBox::Inline(box_) => {
+            box_.style.display = box_.style.display.run_in_inlinified();
+            inlinify_run_in_children(&mut box_.children);
+        }
+        FormattingBox::AtomicInline(box_) => {
+            box_.style.display = box_.style.display.run_in_inlinified();
+            inlinify_run_in_children(&mut box_.children);
+        }
+        FormattingBox::Table(box_) => {
+            box_.style.display = box_.style.display.run_in_inlinified();
+        }
+        FormattingBox::Flex(box_) => {
+            box_.style.display = box_.style.display.run_in_inlinified();
+        }
+        FormattingBox::Replaced(box_) => {
+            box_.style.display = box_.style.display.run_in_inlinified();
+        }
+        FormattingBox::AnonymousBlock(_) | FormattingBox::Line(_) | FormattingBox::Text(_) => {}
+    }
+}
+
+fn inlinify_run_in_children(children: &mut Vec<FormattingBox<'_>>) {
+    let original = std::mem::take(children);
+    for child in original {
+        for part in split_block_in_inline_child(child) {
+            if is_in_flow_block_level_box(&part) {
+                children.push(inlinified_block_descendant(part));
+            } else {
+                children.push(part);
+            }
+        }
+    }
+}
+
+fn inlinified_block_descendant(box_: FormattingBox<'_>) -> FormattingBox<'_> {
+    match box_ {
+        FormattingBox::Block(mut box_) => {
+            box_.style.display =
+                Display::INLINE_BLOCK.with_list_item(box_.style.display.is_list_item());
+            FormattingBox::AtomicInline(AtomicInlineBox {
+                element: box_.element,
+                signature: box_.signature,
+                style: box_.style,
+                marker: box_.marker,
+                children: box_.children,
+                table_fragment: None,
+            })
+        }
+        box_ => box_,
+    }
+}
+
+fn run_in_target_is_eligible(box_: &FormattingBox<'_>) -> bool {
+    if is_out_of_flow_box(box_) {
+        return false;
+    }
+    let FormattingBox::Block(box_) = box_ else {
+        return false;
+    };
+    box_.style.display.is_block_level()
+        && !box_.style.display.establishes_block_formatting_context()
+}
+
+fn insert_run_in_sequence<'a>(
+    target: &mut FormattingBox<'a>,
+    mut sequence: Vec<FormattingBox<'a>>,
+) {
+    if let Some(index) = first_eligible_run_in_descendant_index(target) {
+        let FormattingBox::Block(box_) = target else {
+            return;
+        };
+        insert_run_in_sequence(&mut box_.children[index], sequence);
+        return;
+    }
+    if let FormattingBox::Block(box_) = target {
+        sequence.append(&mut box_.run_in_children);
+        box_.run_in_children = sequence;
+    }
+}
+
+fn first_eligible_run_in_descendant_index(target: &FormattingBox<'_>) -> Option<usize> {
+    let FormattingBox::Block(box_) = target else {
+        return None;
+    };
+    box_.children
+        .iter()
+        .position(|child| !is_out_of_flow_box(child))
+        .filter(|index| run_in_target_is_eligible(&box_.children[*index]))
+}
+
+/// Splits inline boxes that contain in-flow block-level descendants.
+///
+/// CSS 2.2 says an inline box containing an in-flow block-level box is split
+/// around that block. The containing block then sees anonymous block boxes for
+/// surrounding inline runs and the in-flow block participates as a sibling,
+/// which allows normal block formatting and adjoining margin collapsing:
+/// <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level> and
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>.
+fn split_block_in_inline_children<'a>(children: Vec<FormattingBox<'a>>) -> Vec<FormattingBox<'a>> {
+    children
+        .into_iter()
+        .flat_map(split_block_in_inline_child)
+        .collect()
+}
+
+fn split_block_in_inline_child<'a>(child: FormattingBox<'a>) -> Vec<FormattingBox<'a>> {
+    match child {
+        FormattingBox::Inline(box_) if inline_box_contains_in_flow_block(&box_) => {
+            split_inline_box_around_blocks(box_)
+        }
+        child => vec![child],
+    }
+}
+
+fn split_inline_box_around_blocks<'a>(mut box_: InlineBox<'a>) -> Vec<FormattingBox<'a>> {
+    let mut output = Vec::new();
+    let mut inline_run = Vec::new();
+    let children = std::mem::take(&mut box_.children);
+    for child in children {
+        for part in split_block_in_inline_child(child) {
+            if is_in_flow_block_level_box(&part) {
+                flush_split_inline_run(&mut output, &mut inline_run, &box_);
+                output.push(part);
+            } else {
+                inline_run.push(part);
+            }
+        }
+    }
+    flush_split_inline_run(&mut output, &mut inline_run, &box_);
+    output
+}
+
+fn flush_split_inline_run<'a>(
+    output: &mut Vec<FormattingBox<'a>>,
+    inline_run: &mut Vec<FormattingBox<'a>>,
+    box_: &InlineBox<'a>,
+) {
+    trim_split_inline_run_edges(inline_run);
+    if inline_run.is_empty() {
+        return;
+    }
+    output.push(FormattingBox::Inline(InlineBox {
+        element: box_.element,
+        signature: box_.signature.clone(),
+        style: box_.style.clone(),
+        marker: box_.marker.clone(),
+        children: std::mem::take(inline_run),
+    }));
+}
+
+/// Trim collapsible whitespace exposed by splitting an inline around a block.
+///
+/// CSS 2.2 splits inline boxes containing in-flow block boxes into separate
+/// inline fragments around the block, and CSS Text removes collapsible
+/// whitespace at line boundaries. The split creates new anonymous block
+/// boundaries, so indentation whitespace next to the block must not contribute
+/// an extra line-box advance:
+/// <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level> and
+/// <https://www.w3.org/TR/css-text-3/#white-space-phase-1>.
+fn trim_split_inline_run_edges(inline_run: &mut Vec<FormattingBox<'_>>) {
+    trim_split_inline_run_start(inline_run);
+    trim_split_inline_run_end(inline_run);
+}
+
+fn trim_split_inline_run_start(inline_run: &mut Vec<FormattingBox<'_>>) {
+    loop {
+        if inline_run.first().is_some_and(formatting_box_is_empty_text) {
+            inline_run.remove(0);
+            continue;
+        }
+        let Some(first) = inline_run.first_mut() else {
+            return;
+        };
+        let removed = trim_formatting_box_start_collapsible_whitespace(first);
+        if removed || formatting_box_is_empty_text(first) {
+            inline_run.remove(0);
+            continue;
+        }
+        return;
+    }
+}
+
+fn trim_split_inline_run_end(inline_run: &mut Vec<FormattingBox<'_>>) {
+    loop {
+        if inline_run.last().is_some_and(formatting_box_is_empty_text) {
+            inline_run.pop();
+            continue;
+        }
+        let Some(last) = inline_run.last_mut() else {
+            return;
+        };
+        let removed = trim_formatting_box_end_collapsible_whitespace(last);
+        if removed || formatting_box_is_empty_text(last) {
+            inline_run.pop();
+            continue;
+        }
+        return;
+    }
+}
+
+fn trim_formatting_box_start_collapsible_whitespace(box_: &mut FormattingBox<'_>) -> bool {
+    match box_ {
+        FormattingBox::Text(text) if text.style.white_space.collapses_spaces() => {
+            text.text = trim_start_css_collapsible_whitespace(&text.text).to_string();
+            text.text.is_empty()
+        }
+        FormattingBox::Inline(box_) => {
+            trim_split_inline_run_start(&mut box_.children);
+            box_.children.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn trim_formatting_box_end_collapsible_whitespace(box_: &mut FormattingBox<'_>) -> bool {
+    match box_ {
+        FormattingBox::Text(text) if text.style.white_space.collapses_spaces() => {
+            text.text = trim_end_css_collapsible_whitespace(&text.text).to_string();
+            text.text.is_empty()
+        }
+        FormattingBox::Inline(box_) => {
+            trim_split_inline_run_end(&mut box_.children);
+            box_.children.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn formatting_box_is_empty_text(box_: &FormattingBox<'_>) -> bool {
+    matches!(box_, FormattingBox::Text(text) if text.text.is_empty())
+}
+
+fn inline_box_contains_in_flow_block(box_: &InlineBox<'_>) -> bool {
+    box_.children.iter().any(|child| match child {
+        FormattingBox::Inline(child) => inline_box_contains_in_flow_block(child),
+        child => is_in_flow_block_level_box(child),
+    })
+}
+
+fn is_in_flow_block_level_box(box_: &FormattingBox<'_>) -> bool {
+    is_block_level_box(box_) && !is_out_of_flow_box(box_)
+}
+
+pub(crate) fn normalize_orphan_table_internal_boxes<'a>(
+    children: Vec<FormattingBox<'a>>,
+    parent_style: &ComputedStyle,
+) -> Vec<FormattingBox<'a>> {
+    if parent_style.display.is_table()
+        || parent_style.display.is_table_column_group()
+        || parent_style.display.is_table_row_group()
+        || parent_style.display.is_table_row()
+    {
+        return children;
+    }
+
+    let mut normalized = Vec::with_capacity(children.len());
+    let mut table_run = Vec::new();
+    for child in children {
+        if is_table_internal_box(&child) {
+            table_run.push(child);
+        } else {
+            flush_anonymous_table(&mut normalized, &mut table_run, parent_style);
+            normalized.push(child);
+        }
+    }
+    flush_anonymous_table(&mut normalized, &mut table_run, parent_style);
+    normalized
+}
+
+pub(crate) fn flush_anonymous_table<'a>(
+    normalized: &mut Vec<FormattingBox<'a>>,
+    table_run: &mut Vec<FormattingBox<'a>>,
+    parent_style: &ComputedStyle,
+) {
+    if table_run.is_empty() {
+        return;
+    }
+    let children = std::mem::take(table_run);
+    let Some((element, signature, _, _)) = children.iter().find_map(FormattingBox::element_parts)
+    else {
+        return;
+    };
+    let fragment = build_table_fragment(element, signature, &children);
+    // CSS 2.2 table model: internal table boxes that lack a table parent
+    // generate an anonymous table wrapper object around the consecutive run.
+    normalized.push(FormattingBox::Table(TableBox {
+        element,
+        signature: signature.clone(),
+        style: anonymous_table_style(parent_style),
+        marker: None,
+        children,
+        fragment,
+    }));
+}
+
+pub(crate) fn anonymous_table_style(parent_style: &ComputedStyle) -> ComputedStyle {
+    let mut style = css::default_style_for_tag("table");
+    style.custom_properties = parent_style.custom_properties.clone();
+    style.color = parent_style.color;
+    style.text_align = parent_style.text_align;
+    style.text_align_last = parent_style.text_align_last;
+    style.text_justify = parent_style.text_justify;
+    style.font_style = parent_style.font_style;
+    style.font_width = parent_style.font_width;
+    style.text_decoration = parent_style.text_decoration;
+    style.font_family = parent_style.font_family.clone();
+    style.font_feature_settings = parent_style.font_feature_settings.clone();
+    style.font_kerning = parent_style.font_kerning;
+    style.font_variant_ligatures = parent_style.font_variant_ligatures;
+    style.font_variant_position = parent_style.font_variant_position;
+    style.font_variant_caps = parent_style.font_variant_caps;
+    style.font_variant_numeric = parent_style.font_variant_numeric.clone();
+    style.font_variant_alternates = parent_style.font_variant_alternates.clone();
+    style.font_variant_east_asian = parent_style.font_variant_east_asian.clone();
+    style.font_variant_emoji = parent_style.font_variant_emoji;
+    style.language = parent_style.language.clone();
+    style.line_height_multiplier = parent_style.line_height_multiplier;
+    style.line_height_is_normal = parent_style.line_height_is_normal;
+    style.word_spacing = parent_style.word_spacing;
+    style.text_transform = parent_style.text_transform;
+    style.tab_size = parent_style.tab_size;
+    style.white_space = parent_style.white_space;
+    style.word_break = parent_style.word_break;
+    style.overflow_wrap = parent_style.overflow_wrap;
+    style.line_break = parent_style.line_break;
+    style.hyphens = parent_style.hyphens;
+    style.hyphenate_limit_chars = parent_style.hyphenate_limit_chars;
+    style.visibility = parent_style.visibility;
+    style.list_style_type = parent_style.list_style_type.clone();
+    style.list_style_position = parent_style.list_style_position;
+    style.list_style_image = parent_style.list_style_image.clone();
+    style.list_style_image_base_url = parent_style.list_style_image_base_url.clone();
+    style.list_style_image_root_url = parent_style.list_style_image_root_url.clone();
+    style.font_size = parent_style.font_size;
+    style.font_size_adjust = parent_style.font_size_adjust;
+    style.line_height = parent_style.line_height;
+    style.font_weight = parent_style.font_weight;
+    style.border_collapse = parent_style.border_collapse;
+    style.caption_side = parent_style.caption_side;
+    style.empty_cells = parent_style.empty_cells;
+    style.border_spacing = parent_style.border_spacing;
+    style.border_spacing_explicit = parent_style.border_spacing_explicit;
+    style
+}
+
+pub(crate) fn is_table_internal_box(box_: &FormattingBox<'_>) -> bool {
+    let Some((_, _, style, _)) = box_.element_parts() else {
+        return false;
+    };
+    style.display.is_table_caption()
+        || style.display.is_table_column_group()
+        || style.display.is_table_column()
+        || style.display.is_table_row_group()
+        || style.display.is_table_row()
+        || style.display.is_table_cell()
+}
+
+pub(crate) fn flush_anonymous_block<'a>(
+    normalized: &mut Vec<FormattingBox<'a>>,
+    inline_run: &mut Vec<FormattingBox<'a>>,
+    parent_style: &ComputedStyle,
+) {
+    if inline_run.is_empty() {
+        return;
+    }
+    if inline_run.iter().all(formatting_box_is_collapsible_space) {
+        inline_run.clear();
+        return;
+    }
+    normalized.push(FormattingBox::AnonymousBlock(AnonymousBlockBox {
+        style: parent_style.clone(),
+        children: std::mem::take(inline_run),
+    }));
+}
+
+pub(crate) fn formatting_box_is_collapsible_space(box_: &FormattingBox<'_>) -> bool {
+    matches!(box_, FormattingBox::Text(text) if text_is_css_collapsible_space(&text.text, &text.style))
+}
+
+pub(crate) fn is_inline_level_box(box_: &FormattingBox<'_>) -> bool {
+    match box_ {
+        FormattingBox::Inline(_) | FormattingBox::Text(_) => true,
+        FormattingBox::AtomicInline(box_) => {
+            box_.style.display.is_atomic_inline() || box_.style.display.is_replaced()
+        }
+        FormattingBox::Block(_)
+        | FormattingBox::AnonymousBlock(_)
+        | FormattingBox::Line(_)
+        | FormattingBox::Table(_)
+        | FormattingBox::Flex(_)
+        | FormattingBox::Replaced(_) => false,
+    }
+}
+
+pub(crate) fn is_block_level_box(box_: &FormattingBox<'_>) -> bool {
+    match box_ {
+        FormattingBox::Block(_)
+        | FormattingBox::AnonymousBlock(_)
+        | FormattingBox::Table(_)
+        | FormattingBox::Flex(_) => true,
+        FormattingBox::Replaced(box_) => box_.style.display.is_block_level(),
+        FormattingBox::Inline(_)
+        | FormattingBox::AtomicInline(_)
+        | FormattingBox::Line(_)
+        | FormattingBox::Text(_) => false,
+    }
+}
+
+/// Returns whether a formatting box is removed from normal flow.
+///
+/// CSS Positioned Layout makes absolutely positioned and fixed positioned
+/// boxes out-of-flow. Such boxes still generate boxes and positioned paint,
+/// but they do not participate in normal-flow block/inline normalization:
+/// <https://www.w3.org/TR/css-position-3/#absolute-positioning>.
+pub(crate) fn is_out_of_flow_box(box_: &FormattingBox<'_>) -> bool {
+    let Some((_, _, style, _)) = box_.element_parts() else {
+        return false;
+    };
+    matches!(style.position, Position::Absolute | Position::Fixed)
+}

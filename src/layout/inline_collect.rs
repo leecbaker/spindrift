@@ -1,0 +1,2909 @@
+use super::*;
+use crate::text::{
+    character_is_autospace_alpha, character_is_autospace_ideograph, character_is_autospace_numeric,
+    trim_css_collapsible_whitespace,
+};
+
+/// Push CSS Text-normalized inline words into the shared inline item stream.
+///
+/// CSS Text white-space processing, segment breaks, visible control handling,
+/// and preserved-space tokenization must be identical for normal inline
+/// content, generated content, and page-margin text before all consumers build
+/// an `InlineOpportunityGraph`:
+/// <https://www.w3.org/TR/css-text-3/#white-space-processing> and
+/// <https://www.w3.org/TR/css-text-3/#line-breaking>.
+pub(super) fn push_inline_words_for_style(
+    text: &str,
+    style: &ComputedStyle,
+    link_target: Option<String>,
+    baseline_shift: f32,
+    output: &mut Vec<InlineItem>,
+) {
+    let normalized_style;
+    let style = if anonymous_inline_content_needs_normalized_style(style) {
+        normalized_style = normalized_anonymous_inline_content_style(style);
+        &normalized_style
+    } else {
+        style
+    };
+    if style.white_space.collapses_spaces() {
+        push_collapsed_inline_text(text, style, link_target, baseline_shift, output);
+    } else {
+        for text in normalize_pre_wrap_text_for_style(text, style).split_inclusive('\n') {
+            let line = text.strip_suffix('\n').unwrap_or(text);
+            push_preserved_inline_text(line, style, link_target.clone(), baseline_shift, output);
+            if text.ends_with('\n') {
+                trim_trailing_inline_spaces(output);
+                output.push(InlineItem::Break);
+            }
+        }
+    }
+}
+
+fn push_collapsed_inline_text(
+    text: &str,
+    style: &ComputedStyle,
+    link_target: Option<String>,
+    baseline_shift: f32,
+    output: &mut Vec<InlineItem>,
+) {
+    let mut word = String::new();
+    let text = dom::decode_entities_public(text)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    for character in text.chars() {
+        if character == INLINE_BREAK
+            || (style.white_space.preserves_newlines() && matches!(character, '\n' | '\r'))
+        {
+            push_inline_text_run(&word, style, link_target.clone(), baseline_shift, output);
+            word.clear();
+            trim_trailing_inline_spaces(output);
+            output.push(InlineItem::Break);
+        } else if is_css_collapsible_whitespace(character) {
+            push_inline_text_run(&word, style, link_target.clone(), baseline_shift, output);
+            word.clear();
+            push_collapsed_inline_space(style, link_target.clone(), baseline_shift, output);
+        } else {
+            word.push(character);
+        }
+    }
+    push_inline_text_run(&word, style, link_target, baseline_shift, output);
+}
+
+fn push_preserved_inline_text(
+    text: &str,
+    style: &ComputedStyle,
+    link_target: Option<String>,
+    baseline_shift: f32,
+    output: &mut Vec<InlineItem>,
+) {
+    if style.white_space == WhiteSpace::BreakSpaces {
+        for character in text.chars() {
+            let mut buffer = [0; 4];
+            let text = character.encode_utf8(&mut buffer);
+            push_inline_text_run(text, style, link_target.clone(), baseline_shift, output);
+        }
+        return;
+    }
+
+    let mut run = String::new();
+    let mut run_is_space = false;
+    for character in text.chars() {
+        let character_is_space = character == ' ' || character == '\t';
+        if run.is_empty() {
+            run_is_space = character_is_space;
+        } else if run_is_space != character_is_space {
+            push_inline_text_run(&run, style, link_target.clone(), baseline_shift, output);
+            run.clear();
+            run_is_space = character_is_space;
+        }
+        run.push(character);
+    }
+    push_inline_text_run(&run, style, link_target, baseline_shift, output);
+}
+
+fn push_collapsed_inline_space(
+    style: &ComputedStyle,
+    link_target: Option<String>,
+    baseline_shift: f32,
+    output: &mut Vec<InlineItem>,
+) {
+    if output.is_empty()
+        || output.last().is_some_and(|item| {
+            matches!(item, InlineItem::Break) || inline_item_is_collapsible_space(item)
+        })
+    {
+        return;
+    }
+    output.push(InlineItem::Word(Box::new(InlineWord {
+        text: " ".to_string(),
+        style: style.clone(),
+        baseline_shift,
+        link_target,
+        mergeable: true,
+        hanging_edges: InlineHangingEdges::default(),
+    })));
+}
+
+fn push_inline_text_run(
+    text: &str,
+    style: &ComputedStyle,
+    link_target: Option<String>,
+    baseline_shift: f32,
+    output: &mut Vec<InlineItem>,
+) {
+    if !text.is_empty() {
+        let text = text_with_visible_control_characters(text);
+        output.push(InlineItem::Word(Box::new(InlineWord {
+            text,
+            style: style.clone(),
+            baseline_shift,
+            link_target: link_target.clone(),
+            mergeable: true,
+            hanging_edges: InlineHangingEdges::default(),
+        })));
+    }
+}
+
+impl<'a> LayoutBuilder<'a> {
+    pub(super) fn intrinsic_inline_contribution_for_element(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+    ) -> inline_layout::InlineIntrinsicContribution {
+        self.intrinsic_inline_measurement_for_element(
+            element,
+            style,
+            stylesheets,
+            child_boxes,
+            f32::MAX,
+        )
+        .contribution
+    }
+
+    pub(super) fn intrinsic_inline_contribution_for_boxes(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+    ) -> inline_layout::InlineIntrinsicContribution {
+        self.intrinsic_inline_measurement_for_boxes(children, style, stylesheets, f32::MAX)
+            .contribution
+    }
+
+    /// Measure inline content through durable graph-selected fragments.
+    ///
+    /// CSS Sizing derives intrinsic inline contributions from CSS Text break
+    /// opportunities, and CSS Flexbox consumes the same content as selected
+    /// line fragments for hypothetical cross sizes:
+    /// <https://www.w3.org/TR/css-sizing-3/#intrinsic>,
+    /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>,
+    /// <https://www.w3.org/TR/css-inline-3/#line-box>, and
+    /// <https://www.w3.org/TR/css-text-3/#line-breaking>.
+    pub(in crate::layout) fn intrinsic_inline_measurement_for_element(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        available_width: f32,
+    ) -> inline_layout::InlineIntrinsicMeasurement {
+        let items =
+            self.intrinsic_inline_items_for_element(element, style, stylesheets, child_boxes);
+        self.intrinsic_inline_measurement_for_items(items, style, available_width)
+    }
+
+    pub(in crate::layout) fn intrinsic_inline_measurement_for_boxes(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+    ) -> inline_layout::InlineIntrinsicMeasurement {
+        let items = self.intrinsic_inline_items_for_boxes(children, style, stylesheets);
+        self.intrinsic_inline_measurement_for_items(items, style, available_width)
+    }
+
+    pub(in crate::layout) fn intrinsic_inline_measurement_for_text(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        available_width: f32,
+    ) -> inline_layout::InlineIntrinsicMeasurement {
+        let mut items = Vec::new();
+        self.push_inline_words(text, style, None, 0.0, &mut items);
+        self.intrinsic_inline_measurement_for_items(items, style, available_width)
+    }
+
+    fn intrinsic_inline_items_for_element(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+    ) -> Vec<InlineItem> {
+        let mut items = Vec::new();
+        if block_bidi_scope_needs_inline_controls(style) {
+            self.push_bidi_scope_start(style, None, 0.0, &mut items);
+        }
+        self.push_generated_pseudo_items(
+            element,
+            style.before_style.as_deref(),
+            None,
+            0.0,
+            GeneratedPseudoCounterMode::Rollback,
+            &mut items,
+        );
+        if let Some(child_boxes) = child_boxes {
+            if style.content.is_generated() {
+                self.push_intrinsic_element_content_items_from_boxes(
+                    element,
+                    style,
+                    child_boxes,
+                    stylesheets,
+                    None,
+                    0.0,
+                    style.text_decoration,
+                    &mut items,
+                );
+            } else {
+                self.collect_intrinsic_inline_box_items(
+                    child_boxes,
+                    stylesheets,
+                    None,
+                    0.0,
+                    style.text_decoration,
+                    &mut items,
+                );
+            }
+        } else {
+            self.collect_intrinsic_element_content_or_inline_items(
+                element,
+                style,
+                stylesheets,
+                None,
+                0.0,
+                &mut items,
+            );
+        }
+        self.push_generated_pseudo_items(
+            element,
+            style.after_style.as_deref(),
+            None,
+            0.0,
+            GeneratedPseudoCounterMode::Rollback,
+            &mut items,
+        );
+        if block_bidi_scope_needs_inline_controls(style) {
+            self.push_bidi_scope_end(style, None, 0.0, &mut items);
+        }
+        items
+    }
+
+    fn intrinsic_inline_items_for_boxes(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+    ) -> Vec<InlineItem> {
+        let mut items = Vec::new();
+        self.collect_intrinsic_inline_box_items(
+            children,
+            stylesheets,
+            None,
+            0.0,
+            style.text_decoration,
+            &mut items,
+        );
+        items
+    }
+
+    fn intrinsic_inline_measurement_for_items(
+        &mut self,
+        mut items: Vec<InlineItem>,
+        block_style: &ComputedStyle,
+        available_width: f32,
+    ) -> inline_layout::InlineIntrinsicMeasurement {
+        insert_text_autospace_items(&mut items);
+        trim_inline_item_edges(&mut items);
+        let context = InlineParagraphContext {
+            block_style,
+            available_width: available_width.max(1.0),
+            padding_left: 0.0,
+            hanging_indent: 0.0,
+            hanging_punctuation_reserve: 0.0,
+        };
+        let mut output = inline_layout::InlineIntrinsicMeasurement::default();
+        let mut paragraph = Vec::new();
+        for item in items {
+            match item {
+                InlineItem::Break => {
+                    self.flush_intrinsic_inline_measurement_paragraph(
+                        &mut paragraph,
+                        context,
+                        true,
+                        &mut output,
+                    );
+                }
+                InlineItem::Float(_) | InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd => {
+                    self.flush_intrinsic_inline_measurement_paragraph(
+                        &mut paragraph,
+                        context,
+                        false,
+                        &mut output,
+                    );
+                }
+                item => paragraph.push(item),
+            }
+        }
+        self.flush_intrinsic_inline_measurement_paragraph(
+            &mut paragraph,
+            context,
+            false,
+            &mut output,
+        );
+        output
+    }
+
+    /// Estimate inline block-size from graph-selected line fragments.
+    ///
+    /// CSS Flexbox computes a flex item's hypothetical cross size by laying
+    /// the item out as an in-flow block, while CSS Inline and CSS Text define
+    /// the line boxes and break opportunities used by that block layout:
+    /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>,
+    /// <https://www.w3.org/TR/css-inline-3/#line-box>, and
+    /// <https://www.w3.org/TR/css-text-3/#line-breaking>.
+    pub(in crate::layout) fn intrinsic_inline_block_metrics_for_element(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        available_width: f32,
+    ) -> (f32, usize) {
+        let measurement = self.intrinsic_inline_measurement_for_element(
+            element,
+            style,
+            stylesheets,
+            child_boxes,
+            available_width,
+        );
+        (measurement.height, measurement.line_count)
+    }
+
+    pub(in crate::layout) fn intrinsic_inline_block_metrics_for_boxes(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+    ) -> (f32, usize) {
+        let measurement = self.intrinsic_inline_measurement_for_boxes(
+            children,
+            style,
+            stylesheets,
+            available_width,
+        );
+        (measurement.height, measurement.line_count)
+    }
+
+    fn flush_intrinsic_inline_measurement_paragraph(
+        &mut self,
+        paragraph: &mut Vec<InlineItem>,
+        context: InlineParagraphContext<'_>,
+        force_empty_line: bool,
+        output: &mut inline_layout::InlineIntrinsicMeasurement,
+    ) {
+        trim_inline_item_edges(paragraph);
+        if paragraph.is_empty() {
+            if force_empty_line {
+                output.height += context.block_style.line_height;
+                output.line_count += 1;
+            }
+            return;
+        }
+        let graph = self.build_inline_opportunity_graph(paragraph);
+        let contribution = graph.intrinsic_contribution(&mut self.font_system, context.block_style);
+        let (lines, next_line_count) =
+            self.select_inline_lines_from_graph(&graph, context, output.line_count, false);
+        output.height += lines
+            .iter()
+            .map(|line| line.metrics.height.max(context.block_style.line_height))
+            .sum::<f32>();
+        output.line_count = next_line_count;
+        output.contribution.min_content = output
+            .contribution
+            .min_content
+            .max(contribution.min_content);
+        output.contribution.max_content = output
+            .contribution
+            .max_content
+            .max(contribution.max_content);
+        output
+            .paragraphs
+            .push(inline_layout::InlineMeasuredParagraph {
+                graph,
+                contribution,
+                lines,
+            });
+        paragraph.clear();
+    }
+
+    pub(super) fn layout_inline_items_block(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        padding: (f32, f32),
+        link_target: Option<&str>,
+        marker: Option<&ListMarker>,
+    ) {
+        let (padding_left, padding_right) = padding;
+        let available_width =
+            (self.content_right - self.content_left - padding_left - padding_right).max(1.0);
+        let mut items = Vec::new();
+        let link_target = link_target.map(str::to_string);
+        if let Some(marker) = marker
+            && marker.position == ListStylePosition::Outside
+        {
+            if self.cursor_y - style.font_size < self.page_bottom() {
+                self.push_page();
+            }
+            self.paint_outside_marker(
+                marker,
+                style,
+                self.content_left + padding_left,
+                self.content_right - padding_right,
+                self.cursor_y,
+            );
+        }
+        if block_bidi_scope_needs_inline_controls(style) {
+            self.push_bidi_scope_start(style, link_target.clone(), 0.0, &mut items);
+        }
+        if let Some(marker) = marker
+            && marker.position == ListStylePosition::Inside
+            && (marker.image.is_some() || !trim_css_collapsible_whitespace(&marker.text).is_empty())
+        {
+            self.push_inside_marker_items(marker, style, link_target.clone(), &mut items);
+        }
+        self.push_generated_pseudo_items(
+            element,
+            style.before_style.as_deref(),
+            link_target.clone(),
+            0.0,
+            GeneratedPseudoCounterMode::Commit,
+            &mut items,
+        );
+        self.collect_element_content_or_inline_items(
+            element,
+            style,
+            stylesheets,
+            link_target.clone(),
+            0.0,
+            &mut items,
+        );
+        self.push_generated_pseudo_items(
+            element,
+            style.after_style.as_deref(),
+            link_target.clone(),
+            0.0,
+            GeneratedPseudoCounterMode::Commit,
+            &mut items,
+        );
+        if block_bidi_scope_needs_inline_controls(style) {
+            self.push_bidi_scope_end(style, link_target, 0.0, &mut items);
+        }
+        self.layout_inline_items(
+            items,
+            style,
+            available_width,
+            padding_left,
+            0.0,
+            stylesheets,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn layout_run_in_inline_items_block(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        run_in_children: &[box_tree::FormattingBox<'_>],
+        children: &[box_tree::FormattingBox<'_>],
+        link_target: Option<&str>,
+        marker: Option<&ListMarker>,
+    ) {
+        let available_width = (self.content_right - self.content_left).max(1.0);
+        let mut items = Vec::new();
+        let link_target = link_target.map(str::to_string);
+        if let Some(marker) = marker
+            && marker.position == ListStylePosition::Outside
+        {
+            if self.cursor_y - style.font_size < self.page_bottom() {
+                self.push_page();
+            }
+            self.paint_outside_marker(
+                marker,
+                style,
+                self.content_left,
+                self.content_right,
+                self.cursor_y,
+            );
+        }
+        if block_bidi_scope_needs_inline_controls(style) {
+            self.push_bidi_scope_start(style, link_target.clone(), 0.0, &mut items);
+        }
+        if let Some(marker) = marker
+            && marker.position == ListStylePosition::Inside
+            && (marker.image.is_some() || !trim_css_collapsible_whitespace(&marker.text).is_empty())
+        {
+            self.push_inside_marker_items(marker, style, link_target.clone(), &mut items);
+        }
+        self.collect_inline_box_items(
+            run_in_children,
+            stylesheets,
+            link_target.clone(),
+            0.0,
+            style.text_decoration,
+            &mut items,
+        );
+        self.push_generated_pseudo_items(
+            element,
+            style.before_style.as_deref(),
+            link_target.clone(),
+            0.0,
+            GeneratedPseudoCounterMode::Commit,
+            &mut items,
+        );
+        if style.content.is_generated() {
+            self.push_element_content_items_from_boxes(
+                element,
+                style,
+                children,
+                stylesheets,
+                link_target.clone(),
+                0.0,
+                style.text_decoration,
+                &mut items,
+            );
+        } else {
+            self.collect_inline_box_items(
+                children,
+                stylesheets,
+                link_target.clone(),
+                0.0,
+                style.text_decoration,
+                &mut items,
+            );
+        }
+        self.push_generated_pseudo_items(
+            element,
+            style.after_style.as_deref(),
+            link_target.clone(),
+            0.0,
+            GeneratedPseudoCounterMode::Commit,
+            &mut items,
+        );
+        if block_bidi_scope_needs_inline_controls(style) {
+            self.push_bidi_scope_end(style, link_target, 0.0, &mut items);
+        }
+        if !items.is_empty() {
+            self.layout_inline_items(items, style, available_width, 0.0, 0.0, stylesheets);
+        }
+    }
+
+    fn collect_intrinsic_inline_items(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        inherited_link: Option<String>,
+        baseline_shift: f32,
+        output: &mut Vec<InlineItem>,
+    ) {
+        let sibling_tags = element_sibling_tags(element);
+        let mut element_index = 0usize;
+        for child in &element.children {
+            match &child.kind {
+                NodeKind::Text(text) => {
+                    self.push_inline_words(
+                        text,
+                        style,
+                        inherited_link.clone(),
+                        baseline_shift,
+                        output,
+                    );
+                }
+                NodeKind::Element(child_element) => {
+                    let child_signature = ElementSignature::with_siblings(
+                        child_element.tag.clone(),
+                        child_element.attrs.clone(),
+                        element_index,
+                        sibling_tags.clone(),
+                    );
+                    element_index += 1;
+                    let mut child_style = style_for_layout_element(
+                        child_element,
+                        child_signature,
+                        stylesheets,
+                        Some(style),
+                        &self.ancestors,
+                    );
+                    if child_style.float != Float::None
+                        || matches!(child_style.position, Position::Absolute | Position::Fixed)
+                        || child_style.display.is_none()
+                        || child_style.display.is_block_level()
+                    {
+                        continue;
+                    }
+                    child_style.text_decoration = child_style
+                        .text_decoration
+                        .with_propagated_lines(style.text_decoration);
+                    let link = child_element
+                        .attrs
+                        .get("href")
+                        .cloned()
+                        .or_else(|| inherited_link.clone());
+                    let child_baseline_shift =
+                        baseline_shift + vertical_align_baseline_shift(&child_style);
+                    if let Some(atom) = self.intrinsic_inline_atom_for_element(
+                        child_element,
+                        &child_style,
+                        &[],
+                        None,
+                        stylesheets,
+                        child_baseline_shift,
+                        link.clone(),
+                    ) {
+                        output.push(InlineItem::Atom(Box::new(atom)));
+                        continue;
+                    }
+                    let scope = self.begin_inline_element_scope(
+                        child_element,
+                        &child_style,
+                        link.clone(),
+                        child_baseline_shift,
+                        InlineElementScopeOptions::DOM_INTRINSIC,
+                        output,
+                    );
+                    self.push_generated_pseudo_items(
+                        child_element,
+                        child_style.before_style.as_deref(),
+                        link.clone(),
+                        child_baseline_shift,
+                        GeneratedPseudoCounterMode::Rollback,
+                        output,
+                    );
+                    self.collect_intrinsic_element_content_or_inline_items(
+                        child_element,
+                        &child_style,
+                        stylesheets,
+                        link.clone(),
+                        child_baseline_shift,
+                        output,
+                    );
+                    self.push_generated_pseudo_items(
+                        child_element,
+                        child_style.after_style.as_deref(),
+                        link.clone(),
+                        child_baseline_shift,
+                        GeneratedPseudoCounterMode::Rollback,
+                        output,
+                    );
+                    self.end_inline_element_scope(scope, &child_style, output);
+                }
+            }
+        }
+    }
+
+    fn collect_intrinsic_element_content_or_inline_items(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        inherited_link: Option<String>,
+        baseline_shift: f32,
+        output: &mut Vec<InlineItem>,
+    ) {
+        if style.content.is_generated() {
+            self.push_intrinsic_element_content_items_from_dom(
+                element,
+                style,
+                stylesheets,
+                inherited_link,
+                baseline_shift,
+                output,
+            );
+        } else {
+            self.collect_intrinsic_inline_items(
+                element,
+                style,
+                stylesheets,
+                inherited_link,
+                baseline_shift,
+                output,
+            );
+        }
+    }
+
+    fn push_intrinsic_element_content_items_from_dom(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        inherited_link: Option<String>,
+        baseline_shift: f32,
+        output: &mut Vec<InlineItem>,
+    ) {
+        let Some(parts) = style.content.generated_parts().map(|parts| parts.to_vec()) else {
+            return;
+        };
+        let alt_text = self.generated_alt_text(element, style);
+        let mut used_contents = false;
+        for part in &parts {
+            if matches!(part, GeneratedContentPart::Contents) {
+                if !used_contents {
+                    used_contents = true;
+                    self.collect_intrinsic_inline_items(
+                        element,
+                        style,
+                        stylesheets,
+                        inherited_link.clone(),
+                        baseline_shift,
+                        output,
+                    );
+                }
+                continue;
+            }
+            self.push_generated_content_part(
+                element,
+                part,
+                style,
+                inherited_link.clone(),
+                baseline_shift,
+                alt_text.clone(),
+                output,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_intrinsic_element_content_items_from_boxes(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        inherited_link: Option<String>,
+        baseline_shift: f32,
+        propagated_decoration: css::TextDecoration,
+        output: &mut Vec<InlineItem>,
+    ) {
+        let Some(parts) = style.content.generated_parts().map(|parts| parts.to_vec()) else {
+            return;
+        };
+        let alt_text = self.generated_alt_text(element, style);
+        let mut used_contents = false;
+        for part in &parts {
+            if matches!(part, GeneratedContentPart::Contents) {
+                if !used_contents {
+                    used_contents = true;
+                    self.collect_intrinsic_inline_box_items(
+                        children,
+                        stylesheets,
+                        inherited_link.clone(),
+                        baseline_shift,
+                        propagated_decoration,
+                        output,
+                    );
+                }
+                continue;
+            }
+            self.push_generated_content_part(
+                element,
+                part,
+                style,
+                inherited_link.clone(),
+                baseline_shift,
+                alt_text.clone(),
+                output,
+            );
+        }
+    }
+
+    /// Push a regular inline box edge into the inline formatting stream.
+    ///
+    /// CSS Inline treats inline-level margin, border, and padding as part of
+    /// the inline box fragments. Keeping the start/end edges as explicit
+    /// zero-height atomic items lets line fitting account for positive and
+    /// negative inline margins without turning them into text or shaping
+    /// boundaries:
+    /// <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting> and
+    /// <https://www.w3.org/TR/css-inline-3/#model>.
+    fn push_inline_box_edge_item(
+        &mut self,
+        style: &ComputedStyle,
+        edge: InlineBoxEdge,
+        baseline_shift: f32,
+        link_target: Option<String>,
+        output: &mut Vec<InlineItem>,
+    ) {
+        let width = inline_box_edge_width(style, edge);
+        if width.abs() < 0.001 {
+            return;
+        }
+        output.push(InlineItem::Atom(Box::new(InlineAtom {
+            content: InlineAtomContent::InlineEdge,
+            style: style.clone(),
+            width,
+            height: 0.0,
+            baseline_offset: 0.0,
+            baseline_shift,
+            link_target,
+            alt_text: None,
+        })));
+    }
+
+    fn begin_inline_element_scope(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        options: InlineElementScopeOptions,
+        output: &mut Vec<InlineItem>,
+    ) -> InlineElementScopeState {
+        let counter_scope = self.begin_counter_scope(element, style);
+        let inline_box_start = output.len();
+        self.push_inline_box_edge_item(style, InlineBoxEdge::Start, baseline_shift, None, output);
+        let pushed_page_scope = options.push_page_scope && style.page_name_specified;
+        if pushed_page_scope {
+            output.push(InlineItem::PageScopeStart(style.page_name.clone()));
+        }
+        self.push_bidi_scope_start(style, link_target.clone(), baseline_shift, output);
+        if options.push_inside_marker
+            && style.display.is_list_item()
+            && style.list_style_position == ListStylePosition::Inside
+            && let Some(marker) =
+                self.marker_for_list_item(element, style, self.containing_block_direction)
+        {
+            self.push_inside_marker_items(&marker, style, link_target.clone(), output);
+        }
+        InlineElementScopeState {
+            inline_box_start,
+            link_target,
+            baseline_shift,
+            pushed_page_scope,
+            mark_hanging_edges: options.mark_hanging_edges,
+            counter_scope,
+        }
+    }
+
+    fn end_inline_element_scope(
+        &mut self,
+        state: InlineElementScopeState,
+        style: &ComputedStyle,
+        output: &mut Vec<InlineItem>,
+    ) {
+        self.push_bidi_scope_end(style, state.link_target, state.baseline_shift, output);
+        if state.pushed_page_scope {
+            output.push(InlineItem::PageScopeEnd);
+        }
+        self.push_inline_box_edge_item(
+            style,
+            InlineBoxEdge::End,
+            state.baseline_shift,
+            None,
+            output,
+        );
+        if state.mark_hanging_edges {
+            mark_inline_box_hanging_edges(output, state.inline_box_start, style);
+        }
+        self.end_counter_scope(state.counter_scope);
+    }
+
+    pub(in crate::layout) fn collect_element_content_or_inline_items(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        inherited_link: Option<String>,
+        baseline_shift: f32,
+        output: &mut Vec<InlineItem>,
+    ) {
+        if style.content.is_generated() {
+            self.push_element_content_items_from_dom(
+                element,
+                style,
+                stylesheets,
+                inherited_link,
+                baseline_shift,
+                output,
+            );
+        } else {
+            self.collect_inline_items(
+                element,
+                style,
+                stylesheets,
+                inherited_link,
+                baseline_shift,
+                output,
+            );
+        }
+    }
+
+    fn push_element_content_items_from_dom(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        inherited_link: Option<String>,
+        baseline_shift: f32,
+        output: &mut Vec<InlineItem>,
+    ) {
+        let Some(parts) = style.content.generated_parts().map(|parts| parts.to_vec()) else {
+            return;
+        };
+        let alt_text = self.generated_alt_text(element, style);
+        let mut used_contents = false;
+        for part in &parts {
+            if matches!(part, GeneratedContentPart::Contents) {
+                if !used_contents {
+                    used_contents = true;
+                    self.collect_inline_items(
+                        element,
+                        style,
+                        stylesheets,
+                        inherited_link.clone(),
+                        baseline_shift,
+                        output,
+                    );
+                }
+                continue;
+            }
+            self.push_generated_content_part(
+                element,
+                part,
+                style,
+                inherited_link.clone(),
+                baseline_shift,
+                alt_text.clone(),
+                output,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_element_content_items_from_boxes(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        inherited_link: Option<String>,
+        baseline_shift: f32,
+        propagated_decoration: css::TextDecoration,
+        output: &mut Vec<InlineItem>,
+    ) {
+        let Some(parts) = style.content.generated_parts().map(|parts| parts.to_vec()) else {
+            return;
+        };
+        let alt_text = self.generated_alt_text(element, style);
+        let mut used_contents = false;
+        for part in &parts {
+            if matches!(part, GeneratedContentPart::Contents) {
+                if !used_contents {
+                    used_contents = true;
+                    self.collect_inline_box_items(
+                        children,
+                        stylesheets,
+                        inherited_link.clone(),
+                        baseline_shift,
+                        propagated_decoration,
+                        output,
+                    );
+                }
+                continue;
+            }
+            self.push_generated_content_part(
+                element,
+                part,
+                style,
+                inherited_link.clone(),
+                baseline_shift,
+                alt_text.clone(),
+                output,
+            );
+        }
+    }
+
+    pub(super) fn collect_inline_items(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        inherited_link: Option<String>,
+        baseline_shift: f32,
+        output: &mut Vec<InlineItem>,
+    ) {
+        let sibling_tags = element_sibling_tags(element);
+        let mut element_index = 0usize;
+        for child in &element.children {
+            match &child.kind {
+                NodeKind::Text(text) => {
+                    self.push_inline_words(
+                        text,
+                        style,
+                        inherited_link.clone(),
+                        baseline_shift,
+                        output,
+                    );
+                }
+                NodeKind::Element(child_element) => {
+                    let child_signature = ElementSignature::with_siblings(
+                        child_element.tag.clone(),
+                        child_element.attrs.clone(),
+                        element_index,
+                        sibling_tags.clone(),
+                    );
+                    element_index += 1;
+                    let mut child_style = style_for_layout_element(
+                        child_element,
+                        child_signature.clone(),
+                        stylesheets,
+                        Some(style),
+                        &self.ancestors,
+                    );
+                    if child_style.float != Float::None {
+                        output.push(InlineItem::Float(Box::new(InlineFloat {
+                            element: child_element.clone(),
+                            signature: child_signature,
+                            style: child_style,
+                        })));
+                        continue;
+                    }
+                    if matches!(child_style.position, Position::Absolute | Position::Fixed) {
+                        let static_baseline_y =
+                            self.inline_static_baseline_y_from_buffer(output, &child_style);
+                        self.layout_positioned_block_with_inline_static_baseline(
+                            child_element,
+                            &child_style,
+                            stylesheets,
+                            None,
+                            None,
+                            static_baseline_y,
+                        );
+                        continue;
+                    }
+                    child_style.text_decoration = child_style
+                        .text_decoration
+                        .with_propagated_lines(style.text_decoration);
+                    if child_style.display.is_none()
+                        || child_style.display.is_block_level()
+                        || child_style.display.is_table()
+                    {
+                        continue;
+                    }
+                    let link = child_element
+                        .attrs
+                        .get("href")
+                        .cloned()
+                        .or_else(|| inherited_link.clone());
+                    let child_baseline_shift =
+                        baseline_shift + vertical_align_baseline_shift(&child_style);
+                    let scope = self.begin_inline_element_scope(
+                        child_element,
+                        &child_style,
+                        link.clone(),
+                        child_baseline_shift,
+                        InlineElementScopeOptions::DOM_PAINT,
+                        output,
+                    );
+                    self.push_generated_pseudo_items(
+                        child_element,
+                        child_style.before_style.as_deref(),
+                        link.clone(),
+                        child_baseline_shift,
+                        GeneratedPseudoCounterMode::Commit,
+                        output,
+                    );
+                    self.collect_element_content_or_inline_items(
+                        child_element,
+                        &child_style,
+                        stylesheets,
+                        link.clone(),
+                        child_baseline_shift,
+                        output,
+                    );
+                    self.push_generated_pseudo_items(
+                        child_element,
+                        child_style.after_style.as_deref(),
+                        link.clone(),
+                        child_baseline_shift,
+                        GeneratedPseudoCounterMode::Commit,
+                        output,
+                    );
+                    self.end_inline_element_scope(scope, &child_style, output);
+                }
+            }
+        }
+    }
+
+    pub(super) fn collect_inline_box_items(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        inherited_link: Option<String>,
+        baseline_shift: f32,
+        propagated_decoration: css::TextDecoration,
+        output: &mut Vec<InlineItem>,
+    ) {
+        for (child_index, child) in children.iter().enumerate() {
+            if let Some((element, _, style, child_boxes)) = child.element_parts()
+                && matches!(style.position, Position::Absolute | Position::Fixed)
+            {
+                let static_baseline_y = self.inline_static_baseline_y_from_buffer(output, style);
+                self.layout_positioned_block_with_inline_static_baseline(
+                    element,
+                    style,
+                    stylesheets,
+                    Some(child_boxes),
+                    match child {
+                        box_tree::FormattingBox::AtomicInline(box_) => box_.table_fragment.as_ref(),
+                        box_tree::FormattingBox::Table(box_) => Some(&box_.fragment),
+                        _ => None,
+                    },
+                    static_baseline_y,
+                );
+                continue;
+            }
+            match child {
+                box_tree::FormattingBox::Text(box_) => {
+                    let mut text_style = box_.style.clone();
+                    text_style.text_decoration = text_style
+                        .text_decoration
+                        .with_propagated_lines(propagated_decoration);
+                    let text = if child_index + 1 == children.len() {
+                        trim_terminal_preserved_segment_breaks(&box_.text, &text_style)
+                    } else {
+                        box_.text.as_str()
+                    };
+                    self.push_inline_words(
+                        text,
+                        &text_style,
+                        inherited_link.clone(),
+                        baseline_shift,
+                        output,
+                    );
+                }
+                box_tree::FormattingBox::Inline(box_) => {
+                    if box_.style.float != Float::None {
+                        output.push(InlineItem::Float(Box::new(InlineFloat {
+                            element: box_.element.clone(),
+                            signature: box_.signature.clone(),
+                            style: box_.style.clone(),
+                        })));
+                        continue;
+                    }
+                    let mut inline_style = box_.style.clone();
+                    inline_style.text_decoration = inline_style
+                        .text_decoration
+                        .with_propagated_lines(propagated_decoration);
+                    let link = box_
+                        .element
+                        .attrs
+                        .get("href")
+                        .cloned()
+                        .or_else(|| inherited_link.clone());
+                    let child_baseline_shift =
+                        baseline_shift + vertical_align_baseline_shift(&inline_style);
+                    let scope = self.begin_inline_element_scope(
+                        box_.element,
+                        &inline_style,
+                        link.clone(),
+                        child_baseline_shift,
+                        InlineElementScopeOptions::BOX_PAINT,
+                        output,
+                    );
+                    self.push_generated_pseudo_items(
+                        box_.element,
+                        inline_style.before_style.as_deref(),
+                        link.clone(),
+                        child_baseline_shift,
+                        GeneratedPseudoCounterMode::Commit,
+                        output,
+                    );
+                    if inline_style.content.is_generated() {
+                        self.push_element_content_items_from_boxes(
+                            box_.element,
+                            &inline_style,
+                            &box_.children,
+                            stylesheets,
+                            link.clone(),
+                            child_baseline_shift,
+                            inline_style.text_decoration,
+                            output,
+                        );
+                    } else {
+                        self.collect_inline_box_items(
+                            &box_.children,
+                            stylesheets,
+                            link.clone(),
+                            child_baseline_shift,
+                            inline_style.text_decoration,
+                            output,
+                        );
+                    }
+                    self.push_generated_pseudo_items(
+                        box_.element,
+                        inline_style.after_style.as_deref(),
+                        link.clone(),
+                        child_baseline_shift,
+                        GeneratedPseudoCounterMode::Commit,
+                        output,
+                    );
+                    self.end_inline_element_scope(scope, &inline_style, output);
+                }
+                box_tree::FormattingBox::AtomicInline(box_) => {
+                    if box_.style.float != Float::None {
+                        output.push(InlineItem::Float(Box::new(InlineFloat {
+                            element: box_.element.clone(),
+                            signature: box_.signature.clone(),
+                            style: box_.style.clone(),
+                        })));
+                        continue;
+                    }
+                    let link = box_
+                        .element
+                        .attrs
+                        .get("href")
+                        .cloned()
+                        .or_else(|| inherited_link.clone());
+                    if let Some(atom) = self.inline_atom_for_element(
+                        box_.element,
+                        &box_.style,
+                        &box_.children,
+                        box_.table_fragment.as_ref(),
+                        stylesheets,
+                        baseline_shift + vertical_align_baseline_shift(&box_.style),
+                        link.clone(),
+                    ) {
+                        output.push(InlineItem::Atom(Box::new(atom)));
+                    } else {
+                        let text = inline_text_for_style(box_.element, &box_.style);
+                        self.push_inline_words(&text, &box_.style, link, baseline_shift, output);
+                    }
+                }
+                box_tree::FormattingBox::Line(box_) => {
+                    for text in &box_.children {
+                        self.push_inline_words(
+                            &text.text,
+                            &text.style,
+                            inherited_link.clone(),
+                            baseline_shift,
+                            output,
+                        );
+                    }
+                }
+                box_tree::FormattingBox::AnonymousBlock(box_) => self.collect_inline_box_items(
+                    &box_.children,
+                    stylesheets,
+                    inherited_link.clone(),
+                    baseline_shift,
+                    box_.style
+                        .text_decoration
+                        .with_propagated_lines(propagated_decoration),
+                    output,
+                ),
+                box_tree::FormattingBox::Block(_)
+                | box_tree::FormattingBox::Table(_)
+                | box_tree::FormattingBox::Flex(_)
+                | box_tree::FormattingBox::Replaced(_) => {}
+            }
+        }
+    }
+
+    fn collect_intrinsic_inline_box_items(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        inherited_link: Option<String>,
+        baseline_shift: f32,
+        propagated_decoration: css::TextDecoration,
+        output: &mut Vec<InlineItem>,
+    ) {
+        for (child_index, child) in children.iter().enumerate() {
+            if let Some((_, _, style, _)) = child.element_parts()
+                && (matches!(style.position, Position::Absolute | Position::Fixed)
+                    || style.float != Float::None)
+            {
+                continue;
+            }
+            match child {
+                box_tree::FormattingBox::Text(box_) => {
+                    let mut text_style = box_.style.clone();
+                    text_style.text_decoration = text_style
+                        .text_decoration
+                        .with_propagated_lines(propagated_decoration);
+                    let text = if child_index + 1 == children.len() {
+                        trim_terminal_preserved_segment_breaks(&box_.text, &text_style)
+                    } else {
+                        box_.text.as_str()
+                    };
+                    self.push_inline_words(
+                        text,
+                        &text_style,
+                        inherited_link.clone(),
+                        baseline_shift,
+                        output,
+                    );
+                }
+                box_tree::FormattingBox::Inline(box_) => {
+                    let mut inline_style = box_.style.clone();
+                    inline_style.text_decoration = inline_style
+                        .text_decoration
+                        .with_propagated_lines(propagated_decoration);
+                    let link = box_
+                        .element
+                        .attrs
+                        .get("href")
+                        .cloned()
+                        .or_else(|| inherited_link.clone());
+                    let child_baseline_shift =
+                        baseline_shift + vertical_align_baseline_shift(&inline_style);
+                    let scope = self.begin_inline_element_scope(
+                        box_.element,
+                        &inline_style,
+                        link.clone(),
+                        child_baseline_shift,
+                        InlineElementScopeOptions::BOX_INTRINSIC,
+                        output,
+                    );
+                    self.push_generated_pseudo_items(
+                        box_.element,
+                        inline_style.before_style.as_deref(),
+                        link.clone(),
+                        child_baseline_shift,
+                        GeneratedPseudoCounterMode::Rollback,
+                        output,
+                    );
+                    if inline_style.content.is_generated() {
+                        self.push_intrinsic_element_content_items_from_boxes(
+                            box_.element,
+                            &inline_style,
+                            &box_.children,
+                            stylesheets,
+                            link.clone(),
+                            child_baseline_shift,
+                            inline_style.text_decoration,
+                            output,
+                        );
+                    } else {
+                        self.collect_intrinsic_inline_box_items(
+                            &box_.children,
+                            stylesheets,
+                            link.clone(),
+                            child_baseline_shift,
+                            inline_style.text_decoration,
+                            output,
+                        );
+                    }
+                    self.push_generated_pseudo_items(
+                        box_.element,
+                        inline_style.after_style.as_deref(),
+                        link.clone(),
+                        child_baseline_shift,
+                        GeneratedPseudoCounterMode::Rollback,
+                        output,
+                    );
+                    self.end_inline_element_scope(scope, &inline_style, output);
+                }
+                box_tree::FormattingBox::AtomicInline(box_) => {
+                    let link = box_
+                        .element
+                        .attrs
+                        .get("href")
+                        .cloned()
+                        .or_else(|| inherited_link.clone());
+                    if let Some(atom) = self.intrinsic_inline_atom_for_element(
+                        box_.element,
+                        &box_.style,
+                        &box_.children,
+                        box_.table_fragment.as_ref(),
+                        stylesheets,
+                        baseline_shift + vertical_align_baseline_shift(&box_.style),
+                        link,
+                    ) {
+                        output.push(InlineItem::Atom(Box::new(atom)));
+                    } else {
+                        let text = inline_text_for_style(box_.element, &box_.style);
+                        self.push_inline_words(
+                            &text,
+                            &box_.style,
+                            inherited_link.clone(),
+                            baseline_shift,
+                            output,
+                        );
+                    }
+                }
+                box_tree::FormattingBox::Line(box_) => {
+                    for text in &box_.children {
+                        self.push_inline_words(
+                            &text.text,
+                            &text.style,
+                            inherited_link.clone(),
+                            baseline_shift,
+                            output,
+                        );
+                    }
+                }
+                box_tree::FormattingBox::AnonymousBlock(box_) => self
+                    .collect_intrinsic_inline_box_items(
+                        &box_.children,
+                        stylesheets,
+                        inherited_link.clone(),
+                        baseline_shift,
+                        box_.style
+                            .text_decoration
+                            .with_propagated_lines(propagated_decoration),
+                        output,
+                    ),
+                box_tree::FormattingBox::Block(_)
+                | box_tree::FormattingBox::Table(_)
+                | box_tree::FormattingBox::Flex(_)
+                | box_tree::FormattingBox::Replaced(_) => {}
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn intrinsic_inline_atom_for_element(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+        stylesheets: &[Stylesheet],
+        baseline_shift: f32,
+        link_target: Option<String>,
+    ) -> Option<InlineAtom> {
+        let available_width =
+            (self.content_right - self.content_left - style.margin.left - style.margin.right)
+                .max(style.font_size);
+        if let Content::Replacement {
+            image:
+                GeneratedContentPart::Image {
+                    url,
+                    base_url,
+                    root_url,
+                },
+            ..
+        } = &style.content
+        {
+            let image = used_generated_image(
+                url,
+                style,
+                available_width,
+                base_url.as_deref(),
+                root_url.as_deref(),
+                self.resource_cache,
+            )?;
+            return Some(InlineAtom {
+                content: InlineAtomContent::Image(image.decoded),
+                style: style.clone(),
+                width: image.border_box_width + style.margin.left + style.margin.right,
+                height: image.border_box_height + style.margin.top + style.margin.bottom,
+                baseline_offset: image.border_box_height,
+                baseline_shift,
+                link_target,
+                alt_text: self.generated_alt_text(element, style),
+            });
+        }
+        let (width, height, baseline_offset) = match replaced_element_kind(element) {
+            Some(ReplacedElementKind::Canvas) => {
+                let (width, height) = used_canvas_size(element, style, available_width);
+                (
+                    width + style.margin.left + style.margin.right,
+                    height + style.margin.top + style.margin.bottom,
+                    height,
+                )
+            }
+            Some(ReplacedElementKind::Image) => used_image(
+                element,
+                style,
+                available_width,
+                self.base_url,
+                self.root_url,
+                self.resource_cache,
+            )
+            .map(|image| {
+                (
+                    image.border_box_width + style.margin.left + style.margin.right,
+                    image.border_box_height + style.margin.top + style.margin.bottom,
+                    image.border_box_height,
+                )
+            })?,
+            Some(ReplacedElementKind::Svg) => {
+                let (width, height, _) = svg_rect(element)?;
+                (
+                    width + style.margin.left + style.margin.right,
+                    height + style.margin.top + style.margin.bottom,
+                    height,
+                )
+            }
+            None if style.display.is_table() => {
+                let fragment = table_fragment?;
+                (
+                    self.table_shrink_to_fit_width_from_fragment(
+                        element,
+                        style,
+                        stylesheets,
+                        fragment,
+                        available_width,
+                    ) + style.margin.left
+                        + style.margin.right,
+                    style.line_height,
+                    style.line_height,
+                )
+            }
+            None if style.display.is_flex() && style.display.is_inline_level() => {
+                let used_edges = used_box_edges(style, available_width);
+                let horizontal_extras = used_edges.padding.left
+                    + used_edges.padding.right
+                    + horizontal_border_width(style);
+                let (min_width, width) = self.estimate_flex_intrinsic_widths(
+                    element,
+                    style,
+                    stylesheets,
+                    available_width,
+                    Some(children),
+                );
+                let auto_content_width = intrinsic::shrink_to_fit_width(
+                    min_width,
+                    width,
+                    (available_width - horizontal_extras).max(0.0),
+                );
+                let content_width =
+                    used_content_width_or_auto(style, available_width, horizontal_extras)
+                        .unwrap_or(auto_content_width);
+                (
+                    constrain_width(style, content_width, available_width)
+                        + horizontal_extras
+                        + style.margin.left
+                        + style.margin.right,
+                    style.line_height,
+                    style.line_height,
+                )
+            }
+            None if style.display.is_atomic_inline() => {
+                let used_edges = used_box_edges(style, available_width);
+                let horizontal_extras = used_edges.padding.left
+                    + used_edges.padding.right
+                    + horizontal_border_width(style);
+                let vertical_extras = used_edges.padding.top
+                    + used_edges.padding.bottom
+                    + vertical_border_width(style);
+                let contribution = if children.is_empty() {
+                    let text = inline_text_for_style(element, style);
+                    let contribution = self
+                        .intrinsic_inline_measurement_for_text(&text, style, available_width)
+                        .contribution;
+                    inline_layout::InlineIntrinsicContribution {
+                        min_content: contribution.min_content,
+                        max_content: contribution.max_content,
+                    }
+                } else {
+                    self.intrinsic_inline_contribution_for_element(
+                        element,
+                        style,
+                        stylesheets,
+                        Some(children),
+                    )
+                };
+                let auto_content_width = intrinsic::shrink_to_fit_width(
+                    contribution.min_content,
+                    contribution.max_content,
+                    (available_width - horizontal_extras).max(0.0),
+                )
+                .max(style.font_size);
+                let content_width =
+                    used_content_width_or_auto(style, available_width, horizontal_extras)
+                        .unwrap_or(auto_content_width);
+                let measured_content_height = if children.is_empty() {
+                    let text = inline_text_for_style(element, style);
+                    self.intrinsic_inline_measurement_for_text(&text, style, content_width)
+                        .height
+                        .max(style.line_height)
+                } else {
+                    self.intrinsic_inline_measurement_for_element(
+                        element,
+                        style,
+                        stylesheets,
+                        Some(children),
+                        content_width,
+                    )
+                    .height
+                    .max(style.line_height)
+                };
+                let content_height =
+                    used_content_height_or_auto(style, measured_content_height, vertical_extras)
+                        .unwrap_or(measured_content_height);
+                let content_height = constrain_height(style, content_height, available_width);
+                let border_box_height = content_height + vertical_extras;
+                (
+                    constrain_width(style, content_width, available_width)
+                        + horizontal_extras
+                        + style.margin.left
+                        + style.margin.right,
+                    border_box_height + style.margin.top + style.margin.bottom,
+                    border_box_height,
+                )
+            }
+            None => return None,
+        };
+        Some(InlineAtom {
+            content: InlineAtomContent::Svg {
+                fill: Color::TRANSPARENT,
+            },
+            style: style.clone(),
+            width,
+            height,
+            baseline_offset,
+            baseline_shift,
+            link_target,
+            alt_text: None,
+        })
+    }
+
+    fn inline_static_baseline_y_from_buffer(
+        &mut self,
+        output: &[InlineItem],
+        fallback_style: &ComputedStyle,
+    ) -> f32 {
+        if let Some(atom) = output.iter().rev().find_map(|item| match item {
+            InlineItem::Atom(atom) if !matches!(atom.content, InlineAtomContent::InlineEdge) => {
+                Some(atom)
+            }
+            _ => None,
+        }) {
+            let borders = used_border_widths(&atom.style);
+            let atom_baseline_offset =
+                atom.style.margin.top + atom.baseline_offset - atom.baseline_shift;
+            let parent_baseline_offset = self
+                .font_system
+                .rendered_first_line_baseline_offset(&atom.style);
+            let line_baseline_offset = atom_baseline_offset.max(parent_baseline_offset);
+            return self.cursor_y - line_baseline_offset
+                + atom.baseline_offset
+                + atom.baseline_shift
+                - borders.top
+                - atom.style.padding.top
+                - atom.style.font_size;
+        }
+
+        self.cursor_y
+            - self
+                .font_system
+                .rendered_first_line_baseline_offset(fallback_style)
+    }
+
+    pub(in crate::layout) fn push_generated_pseudo_items(
+        &mut self,
+        element: &Element,
+        pseudo_style: Option<&ComputedStyle>,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        counter_mode: GeneratedPseudoCounterMode,
+        output: &mut Vec<InlineItem>,
+    ) {
+        let Some(pseudo_style) = pseudo_style else {
+            return;
+        };
+        let Some(content) = pseudo_style.content.generated_parts() else {
+            return;
+        };
+        let counter_snapshot = (counter_mode == GeneratedPseudoCounterMode::Rollback)
+            .then(|| self.counter_set.clone());
+        let counter_scope = self.begin_pseudo_counter_scope(pseudo_style);
+        let alt_text = self.generated_alt_text(element, pseudo_style);
+        let is_block = pseudo_style.display.is_block_level();
+        if is_block
+            && output
+                .last()
+                .is_some_and(|item| !matches!(item, InlineItem::Break))
+        {
+            trim_trailing_inline_spaces(output);
+            output.push(InlineItem::Break);
+        }
+        let start_len = output.len();
+        self.push_bidi_scope_start(pseudo_style, link_target.clone(), baseline_shift, output);
+        let scope_start_len = output.len();
+        for part in content {
+            self.push_generated_content_part(
+                element,
+                part,
+                pseudo_style,
+                link_target.clone(),
+                baseline_shift,
+                alt_text.clone(),
+                output,
+            );
+        }
+        let emitted_content = output.len() > scope_start_len;
+        if emitted_content {
+            self.push_bidi_scope_end(pseudo_style, link_target, baseline_shift, output);
+        } else {
+            output.truncate(start_len);
+        }
+        if emitted_content
+            && is_block
+            && output
+                .last()
+                .is_some_and(|item| !matches!(item, InlineItem::Break))
+        {
+            trim_trailing_inline_spaces(output);
+            output.push(InlineItem::Break);
+        }
+        self.end_counter_scope(counter_scope);
+        if let Some(counter_snapshot) = counter_snapshot {
+            self.counter_set = counter_snapshot;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_generated_content_part(
+        &mut self,
+        element: &Element,
+        part: &GeneratedContentPart,
+        style: &ComputedStyle,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        alt_text: Option<String>,
+        output: &mut Vec<InlineItem>,
+    ) {
+        match part {
+            GeneratedContentPart::Text(text) => {
+                self.push_inline_words(text, style, link_target, baseline_shift, output);
+            }
+            GeneratedContentPart::Contents => {
+                let text = inline_text_for_style(element, style);
+                self.push_inline_words(&text, style, link_target, baseline_shift, output);
+            }
+            GeneratedContentPart::Attr { .. }
+            | GeneratedContentPart::Counter { .. }
+            | GeneratedContentPart::Counters { .. } => {
+                let text = evaluate_generated_content_text(
+                    element,
+                    std::slice::from_ref(part),
+                    self.counter_set.stacks(),
+                    &self.counter_styles,
+                );
+                self.push_inline_words(&text, style, link_target, baseline_shift, output);
+            }
+            GeneratedContentPart::Quote(quote) => {
+                let text = self.generated_quote_text(*quote, style);
+                self.push_inline_words(&text, style, link_target, baseline_shift, output);
+            }
+            GeneratedContentPart::Leader(text) => {
+                output.push(InlineItem::Atom(Box::new(InlineAtom {
+                    content: InlineAtomContent::Leader(text.clone()),
+                    style: style.clone(),
+                    width: 0.0,
+                    height: style.line_height,
+                    baseline_offset: style.font_size,
+                    baseline_shift,
+                    link_target,
+                    alt_text: None,
+                })));
+            }
+            GeneratedContentPart::Image {
+                url,
+                base_url,
+                root_url,
+            } => {
+                if let Some(atom) = self.generated_image_atom_for_url(
+                    url,
+                    base_url.as_deref(),
+                    root_url.as_deref(),
+                    style,
+                    baseline_shift,
+                    link_target,
+                    alt_text,
+                ) {
+                    output.push(InlineItem::Atom(Box::new(atom)));
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generated_image_atom_for_url(
+        &mut self,
+        url: &str,
+        base_url: Option<&Path>,
+        root_url: Option<&Path>,
+        style: &ComputedStyle,
+        baseline_shift: f32,
+        link_target: Option<String>,
+        alt_text: Option<String>,
+    ) -> Option<InlineAtom> {
+        let available_width = (self.content_right - self.content_left).max(1.0);
+        let mut used_style = self.style_with_current_viewport_lengths(style);
+        let used_edges = used_box_edges(&used_style, available_width);
+        used_style.margin = used_edges.margin.to_css_edges();
+        used_style.padding = used_edges.padding.to_css_edges();
+        let style = &used_style;
+        let image = used_generated_image(
+            url,
+            style,
+            available_width,
+            base_url,
+            root_url,
+            self.resource_cache,
+        )?;
+        Some(InlineAtom {
+            content: InlineAtomContent::Image(image.decoded),
+            style: style.clone(),
+            width: image.border_box_width + style.margin.left + style.margin.right,
+            height: image.border_box_height + style.margin.top + style.margin.bottom,
+            baseline_offset: image.border_box_height,
+            baseline_shift,
+            link_target,
+            alt_text,
+        })
+    }
+
+    pub(super) fn generated_alt_text(
+        &self,
+        element: &Element,
+        style: &ComputedStyle,
+    ) -> Option<String> {
+        style.content.alt().map(|alt| {
+            evaluate_generated_alt_text(
+                element,
+                alt,
+                self.counter_set.stacks(),
+                &self.counter_styles,
+            )
+        })
+    }
+
+    fn generated_quote_text(&mut self, quote: GeneratedQuote, style: &ComputedStyle) -> String {
+        match quote {
+            GeneratedQuote::Open => {
+                let text = quote_pair(style, self.quote_depth).0;
+                self.quote_depth += 1;
+                text
+            }
+            GeneratedQuote::Close => {
+                self.quote_depth = self.quote_depth.saturating_sub(1);
+                quote_pair(style, self.quote_depth).1
+            }
+            GeneratedQuote::NoOpen => {
+                self.quote_depth += 1;
+                String::new()
+            }
+            GeneratedQuote::NoClose => {
+                self.quote_depth = self.quote_depth.saturating_sub(1);
+                String::new()
+            }
+        }
+    }
+
+    /// Push UBA start controls for a CSS `unicode-bidi` inline scope.
+    ///
+    /// CSS Writing Modes defines `unicode-bidi` as adding embedding,
+    /// isolation, override, or plaintext bidi controls around generated inline
+    /// boxes:
+    /// <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>.
+    pub(super) fn push_bidi_scope_start(
+        &mut self,
+        style: &ComputedStyle,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        output: &mut Vec<InlineItem>,
+    ) {
+        if let Some((start, _)) = bidi_control_scope_for_style(style) {
+            self.push_bidi_control_text(start, style, link_target, baseline_shift, output);
+        }
+    }
+
+    /// Push UBA end controls for a CSS `unicode-bidi` inline scope.
+    ///
+    /// CSS Writing Modes scopes embedding, isolation, and override controls to
+    /// the element's inline box and terminates them with UAX #9 PDF/PDI
+    /// controls:
+    /// <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>.
+    pub(super) fn push_bidi_scope_end(
+        &mut self,
+        style: &ComputedStyle,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        output: &mut Vec<InlineItem>,
+    ) {
+        if let Some((_, end)) = bidi_control_scope_for_style(style) {
+            self.push_bidi_control_text(end, style, link_target, baseline_shift, output);
+        }
+    }
+
+    /// Push invisible bidi control text without CSS text transforms.
+    ///
+    /// Directional formatting controls are UAX #9 algorithmic input; they
+    /// affect ordering but do not create visible CSS text or PDF glyphs:
+    /// <https://www.unicode.org/reports/tr9/#Directional_Formatting_Characters>.
+    fn push_bidi_control_text(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        output: &mut Vec<InlineItem>,
+    ) {
+        if !text.is_empty() {
+            output.push(InlineItem::Word(Box::new(InlineWord {
+                text: text.to_string(),
+                style: style.clone(),
+                baseline_shift,
+                link_target,
+                mergeable: true,
+                hanging_edges: InlineHangingEdges::default(),
+            })));
+        }
+    }
+
+    pub(super) fn push_inline_words(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        output: &mut Vec<InlineItem>,
+    ) {
+        push_inline_words_for_style(text, style, link_target, baseline_shift, output);
+    }
+
+    pub(super) fn push_collapsed_inline_space(
+        &mut self,
+        style: &ComputedStyle,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        output: &mut Vec<InlineItem>,
+    ) {
+        // CSS Text whitespace processing removes collapsible spaces at line
+        // boundaries; a preserved newline starts a fresh line here.
+        if output.is_empty()
+            || output.last().is_some_and(|item| {
+                matches!(item, InlineItem::Break) || inline_item_is_collapsible_space(item)
+            })
+        {
+            return;
+        }
+        output.push(InlineItem::Word(Box::new(InlineWord {
+            text: " ".to_string(),
+            style: style.clone(),
+            baseline_shift,
+            link_target,
+            mergeable: true,
+            hanging_edges: InlineHangingEdges::default(),
+        })));
+    }
+
+    fn graph_text_lines_for_text(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        available_width: f32,
+    ) -> Vec<TextLine> {
+        let mut inline_items = Vec::new();
+        push_inline_words_for_style(text, style, None, 0.0, &mut inline_items);
+
+        let mut lines = Vec::new();
+        let mut paragraph = Vec::new();
+        let mut starts_after_forced_break = false;
+        for item in inline_items {
+            if matches!(item, InlineItem::Break) {
+                self.append_graph_text_paragraph_lines(
+                    &mut lines,
+                    &mut paragraph,
+                    style,
+                    available_width,
+                    starts_after_forced_break,
+                );
+                starts_after_forced_break = true;
+            } else {
+                paragraph.push(item);
+            }
+        }
+        self.append_graph_text_paragraph_lines(
+            &mut lines,
+            &mut paragraph,
+            style,
+            available_width,
+            starts_after_forced_break,
+        );
+        lines
+    }
+
+    fn append_graph_text_paragraph_lines(
+        &mut self,
+        output: &mut Vec<TextLine>,
+        paragraph: &mut Vec<InlineItem>,
+        style: &ComputedStyle,
+        available_width: f32,
+        starts_after_forced_break: bool,
+    ) {
+        let mut lines = graph_text_lines_for_paragraph(
+            &mut self.font_system,
+            paragraph,
+            style,
+            available_width,
+        );
+        if starts_after_forced_break && let Some(first) = lines.first_mut() {
+            first.starts_after_forced_break = true;
+        }
+        output.extend(lines);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn inline_atom_for_element(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+        stylesheets: &[Stylesheet],
+        baseline_shift: f32,
+        link_target: Option<String>,
+    ) -> Option<InlineAtom> {
+        if let Content::Replacement {
+            image:
+                GeneratedContentPart::Image {
+                    url,
+                    base_url,
+                    root_url,
+                },
+            ..
+        } = &style.content
+        {
+            let alt_text = self.generated_alt_text(element, style);
+            return self.generated_image_atom_for_url(
+                url,
+                base_url.as_deref(),
+                root_url.as_deref(),
+                style,
+                baseline_shift,
+                link_target,
+                alt_text,
+            );
+        }
+        match replaced_element_kind(element) {
+            Some(ReplacedElementKind::Canvas) => {
+                let available_width = (self.content_right - self.content_left).max(1.0);
+                let style = self.style_with_current_viewport_lengths(style);
+                let (width, height) = used_canvas_size(element, &style, available_width);
+                let atom_width = width + style.margin.left + style.margin.right;
+                Some(InlineAtom {
+                    content: InlineAtomContent::Canvas,
+                    style,
+                    width: atom_width,
+                    height,
+                    baseline_offset: height,
+                    baseline_shift,
+                    link_target,
+                    alt_text: None,
+                })
+            }
+            Some(ReplacedElementKind::Image) => {
+                let available_width = (self.content_right - self.content_left).max(1.0);
+                let mut used_style = self.style_with_current_viewport_lengths(style);
+                let used_edges = used_box_edges(&used_style, available_width);
+                used_style.margin = used_edges.margin.to_css_edges();
+                used_style.padding = used_edges.padding.to_css_edges();
+                let style = &used_style;
+                let image = used_image(
+                    element,
+                    style,
+                    available_width,
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                )?;
+                Some(InlineAtom {
+                    content: InlineAtomContent::Image(image.decoded),
+                    style: style.clone(),
+                    width: image.border_box_width + style.margin.left + style.margin.right,
+                    height: image.border_box_height + style.margin.top + style.margin.bottom,
+                    baseline_offset: image.border_box_height,
+                    baseline_shift,
+                    link_target,
+                    alt_text: element.attrs.get("alt").cloned(),
+                })
+            }
+            Some(ReplacedElementKind::Svg) => {
+                let (width, height, fill) = svg_rect(element)?;
+                Some(InlineAtom {
+                    content: InlineAtomContent::Svg { fill },
+                    style: style.clone(),
+                    width: width + style.margin.left + style.margin.right,
+                    height,
+                    baseline_offset: height,
+                    baseline_shift,
+                    link_target,
+                    alt_text: None,
+                })
+            }
+            None if style.display.is_table() => self.inline_table_atom_for_element(
+                element,
+                style,
+                children,
+                table_fragment?,
+                stylesheets,
+                baseline_shift,
+                link_target,
+            ),
+            None if style.display.is_flex() && style.display.is_inline_level() => {
+                Some(self.inline_flex_atom_for_element(
+                    style,
+                    children,
+                    stylesheets,
+                    baseline_shift,
+                    link_target,
+                ))
+            }
+            None if style.display.is_atomic_inline() => {
+                if has_non_inline_formatting_box(children)
+                    || has_atomic_inline_formatting_box(children)
+                    || has_inline_container_formatting_box(children)
+                    || has_out_of_flow_formatting_box(children)
+                {
+                    return Some(self.inline_fragment_atom_for_children(
+                        style,
+                        children,
+                        stylesheets,
+                        baseline_shift,
+                        link_target,
+                    ));
+                }
+                let text = inline_text_for_style(element, style);
+                let available_width = (self.content_right
+                    - self.content_left
+                    - style.margin.left
+                    - style.margin.right)
+                    .max(style.font_size);
+                let mut used_style = self.style_with_current_viewport_lengths(style);
+                let used_edges = used_box_edges(&used_style, available_width);
+                used_style.margin = used_edges.margin.to_css_edges();
+                used_style.padding = used_edges.padding.to_css_edges();
+                let style = &used_style;
+                let border_widths = used_border_widths(style);
+                let horizontal_extras = border_widths.left
+                    + border_widths.right
+                    + style.padding.left
+                    + style.padding.right;
+                let vertical_extras = border_widths.top
+                    + border_widths.bottom
+                    + style.padding.top
+                    + style.padding.bottom;
+                let intrinsic_width = self
+                    .graph_max_content_text_width(&text, style, available_width)
+                    .max(style.font_size);
+                let requested_content_width =
+                    used_content_width_or_auto(style, available_width, horizontal_extras)
+                        .unwrap_or(intrinsic_width);
+                let content_width =
+                    constrain_width(style, requested_content_width, available_width)
+                        .max(style.font_size);
+                let mut lines = self.graph_text_lines_for_text(&text, style, content_width);
+                if lines.is_empty() && !crate::text::text_is_css_collapsible_whitespace(&text) {
+                    let text =
+                        transform_text(crate::text::trim_css_collapsible_whitespace(&text), style);
+                    let shaped =
+                        self.font_system
+                            .shape_measured_line(&text, style, style.line_height);
+                    let width = shaped
+                        .as_ref()
+                        .map(|line| line.width)
+                        .unwrap_or_else(|| self.font_system.measure_line_text(&text, style));
+                    lines.push(TextLine::new(text, width, style.line_height).with_shaped(shaped));
+                }
+                let measured_content_height = lines
+                    .iter()
+                    .map(|line| line.line_height)
+                    .sum::<f32>()
+                    .max(style.line_height);
+                let requested_content_height =
+                    used_content_height_or_auto(style, measured_content_height, vertical_extras)
+                        .unwrap_or(measured_content_height);
+                // CSS Sizing applies `height` to the content box; line-height
+                // can overflow explicit-height inline-blocks but must not
+                // increase their used height:
+                // <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>.
+                let content_height =
+                    constrain_height(style, requested_content_height, available_width);
+                let border_box_height = content_height + vertical_extras;
+                let baseline_offset = self
+                    .inline_box_text_lines_baseline_offset(&lines, style, border_widths)
+                    .unwrap_or(border_box_height);
+                Some(InlineAtom {
+                    content: InlineAtomContent::InlineBox { lines },
+                    style: style.clone(),
+                    width: content_width
+                        + horizontal_extras
+                        + style.margin.left
+                        + style.margin.right,
+                    height: border_box_height + style.margin.top + style.margin.bottom,
+                    baseline_offset,
+                    baseline_shift,
+                    link_target,
+                    alt_text: None,
+                })
+            }
+            None => None,
+        }
+    }
+
+    pub(super) fn inline_fragment_atom_for_children(
+        &mut self,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        baseline_shift: f32,
+        link_target: Option<String>,
+    ) -> InlineAtom {
+        let available_width =
+            (self.content_right - self.content_left - style.margin.left - style.margin.right)
+                .max(style.font_size);
+        let mut used_style = self.style_with_current_viewport_lengths(style);
+        let used_edges = used_box_edges(&used_style, available_width);
+        used_style.margin = used_edges.margin.to_css_edges();
+        used_style.padding = used_edges.padding.to_css_edges();
+        let style = &used_style;
+        let borders = used_border_widths(style);
+        let horizontal_extras =
+            borders.left + borders.right + style.padding.left + style.padding.right;
+        let vertical_extras =
+            borders.top + borders.bottom + style.padding.top + style.padding.bottom;
+        let preferred = self
+            .inline_boxes_max_content_width(children, stylesheets, available_width)
+            .max(self.inline_block_float_row_max_content_width(
+                children,
+                stylesheets,
+                available_width,
+            ))
+            .max(style.font_size);
+        let auto_width = preferred.min((available_width - horizontal_extras).max(style.font_size));
+        let requested_content_width =
+            used_content_width_or_auto(style, available_width, horizontal_extras)
+                .unwrap_or(auto_width);
+        let content_width =
+            constrain_width(style, requested_content_width, available_width).max(style.font_size);
+
+        let snapshot = self.snapshot();
+        let positioned_layer_start = self.positioned_layers.len();
+        let top = 10_000.0;
+        let content_left = borders.left + style.padding.left;
+        let content_top = top - borders.top - style.padding.top;
+        self.current_page = Page::new(content_width + horizontal_extras, top);
+        self.content_left = content_left;
+        self.content_right = content_left + content_width;
+        self.cursor_y = content_top;
+        self.truncate_page_start_margins = false;
+        let establishes_positioning_containing_block =
+            style.position == Position::Relative || !style.transform.is_empty();
+        if establishes_positioning_containing_block {
+            // CSS Positioned Layout uses the padding box of a positioned
+            // or transformed ancestor as the containing block for absolute
+            // descendants. This inline-block fragment is laid out in a
+            // temporary page whose border-box origin is (0, top).
+            self.containing_blocks.push(ContainingBlock {
+                x: borders.left,
+                top_y: top - borders.top,
+                width: content_width + style.padding.left + style.padding.right,
+                height: used_content_height_or_auto(style, top, 0.0)
+                    .unwrap_or(style.line_height)
+                    .max(0.0)
+                    + style.padding.top
+                    + style.padding.bottom,
+            });
+        }
+        self.push_page_name_scope_suppression();
+        self.push_float_context();
+        if !has_non_inline_formatting_box(children) && formatting_box_has_inline_content(children) {
+            // CSS 2.2 lays out inline-block contents as a separate formatting
+            // context. When that context contains inline-level children, they
+            // must form inline line boxes rather than being replayed as
+            // independent blocks:
+            // <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>.
+            self.layout_anonymous_block(style, children, stylesheets, None);
+        } else {
+            self.layout_flow_root_child_boxes(children, stylesheets);
+        }
+        self.pop_float_context();
+        self.pop_page_name_scope_suppression();
+        if establishes_positioning_containing_block {
+            self.containing_blocks.pop();
+        }
+        let measured_content_height = (content_top - self.cursor_y).max(style.line_height);
+        let requested_content_height =
+            used_content_height_or_auto(style, measured_content_height, vertical_extras)
+                .unwrap_or(measured_content_height);
+        // CSS Sizing applies explicit `height` to the content box of the
+        // atomic inline-block fragment; internal line/block contents may
+        // overflow but do not increase the used height:
+        // <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>.
+        let content_height = constrain_height(style, requested_content_height, available_width);
+        let border_box_height = content_height + vertical_extras;
+        let border_bottom = top - border_box_height;
+        self.flush_positioned_layers_since(positioned_layer_start);
+        let fragment = self
+            .current_page
+            .paint_fragment()
+            .translated(0.0, -border_bottom);
+        // CSS 2.2 defines an inline-block baseline as the baseline of its
+        // last in-flow line box, falling back to the bottom margin edge if no
+        // such line exists:
+        // <https://www.w3.org/TR/CSS22/visudet.html#inlineblock-width>.
+        let baseline_offset = fragment
+            .last_line_y()
+            .map(|line_y| (border_box_height - line_y).max(0.0))
+            .unwrap_or(border_box_height);
+        self.restore(snapshot);
+
+        InlineAtom {
+            content: InlineAtomContent::InlineFragment(fragment),
+            style: style.clone(),
+            width: content_width + horizontal_extras + style.margin.left + style.margin.right,
+            height: border_box_height + style.margin.top + style.margin.bottom,
+            baseline_offset,
+            baseline_shift,
+            link_target,
+            alt_text: None,
+        }
+    }
+
+    /// Estimates max-content width contributed by consecutive floated children.
+    ///
+    /// CSS 2.2 places consecutive floats on the same line while space permits,
+    /// and shrink-to-fit inline-block sizing uses max-content width as the
+    /// unconstrained preferred width:
+    /// <https://www.w3.org/TR/CSS22/visuren.html#floats> and
+    /// <https://www.w3.org/TR/CSS22/visudet.html#inlineblock-width>.
+    fn inline_block_float_row_max_content_width(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+    ) -> f32 {
+        let mut row_width = 0.0f32;
+        let mut max_row_width = 0.0f32;
+        for child in children {
+            let Some((child_element, _, child_style, child_children)) = child.element_parts()
+            else {
+                continue;
+            };
+            if child_style.float == Float::None {
+                row_width = 0.0;
+                continue;
+            }
+            row_width += self.float_margin_box_width(
+                child_element,
+                child_style,
+                stylesheets,
+                available_width,
+                Some(child_children),
+            );
+            max_row_width = max_row_width.max(row_width);
+        }
+        max_row_width
+    }
+
+    /// Lays out normalized children inside an atomic flow-root fragment.
+    ///
+    /// CSS 2.2 defines `inline-block` as an inline-level box whose contents
+    /// establish a block formatting context, and floats are positioned in that
+    /// current block formatting context instead of being replayed as ordinary
+    /// block children:
+    /// <https://www.w3.org/TR/CSS22/visuren.html#inline-blocks> and
+    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+    fn layout_flow_root_child_boxes(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+    ) {
+        let mut float_run = self.float_run_state();
+        for child in children {
+            if let Some((child_element, child_signature, child_style, child_children)) =
+                child.element_parts()
+                && self.layout_floating_child(
+                    child_element,
+                    child_signature.clone(),
+                    child_style,
+                    Some(child_children),
+                    stylesheets,
+                    &mut float_run,
+                )
+            {
+                continue;
+            }
+            self.flush_float_run(&mut float_run);
+            self.layout_formatting_box(child, stylesheets);
+        }
+        self.flush_float_run(&mut float_run);
+    }
+
+    /// Return an inline-block text fast-path baseline from its last line box.
+    ///
+    /// CSS 2.2 defines the baseline of an `inline-block` with in-flow line
+    /// boxes as the baseline of its last line box, not the bottom border edge.
+    /// The bottom edge is only the fallback for inline-blocks without a
+    /// suitable line box:
+    /// <https://www.w3.org/TR/CSS22/visudet.html#inlineblock-width>.
+    fn inline_box_text_lines_baseline_offset(
+        &mut self,
+        lines: &[TextLine],
+        style: &ComputedStyle,
+        borders: css::Edges,
+    ) -> Option<f32> {
+        if lines.is_empty() {
+            return None;
+        }
+        let preceding_line_height = lines
+            .iter()
+            .take(lines.len().saturating_sub(1))
+            .map(|line| line.line_height)
+            .sum::<f32>();
+        Some(
+            borders.top
+                + style.padding.top
+                + preceding_line_height
+                + self.inline_box_text_line_layout_baseline_offset(style),
+        )
+    }
+
+    /// Return a text line's CSS layout baseline offset from its line-box top.
+    ///
+    /// Inline layout aligns atomic inline boxes against the same baseline
+    /// coordinate used for ordinary text fragments. PDF text emission applies
+    /// a backend-specific rendered-baseline projection later, but that
+    /// projection must not affect CSS line-box sizing:
+    /// <https://www.w3.org/TR/css-inline-3/#line-box>.
+    fn inline_box_text_line_layout_baseline_offset(&mut self, style: &ComputedStyle) -> f32 {
+        let font_id = self.font_system.resolve_style(style);
+        let line_height = self.font_system.line_height_for_font(font_id, style);
+        let adjustment =
+            self.font_system
+                .font_ascent_baseline_adjustment(font_id, style, line_height);
+        style.font_size - adjustment
+    }
+}
+
+/// Remove preserved segment breaks at the end of a block container.
+///
+/// CSS Text preserves segment breaks for `pre`, `pre-wrap`, and
+/// `break-spaces`, but the final segment break in a block container terminates
+/// the current line rather than generating an extra empty line box. Trimming
+/// only the terminal segment-break suffix here leaves interior authored line
+/// breaks intact:
+/// <https://www.w3.org/TR/css-text-3/#white-space-phase-1>.
+fn trim_terminal_preserved_segment_breaks<'t>(text: &'t str, style: &ComputedStyle) -> &'t str {
+    if !style.white_space.preserves_newlines() {
+        return text;
+    }
+    let mut end = text.len();
+    while let Some((break_offset, break_len)) = last_segment_break_before(&text[..end]) {
+        let suffix = &text[break_offset + break_len..end];
+        if !suffix.chars().all(is_css_collapsible_whitespace) {
+            break;
+        }
+        end = break_offset;
+        if text[..end].ends_with('\r') {
+            end -= '\r'.len_utf8();
+        }
+    }
+    &text[..end]
+}
+
+fn last_segment_break_before(text: &str) -> Option<(usize, usize)> {
+    text.char_indices()
+        .rev()
+        .find(|(_, character)| matches!(*character, '\n' | '\r' | INLINE_BREAK))
+        .map(|(offset, character)| (offset, character.len_utf8()))
+}
+
+/// Return whether a block container's own bidi value needs inline controls.
+///
+/// HTML's UA stylesheet sets `unicode-bidi: isolate` on many block containers,
+/// but a block formatting context already separates its inline formatting
+/// context from surrounding inline content. Literal UAX #9 controls are still
+/// needed for block-level overrides and plaintext paragraph direction because
+/// those values affect the inline content inside the block:
+/// <https://html.spec.whatwg.org/multipage/rendering.html#bidi-rendering> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>.
+pub(super) fn block_bidi_scope_needs_inline_controls(style: &ComputedStyle) -> bool {
+    matches!(
+        style.unicode_bidi,
+        UnicodeBidi::Embed
+            | UnicodeBidi::BidiOverride
+            | UnicodeBidi::IsolateOverride
+            | UnicodeBidi::Plaintext
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InlineBoxEdge {
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InlineElementScopeOptions {
+    push_page_scope: bool,
+    push_inside_marker: bool,
+    mark_hanging_edges: bool,
+}
+
+impl InlineElementScopeOptions {
+    const DOM_INTRINSIC: Self = Self {
+        push_page_scope: false,
+        push_inside_marker: false,
+        mark_hanging_edges: true,
+    };
+    const DOM_PAINT: Self = Self {
+        push_page_scope: true,
+        push_inside_marker: false,
+        mark_hanging_edges: true,
+    };
+    const BOX_PAINT: Self = Self {
+        push_page_scope: true,
+        push_inside_marker: true,
+        mark_hanging_edges: true,
+    };
+    const BOX_INTRINSIC: Self = Self {
+        push_page_scope: false,
+        push_inside_marker: false,
+        mark_hanging_edges: true,
+    };
+}
+
+#[derive(Debug)]
+struct InlineElementScopeState {
+    inline_box_start: usize,
+    link_target: Option<String>,
+    baseline_shift: f32,
+    pushed_page_scope: bool,
+    mark_hanging_edges: bool,
+    counter_scope: CounterScopeState,
+}
+
+/// Return the inline-axis contribution of one regular inline box edge.
+///
+/// CSS 2.2 says horizontal margin, border, and padding of inline boxes are
+/// respected at the start and end of the inline box. The values may be
+/// negative for margins, which WPT references use to emulate hanging
+/// punctuation:
+/// <https://www.w3.org/TR/CSS22/box.html#inline-boxes>.
+fn inline_box_edge_width(style: &ComputedStyle, edge: InlineBoxEdge) -> f32 {
+    let borders = used_border_widths(style);
+    match (style.direction, edge) {
+        (Direction::Ltr, InlineBoxEdge::Start) => {
+            style.margin.left + borders.left + style.padding.left
+        }
+        (Direction::Ltr, InlineBoxEdge::End) => {
+            style.margin.right + borders.right + style.padding.right
+        }
+        (Direction::Rtl, InlineBoxEdge::Start) => {
+            style.margin.right + borders.right + style.padding.right
+        }
+        (Direction::Rtl, InlineBoxEdge::End) => {
+            style.margin.left + borders.left + style.padding.left
+        }
+    }
+}
+
+/// Mark the text items blocked by an inline box's edge decorations.
+///
+/// CSS Text disallows hanging punctuation when inline-start or inline-end
+/// padding/border separates the glyph from the line edge. The text fragment
+/// itself does not own ancestor inline-box border/padding, so inline
+/// collection records that edge on the first/last visible text item:
+/// <https://www.w3.org/TR/css-text-3/#hanging-punctuation-property>.
+fn mark_inline_box_hanging_edges(
+    output: &mut [InlineItem],
+    inline_box_start: usize,
+    style: &ComputedStyle,
+) {
+    let items = &mut output[inline_box_start..];
+    let blocks_start = inline_box_blocks_hanging_start(style);
+    let blocks_end = inline_box_blocks_hanging_end(style);
+    let has_blocking_edge = blocks_start || blocks_end;
+    let mut marked_visible_item = false;
+    if blocks_start && let Some(word) = items.iter_mut().find_map(visible_hanging_edge_word_mut) {
+        word.hanging_edges.blocks_start = true;
+        marked_visible_item = true;
+    }
+    if blocks_end
+        && let Some(word) = items
+            .iter_mut()
+            .rev()
+            .find_map(visible_hanging_edge_word_mut)
+    {
+        word.hanging_edges.blocks_end = true;
+        marked_visible_item = true;
+    }
+    if has_blocking_edge
+        && !marked_visible_item
+        && let Some(word) = output[..inline_box_start]
+            .iter_mut()
+            .rev()
+            .find_map(visible_hanging_edge_word_mut)
+    {
+        word.hanging_edges.blocks_end = true;
+    }
+}
+
+fn visible_hanging_edge_word_mut(item: &mut InlineItem) -> Option<&mut InlineWord> {
+    let InlineItem::Word(word) = item else {
+        return None;
+    };
+    let text = trim_css_collapsible_whitespace(&word.text);
+    if text.is_empty() || text.chars().all(character_is_bidi_format_control) {
+        return None;
+    }
+    Some(word)
+}
+
+fn inline_box_blocks_hanging_start(style: &ComputedStyle) -> bool {
+    match style.direction {
+        Direction::Ltr => style.padding.left != 0.0 || style.border_widths.left != 0.0,
+        Direction::Rtl => style.padding.right != 0.0 || style.border_widths.right != 0.0,
+    }
+}
+
+fn inline_box_blocks_hanging_end(style: &ComputedStyle) -> bool {
+    match style.direction {
+        Direction::Ltr => style.padding.right != 0.0 || style.border_widths.right != 0.0,
+        Direction::Rtl => style.padding.left != 0.0 || style.border_widths.left != 0.0,
+    }
+}
+
+/// Insert CSS Text Level 4 automatic spacing into inline text item streams.
+///
+/// `text-autospace` creates layout spacing between Han ideographs and adjacent
+/// non-ideographic letters or numbers. The spacing is modeled as an atomic
+/// inline edge so it affects line fitting and paint positions without adding
+/// selectable text or synthetic glyphs to the PDF output:
+/// <https://drafts.csswg.org/css-text-4/#text-autospace-property>.
+pub(in crate::layout) fn insert_text_autospace_items(items: &mut Vec<InlineItem>) {
+    let mut output = Vec::with_capacity(items.len());
+    let mut previous_text = None::<AutospaceTextEdge>;
+    for item in std::mem::take(items) {
+        match item {
+            InlineItem::Word(word) => {
+                push_autospaced_word(&mut output, *word, &mut previous_text);
+            }
+            InlineItem::Atom(atom) => {
+                if !matches!(atom.content, InlineAtomContent::InlineEdge) || atom.width.abs() > 0.0
+                {
+                    previous_text = None;
+                }
+                output.push(InlineItem::Atom(atom));
+            }
+            InlineItem::Float(float) => {
+                previous_text = None;
+                output.push(InlineItem::Float(float));
+            }
+            InlineItem::Break => {
+                previous_text = None;
+                output.push(InlineItem::Break);
+            }
+            InlineItem::PageScopeStart(scope) => output.push(InlineItem::PageScopeStart(scope)),
+            InlineItem::PageScopeEnd => output.push(InlineItem::PageScopeEnd),
+        }
+    }
+    *items = output;
+}
+
+fn push_autospaced_word(
+    output: &mut Vec<InlineItem>,
+    word: InlineWord,
+    previous_text: &mut Option<AutospaceTextEdge>,
+) {
+    if word.style.text_autospace.is_none() {
+        push_autospace_boundary(output, previous_text, &word);
+        *previous_text = AutospaceTextEdge::from_word_end(&word);
+        output.push(InlineItem::Word(Box::new(word)));
+        return;
+    }
+
+    let mut run = String::new();
+    let mut run_end = None::<char>;
+    let mut run_start_index = 0usize;
+    for (index, character) in word.text.char_indices() {
+        if let Some(previous) = run_end
+            && text_autospace_boundary_needs_spacing(
+                &word.style.text_autospace,
+                previous,
+                character,
+            )
+        {
+            push_autospaced_word_run(
+                output,
+                &word,
+                &mut run,
+                previous,
+                run_start_index,
+                previous_text,
+            );
+            push_text_autospace_atom(output, &word.style, word.baseline_shift);
+            *previous_text = None;
+            run_start_index = index;
+        }
+        run.push(character);
+        run_end = Some(character);
+    }
+    if let Some(last_character) = run_end {
+        push_autospaced_word_run(
+            output,
+            &word,
+            &mut run,
+            last_character,
+            run_start_index,
+            previous_text,
+        );
+    }
+}
+
+fn push_autospaced_word_run(
+    output: &mut Vec<InlineItem>,
+    word: &InlineWord,
+    run: &mut String,
+    last_character: char,
+    run_start_index: usize,
+    previous_text: &mut Option<AutospaceTextEdge>,
+) {
+    if run.is_empty() {
+        return;
+    }
+    let run_word = InlineWord {
+        text: std::mem::take(run),
+        style: word.style.clone(),
+        baseline_shift: word.baseline_shift,
+        link_target: word.link_target.clone(),
+        mergeable: word.mergeable && run_start_index == 0,
+        hanging_edges: word.hanging_edges,
+    };
+    push_autospace_boundary(output, previous_text, &run_word);
+    *previous_text = Some(AutospaceTextEdge {
+        character: last_character,
+        style: run_word.style.clone(),
+        baseline_shift: run_word.baseline_shift,
+    });
+    output.push(InlineItem::Word(Box::new(run_word)));
+}
+
+fn push_autospace_boundary(
+    output: &mut Vec<InlineItem>,
+    previous_text: &mut Option<AutospaceTextEdge>,
+    word: &InlineWord,
+) {
+    let Some(current_character) = word.text.chars().next() else {
+        return;
+    };
+    if let Some(previous) = previous_text
+        && text_autospace_boundary_needs_spacing(
+            &previous.style.text_autospace,
+            previous.character,
+            current_character,
+        )
+        && text_autospace_boundary_needs_spacing(
+            &word.style.text_autospace,
+            previous.character,
+            current_character,
+        )
+    {
+        push_text_autospace_atom(output, &previous.style, previous.baseline_shift);
+    }
+}
+
+fn push_text_autospace_atom(
+    output: &mut Vec<InlineItem>,
+    style: &ComputedStyle,
+    baseline_shift: f32,
+) {
+    output.push(InlineItem::Atom(Box::new(InlineAtom {
+        content: InlineAtomContent::InlineEdge,
+        style: style.clone(),
+        width: style.font_size / 8.0,
+        height: 0.0,
+        baseline_offset: 0.0,
+        baseline_shift,
+        link_target: None,
+        alt_text: None,
+    })));
+}
+
+fn quote_pair(style: &ComputedStyle, depth: usize) -> (String, String) {
+    match &style.quotes {
+        Quotes::None => (String::new(), String::new()),
+        Quotes::Pairs(pairs) => pairs
+            .get(depth)
+            .or_else(|| pairs.last())
+            .cloned()
+            .unwrap_or_else(default_quote_pair),
+        Quotes::Auto { .. } => {
+            let (open, close) = quotes::language_quote_pair(style.quotes.auto_language(), depth);
+            (open.to_string(), close.to_string())
+        }
+    }
+}
+
+fn default_quote_pair() -> (String, String) {
+    ("“".to_string(), "”".to_string())
+}
+
+fn text_autospace_boundary_needs_spacing(
+    autospace: &TextAutospace,
+    first: char,
+    second: char,
+) -> bool {
+    if autospace.is_none() {
+        return false;
+    }
+    let first_is_ideograph = character_is_autospace_ideograph(first);
+    let second_is_ideograph = character_is_autospace_ideograph(second);
+    if first_is_ideograph == second_is_ideograph {
+        return false;
+    }
+    let other = if first_is_ideograph { second } else { first };
+    (autospace.ideograph_alpha && character_is_autospace_alpha(other))
+        || (autospace.ideograph_numeric && character_is_autospace_numeric(other))
+}
+
+#[derive(Clone)]
+struct AutospaceTextEdge {
+    character: char,
+    style: ComputedStyle,
+    baseline_shift: f32,
+}
+
+impl AutospaceTextEdge {
+    fn from_word_end(word: &InlineWord) -> Option<Self> {
+        word.text.chars().last().map(|character| Self {
+            character,
+            style: word.style.clone(),
+            baseline_shift: word.baseline_shift,
+        })
+    }
+}
+
+/// Return whether an atomic inline box contains nested inline formatting boxes.
+///
+/// CSS 2.2 lays out inline-block contents as an independent formatting
+/// context. When the contents include inline child boxes, preserving those
+/// boxes is required so descendant styles participate in line construction:
+/// <https://www.w3.org/TR/CSS22/visuren.html#inline-blocks>.
+fn has_inline_container_formatting_box(children: &[box_tree::FormattingBox<'_>]) -> bool {
+    children.iter().any(|child| match child {
+        box_tree::FormattingBox::Inline(_) | box_tree::FormattingBox::Line(_) => true,
+        box_tree::FormattingBox::Text(_) | box_tree::FormattingBox::Replaced(_) => false,
+        _ => has_inline_container_formatting_box(child.children()),
+    })
+}
+
+/// Return whether an atomic inline box contains positioned descendants.
+///
+/// CSS Positioned Layout removes absolutely positioned and fixed descendants
+/// from normal flow, but they still paint in their containing stacking context.
+/// Inline-block layout must therefore use the fragment-backed path whenever
+/// such descendants exist, even if no in-flow child requires a block formatting
+/// context:
+/// <https://www.w3.org/TR/css-position-3/#absolute-positioning> and
+/// <https://www.w3.org/TR/CSS22/visuren.html#inline-blocks>.
+fn has_out_of_flow_formatting_box(children: &[box_tree::FormattingBox<'_>]) -> bool {
+    children.iter().any(|child| {
+        box_tree::is_out_of_flow_box(child) || has_out_of_flow_formatting_box(child.children())
+    })
+}

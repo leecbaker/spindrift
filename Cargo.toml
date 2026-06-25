@@ -1,0 +1,58 @@
+[package]
+name = "quire"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+description = "A from-scratch Rust HTML/CSS to PDF renderer inspired by WeasyPrint."
+repository = "https://github.com/lee/quire"
+readme = "README.md"
+keywords = ["html", "css", "pdf", "renderer", "weasyprint"]
+categories = ["command-line-utilities", "rendering"]
+
+[lib]
+name = "quire"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quire"
+path = "src/main.rs"
+
+[[bench]]
+name = "weasyprint_samples"
+harness = false
+
+[profile.release]
+debug = 1
+strip = false
+lto = "thin"
+split-debuginfo = "packed"
+
+[dependencies]
+base64 = "0.22.1"
+clap = { version = "4.5.53", features = ["derive"] }
+clap_complete = "4.6.5"
+cssparser = "0.37.0"
+env_logger = "0.11.10"
+fontique = "0.10.0"
+html5ever = "0.39.0"
+hyphenation = { version = "0.8.4", features = ["embed_all"] }
+icu_casemap = "2.2.0"
+icu_locale_core = "2.2.0"
+icu_properties = "2.2.0"
+icu_segmenter = "2.2.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+log = "0.4.32"
+markup5ever_rcdom = "0.39.0"
+miniz_oxide = "0.8.9"
+parley = "0.10.0"
+precomputed-hash = "0.1.1"
+reqwest = { version = "0.13.4", default-features = false }
+selectors = "0.38.0"
+taffy = "0.11.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "fs"] }
+ttf-parser = "0.25.1"
+woff2-patched = "0.4.0"
+
+[dev-dependencies]
+criterion = "0.8.2"
