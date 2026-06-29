@@ -312,29 +312,42 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
         set: &crate::css::NamedStringSet,
-    ) -> String {
-        let mut output = String::new();
+    ) -> Vec<page_generated::PageMarginContentItem> {
+        let mut output = Vec::new();
         for part in &set.parts {
             match part {
-                NamedStringPart::String(text) => output.push_str(text),
-                NamedStringPart::ContentText => output.push_str(&inline_text(element)),
+                NamedStringPart::String(text) => {
+                    push_named_string_text_part(&mut output, text);
+                }
+                NamedStringPart::ContentText => {
+                    push_named_string_text_part(&mut output, &inline_text(element));
+                }
                 NamedStringPart::BeforeContent => {
-                    output.push_str(&self.evaluate_generated_pseudo_text_rollback(
+                    let items = self.evaluate_generated_pseudo_items_rollback(
                         element,
                         style.before_style.as_deref(),
-                    ))
+                    );
+                    push_named_string_items(&mut output, items);
                 }
                 NamedStringPart::AfterContent => {
-                    output.push_str(&self.evaluate_generated_pseudo_text_rollback(
+                    let items = self.evaluate_generated_pseudo_items_rollback(
                         element,
                         style.after_style.as_deref(),
-                    ))
+                    );
+                    push_named_string_items(&mut output, items);
                 }
                 NamedStringPart::Attr(name) => {
                     if let Some(value) = element.attrs.get(name) {
-                        output.push_str(value);
+                        push_named_string_text_part(&mut output, value);
                     }
                 }
+                NamedStringPart::Image(url) => output.push(
+                    page_generated::PageMarginContentItem::Inline(GeneratedContentPart::Image {
+                        url: url.clone(),
+                        base_url: self.base_url.map(Path::to_path_buf),
+                        root_url: self.root_url.map(Path::to_path_buf),
+                    }),
+                ),
                 NamedStringPart::Counter {
                     name,
                     style: counter_style,
@@ -350,7 +363,7 @@ impl<'a> LayoutBuilder<'a> {
                         value,
                         &self.counter_styles,
                     ) {
-                        output.push_str(&counter);
+                        push_named_string_text_part(&mut output, &counter);
                     }
                 }
                 NamedStringPart::Counters {
@@ -370,10 +383,60 @@ impl<'a> LayoutBuilder<'a> {
                             list::counter_text(style.clone(), value, &self.counter_styles)
                         })
                         .collect::<Vec<_>>();
-                    output.push_str(&counters.join(separator));
+                    push_named_string_text_part(&mut output, &counters.join(separator));
                 }
             }
         }
+        output
+    }
+
+    /// Evaluates generated pseudo content into page-margin items for `string-set`.
+    ///
+    /// CSS GCPM allows named strings to include generated content through
+    /// `content(before)` and `content(after)`. Capturing typed items here keeps
+    /// supported generated images and quote/leader tokens available for later
+    /// page-margin layout while rolling back pseudo counter side effects:
+    /// <https://www.w3.org/TR/css-gcpm-3/#setting-named-strings>.
+    fn evaluate_generated_pseudo_items_rollback(
+        &mut self,
+        element: &Element,
+        pseudo_style: Option<&ComputedStyle>,
+    ) -> Vec<page_generated::PageMarginContentItem> {
+        let Some(pseudo_style) = pseudo_style else {
+            return Vec::new();
+        };
+        let Some(content) = pseudo_style.content.generated_parts() else {
+            return Vec::new();
+        };
+        let snapshot = self.counter_set.clone();
+        let scope = self.begin_pseudo_counter_scope(pseudo_style);
+        let mut output = Vec::new();
+        for part in content {
+            match part {
+                GeneratedContentPart::Text(text) => push_named_string_text_part(&mut output, text),
+                GeneratedContentPart::Contents => {
+                    push_named_string_text_part(&mut output, &inline_text(element));
+                }
+                GeneratedContentPart::Attr { .. }
+                | GeneratedContentPart::Counter { .. }
+                | GeneratedContentPart::Counters { .. } => {
+                    let text = evaluate_generated_content_text(
+                        element,
+                        std::slice::from_ref(part),
+                        self.counter_set.stacks(),
+                        &self.counter_styles,
+                    );
+                    push_named_string_text_part(&mut output, &text);
+                }
+                GeneratedContentPart::Quote(_)
+                | GeneratedContentPart::Leader(_)
+                | GeneratedContentPart::Image { .. } => {
+                    output.push(page_generated::PageMarginContentItem::Inline(part.clone()))
+                }
+            }
+        }
+        self.end_counter_scope(scope);
+        self.counter_set = snapshot;
         output
     }
 
@@ -391,21 +454,31 @@ impl<'a> LayoutBuilder<'a> {
         output
     }
 
-    pub(super) fn capture_named_strings(&mut self, element: &Element, style: &ComputedStyle) {
+    pub(super) fn capture_named_strings(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+    ) -> Vec<AssignmentId> {
+        let mut ids = Vec::new();
         for set in &style.string_sets {
             // CSS GCPM named strings capture generated text at element layout
             // time so page-margin `string()` can use the value for the page.
             // https://www.w3.org/TR/css-gcpm-3/#setting-named-strings
-            let at_page_start = !self.current_page_has_content();
             let value = self.evaluate_named_string_set_with_counter_scopes(element, style, set);
+            let placement = self.assignment_placement_for_current_page(style);
+            let id = self.next_assignment_id();
             self.current_page_named_strings
                 .entry(set.name.clone())
                 .or_default()
                 .push(NamedStringAssignment {
-                    value,
-                    at_page_start,
+                    id,
+                    value: PageAssignmentValue::GeneratedContent(value),
+                    placement,
                 });
+            ids.push(id);
+            self.record_captured_assignment_id(id);
         }
+        ids
     }
 
     pub(super) fn capture_running_element(
@@ -416,15 +489,266 @@ impl<'a> LayoutBuilder<'a> {
         let Some(name) = &style.running_element_name else {
             return false;
         };
-        let at_page_start = !self.current_page_has_content();
         let value = self.running_element_text_with_counter_scopes(element, style);
+        let content_parts =
+            running_element_content_parts(element, &value, self.base_url, self.root_url);
+        let placement = self.running_element_source_marker_placement();
+        let id = self.next_assignment_id();
         self.current_page_running_elements
             .entry(name.clone())
             .or_default()
             .push(NamedStringAssignment {
-                value,
-                at_page_start,
+                id,
+                value: PageAssignmentValue::RunningElement(Box::new(RunningElementCapture {
+                    fallback_text: value,
+                    content_parts,
+                    element: element.clone(),
+                    style: Box::new(style.clone()),
+                    counter_set: self.counter_set.clone(),
+                    quote_depth: self.quote_depth,
+                })),
+                placement,
             });
+        self.record_captured_assignment_id(id);
         true
+    }
+
+    /// Starts collecting GCPM assignment ids emitted while a layout fragment is produced.
+    ///
+    /// Fragmented formatting contexts can move source boxes after assignment
+    /// capture. The final emitted fragment then becomes the source of truth for
+    /// `string(..., start)` and similar page-boundary lookups:
+    /// <https://www.w3.org/TR/css-gcpm-3/#named-strings>.
+    pub(super) fn begin_assignment_capture_frame(&mut self) {
+        self.assignment_capture_stack.push(Vec::new());
+    }
+
+    pub(super) fn end_assignment_capture_frame(&mut self) -> Vec<AssignmentId> {
+        self.assignment_capture_stack.pop().unwrap_or_default()
+    }
+
+    fn record_captured_assignment_id(&mut self, id: AssignmentId) {
+        if let Some(frame) = self.assignment_capture_stack.last_mut() {
+            frame.push(id);
+        }
+    }
+
+    fn next_assignment_id(&mut self) -> AssignmentId {
+        let id = AssignmentId(self.next_assignment_id);
+        self.next_assignment_id += 1;
+        id
+    }
+
+    /// Records the source-page position for GCPM named-string and running-element assignments.
+    ///
+    /// GCPM `string(..., start)` and `element(..., start)` are defined in terms
+    /// of generated source fragments at the page boundary:
+    /// <https://www.w3.org/TR/css-gcpm-3/#named-strings> and
+    /// <https://www.w3.org/TR/css-gcpm-3/#running-elements>. The current
+    /// capture point is before full child layout for normal-flow boxes, so this
+    /// stores the fragment start estimate available at assignment time while
+    /// preserving the exact page-start marker used by existing behavior.
+    fn assignment_placement_for_current_page(&self, style: &ComputedStyle) -> AssignmentPlacement {
+        let height = style.line_height.max(0.0);
+        AssignmentPlacement {
+            page_index: self.pages.len(),
+            starts_page_fragment: !self.current_page_has_content(),
+            border_box: Some(
+                PageTopRect::new(
+                    self.content_left,
+                    self.cursor_y,
+                    self.content_right - self.content_left,
+                    height,
+                )
+                .paint_clip(),
+            ),
+        }
+    }
+
+    /// Records the final source marker for `position: running()` assignments.
+    ///
+    /// Running elements are removed from normal flow, so there is no later
+    /// source border box to observe. GCPM still resolves `element(..., start)`
+    /// from the assignment's source position, so the post-break cursor is the
+    /// durable zero-size marker for the removed source:
+    /// <https://www.w3.org/TR/css-gcpm-3/#running-elements>.
+    fn running_element_source_marker_placement(&self) -> AssignmentPlacement {
+        AssignmentPlacement {
+            page_index: self.pages.len(),
+            starts_page_fragment: !self.current_page_has_content(),
+            border_box: Some(PaintClip::from_paint_rect(paint_space_rect(
+                self.content_left,
+                self.cursor_y,
+                0.0,
+                0.0,
+            ))),
+        }
+    }
+
+    /// Updates named-string assignments once the source box has produced its final first fragment.
+    ///
+    /// GCPM `string(..., start)` depends on whether the source assignment's
+    /// generated fragment starts the page, so capture-time estimates are
+    /// replaced after layout with the first page that actually received source
+    /// paint:
+    /// <https://www.w3.org/TR/css-gcpm-3/#named-strings>.
+    pub(super) fn update_named_assignment_placements(
+        &mut self,
+        ids: &[AssignmentId],
+        placement: AssignmentPlacement,
+    ) {
+        update_assignment_placements_for_maps(
+            ids,
+            placement,
+            &mut self.page_named_strings,
+            &mut self.current_page_named_strings,
+            self.pages.len(),
+        );
+    }
+
+    pub(super) fn update_running_assignment_placements(
+        &mut self,
+        ids: &[AssignmentId],
+        placement: AssignmentPlacement,
+    ) {
+        update_assignment_placements_for_maps(
+            ids,
+            placement,
+            &mut self.page_running_elements,
+            &mut self.current_page_running_elements,
+            self.pages.len(),
+        );
+    }
+}
+
+fn update_assignment_placements_for_maps(
+    ids: &[AssignmentId],
+    placement: AssignmentPlacement,
+    pages: &mut [HashMap<String, Vec<NamedStringAssignment>>],
+    current: &mut HashMap<String, Vec<NamedStringAssignment>>,
+    current_page_index: usize,
+) {
+    for id in ids {
+        let Some((name, mut assignment)) = take_assignment_by_id(current, *id)
+            .or_else(|| take_assignment_by_id_from_pages(pages, *id))
+        else {
+            continue;
+        };
+        assignment.placement = placement;
+        insert_assignment_for_page(
+            pages,
+            current,
+            placement.page_index,
+            name,
+            assignment,
+            current_page_index,
+        );
+    }
+}
+
+fn take_assignment_by_id_from_pages(
+    pages: &mut [HashMap<String, Vec<NamedStringAssignment>>],
+    id: AssignmentId,
+) -> Option<(String, NamedStringAssignment)> {
+    for page in pages {
+        if let Some(assignment) = take_assignment_by_id(page, id) {
+            return Some(assignment);
+        }
+    }
+    None
+}
+
+fn take_assignment_by_id(
+    assignments: &mut HashMap<String, Vec<NamedStringAssignment>>,
+    id: AssignmentId,
+) -> Option<(String, NamedStringAssignment)> {
+    let name = assignments.iter().find_map(|(name, values)| {
+        values
+            .iter()
+            .any(|assignment| assignment.id == id)
+            .then(|| name.clone())
+    })?;
+    let values = assignments.get_mut(&name)?;
+    let index = values.iter().position(|assignment| assignment.id == id)?;
+    let assignment = values.remove(index);
+    if values.is_empty() {
+        assignments.remove(&name);
+    }
+    Some((name, assignment))
+}
+
+fn insert_assignment_for_page(
+    pages: &mut [HashMap<String, Vec<NamedStringAssignment>>],
+    current: &mut HashMap<String, Vec<NamedStringAssignment>>,
+    page_index: usize,
+    name: String,
+    assignment: NamedStringAssignment,
+    current_page_index: usize,
+) {
+    if page_index < current_page_index {
+        if let Some(page) = pages.get_mut(page_index) {
+            page.entry(name).or_default().push(assignment);
+        }
+    } else {
+        current.entry(name).or_default().push(assignment);
+    }
+}
+
+fn push_named_string_text_part(
+    output: &mut Vec<page_generated::PageMarginContentItem>,
+    value: &str,
+) {
+    if value.is_empty() {
+        return;
+    }
+    match output.last_mut() {
+        Some(page_generated::PageMarginContentItem::Inline(GeneratedContentPart::Text(
+            previous,
+        ))) => previous.push_str(value),
+        _ => output.push(page_generated::PageMarginContentItem::Inline(
+            GeneratedContentPart::Text(value.to_string()),
+        )),
+    }
+}
+
+fn push_named_string_items(
+    output: &mut Vec<page_generated::PageMarginContentItem>,
+    items: Vec<page_generated::PageMarginContentItem>,
+) {
+    for item in items {
+        match item {
+            page_generated::PageMarginContentItem::Inline(GeneratedContentPart::Text(text)) => {
+                push_named_string_text_part(output, &text)
+            }
+            _ => output.push(item),
+        }
+    }
+}
+
+/// Captures the generated-content replay form for `position: running()`.
+///
+/// CSS GCPM defines `element()` as replaying a running element in generated
+/// content: <https://www.w3.org/TR/css-gcpm-3/#running-elements>. This keeps
+/// the capture typed so replaced images can flow through the normal generated
+/// content image path while richer box-fragment replay is added.
+fn running_element_content_parts(
+    element: &Element,
+    fallback_text: &str,
+    base_url: Option<&Path>,
+    root_url: Option<&Path>,
+) -> Vec<GeneratedContentPart> {
+    if element.tag.eq_ignore_ascii_case("img")
+        && let Some(url) = element.attrs.get("src").filter(|value| !value.is_empty())
+    {
+        return vec![GeneratedContentPart::Image {
+            url: url.clone(),
+            base_url: base_url.map(Path::to_path_buf),
+            root_url: root_url.map(Path::to_path_buf),
+        }];
+    }
+    if fallback_text.is_empty() {
+        Vec::new()
+    } else {
+        vec![GeneratedContentPart::Text(fallback_text.to_string())]
     }
 }

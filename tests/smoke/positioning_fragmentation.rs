@@ -1,5 +1,20 @@
 use super::*;
 
+fn assert_no_red_or_hotpink_rects(document: &quire::Document) {
+    let red = Color::new(255, 0, 0);
+    let hotpink = Color::new(255, 105, 180);
+    let painted = document
+        .pages
+        .iter()
+        .flat_map(|page| &page.rects)
+        .filter(|rect| matches!(rect.fill, Some(color) if color == red || color == hotpink))
+        .collect::<Vec<_>>();
+    assert!(
+        painted.is_empty(),
+        "self-collapsing empty blocks should not paint red/hotpink rects: {painted:?}"
+    );
+}
+
 #[tokio::test]
 async fn supports_absolute_positioned_blocks() {
     let options = RenderOptions::default();
@@ -27,14 +42,14 @@ async fn supports_absolute_positioned_blocks() {
 
     assert_eq!(flow.text, "Flow");
     assert_eq!(abs.text, "Abs");
-    assert_eq!(abs.x, options.page_margins.left + 20.0);
+    assert_eq!(abs.x(), options.page_margins.left + 20.0);
     assert_line_baseline_at_top(
         &document,
         abs,
-        options.page_size.height - options.page_margins.top - 30.0,
+        options.page_size.height() - options.page_margins.top - 30.0,
     );
     assert_eq!(after.text, "After");
-    assert!(after.y < flow.y);
+    assert!(after.y() < flow.y());
 }
 
 #[tokio::test]
@@ -58,12 +73,12 @@ async fn percentage_block_width_uses_destination_page_size_after_prebreak() {
     let pink = filled_rect(&document.pages[2], Color::new(255, 192, 203));
 
     assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[0].width, 375.0);
-    assert_eq!(document.pages[1].width, 240.0);
-    assert_eq!(document.pages[2].width, 240.0);
-    assert!((yellow.width - 187.5).abs() < 0.01);
-    assert!((cyan.width - 120.0).abs() < 0.01);
-    assert!((pink.width - 120.0).abs() < 0.01);
+    assert_eq!(document.pages[0].width(), 375.0);
+    assert_eq!(document.pages[1].width(), 240.0);
+    assert_eq!(document.pages[2].width(), 240.0);
+    assert!((yellow.width() - 187.5).abs() < 0.01);
+    assert!((cyan.width() - 120.0).abs() < 0.01);
+    assert!((pink.width() - 120.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -85,8 +100,8 @@ async fn percentage_flex_width_uses_destination_page_size_after_prebreak() {
     let cyan = filled_rect(&document.pages[1], Color::new(0, 255, 255));
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[1].width, 240.0);
-    assert!((cyan.width - 120.0).abs() < 0.01);
+    assert_eq!(document.pages[1].width(), 240.0);
+    assert!((cyan.width() - 120.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -108,8 +123,8 @@ async fn percentage_hr_width_uses_destination_page_size_after_prebreak() {
     let cyan = filled_rect(&document.pages[1], Color::new(0, 255, 255));
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[1].width, 240.0);
-    assert!((cyan.width - 120.0).abs() < 0.01);
+    assert_eq!(document.pages[1].width(), 240.0);
+    assert!((cyan.width() - 120.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -130,8 +145,8 @@ async fn viewport_width_units_use_destination_page_size_after_prebreak() {
     let cyan = filled_rect(&document.pages[1], Color::new(0, 255, 255));
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[1].width, 240.0);
-    assert!((cyan.width - 120.0).abs() < 0.01);
+    assert_eq!(document.pages[1].width(), 240.0);
+    assert!((cyan.width() - 120.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -142,7 +157,7 @@ async fn supports_positioned_right_and_bottom_offsets() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].x, 120.0);
+    assert_eq!(document.pages[0].lines[0].x(), 120.0);
     assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 60.0);
 }
 
@@ -159,11 +174,11 @@ async fn absolute_positioned_table_bottom_anchors_border_box_to_page_area() {
         .rects
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(238, 238, 238)))
-        .max_by(|left, right| left.width.total_cmp(&right.width))
+        .max_by(|left, right| left.width().total_cmp(&right.width()))
         .unwrap();
 
     assert!(
-        (table_background.y - 20.0).abs() < 0.01,
+        (table_background.y() - 20.0).abs() < 0.01,
         "expected table border box bottom at y=20, got {:?}",
         table_background
     );
@@ -188,7 +203,7 @@ async fn generated_before_and_after_content_participates_in_inline_layout() {
         .find(|line| line.text == "Date:March 31, 2018")
         .unwrap();
 
-    assert!(date.y < invoice.y);
+    assert!(date.y() < invoice.y());
 }
 
 #[tokio::test]
@@ -200,7 +215,7 @@ async fn absolute_position_static_auto_offsets_start_at_containing_block() {
     .unwrap();
 
     assert_eq!(document.pages[0].lines[0].text, "Auto");
-    assert!((document.pages[0].lines[0].x - 10.0).abs() < 0.01);
+    assert!((document.pages[0].lines[0].x() - 10.0).abs() < 0.01);
     assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 110.0);
 }
 
@@ -218,7 +233,7 @@ async fn absolute_position_applies_non_auto_margins_to_border_edge() {
         .find(|line| line.text == "Margin")
         .unwrap();
 
-    assert!((line.x - 37.0).abs() < 0.01);
+    assert!((line.x() - 37.0).abs() < 0.01);
     assert_line_baseline_at_top(&document, line, 90.0);
 }
 
@@ -247,9 +262,152 @@ async fn absolute_position_auto_offsets_use_static_position_after_flow() {
         .unwrap();
 
     assert_line_baseline_at_top(&document, flow, 110.0);
-    assert!((auto.x - 10.0).abs() < 0.01);
+    assert!((auto.x() - 10.0).abs() < 0.01);
     assert_line_baseline_at_top(&document, auto, 100.0);
     assert_line_baseline_at_top(&document, after, 100.0);
+}
+
+#[tokio::test]
+async fn absolute_block_level_abspos_static_position_after_inline_content() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 300px 220px; margin: 0 }\
+         body, div { margin: 0; font-size: 10px; line-height: 10px }\
+         .rtl { direction: rtl }\
+         .absolute { position: absolute }\
+         </style>\
+         <div><div class=\"absolute\">abs before ltr</div><span>inline before ltr</span></div>\
+         <div><span>inline after ltr</span><div class=\"absolute\">abs after ltr</div></div>\
+         <br>\
+         <div class=\"rtl\"><div class=\"absolute\">abs before rtl</div><span>inline before rtl</span></div>\
+         <div class=\"rtl\"><span>inline after rtl</span><div class=\"absolute\">abs after rtl</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = |text: &str| {
+        document.pages[0]
+            .lines
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines))
+    };
+
+    let inline_before_ltr = line("inline before ltr");
+    let abs_before_ltr = line("abs before ltr");
+    let inline_after_ltr = line("inline after ltr");
+    let abs_after_ltr = line("abs after ltr");
+    let inline_before_rtl = line("inline before rtl");
+    let abs_before_rtl = line("abs before rtl");
+    let inline_after_rtl = line("inline after rtl");
+    let abs_after_rtl = line("abs after rtl");
+
+    assert!((abs_before_ltr.y() - inline_before_ltr.y()).abs() < 0.01);
+    assert!(
+        abs_after_ltr.y() < inline_after_ltr.y() - 7.0,
+        "ltr after abspos should be below inline content: inline={inline_after_ltr:?} abs={abs_after_ltr:?}",
+    );
+    assert!((abs_before_rtl.y() - inline_before_rtl.y()).abs() < 0.01);
+    assert!(
+        abs_after_rtl.y() < inline_after_rtl.y() - 7.0,
+        "rtl after abspos should be below inline content: inline={inline_after_rtl:?} abs={abs_after_rtl:?}",
+    );
+}
+
+#[tokio::test]
+async fn auto_positioned_abspos_after_text_before_float() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>@page { size: 260px 260px; margin: 0 } body, p, div { margin: 0 }</style>\
+         <p style=\"display:none\">Test passes if there is a filled green square and no red.</p>\
+         <div style=\"line-height:20px;\">\
+           &nbsp;\
+           <div style=\"position:absolute; width:200px; height:200px; background:green;\"></div>\
+           <div style=\"float:left; margin-top:20px; width:200px; height:200px; background:red;\"></div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red_index = page
+        .rects
+        .iter()
+        .position(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("red float rectangle should be painted");
+    let green_index = page
+        .rects
+        .iter()
+        .position(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap_or_else(|| panic!("green abspos rectangle should be painted: {:?}", page.rects));
+    let red = &page.rects[red_index];
+    let green = &page.rects[green_index];
+
+    assert!(
+        (green.x() - red.x()).abs() < 0.01
+            && (green.y() - red.y()).abs() < 0.01
+            && (green.width() - red.width()).abs() < 0.01
+            && (green.height() - red.height()).abs() < 0.01,
+        "green abspos should cover the later float: red={red:?} green={green:?}",
+    );
+    assert!(
+        first_rect_paint_operation_index(page, Color::new(0, 128, 0))
+            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+        "green abspos should paint after red: operations={:?} rects={:?}",
+        page.paint_operations(),
+        page.rects,
+    );
+}
+
+#[tokio::test]
+async fn fixed_static_position_inside_static_position_absolute() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <title>Static position fixed inside static position absolute</title>\
+         <style>@page { size: 100px 100px; margin: 0 } body, p { margin: 0 } p { display: none }</style>\
+         <p>Test passes if there is a filled green square and <strong>no red</strong>.</p>\
+         <div style=\"display: absolute; width: 100px; height: 100px; background: green;\">\
+             <div style=\"position: absolute; width: 50px; height: 50px; margin-left: 50px; margin-top: 50px; background: red;\">\
+                 <div style=\"position: fixed; width: 50px; height: 50px; background: green;\"></div>\
+             </div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = Color::new(0, 128, 0);
+    let red = Color::new(255, 0, 0);
+
+    for (x, y) in [(3.75, 71.25), (18.75, 18.75), (56.25, 18.75), (71.25, 3.75)] {
+        assert_eq!(final_rect_fill_at(page, x, y), Some(green));
+    }
+
+    let small_green_operation = page
+        .paint_operations()
+        .iter()
+        .position(|operation| {
+            let quire::PaintOperation::Rect(index) = operation else {
+                return false;
+            };
+            page.rects.get(*index).is_some_and(|rect| {
+                rect.fill == Some(green)
+                    && (rect.width() - 37.5).abs() < 0.01
+                    && (rect.height() - 37.5).abs() < 0.01
+            })
+        })
+        .expect("fixed green rectangle should be present");
+
+    assert!(
+        small_green_operation > first_rect_paint_operation_index(page, red),
+        "fixed green should paint after red absolute parent: operations={:?} rects={:?}",
+        page.paint_operations(),
+        page.rects,
+    );
 }
 
 #[tokio::test]
@@ -266,8 +424,8 @@ async fn absolute_auto_width_fills_between_left_and_right() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.x - 30.0).abs() < 0.01);
-    assert!((blue.width - 130.0).abs() < 0.01);
+    assert!((blue.x() - 30.0).abs() < 0.01);
+    assert!((blue.width() - 130.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -284,8 +442,8 @@ async fn absolute_auto_width_between_insets_subtracts_non_auto_margins() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.x - 35.0).abs() < 0.01);
-    assert!((blue.width - 118.0).abs() < 0.01);
+    assert!((blue.x() - 35.0).abs() < 0.01);
+    assert!((blue.width() - 118.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -302,8 +460,8 @@ async fn absolute_auto_width_between_insets_subtracts_padding_and_borders() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.x - 30.0).abs() < 0.01);
-    assert!((blue.width - 130.0).abs() < 0.01);
+    assert!((blue.x() - 30.0).abs() < 0.01);
+    assert!((blue.width() - 130.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -320,8 +478,58 @@ async fn absolute_right_offset_anchors_margin_box_edge() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.x - 115.0).abs() < 0.01);
-    assert!((blue.width - 50.0).abs() < 0.01);
+    assert!((blue.x() - 115.0).abs() < 0.01);
+    assert!((blue.width() - 50.0).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn absolute_overconstrained_horizontal_axis_uses_containing_direction() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 120pt; margin: 10pt } body { direction: rtl; margin: 0 } div { position: absolute; left: 10pt; right: 20pt; width: 50pt; height: 10pt; background: #2292d4 }</style><div></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let blue = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .unwrap();
+
+    assert!((blue.x() - 120.0).abs() < 0.01);
+    assert!((blue.width() - 50.0).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn absolute_horizontal_auto_margins_center_definite_width_between_insets() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 120pt; margin: 10pt } body { margin: 0 } .container { position: relative; width: 160pt; height: 40pt } .target { position: absolute; left: 0; right: 0; width: 100pt; height: 10pt; margin-left: auto; margin-right: auto; background: #2292d4 }</style><div class=\"container\"><div class=\"target\"></div></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let blue = filled_rect(&document.pages[0], Color::new(34, 146, 212));
+
+    assert!((blue.x() - 40.0).abs() < 0.01);
+    assert!((blue.width() - 100.0).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn absolute_right_anchored_width_applies_min_width_before_positioning() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 120pt; margin: 10pt } body { margin: 0 } div { position: absolute; right: 0; width: 20pt; min-width: 50pt; height: 10pt; background: #2292d4 }</style><div></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let blue = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .unwrap();
+
+    assert!((blue.x() - 140.0).abs() < 0.01);
+    assert!((blue.width() - 50.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -338,8 +546,22 @@ async fn absolute_auto_height_fills_between_top_and_bottom() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.y - 40.0).abs() < 0.01);
-    assert!((blue.height - 90.0).abs() < 0.01);
+    assert!((blue.y() - 40.0).abs() < 0.01);
+    assert!((blue.height() - 90.0).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn absolute_vertical_auto_margins_center_definite_height_between_insets() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 140pt; margin: 10pt } body { margin: 0 } .container { position: relative; width: 40pt; height: 100pt } .target { position: absolute; top: 0; bottom: 0; width: 20pt; height: 40pt; margin-top: auto; margin-bottom: auto; background: #2292d4 }</style><div class=\"container\"><div class=\"target\"></div></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let blue = filled_rect(&document.pages[0], Color::new(34, 146, 212));
+
+    assert!((blue.y() - 60.0).abs() < 0.01);
+    assert!((blue.height() - 40.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -356,8 +578,8 @@ async fn absolute_auto_height_between_insets_subtracts_non_auto_margins() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.y - 47.0).abs() < 0.01);
-    assert!((blue.height - 78.0).abs() < 0.01);
+    assert!((blue.y() - 47.0).abs() < 0.01);
+    assert!((blue.height() - 78.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -374,8 +596,8 @@ async fn absolute_auto_height_between_insets_subtracts_padding_and_borders() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.y - 40.0).abs() < 0.01);
-    assert!((blue.height - 90.0).abs() < 0.01);
+    assert!((blue.y() - 40.0).abs() < 0.01);
+    assert!((blue.height() - 90.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -397,9 +619,9 @@ async fn relative_position_offsets_visual_box_without_affecting_flow() {
         .find(|line| line.text == "After")
         .unwrap();
 
-    assert!((moved.x - 25.0).abs() < 0.01);
+    assert!((moved.x() - 25.0).abs() < 0.01);
     assert_line_baseline_at_top(&document, moved, 105.0);
-    assert!((after.x - 10.0).abs() < 0.01);
+    assert!((after.x() - 10.0).abs() < 0.01);
     assert_line_baseline_at_top(&document, after, 100.0);
 }
 
@@ -412,8 +634,8 @@ async fn absolute_position_applies_to_replaced_images() {
     .unwrap();
 
     assert_eq!(document.pages[0].images.len(), 1);
-    assert!((document.pages[0].images[0].x - 30.0).abs() < 0.01);
-    assert!((document.pages[0].images[0].y - 80.0).abs() < 0.01);
+    assert!((document.pages[0].images[0].x() - 30.0).abs() < 0.01);
+    assert!((document.pages[0].images[0].y() - 80.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -425,8 +647,43 @@ async fn absolute_position_applies_to_tables() {
     .unwrap();
 
     assert_eq!(document.pages[0].lines[0].text, "Cell");
-    assert!((document.pages[0].lines[0].x - 40.0).abs() < 0.01);
+    assert!((document.pages[0].lines[0].x() - 40.0).abs() < 0.01);
     assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 90.0);
+}
+
+#[tokio::test]
+async fn absolute_table_auto_margins_center_like_block_between_insets() {
+    let document = Html::from_string(
+        "<style>@page { size: 200px 200px; margin: 0 } body { margin: 0 } .container { position: relative; left: -30px; top: -30px; width: 160px; height: 160px } .target { display: block; background: red } .table { display: table; background: green } .centered { position: absolute; width: 100px; height: 100px; inset: 0; margin: auto }</style><div class=\"container\"><div class=\"centered target\"></div><div class=\"centered table\"></div></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = filled_rect(page, Color::new(255, 0, 0));
+    let green = page
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .max_by(|left, right| {
+            (left.width() * left.height()).total_cmp(&(right.width() * right.height()))
+        })
+        .expect("green table background should be present");
+
+    assert!((green.x() - 0.0).abs() < 0.01);
+    assert!((green.y() - 75.0).abs() < 0.01);
+    assert!((green.width() - 75.0).abs() < 0.01);
+    assert!((green.height() - 75.0).abs() < 0.01);
+    assert!((green.x() - red.x()).abs() < 0.01);
+    assert!((green.y() - red.y()).abs() < 0.01);
+    assert!((green.width() - red.width()).abs() < 0.01);
+    assert!((green.height() - red.height()).abs() < 0.01);
+    assert!(
+        first_rect_paint_operation_index(page, Color::new(0, 128, 0))
+            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+        "green table should paint after and cover the red block: {:?}",
+        page.paint_operations()
+    );
 }
 
 #[tokio::test]
@@ -453,15 +710,15 @@ async fn absolute_auto_width_table_uses_fragment_intrinsic_width() {
         .rects
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(238, 238, 238)))
-        .max_by(|left, right| left.width.total_cmp(&right.width))
+        .max_by(|left, right| left.width().total_cmp(&right.width()))
         .unwrap();
 
     assert!(
-        cell.x - wide.x > 75.0,
+        cell.x() - wide.x() > 75.0,
         "positioned table cells should use fragment intrinsic column widths"
     );
     assert!(
-        table_background.width > 115.0,
+        table_background.width() > 115.0,
         "positioned auto-width table should shrink-wrap its fragment grid: {table_background:?}"
     );
 }
@@ -469,7 +726,7 @@ async fn absolute_auto_width_table_uses_fragment_intrinsic_width() {
 #[tokio::test]
 async fn absolute_collapsed_table_bottom_uses_fragment_border_insets() {
     let document = Html::from_string(
-        "<style>@page { size: 200pt 180pt; margin: 20pt } body { margin:0 } table { position:absolute; bottom:0; margin:0; width:80pt; border-collapse:collapse; border:20pt solid #eeeeee; background:#eeeeee } td { padding:0; font-size:10pt; line-height:10pt }</style>\
+        "<style>@page { size: 200pt 180pt; margin: 20pt } body { margin:0 } table { position:absolute; bottom:0; margin:0; width:80pt; border-collapse:collapse; border:20pt solid #eeeeee; background:#00aa00 } td { padding:0; font-size:10pt; line-height:10pt }</style>\
          <table><tr><td>Bottom</td></tr></table>",
     )
     .render_async(&RenderOptions::default())
@@ -479,12 +736,13 @@ async fn absolute_collapsed_table_bottom_uses_fragment_border_insets() {
     let table_background = document.pages[0]
         .rects
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(238, 238, 238)))
-        .max_by(|left, right| left.width.total_cmp(&right.width))
+        .filter(|rect| rect.fill == Some(Color::new(0, 170, 0)))
+        .max_by(|left, right| left.width().total_cmp(&right.width()))
         .unwrap();
 
     assert!(
-        table_background.y >= 20.0 && table_background.y < 25.0,
+        (table_background.y() - 20.0).abs() < 0.01
+            && (table_background.height() - 50.0).abs() < 0.01,
         "collapsed table bottom should use fragment-derived outer border insets near the page bottom: {table_background:?}"
     );
 }
@@ -513,11 +771,11 @@ async fn relative_position_offsets_flex_and_table_boxes() {
         .find(|line| line.text == "After")
         .unwrap();
 
-    assert!((flex.x - 20.0).abs() < 0.01);
+    assert!((flex.x() - 20.0).abs() < 0.01);
     assert_line_baseline_at_top(&document, flex, 125.0);
-    assert!((table.x - 30.0).abs() < 0.01);
+    assert!((table.x() - 30.0).abs() < 0.01);
     assert_line_baseline_at_top(&document, table, 115.0);
-    assert!((after.x - 10.0).abs() < 0.01);
+    assert!((after.x() - 10.0).abs() < 0.01);
     assert_line_baseline_at_top(&document, after, 110.0);
 }
 
@@ -533,7 +791,7 @@ async fn bottom_positioned_auto_height_uses_content_height() {
     assert_eq!(document.pages[0].lines.len(), 3);
     assert_eq!(document.pages[0].lines[0].text, "One");
     assert_eq!(document.pages[0].lines[2].text, "Three");
-    assert!(document.pages[0].lines[0].y > document.pages[0].lines[2].y);
+    assert!(document.pages[0].lines[0].y() > document.pages[0].lines[2].y());
 }
 
 #[tokio::test]
@@ -550,8 +808,8 @@ async fn positions_absolute_children_against_relative_containing_blocks() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.x - 35.0).abs() < 0.01);
-    assert!((blue.width - 50.0).abs() < 0.01);
+    assert!((blue.x() - 35.0).abs() < 0.01);
+    assert!((blue.width() - 50.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -568,8 +826,8 @@ async fn transformed_block_establishes_containing_block_for_absolute_child() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.x - 35.0).abs() < 0.01);
-    assert!((blue.width - 50.0).abs() < 0.01);
+    assert!((blue.x() - 35.0).abs() < 0.01);
+    assert!((blue.width() - 50.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -586,8 +844,8 @@ async fn positioned_containing_block_uses_relative_parent_padding_box() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.x - 12.0).abs() < 0.01);
-    assert!((blue.y - 138.0).abs() < 0.01);
+    assert!((blue.x() - 12.0).abs() < 0.01);
+    assert!((blue.y() - 138.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -604,8 +862,8 @@ async fn positioned_table_cell_establishes_padding_box_containing_block() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.x - 12.0).abs() < 0.01);
-    assert!((blue.y - 138.0).abs() < 0.01);
+    assert!((blue.x() - 12.0).abs() < 0.01);
+    assert!((blue.y() - 138.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -622,8 +880,8 @@ async fn positioned_table_wrapper_establishes_containing_block_for_cell_descenda
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.x - 30.0).abs() < 0.01);
-    assert!((blue.y - 130.0).abs() < 0.01);
+    assert!((blue.x() - 30.0).abs() < 0.01);
+    assert!((blue.y() - 130.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -640,8 +898,8 @@ async fn positioned_inline_block_fragment_captures_absolute_descendants() {
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
-    assert!((blue.x - 11.0).abs() < 0.01);
-    assert!((blue.y - 99.0).abs() < 0.01);
+    assert!((blue.x() - 11.0).abs() < 0.01);
+    assert!((blue.y() - 99.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -709,7 +967,56 @@ async fn collapses_first_descendant_top_margin_through_transparent_wrappers() {
     .await
     .unwrap();
 
-    assert_eq!(wrapped.pages[0].lines[0].y, direct.pages[0].lines[0].y);
+    assert_eq!(wrapped.pages[0].lines[0].y(), direct.pages[0].lines[0].y());
+}
+
+#[tokio::test]
+async fn empty_self_collapsing_child_does_not_give_parent_background_height() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 } p { margin: 0; font-size: 10pt; line-height: 10pt }</style>\
+         <p>Before</p><div style=\"background:red\"><div style=\"background:hotpink\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_no_red_or_hotpink_rects(&document);
+}
+
+#[tokio::test]
+async fn empty_self_collapsing_child_top_margin_does_not_paint_parent_background() {
+    let document = Html::from_string(
+        "<style>@page { size: 240pt 240pt; margin: 10pt } body { margin: 0 } p { margin: 0; font-size: 10pt; line-height: 10pt }</style>\
+         <p>Before</p><div style=\"background:red\"><div style=\"margin-top:150px; background:hotpink\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_no_red_or_hotpink_rects(&document);
+}
+
+#[tokio::test]
+async fn clear_left_after_collapsed_large_top_margin_does_not_paint_parent_background() {
+    let document = Html::from_string(
+        r#"<!DOCTYPE html>
+<style>@page { size: 240pt 260pt; margin: 10pt } body { margin: 0 }</style>
+<p>There should be nothing below.</p>
+<div style="float:left; width:10px; height:100px;"></div>
+<div>
+  <div>
+    <div style="float:right; width:10px; height:200px;"></div>
+  </div>
+  <div style="background:red;">
+    <div style="margin-top:150px; clear:left; background:hotpink;"></div>
+  </div>
+</div>"#,
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_no_red_or_hotpink_rects(&document);
 }
 
 #[tokio::test]
@@ -772,8 +1079,8 @@ async fn block_in_inline_text_align_does_not_move_split_block_child() {
         .map(|line| {
             (
                 line.text.clone(),
-                line.x.round() as i32,
-                line.y.round() as i32,
+                line.x().round() as i32,
+                line.y().round() as i32,
             )
         })
         .collect::<Vec<_>>();
@@ -783,8 +1090,8 @@ async fn block_in_inline_text_align_does_not_move_split_block_child() {
         .map(|line| {
             (
                 line.text.clone(),
-                line.x.round() as i32,
-                line.y.round() as i32,
+                line.x().round() as i32,
+                line.y().round() as i32,
             )
         })
         .collect::<Vec<_>>();
@@ -824,8 +1131,8 @@ async fn wpt_block_in_inline_align_matches_reference_if_available() {
         .map(|line| {
             (
                 line.text.clone(),
-                line.x.round() as i32,
-                line.y.round() as i32,
+                line.x().round() as i32,
+                line.y().round() as i32,
             )
         })
         .collect::<Vec<_>>();
@@ -835,8 +1142,8 @@ async fn wpt_block_in_inline_align_matches_reference_if_available() {
         .map(|line| {
             (
                 line.text.clone(),
-                line.x.round() as i32,
-                line.y.round() as i32,
+                line.x().round() as i32,
+                line.y().round() as i32,
             )
         })
         .collect::<Vec<_>>();
@@ -924,10 +1231,10 @@ async fn paints_body_background_on_page() {
         .unwrap();
 
     let background = &document.pages[0].rects[0];
-    assert_eq!(background.x, 0.0);
-    assert_eq!(background.y, 0.0);
-    assert_eq!(background.width, document.pages[0].width);
-    assert_eq!(background.height, document.pages[0].height);
+    assert_eq!(background.x(), 0.0);
+    assert_eq!(background.y(), 0.0);
+    assert_eq!(background.width(), document.pages[0].width());
+    assert_eq!(background.height(), document.pages[0].height());
     assert_eq!(background.fill, Some(Color::new(255, 255, 0)));
 }
 
@@ -970,7 +1277,7 @@ async fn fixed_position_repeats_on_pages_created_by_absolute_overflow() {
             index + 1
         );
         assert!(
-            fixed[0].y < RenderOptions::default().page_margins.bottom + 20.0,
+            fixed[0].y() < RenderOptions::default().page_margins.bottom + 20.0,
             "fixed-position line should be at page bottom on page {}: {:?}",
             index + 1,
             fixed[0]
@@ -1076,8 +1383,8 @@ async fn named_page_change_and_break_before_page_create_one_break() {
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[0].lines[0].text, "AAA");
     assert_eq!(document.pages[1].lines[0].text, "BBB");
-    assert_eq!(document.pages[0].lines[0].x, 30.0);
-    assert_eq!(document.pages[1].lines[0].x, 50.0);
+    assert_eq!(document.pages[0].lines[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1103,9 +1410,9 @@ async fn explicit_page_auto_exits_ancestor_named_page_group() {
     assert_eq!(document.pages[0].lines[0].text, "A");
     assert_eq!(document.pages[1].lines[0].text, "B");
     assert_eq!(document.pages[2].lines[0].text, "C");
-    assert_eq!(document.pages[0].lines[0].x, 30.0);
-    assert_eq!(document.pages[1].lines[0].x, 10.0);
-    assert_eq!(document.pages[2].lines[0].x, 50.0);
+    assert_eq!(document.pages[0].lines[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines[0].x(), 10.0);
+    assert_eq!(document.pages[2].lines[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1128,8 +1435,8 @@ async fn nested_page_names_use_first_and_last_in_flow_descendant_values() {
     assert_eq!(document.pages.len(), 1);
     assert_eq!(document.pages[0].lines[0].text, "A");
     assert_eq!(document.pages[0].lines[1].text, "B");
-    assert_eq!(document.pages[0].lines[0].x, 30.0);
-    assert_eq!(document.pages[0].lines[1].x, 30.0);
+    assert_eq!(document.pages[0].lines[0].x(), 30.0);
+    assert_eq!(document.pages[0].lines[1].x(), 30.0);
 }
 
 #[tokio::test]
@@ -1152,8 +1459,8 @@ async fn nested_page_scope_exit_does_not_split_following_same_named_page_group()
     assert_eq!(document.pages.len(), 1);
     assert_eq!(document.pages[0].lines[0].text, "A");
     assert_eq!(document.pages[0].lines[1].text, "C");
-    assert_eq!(document.pages[0].lines[0].x, 30.0);
-    assert_eq!(document.pages[0].lines[1].x, 30.0);
+    assert_eq!(document.pages[0].lines[0].x(), 30.0);
+    assert_eq!(document.pages[0].lines[1].x(), 30.0);
 }
 
 #[tokio::test]
@@ -1179,9 +1486,9 @@ async fn nested_page_name_boundary_splits_when_sibling_page_values_differ() {
     assert!(document.pages[0].lines[0].text.starts_with("Large"));
     assert_eq!(document.pages[1].lines[0].text, "Small");
     assert!(document.pages[2].lines[0].text.starts_with("Large"));
-    assert_eq!(document.pages[0].lines[0].x, 30.0);
-    assert_eq!(document.pages[1].lines[0].x, 50.0);
-    assert_eq!(document.pages[2].lines[0].x, 30.0);
+    assert_eq!(document.pages[0].lines[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines[0].x(), 50.0);
+    assert_eq!(document.pages[2].lines[0].x(), 30.0);
 }
 
 #[tokio::test]
@@ -1310,12 +1617,12 @@ async fn fixed_auto_width_shrink_to_fit_uses_nested_column_flex_intrinsics() {
 
     assert_eq!(green_rows.len(), 2);
     assert!(
-        red.width > 220.0,
+        red.width() > 220.0,
         "fixed auto width should use nested flex max-content width: {red:?}"
     );
     for green in green_rows {
         assert!(
-            (green.width - red.width).abs() < 0.01,
+            (green.width() - red.width()).abs() < 0.01,
             "percentage flex child should cover fixed background: red={red:?} green={green:?}"
         );
     }
@@ -1362,8 +1669,8 @@ async fn floated_page_name_is_ignored_between_in_flow_named_page_siblings() {
     assert!(document.pages[0].lines.iter().any(|line| line.text == "A"));
     assert!(document.pages[0].lines.iter().any(|line| line.text == "B"));
     assert!(document.pages[1].lines.iter().any(|line| line.text == "C"));
-    assert_eq!(document.pages[0].lines[0].x, 30.0);
-    assert_eq!(document.pages[1].lines[0].x, 50.0);
+    assert_eq!(document.pages[0].lines[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1424,7 +1731,7 @@ async fn inline_block_page_values_create_boundary_after_atomic_box() {
             .map(|page| {
                 page.lines
                     .iter()
-                    .map(|line| (line.text.as_str(), line.x, line.y))
+                    .map(|line| (line.text.as_str(), line.x(), line.y()))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>()
@@ -1442,7 +1749,7 @@ async fn inline_block_page_values_create_boundary_after_atomic_box() {
     assert!(page_zero_lines.contains(&"A"), "{page_zero_lines:?}");
     assert!(page_zero_lines.contains(&"B"), "{page_zero_lines:?}");
     assert!(page_one_lines.contains(&"C"), "{page_one_lines:?}");
-    assert_eq!(document.pages[1].lines[0].x, 70.0);
+    assert_eq!(document.pages[1].lines[0].x(), 70.0);
 }
 
 #[tokio::test]
@@ -1493,15 +1800,66 @@ async fn non_leading_inline_page_name_splits_inline_formatting_context() {
     // https://www.w3.org/TR/css-page-3/#using-named-pages
     assert_eq!(document.pages.len(), 3);
     assert_eq!(document.pages[0].lines[0].text, "Before");
-    assert_eq!(document.pages[0].lines[0].x, 30.0);
+    assert_eq!(document.pages[0].lines[0].x(), 30.0);
     assert_eq!(document.pages[1].lines[0].text, "Named");
-    assert_eq!(document.pages[1].lines[0].x, 50.0);
+    assert_eq!(document.pages[1].lines[0].x(), 50.0);
     assert_eq!(document.pages[2].lines[0].text, "After");
-    assert_eq!(document.pages[2].lines[0].x, 30.0);
+    assert_eq!(document.pages[2].lines[0].x(), 30.0);
 }
 
 fn red_png_data_uri() -> &'static str {
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAIAAAABc2X6AAAAa0lEQVR42u3QMREAAAwCMfybbl3AEu4NhCQ3abUAAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwOXwbunRwEDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA3d78VrQ4ODmDDUAAAAASUVORK5CYII="
+}
+
+#[tokio::test]
+async fn absolute_block_inside_inline_uses_split_inline_static_position() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <title>Static position inside inline</title>\
+         <style>\
+         @page { size: 200px 200px; margin: 0 }\
+         body { margin: 0 }\
+         #wrapper { overflow: hidden; width: 100px; height: 100px; margin-top: -100px; }\
+         #inline { line-height: 100px; color: transparent; border-left: 100px solid transparent; margin-left: -100px; }\
+         #abspos { position: absolute; background-color: green; width: 100px; height: 100px; }\
+         #red { position: absolute; width: 100px; height: 100px; background: red; }\
+         </style>\
+         <p>Instruction text.</p>\
+         <div id=\"red\"></div>\
+         <div id=\"wrapper\"><span id=\"inline\"><div id=\"abspos\"></div>X</span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red_index = page
+        .rects
+        .iter()
+        .position(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("red abspos rectangle should be painted");
+    let green_index = page
+        .rects
+        .iter()
+        .position(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap_or_else(|| panic!("green abspos rectangle should be painted: {:?}", page.rects));
+    let red = &page.rects[red_index];
+    let green = &page.rects[green_index];
+
+    assert!(
+        (green.x() - red.x()).abs() < 0.01
+            && (green.y() - red.y()).abs() < 0.01
+            && (green.width() - red.width()).abs() < 0.01
+            && (green.height() - red.height()).abs() < 0.01,
+        "green abspos should cover red at the wrapper static position: red={red:?} green={green:?}",
+    );
+    assert!(
+        first_rect_paint_operation_index(page, Color::new(0, 128, 0))
+            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+        "green abspos should paint after red: operations={:?} rects={:?}",
+        page.paint_operations(),
+        page.rects,
+    );
 }
 
 #[tokio::test]
@@ -1526,7 +1884,7 @@ async fn inline_replaced_page_name_is_ignored_before_block_sibling_boundary() {
 
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[1].lines[0].text, "B");
-    assert_eq!(document.pages[1].lines[0].x, 50.0);
+    assert_eq!(document.pages[1].lines[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1551,7 +1909,7 @@ async fn inline_replaced_page_name_is_ignored_after_block_sibling_boundary() {
 
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[0].lines[0].text, "A");
-    assert_eq!(document.pages[0].lines[0].x, 50.0);
+    assert_eq!(document.pages[0].lines[0].x(), 50.0);
     assert_eq!(document.pages[1].images.len(), 1);
 }
 
@@ -1578,7 +1936,7 @@ async fn block_replaced_page_name_participates_in_named_page_group() {
     assert_eq!(document.pages.len(), 1);
     assert_eq!(document.pages[0].images.len(), 1);
     assert_eq!(document.pages[0].lines[0].text, "B");
-    assert_eq!(document.pages[0].lines[0].x, 50.0);
+    assert_eq!(document.pages[0].lines[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1603,7 +1961,7 @@ async fn block_replaced_page_name_matches_previous_named_block_group() {
 
     assert_eq!(document.pages.len(), 1);
     assert_eq!(document.pages[0].lines[0].text, "A");
-    assert_eq!(document.pages[0].lines[0].x, 50.0);
+    assert_eq!(document.pages[0].lines[0].x(), 50.0);
     assert_eq!(document.pages[0].images.len(), 1);
 }
 
@@ -1629,7 +1987,7 @@ async fn inline_canvas_page_name_is_ignored_before_block_sibling_boundary() {
     // WPT: css/css-page/page-name-canvas-001-print.html.
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[1].lines[0].text, "B");
-    assert_eq!(document.pages[1].lines[0].x, 50.0);
+    assert_eq!(document.pages[1].lines[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1654,7 +2012,7 @@ async fn inline_canvas_page_name_is_ignored_after_block_sibling_boundary() {
     // WPT: css/css-page/page-name-canvas-002-print.html.
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[0].lines[0].text, "A");
-    assert_eq!(document.pages[0].lines[0].x, 50.0);
+    assert_eq!(document.pages[0].lines[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1679,7 +2037,7 @@ async fn block_canvas_page_name_participates_in_named_page_group() {
     // WPT: css/css-page/page-name-canvas-003-print.html.
     assert_eq!(document.pages.len(), 1);
     assert_eq!(document.pages[0].lines[0].text, "B");
-    assert_eq!(document.pages[0].lines[0].x, 50.0);
+    assert_eq!(document.pages[0].lines[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1704,7 +2062,7 @@ async fn block_canvas_page_name_splits_before_following_unnamed_block() {
     // WPT: css/css-page/page-name-canvas-004-print.html.
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[1].lines[0].text, "B");
-    assert_eq!(document.pages[1].lines[0].x, 30.0);
+    assert_eq!(document.pages[1].lines[0].x(), 30.0);
 }
 
 #[tokio::test]
@@ -1729,11 +2087,11 @@ async fn trailing_unnamed_page_after_named_page_uses_default_page_context() {
     // page context rather than inheriting the previous named page.
     assert_eq!(document.pages.len(), 3);
     assert_eq!(document.pages[0].lines[0].text, "First");
-    assert_eq!(document.pages[0].lines[0].x, 10.0);
+    assert_eq!(document.pages[0].lines[0].x(), 10.0);
     assert_eq!(document.pages[1].lines[0].text, "Named");
-    assert_eq!(document.pages[1].lines[0].x, 40.0);
+    assert_eq!(document.pages[1].lines[0].x(), 40.0);
     assert_eq!(document.pages[2].lines[0].text, "Trailing");
-    assert_eq!(document.pages[2].lines[0].x, 10.0);
+    assert_eq!(document.pages[2].lines[0].x(), 10.0);
 }
 
 #[tokio::test]
@@ -1766,7 +2124,7 @@ async fn flex_item_page_names_do_not_create_container_page_breaks() {
             .map(|page| {
                 page.lines
                     .iter()
-                    .map(|line| (line.text.as_str(), line.x, line.y))
+                    .map(|line| (line.text.as_str(), line.x(), line.y()))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>()
@@ -1805,7 +2163,7 @@ async fn flex_container_own_page_name_creates_boundary_around_container() {
     assert_eq!(document.pages[1].lines[0].text, "B");
     assert_eq!(document.pages[1].lines[1].text, "C");
     assert_eq!(document.pages[2].lines[0].text, "D");
-    assert_eq!(document.pages[1].lines[0].x, 40.0);
+    assert_eq!(document.pages[1].lines[0].x(), 40.0);
 }
 
 #[tokio::test]
@@ -1837,7 +2195,7 @@ async fn nested_block_page_names_inside_flex_item_create_internal_breaks_only() 
             .map(|page| {
                 page.lines
                     .iter()
-                    .map(|line| (line.text.as_str(), line.x, line.y))
+                    .map(|line| (line.text.as_str(), line.x(), line.y()))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>()
@@ -1846,7 +2204,7 @@ async fn nested_block_page_names_inside_flex_item_create_internal_breaks_only() 
     assert_eq!(document.pages[0].lines[1].text, "B");
     assert_eq!(document.pages[1].lines[0].text, "C");
     assert_eq!(document.pages[1].lines[1].text, "D");
-    assert_eq!(document.pages[1].lines[0].x, 50.0);
+    assert_eq!(document.pages[1].lines[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1869,18 +2227,18 @@ async fn table_own_page_name_selects_named_page_context() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 1);
-    assert_eq!(document.pages[0].width, 360.0);
-    assert_eq!(document.pages[0].height, 360.0);
+    assert_eq!(document.pages[0].width(), 360.0);
+    assert_eq!(document.pages[0].height(), 360.0);
     assert!(
         document.pages[0]
             .lines
             .iter()
-            .all(|line| (line.x - 30.0).abs() < 0.01),
+            .all(|line| (line.x() - 30.0).abs() < 0.01),
         "{:?}",
         document.pages[0]
             .lines
             .iter()
-            .map(|line| (line.text.as_str(), line.x, line.y))
+            .map(|line| (line.text.as_str(), line.x(), line.y()))
             .collect::<Vec<_>>()
     );
 }
@@ -1906,10 +2264,10 @@ async fn empty_page_named_block_with_display_none_child_still_creates_page_group
     assert_eq!(document.pages.len(), 3);
     assert_eq!(document.pages[0].lines[0].text, "A");
     assert!(document.pages[1].lines.is_empty());
-    assert_eq!(document.pages[1].width, 140.0);
+    assert_eq!(document.pages[1].width(), 140.0);
     assert_eq!(document.pages[2].lines[0].text, "B");
-    assert_eq!(document.pages[0].lines[0].x, 30.0);
-    assert_eq!(document.pages[2].lines[0].x, 50.0);
+    assert_eq!(document.pages[0].lines[0].x(), 30.0);
+    assert_eq!(document.pages[2].lines[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1961,9 +2319,9 @@ async fn rtl_root_direction_makes_first_page_match_left_page_selector() {
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[0].lines[0].text, "One");
     assert_eq!(document.pages[1].lines[0].text, "Two");
-    assert_eq!(document.pages[0].lines[0].x, 40.0);
-    assert_eq!(document.pages[1].lines[0].x, 0.0);
-    assert!((document.pages[1].lines[0].y - document.pages[0].lines[0].y - 20.0).abs() < 0.01);
+    assert_eq!(document.pages[0].lines[0].x(), 40.0);
+    assert_eq!(document.pages[1].lines[0].x(), 0.0);
+    assert!((document.pages[1].lines[0].y() - document.pages[0].lines[0].y() - 20.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -1986,7 +2344,7 @@ async fn rtl_forced_left_break_targets_next_left_page() {
     assert_eq!(document.pages[0].lines[0].text, "One");
     assert!(document.pages[1].lines.is_empty());
     assert_eq!(document.pages[2].lines[0].text, "Two");
-    assert_eq!(document.pages[2].lines[0].x, 40.0);
+    assert_eq!(document.pages[2].lines[0].x(), 40.0);
 }
 
 #[tokio::test]
@@ -2000,7 +2358,7 @@ async fn paints_parent_block_after_child_forced_page_break() {
     assert_eq!(document.pages.len(), 2);
     assert!(document.pages.iter().any(|page| !page.rects.is_empty()));
     let pdf = document.write_pdf_bytes().unwrap();
-    assert!(String::from_utf8_lossy(&pdf).starts_with("%PDF-1.4"));
+    assert!(String::from_utf8_lossy(&pdf).starts_with("%PDF-1.7"));
 }
 
 #[tokio::test]
@@ -2189,7 +2547,7 @@ async fn nested_break_inside_avoid_block_moves_to_next_page_when_it_fits() {
         .map(|page| {
             page.lines
                 .iter()
-                .map(|line| (line.text.clone(), line.x, line.y))
+                .map(|line| (line.text.clone(), line.x(), line.y()))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -2346,6 +2704,23 @@ async fn positioned_negative_z_index_paints_before_normal_flow() {
 }
 
 #[tokio::test]
+async fn absolute_z_index_auto_does_not_trap_positive_positioned_descendant() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body, div { margin: 0 } .parent { position: absolute; left: 0; top: 0; width: 30pt; height: 30pt } .child { position: absolute; z-index: 1; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 } .sibling { position: absolute; z-index: 0; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"parent\"><div class=\"child\"></div></div><div class=\"sibling\"></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert_eq!(
+        painted_rect_fills(
+            &document.pages[0],
+            &[Color::new(255, 0, 0), Color::new(0, 255, 0)]
+        ),
+        vec![Color::new(255, 0, 0), Color::new(0, 255, 0)]
+    );
+}
+
+#[tokio::test]
 async fn positioned_descendant_z_index_stays_inside_parent_stacking_context() {
     let document = Html::from_string(
         "<style>@page { size: 120pt 120pt; margin: 10pt } body, div { margin: 0 } .parent { position: absolute; z-index: 1; left: 0; top: 0; width: 30pt; height: 30pt; background: #0000ff } .child { position: absolute; z-index: 999; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 } .sibling { position: absolute; z-index: 2; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"parent\"><div class=\"child\"></div></div><div class=\"sibling\"></div>",
@@ -2452,7 +2827,7 @@ async fn fixed_position_transaction_leaves_no_temporary_paint_primitives() {
     .write_pdf_bytes_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert!(String::from_utf8_lossy(&pdf).starts_with("%PDF-1.4"));
+    assert!(String::from_utf8_lossy(&pdf).starts_with("%PDF-1.7"));
 }
 
 #[tokio::test]
@@ -2490,6 +2865,254 @@ async fn fixed_position_z_index_applies_on_each_page() {
 }
 
 #[tokio::test]
+async fn multiple_negative_positioned_siblings_sort_by_z_index() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body, div { margin: 0 } .flow { width: 30pt; height: 30pt; background: #ff0000 } .low { position: absolute; z-index: -3; left: 0; top: 0; width: 30pt; height: 30pt; background: #0000ff } .high { position: absolute; z-index: -1; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 }</style><div class=\"high\"></div><div class=\"flow\"></div><div class=\"low\"></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert_eq!(
+        painted_rect_fills(
+            &document.pages[0],
+            &[
+                Color::new(0, 0, 255),
+                Color::new(0, 255, 0),
+                Color::new(255, 0, 0),
+            ],
+        ),
+        vec![
+            Color::new(0, 0, 255),
+            Color::new(0, 255, 0),
+            Color::new(255, 0, 0),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn z_index_auto_and_zero_share_source_order_level() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body, div { margin: 0 } .auto { position: absolute; left: 0; top: 0; width: 30pt; height: 30pt; background: #0000ff } .zero { position: absolute; z-index: 0; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"zero\"></div><div class=\"auto\"></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert_eq!(
+        painted_red_blue_rect_fills(&document.pages[0]),
+        vec![Color::new(255, 0, 0), Color::new(0, 0, 255)]
+    );
+}
+
+#[tokio::test]
+async fn positioned_context_preserves_internal_inline_above_negative_child() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 120pt; margin: 10pt } body, div { margin: 0 } .parent { position: absolute; z-index: 1; left: 0; top: 0; width: 80pt; height: 30pt; color: black; font-size: 10pt; line-height: 10pt } .child { position: absolute; z-index: -1; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"parent\">Text<div class=\"child\"></div></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let red_index = first_rect_paint_operation_index(&document.pages[0], Color::new(255, 0, 0));
+    let text_index = document.pages[0]
+        .operations
+        .iter()
+        .position(|operation| {
+            matches!(
+                operation,
+                quire::PaintOperation::Line(index)
+                    if document.pages[0].lines.get(*index).is_some_and(|line| line.text == "Text")
+            )
+        })
+        .unwrap();
+
+    assert!(red_index < text_index);
+}
+
+#[tokio::test]
+async fn flex_item_z_index_paints_above_later_item() {
+    let document = Html::from_string(
+        "<style>@page { size: 140pt 120pt; margin: 10pt } body { margin: 0 } .flex { display: flex; width: 60pt; height: 30pt } .first { z-index: 1; margin-right: -30pt; width: 30pt; height: 30pt; background: #0000ff } .second { width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"flex\"><div class=\"first\"></div><div class=\"second\"></div></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert_eq!(
+        painted_red_blue_rect_fills(&document.pages[0]),
+        vec![Color::new(255, 0, 0), Color::new(0, 0, 255)]
+    );
+}
+
+#[tokio::test]
+async fn fixed_z_index_auto_traps_positive_positioned_descendant() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body, div { margin: 0 } .parent { position: fixed; left: 0; top: 0; width: 30pt; height: 30pt; background: #0000ff } .child { position: absolute; z-index: 999; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 } .sibling { position: absolute; z-index: 1; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"parent\"><div class=\"child\"></div></div><div class=\"sibling\"></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert_eq!(
+        painted_rect_fills(
+            &document.pages[0],
+            &[
+                Color::new(0, 0, 255),
+                Color::new(0, 255, 0),
+                Color::new(255, 0, 0),
+            ],
+        ),
+        vec![
+            Color::new(0, 0, 255),
+            Color::new(0, 255, 0),
+            Color::new(255, 0, 0),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sticky_z_index_auto_traps_positive_positioned_descendant() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body, div { margin: 0 } .parent { position: sticky; top: 0; width: 30pt; height: 30pt; background: #0000ff } .child { position: absolute; z-index: 999; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 } .sibling { position: absolute; z-index: 1; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"parent\"><div class=\"child\"></div></div><div class=\"sibling\"></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert_eq!(
+        painted_rect_fills(
+            &document.pages[0],
+            &[
+                Color::new(0, 0, 255),
+                Color::new(0, 255, 0),
+                Color::new(255, 0, 0),
+            ],
+        ),
+        vec![
+            Color::new(0, 0, 255),
+            Color::new(0, 255, 0),
+            Color::new(255, 0, 0),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn relative_z_index_auto_does_not_trap_positive_positioned_descendant() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body, div { margin: 0 } .parent { position: relative; left: 0; top: 0; width: 30pt; height: 30pt } .child { position: absolute; z-index: 1; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 } .sibling { position: absolute; z-index: 0; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"parent\"><div class=\"child\"></div></div><div class=\"sibling\"></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert_eq!(
+        painted_rect_fills(
+            &document.pages[0],
+            &[Color::new(255, 0, 0), Color::new(0, 255, 0)]
+        ),
+        vec![Color::new(255, 0, 0), Color::new(0, 255, 0)]
+    );
+}
+
+#[tokio::test]
+async fn float_fake_context_does_not_trap_positioned_descendant() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body, div { margin: 0 } .parent { float: left; width: 30pt; height: 30pt } .child { position: absolute; z-index: 1; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 } .sibling { position: absolute; z-index: 0; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"parent\"><div class=\"child\"></div></div><div class=\"sibling\"></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert_eq!(
+        painted_rect_fills(
+            &document.pages[0],
+            &[Color::new(255, 0, 0), Color::new(0, 255, 0)]
+        ),
+        vec![Color::new(255, 0, 0), Color::new(0, 255, 0)]
+    );
+}
+
+#[tokio::test]
+async fn inline_block_fake_context_does_not_trap_positioned_descendant() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body, div { margin: 0 } .parent { display: inline-block; width: 30pt; height: 30pt } .child { position: absolute; z-index: 1; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 } .sibling { position: absolute; z-index: 0; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"parent\"><div class=\"child\"></div></div><div class=\"sibling\"></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert_eq!(
+        painted_rect_fills(
+            &document.pages[0],
+            &[Color::new(255, 0, 0), Color::new(0, 255, 0)]
+        ),
+        vec![Color::new(255, 0, 0), Color::new(0, 255, 0)]
+    );
+}
+
+#[tokio::test]
+async fn table_fake_context_does_not_trap_positioned_descendant() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body, table, td { margin: 0; border-spacing: 0; padding: 0 } .parent { display: table; width: 30pt; height: 30pt } .child { position: absolute; z-index: 1; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 } .sibling { position: absolute; z-index: 0; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }</style><div class=\"parent\"><div style=\"display: table-row\"><div style=\"display: table-cell\"><div class=\"child\"></div></div></div></div><div class=\"sibling\"></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert_eq!(
+        painted_rect_fills(
+            &document.pages[0],
+            &[Color::new(255, 0, 0), Color::new(0, 255, 0)]
+        ),
+        vec![Color::new(255, 0, 0), Color::new(0, 255, 0)]
+    );
+}
+
+#[tokio::test]
+async fn effect_triggers_trap_positive_positioned_descendants() {
+    for parent_declaration in [
+        "opacity: .999",
+        "transform: translate(0)",
+        "filter: blur(0)",
+        "mix-blend-mode: multiply",
+        "isolation: isolate",
+        "contain: paint",
+        "content-visibility: auto",
+        "clip-path: inset(0)",
+        "mask-image: linear-gradient(black, black)",
+        "will-change: transform, opacity",
+    ] {
+        assert_eq!(
+            stacking_trigger_paint_order(parent_declaration).await,
+            vec![
+                Color::new(0, 0, 255),
+                Color::new(0, 255, 0),
+                Color::new(255, 0, 0),
+            ],
+            "{parent_declaration} should isolate positioned descendants"
+        );
+    }
+}
+
+#[tokio::test]
+async fn filter_blend_isolation_and_mask_contexts_write_pdf_groups() {
+    let pdf = Html::from_string(
+        "<style>@page { size: 160pt 160pt; margin: 10pt } body, div { margin: 0 } .box { width: 20pt; height: 20pt; background: #0000ff } .filter { filter: blur(0) } .blend { mix-blend-mode: multiply } .isolate { isolation: isolate } .mask { mask-image: linear-gradient(black, black) }</style><div class=\"box filter\"></div><div class=\"box blend\"></div><div class=\"box isolate\"></div><div class=\"box mask\"></div>",
+    )
+    .write_pdf_bytes_async(&RenderOptions::default()).await
+    .unwrap();
+    let pdf = String::from_utf8_lossy(&pdf);
+
+    assert!(pdf.matches("/Group").count() >= 4);
+    assert!(pdf.contains("/BM /Multiply"));
+}
+
+#[tokio::test]
+async fn opacity_transform_and_overflow_context_writes_pdf_group() {
+    let pdf = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 } .box { opacity: .5; transform: translate(5pt, 0); overflow: hidden; width: 20pt; height: 20pt; background: #0000ff } .child { width: 40pt; height: 20pt; background: #ff0000 }</style><div class=\"box\"><div class=\"child\"></div></div>",
+    )
+    .write_pdf_bytes_async(&RenderOptions::default()).await
+    .unwrap();
+    let pdf = String::from_utf8_lossy(&pdf);
+
+    assert!(pdf.contains("/Group"));
+    assert!(pdf.contains("cm"));
+    assert!(pdf.contains("W\nn"));
+}
+
+#[tokio::test]
 async fn positioned_collapsed_table_paints_cell_text_above_late_border_rects() {
     let document = Html::from_string(
         "<style>@page { size: 220pt 160pt; margin: 10pt } body { margin: 0 } footer { position: relative; height: 100pt } table { position: absolute; bottom: 0; border-collapse: collapse; border: 20pt solid #eee; background: #eee } td { font-size: 12pt; line-height: 14pt }</style><footer><table><tr><td>Visible</td></tr></table></footer>",
@@ -2517,10 +3140,10 @@ async fn positioned_collapsed_table_paints_cell_text_above_late_border_rects() {
             _ => None,
         })
         .any(|rect| {
-            rect.x <= line.x
-                && rect.x + rect.width >= line.x
-                && rect.y <= line.y
-                && rect.y + rect.height >= line.y
+            rect.x() <= line.x()
+                && rect.x() + rect.width() >= line.x()
+                && rect.y() <= line.y()
+                && rect.y() + rect.height() >= line.y()
         });
 
     assert!(!covering_rect_after_text);
@@ -2530,6 +3153,24 @@ fn painted_red_blue_rect_fills(page: &quire::Page) -> Vec<Color> {
     let red = Color::new(255, 0, 0);
     let blue = Color::new(0, 0, 255);
     painted_rect_fills(page, &[red, blue])
+}
+
+async fn stacking_trigger_paint_order(parent_declaration: &str) -> Vec<Color> {
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 120pt 120pt; margin: 10pt }} body, div {{ margin: 0 }} .parent {{ {parent_declaration}; width: 30pt; height: 30pt; background: #0000ff }} .child {{ position: absolute; z-index: 999; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 }} .sibling {{ position: absolute; z-index: 1; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }}</style><div class=\"parent\"><div class=\"child\"></div></div><div class=\"sibling\"></div>"
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    painted_rect_fills(
+        &document.pages[0],
+        &[
+            Color::new(0, 0, 255),
+            Color::new(0, 255, 0),
+            Color::new(255, 0, 0),
+        ],
+    )
 }
 
 fn filled_rect(page: &quire::Page, color: Color) -> &quire::RenderedRect {

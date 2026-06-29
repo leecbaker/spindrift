@@ -72,6 +72,13 @@ impl Color {
 #[derive(Debug, Clone)]
 pub(crate) struct Stylesheet {
     pub origin: StylesheetOrigin,
+    /// Whether this is Quire's built-in HTML presentational-hints sheet.
+    ///
+    /// Static selector-expressible hints live in the stylesheet itself, while
+    /// value-dependent hints are injected during element cascade with the same
+    /// author-origin, zero-specificity priority:
+    /// <https://html.spec.whatwg.org/multipage/rendering.html#presentational-hints>.
+    pub html_presentational_hints: bool,
     /// Optional specificity used for all style rules in this stylesheet.
     ///
     /// HTML presentational hints are author-origin declarations with zero
@@ -295,6 +302,7 @@ pub(crate) enum CounterStyleSystem {
 pub(crate) struct CssFontFace {
     pub family: String,
     pub sources: Vec<FontFaceSource>,
+    pub unicode_range: Option<Vec<UnicodeRange>>,
     pub weight: FontWeight,
     pub style: FontStyle,
     pub width: FontWidth,
@@ -305,6 +313,29 @@ pub(crate) struct CssFontFace {
     pub font_variant_numeric: FontVariantNumeric,
     pub font_variant_alternates: FontVariantAlternates,
     pub font_variant_east_asian: FontVariantEastAsian,
+}
+
+/// One inclusive CSS `@font-face unicode-range` interval.
+///
+/// CSS Fonts defines `unicode-range` as a font-face descriptor that limits the
+/// characters for which a downloaded face participates in font matching:
+/// <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnicodeRange {
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+}
+
+impl UnicodeRange {
+    pub(crate) const ALL: Self = Self {
+        start: 0,
+        end: 0x10ffff,
+    };
+
+    pub(crate) fn contains(self, character: char) -> bool {
+        let scalar = character as u32;
+        self.start <= scalar && scalar <= self.end
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

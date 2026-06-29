@@ -3,6 +3,7 @@ use super::*;
 pub(super) const SOFT_HYPHEN: char = '\u{00ad}';
 pub(super) const ZERO_WIDTH_SPACE: char = '\u{200b}';
 
+#[allow(dead_code)]
 pub(super) fn line_ends_with_visible_soft_hyphen(
     text: &str,
     range: &Range<usize>,
@@ -13,6 +14,7 @@ pub(super) fn line_ends_with_visible_soft_hyphen(
         && text[..range.end].ends_with(SOFT_HYPHEN)
 }
 
+#[allow(dead_code)]
 pub(super) fn normalize_soft_hyphens(
     mut text: String,
     visible_trailing_soft_hyphen: bool,
@@ -33,7 +35,7 @@ pub(super) fn normalize_soft_hyphens(
     }
 }
 
-pub(super) fn text_with_hyphenation_controls<'a>(
+pub(crate) fn text_with_hyphenation_controls<'a>(
     text: &'a str,
     style: &ComputedStyle,
 ) -> Cow<'a, str> {
@@ -273,6 +275,7 @@ fn pre_wrap_preserved_tab_breaks(text: &str) -> impl Iterator<Item = usize> + '_
 /// CSS Text's atomic-inline tailoring still allows U+00A0 NBSP next to an
 /// atomic inline:
 /// <https://www.w3.org/TR/css-text-3/#line-break-details>.
+#[allow(dead_code)]
 pub(crate) fn inline_atomic_boundary_allows_soft_wrap(
     before: &str,
     after: &str,
@@ -299,7 +302,7 @@ fn nbsp_is_next_to_atomic_inline(before: &str, after: &str) -> bool {
     )
 }
 
-pub(super) fn grapheme_cluster_inner_boundaries(text: &str) -> Vec<usize> {
+pub(crate) fn grapheme_cluster_inner_boundaries(text: &str) -> Vec<usize> {
     GraphemeClusterSegmenter::new()
         .segment_str(text)
         .filter(|position| *position > 0 && *position < text.len())
@@ -372,14 +375,9 @@ fn suppress_keep_all_unit_breaks(text: &str, style: &ComputedStyle, breaks: &mut
         !matches!(
             (previous, next),
             (Some(previous), Some(next))
-                if keep_all_unbreakable_unit(previous) && keep_all_unbreakable_unit(next)
+                if keep_all_suppresses_break_between(previous, next)
         )
     });
-}
-
-fn keep_all_unbreakable_unit(character: char) -> bool {
-    character_is_unicode_alphanumeric(character)
-        || matches!(line_break_class(character), LineBreak::Ideographic)
 }
 
 /// Return whether a Unicode line-break class forbids a line break before it.
@@ -401,6 +399,7 @@ fn line_break_class_suppresses_line_start(character: char) -> bool {
     )
 }
 
+#[allow(dead_code)]
 pub(super) fn measured_emergency_breaks_allowed(style: &ComputedStyle) -> bool {
     matches!(style.word_break, CssWordBreak::BreakAll)
         || matches!(style.line_break, CssLineBreak::Anywhere)

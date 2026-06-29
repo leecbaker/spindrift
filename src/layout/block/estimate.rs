@@ -80,12 +80,9 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> f32 {
         let mut used_style = self.style_with_current_viewport_lengths(style);
-        let used_edges = used_box_edges(&used_style, available_outer_width.max(0.0));
-        used_style.margin = used_edges.margin.to_css_edges();
-        used_style.padding = used_edges.padding.to_css_edges();
+        let box_metrics = apply_used_box_metrics(&mut used_style, available_outer_width.max(0.0));
         let style = &used_style;
-        let horizontal_extras =
-            horizontal_border_width(style) + style.padding.left + style.padding.right;
+        let horizontal_extras = box_metrics.horizontal_non_content();
         let requested_content_width = self.used_block_content_width(
             element,
             style,
@@ -220,8 +217,7 @@ impl<'a> LayoutBuilder<'a> {
             || used_min_height(style, content_width).is_some()
             || used_max_height(style, content_width).is_some()
         {
-            let vertical_extras =
-                vertical_border_width(style) + style.padding.top + style.padding.bottom;
+            let vertical_extras = box_metrics.vertical_non_content();
             let requested_content_height =
                 used_content_height_or_auto(style, content_height, vertical_extras)
                     .unwrap_or(content_height);
@@ -293,6 +289,6 @@ impl<'a> LayoutBuilder<'a> {
     ) -> f32 {
         let available_width = (available_width - padding_left - padding_right).max(1.0);
         self.intrinsic_inline_measurement_for_text(text, style, available_width)
-            .height
+            .height()
     }
 }

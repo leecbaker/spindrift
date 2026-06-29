@@ -178,6 +178,74 @@ async fn block_inside_inline_is_split_into_parent_block_flow() {
 }
 
 #[tokio::test]
+async fn block_inside_inline_preserves_empty_fragment_with_owned_inline_start_edge() {
+    let root = dom::parse("<html><body><span><div>Block</div>X</span></body></html>");
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        "body > span { margin-left: -100px; border-left: 100px solid transparent }",
+    ));
+    let page = build_test_page(&root, &[stylesheet]);
+    let body = &page.children[0].children()[0];
+
+    assert_eq!(
+        body.children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![
+            FormattingBoxKind::AnonymousBlock,
+            FormattingBoxKind::Block,
+            FormattingBoxKind::AnonymousBlock,
+        ]
+    );
+    let FormattingBox::Inline(before_span) = &body.children()[0].children()[0] else {
+        panic!("pre-block anonymous block should contain the edge-only span fragment");
+    };
+    assert!(before_span.children.is_empty());
+    assert_eq!(
+        before_span.fragment_edges,
+        InlineBoxFragmentEdges {
+            owns_start: true,
+            owns_end: false,
+        }
+    );
+}
+
+#[tokio::test]
+async fn block_inside_inline_after_fragment_owns_only_inline_end_edge() {
+    let root = dom::parse("<html><body><span><div>One</div>Two</span></body></html>");
+    let stylesheet =
+        css::parse_stylesheet(&Css::from_string("body > span { border: 3px solid blue }"));
+    let page = build_test_page(&root, &[stylesheet]);
+    let body = &page.children[0].children()[0];
+
+    assert_eq!(
+        body.children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![FormattingBoxKind::Block, FormattingBoxKind::AnonymousBlock]
+    );
+    assert_eq!(
+        body.children()[1]
+            .children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![FormattingBoxKind::Inline]
+    );
+    let FormattingBox::Inline(span_fragment) = &body.children()[1].children()[0] else {
+        panic!("post-block anonymous block should contain the span inline fragment");
+    };
+    assert_eq!(
+        span_fragment.fragment_edges,
+        InlineBoxFragmentEdges {
+            owns_start: false,
+            owns_end: true,
+        }
+    );
+}
+
+#[tokio::test]
 async fn block_inside_inline_splits_surrounding_inline_runs() {
     let root = dom::parse("<html><body><div>A<span>B<p>Block</p>C</span>D</div></body></html>");
     let page = build_test_page(&root, &[]);
@@ -209,6 +277,86 @@ async fn block_inside_inline_splits_surrounding_inline_runs() {
             .map(FormattingBox::kind)
             .collect::<Vec<_>>(),
         vec![FormattingBoxKind::Inline, FormattingBoxKind::Text]
+    );
+    let FormattingBox::Inline(before_span) = &div.children()[0].children()[1] else {
+        panic!("before anonymous block should contain a span inline fragment");
+    };
+    assert_eq!(
+        before_span.fragment_edges,
+        InlineBoxFragmentEdges {
+            owns_start: true,
+            owns_end: false,
+        }
+    );
+    let FormattingBox::Inline(after_span) = &div.children()[2].children()[0] else {
+        panic!("after anonymous block should contain a span inline fragment");
+    };
+    assert_eq!(
+        after_span.fragment_edges,
+        InlineBoxFragmentEdges {
+            owns_start: false,
+            owns_end: true,
+        }
+    );
+}
+
+#[tokio::test]
+async fn nested_block_inside_inline_preserves_each_inline_fragment_edges() {
+    let root =
+        dom::parse("<html><body><div><span>A<em>B<p>Block</p>C</em>D</span></div></body></html>");
+    let page = build_test_page(&root, &[]);
+    let div = &page.children[0].children()[0].children()[0];
+
+    assert_eq!(
+        div.children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![
+            FormattingBoxKind::AnonymousBlock,
+            FormattingBoxKind::Block,
+            FormattingBoxKind::AnonymousBlock,
+        ]
+    );
+    let FormattingBox::Inline(before_span) = &div.children()[0].children()[0] else {
+        panic!("before block should start with the span fragment");
+    };
+    assert_eq!(
+        before_span.fragment_edges,
+        InlineBoxFragmentEdges {
+            owns_start: true,
+            owns_end: false,
+        }
+    );
+    let FormattingBox::Inline(before_em) = &before_span.children[1] else {
+        panic!("before span fragment should contain the em fragment");
+    };
+    assert_eq!(
+        before_em.fragment_edges,
+        InlineBoxFragmentEdges {
+            owns_start: true,
+            owns_end: false,
+        }
+    );
+    let FormattingBox::Inline(after_span) = &div.children()[2].children()[0] else {
+        panic!("after block should contain the span fragment");
+    };
+    assert_eq!(
+        after_span.fragment_edges,
+        InlineBoxFragmentEdges {
+            owns_start: false,
+            owns_end: true,
+        }
+    );
+    let FormattingBox::Inline(after_em) = &after_span.children[0] else {
+        panic!("after span fragment should contain the em fragment");
+    };
+    assert_eq!(
+        after_em.fragment_edges,
+        InlineBoxFragmentEdges {
+            owns_start: false,
+            owns_end: true,
+        }
     );
 }
 
@@ -296,6 +444,48 @@ async fn orphan_table_cell_with_formatting_whitespace_keeps_fragment_rows() {
 }
 
 #[tokio::test]
+async fn orphan_table_cells_inside_inline_create_anonymous_inline_table_wrapper() {
+    let root = dom::parse(
+        "<html><body><p>Before <span><span style=\"display:table-cell\">Cell</span></span> After</p></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let paragraph = &page.children[0].children()[0].children()[0];
+
+    assert_eq!(
+        paragraph
+            .children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![
+            FormattingBoxKind::Text,
+            FormattingBoxKind::Inline,
+            FormattingBoxKind::Text
+        ]
+    );
+    let FormattingBox::Inline(span) = &paragraph.children()[1] else {
+        panic!("expected inline parent to remain inline");
+    };
+    assert_eq!(
+        span.children
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![FormattingBoxKind::AtomicInline]
+    );
+    let FormattingBox::AtomicInline(table) = &span.children[0] else {
+        panic!("expected anonymous inline-table wrapper");
+    };
+    assert_eq!(table.style.display, Display::INLINE_TABLE);
+    let fragment = table
+        .table_fragment
+        .as_ref()
+        .expect("anonymous inline-table should retain a durable table fragment");
+    assert_eq!(fragment.rows.len(), 1);
+    assert_eq!(fragment.rows[0].cells.len(), 1);
+}
+
+#[tokio::test]
 async fn table_box_contains_durable_fragment_rows_columns_and_captions() {
     let root = dom::parse(
         "<html><body><table><caption>Cap</caption><colgroup span=\"2\"></colgroup><tbody><tr><td>A</td><td>B</td></tr></tbody></table></body></html>",
@@ -312,6 +502,39 @@ async fn table_box_contains_durable_fragment_rows_columns_and_captions() {
     assert_eq!(table.fragment.rows.len(), 1);
     assert_eq!(table.fragment.rows[0].cells.len(), 2);
     assert_eq!(table.fragment.grid.column_count, 2);
+}
+
+#[tokio::test]
+async fn table_fragment_clamps_html_span_attributes() {
+    let root = dom::parse(
+        "<html><body><table><colgroup span=\"1001px\"></colgroup><tr><td colspan=\"1001px\">A</td></tr><tr><td rowspan=\"999999999999999999999999px\">B</td><td>C</td></tr></table></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let table = &page.children[0].children()[0].children()[0];
+
+    let FormattingBox::Table(table) = table else {
+        panic!("expected table formatting box");
+    };
+    assert_eq!(table.fragment.columns.len(), 1);
+    assert_eq!(table.fragment.columns[0].span, 1000);
+    assert_eq!(table.fragment.grid.rows[0][0].colspan, 1000);
+    assert_eq!(table.fragment.grid.rows[1][0].rowspan, 1);
+}
+
+#[tokio::test]
+async fn table_fragment_span_attributes_use_ascii_digits_only() {
+    let root = dom::parse(
+        "<html><body><table><col span=\"２\"></col><tr><td colspan=\"２\">A</td><td>B</td></tr></table></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let table = &page.children[0].children()[0].children()[0];
+
+    let FormattingBox::Table(table) = table else {
+        panic!("expected table formatting box");
+    };
+    assert_eq!(table.fragment.columns[0].span, 1);
+    assert_eq!(table.fragment.grid.rows[0][0].colspan, 1);
+    assert_eq!(table.fragment.grid.rows[0][1].column, 1);
 }
 
 #[tokio::test]
@@ -337,6 +560,51 @@ async fn table_fragment_wraps_text_children_in_anonymous_cells() {
             .collect::<Vec<_>>(),
         vec![FormattingBoxKind::Text]
     );
+}
+
+#[tokio::test]
+async fn table_fragment_groups_consecutive_non_cell_children_with_whitespace() {
+    let root = dom::parse(
+        "<html><body><div style=\"display:table\"><span style=\"display:inline-block\">A</span> <span style=\"display:inline-block\">B</span></div></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let table = &page.children[0].children()[0].children()[0];
+
+    let FormattingBox::Table(table) = table else {
+        panic!("expected table formatting box");
+    };
+    assert_eq!(table.fragment.rows.len(), 1);
+    assert_eq!(table.fragment.rows[0].cells.len(), 1);
+    assert!(table.fragment.rows[0].cells[0].anonymous);
+    assert_eq!(
+        table.fragment.rows[0].cells[0]
+            .children
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![
+            FormattingBoxKind::AtomicInline,
+            FormattingBoxKind::Text,
+            FormattingBoxKind::AtomicInline,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn table_fragment_ignores_whitespace_between_internal_cells() {
+    let root = dom::parse(
+        "<html><body><div style=\"display:table\"><span style=\"display:table-cell\">A</span> <span style=\"display:table-cell\">B</span></div></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let table = &page.children[0].children()[0].children()[0];
+
+    let FormattingBox::Table(table) = table else {
+        panic!("expected table formatting box");
+    };
+    assert_eq!(table.fragment.rows.len(), 1);
+    assert_eq!(table.fragment.rows[0].cells.len(), 2);
+    assert!(!table.fragment.rows[0].cells[0].anonymous);
+    assert!(!table.fragment.rows[0].cells[1].anonymous);
 }
 
 #[tokio::test]
@@ -384,6 +652,23 @@ async fn table_fragment_grid_tracks_rowspan_and_colspan_occupancy() {
     assert_eq!(table.fragment.grid.rows[0][1].colspan, 2);
     assert_eq!(table.fragment.grid.rows[1][0].column, 1);
     assert_eq!(table.fragment.grid.rows[1][1].column, 2);
+}
+
+#[tokio::test]
+async fn table_fragment_preserves_authored_empty_rows() {
+    let root = dom::parse(
+        "<html><body><table><tbody><tr><td>A</td></tr><tr style=\"height:40px\"></tr><tr><td>B</td></tr></tbody></table></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let table = &page.children[0].children()[0].children()[0];
+
+    let FormattingBox::Table(table) = table else {
+        panic!("expected table formatting box");
+    };
+    assert_eq!(table.fragment.rows.len(), 3);
+    assert_eq!(table.fragment.rows[1].cells.len(), 0);
+    assert_eq!(table.fragment.grid.rows.len(), 3);
+    assert_eq!(table.fragment.grid.rows[1].len(), 0);
 }
 
 #[tokio::test]

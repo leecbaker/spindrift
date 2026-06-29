@@ -18,6 +18,8 @@ pub(super) fn shape_document_text(document: &Document) -> ShapedDocument {
                             Some(ShapedRun {
                                 document_font_id: font_id,
                                 x_offset: run.x_offset,
+                                y_offset: run.y_offset,
+                                text_matrix: run.text_matrix,
                                 font_size: run.font_size,
                                 glyphs: glyphs.iter().map(shaped_glyph_from_rendered).collect(),
                             })

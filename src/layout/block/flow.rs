@@ -37,28 +37,38 @@ impl<'a> LayoutBuilder<'a> {
         }
         let style = &geometry.style;
         let relative_offset = geometry.relative_offset;
-        if style.position == Position::Relative {
+        if matches!(style.position, Position::Relative | Position::Sticky) {
             self.cursor_y += relative_offset.y;
         }
         let border_widths = geometry.border_widths;
         let vertical_extras = geometry.vertical_extras;
         let definite_content_height = geometry.definite_content_height;
-        let content_width = geometry.content_width;
-        let outer_width = geometry.outer_width;
-        let mut outer_x = geometry.outer_x;
-        let mut inner_x = geometry.inner_x;
-        let inner_width = geometry.inner_width;
+        let mut outer_inline = geometry.outer_inline();
+        let mut content_inline = geometry.content_inline();
+        let content_width = content_inline.size();
+        let outer_width = outer_inline.size();
+        let mut block_align_content_offset_y = 0.0;
         let starts_at_page_top = self.cursor_is_at_page_top() && self.truncate_page_start_margins;
         let applied_start_margin = page_start_margin(style.margin.top, starts_at_page_top);
         self.cursor_y -= applied_start_margin;
-        let establishes_independent_bfc =
-            style.display.establishes_block_formatting_context() || style.overflow.clips_overflow();
+        let clearance_count_at_block_entry = self.applied_clearance_count;
+        let establishes_independent_bfc = style.display.establishes_block_formatting_context()
+            || style.overflow.clips_overflow()
+            || block_align_content_establishes_independent_formatting_context(style.align_content);
         if !establishes_independent_bfc {
-            self.cursor_y = self.clear_active_floats_top(
+            let before_clear_page_index = self.pages.len();
+            let before_clear_top = self.cursor_y;
+            let cleared_top = self.clear_active_floats_top(
                 style.clear,
-                self.containing_block_direction,
+                style.writing_mode,
+                style.direction,
                 self.cursor_y,
             );
+            if self.pages.len() != before_clear_page_index || cleared_top < before_clear_top - 0.01
+            {
+                self.applied_clearance_count += 1;
+            }
+            self.cursor_y = cleared_top;
         }
         if establishes_independent_bfc && style.float == Float::None {
             let margin_box_width = style.margin.left + outer_width + style.margin.right;
@@ -71,15 +81,25 @@ impl<'a> LayoutBuilder<'a> {
                 margin_box_width,
                 collision_height,
                 style.clear,
+                style.writing_mode,
+                style.direction,
                 self.containing_block_direction,
             );
             self.cursor_y = avoided_top;
-            outer_x = margin_box_left + style.margin.left + relative_offset.x;
-            inner_x = outer_x + border_widths.left + style.padding.left;
+            let outer_x = margin_box_left + style.margin.left + relative_offset.x;
+            outer_inline = BlockInlineBounds::new(outer_x, outer_width);
+            content_inline = BlockInlineBounds::new(
+                outer_x + border_widths.left + style.padding.left,
+                content_width,
+            );
         }
+        let outer_x = outer_inline.start();
+        let inner_x = content_inline.start();
+        let inner_width = content_inline.size();
         let block_top = self.cursor_y;
         let establishes_positioning_containing_block =
-            style.position == Position::Relative || !style.transform.is_empty();
+            matches!(style.position, Position::Relative | Position::Sticky)
+                || !style.transform.is_empty();
         let paint_checkpoint = self.current_page.paint_checkpoint();
         let paint_page_index = self.pages.len();
         self.cursor_y -= border_widths.top + style.padding.top;
@@ -88,26 +108,28 @@ impl<'a> LayoutBuilder<'a> {
             .push(self.current_page_context.top() - content_top);
         self.add_bookmark(element, style, inner_x, block_top);
         self.add_page_anchor(element, style);
+        let descendant_bookmark_start = self.bookmarks.len();
 
         let previous_left = self.content_left;
         let previous_right = self.content_right;
         let previous_containing_block_direction = self.containing_block_direction;
+        let previous_containing_block_writing_mode = self.containing_block_writing_mode;
         self.content_left = inner_x;
         self.content_right = inner_x + inner_width;
         self.containing_block_direction = style.direction;
+        self.containing_block_writing_mode = style.writing_mode;
         if establishes_independent_bfc {
             self.push_float_context();
         }
         if establishes_positioning_containing_block {
-            self.containing_blocks.push(ContainingBlock {
-                x: outer_x + border_widths.left,
-                top_y: block_top - border_widths.top,
-                width: (content_width + style.padding.left + style.padding.right).max(0.0),
-                height: (definite_content_height.unwrap_or(style.line_height)
-                    + style.padding.top
-                    + style.padding.bottom)
-                    .max(0.0),
-            });
+            self.containing_blocks
+                .push(ContainingBlock::from_page_top_rect(
+                    geometry.padding_box_top_rect(
+                        outer_x,
+                        block_top,
+                        definite_content_height.unwrap_or(style.line_height),
+                    ),
+                ));
         }
         let overflow_clip_active = if style.overflow.clips_overflow()
             && !is_document_canvas_element(element)
@@ -116,12 +138,15 @@ impl<'a> LayoutBuilder<'a> {
                     .map(|height| constrain_height(style, height, content_width))
         {
             let clip_height = clip_content_height + style.padding.top + style.padding.bottom;
-            self.push_overflow_clip(OverflowClip {
-                x: outer_x + border_widths.left,
-                y: block_top - border_widths.top - clip_height,
-                width: content_width + style.padding.left + style.padding.right,
-                height: clip_height,
-            });
+            self.push_overflow_clip(
+                PageTopRect::new(
+                    outer_x + border_widths.left,
+                    block_top - border_widths.top,
+                    content_width + style.padding.left + style.padding.right,
+                    clip_height,
+                )
+                .overflow_clip(),
+            );
             true
         } else {
             false
@@ -150,8 +175,9 @@ impl<'a> LayoutBuilder<'a> {
         // its original DOM text here. Inline pseudo content that survives in
         // normalized inline boxes is handled through `use_box_inline_items`.
         let normalized_children_empty = child_boxes.is_some_and(|boxes| boxes.is_empty());
-        let detached_normalized_text =
-            normalized_children_empty && !inline_text_for_style(element, style).is_empty();
+        let detached_normalized_text = normalized_children_empty
+            && !has_generated_content
+            && !inline_text_for_style(element, style).is_empty();
         let text = if normalized_children_empty
             || has_generated_content
             || use_ordered_mixed_flow
@@ -256,6 +282,11 @@ impl<'a> LayoutBuilder<'a> {
             can_collapse_block_start_margin(style, border_widths, has_direct_inline_content);
         let can_collapse_end_margin =
             can_collapse_block_end_margin(style, border_widths, has_direct_inline_content);
+        let self_collapsing_block = if let Some(child_boxes) = child_boxes {
+            is_self_collapsing_block_box(element, style, child_boxes)
+        } else {
+            is_self_collapsing_block_dom(element, style, stylesheets, &self.ancestors)
+        };
         let mut collapsed_end_margin = false;
         let mut previous_flow_bottom_margin = None;
         let mut seen_flow_child = false;
@@ -831,6 +862,12 @@ impl<'a> LayoutBuilder<'a> {
         }
         self.definite_block_size_stack.pop();
 
+        if establishes_independent_bfc
+            && has_auto_height(style)
+            && let Some(float_bottom) = self.current_float_context_lowest_bottom()
+        {
+            self.cursor_y = self.cursor_y.min(float_bottom);
+        }
         if establishes_independent_bfc {
             self.pop_float_context();
         }
@@ -841,9 +878,17 @@ impl<'a> LayoutBuilder<'a> {
         self.content_left = previous_left;
         self.content_right = previous_right;
         self.containing_block_direction = previous_containing_block_direction;
+        self.containing_block_writing_mode = previous_containing_block_writing_mode;
 
         if pushed_list_context {
             self.list_stack.pop();
+        }
+
+        if self_collapsing_block
+            && self.pages.len() == paint_page_index
+            && self.applied_clearance_count == clearance_count_at_block_entry
+        {
+            self.cursor_y = content_top;
         }
 
         if !has_auto_height(style)
@@ -856,12 +901,24 @@ impl<'a> LayoutBuilder<'a> {
                     .unwrap_or(current_content_height)
             });
             let height = constrain_height(style, requested_content_height, content_width);
+            if self.pages.len() == paint_page_index
+                && style.writing_mode == WritingMode::HorizontalTb
+            {
+                let free_space = height - current_content_height;
+                block_align_content_offset_y = if laid_out_column_children {
+                    multicol_align_content_y_offset(style.align_content, free_space)
+                } else {
+                    block_align_content_y_offset_for_style(style, free_space)
+                };
+            }
             self.cursor_y = content_top - height;
         }
         self.fragment_top_offsets.pop();
         self.cursor_y -= style.padding.bottom + border_widths.bottom;
         let block_bottom = self.cursor_y;
         let block_height = (block_top - block_bottom).max(0.0);
+        let border_box = geometry.border_box_top_rect(outer_x, block_top, block_height);
+        let border_paint_rect = border_box.page_top_rect().paint_rect();
         if block_height > 0.0 {
             self.mark_current_page_flow_content();
         }
@@ -883,11 +940,12 @@ impl<'a> LayoutBuilder<'a> {
                 let mut border_style = style.clone();
                 border_style.background_color = None;
                 border_style.background_image = None;
+                border_style.background_layers.clear();
                 own_background_primitives = self.box_background_primitives(
-                    outer_x,
-                    block_bottom,
-                    outer_width,
-                    block_height,
+                    border_paint_rect.origin.x,
+                    border_paint_rect.origin.y,
+                    border_paint_rect.size.width,
+                    border_paint_rect.size.height,
                     &border_style,
                 );
             }
@@ -899,26 +957,34 @@ impl<'a> LayoutBuilder<'a> {
             && style.visibility == Visibility::Visible
         {
             own_background_primitives = self.box_background_primitives(
-                outer_x,
-                block_bottom,
-                outer_width,
-                block_height,
+                border_paint_rect.origin.x,
+                border_paint_rect.origin.y,
+                border_paint_rect.size.width,
+                border_paint_rect.size.height,
                 style,
             );
         }
         if block_height > 0.0 && style.visibility == Visibility::Visible {
             own_outline_primitives = self.box_outline_primitives(
-                outer_x,
-                block_bottom,
-                outer_width,
-                block_height,
+                border_paint_rect.origin.x,
+                border_paint_rect.origin.y,
+                border_paint_rect.size.width,
+                border_paint_rect.size.height,
                 style,
             );
         }
         let has_own_background_primitives = !own_background_primitives.is_empty();
         let has_own_outline_primitives = !own_outline_primitives.is_empty();
+        self.translate_aligned_block_descendant_bookmarks(
+            descendant_bookmark_start,
+            paint_page_index,
+            0.0,
+            block_align_content_offset_y,
+        );
         if self.preserve_scoped_paint_public_order
             && self.pages.len() == paint_page_index
+            && block_align_content_offset_y.abs() <= 0.01
+            && !vertical_block_align_content_needs_fragment_bounds(style)
             && let Some(mut fragment) = self
                 .current_page
                 .paint_tree_fragment_since(&paint_checkpoint)
@@ -948,14 +1014,42 @@ impl<'a> LayoutBuilder<'a> {
             if !collapsed_end_margin {
                 self.cursor_y -= style.margin.bottom;
             }
-            if style.position == Position::Relative {
+            if matches!(style.position, Position::Relative | Position::Sticky) {
                 self.cursor_y -= relative_offset.y;
             }
             self.apply_forced_break(style.break_after);
             return;
         }
         let fragments = self.take_positioned_fragments_since(paint_page_index, paint_checkpoint);
+        let mut translated_vertical_bookmarks = false;
         for (page_index, mut fragment) in fragments {
+            let mut block_align_content_offset_x = 0.0;
+            if page_index == paint_page_index {
+                block_align_content_offset_x = vertical_block_align_content_x_offset(
+                    style,
+                    inner_x,
+                    content_width,
+                    fragment.bounds(),
+                );
+                if block_align_content_offset_x.abs() > 0.01 && !translated_vertical_bookmarks {
+                    self.translate_aligned_block_descendant_bookmarks(
+                        descendant_bookmark_start,
+                        paint_page_index,
+                        block_align_content_offset_x,
+                        0.0,
+                    );
+                    translated_vertical_bookmarks = true;
+                }
+            }
+            if page_index == paint_page_index
+                && (block_align_content_offset_x.abs() > 0.01
+                    || block_align_content_offset_y.abs() > 0.01)
+            {
+                fragment = fragment.translated(PaintVector::new(
+                    block_align_content_offset_x,
+                    block_align_content_offset_y,
+                ));
+            }
             if page_index == background_page_index {
                 fragment.prepend_primitives_in_band(
                     PaintBand::BackgroundBorder,
@@ -975,18 +1069,36 @@ impl<'a> LayoutBuilder<'a> {
                 fragment
             };
             if page_index < self.pages.len() {
-                self.pages[page_index].append_paint_fragment(&fragment, 0.0, 0.0);
+                self.pages[page_index].append_paint_fragment(&fragment, PaintVector::new(0.0, 0.0));
             } else {
-                self.current_page.append_paint_fragment(&fragment, 0.0, 0.0);
+                self.current_page
+                    .append_paint_fragment(&fragment, PaintVector::new(0.0, 0.0));
             }
         }
         if !collapsed_end_margin {
             self.cursor_y -= style.margin.bottom;
         }
-        if style.position == Position::Relative {
+        if matches!(style.position, Position::Relative | Position::Sticky) {
             self.cursor_y -= relative_offset.y;
         }
         self.apply_forced_break(style.break_after);
+    }
+
+    fn translate_aligned_block_descendant_bookmarks(
+        &mut self,
+        descendant_bookmark_start: usize,
+        page_index: usize,
+        x_offset: f32,
+        y_offset: f32,
+    ) {
+        if x_offset.abs() <= 0.01 && y_offset.abs() <= 0.01 {
+            return;
+        }
+        for bookmark in self.bookmarks.iter_mut().skip(descendant_bookmark_start) {
+            if bookmark.page_index == page_index {
+                bookmark.translate_target(x_offset, y_offset);
+            }
+        }
     }
 
     /// Resolve a block box's used content width, including intrinsic keywords.
@@ -1006,46 +1118,31 @@ impl<'a> LayoutBuilder<'a> {
         available_outer_width: f32,
         horizontal_extras: f32,
     ) -> f32 {
-        match style.box_values.width {
-            css::ComputedLengthPercentageOrAuto::MinContent => {
-                let (min_content, _) = self.block_intrinsic_content_widths(
-                    element,
-                    style,
-                    stylesheets,
-                    child_boxes,
-                    available_outer_width,
-                );
-                min_content
-            }
-            css::ComputedLengthPercentageOrAuto::MaxContent => {
-                let (_, max_content) = self.block_intrinsic_content_widths(
-                    element,
-                    style,
-                    stylesheets,
-                    child_boxes,
-                    available_outer_width,
-                );
-                max_content
-            }
-            css::ComputedLengthPercentageOrAuto::FitContent(limit) => {
-                let (min_content, max_content) = self.block_intrinsic_content_widths(
-                    element,
-                    style,
-                    stylesheets,
-                    child_boxes,
-                    available_outer_width,
-                );
-                let stretch = (available_outer_width - horizontal_extras).max(0.0);
-                let limit = limit
-                    .map(|limit| used_length_percentage(limit, available_outer_width).max(0.0))
-                    .unwrap_or(stretch);
-                max_content.min(min_content.max(limit))
-            }
-            css::ComputedLengthPercentageOrAuto::Auto
-            | css::ComputedLengthPercentageOrAuto::LengthPercentage(_) => {
-                used_content_width(style, available_outer_width, horizontal_extras)
-            }
+        let needs_intrinsic = matches!(
+            style.box_values.width,
+            css::ComputedLengthPercentageOrAuto::MinContent
+                | css::ComputedLengthPercentageOrAuto::MaxContent
+                | css::ComputedLengthPercentageOrAuto::FitContent(_)
+        );
+        if !needs_intrinsic {
+            return used_content_width(style, available_outer_width, horizontal_extras);
         }
+
+        let (min_content, max_content) = self.block_intrinsic_content_widths(
+            element,
+            style,
+            stylesheets,
+            child_boxes,
+            available_outer_width,
+        );
+        intrinsic::content_width_from_intrinsic(
+            style,
+            available_outer_width,
+            horizontal_extras,
+            min_content,
+            max_content,
+            intrinsic::IntrinsicAutoWidth::FillAvailable,
+        )
     }
 
     /// Estimate block min-content and max-content content-box inline sizes.
@@ -1080,10 +1177,7 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
         );
         if contribution.max_content > 0.0 || contribution.min_content > 0.0 {
-            return (
-                contribution.min_content,
-                intrinsic::guarded_max_content_width(contribution.max_content, style),
-            );
+            return (contribution.min_content, contribution.max_content);
         }
         let shrink_to_fit = self.estimate_shrink_to_fit_width(
             element,
@@ -1105,24 +1199,16 @@ impl<'a> LayoutBuilder<'a> {
     ) -> BlockLayoutGeometry {
         let containing_inline_size = (self.content_right - self.content_left).max(0.0);
         let mut used_style = self.style_with_current_viewport_lengths(style);
-        let used_edges = used_box_edges(&used_style, containing_inline_size);
-        used_style.margin = used_edges.margin.to_css_edges();
-        used_style.padding = used_edges.padding.to_css_edges();
+        let box_metrics = apply_used_box_metrics(&mut used_style, containing_inline_size);
         let relative_offset =
             relative_position_offset(&used_style, self.current_containing_block());
         let available_outer_width = self.content_right
             - self.content_left
             - used_style.margin.left
             - used_style.margin.right;
-        let border_widths = used_border_widths(&used_style);
-        let horizontal_extras = border_widths.left
-            + border_widths.right
-            + used_style.padding.left
-            + used_style.padding.right;
-        let vertical_extras = border_widths.top
-            + border_widths.bottom
-            + used_style.padding.top
-            + used_style.padding.bottom;
+        let border_widths = box_metrics.border;
+        let horizontal_extras = box_metrics.horizontal_non_content();
+        let vertical_extras = box_metrics.vertical_non_content();
         let requested_content_width = self.used_block_content_width(
             element,
             &used_style,
@@ -1144,6 +1230,12 @@ impl<'a> LayoutBuilder<'a> {
         let outer_width = (content_width + horizontal_extras)
             .min(available_outer_width)
             .max(0.0);
+        resolve_normal_flow_block_auto_margins(
+            &mut used_style,
+            containing_inline_size,
+            outer_width,
+            self.containing_block_direction,
+        );
         let outer_x = normal_flow_block_outer_x(
             self.content_left,
             self.content_right,
@@ -1158,27 +1250,278 @@ impl<'a> LayoutBuilder<'a> {
             relative_offset,
             border_widths,
             vertical_extras,
-            content_width,
             definite_content_height,
-            outer_width,
-            outer_x,
-            inner_x,
-            inner_width: content_width.max(0.0),
+            outer_inline: BlockInlineBounds::new(outer_x, outer_width),
+            content_inline: BlockInlineBounds::new(inner_x, content_width),
         }
     }
 }
 
+/// Returns whether block `align-content` needs descendant paint bounds.
+///
+/// Horizontal block containers know their alignment-subject block size from
+/// normal-flow layout height. In vertical writing modes the block axis is
+/// physical horizontal, so same-page alignment uses captured descendant paint
+/// bounds as the concrete alignment subject:
+/// <https://www.w3.org/TR/css-align-3/#align-content-property> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#block-flow>.
+fn vertical_block_align_content_needs_fragment_bounds(style: &ComputedStyle) -> bool {
+    style.writing_mode != WritingMode::HorizontalTb
+        && style.align_content.keyword != ContentAlignmentKeyword::Normal
+}
+
+fn vertical_block_align_content_x_offset(
+    style: &ComputedStyle,
+    content_left: f32,
+    content_width: f32,
+    subject_bounds: Option<PaintClip>,
+) -> f32 {
+    if !vertical_block_align_content_needs_fragment_bounds(style) {
+        return 0.0;
+    }
+    let Some(subject_bounds) = subject_bounds else {
+        return 0.0;
+    };
+    let subject_width = subject_bounds.width().max(0.0);
+    let free_space = content_width.max(0.0) - subject_width;
+    let toward_block_end = content_alignment_offset_toward_end(
+        style.align_content,
+        free_space,
+        block_align_content_defaults_to_safe_overflow(style),
+    );
+    match block_start_side(style.writing_mode) {
+        PhysicalSide::Left => content_left + toward_block_end - subject_bounds.x(),
+        PhysicalSide::Right => {
+            content_left + content_width.max(0.0)
+                - toward_block_end
+                - (subject_bounds.x() + subject_width)
+        }
+        PhysicalSide::Top | PhysicalSide::Bottom => 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_align_content_offset_uses_single_subject_fallbacks() {
+        assert_eq!(block_align_content_y_offset(AlignContent::End, 30.0), -30.0);
+        assert_eq!(
+            block_align_content_y_offset(AlignContent::SpaceAround, 30.0),
+            -15.0
+        );
+        assert_eq!(
+            block_align_content_y_offset(
+                AlignContent::safe(ContentAlignmentKeyword::Center),
+                -20.0,
+            ),
+            0.0
+        );
+        assert_eq!(
+            block_align_content_y_offset(
+                AlignContent::unsafe_position(ContentAlignmentKeyword::Center),
+                -20.0,
+            ),
+            10.0
+        );
+        assert_eq!(
+            block_align_content_y_offset(AlignContent::LastBaseline, -20.0),
+            0.0
+        );
+        let mut scroll_container_style = ComputedStyle::initial();
+        scroll_container_style.align_content = AlignContent::Center;
+        scroll_container_style.overflow_y = css::Overflow::Auto;
+        assert_eq!(
+            block_align_content_y_offset_for_style(&scroll_container_style, -20.0),
+            10.0
+        );
+        assert!(
+            block_align_content_establishes_independent_formatting_context(AlignContent::Center)
+        );
+        assert!(
+            !block_align_content_establishes_independent_formatting_context(AlignContent::Normal)
+        );
+    }
+
+    #[test]
+    fn vertical_block_align_content_offsets_use_logical_block_axis() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalLr;
+        style.align_content = AlignContent::Center;
+        let subject = PaintClip::from_paint_rect(paint_space_rect(10.0, 20.0, 20.0, 40.0));
+        assert_eq!(
+            vertical_block_align_content_x_offset(&style, 10.0, 80.0, Some(subject)),
+            30.0
+        );
+
+        style.align_content = AlignContent::End;
+        assert_eq!(
+            vertical_block_align_content_x_offset(&style, 10.0, 80.0, Some(subject)),
+            60.0
+        );
+
+        style.writing_mode = WritingMode::VerticalRl;
+        assert_eq!(
+            vertical_block_align_content_x_offset(&style, 10.0, 80.0, Some(subject)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn block_border_box_projects_top_edge_to_paint_space() {
+        let border_box = BlockBorderBox::new(12.0, 90.0, 40.0, 25.0);
+        let page_top_rect = border_box.page_top_rect();
+        assert_eq!(page_top_rect.bottom_y(), 65.0);
+        assert_eq!(
+            page_top_rect.paint_rect(),
+            paint_space_rect(12.0, 65.0, 40.0, 25.0)
+        );
+    }
+}
+
+/// Horizontal and size inputs for one normal-flow block box.
+///
+/// CSS 2.2 block formatting computes inline-size, margins, padding, and
+/// relative-position offsets before child layout determines the final block
+/// extent. This struct therefore stores the pre-layout physical inline
+/// geometry and exposes typed page-space helpers once a block top and used
+/// content height are known:
+/// <https://www.w3.org/TR/CSS22/visuren.html#block-formatting> and
+/// <https://www.w3.org/TR/CSS22/box.html>.
 struct BlockLayoutGeometry {
     style: ComputedStyle,
     relative_offset: RelativeOffset,
     border_widths: css::Edges,
     vertical_extras: f32,
-    content_width: f32,
     definite_content_height: Option<f32>,
-    outer_width: f32,
-    outer_x: f32,
-    inner_x: f32,
-    inner_width: f32,
+    outer_inline: BlockInlineBounds,
+    content_inline: BlockInlineBounds,
+}
+
+impl BlockLayoutGeometry {
+    fn outer_inline(&self) -> BlockInlineBounds {
+        self.outer_inline
+    }
+
+    fn content_inline(&self) -> BlockInlineBounds {
+        self.content_inline
+    }
+
+    fn outer_width(&self) -> f32 {
+        self.outer_inline.size()
+    }
+
+    fn content_width(&self) -> f32 {
+        self.content_inline.size()
+    }
+
+    /// Return the final block border box in block formatting coordinates.
+    ///
+    /// CSS Box defines the border box as the outer painted box excluding
+    /// margins. Block layout knows the top edge before descendants are laid out
+    /// and the final block size afterward, so this is the point where Quire can
+    /// form a typed block-layout rectangle:
+    /// <https://www.w3.org/TR/CSS22/box.html#box-dimensions>.
+    fn border_box_top_rect(
+        &self,
+        outer_x: f32,
+        block_top: f32,
+        block_height: f32,
+    ) -> BlockBorderBox {
+        BlockBorderBox::new(outer_x, block_top, self.outer_width(), block_height)
+    }
+
+    /// Return the block padding box as a top-edge page rectangle.
+    ///
+    /// CSS Positioned Layout uses the padding box of positioned ancestors as
+    /// the containing block for absolute descendants:
+    /// <https://www.w3.org/TR/css-position-3/#def-cb>.
+    fn padding_box_top_rect(
+        &self,
+        outer_x: f32,
+        block_top: f32,
+        content_height: f32,
+    ) -> PageTopRect {
+        PageTopRect::new(
+            outer_x + self.border_widths.left,
+            block_top - self.border_widths.top,
+            self.content_width() + self.style.padding.left + self.style.padding.right,
+            content_height + self.style.padding.top + self.style.padding.bottom,
+        )
+    }
+}
+
+/// Physical inline-axis bounds for a block formatting box.
+///
+/// CSS normal-flow block layout resolves the used inline size and physical
+/// inline-start offset before child layout determines the block-axis extent.
+/// This wrapper keeps those values labelled as block formatting coordinates
+/// instead of carrying unqualified `x` and `width` scalars through layout:
+/// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BlockInlineBounds {
+    span: PageInlineSpan,
+}
+
+impl BlockInlineBounds {
+    fn new(start: f32, size: f32) -> Self {
+        Self {
+            span: PageInlineSpan::new(start, size),
+        }
+    }
+
+    fn start(self) -> f32 {
+        self.span.left_x()
+    }
+
+    fn size(self) -> f32 {
+        self.span.width()
+    }
+}
+
+/// A CSS block border box in block formatting coordinates.
+///
+/// The origin is the physical top-left border edge used by CSS 2.2 normal-flow
+/// block layout, and the block extent grows downward. This is intentionally a
+/// block-layout type, not a paint-space rectangle; callers must project through
+/// [`page_top_rect`](Self::page_top_rect) before creating paint or PDF data:
+/// <https://www.w3.org/TR/CSS22/box.html#box-dimensions> and
+/// <https://www.w3.org/TR/CSS22/visuren.html#block-formatting>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BlockBorderBox {
+    rect: BlockRect,
+}
+
+impl BlockBorderBox {
+    fn new(x: f32, top_y: f32, width: f32, height: f32) -> Self {
+        Self {
+            rect: BlockRect::new(
+                BlockPoint::new(x, top_y),
+                BlockSize::new(width.max(0.0), height.max(0.0)),
+            ),
+        }
+    }
+
+    fn x(self) -> f32 {
+        self.rect.origin.x
+    }
+
+    fn top_y(self) -> f32 {
+        self.rect.origin.y
+    }
+
+    fn width(self) -> f32 {
+        self.rect.size.width
+    }
+
+    fn height(self) -> f32 {
+        self.rect.size.height
+    }
+
+    fn page_top_rect(self) -> PageTopRect {
+        PageTopRect::new(self.x(), self.top_y(), self.width(), self.height())
+    }
 }
 
 /// Inputs for deciding whether a definite-height block should prebreak.

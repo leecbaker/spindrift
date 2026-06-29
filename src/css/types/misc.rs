@@ -295,6 +295,130 @@ pub(crate) enum Position {
     Relative,
     Absolute,
     Fixed,
+    Sticky,
+}
+
+/// Computed `isolation`.
+///
+/// CSS Compositing and Blending defines `isolation:isolate` as creating an
+/// isolated stacking context:
+/// <https://www.w3.org/TR/compositing-1/#isolation>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Isolation {
+    Auto,
+    Isolate,
+}
+
+/// Computed `mix-blend-mode` subset.
+///
+/// Non-`normal` blend modes establish stacking contexts. The renderer currently
+/// records the trigger and preserves isolation ordering; PDF blend-mode output
+/// can be expanded from these variants:
+/// <https://www.w3.org/TR/compositing-1/#mix-blend-mode>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MixBlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+/// Computed `filter` value retained for stacking and later effect emission.
+///
+/// Non-`none` filter function lists establish a stacking context:
+/// <https://www.w3.org/TR/filter-effects-1/#FilterProperty>.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilterValue {
+    None,
+    Functions(String),
+}
+
+/// Computed mask image/source value retained for stacking and later masking.
+///
+/// Non-`none` masks establish an isolated paint effect in CSS Masking:
+/// <https://www.w3.org/TR/css-masking-1/#the-mask-image>.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MaskValue {
+    None,
+    Image(String),
+}
+
+/// Computed paint containment bits relevant to stacking.
+///
+/// `contain: paint`, `contain: strict`, and `contain: content` establish paint
+/// containment and therefore a stacking context:
+/// <https://www.w3.org/TR/css-contain-2/#containment-paint>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Contain {
+    pub(crate) layout: bool,
+    pub(crate) paint: bool,
+    pub(crate) style: bool,
+    pub(crate) size: bool,
+}
+
+impl Contain {
+    pub(crate) const NONE: Self = Self {
+        layout: false,
+        paint: false,
+        style: false,
+        size: false,
+    };
+}
+
+/// Computed `content-visibility`.
+///
+/// `auto` and `hidden` imply layout/style/paint containment in CSS Containment:
+/// <https://www.w3.org/TR/css-contain-2/#content-visibility>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentVisibility {
+    Visible,
+    Auto,
+    Hidden,
+}
+
+/// Computed `clip-path` support relevant to paint isolation.
+///
+/// Non-`none` clip paths establish stacking contexts. Geometry support is kept
+/// intentionally coarse until clipping is represented as paths in paint
+/// effects:
+/// <https://www.w3.org/TR/css-masking-1/#the-clip-path>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipPath {
+    None,
+    Inset,
+    Shape,
+    Url,
+}
+
+/// Computed `will-change` features relevant to stacking-context prediction.
+///
+/// CSS Will Change requires the element to act as if specified features already
+/// had their non-initial values for stacking-context creation:
+/// <https://www.w3.org/TR/css-will-change-1/#will-change>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct WillChange {
+    pub(crate) contents: bool,
+    pub(crate) scroll_position: bool,
+    pub(crate) opacity: bool,
+    pub(crate) transform: bool,
+    pub(crate) filter: bool,
+    pub(crate) clip_path: bool,
+    pub(crate) mask: bool,
+    pub(crate) mix_blend_mode: bool,
+    pub(crate) isolation: bool,
+    pub(crate) contain: bool,
 }
 
 /// One computed CSS 2D transform function.
@@ -365,16 +489,6 @@ pub(crate) enum Float {
     InlineEnd,
 }
 
-impl Float {
-    pub(crate) fn physical(self, direction: Direction) -> Self {
-        match (self, direction) {
-            (Self::InlineStart, Direction::Ltr) | (Self::InlineEnd, Direction::Rtl) => Self::Left,
-            (Self::InlineStart, Direction::Rtl) | (Self::InlineEnd, Direction::Ltr) => Self::Right,
-            _ => self,
-        }
-    }
-}
-
 /// Computed `clear` value.
 ///
 /// CSS 2.2 defines clearance as moving a box below prior left and/or right
@@ -388,23 +502,6 @@ pub(crate) enum Clear {
     Both,
     InlineStart,
     InlineEnd,
-}
-
-impl Clear {
-    pub(crate) fn matches_float(self, float: Float, direction: Direction) -> bool {
-        let clear = match (self, direction) {
-            (Self::InlineStart, Direction::Ltr) | (Self::InlineEnd, Direction::Rtl) => Self::Left,
-            (Self::InlineStart, Direction::Rtl) | (Self::InlineEnd, Direction::Ltr) => Self::Right,
-            _ => self,
-        };
-        let float = float.physical(direction);
-        matches!(
-            (clear, float),
-            (Self::Both, Float::Left | Float::Right)
-                | (Self::Left, Float::Left)
-                | (Self::Right, Float::Right)
-        )
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +567,7 @@ pub(crate) enum NamedStringPart {
     BeforeContent,
     AfterContent,
     Attr(String),
+    Image(String),
     Counter {
         name: String,
         style: Option<ListStyleType>,
@@ -1129,6 +1227,43 @@ impl Default for TextEmphasisSkip {
             punctuation: true,
             symbols: false,
             narrow: false,
+        }
+    }
+}
+
+/// Computed CSS `box-shadow` layer.
+///
+/// CSS Backgrounds and Borders Level 3 defines each shadow as a box-shaped
+/// image outside or inside the border box, with the same geometry as the
+/// border box unless offset, blur, or spread modifies it:
+/// <https://www.w3.org/TR/css-backgrounds-3/#box-shadow>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BoxShadow {
+    pub(crate) color: BoxShadowColor,
+    pub(crate) offset_x: f32,
+    pub(crate) offset_y: f32,
+    pub(crate) blur_radius: f32,
+    pub(crate) spread: f32,
+    pub(crate) inset: bool,
+}
+
+/// Color component of a computed CSS `box-shadow`.
+///
+/// CSS Color defines `currentColor` as the element's own computed `color`.
+/// `box-shadow` is not inherited, but `currentColor` still resolves against
+/// the box that paints the shadow:
+/// <https://www.w3.org/TR/css-color-3/#currentcolor>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum BoxShadowColor {
+    CurrentColor,
+    Color(Color),
+}
+
+impl BoxShadowColor {
+    pub(crate) fn resolve(self, current_color: Color) -> Color {
+        match self {
+            Self::CurrentColor => current_color,
+            Self::Color(color) => color,
         }
     }
 }

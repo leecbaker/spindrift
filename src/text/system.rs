@@ -1,7 +1,6 @@
 pub(super) use super::*;
 
 mod api;
-mod breaking;
 mod fallback;
 mod font_face;
 mod font_loading;

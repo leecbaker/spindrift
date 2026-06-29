@@ -366,6 +366,7 @@ fn register_loaded_font_face(
             metadata: RegisteredFontFaceMetadata {
                 family: font_face.family.clone(),
                 feature_defaults: FontFaceFeatureDefaults::from_font_face(font_face),
+                unicode_range: font_face.unicode_range.clone(),
             },
         })
         .collect()

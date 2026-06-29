@@ -22,7 +22,7 @@ impl<'a> LayoutBuilder<'a> {
             None,
             f32::MAX,
         );
-        (measurement.contribution.max_content, measurement.height)
+        (measurement.contribution.max_content, measurement.height())
     }
 
     pub(super) fn push_ancestor_signature(&mut self, signature: ElementSignature) {

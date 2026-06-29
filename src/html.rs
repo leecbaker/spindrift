@@ -167,7 +167,9 @@ impl Html {
 
     pub async fn write_pdf_bytes_async(&self, options: &RenderOptions) -> Result<Vec<u8>> {
         let _timer = DebugTimer::start("rendering and writing PDF bytes");
-        self.render_async(options).await?.write_pdf_bytes()
+        self.render_async(options)
+            .await?
+            .write_pdf_bytes_with_options(options)
     }
 
     pub async fn write_pdf_async<P: AsRef<Path>>(

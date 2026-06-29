@@ -213,6 +213,9 @@ pub(crate) fn parse_named_string_sets(value: &str) -> Option<Vec<NamedStringSet>
                 }
                 parts.push(NamedStringPart::Attr(name));
                 rest = tail.trim_start();
+            } else if let Some((url, tail)) = parse_css_url_token(rest) {
+                parts.push(NamedStringPart::Image(url));
+                rest = tail.trim_start();
             } else if let Some((counter, tail)) = parse_named_string_counter_token(rest) {
                 parts.push(counter);
                 rest = tail.trim_start();

@@ -1,42 +1,9 @@
 use super::super::*;
+use super::InlineLineSequence;
 use super::graph::{InlineLineFragment, MeasuredInlineItem, measured_inline_items};
 
 impl<'a> LayoutBuilder<'a> {
-    pub(in crate::layout) fn paint_mixed_inline_line(
-        &mut self,
-        line: &InlineLineFragment,
-        context: InlinePaintContext<'_>,
-    ) {
-        let block_style = context.block_style;
-        let line_metrics = line.metrics;
-        let line_height = line_metrics.height.max(block_style.line_height);
-        if line.items.is_empty() {
-            self.cursor_y -= line_height;
-            return;
-        }
-        if self.cursor_y - line_height < self.page_bottom() {
-            self.push_page();
-        }
-        let band = self.current_float_band(self.cursor_y, line_height);
-        let left_offset = (band.left - self.content_left - context.padding_left).max(0.0);
-        let right_offset = (self.content_right - band.right).max(0.0);
-        let context = if left_offset > 0.0 || right_offset > 0.0 {
-            let available_width = (band.right - self.content_left - context.padding_left).max(1.0);
-            InlinePaintContext {
-                available_width: context.available_width.min(available_width),
-                line_indent: context.line_indent.max(left_offset),
-                ..context
-            }
-        } else {
-            context
-        };
-        if let Some(prepared) = self.prepare_mixed_inline_line(line, context) {
-            self.paint_prepared_mixed_inline_line(&prepared);
-        }
-        self.cursor_y -= line_height;
-    }
-
-    /// Prepare one mixed inline line for painting.
+    /// Prepare one inline line fragment for painting.
     ///
     /// CSS Inline first resolves the line box and positions inline-level
     /// fragments within it; CSS Text shaping then produces glyph runs for
@@ -44,20 +11,23 @@ impl<'a> LayoutBuilder<'a> {
     /// positions and shaped groups before any page paint operation is emitted:
     /// <https://www.w3.org/TR/css-inline-3/#line-box> and
     /// <https://www.w3.org/TR/css-text-3/#boundary-shaping>.
-    pub(in crate::layout) fn prepare_mixed_inline_line(
+    pub(in crate::layout) fn prepare_inline_line_fragment(
         &mut self,
         line_fragment: &InlineLineFragment,
         context: InlinePaintContext<'_>,
-    ) -> Option<PreparedMixedInlineLine> {
+    ) -> Option<PreparedInlineLine> {
         let block_style = context.block_style;
         let line_metrics = line_fragment.metrics;
-        let justify_by_character = matches!(block_style.text_justify, TextJustify::InterCharacter);
+        let should_justify_line = context.text_align.justifies()
+            && !matches!(block_style.text_justify, TextJustify::None);
+        let split_for_inter_character =
+            should_justify_line && matches!(block_style.text_justify, TextJustify::InterCharacter);
         let apply_typographic_pseudos = context.is_first_line
             && (block_style.first_line_style.is_some() || block_style.first_letter_style.is_some());
         let line = if apply_typographic_pseudos {
             let mut source_items = measured_inline_items(&line_fragment.items);
             apply_first_line_pseudos_to_line_items(&mut source_items, block_style);
-            let source_items = if justify_by_character {
+            let source_items = if split_for_inter_character {
                 split_mixed_line_into_inter_character_units(&source_items)
             } else {
                 source_items
@@ -75,7 +45,10 @@ impl<'a> LayoutBuilder<'a> {
                             )
                             .map(|line| line.advance_width())
                             .unwrap_or(0.0),
-                        InlineLineItem::Atom(atom) => atom.width,
+                        InlineLineItem::Atom(atom) => {
+                            inline_atom_logical_inline_size(atom, block_style)
+                        }
+                        InlineLineItem::Float(_) => 0.0,
                     };
                     MeasuredInlineItem {
                         item,
@@ -84,7 +57,7 @@ impl<'a> LayoutBuilder<'a> {
                     }
                 })
                 .collect::<Vec<_>>()
-        } else if justify_by_character {
+        } else if split_for_inter_character {
             split_mixed_line_into_inter_character_units(&measured_inline_items(
                 &line_fragment.items,
             ))
@@ -100,7 +73,10 @@ impl<'a> LayoutBuilder<'a> {
                         )
                         .map(|line| line.advance_width())
                         .unwrap_or(0.0),
-                    InlineLineItem::Atom(atom) => atom.width,
+                    InlineLineItem::Atom(atom) => {
+                        inline_atom_logical_inline_size(atom, block_style)
+                    }
+                    InlineLineItem::Float(_) => 0.0,
                 };
                 MeasuredInlineItem {
                     item,
@@ -113,60 +89,49 @@ impl<'a> LayoutBuilder<'a> {
             line_fragment.items.clone()
         };
         let line_items = measured_inline_items(&line);
+        let line_geometry = InlineLineGeometry::new(self.content_left, self.cursor_y, context);
+        let line_alignment_width = (line_metrics.width
+            - visual_leading_inline_end_box_edge_width(&line, line_geometry))
+        .max(0.0);
         let hanging_widths = line_fragment.hanging_widths;
-        let line_available_width = (context.available_width - context.line_indent).max(1.0);
+        let line_available_width = line_geometry.inline_size;
         let line_align = context.text_align;
         let line_baseline_offset = line_metrics.baseline_offset;
-        let should_justify =
-            line_align.justifies() && !matches!(block_style.text_justify, TextJustify::None);
-        let justify_inter_word = should_justify && !justify_by_character;
-        let extra_space_width = if should_justify {
-            let gaps = if justify_by_character {
-                inter_character_mixed_gap_count(&line_items)
-            } else {
-                justifiable_mixed_space_count(&line_items)
-            };
-            if gaps > 0 && line_metrics.width < line_available_width {
-                (line_available_width - line_metrics.width) / gaps as f32
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-        let mut x = aligned_x_with_width(
-            inline_line_left_for_indent(
-                self.content_left,
-                context.padding_left,
-                context.line_indent,
-                block_style,
-            ),
-            line_available_width,
-            line_metrics.width,
-            if should_justify {
+        let justification_plan = InlineJustificationPlan::for_line(
+            &line_items,
+            block_style.text_justify,
+            should_justify_line,
+        );
+        let extra_space_width =
+            justification_plan.extra_space_width(line_metrics.width, line_available_width);
+        let mut line_logical_inline_start = line_geometry.alignment_offset(
+            line_alignment_width,
+            if should_justify_line {
                 TextAlign::Left
             } else {
                 line_align
             },
         );
-        x += line_start_hanging_punctuation_paint_offset(block_style, hanging_widths.start)
-            + line_end_hanging_punctuation_paint_offset(block_style, hanging_widths.end);
+        line_logical_inline_start += line_geometry.hanging_punctuation_offset(hanging_widths);
+        let line_physical_origin =
+            line_geometry.visual_line_origin(line_logical_inline_start, line_alignment_width);
+        let mut inline_position = 0.0;
         let mut pending_fragments = Vec::new();
-        let mut pending_x = x;
+        let mut pending_inline_position = inline_position;
+        let mut pending_preserve_leading_summary_space = false;
+        let mut previous_item_was_opaque_atom = false;
         let mut paint_items = Vec::new();
         for (item_index, measured_item) in line.iter().enumerate() {
             match &measured_item.item {
                 InlineLineItem::Fragment(fragment) => {
                     let mut fragment = fragment.clone();
-                    let had_soft_hyphen = fragment.text.contains('\u{00ad}');
-                    if had_soft_hyphen {
-                        fragment.text = fragment.text.replace('\u{00ad}', "");
-                    }
                     if inline_fragment_is_join_control_only(&fragment) {
                         if pending_fragments.is_empty() {
-                            pending_x = x;
+                            pending_inline_position = inline_position;
+                            pending_preserve_leading_summary_space = previous_item_was_opaque_atom;
                         }
                         pending_fragments.push(fragment);
+                        previous_item_was_opaque_atom = false;
                         continue;
                     }
                     let fragment_baseline_offset =
@@ -174,7 +139,7 @@ impl<'a> LayoutBuilder<'a> {
                     let fragment_background_y = self.cursor_y - line_baseline_offset
                         + fragment_baseline_offset
                         - fragment.style.line_height;
-                    if !matches!(fragment.style.vertical_align, VerticalAlign::Top) {
+                    if !fragment.style.vertical_align.aligns_to_line_box_edge() {
                         let natural_baseline_offset =
                             fragment_baseline_offset + fragment.baseline_shift;
                         fragment.baseline_shift += natural_baseline_offset - line_baseline_offset;
@@ -184,11 +149,6 @@ impl<'a> LayoutBuilder<'a> {
                         .as_ref()
                         .map(ShapedInlineLine::advance_width)
                         .unwrap_or(measured_item.width);
-                    if had_soft_hyphen {
-                        width = self
-                            .font_system
-                            .measure_text(&fragment.text, &fragment.style);
-                    }
                     if item_index + 1 == line.len() {
                         width = (width
                             - trailing_letter_spacing_width_for_line_items(std::slice::from_ref(
@@ -196,190 +156,276 @@ impl<'a> LayoutBuilder<'a> {
                             )))
                         .max(0.0);
                     }
-                    let fragment_is_justification_space =
-                        inline_fragment_is_inter_word_justification_space(&fragment);
-                    let inter_word_space_count = usize::from(justify_inter_word)
-                        * usize::from(fragment_is_justification_space)
-                        * fragment.text.chars().count();
+                    let fragment_expansion_count =
+                        justification_plan.expansion_count_after_item(item_index);
+                    let fragment_rect = line_geometry.visual_line_item_rect(
+                        line_logical_inline_start,
+                        line_physical_origin,
+                        inline_position,
+                        width + extra_space_width * fragment_expansion_count as f32,
+                        fragment_background_y,
+                        fragment.style.line_height,
+                    );
                     paint_items.push(PreparedInlinePaintItem::FragmentBackground(
                         PreparedInlineFragment {
                             fragment: fragment.clone(),
-                            x,
-                            background_y: fragment_background_y,
-                            width: width + extra_space_width * inter_word_space_count as f32,
-                            height: fragment.style.line_height,
+                            rect: fragment_rect,
                         },
                     ));
-                    let fragment_char_count = fragment.text.chars().count();
-                    let can_append = (extra_space_width == 0.0 || justify_inter_word)
+                    let can_append = (extra_space_width == 0.0
+                        || justification_plan.justifies_inter_word())
                         && pending_fragments.last().is_some_and(|previous| {
                             can_queue_inline_fragments_for_shaping(previous, &fragment)
                         });
                     if pending_fragments.is_empty() {
-                        pending_x = x;
+                        pending_inline_position = inline_position;
+                        pending_preserve_leading_summary_space = previous_item_was_opaque_atom;
                     } else if !can_append {
-                        if let Some(group) = if justify_inter_word {
-                            self.prepare_justified_inline_text_group(
+                        if let Some(group) = if justification_plan.justifies_inter_word() {
+                            self.prepare_justified_inline_text_group_at_inline_position(
                                 &pending_fragments,
-                                pending_x,
+                                line_geometry,
+                                line_logical_inline_start,
+                                line_physical_origin,
+                                pending_inline_position,
                                 extra_space_width,
+                                pending_preserve_leading_summary_space,
                             )
                         } else {
-                            self.prepare_inline_text_group(&pending_fragments, pending_x)
+                            self.prepare_inline_text_group_at_inline_position(
+                                &pending_fragments,
+                                line_geometry,
+                                line_logical_inline_start,
+                                line_physical_origin,
+                                pending_inline_position,
+                                pending_preserve_leading_summary_space,
+                            )
                         } {
                             paint_items.push(PreparedInlinePaintItem::TextGroup(group));
                         }
                         pending_fragments.clear();
-                        pending_x = x;
+                        pending_inline_position = inline_position;
+                        pending_preserve_leading_summary_space = false;
                     }
                     if fragment.style.visibility == Visibility::Visible
                         && inline_fragment_has_visible_text_paint(&fragment)
                     {
                         pending_fragments.push(fragment);
                     }
-                    x += width;
-                    let add_inter_character_gap = justify_by_character
-                        && inter_character_gap_after_mixed_item(&line_items, item_index);
+                    inline_position += width;
+                    let add_inter_character_gap = justification_plan.justifies_inter_character()
+                        && fragment_expansion_count > 0;
                     if extra_space_width > 0.0
-                        && (add_inter_character_gap || fragment_is_justification_space)
+                        && (add_inter_character_gap || fragment_expansion_count > 0)
                     {
                         if add_inter_character_gap {
-                            if let Some(group) =
-                                self.prepare_inline_text_group(&pending_fragments, pending_x)
-                            {
+                            if let Some(group) = self.prepare_inline_text_group_at_inline_position(
+                                &pending_fragments,
+                                line_geometry,
+                                line_logical_inline_start,
+                                line_physical_origin,
+                                pending_inline_position,
+                                pending_preserve_leading_summary_space,
+                            ) {
                                 paint_items.push(PreparedInlinePaintItem::TextGroup(group));
                             }
                             pending_fragments.clear();
+                            pending_preserve_leading_summary_space = false;
                         }
-                        x += if add_inter_character_gap {
+                        inline_position += if add_inter_character_gap {
                             extra_space_width
                         } else {
-                            extra_space_width * fragment_char_count as f32
+                            extra_space_width * fragment_expansion_count as f32
                         };
                     }
-                }
-                InlineLineItem::Atom(atom)
-                    if matches!(atom.content, InlineAtomContent::Leader(_)) =>
-                {
-                    if let Some(group) = if justify_inter_word {
-                        self.prepare_justified_inline_text_group(
-                            &pending_fragments,
-                            pending_x,
-                            extra_space_width,
-                        )
-                    } else {
-                        self.prepare_inline_text_group(&pending_fragments, pending_x)
-                    } {
-                        paint_items.push(PreparedInlinePaintItem::TextGroup(group));
-                    }
-                    pending_fragments.clear();
-                    let InlineAtomContent::Leader(pattern) = &atom.content else {
-                        unreachable!();
-                    };
-                    let pattern_width = self.font_system.measure_text(pattern, &atom.style);
-                    if pattern_width > 0.0 {
-                        let remaining = (line_available_width - line_metrics.width).max(0.0);
-                        let repeat_count = (remaining / pattern_width).floor() as usize;
-                        if repeat_count > 0 {
-                            let text = pattern.repeat(repeat_count);
-                            let width = self.font_system.measure_text(&text, &atom.style);
-                            let fragment = InlineFragment {
-                                text,
-                                style: atom.style.clone(),
-                                baseline_shift: atom.baseline_shift,
-                                link_target: atom.link_target.clone(),
-                                mergeable: false,
-                                hanging_edges: InlineHangingEdges::default(),
-                            };
-                            if let Some(group) =
-                                self.prepare_inline_text_group(std::slice::from_ref(&fragment), x)
-                            {
-                                paint_items.push(PreparedInlinePaintItem::TextGroup(group));
-                            }
-                            x += width;
-                        }
-                    }
+                    previous_item_was_opaque_atom = false;
                 }
                 InlineLineItem::Atom(atom) => {
                     if matches!(atom.content, InlineAtomContent::Leader(_)) {
                         continue;
                     }
-                    if let Some(group) = if justify_inter_word {
-                        self.prepare_justified_inline_text_group(
+                    if let Some(group) = if justification_plan.justifies_inter_word() {
+                        self.prepare_justified_inline_text_group_at_inline_position(
                             &pending_fragments,
-                            pending_x,
+                            line_geometry,
+                            line_logical_inline_start,
+                            line_physical_origin,
+                            pending_inline_position,
                             extra_space_width,
+                            pending_preserve_leading_summary_space,
                         )
                     } else {
-                        self.prepare_inline_text_group(&pending_fragments, pending_x)
+                        self.prepare_inline_text_group_at_inline_position(
+                            &pending_fragments,
+                            line_geometry,
+                            line_logical_inline_start,
+                            line_physical_origin,
+                            pending_inline_position,
+                            pending_preserve_leading_summary_space,
+                        )
                     } {
                         paint_items.push(PreparedInlinePaintItem::TextGroup(group));
                     }
                     pending_fragments.clear();
-                    let content_x = x + atom.style.margin.left;
-                    let content_width =
-                        (atom.width - atom.style.margin.left - atom.style.margin.right).max(0.0);
-                    let margin_box_inner_height =
-                        (atom.height - atom.style.margin.top - atom.style.margin.bottom).max(0.0);
+                    pending_preserve_leading_summary_space = false;
+                    let logical_inline_start_margin =
+                        inline_atom_logical_inline_start_margin(atom, block_style);
+                    let content_inline_size =
+                        inline_atom_logical_border_inline_size(atom, block_style);
+                    let content_block_size =
+                        inline_atom_logical_border_block_size(atom, block_style);
                     // CSS 2.2 inline formatting treats inline-block/replaced
                     // boxes as atomic inline-level margin boxes; the border
-                    // box is painted inside the atom's vertical margins.
-                    let content_height = margin_box_inner_height;
-                    let y = self.cursor_y - line_baseline_offset + atom.baseline_offset
-                        - margin_box_inner_height
-                        + atom.baseline_shift;
+                    // box is painted inside the atom's logical margins.
+                    let y = inline_atom_horizontal_content_y(
+                        atom,
+                        block_style,
+                        self.cursor_y,
+                        line_metrics.height,
+                        line_baseline_offset,
+                        content_block_size,
+                    );
+                    let content_rect = line_geometry.visual_line_item_rect(
+                        line_logical_inline_start,
+                        line_physical_origin,
+                        inline_position + logical_inline_start_margin,
+                        content_inline_size,
+                        y,
+                        content_block_size,
+                    );
                     paint_items.push(PreparedInlinePaintItem::Atom(PreparedInlineAtom {
                         atom: atom.clone(),
-                        content_x,
-                        y,
-                        content_width,
-                        content_height,
+                        content_rect,
                     }));
-                    x += atom.width;
-                    if extra_space_width > 0.0
-                        && justify_by_character
-                        && inter_character_gap_after_mixed_item(&line_items, item_index)
-                    {
-                        x += extra_space_width;
+                    inline_position += inline_atom_logical_inline_size(atom, block_style);
+                    previous_item_was_opaque_atom =
+                        inline_atom_content_preserves_adjacent_space_summary(&atom.content);
+                }
+                InlineLineItem::Float(_) => {
+                    if let Some(group) = if justification_plan.justifies_inter_word() {
+                        self.prepare_justified_inline_text_group_at_inline_position(
+                            &pending_fragments,
+                            line_geometry,
+                            line_logical_inline_start,
+                            line_physical_origin,
+                            pending_inline_position,
+                            extra_space_width,
+                            pending_preserve_leading_summary_space,
+                        )
+                    } else {
+                        self.prepare_inline_text_group_at_inline_position(
+                            &pending_fragments,
+                            line_geometry,
+                            line_logical_inline_start,
+                            line_physical_origin,
+                            pending_inline_position,
+                            pending_preserve_leading_summary_space,
+                        )
+                    } {
+                        paint_items.push(PreparedInlinePaintItem::TextGroup(group));
                     }
+                    pending_fragments.clear();
+                    pending_preserve_leading_summary_space = false;
+                    inline_position += measured_item.width;
+                    previous_item_was_opaque_atom = false;
                 }
             }
         }
-        if let Some(group) = if justify_inter_word {
-            self.prepare_justified_inline_text_group(
+        if let Some(group) = if justification_plan.justifies_inter_word() {
+            self.prepare_justified_inline_text_group_at_inline_position(
                 &pending_fragments,
-                pending_x,
+                line_geometry,
+                line_logical_inline_start,
+                line_physical_origin,
+                pending_inline_position,
                 extra_space_width,
+                pending_preserve_leading_summary_space,
             )
         } else {
-            self.prepare_inline_text_group(&pending_fragments, pending_x)
+            self.prepare_inline_text_group_at_inline_position(
+                &pending_fragments,
+                line_geometry,
+                line_logical_inline_start,
+                line_physical_origin,
+                pending_inline_position,
+                pending_preserve_leading_summary_space,
+            )
         } {
             paint_items.push(PreparedInlinePaintItem::TextGroup(group));
         }
-        Some(PreparedMixedInlineLine {
+        Some(PreparedInlineLine {
             metrics: line_metrics,
             paint_items,
         })
     }
 
-    /// Paint a prepared mixed inline line without reshaping text.
+    fn prepare_inline_text_group_at_inline_position(
+        &mut self,
+        fragments: &[InlineFragment],
+        line_geometry: InlineLineGeometry,
+        line_logical_inline_start: f32,
+        line_physical_origin: f32,
+        visual_inline_start: f32,
+        preserve_leading_summary_space: bool,
+    ) -> Option<PreparedInlineTextGroup> {
+        let mut group = self.prepare_inline_text_group_with_summary_policy(
+            fragments,
+            0.0,
+            preserve_leading_summary_space,
+        )?;
+        line_geometry.position_visual_text_group(
+            &mut group,
+            line_logical_inline_start,
+            line_physical_origin,
+            visual_inline_start,
+        );
+        Some(group)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_justified_inline_text_group_at_inline_position(
+        &mut self,
+        fragments: &[InlineFragment],
+        line_geometry: InlineLineGeometry,
+        line_logical_inline_start: f32,
+        line_physical_origin: f32,
+        visual_inline_start: f32,
+        extra_per_separator: f32,
+        preserve_leading_summary_space: bool,
+    ) -> Option<PreparedInlineTextGroup> {
+        let mut group = self.prepare_justified_inline_text_group_with_summary_policy(
+            fragments,
+            0.0,
+            extra_per_separator,
+            preserve_leading_summary_space,
+        )?;
+        line_geometry.position_visual_text_group(
+            &mut group,
+            line_logical_inline_start,
+            line_physical_origin,
+            visual_inline_start,
+        );
+        Some(group)
+    }
+
+    /// Paint a prepared inline line without reshaping text.
     ///
     /// PDF text and CSS decoration emission consume the shaped glyph runs
     /// stored during line preparation, keeping fallback fonts and glyph
     /// advances stable after line fitting:
     /// <https://www.w3.org/TR/css-text-3/#text-processing-order> and
     /// ISO 32000-2:2020, 9.4 "Text".
-    fn paint_prepared_mixed_inline_line(&mut self, line: &PreparedMixedInlineLine) {
+    pub(in crate::layout) fn paint_prepared_inline_line(&mut self, line: &PreparedInlineLine) {
         debug_assert!(line.metrics.height.is_finite());
         for item in &line.paint_items {
             match item {
                 PreparedInlinePaintItem::FragmentBackground(fragment) => {
                     self.paint_inline_fragment_background(
                         &fragment.fragment,
-                        fragment.x,
-                        fragment.background_y,
-                        fragment.width,
-                        fragment.height,
+                        fragment.rect.x(),
+                        fragment.rect.y(),
+                        fragment.rect.width(),
+                        fragment.rect.height(),
                     );
                 }
                 PreparedInlinePaintItem::TextGroup(group) => {
@@ -405,7 +451,7 @@ impl<'a> LayoutBuilder<'a> {
         }
         if matches!(
             atom.content,
-            InlineAtomContent::InlineEdge | InlineAtomContent::Leader(_)
+            InlineAtomContent::InlineEdge(_) | InlineAtomContent::Leader(_)
         ) {
             return;
         }
@@ -414,25 +460,30 @@ impl<'a> LayoutBuilder<'a> {
         self.scope_current_page_atomic_paint_since(
             &checkpoint,
             PaintBand::Inline,
-            PaintClip {
-                x: prepared.content_x,
-                y: prepared.y,
-                width: prepared.content_width,
-                height: prepared.content_height,
-            },
+            prepared.content_rect.paint_clip(),
             &atom.style,
             Vec::new(),
         );
+        if let Some(layers) = &atom.escaped_positioned_layers {
+            for layer in layers.iter() {
+                let mut layer = layer.clone().translated(PaintVector::new(
+                    prepared.content_rect.x(),
+                    prepared.content_rect.y(),
+                ));
+                layer.page_index = self.pages.len();
+                self.positioned_layers.push(layer);
+            }
+        }
     }
 
     fn paint_prepared_inline_atom_contents(&mut self, prepared: &PreparedInlineAtom) {
         let atom = &prepared.atom;
-        let content_x = prepared.content_x;
-        let y = prepared.y;
-        let content_width = prepared.content_width;
-        let content_height = prepared.content_height;
+        let content_x = prepared.content_rect.x();
+        let y = prepared.content_rect.y();
+        let content_width = prepared.content_rect.width();
+        let content_height = prepared.content_rect.height();
         match &atom.content {
-            InlineAtomContent::InlineEdge | InlineAtomContent::Leader(_) => {}
+            InlineAtomContent::InlineEdge(_) | InlineAtomContent::Leader(_) => {}
             InlineAtomContent::Canvas => {
                 if atom.style.background_color.is_some() || used_border_width(&atom.style) > 0.0 {
                     let (rects, rounded_rects, paths, strokes) =
@@ -483,37 +534,29 @@ impl<'a> LayoutBuilder<'a> {
                     .max(0.0);
                 self.push_image_in_band(
                     PaintBand::Inline,
-                    RenderedImage {
-                        background: false,
-                        x: image_x,
-                        y: image_y,
-                        width: image_width,
-                        height: image_height,
-                        pixel_width: decoded.pixel_width,
-                        pixel_height: decoded.pixel_height,
-                        source_rect: None,
-                        interpolate: false,
-                        rgb: decoded.rgb.clone(),
-                        alpha: decoded.alpha.clone(),
-                        alt_text: atom.alt_text.clone(),
-                    },
+                    RenderedImage::from_paint_rect(
+                        paint_space_rect(image_x, image_y, image_width, image_height),
+                        false,
+                        decoded.pixel_width,
+                        decoded.pixel_height,
+                        None,
+                        false,
+                        decoded.rgb.clone(),
+                        decoded.alpha.clone(),
+                        atom.alt_text.clone(),
+                    ),
                 );
             }
             InlineAtomContent::Svg { fill } => {
                 self.push_rect_in_band(
                     PaintBand::Inline,
-                    RenderedRect {
-                        x: content_x,
-                        y,
-                        width: content_width,
-                        height: content_height,
-                        fill: Some(*fill),
-                        stroke: None,
-                        stroke_width: 0.0,
-                    },
+                    RenderedRect::from_paint_rect(
+                        paint_space_rect(content_x, y, content_width, content_height),
+                        Some(*fill),
+                    ),
                 );
             }
-            InlineAtomContent::InlineBox { lines } => {
+            InlineAtomContent::InlineBox { sequence } => {
                 if atom.style.background_color.is_some() || used_border_width(&atom.style) > 0.0 {
                     let (rects, rounded_rects, paths, strokes) =
                         block_paint_ops(content_x, y, content_width, content_height, &atom.style);
@@ -529,7 +572,7 @@ impl<'a> LayoutBuilder<'a> {
                     self.extend_strokes_in_band(PaintBand::Inline, strokes);
                 }
                 let borders = used_border_widths(&atom.style);
-                let mut line_top = y + content_height - borders.top - atom.style.padding.top;
+                let text_top = y + content_height - borders.top - atom.style.padding.top;
                 let text_x = content_x + borders.left + atom.style.padding.left;
                 let text_available_width = (content_width
                     - borders.left
@@ -537,39 +580,13 @@ impl<'a> LayoutBuilder<'a> {
                     - atom.style.padding.left
                     - atom.style.padding.right)
                     .max(1.0);
-                for line in lines {
-                    let x = aligned_x_with_width(
-                        text_x,
-                        text_available_width,
-                        line.width,
-                        atom.style.text_align.physical(atom.style.direction),
-                    );
-                    let rendered_line = if let Some(shaped) = &line.shaped {
-                        self.paint_shaped_inline_line(
-                            shaped,
-                            x,
-                            line_top - atom.style.font_size,
-                            &atom.style,
-                        )
-                    } else {
-                        self.paint_text_runs(
-                            &line.text,
-                            x,
-                            line_top - atom.style.font_size,
-                            &atom.style,
-                        )
-                    };
-                    if let Some(rendered_line) = rendered_line {
-                        self.paint_text_decoration_lines(
-                            x,
-                            rendered_line.y,
-                            line.width,
-                            &atom.style,
-                            &rendered_line.runs,
-                        );
-                    }
-                    line_top -= line.line_height;
-                }
+                self.paint_inline_box_sequence(
+                    sequence,
+                    &atom.style,
+                    text_x,
+                    text_available_width,
+                    text_top,
+                );
             }
             InlineAtomContent::InlineFragment(fragment) => {
                 if atom.style.background_color.is_some() || used_border_width(&atom.style) > 0.0 {
@@ -587,7 +604,7 @@ impl<'a> LayoutBuilder<'a> {
                     self.extend_strokes_in_band(PaintBand::Inline, strokes);
                 }
                 self.current_page
-                    .append_paint_fragment(fragment, content_x, y);
+                    .append_paint_fragment(fragment, PaintVector::new(content_x, y));
             }
         }
         for primitive in
@@ -596,14 +613,37 @@ impl<'a> LayoutBuilder<'a> {
             self.push_primitive_in_band(PaintBand::Outline, primitive);
         }
         if let Some(target) = &atom.link_target {
-            self.current_page.push_link(RenderedLink {
-                x: content_x,
-                y,
-                width: content_width,
-                height: content_height,
-                target: target.clone(),
-            });
+            self.current_page.push_link(RenderedLink::from_paint_rect(
+                paint_space_rect(content_x, y, content_width, content_height),
+                target.clone(),
+            ));
         }
+    }
+
+    fn paint_inline_box_sequence(
+        &mut self,
+        sequence: &InlineLineSequence,
+        style: &ComputedStyle,
+        content_left: f32,
+        available_width: f32,
+        block_top: f32,
+    ) {
+        let saved_content_left = self.content_left;
+        let saved_content_right = self.content_right;
+        let saved_cursor_y = self.cursor_y;
+        self.content_left = content_left;
+        self.content_right = content_left + available_width;
+        self.cursor_y = block_top;
+        self.paint_inline_line_sequence_slice(
+            sequence,
+            style,
+            block_top,
+            block_top,
+            f32::NEG_INFINITY,
+        );
+        self.content_left = saved_content_left;
+        self.content_right = saved_content_right;
+        self.cursor_y = saved_cursor_y;
     }
 
     /// Return a text fragment baseline offset from the mixed line top.
@@ -623,4 +663,73 @@ impl<'a> LayoutBuilder<'a> {
                 .font_ascent_baseline_adjustment(font_id, &fragment.style, line_height);
         fragment.style.font_size - adjustment - fragment.baseline_shift
     }
+}
+
+/// Return the physical bottom y for a horizontal atomic inline content box.
+///
+/// CSS 2.2 defines `vertical-align: top`/`bottom` on inline-level boxes as
+/// margin-box alignment to the line box edge; baseline-like values use the
+/// atom's synthesized baseline:
+/// <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>.
+fn inline_atom_horizontal_content_y(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+    line_top: f32,
+    line_height: f32,
+    line_baseline_offset: f32,
+    content_block_size: f32,
+) -> f32 {
+    match atom.style.vertical_align.baseline_shift {
+        BaselineShift::Top => {
+            line_top
+                - inline_atom_logical_block_start_margin(atom, containing_style)
+                - content_block_size
+                + atom.baseline_shift
+        }
+        BaselineShift::Bottom => {
+            line_top - line_height
+                + inline_atom_logical_block_end_margin(atom, containing_style)
+                + atom.baseline_shift
+        }
+        BaselineShift::LengthPercentage(_)
+        | BaselineShift::Sub
+        | BaselineShift::Super
+        | BaselineShift::Center => {
+            line_top - line_baseline_offset + atom.baseline_offset - content_block_size
+                + atom.baseline_shift
+        }
+    }
+}
+
+fn inline_atom_content_preserves_adjacent_space_summary(content: &InlineAtomContent) -> bool {
+    matches!(
+        content,
+        InlineAtomContent::Canvas
+            | InlineAtomContent::Image(_)
+            | InlineAtomContent::Svg { .. }
+            | InlineAtomContent::InlineBox { .. }
+            | InlineAtomContent::InlineFragment(_)
+            | InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge)
+    )
+}
+
+fn visual_leading_inline_end_box_edge_width(
+    line: &[MeasuredInlineItem],
+    geometry: InlineLineGeometry,
+) -> f32 {
+    if !matches!(geometry.writing_mode, WritingMode::HorizontalTb)
+        || !matches!(geometry.direction, Direction::Rtl)
+    {
+        return 0.0;
+    }
+    line.iter()
+        .take_while(|item| {
+            matches!(
+                &item.item,
+                InlineLineItem::Atom(atom)
+                    if matches!(atom.content, InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge))
+            )
+        })
+        .map(|item| item.width)
+        .sum()
 }

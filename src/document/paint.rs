@@ -2,6 +2,69 @@ use super::Page;
 use crate::{Color, Error, Result};
 use std::borrow::Cow;
 
+/// Page-local paint coordinates before PDF serialization.
+///
+/// Paint primitives are expressed with a bottom-left origin and an upward
+/// `y` axis. That matches PDF default user space for unrotated pages, but this
+/// marker keeps the CSS painting model boundary distinct from final PDF
+/// serialization and future page-rotation or form-XObject coordinate changes:
+/// <https://www.w3.org/TR/css2/visuren.html#painting-order> and
+/// ISO 32000-2:2020, 8.3 "Coordinate Systems".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaintSpace {}
+
+/// PDF default user-space coordinates.
+///
+/// For current unrotated page content streams this is numerically identical to
+/// [`PaintSpace`]. Keeping a separate marker documents the serialization
+/// boundary where page boxes, page rotation, and PDF form coordinate systems
+/// would be applied:
+/// ISO 32000-2:2020, 8.3 "Coordinate Systems".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PdfUserSpace {}
+
+/// A point in page-local paint coordinates.
+pub type PaintPoint = euclid::Point2D<f32, PaintSpace>;
+/// A page-local paint-space translation vector.
+///
+/// This represents movement within the already resolved CSS painting plane:
+/// `x` moves right and `y` moves upward from the physical bottom-left of the
+/// page. Use this for translating captured paint fragments and display-list
+/// primitives; layout top-edge coordinates should be converted before creating
+/// a paint-space vector:
+/// <https://www.w3.org/TR/css2/visuren.html#painting-order>.
+pub(crate) type PaintVector = euclid::Vector2D<f32, PaintSpace>;
+/// A size in page-local paint coordinates.
+pub type PaintSize = euclid::Size2D<f32, PaintSpace>;
+/// A bottom-left-origin rectangle in page-local paint coordinates.
+pub type PaintRect = euclid::Rect<f32, PaintSpace>;
+/// A point in PDF user space.
+pub(crate) type PdfPoint = euclid::Point2D<f32, PdfUserSpace>;
+/// A size in PDF user space.
+pub(crate) type PdfSize = euclid::Size2D<f32, PdfUserSpace>;
+/// A bottom-left-origin rectangle in PDF user space.
+pub(crate) type PdfRect = euclid::Rect<f32, PdfUserSpace>;
+
+/// Convert a paint-space rectangle into current PDF user-space coordinates.
+///
+/// This is intentionally identity today. It names the final boundary so future
+/// page rotation, crop-box, or form-XObject conversions do not get embedded in
+/// individual PDF drawing routines.
+pub(crate) fn paint_rect_to_pdf(rect: PaintRect) -> PdfRect {
+    PdfRect::new(
+        PdfPoint::new(rect.origin.x, rect.origin.y),
+        PdfSize::new(rect.size.width, rect.size.height),
+    )
+}
+
+/// Convert a paint-space point into current PDF user-space coordinates.
+///
+/// Like [`paint_rect_to_pdf`], this is identity for current unrotated pages
+/// but names the boundary for path, stroke, text, and annotation emission.
+pub(crate) fn paint_point_to_pdf(point: PaintPoint) -> PdfPoint {
+    PdfPoint::new(point.x, point.y)
+}
+
 #[allow(dead_code)]
 impl Page {
     pub(crate) fn paint_checkpoint(&self) -> PaintCheckpoint {
@@ -457,10 +520,9 @@ impl Page {
     pub(crate) fn record_paint_fragment(
         &mut self,
         fragment: &PaintFragment,
-        x_offset: f32,
-        y_offset: f32,
+        offset: PaintVector,
     ) -> RecordedPaintFragment {
-        let translated = fragment.clone().translated(x_offset, y_offset);
+        let translated = fragment.clone().translated(offset);
         let operations = translated
             .flattened_primitives()
             .into_iter()
@@ -482,13 +544,8 @@ impl Page {
         }
     }
 
-    pub(crate) fn append_paint_fragment(
-        &mut self,
-        fragment: &PaintFragment,
-        x_offset: f32,
-        y_offset: f32,
-    ) {
-        let recorded = self.record_paint_fragment(fragment, x_offset, y_offset);
+    pub(crate) fn append_paint_fragment(&mut self, fragment: &PaintFragment, offset: PaintVector) {
+        let recorded = self.record_paint_fragment(fragment, offset);
         self.append_recorded_paint_fragment(recorded);
     }
 
@@ -504,6 +561,12 @@ impl Page {
             tree.append_display_list(recorded.display_list);
         }
         self.operations.extend(recorded.operations);
+    }
+
+    pub(crate) fn sort_paint_tree_stacking_contexts(&mut self) {
+        if let Some(tree) = &mut self.paint_tree {
+            tree.sort_stacking_contexts();
+        }
     }
 
     fn paint_primitive(&self, operation: &PaintOperation) -> Option<PaintPrimitive> {
@@ -660,39 +723,53 @@ pub(crate) enum PaintPrimitive {
 }
 
 impl PaintPrimitive {
-    fn translated(self, x_offset: f32, y_offset: f32) -> Self {
+    pub(crate) fn translated(self, offset: PaintVector) -> Self {
         match self {
-            Self::Rect(rect) => Self::Rect(rect.translated(x_offset, y_offset)),
-            Self::RoundedRect(rect) => Self::RoundedRect(rect.translated(x_offset, y_offset)),
-            Self::Path(path) => Self::Path(path.translated(x_offset, y_offset)),
-            Self::Stroke(stroke) => Self::Stroke(stroke.translated(x_offset, y_offset)),
-            Self::Image(image) => Self::Image(image.translated(x_offset, y_offset)),
-            Self::Line(line) => Self::Line(line.translated(x_offset, y_offset)),
+            Self::Rect(rect) => Self::Rect(rect.translated(offset)),
+            Self::RoundedRect(rect) => Self::RoundedRect(rect.translated(offset)),
+            Self::Path(path) => Self::Path(path.translated(offset)),
+            Self::Stroke(stroke) => Self::Stroke(stroke.translated(offset)),
+            Self::Image(image) => Self::Image(image.translated(offset)),
+            Self::Line(line) => Self::Line(line.translated(offset)),
+        }
+    }
+
+    fn clipped_to_rect(self, clip: PaintClip) -> Option<Self> {
+        match self {
+            Self::Rect(mut rect) => {
+                let clipped = PaintClip::from_paint_rect(rect.paint_rect()).intersect(clip)?;
+                rect.set_paint_rect(clipped.paint_rect());
+                Some(Self::Rect(rect))
+            }
+            Self::RoundedRect(mut rect) => {
+                let clipped = PaintClip::from_paint_rect(rect.paint_rect()).intersect(clip)?;
+                rect.rect = clipped.paint_rect();
+                Some(Self::RoundedRect(rect))
+            }
+            Self::Image(image) => rect_bounds(image.paint_rect())
+                .and_then(|bounds| bounds.intersect(clip))
+                .map(|_| Self::Image(image)),
+            Self::Path(path) => path_bounds(&path)
+                .and_then(|bounds| bounds.intersect(clip))
+                .map(|_| Self::Path(path)),
+            Self::Stroke(stroke) => stroke
+                .paint_bounds()
+                .intersect(clip)
+                .map(|_| Self::Stroke(stroke)),
+            Self::Line(line) => line
+                .paint_bounds()
+                .intersect(clip)
+                .map(|_| Self::Line(line)),
         }
     }
 
     fn bounds(&self) -> Option<PaintClip> {
         match self {
-            Self::Rect(rect) => rect_bounds(rect.x, rect.y, rect.width, rect.height),
-            Self::RoundedRect(rect) => rect_bounds(rect.x, rect.y, rect.width, rect.height),
-            Self::Image(image) => rect_bounds(image.x, image.y, image.width, image.height),
-            Self::Stroke(stroke) => {
-                let half = stroke.width / 2.0;
-                let left = stroke.x1.min(stroke.x2) - half;
-                let right = stroke.x1.max(stroke.x2) + half;
-                let bottom = stroke.y1.min(stroke.y2) - half;
-                let top = stroke.y1.max(stroke.y2) + half;
-                rect_bounds(left, bottom, right - left, top - bottom)
-            }
-            Self::Line(line) => {
-                let width = rendered_line_width(line);
-                rect_bounds(
-                    line.x,
-                    line.y - line.font_size,
-                    width,
-                    line.font_size * 1.35,
-                )
-            }
+            Self::Rect(rect) => rect_bounds(rect.paint_rect()),
+            Self::RoundedRect(rect) => rect_bounds(rect.paint_rect()),
+            Self::Image(image) => rect_bounds(image.paint_rect()),
+            Self::Stroke(stroke) => Some(stroke.paint_bounds()),
+            Self::Line(line) => Some(line.paint_bounds()),
             Self::Path(path) => path_bounds(path),
         }
     }
@@ -739,9 +816,9 @@ impl PaintDisplayList {
         self.bands.push_flattened_primitives(primitives);
     }
 
-    fn translated(self, x_offset: f32, y_offset: f32) -> Self {
+    pub(crate) fn translated(self, offset: PaintVector) -> Self {
         Self {
-            bands: self.bands.translated(x_offset, y_offset),
+            bands: self.bands.translated(offset),
         }
     }
 
@@ -792,6 +869,14 @@ impl PagePaintTree {
         self.root.bands.push_link(band, link);
     }
 
+    pub(crate) fn push_context(&mut self, context: PaintStackingContext) {
+        self.root.bands.push_context(context);
+    }
+
+    pub(crate) fn sort_stacking_contexts(&mut self) {
+        self.root.bands.sort_stacking_contexts();
+    }
+
     pub(crate) fn prepend_display_list(&mut self, display_list: PaintDisplayList) {
         self.root.bands.prepend_bands(display_list.bands);
     }
@@ -832,6 +917,7 @@ impl PagePaintTree {
 /// <https://www.w3.org/TR/CSS22/zindex.html>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaintBand {
+    PageBackground,
     BackgroundBorder,
     NegativeZ,
     InFlowBlock,
@@ -843,7 +929,8 @@ pub(crate) enum PaintBand {
 }
 
 impl PaintBand {
-    pub(crate) const ORDER: [Self; 8] = [
+    pub(crate) const ORDER: [Self; 9] = [
+        Self::PageBackground,
         Self::BackgroundBorder,
         Self::NegativeZ,
         Self::InFlowBlock,
@@ -856,14 +943,15 @@ impl PaintBand {
 
     pub(crate) const fn index(self) -> usize {
         match self {
-            Self::BackgroundBorder => 0,
-            Self::NegativeZ => 1,
-            Self::InFlowBlock => 2,
-            Self::Float => 3,
-            Self::Inline => 4,
-            Self::AutoZeroZ => 5,
-            Self::PositiveZ => 6,
-            Self::Outline => 7,
+            Self::PageBackground => 0,
+            Self::BackgroundBorder => 1,
+            Self::NegativeZ => 2,
+            Self::InFlowBlock => 3,
+            Self::Float => 4,
+            Self::Inline => 5,
+            Self::AutoZeroZ => 6,
+            Self::PositiveZ => 7,
+            Self::Outline => 8,
         }
     }
 }
@@ -871,7 +959,7 @@ impl PaintBand {
 /// Ordered paint-band buckets for a fragment-local display list.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct PaintBandList {
-    pub(crate) bands: [Vec<PaintDisplayItem>; 8],
+    pub(crate) bands: [Vec<PaintDisplayItem>; 9],
 }
 
 #[allow(dead_code)]
@@ -1001,12 +1089,12 @@ impl PaintBandList {
         }
     }
 
-    fn translated(self, x_offset: f32, y_offset: f32) -> Self {
+    pub(crate) fn translated(self, offset: PaintVector) -> Self {
         Self {
             bands: self.bands.map(|items| {
                 items
                     .into_iter()
-                    .map(|item| item.translated(x_offset, y_offset))
+                    .map(|item| item.translated(offset))
                     .collect()
             }),
         }
@@ -1066,14 +1154,12 @@ pub(crate) enum PaintDisplayItem {
 
 #[allow(dead_code)]
 impl PaintDisplayItem {
-    fn translated(self, x_offset: f32, y_offset: f32) -> Self {
+    fn translated(self, offset: PaintVector) -> Self {
         match self {
             Self::Operation(operation) => Self::Operation(operation),
-            Self::Primitive(primitive) => Self::Primitive(primitive.translated(x_offset, y_offset)),
-            Self::StackingContext(context) => {
-                Self::StackingContext(context.translated(x_offset, y_offset))
-            }
-            Self::Link(link) => Self::Link(link.translated(x_offset, y_offset)),
+            Self::Primitive(primitive) => Self::Primitive(primitive.translated(offset)),
+            Self::StackingContext(context) => Self::StackingContext(context.translated(offset)),
+            Self::Link(link) => Self::Link(link.translated(offset)),
         }
     }
 
@@ -1124,11 +1210,15 @@ pub(crate) enum StackLevel {
 }
 
 impl StackLevel {
-    fn from_z_index(z_index: i32) -> Self {
+    pub(crate) fn from_z_index(z_index: i32) -> Self {
         Self::Integer(z_index)
     }
 
-    fn paint_band(self) -> PaintBand {
+    pub(crate) fn from_optional_z_index(z_index: Option<i32>) -> Self {
+        z_index.map_or(Self::Auto, Self::Integer)
+    }
+
+    pub(crate) fn paint_band(self) -> PaintBand {
         match self {
             Self::Integer(value) if value < 0 => PaintBand::NegativeZ,
             Self::Integer(value) if value > 0 => PaintBand::PositiveZ,
@@ -1137,9 +1227,9 @@ impl StackLevel {
         }
     }
 
-    fn sort_key(self) -> (i32, i32) {
+    pub(crate) fn sort_key(self) -> (i32, i32) {
         match self {
-            Self::Integer(value) => (value, 1),
+            Self::Integer(value) => (value, 0),
             Self::Auto => (0, 0),
         }
     }
@@ -1159,6 +1249,11 @@ pub(crate) struct PaintEffects {
     pub(crate) transform: Option<PaintTransform>,
     pub(crate) overflow_clip: Option<PaintClip>,
     pub(crate) absolute_clip: Option<PaintClip>,
+    pub(crate) clip_path: PaintClipPathEffect,
+    pub(crate) mask: PaintMaskEffect,
+    pub(crate) filter: PaintFilterEffect,
+    pub(crate) blend_mode: PaintBlendMode,
+    pub(crate) isolation: bool,
 }
 
 impl Default for PaintEffects {
@@ -1168,8 +1263,185 @@ impl Default for PaintEffects {
             transform: None,
             overflow_clip: None,
             absolute_clip: None,
+            clip_path: PaintClipPathEffect::None,
+            mask: PaintMaskEffect::None,
+            filter: PaintFilterEffect::None,
+            blend_mode: PaintBlendMode::Normal,
+            isolation: false,
         }
     }
+}
+
+impl PaintEffects {
+    pub(crate) fn needs_group(self) -> bool {
+        self.opacity < 1.0
+            || self.filter.is_active()
+            || self.mask.is_active()
+            || self.blend_mode != PaintBlendMode::Normal
+            || self.isolation
+    }
+
+    pub(crate) fn without_group_effects(mut self) -> Self {
+        self.opacity = 1.0;
+        self.filter = PaintFilterEffect::None;
+        self.mask = PaintMaskEffect::None;
+        self.blend_mode = PaintBlendMode::Normal;
+        self.isolation = false;
+        self
+    }
+
+    pub(crate) fn ordered_steps(self) -> Vec<PaintEffectStep> {
+        let mut steps = Vec::new();
+        if let Some(clip) = self.absolute_clip {
+            steps.push(PaintEffectStep::Clip(clip));
+        }
+        if let Some(clip) = self.overflow_clip {
+            steps.push(PaintEffectStep::Clip(clip));
+        }
+        if self.clip_path.is_active() {
+            steps.push(PaintEffectStep::ClipPath(self.clip_path));
+        }
+        if let Some(transform) = self.transform {
+            steps.push(PaintEffectStep::Transform(transform));
+        }
+        if self.filter.is_active() {
+            steps.push(PaintEffectStep::Filter(self.filter));
+        }
+        if self.mask.is_active() {
+            steps.push(PaintEffectStep::Mask(self.mask));
+        }
+        if self.opacity < 1.0 {
+            steps.push(PaintEffectStep::Opacity(self.opacity));
+        }
+        if self.blend_mode != PaintBlendMode::Normal {
+            steps.push(PaintEffectStep::Blend(self.blend_mode));
+        }
+        if self.isolation {
+            steps.push(PaintEffectStep::Isolation);
+        }
+        steps
+    }
+}
+
+/// Shape source for a context-level CSS `clip-path`.
+///
+/// The current renderer records the source category so stacking and PDF group
+/// construction are deterministic. Geometry emission is implemented later for
+/// each non-`None` variant:
+/// <https://www.w3.org/TR/css-masking-1/#the-clip-path>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaintClipPathEffect {
+    None,
+    Inset,
+    Shape,
+    Url,
+    WillChange,
+}
+
+impl PaintClipPathEffect {
+    pub(crate) const fn is_active(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Masking source recorded for context-level PDF grouping.
+///
+/// CSS Masking allows image and generated-image masks. Quire currently records
+/// the presence of a mask for isolation/grouping and leaves shape/raster
+/// emission as a remaining conformance step:
+/// <https://www.w3.org/TR/css-masking-1/#the-mask-image>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaintMaskEffect {
+    None,
+    MaskImage,
+    WillChange,
+}
+
+impl PaintMaskEffect {
+    pub(crate) const fn is_active(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Filter source recorded for context-level PDF grouping.
+///
+/// Filter function rendering is not complete yet; this type distinguishes real
+/// authored filters from `will-change` pre-isolation.
+/// <https://www.w3.org/TR/filter-effects-1/#FilterProperty>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaintFilterEffect {
+    None,
+    FilterList,
+    WillChange,
+}
+
+impl PaintFilterEffect {
+    pub(crate) const fn is_active(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// PDF-facing blend mode selected by CSS `mix-blend-mode`.
+///
+/// The current content writer uses this to force isolated group construction;
+/// future PDF ExtGState output can map these variants to `/BM` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PaintBlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl PaintBlendMode {
+    pub(crate) const fn pdf_name(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::Multiply => Some("Multiply"),
+            Self::Screen => Some("Screen"),
+            Self::Overlay => Some("Overlay"),
+            Self::Darken => Some("Darken"),
+            Self::Lighten => Some("Lighten"),
+            Self::ColorDodge => Some("ColorDodge"),
+            Self::ColorBurn => Some("ColorBurn"),
+            Self::HardLight => Some("HardLight"),
+            Self::SoftLight => Some("SoftLight"),
+            Self::Difference => Some("Difference"),
+            Self::Exclusion => Some("Exclusion"),
+            Self::Hue => Some("Hue"),
+            Self::Saturation => Some("Saturation"),
+            Self::Color => Some("Color"),
+            Self::Luminosity => Some("Luminosity"),
+        }
+    }
+
+    pub(crate) fn resource_name(self) -> Option<String> {
+        self.pdf_name().map(|name| format!("GSblend{name}"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PaintEffectStep {
+    Clip(PaintClip),
+    ClipPath(PaintClipPathEffect),
+    Transform(PaintTransform),
+    Filter(PaintFilterEffect),
+    Mask(PaintMaskEffect),
+    Opacity(f32),
+    Blend(PaintBlendMode),
+    Isolation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1194,14 +1466,20 @@ impl PaintTransform {
         }
     }
 
-    pub(crate) const fn translate(x: f32, y: f32) -> Self {
+    /// Build a paint-space translation transform.
+    ///
+    /// CSS Transforms applies translation functions in the element's current
+    /// painting coordinate system; by this point Quire has already projected
+    /// layout geometry into [`PaintSpace`]:
+    /// <https://www.w3.org/TR/css-transforms-1/#transform-functions>.
+    pub(crate) fn translate(offset: PaintVector) -> Self {
         Self {
             a: 1.0,
             b: 0.0,
             c: 0.0,
             d: 1.0,
-            e: x,
-            f: y,
+            e: offset.x,
+            f: offset.y,
         }
     }
 
@@ -1216,36 +1494,53 @@ impl PaintTransform {
         }
     }
 
-    pub(crate) fn apply_point(self, x: f32, y: f32) -> (f32, f32) {
-        (
-            self.a * x + self.c * y + self.e,
-            self.b * x + self.d * y + self.f,
+    /// Apply this transform to a page-local paint point.
+    ///
+    /// CSS Transforms maps already-painted geometry into the parent painting
+    /// coordinate system. Keeping the input and output as [`PaintPoint`]
+    /// prevents transform effects from crossing into layout top-edge or PDF
+    /// user-space coordinates by accident:
+    /// <https://www.w3.org/TR/css-transforms-1/#transform-rendering>.
+    pub(crate) fn apply_point(self, point: PaintPoint) -> PaintPoint {
+        PaintPoint::new(
+            self.a * point.x + self.c * point.y + self.e,
+            self.b * point.x + self.d * point.y + self.f,
         )
     }
 
+    /// Transform a paint-space clip rectangle and return its axis-aligned bounds.
+    ///
+    /// CSS rectangular clips are transformed with the element, while PDF
+    /// annotation bounds and effect isolation need a conservative axis-aligned
+    /// paint rectangle after transform application:
+    /// <https://www.w3.org/TR/css-transforms-1/#transform-rendering>.
     pub(crate) fn apply_clip_to_aabb(self, clip: PaintClip) -> PaintClip {
         let points = [
-            self.apply_point(clip.x, clip.y),
-            self.apply_point(clip.x + clip.width, clip.y),
-            self.apply_point(clip.x, clip.y + clip.height),
-            self.apply_point(clip.x + clip.width, clip.y + clip.height),
+            self.apply_point(clip.bottom_left()),
+            self.apply_point(clip.bottom_right()),
+            self.apply_point(clip.top_left()),
+            self.apply_point(clip.top_right()),
         ];
-        let min_x = points.iter().map(|(x, _)| *x).fold(f32::INFINITY, f32::min);
+        let min_x = points
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::INFINITY, f32::min);
         let max_x = points
             .iter()
-            .map(|(x, _)| *x)
+            .map(|point| point.x)
             .fold(f32::NEG_INFINITY, f32::max);
-        let min_y = points.iter().map(|(_, y)| *y).fold(f32::INFINITY, f32::min);
+        let min_y = points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::INFINITY, f32::min);
         let max_y = points
             .iter()
-            .map(|(_, y)| *y)
+            .map(|point| point.y)
             .fold(f32::NEG_INFINITY, f32::max);
-        PaintClip {
-            x: min_x,
-            y: min_y,
-            width: (max_x - min_x).max(0.0),
-            height: (max_y - min_y).max(0.0),
-        }
+        PaintClip::from_paint_rect(PaintRect::new(
+            PaintPoint::new(min_x, min_y),
+            PaintSize::new((max_x - min_x).max(0.0), (max_y - min_y).max(0.0)),
+        ))
     }
 }
 
@@ -1258,30 +1553,90 @@ impl PaintTransform {
 /// <https://www.w3.org/TR/css-transforms-1/#transform-rendering>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PaintClip {
-    pub(crate) x: f32,
-    pub(crate) y: f32,
-    pub(crate) width: f32,
-    pub(crate) height: f32,
+    rect: PaintRect,
 }
 
 impl PaintClip {
-    fn translated(mut self, x_offset: f32, y_offset: f32) -> Self {
-        self.x += x_offset;
-        self.y += y_offset;
+    pub(crate) fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self::from_paint_rect(PaintRect::new(
+            PaintPoint::new(x, y),
+            PaintSize::new(width.max(0.0), height.max(0.0)),
+        ))
+    }
+
+    pub(crate) fn from_paint_rect(rect: PaintRect) -> Self {
+        Self { rect }
+    }
+
+    pub(crate) fn from_paint_point(point: PaintPoint) -> Self {
+        Self::from_paint_rect(PaintRect::new(point, PaintSize::new(0.0, 0.0)))
+    }
+
+    pub(crate) fn x(self) -> f32 {
+        self.rect.origin.x
+    }
+
+    pub(crate) fn y(self) -> f32 {
+        self.rect.origin.y
+    }
+
+    pub(crate) fn width(self) -> f32 {
+        self.rect.size.width
+    }
+
+    pub(crate) fn height(self) -> f32 {
+        self.rect.size.height
+    }
+
+    pub(crate) fn paint_rect(self) -> PaintRect {
+        self.rect
+    }
+
+    pub(crate) fn bottom_left(self) -> PaintPoint {
+        self.rect.origin
+    }
+
+    pub(crate) fn bottom_right(self) -> PaintPoint {
+        PaintPoint::new(self.x() + self.width(), self.y())
+    }
+
+    pub(crate) fn top_left(self) -> PaintPoint {
+        PaintPoint::new(self.x(), self.y() + self.height())
+    }
+
+    pub(crate) fn top_right(self) -> PaintPoint {
+        PaintPoint::new(self.x() + self.width(), self.y() + self.height())
+    }
+
+    fn translated(mut self, offset: PaintVector) -> Self {
+        self.rect.origin += offset;
         self
     }
 
+    pub(crate) fn intersect(self, other: Self) -> Option<Self> {
+        let left = self.x().max(other.x());
+        let right = (self.x() + self.width()).min(other.x() + other.width());
+        let bottom = self.y().max(other.y());
+        let top = (self.y() + self.height()).min(other.y() + other.height());
+        (right > left && top > bottom).then_some(Self::new(
+            left,
+            bottom,
+            right - left,
+            top - bottom,
+        ))
+    }
+
     fn union(self, other: Self) -> Self {
-        let left = self.x.min(other.x);
-        let right = (self.x + self.width).max(other.x + other.width);
-        let bottom = self.y.min(other.y);
-        let top = (self.y + self.height).max(other.y + other.height);
-        Self {
-            x: left,
-            y: bottom,
-            width: (right - left).max(0.0),
-            height: (top - bottom).max(0.0),
-        }
+        let left = self.x().min(other.x());
+        let right = (self.x() + self.width()).max(other.x() + other.width());
+        let bottom = self.y().min(other.y());
+        let top = (self.y() + self.height()).max(other.y() + other.height());
+        Self::new(
+            left,
+            bottom,
+            (right - left).max(0.0),
+            (top - bottom).max(0.0),
+        )
     }
 }
 
@@ -1321,6 +1676,14 @@ impl PaintStackingContext {
         content: PaintFragment,
         child_contexts: Vec<PaintStackingContext>,
     ) -> Self {
+        Self::new_with_stack_level(StackLevel::from_z_index(z_index), content, child_contexts)
+    }
+
+    pub(crate) fn new_with_stack_level(
+        stack_level: StackLevel,
+        content: PaintFragment,
+        child_contexts: Vec<PaintStackingContext>,
+    ) -> Self {
         let mut bands = PaintBandList::default();
         bands.extend_band(
             PaintBand::BackgroundBorder,
@@ -1330,7 +1693,39 @@ impl PaintStackingContext {
             bands.push_context(context);
         }
         bands.sort_stacking_contexts();
-        Self::with_bands(StackLevel::from_z_index(z_index), bands)
+        Self::with_bands(stack_level, bands)
+    }
+
+    /// Build a stacking-context node for an independently painted fragment
+    /// while preserving the fragment's internal CSS paint bands.
+    ///
+    /// CSS Positioned Layout assigns the outer stack level in the parent
+    /// context, but CSS 2.2 Appendix E still applies recursively inside that
+    /// positioned context:
+    /// <https://www.w3.org/TR/css-position-3/#painting-order> and
+    /// <https://www.w3.org/TR/CSS22/zindex.html>.
+    pub(crate) fn from_banded_fragment_with_stack_level(
+        stack_level: StackLevel,
+        content: PaintFragment,
+        child_contexts: Vec<PaintStackingContext>,
+    ) -> Self {
+        let mut bands = content.display_list.bands;
+        if matches!(stack_level, StackLevel::Integer(_)) {
+            let in_flow = std::mem::take(&mut bands.bands[PaintBand::InFlowBlock.index()]);
+            bands
+                .bands
+                .get_mut(PaintBand::BackgroundBorder.index())
+                .expect("background band index should exist")
+                .extend(in_flow);
+        }
+        for link in content.links {
+            bands.push_link(PaintBand::Inline, link);
+        }
+        for context in child_contexts {
+            bands.push_context(context);
+        }
+        bands.sort_stacking_contexts();
+        Self::with_bands(stack_level, bands)
     }
 
     /// Build an atomic stacking-context node while preserving the fragment's
@@ -1387,19 +1782,42 @@ impl PaintStackingContext {
         self
     }
 
+    /// Return bounds after context-level clipping and transforms.
+    ///
+    /// CSS applies overflow/absolute clipping in the context's local coordinate
+    /// space and then maps the painted result through transforms. PDF opacity
+    /// groups need a Form XObject `/BBox` covering that composed output:
+    /// <https://www.w3.org/TR/css-overflow-3/#overflow-clip-edge>,
+    /// <https://www.w3.org/TR/css-transforms-1/#transform-rendering>, and
+    /// ISO 32000-1:2008 §11.6.6.
+    pub(crate) fn effect_bounds(&self, fallback: PaintClip) -> PaintClip {
+        let mut bounds = self.bounds.unwrap_or(fallback);
+        for clip in [self.effects.absolute_clip, self.effects.overflow_clip]
+            .into_iter()
+            .flatten()
+        {
+            bounds =
+                bounds
+                    .intersect(clip)
+                    .unwrap_or(PaintClip::new(bounds.x(), bounds.y(), 0.0, 0.0));
+        }
+        if let Some(transform) = self.effects.transform {
+            bounds = transform.apply_clip_to_aabb(bounds);
+        }
+        bounds
+    }
+
     fn push_flattened_primitives(&self, primitives: &mut Vec<PaintPrimitive>) {
         self.bands.push_flattened_primitives(primitives);
     }
 
-    fn translated(self, x_offset: f32, y_offset: f32) -> Self {
+    pub(crate) fn translated(self, offset: PaintVector) -> Self {
         Self {
             source_order: self.source_order,
             stack_level: self.stack_level,
-            bands: self.bands.translated(x_offset, y_offset),
+            bands: self.bands.translated(offset),
             effects: self.effects,
-            bounds: self
-                .bounds
-                .map(|bounds| bounds.translated(x_offset, y_offset)),
+            bounds: self.bounds.map(|bounds| bounds.translated(offset)),
         }
     }
 
@@ -1460,22 +1878,6 @@ impl PaintFragment {
     ) -> Self {
         Self {
             display_list: PaintDisplayList::from_primitives(primitives),
-            links,
-        }
-    }
-
-    pub(crate) fn from_primitives_in_band(
-        band: PaintBand,
-        primitives: Vec<PaintPrimitive>,
-        links: Vec<RenderedLink>,
-    ) -> Self {
-        let mut bands = PaintBandList::default();
-        bands.extend_band(
-            band,
-            primitives.into_iter().map(PaintDisplayItem::Primitive),
-        );
-        Self {
-            display_list: PaintDisplayList { bands },
             links,
         }
     }
@@ -1547,7 +1949,7 @@ impl PaintFragment {
         self.flattened_primitives()
             .into_iter()
             .find_map(|primitive| match primitive {
-                PaintPrimitive::Line(line) => Some(line.y),
+                PaintPrimitive::Line(line) => Some(line.y()),
                 _ => None,
             })
     }
@@ -1557,7 +1959,7 @@ impl PaintFragment {
             .into_iter()
             .rev()
             .find_map(|primitive| match primitive {
-                PaintPrimitive::Line(line) => Some(line.y),
+                PaintPrimitive::Line(line) => Some(line.y()),
                 _ => None,
             })
     }
@@ -1574,12 +1976,7 @@ impl PaintFragment {
             });
         }
         for link in &self.links {
-            let link_bounds = PaintClip {
-                x: link.x,
-                y: link.y,
-                width: link.width,
-                height: link.height,
-            };
+            let link_bounds = PaintClip::from_paint_rect(link.paint_rect());
             bounds = Some(match bounds {
                 Some(existing) => existing.union(link_bounds),
                 None => link_bounds,
@@ -1588,14 +1985,38 @@ impl PaintFragment {
         bounds
     }
 
-    pub(crate) fn translated(mut self, x_offset: f32, y_offset: f32) -> Self {
-        self.display_list = self.display_list.translated(x_offset, y_offset);
+    pub(crate) fn translated(mut self, offset: PaintVector) -> Self {
+        self.display_list = self.display_list.translated(offset);
         self.links = self
             .links
             .into_iter()
-            .map(|link| link.translated(x_offset, y_offset))
+            .map(|link| link.translated(offset))
             .collect();
         self
+    }
+
+    /// Return a fragment whose flattened public primitive data is clipped to a
+    /// rectangular page-local slice.
+    ///
+    /// Context effects preserve the same clip for PDF output; this helper keeps
+    /// `Document` inspection data aligned with fragmented paint:
+    /// <https://www.w3.org/TR/css-break-3/#box-splitting>.
+    pub(crate) fn clipped_to_rect(self, clip: PaintClip) -> Self {
+        let primitives = self
+            .flattened_primitives()
+            .into_iter()
+            .filter_map(|primitive| primitive.clipped_to_rect(clip))
+            .collect::<Vec<_>>();
+        let links = self
+            .links
+            .into_iter()
+            .filter_map(|mut link| {
+                let clipped = PaintClip::from_paint_rect(link.paint_rect()).intersect(clip)?;
+                link.rect = clipped.paint_rect();
+                Some(link)
+            })
+            .collect::<Vec<_>>();
+        Self::from_primitives(primitives, links)
     }
 }
 
@@ -1620,37 +2041,83 @@ fn primitive_is_covered_by_later_opaque_rect(
 }
 
 fn same_rect_geometry(left: &RenderedRect, right: &RenderedRect) -> bool {
-    (left.x - right.x).abs() < 0.001
-        && (left.y - right.y).abs() < 0.001
-        && (left.width - right.width).abs() < 0.001
-        && (left.height - right.height).abs() < 0.001
+    (left.x() - right.x()).abs() < 0.001
+        && (left.y() - right.y()).abs() < 0.001
+        && (left.width() - right.width()).abs() < 0.001
+        && (left.height() - right.height()).abs() < 0.001
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedRect {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
+    rect: PaintRect,
     pub fill: Option<Color>,
     pub stroke: Option<Color>,
     pub stroke_width: f32,
 }
 
 impl RenderedRect {
-    fn translated(mut self, x_offset: f32, y_offset: f32) -> Self {
-        self.x += x_offset;
-        self.y += y_offset;
+    pub fn new(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        fill: Option<Color>,
+        stroke: Option<Color>,
+        stroke_width: f32,
+    ) -> Self {
+        Self {
+            rect: PaintRect::new(
+                PaintPoint::new(x, y),
+                PaintSize::new(width.max(0.0), height.max(0.0)),
+            ),
+            fill,
+            stroke,
+            stroke_width,
+        }
+    }
+
+    pub(crate) fn from_paint_rect(rect: PaintRect, fill: Option<Color>) -> Self {
+        Self {
+            rect,
+            fill,
+            stroke: None,
+            stroke_width: 0.0,
+        }
+    }
+
+    pub fn x(&self) -> f32 {
+        self.rect.origin.x
+    }
+
+    pub fn y(&self) -> f32 {
+        self.rect.origin.y
+    }
+
+    pub fn width(&self) -> f32 {
+        self.rect.size.width
+    }
+
+    pub fn height(&self) -> f32 {
+        self.rect.size.height
+    }
+
+    pub(crate) fn paint_rect(&self) -> PaintRect {
+        self.rect
+    }
+
+    pub(crate) fn set_paint_rect(&mut self, rect: PaintRect) {
+        self.rect = rect;
+    }
+
+    fn translated(mut self, offset: PaintVector) -> Self {
+        self.rect.origin += offset;
         self
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderedRoundedRect {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
+    rect: PaintRect,
     pub radii: RenderedRoundedRectRadii,
     pub fill: Option<Color>,
     pub stroke: Option<Color>,
@@ -1658,9 +2125,67 @@ pub struct RenderedRoundedRect {
 }
 
 impl RenderedRoundedRect {
-    fn translated(mut self, x_offset: f32, y_offset: f32) -> Self {
-        self.x += x_offset;
-        self.y += y_offset;
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radii: RenderedRoundedRectRadii,
+        fill: Option<Color>,
+        stroke: Option<Color>,
+        stroke_width: f32,
+    ) -> Self {
+        Self::from_paint_rect(
+            PaintRect::new(
+                PaintPoint::new(x, y),
+                PaintSize::new(width.max(0.0), height.max(0.0)),
+            ),
+            radii,
+            fill,
+            stroke,
+            stroke_width,
+        )
+    }
+
+    pub(crate) fn from_paint_rect(
+        rect: PaintRect,
+        radii: RenderedRoundedRectRadii,
+        fill: Option<Color>,
+        stroke: Option<Color>,
+        stroke_width: f32,
+    ) -> Self {
+        Self {
+            rect,
+            radii,
+            fill,
+            stroke,
+            stroke_width,
+        }
+    }
+
+    pub fn x(self) -> f32 {
+        self.rect.origin.x
+    }
+
+    pub fn y(self) -> f32 {
+        self.rect.origin.y
+    }
+
+    pub fn width(self) -> f32 {
+        self.rect.size.width
+    }
+
+    pub fn height(self) -> f32 {
+        self.rect.size.height
+    }
+
+    pub(crate) fn paint_rect(self) -> PaintRect {
+        self.rect
+    }
+
+    fn translated(mut self, offset: PaintVector) -> Self {
+        self.rect.origin += offset;
         self
     }
 }
@@ -1683,19 +2208,37 @@ pub struct RenderedPath {
 }
 
 impl RenderedPath {
-    fn translated(mut self, x_offset: f32, y_offset: f32) -> Self {
+    pub(crate) fn new(
+        commands: Vec<RenderedPathCommand>,
+        fill: Option<Color>,
+        fill_rule: RenderedPathFillRule,
+        stroke: Option<Color>,
+        stroke_width: f32,
+        clip: Option<RenderedPathClip>,
+    ) -> Self {
+        Self {
+            clip,
+            commands,
+            fill,
+            fill_rule,
+            stroke,
+            stroke_width,
+        }
+    }
+
+    fn translated(mut self, offset: PaintVector) -> Self {
         if let Some(clip) = &mut self.clip {
             for command in &mut clip.commands {
-                command.translate(x_offset, y_offset);
+                command.translate(offset);
             }
             for nested_clip in &mut clip.additional_clips {
                 for command in &mut nested_clip.commands {
-                    command.translate(x_offset, y_offset);
+                    command.translate(offset);
                 }
             }
         }
         for command in &mut self.commands {
-            command.translate(x_offset, y_offset);
+            command.translate(offset);
         }
         self
     }
@@ -1716,6 +2259,20 @@ pub struct RenderedPathClip {
     pub additional_clips: Vec<RenderedPathClipPath>,
 }
 
+impl RenderedPathClip {
+    pub(crate) fn new(
+        commands: Vec<RenderedPathCommand>,
+        fill_rule: RenderedPathFillRule,
+        additional_clips: Vec<RenderedPathClipPath>,
+    ) -> Self {
+        Self {
+            commands,
+            fill_rule,
+            additional_clips,
+        }
+    }
+}
+
 /// One additional PDF clipping path intersected with an active clip scope.
 ///
 /// CSS rounded patterned borders need the intersection of a side transition
@@ -1728,50 +2285,99 @@ pub struct RenderedPathClipPath {
     pub fill_rule: RenderedPathFillRule,
 }
 
+impl RenderedPathClipPath {
+    pub(crate) fn new(commands: Vec<RenderedPathCommand>, fill_rule: RenderedPathFillRule) -> Self {
+        Self {
+            commands,
+            fill_rule,
+        }
+    }
+}
+
 /// A PDF-compatible path construction command.
 ///
 /// The variants map directly to PDF `m`, `l`, `c`, and `h` operators from ISO
 /// 32000-1:2008, 8.5.2 "Path Construction Operators".
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RenderedPathCommand {
-    MoveTo(f32, f32),
-    LineTo(f32, f32),
+    MoveTo(PaintPoint),
+    LineTo(PaintPoint),
     CurveTo {
-        x1: f32,
-        y1: f32,
-        x2: f32,
-        y2: f32,
-        x3: f32,
-        y3: f32,
+        control_1: PaintPoint,
+        control_2: PaintPoint,
+        end: PaintPoint,
     },
     Close,
 }
 
 impl RenderedPathCommand {
-    fn translate(&mut self, x_offset: f32, y_offset: f32) {
+    pub(crate) fn move_to(point: PaintPoint) -> Self {
+        Self::MoveTo(point)
+    }
+
+    pub(crate) fn line_to(point: PaintPoint) -> Self {
+        Self::LineTo(point)
+    }
+
+    pub(crate) fn curve_to(control_1: PaintPoint, control_2: PaintPoint, end: PaintPoint) -> Self {
+        Self::CurveTo {
+            control_1,
+            control_2,
+            end,
+        }
+    }
+
+    pub(crate) fn typed_points(self) -> RenderedPathCommandPoints {
         match self {
-            Self::MoveTo(x, y) | Self::LineTo(x, y) => {
-                *x += x_offset;
-                *y += y_offset;
+            Self::MoveTo(point) => RenderedPathCommandPoints::MoveTo(point),
+            Self::LineTo(point) => RenderedPathCommandPoints::LineTo(point),
+            Self::CurveTo {
+                control_1,
+                control_2,
+                end,
+            } => RenderedPathCommandPoints::CurveTo {
+                control_1,
+                control_2,
+                end,
+            },
+            Self::Close => RenderedPathCommandPoints::Close,
+        }
+    }
+
+    fn translate(&mut self, offset: PaintVector) {
+        match self {
+            Self::MoveTo(point) | Self::LineTo(point) => {
+                *point += offset;
             }
             Self::CurveTo {
-                x1,
-                y1,
-                x2,
-                y2,
-                x3,
-                y3,
+                control_1,
+                control_2,
+                end,
             } => {
-                *x1 += x_offset;
-                *y1 += y_offset;
-                *x2 += x_offset;
-                *y2 += y_offset;
-                *x3 += x_offset;
-                *y3 += y_offset;
+                *control_1 += offset;
+                *control_2 += offset;
+                *end += offset;
             }
             Self::Close => {}
         }
     }
+}
+
+/// Typed paint-space points for a rendered path command.
+///
+/// The public command enum keeps scalar fields for compatibility, while this
+/// view gives the PDF backend explicit paint-space coordinates before the
+/// final conversion to PDF user space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum RenderedPathCommandPoints {
+    MoveTo(PaintPoint),
+    LineTo(PaintPoint),
+    CurveTo {
+        control_1: PaintPoint,
+        control_2: PaintPoint,
+        end: PaintPoint,
+    },
+    Close,
 }
 
 /// Fill rule for a PDF path.
@@ -1805,31 +2411,120 @@ impl RenderedRoundedRectRadii {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderedCornerRadius {
-    pub x: f32,
-    pub y: f32,
+    size: PaintSize,
 }
 
 impl RenderedCornerRadius {
-    pub const ZERO: Self = Self { x: 0.0, y: 0.0 };
+    pub const ZERO: Self = Self {
+        size: PaintSize::new(0.0, 0.0),
+    };
+
+    pub fn new(x: f32, y: f32) -> Self {
+        Self {
+            size: PaintSize::new(x.max(0.0), y.max(0.0)),
+        }
+    }
+
+    pub fn x(&self) -> f32 {
+        self.size.width
+    }
+
+    pub fn y(&self) -> f32 {
+        self.size.height
+    }
+
+    pub(crate) fn inset(&mut self, inset: f32) {
+        self.size.width = (self.size.width - inset).max(0.0);
+        self.size.height = (self.size.height - inset).max(0.0);
+    }
+
+    pub(crate) fn scale(&mut self, factor: f32) {
+        self.size.width *= factor;
+        self.size.height *= factor;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderedStroke {
-    pub x1: f32,
-    pub y1: f32,
-    pub x2: f32,
-    pub y2: f32,
+    start: PaintPoint,
+    end: PaintPoint,
     pub width: f32,
     pub color: Color,
     pub dash: Option<(f32, f32)>,
 }
 
 impl RenderedStroke {
-    fn translated(mut self, x_offset: f32, y_offset: f32) -> Self {
-        self.x1 += x_offset;
-        self.y1 += y_offset;
-        self.x2 += x_offset;
-        self.y2 += y_offset;
+    pub fn new(
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        width: f32,
+        color: Color,
+        dash: Option<(f32, f32)>,
+    ) -> Self {
+        Self::from_paint_points(
+            PaintPoint::new(x1, y1),
+            PaintPoint::new(x2, y2),
+            width,
+            color,
+            dash,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn from_paint_points(
+        start: PaintPoint,
+        end: PaintPoint,
+        width: f32,
+        color: Color,
+        dash: Option<(f32, f32)>,
+    ) -> Self {
+        Self {
+            start,
+            end,
+            width,
+            color,
+            dash,
+        }
+    }
+
+    pub fn x1(&self) -> f32 {
+        self.start.x
+    }
+
+    pub fn y1(&self) -> f32 {
+        self.start.y
+    }
+
+    pub fn x2(&self) -> f32 {
+        self.end.x
+    }
+
+    pub fn y2(&self) -> f32 {
+        self.end.y
+    }
+
+    pub(crate) fn paint_points(self) -> (PaintPoint, PaintPoint) {
+        (self.start, self.end)
+    }
+
+    pub(crate) fn paint_bounds(self) -> PaintClip {
+        let (start, end) = self.paint_points();
+        let half = self.width / 2.0;
+        let left = start.x.min(end.x) - half;
+        let right = start.x.max(end.x) + half;
+        let bottom = start.y.min(end.y) - half;
+        let top = start.y.max(end.y) + half;
+        PaintClip::from_paint_rect(PaintRect::new(
+            PaintPoint::new(left, bottom),
+            PaintSize::new((right - left).max(0.0), (top - bottom).max(0.0)),
+        ))
+    }
+
+    fn translated(mut self, offset: PaintVector) -> Self {
+        self.start += offset;
+        self.end += offset;
         self
     }
 }
@@ -1837,8 +2532,7 @@ impl RenderedStroke {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedLine {
     pub text: String,
-    pub x: f32,
-    pub y: f32,
+    origin: PaintPoint,
     pub font_size: f32,
     pub font_id: Option<usize>,
     pub color: Color,
@@ -1846,71 +2540,117 @@ pub struct RenderedLine {
 }
 
 impl RenderedLine {
-    fn translated(mut self, x_offset: f32, y_offset: f32) -> Self {
-        self.x += x_offset;
-        self.y += y_offset;
+    pub fn new(
+        text: String,
+        x: f32,
+        y: f32,
+        font_size: f32,
+        font_id: Option<usize>,
+        color: Color,
+        runs: Vec<RenderedTextRun>,
+    ) -> Self {
+        Self::from_paint_origin(text, PaintPoint::new(x, y), font_size, font_id, color, runs)
+    }
+
+    pub fn x(&self) -> f32 {
+        self.origin.x
+    }
+
+    pub fn y(&self) -> f32 {
+        self.origin.y
+    }
+
+    pub(crate) fn from_paint_origin(
+        text: String,
+        origin: PaintPoint,
+        font_size: f32,
+        font_id: Option<usize>,
+        color: Color,
+        runs: Vec<RenderedTextRun>,
+    ) -> Self {
+        Self {
+            text,
+            origin,
+            font_size,
+            font_id,
+            color,
+            runs,
+        }
+    }
+
+    pub(crate) fn origin(&self) -> PaintPoint {
+        self.origin
+    }
+
+    pub(crate) fn paint_bounds(&self) -> PaintClip {
+        let origin = self.origin();
+        PaintClip::from_paint_rect(PaintRect::new(
+            PaintPoint::new(origin.x, origin.y - self.font_size),
+            PaintSize::new(rendered_line_width(self), self.font_size * 1.35),
+        ))
+    }
+
+    fn translated(mut self, offset: PaintVector) -> Self {
+        self.origin += offset;
         self
+    }
+
+    pub(crate) fn translate_origin(&mut self, offset: PaintVector) {
+        self.origin += offset;
     }
 }
 
 fn rendered_line_width(line: &RenderedLine) -> f32 {
     line.runs.iter().fold(0.0_f32, |width, run| {
-        let run_width = run
-            .glyphs
-            .as_ref()
-            .map(|glyphs| glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>())
-            .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.5);
+        let run_width = if run.text_matrix.is_identity() {
+            run.glyphs
+                .as_ref()
+                .map(|glyphs| glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>())
+                .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.5)
+        } else {
+            run.font_size
+        };
         width.max(run.x_offset + run_width)
     })
 }
 
-fn rect_bounds(x: f32, y: f32, width: f32, height: f32) -> Option<PaintClip> {
-    (width > 0.0 && height > 0.0).then_some(PaintClip {
-        x,
-        y,
-        width,
-        height,
-    })
+fn rect_bounds(rect: PaintRect) -> Option<PaintClip> {
+    (rect.size.width > 0.0 && rect.size.height > 0.0).then_some(PaintClip::from_paint_rect(rect))
 }
 
 fn path_bounds(path: &RenderedPath) -> Option<PaintClip> {
     let mut bounds: Option<PaintClip> = None;
     for command in &path.commands {
-        for (x, y) in command_points(*command) {
-            let point = PaintClip {
-                x,
-                y,
-                width: 0.0,
-                height: 0.0,
-            };
+        for point in command_points(*command) {
+            let point = PaintClip::from_paint_point(point);
             bounds = Some(match bounds {
                 Some(existing) => existing.union(point),
                 None => point,
             });
         }
     }
-    bounds.map(|mut bounds| {
+    bounds.map(|bounds| {
         let outset = path.stroke_width.max(0.0) / 2.0;
-        bounds.x -= outset;
-        bounds.y -= outset;
-        bounds.width += outset * 2.0;
-        bounds.height += outset * 2.0;
-        bounds
+        PaintClip::new(
+            bounds.x() - outset,
+            bounds.y() - outset,
+            bounds.width() + outset * 2.0,
+            bounds.height() + outset * 2.0,
+        )
     })
 }
 
-fn command_points(command: RenderedPathCommand) -> Vec<(f32, f32)> {
-    match command {
-        RenderedPathCommand::MoveTo(x, y) | RenderedPathCommand::LineTo(x, y) => vec![(x, y)],
-        RenderedPathCommand::CurveTo {
-            x1,
-            y1,
-            x2,
-            y2,
-            x3,
-            y3,
-        } => vec![(x1, y1), (x2, y2), (x3, y3)],
-        RenderedPathCommand::Close => Vec::new(),
+fn command_points(command: RenderedPathCommand) -> Vec<PaintPoint> {
+    match command.typed_points() {
+        RenderedPathCommandPoints::MoveTo(point) | RenderedPathCommandPoints::LineTo(point) => {
+            vec![point]
+        }
+        RenderedPathCommandPoints::CurveTo {
+            control_1,
+            control_2,
+            end,
+        } => vec![control_1, control_2, end],
+        RenderedPathCommandPoints::Close => Vec::new(),
     }
 }
 
@@ -1923,9 +2663,52 @@ fn command_points(command: RenderedPathCommand) -> Vec<(f32, f32)> {
 pub struct RenderedTextRun {
     pub text: String,
     pub x_offset: f32,
+    pub y_offset: f32,
+    pub text_matrix: RenderedTextMatrix,
     pub font_size: f32,
     pub font_id: Option<usize>,
     pub glyphs: Option<Vec<RenderedGlyph>>,
+}
+
+/// PDF text matrix orientation for one shaped text run.
+///
+/// CSS Writing Modes can place the same shaped glyph stream on a horizontal
+/// or vertical baseline. Keeping the 2x2 matrix with the run lets layout own
+/// writing-mode placement while PDF emission only applies the selected text
+/// matrix:
+/// <https://www.w3.org/TR/css-writing-modes-4/#text-flow> and
+/// ISO 32000-2:2020, 9.4.4 "Text Space Details".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderedTextMatrix {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+}
+
+impl RenderedTextMatrix {
+    pub const IDENTITY: Self = Self {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+    };
+    pub const ROTATE_CW: Self = Self {
+        a: 0.0,
+        b: -1.0,
+        c: 1.0,
+        d: 0.0,
+    };
+    pub const ROTATE_CCW: Self = Self {
+        a: 0.0,
+        b: 1.0,
+        c: -1.0,
+        d: 0.0,
+    };
+
+    pub(crate) fn is_identity(self) -> bool {
+        self == Self::IDENTITY
+    }
 }
 
 /// Shaped glyph data kept with painted text for PDF emission.
@@ -1945,44 +2728,50 @@ pub struct RenderedGlyph {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedLink {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
+    rect: PaintRect,
     pub target: String,
 }
 
 impl RenderedLink {
-    fn translated(mut self, x_offset: f32, y_offset: f32) -> Self {
-        self.x += x_offset;
-        self.y += y_offset;
+    pub(crate) fn from_paint_rect(rect: PaintRect, target: String) -> Self {
+        Self { rect, target }
+    }
+
+    pub fn x(&self) -> f32 {
+        self.rect.origin.x
+    }
+
+    pub fn y(&self) -> f32 {
+        self.rect.origin.y
+    }
+
+    pub fn width(&self) -> f32 {
+        self.rect.size.width
+    }
+
+    pub fn height(&self) -> f32 {
+        self.rect.size.height
+    }
+
+    pub(crate) fn paint_rect(&self) -> PaintRect {
+        self.rect
+    }
+
+    pub(crate) fn translated(mut self, offset: PaintVector) -> Self {
+        self.rect.origin += offset;
         self
     }
 
     fn transformed(&self, transform: PaintTransform) -> Self {
-        let clip = transform.apply_clip_to_aabb(PaintClip {
-            x: self.x,
-            y: self.y,
-            width: self.width,
-            height: self.height,
-        });
-        Self {
-            x: clip.x,
-            y: clip.y,
-            width: clip.width,
-            height: clip.height,
-            target: self.target.clone(),
-        }
+        let clip = transform.apply_clip_to_aabb(PaintClip::from_paint_rect(self.rect));
+        Self::from_paint_rect(clip.paint_rect(), self.target.clone())
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedImage {
     pub background: bool,
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
+    rect: PaintRect,
     pub pixel_width: u32,
     pub pixel_height: u32,
     pub source_rect: Option<RenderedImageSourceRect>,
@@ -1993,9 +2782,59 @@ pub struct RenderedImage {
 }
 
 impl RenderedImage {
-    fn translated(mut self, x_offset: f32, y_offset: f32) -> Self {
-        self.x += x_offset;
-        self.y += y_offset;
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_paint_rect(
+        rect: PaintRect,
+        background: bool,
+        pixel_width: u32,
+        pixel_height: u32,
+        source_rect: Option<RenderedImageSourceRect>,
+        interpolate: bool,
+        rgb: Vec<u8>,
+        alpha: Option<Vec<u8>>,
+        alt_text: Option<String>,
+    ) -> Self {
+        Self {
+            background,
+            rect,
+            pixel_width,
+            pixel_height,
+            source_rect,
+            interpolate,
+            rgb,
+            alpha,
+            alt_text,
+        }
+    }
+
+    pub fn x(&self) -> f32 {
+        self.rect.origin.x
+    }
+
+    pub fn y(&self) -> f32 {
+        self.rect.origin.y
+    }
+
+    pub fn width(&self) -> f32 {
+        self.rect.size.width
+    }
+
+    pub fn height(&self) -> f32 {
+        self.rect.size.height
+    }
+
+    pub(crate) fn paint_rect(&self) -> PaintRect {
+        self.rect
+    }
+
+    pub(crate) fn set_paint_rect(&mut self, rect: PaintRect) {
+        self.rect = rect;
+    }
+}
+
+impl RenderedImage {
+    fn translated(mut self, offset: PaintVector) -> Self {
+        self.rect.origin += offset;
         self
     }
 }
@@ -2013,4 +2852,170 @@ pub struct RenderedImageSourceRect {
     pub y: u32,
     pub width: u32,
     pub height: u32,
+}
+
+impl RenderedImageSourceRect {
+    pub fn x(&self) -> u32 {
+        self.x
+    }
+
+    pub fn y(&self) -> u32 {
+        self.y
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paint_clip_round_trips_through_typed_rect() {
+        let rect = PaintRect::new(PaintPoint::new(10.0, 20.0), PaintSize::new(30.0, 40.0));
+        let clip = PaintClip::from_paint_rect(rect);
+
+        assert_eq!(clip, PaintClip::new(10.0, 20.0, 30.0, 40.0));
+        assert_eq!(clip.paint_rect(), rect);
+    }
+
+    #[test]
+    fn rendered_rect_exposes_paint_rect() {
+        let rect = PaintRect::new(PaintPoint::new(3.0, 4.0), PaintSize::new(5.0, 6.0));
+        let rendered = RenderedRect::from_paint_rect(rect, Some(Color::BLACK));
+
+        assert_eq!(rendered.paint_rect(), rect);
+        assert_eq!(rendered.fill, Some(Color::BLACK));
+    }
+
+    #[test]
+    fn rendered_image_exposes_paint_rect() {
+        let rect = PaintRect::new(PaintPoint::new(3.0, 4.0), PaintSize::new(5.0, 6.0));
+        let image = RenderedImage::from_paint_rect(
+            rect,
+            false,
+            5,
+            6,
+            None,
+            false,
+            Vec::new(),
+            None,
+            Some("alt".to_string()),
+        );
+
+        assert_eq!(image.paint_rect(), rect);
+        assert_eq!(image.width(), 5.0);
+        assert_eq!(image.height(), 6.0);
+    }
+
+    #[test]
+    fn paint_rect_to_pdf_is_identity_for_unrotated_pages() {
+        let rect = PaintRect::new(PaintPoint::new(7.0, 8.0), PaintSize::new(9.0, 10.0));
+
+        assert_eq!(
+            paint_rect_to_pdf(rect),
+            PdfRect::new(PdfPoint::new(7.0, 8.0), PdfSize::new(9.0, 10.0))
+        );
+    }
+
+    #[test]
+    fn paint_point_to_pdf_is_identity_for_unrotated_pages() {
+        assert_eq!(
+            paint_point_to_pdf(PaintPoint::new(11.0, 12.0)),
+            PdfPoint::new(11.0, 12.0)
+        );
+    }
+
+    #[test]
+    fn paint_transform_maps_typed_points_and_clips() {
+        let transform = PaintTransform::translate(PaintVector::new(5.0, -2.0));
+
+        assert_eq!(
+            transform.apply_point(PaintPoint::new(10.0, 20.0)),
+            PaintPoint::new(15.0, 18.0)
+        );
+        assert_eq!(
+            transform.apply_clip_to_aabb(PaintClip::from_paint_rect(PaintRect::new(
+                PaintPoint::new(10.0, 20.0),
+                PaintSize::new(30.0, 40.0),
+            ))),
+            PaintClip::from_paint_rect(PaintRect::new(
+                PaintPoint::new(15.0, 18.0),
+                PaintSize::new(30.0, 40.0),
+            ))
+        );
+    }
+
+    #[test]
+    fn path_commands_expose_typed_paint_points() {
+        assert_eq!(
+            RenderedPathCommand::move_to(PaintPoint::new(1.0, 2.0)).typed_points(),
+            RenderedPathCommandPoints::MoveTo(PaintPoint::new(1.0, 2.0))
+        );
+        assert_eq!(
+            RenderedPathCommand::curve_to(
+                PaintPoint::new(1.0, 2.0),
+                PaintPoint::new(3.0, 4.0),
+                PaintPoint::new(5.0, 6.0),
+            )
+            .typed_points(),
+            RenderedPathCommandPoints::CurveTo {
+                control_1: PaintPoint::new(1.0, 2.0),
+                control_2: PaintPoint::new(3.0, 4.0),
+                end: PaintPoint::new(5.0, 6.0),
+            }
+        );
+    }
+
+    #[test]
+    fn stroke_and_line_expose_typed_paint_points() {
+        let stroke = RenderedStroke::from_paint_points(
+            PaintPoint::new(1.0, 2.0),
+            PaintPoint::new(3.0, 4.0),
+            1.0,
+            Color::BLACK,
+            None,
+        );
+        assert_eq!(
+            stroke.paint_points(),
+            (PaintPoint::new(1.0, 2.0), PaintPoint::new(3.0, 4.0))
+        );
+
+        let line = RenderedLine::from_paint_origin(
+            "text".to_string(),
+            PaintPoint::new(5.0, 6.0),
+            10.0,
+            None,
+            Color::BLACK,
+            Vec::new(),
+        );
+        assert_eq!(line.origin(), PaintPoint::new(5.0, 6.0));
+    }
+
+    #[test]
+    fn stroke_line_and_link_expose_typed_paint_bounds() {
+        let stroke = RenderedStroke::from_paint_points(
+            PaintPoint::new(10.0, 20.0),
+            PaintPoint::new(30.0, 40.0),
+            4.0,
+            Color::BLACK,
+            None,
+        );
+        assert_eq!(stroke.paint_bounds(), PaintClip::new(8.0, 18.0, 24.0, 24.0));
+
+        let link = RenderedLink::from_paint_rect(
+            PaintRect::new(PaintPoint::new(1.0, 2.0), PaintSize::new(3.0, 4.0)),
+            "https://example.com".to_string(),
+        );
+        assert_eq!(
+            link.paint_rect(),
+            PaintRect::new(PaintPoint::new(1.0, 2.0), PaintSize::new(3.0, 4.0))
+        );
+    }
 }

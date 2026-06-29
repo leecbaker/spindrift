@@ -130,56 +130,29 @@ pub(super) fn evaluate_generated_alt_text(
     output
 }
 
-pub(super) fn aligned_x_with_width(
-    left: f32,
-    available_width: f32,
-    text_width: f32,
-    align: TextAlign,
-) -> f32 {
-    match align {
-        TextAlign::Left => left,
-        TextAlign::Center => left + ((available_width - text_width) / 2.0).max(0.0),
-        TextAlign::Right => left + (available_width - text_width).max(0.0),
-        TextAlign::Start | TextAlign::End | TextAlign::Justify | TextAlign::JustifyAll => left,
-    }
-}
-
-/// Return the physical left edge for a line box with a logical indent.
-///
-/// CSS Text defines `text-indent` as an indentation of the line box's
-/// inline-start edge, not as an unconditional physical-left offset. In
-/// horizontal LTR text that moves the physical left edge; in horizontal RTL
-/// text it moves the physical right edge, so the left edge remains the block
-/// content edge while the available inline size changes:
-/// <https://www.w3.org/TR/css-text-3/#text-indent-property>.
-pub(super) fn inline_line_left_for_indent(
-    content_left: f32,
-    padding_left: f32,
-    line_indent: f32,
-    style: &ComputedStyle,
-) -> f32 {
-    let inline_start_offset = match style.direction {
-        Direction::Ltr => line_indent,
-        Direction::Rtl => 0.0,
-    };
-    content_left + padding_left + inline_start_offset
-}
-
-/// Returns the alignment that applies to one inline line box.
+/// Returns the logical alignment that applies to one inline line box.
 ///
 /// CSS Text applies `text-align-last` only to the last line of a block or to a
 /// line before a forced break. `auto` keeps ordinary `text-align` behavior,
 /// except that a justified affected line falls back to logical start:
 /// <https://www.w3.org/TR/css-text-3/#text-align-last-property>.
 pub(super) fn text_align_for_inline_line(style: &ComputedStyle, is_last_line: bool) -> TextAlign {
-    let align = if is_last_line {
-        style
-            .text_align_last
-            .effective(style.text_align, style.direction)
+    if is_last_line {
+        logical_text_align_last(style)
     } else {
         style.text_align
-    };
-    align.physical(style.direction)
+    }
+}
+
+fn logical_text_align_last(style: &ComputedStyle) -> TextAlign {
+    match style.text_align_last {
+        TextAlignLast::Align(align) => align,
+        TextAlignLast::Auto => match style.text_align {
+            TextAlign::Justify => TextAlign::Start,
+            TextAlign::JustifyAll => TextAlign::Justify,
+            align => align,
+        },
+    }
 }
 
 /// Returns the alignment that applies to one inline line box with line text.
@@ -249,16 +222,116 @@ fn used_text_indent(style: &ComputedStyle, available_width: f32) -> f32 {
     style.text_indent.amount.length + style.text_indent.amount.percent * available_width
 }
 
-pub(super) fn vertical_align_baseline_shift(style: &ComputedStyle) -> f32 {
-    match style.vertical_align {
-        VerticalAlign::Baseline => 0.0,
-        VerticalAlign::Super => style.font_size * 0.45,
-        VerticalAlign::Sub => -style.font_size * 0.4,
-        VerticalAlign::Top
-        | VerticalAlign::Middle
-        | VerticalAlign::Bottom
-        | VerticalAlign::TextTop
-        | VerticalAlign::TextBottom => 0.0,
+impl<'a> LayoutBuilder<'a> {
+    /// Resolve the inline-level `vertical-align` shift for text fragments.
+    ///
+    /// CSS 2.2 defines most `vertical-align` values in terms of the parent
+    /// inline box's baseline, content area, or x-height. This helper returns a
+    /// shift where positive values raise the child inline box and negative
+    /// values lower it:
+    /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>.
+    pub(super) fn vertical_align_baseline_shift_for_inline_style(
+        &mut self,
+        style: &ComputedStyle,
+        parent_style: &ComputedStyle,
+    ) -> f32 {
+        let own_baseline = self.font_system.rendered_first_line_baseline_offset(style);
+        self.vertical_align_baseline_shift_for_box(
+            style,
+            parent_style,
+            style.line_height,
+            own_baseline,
+        )
+    }
+
+    /// Resolve the inline-level `vertical-align` shift for an atomic inline box.
+    ///
+    /// Atomic inline boxes expose synthesized baselines and margin-box extents,
+    /// but CSS 2.2 alignment values still use the containing inline box as the
+    /// reference:
+    /// <https://www.w3.org/TR/css-inline-3/#atomic-inline> and
+    /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>.
+    pub(super) fn vertical_align_baseline_shift_for_atom(
+        &mut self,
+        atom: &InlineAtom,
+        parent_style: &ComputedStyle,
+    ) -> f32 {
+        let own_block_size = inline_atom_logical_block_size(atom, parent_style);
+        let own_baseline = match parent_style.writing_mode {
+            WritingMode::HorizontalTb => atom.style.margin.top + atom.baseline_offset,
+            WritingMode::VerticalRl | WritingMode::VerticalLr => {
+                inline_atom_logical_block_start_margin(atom, parent_style)
+                    + inline_atom_logical_border_block_size(atom, parent_style)
+            }
+        };
+        self.vertical_align_baseline_shift_for_box(
+            &atom.style,
+            parent_style,
+            own_block_size,
+            own_baseline,
+        )
+    }
+
+    fn vertical_align_baseline_shift_for_box(
+        &mut self,
+        style: &ComputedStyle,
+        parent_style: &ComputedStyle,
+        own_block_size: f32,
+        own_baseline: f32,
+    ) -> f32 {
+        let alignment_shift = match resolved_alignment_baseline_metric(style, parent_style) {
+            BaselineMetric::Alphabetic => 0.0,
+            BaselineMetric::Middle => {
+                let parent_x_height = self
+                    .font_system
+                    .x_height_for_style(parent_style)
+                    .unwrap_or(parent_style.font_size * 0.5);
+                own_block_size / 2.0 - own_baseline + parent_x_height / 2.0
+            }
+            BaselineMetric::TextTop | BaselineMetric::Hanging => {
+                own_baseline
+                    - self
+                        .font_system
+                        .rendered_first_line_baseline_offset(parent_style)
+            }
+            BaselineMetric::TextBottom | BaselineMetric::Ideographic => {
+                let parent_baseline = self
+                    .font_system
+                    .rendered_first_line_baseline_offset(parent_style);
+                own_block_size - own_baseline - (parent_style.font_size - parent_baseline)
+            }
+            BaselineMetric::Central | BaselineMetric::Mathematical => {
+                own_block_size / 2.0 - own_baseline + parent_style.font_size / 2.0
+            }
+        };
+        let baseline_shift = match style.vertical_align.baseline_shift {
+            BaselineShift::LengthPercentage(_) => style
+                .vertical_align
+                .length_percentage_shift(style.line_height),
+            BaselineShift::Super => self
+                .font_system
+                .script_vertical_align_shift(style, BaselineShift::Super)
+                .unwrap_or(style.font_size * 0.45),
+            BaselineShift::Sub => self
+                .font_system
+                .script_vertical_align_shift(style, BaselineShift::Sub)
+                .unwrap_or(-style.font_size * 0.4),
+            BaselineShift::Top | BaselineShift::Center | BaselineShift::Bottom => 0.0,
+        };
+        alignment_shift + baseline_shift
+    }
+}
+
+fn resolved_alignment_baseline_metric(
+    style: &ComputedStyle,
+    parent_style: &ComputedStyle,
+) -> BaselineMetric {
+    match style.vertical_align.alignment_baseline {
+        AlignmentBaseline::Metric(metric) => metric,
+        AlignmentBaseline::Baseline => match parent_style.vertical_align.dominant_baseline {
+            DominantBaseline::Metric(metric) => metric,
+            DominantBaseline::Auto => BaselineMetric::Alphabetic,
+        },
     }
 }
 

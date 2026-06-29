@@ -4,8 +4,8 @@ use crate::css::{
     FontVariantCaps, FontVariantEastAsian, FontVariantEastAsianValue, FontVariantEmoji,
     FontVariantLigatures, FontVariantNumeric, FontVariantNumericValue, FontVariantPosition,
     FontWeight, FontWidth, HyphenateLimitChars, Hyphens, LineBreak as CssLineBreak,
-    OverflowWrap as CssOverflowWrap, Stylesheet, UnicodeBidi, WordBreak as CssWordBreak,
-    WritingMode, known_font_family,
+    OverflowWrap as CssOverflowWrap, Stylesheet, TextOrientation, UnicodeBidi, UnicodeRange,
+    WordBreak as CssWordBreak, WritingMode, known_font_family,
 };
 use crate::document::{DocumentFont, FontProgramKind, RenderedGlyph, RenderedTextRun};
 use base64::Engine as _;
@@ -21,7 +21,7 @@ use icu_properties::{
     CodePointMapData, CodePointMapDataBorrowed, CodePointSetData, CodePointSetDataBorrowed,
     props::{
         BidiClass, BidiControl, DefaultIgnorableCodePoint, GeneralCategory, GeneralCategoryGroup,
-        JoinControl, JoiningType, LineBreak, WordBreak as IcuWordBreak,
+        JoinControl, JoiningType, LineBreak, VerticalOrientation, WordBreak as IcuWordBreak,
     },
 };
 use icu_segmenter::options::{
@@ -125,46 +125,10 @@ pub(crate) struct StyledTextSpan<'a> {
     pub(crate) style: &'a ComputedStyle,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TextLine {
-    pub(crate) text: String,
-    pub(crate) width: f32,
-    pub(crate) offset: f32,
-    pub(crate) aligned_by_parley: bool,
-    pub(crate) line_height: f32,
-    pub(crate) shaped: Option<ShapedInlineLine>,
-    pub(crate) starts_after_forced_break: bool,
-}
-
-impl TextLine {
-    /// Create a CSS text line whose shaped payload can be filled by `FontSystem`.
-    ///
-    /// CSS Text line breaking first determines the formatted line text and
-    /// used measure; CSS Fonts then shapes that exact line with the selected
-    /// font faces before painting or PDF glyph emission:
-    /// <https://www.w3.org/TR/css-text-3/#line-breaking> and
-    /// <https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm>.
-    pub(crate) fn new(text: String, width: f32, line_height: f32) -> Self {
-        Self {
-            text,
-            width,
-            offset: 0.0,
-            aligned_by_parley: false,
-            line_height,
-            shaped: None,
-            starts_after_forced_break: false,
-        }
-    }
-
-    pub(crate) fn with_shaped(mut self, shaped: Option<ShapedInlineLine>) -> Self {
-        self.shaped = shaped;
-        self
-    }
-
-    pub(crate) fn starting_after_forced_break(mut self) -> Self {
-        self.starts_after_forced_break = true;
-        self
-    }
+#[derive(Debug, Clone)]
+struct UnicodeRangeResolvedSpan {
+    range: Range<usize>,
+    style: ComputedStyle,
 }
 
 /// A durable shaped CSS inline line.
@@ -326,6 +290,8 @@ impl ShapedInlineRun {
         RenderedTextRun {
             text: self.text.clone(),
             x_offset: self.x_offset,
+            y_offset: 0.0,
+            text_matrix: crate::RenderedTextMatrix::IDENTITY,
             font_size: self.font_size,
             font_id: self.font_id,
             glyphs: Some(
@@ -603,6 +569,7 @@ struct RegisteredFontFace {
 struct RegisteredFontFaceMetadata {
     family: String,
     feature_defaults: FontFaceFeatureDefaults,
+    unicode_range: Option<Vec<UnicodeRange>>,
 }
 
 mod bidi;
@@ -610,28 +577,39 @@ mod breaking;
 mod font_matching;
 mod shaping;
 mod system;
+mod typographic_units;
 mod unicode_properties;
 
 pub(crate) use bidi::{
     bidi_control_scope_for_style, text_with_css_bidi_controls, text_without_bidi_format_controls,
 };
 pub(crate) use breaking::contains_bidi_text;
+pub(crate) use breaking::grapheme_cluster_inner_boundaries;
+#[cfg(test)]
 pub(crate) use breaking::inline_atomic_boundary_allows_soft_wrap;
 pub(crate) use breaking::measured_break_opportunities;
+pub(crate) use breaking::text_with_hyphenation_controls;
+#[cfg(test)]
 use breaking::*;
 use font_matching::*;
 use shaping::*;
+pub(crate) use typographic_units::{
+    inter_character_gap_allowed_between_text, keep_all_suppresses_break_between,
+    text_break_is_min_content_eligible, typographic_unit_count, typographic_unit_ranges,
+};
 use unicode_properties::*;
 pub(crate) use unicode_properties::{
-    character_is_autospace_alpha, character_is_autospace_ideograph, character_is_autospace_numeric,
-    character_is_bidi_format_control, character_is_css_other_space_separator,
-    character_is_css_word_separator, character_is_default_ignorable_code_point,
-    character_is_first_hangable_punctuation, character_is_font_neutral_default_ignorable,
-    character_is_hangable_stop_or_comma, character_is_join_control,
-    character_is_last_hangable_punctuation, character_is_text_decoration_spacer,
-    character_is_unicode_alphanumeric, character_is_unicode_control, character_is_unicode_letter,
-    character_is_unicode_punctuation, character_preserves_word_boundary_context,
-    character_receives_text_emphasis_mark, plaintext_direction_for_text,
+    character_is_arabic_tatweel, character_is_autospace_alpha, character_is_autospace_ideograph,
+    character_is_autospace_numeric, character_is_bidi_format_control,
+    character_is_css_other_space_separator, character_is_css_word_separator,
+    character_is_default_ignorable_code_point, character_is_first_hangable_punctuation,
+    character_is_font_neutral_default_ignorable, character_is_hangable_stop_or_comma,
+    character_is_join_control, character_is_last_hangable_punctuation,
+    character_is_text_decoration_spacer, character_is_unicode_alphanumeric,
+    character_is_unicode_control, character_is_unicode_letter, character_is_unicode_mark,
+    character_is_unicode_punctuation, character_is_unicode_symbol,
+    character_preserves_word_boundary_context, character_receives_text_emphasis_mark,
+    plaintext_direction_for_text, typographic_unit_is_upright_in_mixed_orientation,
 };
 
 #[cfg(test)]

@@ -93,12 +93,29 @@ pub(super) fn push_parley_text_spacing_default_with_context(
     context: Option<&FontFeatureContext>,
 ) {
     let used_letter_spacing = used_letter_spacing_for_text(text, style.used_letter_spacing());
+    let vertical_form_ranges = vertical_form_feature_ranges(text, style);
+    let default_feature_policy = FontFeaturePolicy {
+        vertical_forms: vertical_form_ranges
+            .first()
+            .is_some_and(|range| range.start == 0 && range.end == text.len()),
+    };
     builder.push_default(StyleProperty::LetterSpacing(used_letter_spacing));
     builder.push_default(StyleProperty::FontFeatures(parley_font_features(
         style,
         used_letter_spacing,
         context,
+        default_feature_policy,
     )));
+    if !default_feature_policy.vertical_forms {
+        push_vertical_form_feature_ranges(
+            builder,
+            style,
+            0..text.len(),
+            used_letter_spacing,
+            context,
+            &vertical_form_ranges,
+        );
+    }
 }
 
 pub(super) fn push_parley_text_spacing_range_with_context(
@@ -109,14 +126,35 @@ pub(super) fn push_parley_text_spacing_range_with_context(
     context: Option<&FontFeatureContext>,
 ) {
     let used_letter_spacing = used_letter_spacing_for_text(text, style.used_letter_spacing());
+    let vertical_form_ranges = vertical_form_feature_ranges(text, style);
+    let default_feature_policy = FontFeaturePolicy {
+        vertical_forms: vertical_form_ranges.first().is_some_and(|vertical_range| {
+            vertical_range.start == 0 && vertical_range.end == text.len()
+        }),
+    };
     builder.push(
         StyleProperty::LetterSpacing(used_letter_spacing),
         range.clone(),
     );
     builder.push(
-        StyleProperty::FontFeatures(parley_font_features(style, used_letter_spacing, context)),
-        range,
+        StyleProperty::FontFeatures(parley_font_features(
+            style,
+            used_letter_spacing,
+            context,
+            default_feature_policy,
+        )),
+        range.clone(),
     );
+    if !default_feature_policy.vertical_forms {
+        push_vertical_form_feature_ranges(
+            builder,
+            style,
+            range,
+            used_letter_spacing,
+            context,
+            &vertical_form_ranges,
+        );
+    }
 }
 
 pub(super) fn push_parley_style_range(
@@ -186,6 +224,7 @@ fn parley_font_features(
     style: &ComputedStyle,
     used_letter_spacing: f32,
     context: Option<&FontFeatureContext>,
+    policy: FontFeaturePolicy,
 ) -> ParleyFontFeatures<'static> {
     let mut features = Vec::<ParleyFontFeature>::new();
     if let Some(defaults) = context.and_then(|context| context.face_defaults.as_ref()) {
@@ -216,6 +255,7 @@ fn parley_font_features(
         resolver.as_ref(),
     );
     push_font_variant_east_asian_features(&mut features, &style.font_variant_east_asian);
+    push_vertical_form_features(&mut features, policy);
     if used_letter_spacing != 0.0 {
         push_parley_font_feature(&mut features, *b"liga", 0);
         push_parley_font_feature(&mut features, *b"clig", 0);
@@ -228,6 +268,96 @@ fn parley_font_features(
     } else {
         features.sort_by_key(|feature| feature.tag);
         ParleyFontFeatures::List(Cow::Owned(features))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FontFeaturePolicy {
+    vertical_forms: bool,
+}
+
+/// Return byte ranges that should shape with OpenType vertical glyph forms.
+///
+/// CSS Writing Modes orients vertical typographic character units according to
+/// `text-orientation`; upright units are eligible for vertical glyph forms.
+/// The shaping feature policy applies `vert`/`vrt2` before PDF placement so
+/// glyph selection, measurement, and ToUnicode output remain one artifact:
+/// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation> and
+/// <https://learn.microsoft.com/en-us/typography/opentype/spec/features_uz#tag-vert>.
+fn vertical_form_feature_ranges(text: &str, style: &ComputedStyle) -> Vec<Range<usize>> {
+    if text.is_empty() || style.writing_mode == WritingMode::HorizontalTb {
+        return Vec::new();
+    }
+    match style.text_orientation {
+        TextOrientation::Sideways => Vec::new(),
+        TextOrientation::Upright => std::iter::once(0..text.len()).collect(),
+        TextOrientation::Mixed => {
+            let mut ranges = Vec::new();
+            for range in typographic_unit_ranges(text) {
+                if typographic_unit_is_upright_in_mixed_orientation(&text[range.clone()]) {
+                    push_vertical_form_range_with_inherited_characters(text, range, &mut ranges);
+                }
+            }
+            ranges
+        }
+    }
+}
+
+fn push_vertical_form_range_with_inherited_characters(
+    text: &str,
+    range: Range<usize>,
+    ranges: &mut Vec<Range<usize>>,
+) {
+    let mut start = range.start;
+    while let Some((previous_start, character)) = text[..start].char_indices().next_back()
+        && character_inherits_vertical_orientation(character)
+    {
+        start = previous_start;
+    }
+    let mut end = range.end;
+    while let Some((offset, character)) = text[end..].char_indices().next()
+        && character_inherits_vertical_orientation(character)
+    {
+        end += offset + character.len_utf8();
+    }
+    if let Some(previous) = ranges.last_mut()
+        && start <= previous.end
+    {
+        previous.end = previous.end.max(end);
+        return;
+    }
+    ranges.push(start..end);
+}
+
+fn push_vertical_form_feature_ranges(
+    builder: &mut parley::RangedBuilder<'_, [u8; 4]>,
+    style: &ComputedStyle,
+    base_range: Range<usize>,
+    used_letter_spacing: f32,
+    context: Option<&FontFeatureContext>,
+    vertical_form_ranges: &[Range<usize>],
+) {
+    for vertical_range in vertical_form_ranges {
+        let range =
+            (base_range.start + vertical_range.start)..(base_range.start + vertical_range.end);
+        builder.push(
+            StyleProperty::FontFeatures(parley_font_features(
+                style,
+                used_letter_spacing,
+                context,
+                FontFeaturePolicy {
+                    vertical_forms: true,
+                },
+            )),
+            range,
+        );
+    }
+}
+
+fn push_vertical_form_features(features: &mut Vec<ParleyFontFeature>, policy: FontFeaturePolicy) {
+    if policy.vertical_forms {
+        push_parley_font_feature(features, *b"vert", 1);
+        push_parley_font_feature(features, *b"vrt2", 1);
     }
 }
 
@@ -732,4 +862,98 @@ pub(super) fn sanitize_pdf_name(name: &str) -> String {
         })
         .collect::<String>();
     sanitized.trim_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::css::{FontFeatureSetting, FontFeatureSettings};
+
+    fn vertical_range_texts<'a>(text: &'a str, style: &ComputedStyle) -> Vec<&'a str> {
+        vertical_form_feature_ranges(text, style)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect()
+    }
+
+    fn feature_value(features: &ParleyFontFeatures<'static>, tag: [u8; 4]) -> Option<u16> {
+        match features {
+            ParleyFontFeatures::List(features) => features
+                .iter()
+                .find(|feature| feature.tag == ParleyTag::from_bytes(tag))
+                .map(|feature| feature.value),
+            ParleyFontFeatures::Source(_) => None,
+        }
+    }
+
+    #[test]
+    fn vertical_form_policy_enables_features_for_upright_vertical_units_only() {
+        let mut style = ComputedStyle::initial();
+        assert!(vertical_form_feature_ranges("中文", &style).is_empty());
+
+        style.writing_mode = WritingMode::VerticalRl;
+        style.text_orientation = TextOrientation::Sideways;
+        assert!(vertical_form_feature_ranges("中文", &style).is_empty());
+
+        style.text_orientation = TextOrientation::Upright;
+        assert_eq!(vertical_range_texts("a§、〈", &style), vec!["a§、〈"]);
+
+        style.text_orientation = TextOrientation::Mixed;
+        assert_eq!(vertical_range_texts("a§、〈", &style), vec!["§、"]);
+    }
+
+    #[test]
+    fn vertical_form_policy_keeps_combining_units_with_their_base() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalRl;
+        style.text_orientation = TextOrientation::Mixed;
+
+        assert_eq!(
+            vertical_range_texts("\u{200d}中\u{301}", &style),
+            vec!["\u{200d}中\u{301}"]
+        );
+        assert!(vertical_form_feature_ranges("a\u{301}", &style).is_empty());
+    }
+
+    #[test]
+    fn vertical_form_features_are_css_implied_and_low_level_overridable() {
+        let style = ComputedStyle::initial();
+        let disabled = parley_font_features(
+            &style,
+            0.0,
+            None,
+            FontFeaturePolicy {
+                vertical_forms: false,
+            },
+        );
+        assert_eq!(feature_value(&disabled, *b"vert"), None);
+        assert_eq!(feature_value(&disabled, *b"vrt2"), None);
+
+        let enabled = parley_font_features(
+            &style,
+            0.0,
+            None,
+            FontFeaturePolicy {
+                vertical_forms: true,
+            },
+        );
+        assert_eq!(feature_value(&enabled, *b"vert"), Some(1));
+        assert_eq!(feature_value(&enabled, *b"vrt2"), Some(1));
+
+        let mut overridden = style.clone();
+        overridden.font_feature_settings = FontFeatureSettings(vec![
+            FontFeatureSetting::new(*b"vert", 0),
+            FontFeatureSetting::new(*b"vrt2", 0),
+        ]);
+        let features = parley_font_features(
+            &overridden,
+            0.0,
+            None,
+            FontFeaturePolicy {
+                vertical_forms: true,
+            },
+        );
+        assert_eq!(feature_value(&features, *b"vert"), Some(0));
+        assert_eq!(feature_value(&features, *b"vrt2"), Some(0));
+    }
 }

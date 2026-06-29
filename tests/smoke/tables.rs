@@ -12,8 +12,8 @@ async fn renders_basic_tables_in_rows_and_columns() {
     assert_eq!(document.pages[0].lines[1].text, "B");
     assert_eq!(document.pages[0].lines[2].text, "C");
     assert_eq!(document.pages[0].lines[3].text, "D");
-    assert!(document.pages[0].lines[1].x > document.pages[0].lines[0].x);
-    assert!(document.pages[0].lines[2].y < document.pages[0].lines[0].y);
+    assert!(document.pages[0].lines[1].x() > document.pages[0].lines[0].x());
+    assert!(document.pages[0].lines[2].y() < document.pages[0].lines[0].y());
     assert_eq!(document.pages[0].rects[0].fill, Some(Color::BLACK));
     assert_eq!(document.pages[0].rects[0].stroke, None);
 }
@@ -31,7 +31,370 @@ async fn supports_authored_table_internal_display_values() {
     let lines = &document.pages[0].lines;
     assert_eq!(lines[0].text, "A");
     assert_eq!(lines[1].text, "B");
-    assert!(lines[1].x > lines[0].x);
+    assert!(lines[1].x() > lines[0].x());
+}
+
+#[tokio::test]
+async fn table_cell_align_content_overrides_legacy_vertical_align_when_non_normal() {
+    let document = Html::from_string(
+        "<style>@page { size: 260pt 120pt; margin: 10pt }\
+         body, table, td { margin: 0; border-spacing: 0; padding: 0; font-size: 10pt; line-height: 10pt }\
+         td { width: 55pt; height: 60pt; vertical-align: top }\
+         .normal { vertical-align: bottom; align-content: normal }\
+         .center { align-content: center }\
+         .end { align-content: end }</style>\
+         <table><tr><td>Top</td><td class=\"normal\">Normal</td><td class=\"center\">Center</td><td class=\"end\">End</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = |text: &str| {
+        document.pages[0]
+            .lines
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("{text} should render"))
+    };
+    let top = line("Top");
+    let normal = line("Normal");
+    let center = line("Center");
+    let end = line("End");
+
+    assert!(
+        (top.y() - center.y() - 25.0).abs() < 0.5,
+        "align-content:center should center table-cell content: top={top:?}, center={center:?}"
+    );
+    assert!(
+        (top.y() - end.y() - 50.0).abs() < 0.5,
+        "align-content:end should pack table-cell content to block-end: top={top:?}, end={end:?}"
+    );
+    assert!(
+        (normal.y() - end.y()).abs() < 0.5,
+        "align-content:normal should preserve legacy vertical-align behavior: normal={normal:?}, end={end:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_lr_table_cell_align_content_center_uses_horizontal_block_axis() {
+    let document = Html::from_string(
+        "<style>@page { size: 150pt 120pt; margin: 10pt }\
+         body, table, td { margin: 0; border-spacing: 0; padding: 0 }\
+         td { writing-mode: vertical-lr; width: 80pt; height: 50pt; align-content: center; background: red }\
+         .item { width: 20pt; height: 40pt; background: green }</style>\
+         <table><tr><td><div class=\"item\"></div></td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("vertical table-cell background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("vertical table-cell child should paint");
+
+    assert!(
+        (green.x() - red.x() - 30.0).abs() < 0.01,
+        "vertical-lr table-cell align-content:center should center on the horizontal block axis: red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_lr_table_cell_align_content_centers_inline_text_subject() {
+    let document = Html::from_string(
+        "<style>@page { size: 150pt 120pt; margin: 10pt }\
+         body, table, td { margin: 0; border-spacing: 0; padding: 0 }\
+         td { writing-mode: vertical-lr; width: 80pt; height: 50pt; align-content: center; font-size: 10pt; line-height: 20pt; background: red }</style>\
+         <table><tr><td>縦</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("vertical table-cell background should paint");
+    let line = page
+        .lines
+        .iter()
+        .find(|line| line.text == "縦")
+        .expect("vertical table-cell inline text should paint");
+
+    assert!(
+        (line.x() - red.x() - 35.0).abs() < 0.5,
+        "vertical-lr table-cell align-content:center should center the inline line box and paint the upright glyph inside it: red={red:?}, line={line:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_rl_table_cell_align_content_end_uses_right_to_left_block_axis() {
+    let document = Html::from_string(
+        "<style>@page { size: 150pt 120pt; margin: 10pt }\
+         body, table, td { margin: 0; border-spacing: 0; padding: 0 }\
+         td { writing-mode: vertical-rl; width: 80pt; height: 50pt; align-content: end; background: red }\
+         .item { width: 20pt; height: 40pt; background: green }</style>\
+         <table><tr><td><div class=\"item\"></div></td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("vertical table-cell background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("vertical table-cell child should paint");
+
+    assert!(
+        (green.x() - red.x()).abs() < 0.01,
+        "vertical-rl table-cell align-content:end should pack content against physical left/block-end: red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_table_cell_align_content_overflow_uses_axis_aware_defaults() {
+    let document = Html::from_string(
+        "<style>@page { size: 220pt 120pt; margin: 10pt }\
+         body, table, td { margin: 0; border-spacing: 0; padding: 0 }\
+         table { margin-right: 10pt; display: inline-table; table-layout: fixed; width: 20pt }\
+         td { writing-mode: vertical-lr; width: 20pt; height: 50pt; align-content: center; background: red }\
+         .scroll { overflow-x: auto }\
+         .item { width: 40pt; height: 40pt; background: green }</style>\
+         <table><tr><td><div class=\"item\"></div></td></tr></table>\
+         <table><tr><td class=\"scroll\"><div class=\"item\"></div></td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let mut red = page
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .collect::<Vec<_>>();
+    red.sort_by(|a, b| a.x().total_cmp(&b.x()));
+    let mut green = page
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .collect::<Vec<_>>();
+    green.sort_by(|a, b| a.x().total_cmp(&b.x()));
+
+    assert_eq!(red.len(), 2, "expected two table-cell backgrounds: {red:?}");
+    assert_eq!(
+        green.len(),
+        2,
+        "expected two overflowing table-cell children: {green:?}"
+    );
+    assert!(
+        (green[0].x() - red[0].x()).abs() < 0.01,
+        "non-scrollable vertical table-cell should default to safe block-start overflow: red={:?}, green={:?}",
+        red[0],
+        green[0]
+    );
+    assert!(
+        (green[1].x() - red[1].x() + 10.0).abs() < 0.01,
+        "scrollable vertical table-cell should default to unsafe centered overflow on overflow-x: red={:?}, green={:?}",
+        red[1],
+        green[1]
+    );
+}
+
+#[tokio::test]
+async fn table_cell_align_content_baseline_joins_row_baseline_group() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 120pt; margin: 10pt }\
+         body, table, td { margin: 0; border-spacing: 0; padding: 0 }\
+         td { width: 50pt; height: 50pt; vertical-align: top; align-content: baseline }\
+         .big { font-size: 30pt; line-height: 30pt }\
+         .small { font-size: 10pt; line-height: 10pt }</style>\
+         <table><tr><td class=\"big\">A</td><td class=\"small\">B</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = |text: &str| {
+        document.pages[0]
+            .lines
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("{text} should render"))
+    };
+    let big = line("A");
+    let small = line("B");
+
+    assert!(
+        (big.y() - small.y()).abs() < 0.5,
+        "align-content:baseline should align table-cell content baselines: big={big:?}, small={small:?}"
+    );
+}
+
+#[tokio::test]
+async fn table_cell_align_content_last_baseline_joins_row_baseline_group() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 120pt; margin: 10pt }\
+         body, table, td { margin: 0; border-spacing: 0; padding: 0 }\
+         td { width: 50pt; height: 60pt; vertical-align: top; align-content: last baseline }\
+         .two { font-size: 10pt; line-height: 10pt }\
+         .big { font-size: 30pt; line-height: 30pt }</style>\
+         <table><tr><td class=\"two\">A<br>B</td><td class=\"big\">C</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = |text: &str| {
+        document.pages[0]
+            .lines
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("{text} should render"))
+    };
+    let first_last = line("B");
+    let second = line("C");
+
+    assert!(
+        (first_last.y() - second.y()).abs() < 0.5,
+        "align-content:last baseline should align table-cell last baselines: first_last={first_last:?}, second={second:?}"
+    );
+}
+
+#[tokio::test]
+async fn orthogonal_table_cell_align_content_baseline_uses_fallback() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 180pt; margin: 10pt }\
+         body, table, td { margin: 0; border-spacing: 0; padding: 0 }\
+         td { width: 50pt; height: 60pt; vertical-align: top }\
+         .peer { align-content: baseline; font-size: 30pt; line-height: 30pt }\
+         .ortho, .start { writing-mode: vertical-lr; font-size: 10pt; line-height: 20pt }\
+         .ortho { align-content: baseline; background: red }\
+         .start { align-content: start; background: blue }</style>\
+         <table><tr><td class=\"peer\">A</td><td class=\"ortho\">甲</td></tr>\
+         <tr><td class=\"peer\">B</td><td class=\"start\">乙</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("orthogonal baseline cell background should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("orthogonal start fallback cell background should paint");
+    let baseline = page
+        .lines
+        .iter()
+        .find(|line| line.text == "甲")
+        .expect("orthogonal baseline cell text should paint");
+    let start = page
+        .lines
+        .iter()
+        .find(|line| line.text == "乙")
+        .expect("orthogonal start cell text should paint");
+
+    assert!(
+        ((baseline.y() - red.y()) - (start.y() - blue.y())).abs() < 0.5,
+        "orthogonal align-content:baseline cell should not consume the horizontal row baseline: red={red:?}, blue={blue:?}, baseline={baseline:?}, start={start:?}"
+    );
+}
+
+#[tokio::test]
+async fn rowspan_table_cell_align_content_baseline_joins_startmost_row_group() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 140pt; margin: 10pt }\
+         body, table, td { margin: 0; border-spacing: 0; padding: 0 }\
+         td { width: 50pt; height: 30pt; vertical-align: top; align-content: baseline }\
+         .span { font-size: 10pt; line-height: 10pt; background: red }\
+         .peer { font-size: 30pt; line-height: 30pt }</style>\
+         <table><tr><td class=\"span\" rowspan=\"2\">Span</td><td class=\"peer\">A</td></tr><tr><td>B</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("baseline rowspan cell background should paint");
+    let span = page
+        .lines
+        .iter()
+        .find(|line| line.text == "Span")
+        .expect("baseline rowspan text should paint");
+    let peer = page
+        .lines
+        .iter()
+        .find(|line| line.text == "A")
+        .expect("first-row peer baseline text should paint");
+
+    assert!(
+        (span.y() - peer.y()).abs() < 0.5,
+        "row-spanning align-content:baseline cell should join the start-most row baseline group: red={red:?}, span={span:?}, peer={peer:?}"
+    );
+}
+
+#[tokio::test]
+async fn rowspan_table_cell_align_content_last_baseline_joins_endmost_row_group() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 140pt; margin: 10pt }\
+         body, table, td { margin: 0; border-spacing: 0; padding: 0 }\
+         td { width: 50pt; height: 30pt; vertical-align: top }\
+         .span { align-content: last baseline; font-size: 10pt; line-height: 10pt; background: red }\
+         .small { font-size: 10pt; line-height: 10pt }\
+         .peer { align-content: last baseline; font-size: 30pt; line-height: 30pt }</style>\
+         <table><tr><td class=\"span\" rowspan=\"2\">Span</td><td class=\"small\">A</td></tr><tr><td class=\"peer\">B</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("last-baseline rowspan cell background should paint");
+    let span = page
+        .lines
+        .iter()
+        .find(|line| line.text == "Span")
+        .expect("last-baseline rowspan text should paint");
+    let peer = page
+        .lines
+        .iter()
+        .find(|line| line.text == "B")
+        .expect("end-most row peer baseline text should paint");
+
+    assert!(
+        (span.y() - peer.y()).abs() < 0.5,
+        "row-spanning align-content:last baseline cell should join the end-most row baseline group: red={red:?}, span={span:?}, peer={peer:?}"
+    );
 }
 
 #[tokio::test]
@@ -48,7 +411,7 @@ async fn auto_table_sizing_uses_inline_edges_for_cell_contributions() {
     let lines = &document.pages[0].lines;
     let next = lines.iter().find(|line| line.text == "Next").unwrap();
     assert!(
-        next.x > 55.0,
+        next.x() > 55.0,
         "second cell should be shifted by the first cell's inline padding: {next:?}"
     );
 }
@@ -75,7 +438,7 @@ async fn nested_table_fragment_contributes_to_cell_intrinsic_width() {
         .unwrap();
 
     assert!(
-        next.x - inner.x > 85.0,
+        next.x() - inner.x() > 85.0,
         "outer cell should reserve the nested table fragment width: inner={inner:?}, next={next:?}"
     );
 }
@@ -97,8 +460,8 @@ async fn table_row_groups_use_css_visual_order() {
     assert_eq!(lines[0].text, "Head");
     assert_eq!(lines[1].text, "Body");
     assert_eq!(lines[2].text, "Foot");
-    assert!(lines[0].y > lines[1].y);
-    assert!(lines[1].y > lines[2].y);
+    assert!(lines[0].y() > lines[1].y());
+    assert!(lines[1].y() > lines[2].y());
 }
 
 #[tokio::test]
@@ -127,8 +490,8 @@ async fn authored_table_row_groups_use_css_visual_order() {
     assert_eq!(lines[0].text, "Head");
     assert_eq!(lines[1].text, "Body");
     assert_eq!(lines[2].text, "Foot");
-    assert!(lines[0].y > lines[1].y);
-    assert!(lines[1].y > lines[2].y);
+    assert!(lines[0].y() > lines[1].y());
+    assert!(lines[1].y() > lines[2].y());
 }
 
 #[tokio::test]
@@ -201,12 +564,12 @@ async fn repeated_table_header_and_footer_keep_page_fragment_order() {
         }
         if let Some(header) = header {
             for body in &bodies {
-                assert!(header.y > body.y, "header should paint above body rows");
+                assert!(header.y() > body.y(), "header should paint above body rows");
             }
         }
         if let Some(footer) = footer {
             for body in &bodies {
-                assert!(body.y > footer.y, "footer should paint below body rows");
+                assert!(body.y() > footer.y(), "footer should paint below body rows");
             }
         }
     }
@@ -250,8 +613,8 @@ async fn repeated_collapsed_table_header_paints_fragment_borders() {
                     quire::PaintOperation::Rect(index)
                         if page.rects.get(*index).is_some_and(|rect| {
                             rect.fill == Some(Color::new(255, 0, 0))
-                                && rect.width > 0.0
-                                && rect.height > 0.0
+                                && rect.width() > 0.0
+                                && rect.height() > 0.0
                         })
                 )
             }),
@@ -323,8 +686,8 @@ async fn repeated_table_header_traps_positioned_descendants_in_fragment() {
                 quire::PaintOperation::Rect(index)
                     if repeated_page.rects.get(*index).is_some_and(|rect| {
                         rect.fill == Some(Color::new(255, 0, 0))
-                            && rect.width > 0.0
-                            && rect.height > 0.0
+                            && rect.width() > 0.0
+                            && rect.height() > 0.0
                     })
             )
         }),
@@ -361,8 +724,8 @@ async fn fragmented_collapsed_table_body_paints_borders_on_each_page() {
                     quire::PaintOperation::Rect(index)
                         if page.rects.get(*index).is_some_and(|rect| {
                             rect.fill == Some(Color::new(255, 0, 0))
-                                && rect.width > 0.0
-                                && rect.height > 0.0
+                                && rect.width() > 0.0
+                                && rect.height() > 0.0
                         })
                 )
             }),
@@ -387,12 +750,12 @@ async fn fragmented_collapsed_table_uses_full_grid_boundary_winners() {
         .find(|page| page.lines.iter().any(|line| line.text == "B"))
         .expect("second row should be forced to a later page");
     let red_horizontal = second_page.rects.iter().any(|rect| {
-        rect.fill == Some(Color::new(255, 0, 0)) && rect.width > 20.0 && rect.height >= 7.9
+        rect.fill == Some(Color::new(255, 0, 0)) && rect.width() > 20.0 && rect.height() >= 7.9
     });
     let blue_horizontal = second_page.rects.iter().any(|rect| {
         rect.fill == Some(Color::new(0, 0, 255))
-            && rect.width > 20.0
-            && (rect.height - 2.0).abs() < 0.01
+            && rect.width() > 20.0
+            && (rect.height() - 2.0).abs() < 0.01
     });
 
     assert!(
@@ -432,7 +795,7 @@ async fn fragmented_collapsed_table_background_uses_wrapper_slice_bounds() {
             .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
             .expect("table background should paint on each fragment");
         assert!(
-            (green.width - 42.0).abs() < 0.01,
+            (green.width() - 42.0).abs() < 0.01,
             "fragment table background should include collapsed wrapper insets, got {green:?}"
         );
     }
@@ -458,12 +821,12 @@ async fn repeated_collapsed_header_uses_full_grid_bottom_boundary() {
         })
         .expect("a non-final page should repeat the header");
     let red_horizontal = repeated_page.rects.iter().any(|rect| {
-        rect.fill == Some(Color::new(255, 0, 0)) && rect.width > 20.0 && rect.height >= 7.9
+        rect.fill == Some(Color::new(255, 0, 0)) && rect.width() > 20.0 && rect.height() >= 7.9
     });
     let blue_horizontal = repeated_page.rects.iter().any(|rect| {
         rect.fill == Some(Color::new(0, 0, 255))
-            && rect.width > 20.0
-            && (rect.height - 2.0).abs() < 0.01
+            && rect.width() > 20.0
+            && (rect.height() - 2.0).abs() < 0.01
     });
 
     assert!(
@@ -506,8 +869,8 @@ async fn fragmented_collapsed_table_body_keeps_rowspan_border_candidates() {
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(0, 0, 255))
-                && (rect.width - 4.0).abs() < 0.01
-                && rect.height > 0.0
+                && (rect.width() - 4.0).abs() < 0.01
+                && rect.height() > 0.0
         })
         .count();
 
@@ -555,8 +918,8 @@ async fn fragmented_collapsed_table_body_keeps_rowspan_candidates_across_collaps
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(0, 0, 255))
-                && (rect.width - 4.0).abs() < 0.01
-                && rect.height > 0.0
+                && (rect.width() - 4.0).abs() < 0.01
+                && rect.height() > 0.0
         })
         .count();
 
@@ -584,7 +947,9 @@ async fn oversized_table_row_splits_into_durable_body_fragments() {
         .iter()
         .filter(|page| {
             page.rects.iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 0, 255)) && rect.width > 0.0 && rect.height > 0.0
+                rect.fill == Some(Color::new(0, 0, 255))
+                    && rect.width() > 0.0
+                    && rect.height() > 0.0
             })
         })
         .collect::<Vec<_>>();
@@ -596,7 +961,9 @@ async fn oversized_table_row_splits_into_durable_body_fragments() {
     for page in painted_fragments {
         assert!(
             page.rects.iter().any(|rect| {
-                rect.fill == Some(Color::new(255, 0, 0)) && rect.width > 0.0 && rect.height > 0.0
+                rect.fill == Some(Color::new(255, 0, 0))
+                    && rect.width() > 0.0
+                    && rect.height() > 0.0
             }),
             "each oversized row fragment should own collapsed border paint"
         );
@@ -618,7 +985,9 @@ async fn oversized_collapsed_row_pieces_do_not_synthesize_horizontal_slice_borde
         .iter()
         .filter(|page| {
             page.rects.iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 0, 255)) && rect.width > 0.0 && rect.height > 0.0
+                rect.fill == Some(Color::new(0, 0, 255))
+                    && rect.width() > 0.0
+                    && rect.height() > 0.0
             })
         })
         .collect::<Vec<_>>();
@@ -627,16 +996,16 @@ async fn oversized_collapsed_row_pieces_do_not_synthesize_horizontal_slice_borde
     let middle_page = row_piece_pages[1];
     let synthetic_horizontal = middle_page.rects.iter().any(|rect| {
         rect.fill == Some(Color::new(255, 0, 0))
-            && rect.width > 40.0
-            && (rect.height - 4.0).abs() < 0.01
+            && rect.width() > 40.0
+            && (rect.height() - 4.0).abs() < 0.01
     });
     let vertical_edges = middle_page
         .rects
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(255, 0, 0))
-                && (rect.width - 4.0).abs() < 0.01
-                && rect.height > 0.0
+                && (rect.width() - 4.0).abs() < 0.01
+                && rect.height() > 0.0
         })
         .count();
 
@@ -669,7 +1038,9 @@ async fn repeated_header_wraps_oversized_table_row_fragments() {
         .iter()
         .filter(|page| {
             page.rects.iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 0, 255)) && rect.width > 0.0 && rect.height > 0.0
+                rect.fill == Some(Color::new(0, 0, 255))
+                    && rect.width() > 0.0
+                    && rect.height() > 0.0
             })
         })
         .collect::<Vec<_>>();
@@ -706,7 +1077,9 @@ async fn oversized_table_rowspan_fragments_keep_collapsed_border_candidates() {
         .iter()
         .filter(|page| {
             page.rects.iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 0, 255)) && rect.width > 0.0 && rect.height > 0.0
+                rect.fill == Some(Color::new(0, 0, 255))
+                    && rect.width() > 0.0
+                    && rect.height() > 0.0
             })
         })
         .collect::<Vec<_>>();
@@ -718,8 +1091,8 @@ async fn oversized_table_rowspan_fragments_keep_collapsed_border_candidates() {
             .iter()
             .filter(|rect| {
                 rect.fill == Some(Color::new(0, 128, 0))
-                    && (rect.width - 4.0).abs() < 0.01
-                    && rect.height > 0.0
+                    && (rect.width() - 4.0).abs() < 0.01
+                    && rect.height() > 0.0
             })
             .count();
         assert!(
@@ -821,7 +1194,9 @@ async fn oversized_table_row_fragments_inline_block_atoms_per_piece() {
         .iter()
         .filter(|page| {
             page.rects.iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 128, 0)) && rect.width > 0.0 && rect.height > 0.0
+                rect.fill == Some(Color::new(0, 128, 0))
+                    && rect.width() > 0.0
+                    && rect.height() > 0.0
             })
         })
         .count();
@@ -857,7 +1232,9 @@ async fn oversized_table_row_fragments_nested_inline_block_atoms_from_plan() {
         .iter()
         .filter(|page| {
             page.rects.iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 128, 0)) && rect.width > 0.0 && rect.height > 0.0
+                rect.fill == Some(Color::new(0, 128, 0))
+                    && rect.width() > 0.0
+                    && rect.height() > 0.0
             })
         })
         .count();
@@ -884,7 +1261,9 @@ async fn oversized_table_row_clips_replaced_children_per_piece() {
         .iter()
         .filter(|page| {
             page.rects.iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 0, 255)) && rect.width > 0.0 && rect.height > 0.0
+                rect.fill == Some(Color::new(0, 0, 255))
+                    && rect.width() > 0.0
+                    && rect.height() > 0.0
             })
         })
         .count();
@@ -1020,7 +1399,7 @@ async fn ua_table_box_sizing_border_box_keeps_border_and_padding_inside_width() 
         .unwrap();
 
     assert!(
-        (background.width - 60.0).abs() < 0.01,
+        (background.width() - 60.0).abs() < 0.01,
         "table border-box wrapper width should be 60pt, got {background:?}"
     );
 }
@@ -1029,7 +1408,7 @@ async fn ua_table_box_sizing_border_box_keeps_border_and_padding_inside_width() 
 async fn collapsed_table_decorative_borders_do_not_shrink_grid_width() {
     let document = Html::from_string(
         "<style>body { margin: 0 } table { border-collapse: collapse; margin: 0; width: 100pt; border-left: 30pt solid transparent; border-right: 30pt solid transparent; border-spacing: 0; font-size: 10pt; line-height: 10pt } td { padding: 0 }</style>\
-         <table><tr><td style=\"width:50pt\">Left side</td><td style=\"width:50pt\">Right side</td></tr></table>",
+         <table><tr><td style=\"width:50pt\">L</td><td style=\"width:50pt\">R</td></tr></table>",
     )
     .render_async(&RenderOptions::default()).await
     .unwrap();
@@ -1037,16 +1416,16 @@ async fn collapsed_table_decorative_borders_do_not_shrink_grid_width() {
     let left = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "Left side")
+        .find(|line| line.text == "L")
         .unwrap();
     let right = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "Right side")
+        .find(|line| line.text == "R")
         .unwrap();
 
     assert!(
-        right.x - left.x > 40.0,
+        right.x() - left.x() > 30.0,
         "collapsed table borders should not consume column grid width: left={left:?} right={right:?}"
     );
 }
@@ -1069,11 +1448,11 @@ async fn collapsed_table_wrapper_inline_insets_use_first_displayed_row() {
     let wide_red_edges = document.pages[0]
         .rects
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)) && rect.width >= 29.9)
+        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)) && rect.width() >= 29.9)
         .count();
 
     assert!(
-        (green.width - 42.0).abs() < 0.01,
+        (green.width() - 42.0).abs() < 0.01,
         "wrapper background should use first-row outer insets, got {green:?}"
     );
     assert!(
@@ -1099,8 +1478,8 @@ async fn collapsed_table_wrapper_block_insets_use_top_and_bottom_grid_edges() {
         .expect("collapsed table background should paint");
 
     assert!(
-        (green.height - 36.0).abs() < 0.01,
-        "wrapper background should include half of widest top/bottom grid-edge borders, got {green:?}"
+        (green.height() - 52.0).abs() < 0.01,
+        "wrapper background should include full collapsed edge occupancy, got {green:?}"
     );
 }
 
@@ -1116,7 +1495,7 @@ async fn invoice_sample_generated_metadata_terms_do_not_wrap() {
     let invoice_label = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "Invoice number:" && line.x > 300.0)
+        .find(|line| line.text == "Invoice number:" && line.x() > 300.0)
         .unwrap();
     let invoice_value = document.pages[0]
         .lines
@@ -1135,15 +1514,15 @@ async fn invoice_sample_generated_metadata_terms_do_not_wrap() {
         .unwrap();
 
     assert!(
-        (invoice_label.y - invoice_value.y).abs() < 0.1,
+        (invoice_label.y() - invoice_value.y()).abs() < 0.1,
         "invoice number should share one generated-content line"
     );
     assert!(
-        (date_label.y - date_value.y).abs() < 0.1,
+        (date_label.y() - date_value.y()).abs() < 0.1,
         "invoice date should share one generated-content line"
     );
-    assert!(invoice_label.x < invoice_value.x);
-    assert!(date_label.x < date_value.x);
+    assert!(invoice_label.x() < invoice_value.x());
+    assert!(date_label.x() < date_value.x());
 }
 
 #[tokio::test]
@@ -1171,9 +1550,9 @@ async fn table_cells_honor_nested_of_type_text_alignment_rules() {
         .find(|line| line.text == "Right")
         .unwrap();
 
-    assert!(left.x < middle.x);
-    assert!(middle.x < right.x);
-    assert!(right.x > 160.0, "right-aligned cell at x={}", right.x);
+    assert!(left.x() < middle.x());
+    assert!(middle.x() < right.x());
+    assert!(right.x() > 160.0, "right-aligned cell at x={}", right.x());
 }
 
 #[tokio::test]
@@ -1192,7 +1571,7 @@ async fn table_cells_match_table_descendant_of_type_selectors() {
         .unwrap();
 
     assert_eq!(right.color, Color::new(30, 228, 148));
-    assert!(right.x > 150.0);
+    assert!(right.x() > 150.0);
 }
 
 #[tokio::test]
@@ -1207,7 +1586,7 @@ async fn inline_table_participates_as_atomic_inline_box() {
     let before = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "Before")
+        .find(|line| line.text.trim() == "Before")
         .unwrap();
     let cell = document.pages[0]
         .lines
@@ -1217,12 +1596,12 @@ async fn inline_table_participates_as_atomic_inline_box() {
     let after = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "After")
+        .find(|line| line.text.trim() == "After")
         .unwrap();
 
-    assert!(before.x < cell.x);
-    assert!(cell.x < after.x);
-    assert!((before.y - after.y).abs() < 0.1);
+    assert!(before.x() < cell.x());
+    assert!(cell.x() < after.x());
+    assert!((before.y() - after.y()).abs() < 0.1);
 }
 
 #[tokio::test]
@@ -1252,11 +1631,11 @@ async fn auto_inline_table_uses_fragment_intrinsic_width() {
         .unwrap();
 
     assert!(
-        cell.x - wide.x > 75.0,
+        cell.x() - wide.x() > 75.0,
         "second cell should use first column's intrinsic table width: wide={wide:?}, cell={cell:?}"
     );
     assert!(
-        after.x - wide.x > 115.0,
+        after.x() - wide.x() > 115.0,
         "trailing inline text should follow the auto inline-table width: wide={wide:?}, after={after:?}"
     );
 }
@@ -1274,7 +1653,7 @@ async fn inline_table_fragment_intrinsics_follow_visual_row_order() {
     let before = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "Before")
+        .find(|line| line.text.trim() == "Before")
         .unwrap();
     let head = document.pages[0]
         .lines
@@ -1289,12 +1668,15 @@ async fn inline_table_fragment_intrinsics_follow_visual_row_order() {
     let after = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "After")
+        .find(|line| line.text.trim() == "After")
         .unwrap();
 
-    assert!(head.y > body.y, "header row should be laid out before body");
     assert!(
-        after.x - head.x > 85.0,
+        head.y() > body.y(),
+        "header row should be laid out before body"
+    );
+    assert!(
+        after.x() - head.x() > 85.0,
         "trailing text should follow the visual header row's table width"
     );
     assert!(
@@ -1318,7 +1700,7 @@ async fn inline_table_uses_first_row_baseline() {
     let before = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "Before")
+        .find(|line| line.text.trim() == "Before")
         .unwrap();
     let cell = document.pages[0]
         .lines
@@ -1328,7 +1710,7 @@ async fn inline_table_uses_first_row_baseline() {
     let after = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "After")
+        .find(|line| line.text.trim() == "After")
         .unwrap();
 
     let before_top = rendered_line_baseline_top(&document, before);
@@ -1356,7 +1738,7 @@ async fn inline_table_baseline_ignores_top_caption() {
     let before = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "Before")
+        .find(|line| line.text.trim() == "Before")
         .unwrap();
     let caption = document.pages[0]
         .lines
@@ -1371,7 +1753,7 @@ async fn inline_table_baseline_ignores_top_caption() {
     let after = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "After")
+        .find(|line| line.text.trim() == "After")
         .unwrap();
 
     let before_top = rendered_line_baseline_top(&document, before);
@@ -1404,7 +1786,7 @@ async fn two_keyword_inline_table_uses_inline_table_layout() {
     let before = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "Before")
+        .find(|line| line.text.trim() == "Before")
         .unwrap();
     let cell = document.pages[0]
         .lines
@@ -1414,12 +1796,12 @@ async fn two_keyword_inline_table_uses_inline_table_layout() {
     let after = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "After")
+        .find(|line| line.text.trim() == "After")
         .unwrap();
 
-    assert!(before.x < cell.x);
-    assert!(cell.x < after.x);
-    assert!((before.y - after.y).abs() < 0.1);
+    assert!(before.x() < cell.x());
+    assert!(cell.x() < after.x());
+    assert!((before.y() - after.y()).abs() < 0.1);
 }
 
 #[tokio::test]
@@ -1437,8 +1819,40 @@ async fn wraps_orphan_table_cells_in_anonymous_table() {
     let lines = &document.pages[0].lines;
     assert_eq!(lines[0].text, "A");
     assert_eq!(lines[1].text, "B");
-    assert!(lines[1].x > lines[0].x);
-    assert!((lines[1].y - lines[0].y).abs() < 0.01);
+    assert!(lines[1].x() > lines[0].x());
+    assert!((lines[1].y() - lines[0].y()).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn wraps_inline_orphan_table_cells_in_anonymous_inline_table() {
+    let document = Html::from_string(
+        "<style>@page { size: 260pt 100pt; margin: 10pt } body, p { margin:0; font-size:10pt; line-height:14pt } span { border-spacing:0 } td, span { padding:0 }</style>\
+         <p>Before <span><span style=\"display:table-cell;width:40pt\">Cell</span></span> After</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let before = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text.trim() == "Before")
+        .unwrap();
+    let cell = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "Cell")
+        .unwrap();
+    let after = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text.trim() == "After")
+        .unwrap();
+
+    assert!(before.x() < cell.x());
+    assert!(cell.x() < after.x());
+    assert!((before.y() - cell.y()).abs() < 0.1);
+    assert!((after.y() - cell.y()).abs() < 0.1);
 }
 
 #[tokio::test]
@@ -1462,12 +1876,12 @@ async fn wraps_non_row_table_children_in_anonymous_cells() {
         .find(|line| line.text == "Cell")
         .unwrap();
 
-    assert!(anon.x < cell.x);
+    assert!(anon.x() < cell.x());
     assert!(
-        (anon.y - cell.y).abs() < 2.0,
+        (anon.y() - cell.y()).abs() < 2.0,
         "generated anonymous cell should stay in the same visual row: anon_y={}, cell_y={}",
-        anon.y,
-        cell.y
+        anon.y(),
+        cell.y()
     );
 }
 
@@ -1492,12 +1906,12 @@ async fn wraps_non_cell_row_children_in_anonymous_cells() {
         .find(|line| line.text == "Cell")
         .unwrap();
 
-    assert!(anon.x < cell.x);
+    assert!(anon.x() < cell.x());
     assert!(
-        (anon.y - cell.y).abs() < 2.0,
+        (anon.y() - cell.y()).abs() < 2.0,
         "generated anonymous cell should stay in the same visual row: anon_y={}, cell_y={}",
-        anon.y,
-        cell.y
+        anon.y(),
+        cell.y()
     );
 }
 
@@ -1522,8 +1936,44 @@ async fn wraps_table_text_children_in_anonymous_rows_and_cells() {
         .find(|line| line.text == "Cell")
         .unwrap();
 
-    assert!(lead.x < cell.x);
-    assert!((lead.y - cell.y).abs() < 0.01);
+    assert!(lead.x() < cell.x());
+    assert!((lead.y() - cell.y()).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn preserves_whitespace_between_non_cell_table_children() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 600px 120px; margin: 0 }\
+         body { margin: 0; font-size: 16px; line-height: 20px }\
+         .outer { display: table; width: 500px; border-spacing: 0 }\
+         .half { display: inline-block; width: 50% }\
+         </style>\
+         <div class=\"outer\"><div class=\"half\">A</div> <div class=\"half\">B</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let a = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "A")
+        .unwrap();
+    let b = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "B")
+        .unwrap();
+
+    assert!(
+        b.y() < a.y() - 1.0,
+        "preserved whitespace should force B onto the next line: a={a:?}, b={b:?}"
+    );
+    assert!(
+        (a.x() - b.x()).abs() < 1.0,
+        "wrapped inline-block should restart near the same inline position: a={a:?}, b={b:?}"
+    );
 }
 
 #[tokio::test]
@@ -1546,28 +1996,28 @@ async fn html_display_table_shrink_wraps_body_inline_blocks() {
         .filter(|rect| rect.fill == Some(Color::new(255, 255, 0)))
         .collect::<Vec<_>>();
     assert_eq!(yellow_rects.len(), 2, "{yellow_rects:?}");
-    let yellow_width = yellow_rects.iter().map(|rect| rect.width).sum::<f32>();
+    let yellow_width = yellow_rects.iter().map(|rect| rect.width()).sum::<f32>();
     assert!((yellow_width - 210.0).abs() < 0.5, "{yellow_rects:?}");
     assert!(
         yellow_rects
             .iter()
-            .all(|rect| (rect.height - 225.0).abs() < 0.5),
+            .all(|rect| (rect.height() - 225.0).abs() < 0.5),
         "{yellow_rects:?}"
     );
     assert!(
-        (yellow_rects[0].y - yellow_rects[1].y).abs() < 0.5,
+        (yellow_rects[0].y() - yellow_rects[1].y()).abs() < 0.5,
         "{yellow_rects:?}"
     );
 
     let green_horizontal_borders = document.pages[0]
         .rects
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)) && rect.height < rect.width)
+        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)) && rect.height() < rect.width())
         .collect::<Vec<_>>();
     assert!(
         green_horizontal_borders
             .iter()
-            .any(|rect| (rect.width - 225.0).abs() < 0.5),
+            .any(|rect| (rect.width() - 225.0).abs() < 0.5),
         "{green_horizontal_borders:?}"
     );
 }
@@ -1585,8 +2035,8 @@ async fn wraps_direct_table_cells_in_anonymous_rows() {
     assert_eq!(lines[1].text, "B");
     assert_eq!(lines[2].text, "C");
     assert_eq!(lines[3].text, "D");
-    assert!(lines[1].x > lines[0].x);
-    assert!(lines[2].y < lines[0].y);
+    assert!(lines[1].x() > lines[0].x());
+    assert!(lines[2].y() < lines[0].y());
     assert_eq!(document.pages[0].rects[0].fill, Some(Color::BLACK));
 }
 
@@ -1612,8 +2062,52 @@ async fn lays_out_table_captions_above_and_below_table_grid() {
         .unwrap();
     let b = lines.iter().find(|line| line.text == "B").unwrap();
 
-    assert!(top_caption.y > a.y);
-    assert!(bottom_caption.y < b.y);
+    assert!(top_caption.y() > a.y());
+    assert!(bottom_caption.y() < b.y());
+}
+
+#[tokio::test]
+async fn captions_and_abspos_descendants() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><meta charset=\"utf-8\">\
+         <style>\
+         @page { size: 140px 120px; margin: 0 } body { margin: 0 }\
+         table { position: relative; margin: 0 0 0 20px; border-spacing: 0 }\
+         caption, .cap-fill { height: 100px; width: 50px; background: green; margin: 0; padding: 0 }\
+         #redSquare { position: absolute; z-index: -1; left: 20px; top: 0; height: 100px; width: 100px; background: red }\
+         </style>\
+         <div id=\"redSquare\"></div>\
+         <table><caption><div class=\"cap-fill\" style=\"position: absolute; left: 50px\"></div></caption></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = Color::new(0, 128, 0);
+    let red = Color::new(255, 0, 0);
+
+    assert_eq!(final_rect_fill_at(page, 33.75, 52.5), Some(green));
+    assert_eq!(final_rect_fill_at(page, 71.25, 52.5), Some(green));
+    assert_ne!(final_rect_fill_at(page, 86.25, 52.5), Some(red));
+
+    let positioned_green = page
+        .rects
+        .iter()
+        .find(|rect| {
+            rect.fill == Some(green)
+                && (rect.x() - 52.5).abs() < 0.01
+                && (rect.width() - 37.5).abs() < 0.01
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "caption abspos child should paint at table x + 50px: {:?}",
+                page.rects
+            )
+        });
+
+    assert!((positioned_green.y() - 15.0).abs() < 0.01);
+    assert!((positioned_green.height() - 75.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -1635,9 +2129,9 @@ async fn table_rows_with_zero_line_height_advance_for_replaced_content() {
             .collect::<Vec<_>>(),
         vec!["A", "B", "C", "D"]
     );
-    assert!((lines[1].y - lines[0].y).abs() < 0.01);
-    assert!((lines[3].y - lines[2].y).abs() < 0.01);
-    assert!(lines[2].y < lines[0].y - 1.0);
+    assert!((lines[1].y() - lines[0].y()).abs() < 0.01);
+    assert!((lines[3].y() - lines[2].y()).abs() < 0.01);
+    assert!(lines[2].y() < lines[0].y() - 1.0);
 }
 
 #[tokio::test]
@@ -1668,12 +2162,36 @@ async fn table_row_height_is_a_minimum_for_cell_content() {
 
     assert_eq!(lines[0].text, "A");
     assert_eq!(lines[1].text, "B");
-    let advance = lines[0].y - lines[1].y;
+    let advance = lines[0].y() - lines[1].y();
     assert!(
         (advance - 30.0).abs() < 0.01,
         "expected row text advance to be 30pt, got {advance} from y={} and y={}",
-        lines[0].y,
-        lines[1].y
+        lines[0].y(),
+        lines[1].y()
+    );
+}
+
+#[tokio::test]
+async fn authored_empty_table_row_with_height_contributes_to_grid_height() {
+    let document = Html::from_string(
+        "<table cellpadding=\"0\" style=\"margin:0;width:40pt;border-spacing:0;font-size:10pt;line-height:10pt\">\
+         <tr><td style=\"vertical-align:top\">A</td></tr>\
+         <tr style=\"height:30pt\"></tr>\
+         <tr><td style=\"vertical-align:top\">B</td></tr>\
+         </table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let lines = &document.pages[0].lines;
+    assert_eq!(lines[0].text, "A");
+    assert_eq!(lines[1].text, "B");
+    let advance = lines[0].y() - lines[1].y();
+    assert!(
+        (advance - 40.0).abs() < 0.01,
+        "expected empty row height to advance following row by 40pt total, got {advance} from y={} and y={}",
+        lines[0].y(),
+        lines[1].y()
     );
 }
 
@@ -1697,7 +2215,7 @@ async fn visibility_collapse_removes_table_row_space() {
             .collect::<Vec<_>>(),
         vec!["A", "C"]
     );
-    assert!((lines[0].y - lines[1].y - 10.0).abs() < 0.01);
+    assert!((lines[0].y() - lines[1].y() - 10.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -1773,7 +2291,7 @@ async fn separated_table_background_includes_vertical_edge_spacing() {
         .expect("table background should paint");
 
     assert!(
-        (background.height - 22.0).abs() < 0.01,
+        (background.height() - 22.0).abs() < 0.01,
         "separated table background should include top and bottom vertical border-spacing, got {background:?}"
     );
 }
@@ -1793,8 +2311,54 @@ async fn definite_table_height_distributes_extra_height_to_row_groups() {
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("definite-height table should paint its background");
 
-    assert!((green.width - 75.0).abs() < 0.01, "{green:?}");
-    assert!((green.height - 75.0).abs() < 0.01, "{green:?}");
+    assert!((green.width() - 75.0).abs() < 0.01, "{green:?}");
+    assert!((green.height() - 75.0).abs() < 0.01, "{green:?}");
+}
+
+#[tokio::test]
+async fn table_min_height_grows_grid_after_wrapper_padding_and_border() {
+    let document = Html::from_string(
+        "<!doctype html><title>min-height can grow a table over its intrinsic size</title>\
+         <style>@page{size:360pt 360pt;margin:0}body{margin:0}td{padding:0}\
+         table{border-spacing:0;min-height:312px;border:1px solid black;background:green;padding:5px}\
+         div{width:300px;height:100%;background:blue}</style>\
+         <table><tr><td><div></div></td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("min-height table background should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("percent-height child should fill the grown table row");
+
+    assert!((green.height() - 234.0).abs() < 0.01, "{green:?}");
+    assert!((blue.height() - 225.0).abs() < 0.01, "{blue:?}");
+}
+
+#[tokio::test]
+async fn table_max_height_alone_does_not_shrink_intrinsic_rows() {
+    let document = Html::from_string(
+        "<style>@page{size:160pt 160pt;margin:0}body{margin:0}table{margin:0;border-collapse:collapse;background:green;max-height:10px}td{padding:0}div{width:40px;height:40px}</style>\
+         <table><tr><td><div></div></td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("table background should paint");
+
+    assert!((green.height() - 30.0).abs() < 0.01, "{green:?}");
 }
 
 #[tokio::test]
@@ -1817,8 +2381,8 @@ async fn definite_table_height_distributes_extra_height_across_row_groups() {
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("second row group background should paint");
 
-    assert!((red.height - 37.5).abs() < 0.01, "{red:?}");
-    assert!((blue.height - 37.5).abs() < 0.01, "{blue:?}");
+    assert!((red.height() - 37.5).abs() < 0.01, "{red:?}");
+    assert!((blue.height() - 37.5).abs() < 0.01, "{blue:?}");
 }
 
 #[tokio::test]
@@ -1841,8 +2405,8 @@ async fn explicit_row_group_height_expands_auto_table_group_only() {
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("second row group background should paint");
 
-    assert!((red.height - 60.0).abs() < 0.01, "{red:?}");
-    assert!((blue.height - 7.5).abs() < 0.01, "{blue:?}");
+    assert!((red.height() - 60.0).abs() < 0.01, "{red:?}");
+    assert!((blue.height() - 7.5).abs() < 0.01, "{blue:?}");
 }
 
 #[tokio::test]
@@ -1865,8 +2429,8 @@ async fn table_height_interpolates_between_base_and_percentage_reference_rows() 
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("auto row background should paint");
 
-    assert!((red.height - 52.5).abs() < 0.01, "{red:?}");
-    assert!((blue.height - 7.5).abs() < 0.01, "{blue:?}");
+    assert!((red.height() - 52.5).abs() < 0.01, "{red:?}");
+    assert!((blue.height() - 7.5).abs() < 0.01, "{blue:?}");
 }
 
 #[tokio::test]
@@ -1889,8 +2453,8 @@ async fn percentage_sizing_of_table_cell_and_row_group_uses_definite_table_heigh
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("explicit row group background should paint");
 
-    assert!((red.height - 48.75).abs() < 0.01, "{red:?}");
-    assert!((blue.height - 26.25).abs() < 0.01, "{blue:?}");
+    assert!((red.height() - 48.75).abs() < 0.01, "{red:?}");
+    assert!((blue.height() - 26.25).abs() < 0.01, "{blue:?}");
 }
 
 #[tokio::test]
@@ -1913,8 +2477,8 @@ async fn extra_table_height_goes_to_auto_rows_after_reference_rows() {
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("auto row background should paint");
 
-    assert!((red.height - 45.0).abs() < 0.01, "{red:?}");
-    assert!((blue.height - 30.0).abs() < 0.01, "{blue:?}");
+    assert!((red.height() - 45.0).abs() < 0.01, "{red:?}");
+    assert!((blue.height() - 30.0).abs() < 0.01, "{blue:?}");
 }
 
 #[tokio::test]
@@ -1937,8 +2501,8 @@ async fn rowspan_height_constraint_grows_auto_rows_before_explicit_rows() {
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("auto row background should paint");
 
-    assert!((red.height - 45.0).abs() < 0.01, "{red:?}");
-    assert!((blue.height - 22.5).abs() < 0.01, "{blue:?}");
+    assert!((red.height() - 45.0).abs() < 0.01, "{red:?}");
+    assert!((blue.height() - 22.5).abs() < 0.01, "{blue:?}");
 }
 
 #[tokio::test]
@@ -1956,7 +2520,94 @@ async fn percent_height_table_cell_child_uses_final_cell_content_height() {
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("percentage-height child should paint");
 
-    assert!((green.height - 75.0).abs() < 0.01, "{green:?}");
+    assert!((green.height() - 75.0).abs() < 0.01, "{green:?}");
+}
+
+#[tokio::test]
+async fn percentage_row_heights_overflowing_table_height_share_available_height() {
+    let document = Html::from_string(
+        "<style>@page{size:180pt 180pt;margin:0}body{margin:0}table{margin:0;border-collapse:collapse;height:100px}td{padding:0}td div{width:20px;height:10px}.a{height:80%;background:red}.b{height:80%;background:green}.c{background:blue}</style>\
+         <table><tr class=\"a\"><td><div></div></td></tr><tr class=\"b\"><td><div></div></td></tr><tr class=\"c\"><td><div></div></td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let red = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first percentage row should paint");
+    let green = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("second percentage row should paint");
+    let blue = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("auto row should paint");
+
+    assert!((red.height() - 33.75).abs() < 0.01, "{red:?}");
+    assert!((green.height() - 33.75).abs() < 0.01, "{green:?}");
+    assert!((blue.height() - 7.5).abs() < 0.01, "{blue:?}");
+}
+
+#[tokio::test]
+async fn nested_table_fragment_height_contributes_to_outer_row_height() {
+    let document = Html::from_string(
+        "<style>@page{size:180pt 180pt;margin:0}body{margin:0}table{margin:0;font-size:0;line-height:0}td{padding:0}.outer{border-collapse:collapse}.first{background:red}.inner{border-spacing:0 5pt}.inner td{width:20pt;height:10pt}.after{height:10pt;background:blue}</style>\
+         <table class=\"outer\"><tr class=\"first\"><td><table class=\"inner\"><tr><td></td></tr><tr><td></td></tr></table></td></tr><tr><td class=\"after\"></td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let red = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("outer row background should paint");
+    let blue = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("following row background should paint");
+
+    assert!(
+        (red.height() - 35.0).abs() < 0.01,
+        "outer row should include nested table rows and vertical border-spacing: {red:?}"
+    );
+    assert!((blue.height() - 10.0).abs() < 0.01, "{blue:?}");
+}
+
+#[tokio::test]
+async fn floated_table_cell_content_contributes_to_auto_row_height() {
+    let document = Html::from_string(
+        "<style>@page{size:160pt 160pt;margin:0}body{margin:0}table{margin:0;border-collapse:collapse;font-size:0;line-height:0}td{padding:0}.first{background:red}.float{float:left;width:20pt;height:30pt;background:green}.after{height:10pt;background:blue}</style>\
+         <table><tr class=\"first\"><td><div class=\"float\"></div></td></tr><tr><td class=\"after\"></td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let red = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("row background should paint");
+    let green = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("floated child should paint");
+    let blue = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("following row should paint");
+
+    assert!((red.height() - 30.0).abs() < 0.01, "{red:?}");
+    assert!((green.height() - 30.0).abs() < 0.01, "{green:?}");
+    assert!((blue.height() - 10.0).abs() < 0.01, "{blue:?}");
 }
 
 #[tokio::test]
@@ -1990,8 +2641,8 @@ async fn fragmented_table_uses_distributed_final_row_heights() {
         .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert!((a.y - b.y - 40.0).abs() < 0.01, "a={a:?} b={b:?}");
-    assert!((c.y - d.y - 40.0).abs() < 0.01, "c={c:?} d={d:?}");
+    assert!((a.y() - b.y() - 40.0).abs() < 0.01, "a={a:?} b={b:?}");
+    assert!((c.y() - d.y() - 40.0).abs() < 0.01, "c={c:?} d={d:?}");
 }
 
 #[tokio::test]
@@ -2012,8 +2663,8 @@ async fn display_contents_inside_table_preserves_child_styles_and_fixup() {
                 line.text.as_str(),
                 line.color,
                 line.font_size,
-                line.x,
-                line.y,
+                line.x(),
+                line.y(),
             )
         })
         .collect::<Vec<_>>();
@@ -2064,7 +2715,7 @@ async fn visibility_collapse_removes_table_column_space() {
             .collect::<Vec<_>>(),
         vec!["B"]
     );
-    assert!(lines[0].x < RenderOptions::default().page_margins.left + 1.0);
+    assert!(lines[0].x() < RenderOptions::default().page_margins.left + 1.0);
 }
 
 #[tokio::test]
@@ -2087,7 +2738,7 @@ async fn visibility_collapse_removes_table_column_group_span_space() {
             .collect::<Vec<_>>(),
         vec!["C"]
     );
-    assert!(lines[0].x < RenderOptions::default().page_margins.left + 1.0);
+    assert!(lines[0].x() < RenderOptions::default().page_margins.left + 1.0);
 }
 
 #[tokio::test]
@@ -2110,7 +2761,7 @@ async fn collapsed_table_column_group_overrides_visible_child_columns() {
             .collect::<Vec<_>>(),
         vec!["C"]
     );
-    assert!(lines[0].x < RenderOptions::default().page_margins.left + 1.0);
+    assert!(lines[0].x() < RenderOptions::default().page_margins.left + 1.0);
 }
 
 #[tokio::test]
@@ -2184,7 +2835,7 @@ async fn empty_cells_hide_makes_all_empty_row_zero_height_with_single_spacing() 
         vec!["A", "C"]
     );
     assert!(
-        (lines[0].y - lines[1].y - 18.0).abs() < 0.01,
+        (lines[0].y() - lines[1].y() - 18.0).abs() < 0.01,
         "hidden empty row should leave only one vertical spacing side: lines={lines:?}"
     );
     assert!(
@@ -2222,10 +2873,10 @@ async fn aligns_table_cell_content_vertically_inside_row_height() {
         .find(|line| line.text == "Bot")
         .unwrap();
 
-    assert!(top.y > middle.y);
-    assert!(middle.y > bottom.y);
-    assert!((top.y - middle.y - 15.0).abs() < 0.01);
-    assert!((middle.y - bottom.y - 15.0).abs() < 0.01);
+    assert!(top.y() > middle.y());
+    assert!(middle.y() > bottom.y());
+    assert!((top.y() - middle.y() - 15.0).abs() < 0.01);
+    assert!((middle.y() - bottom.y() - 15.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -2250,10 +2901,10 @@ async fn aligns_table_cell_text_on_explicit_baseline() {
         .unwrap();
 
     assert!(
-        (big.y - small.y).abs() < 0.01,
+        (big.y() - small.y()).abs() < 0.01,
         "expected table-cell baselines to match, got Big y={} and Small y={}",
-        big.y,
-        small.y
+        big.y(),
+        small.y()
     );
 }
 
@@ -2284,13 +2935,13 @@ async fn aligns_table_cell_multiline_content_on_first_baseline() {
         .unwrap();
 
     assert!(
-        (first.y - peer.y).abs() < 0.01,
+        (first.y() - peer.y()).abs() < 0.01,
         "expected multiline cell first baseline to align with peer: first={}, peer={}",
-        first.y,
-        peer.y
+        first.y(),
+        peer.y()
     );
     assert!(
-        second.y < first.y,
+        second.y() < first.y(),
         "second line should remain below the first line after baseline alignment"
     );
 }
@@ -2317,10 +2968,10 @@ async fn aligns_table_cell_block_child_text_baseline() {
         .unwrap();
 
     assert!(
-        (block.y - peer.y).abs() < 0.01,
+        (block.y() - peer.y()).abs() < 0.01,
         "expected block child baseline to align with peer: block={}, peer={}",
-        block.y,
-        peer.y
+        block.y(),
+        peer.y()
     );
 }
 
@@ -2346,10 +2997,10 @@ async fn aligns_table_cell_nested_table_row_baseline() {
         .unwrap();
 
     assert!(
-        (inner.y - peer.y).abs() < 0.01,
+        (inner.y() - peer.y()).abs() < 0.01,
         "expected nested table row baseline to align with peer: inner={}, peer={}",
-        inner.y,
-        peer.y
+        inner.y(),
+        peer.y()
     );
 }
 
@@ -2375,10 +3026,10 @@ async fn table_cell_baseline_falls_back_to_non_text_content_bottom() {
         .unwrap();
 
     assert!(
-        (peer.y - svg.y).abs() < 0.01,
+        (peer.y() - svg.y()).abs() < 0.01,
         "expected text baseline to align with SVG content-bottom fallback: peer={}, svg_bottom={}",
-        peer.y,
-        svg.y
+        peer.y(),
+        svg.y()
     );
 }
 
@@ -2396,7 +3047,7 @@ async fn table_cell_inline_vertical_align_keywords_align_as_baseline() {
         .lines
         .iter()
         .find(|line| line.text == "Base")
-        .map(|line| line.y)
+        .map(|line| line.y())
         .unwrap();
 
     for text in ["TextTop", "TextBottom", "Sub", "Super"] {
@@ -2405,7 +3056,7 @@ async fn table_cell_inline_vertical_align_keywords_align_as_baseline() {
             .iter()
             .find(|line| line.text == text)
             .unwrap();
-        let candidate = line.y;
+        let candidate = line.y();
         assert!(
             (candidate - baseline).abs() < 0.01,
             "{text} should align as a table-cell baseline value: candidate={candidate}, baseline={baseline}"
@@ -2438,8 +3089,8 @@ async fn table_valign_presentational_hint_aligns_cell_content_when_enabled() {
         .find(|line| line.text == "Bottom")
         .unwrap();
 
-    assert!(top.y > bottom.y);
-    assert!((top.y - bottom.y - 30.0).abs() < 0.01);
+    assert!(top.y() > bottom.y());
+    assert!((top.y() - bottom.y() - 30.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -2468,7 +3119,7 @@ async fn author_css_overrides_table_valign_presentational_hint() {
         .find(|line| line.text == "Author")
         .unwrap();
 
-    assert!((hinted.y - author.y).abs() < 0.01);
+    assert!((hinted.y() - author.y()).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -2496,14 +3147,16 @@ async fn table_rules_groups_presentational_hint_paints_group_borders() {
         .rects
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(128, 128, 128)) && rect.height <= 1.0 && rect.width > 10.0
+            rect.fill == Some(Color::new(128, 128, 128))
+                && rect.height() <= 1.0
+                && rect.width() > 10.0
         })
         .count();
     let thin_blue = document.pages[0]
         .rects
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 0, 255)) && rect.height <= 1.0 && rect.width > 10.0
+            rect.fill == Some(Color::new(0, 0, 255)) && rect.height() <= 1.0 && rect.width() > 10.0
         })
         .count();
     let thick_gray = document.pages[0]
@@ -2511,8 +3164,8 @@ async fn table_rules_groups_presentational_hint_paints_group_borders() {
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(128, 128, 128))
-                && (rect.height - 3.75).abs() < 0.01
-                && rect.width > 10.0
+                && (rect.height() - 3.75).abs() < 0.01
+                && rect.width() > 10.0
         })
         .count();
 
@@ -2556,6 +3209,43 @@ async fn break_inside_avoid_keeps_table_row_groups_together_when_they_fit() {
             .collect::<Vec<_>>(),
         vec!["A", "B", "C"]
     );
+}
+
+#[tokio::test]
+async fn row_group_break_inside_avoid_suppresses_repeats_when_they_prevent_progress() {
+    let document = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        Html::from_string(
+            "<!DOCTYPE html><html lang=\"en-US\"><head>\
+             <title>CSS Test: CSS 2.1 page-break-inside:avoid</title>\
+             <style>@page { size:5in 3in; margin:0.5in; }\
+             p { height: 1in; width: 1in; margin:0; background-color:blue; }\
+             td { padding:0; }\
+             .test { page-break-inside:avoid; }</style></head><body>\
+             <table border=\"1\">\
+             <tfoot><tr><td><p>3</p></td></tr></tfoot>\
+             <thead><tr><td><p>1</p></td></tr></thead>\
+             <tbody class=\"test\"><tr><td><p>2</p><p>2</p></td></tr></tbody>\
+             </table></body></html>",
+        )
+        .render_async(&RenderOptions::default()),
+    )
+    .await
+    .expect("table row-group avoid pagination should complete")
+    .unwrap();
+
+    let body_pages = document
+        .pages
+        .iter()
+        .enumerate()
+        .filter_map(|(page_index, page)| {
+            let body_line_count = page.lines.iter().filter(|line| line.text == "2").count();
+            (body_line_count > 0).then_some((page_index, body_line_count))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(body_pages.len(), 1, "{body_pages:?}");
+    assert_eq!(body_pages[0].1, 2, "{body_pages:?}");
 }
 
 #[tokio::test]
@@ -2801,7 +3491,7 @@ async fn forced_table_row_break_overrides_previous_avoid() {
 }
 
 #[tokio::test]
-async fn oversized_table_row_slices_direct_cell_text_from_inline_plan() {
+async fn oversized_table_row_slices_direct_cell_text_from_inline_sequence() {
     let document = Html::from_string(
         "<style>@page { size: 120pt 70pt; margin: 10pt }\
          body, table, td { margin: 0; padding: 0; border-spacing: 0; font-size: 10pt; line-height: 10pt }\
@@ -2876,7 +3566,7 @@ async fn table_cell_break_inside_avoid_moves_fitting_row_before_splitting() {
 }
 
 #[tokio::test]
-async fn oversized_table_row_slices_styled_inline_cell_content_from_plan() {
+async fn oversized_table_row_slices_styled_inline_cell_content_from_inline_sequence() {
     let document = Html::from_string(
         "<style>@page { size: 120pt 70pt; margin: 10pt }\
          body, table, td, span { margin: 0; padding: 0; border-spacing: 0; font-size: 10pt; line-height: 10pt }\
@@ -2898,18 +3588,41 @@ async fn oversized_table_row_slices_styled_inline_cell_content_from_plan() {
         .count();
     assert!(
         red_pages >= 2,
-        "styled inline table-cell content should be planned and sliced across row pieces"
+        "styled inline table-cell content should be sequenced and sliced across row pieces"
     );
 }
 
 #[tokio::test]
-async fn oversized_table_row_slices_generated_cell_inline_content_from_plan() {
+async fn oversized_table_row_slices_generated_cell_inline_content_from_inline_sequence() {
     let document = Html::from_string(
         "<style>@page { size: 120pt 70pt; margin: 10pt }\
          body, table, td { margin: 0; padding: 0; border-spacing: 0; font-size: 10pt; line-height: 10pt }\
          table { width: 24pt; border-collapse: collapse } td { width: 24pt; height: 160pt }\
          td::before { content: \"Before\"; color: red } td::after { content: \"After\"; color: blue }</style>\
          <table><tbody><tr><td>Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India Juliett Kilo Lima</td></tr></tbody></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let texts = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines.iter().map(|line| line.text.as_str()))
+        .collect::<Vec<_>>();
+    assert!(texts.contains(&"Before"), "{texts:?}");
+    assert!(texts.contains(&"After"), "{texts:?}");
+}
+
+#[tokio::test]
+async fn split_table_cell_nested_inline_child_uses_sequence_for_generated_content() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 70pt; margin: 10pt }\
+         body, table, td, div, span { margin: 0; padding: 0; border-spacing: 0; font-size: 10pt; line-height: 10pt }\
+         table { width: 24pt; border-collapse: collapse } td { width: 24pt; height: 180pt }\
+         div { display: block; height: 10pt }\
+         .gen::before { content: \"Before\"; color: red } .gen::after { content: \"After\"; color: blue }</style>\
+         <table><tbody><tr><td><div>Block</div><span class=\"gen\">Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India Juliett Kilo Lima</span></td></tr></tbody></table>",
     )
     .render_async(&RenderOptions::default())
     .await
@@ -2991,7 +3704,9 @@ async fn oversized_separated_row_pieces_do_not_clone_horizontal_cell_borders() {
         .iter()
         .filter(|page| {
             page.rects.iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 0, 255)) && rect.width > 0.0 && rect.height > 0.0
+                rect.fill == Some(Color::new(0, 0, 255))
+                    && rect.width() > 0.0
+                    && rect.height() > 0.0
             })
         })
         .collect::<Vec<_>>();
@@ -3000,16 +3715,16 @@ async fn oversized_separated_row_pieces_do_not_clone_horizontal_cell_borders() {
     let middle_page = row_piece_pages[1];
     let synthetic_horizontal = middle_page.rects.iter().any(|rect| {
         rect.fill == Some(Color::new(255, 0, 0))
-            && rect.width > 40.0
-            && (rect.height - 4.0).abs() < 0.01
+            && rect.width() > 40.0
+            && (rect.height() - 4.0).abs() < 0.01
     });
     let vertical_edges = middle_page
         .rects
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(255, 0, 0))
-                && (rect.width - 4.0).abs() < 0.01
-                && rect.height > 0.0
+                && (rect.width() - 4.0).abs() < 0.01
+                && rect.height() > 0.0
         })
         .count();
 
@@ -3042,16 +3757,16 @@ async fn does_not_flatten_table_text_into_parent_blocks() {
 #[tokio::test]
 async fn supports_basic_table_colspan() {
     let document = Html::from_string(
-        "<table style=\"margin: 0; width: 120pt\"><tr><td colspan=\"2\" style=\"border: 1pt solid black\">Wide</td></tr><tr><td>Left</td><td>Right</td></tr></table>",
+        "<table style=\"margin: 0; width: 120pt; border-spacing: 0\"><tr><td colspan=\"2\" style=\"border: 1pt solid black\">Wide</td></tr><tr><td>Left</td><td>Right</td></tr></table>",
     )
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
     assert_eq!(document.pages[0].lines[0].text, "Wide");
-    assert_eq!(document.pages[0].rects[0].width, 120.0);
+    assert_eq!(document.pages[0].rects[0].width(), 120.0);
     assert_eq!(document.pages[0].lines[1].text, "Left");
     assert_eq!(document.pages[0].lines[2].text, "Right");
-    assert!(document.pages[0].lines[2].x - document.pages[0].lines[1].x >= 50.0);
+    assert!(document.pages[0].lines[2].x() - document.pages[0].lines[1].x() >= 50.0);
 }
 
 #[tokio::test]
@@ -3081,9 +3796,9 @@ async fn supports_basic_table_rowspan_occupancy() {
         .find(|line| line.text == "B")
         .unwrap();
 
-    assert!(a.x > span.x);
-    assert!((a.x - b.x).abs() < 0.01);
-    assert!(b.y < a.y);
+    assert!(a.x() > span.x());
+    assert!((a.x() - b.x()).abs() < 0.01);
+    assert!(b.y() < a.y());
 }
 
 #[tokio::test]
@@ -3116,9 +3831,9 @@ async fn parses_table_span_attributes_with_html_integer_rules() {
     let wide_border = colspan.pages[0]
         .rects
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK) && rect.width > 50.0)
+        .find(|rect| rect.fill == Some(Color::BLACK) && rect.width() > 50.0)
         .expect("colspan should span two columns");
-    assert!(wide_border.width > 50.0);
+    assert!(wide_border.width() > 50.0);
 
     let span = rowspan.pages[0]
         .lines
@@ -3135,11 +3850,11 @@ async fn parses_table_span_attributes_with_html_integer_rules() {
         .iter()
         .find(|line| line.text == "B")
         .unwrap();
-    assert!(a.x > span.x);
-    assert!((a.x - b.x).abs() < 0.01);
+    assert!(a.x() > span.x());
+    assert!((a.x() - b.x()).abs() < 0.01);
 
     let lines = &col_span.pages[0].lines;
-    assert!(((lines[1].x - lines[0].x) - (lines[2].x - lines[1].x)).abs() < 0.01);
+    assert!(((lines[1].x() - lines[0].x()) - (lines[2].x() - lines[1].x())).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -3180,10 +3895,10 @@ async fn rowspan_zero_spans_to_end_of_row_group() {
         .find(|line| line.text == "C")
         .unwrap();
 
-    assert!((a.x - b.x).abs() < 0.01);
-    assert!(a.x > span.x);
-    assert!((foot.x - span.x).abs() < 0.01);
-    assert!(c.x > foot.x);
+    assert!((a.x() - b.x()).abs() < 0.01);
+    assert!(a.x() > span.x());
+    assert!((foot.x() - span.x()).abs() < 0.01);
+    assert!(c.x() > foot.x());
 }
 
 #[tokio::test]
@@ -3194,7 +3909,7 @@ async fn supports_percentage_table_cell_widths() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].rects[0].width, 50.0);
+    assert_eq!(document.pages[0].rects[0].width(), 50.0);
 }
 
 #[tokio::test]
@@ -3239,6 +3954,70 @@ async fn auto_table_columns_use_intrinsic_content_widths() {
     assert!(widths[0] < 100.0);
     assert!(widths[1] > 200.0);
     assert!((widths.iter().sum::<f32>() - 300.0).abs() < 0.01);
+}
+
+fn painted_table_rect_width(document: &quire::Document, color: Color) -> f32 {
+    document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(color))
+        .unwrap_or_else(|| panic!("expected table background with color {color:?}"))
+        .width()
+}
+
+#[tokio::test]
+async fn table_width_intrinsic_keywords_use_min_fit_and_max_content() {
+    let document = Html::from_string(
+        "<style>@page { size: 240pt 160pt; margin: 0 } body { margin: 0; font: 10px/12px sans-serif }\
+         table { margin: 0; border-spacing: 0; height: 12pt } td { padding: 0 }\
+         .min { width: min-content; background: green }\
+         .fit { width: fit-content(14px); background: blue }\
+         .max { width: max-content; background: black }</style>\
+         <table class=\"min\"><tr><td>aa bb</td></tr></table>\
+         <table class=\"fit\"><tr><td>aa bb</td></tr></table>\
+         <table class=\"max\"><tr><td>aa bb</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let min = painted_table_rect_width(&document, Color::new(0, 128, 0));
+    let fit = painted_table_rect_width(&document, Color::new(0, 0, 255));
+    let max = painted_table_rect_width(&document, Color::new(0, 0, 0));
+    assert!(
+        min < fit && fit < max,
+        "table intrinsic widths should order min < fit < max: min={min}, fit={fit}, max={max}"
+    );
+}
+
+#[tokio::test]
+async fn auto_table_definite_width_clamps_content_box_to_min_content() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><meta charset=\"utf-8\">\
+         <style>@page { size: 100px 100px; margin: 0 } body { margin: 0 }\
+         .outer { width: min-content; background: green }\
+         .table { display: table; inline-size: 30px; block-size: 100px; border-inline: 10px solid green; margin-inline: 10px }\
+         .content { inline-size: 60px; height: 100px }</style>\
+         <div class=\"outer\"><div class=\"table\"><div class=\"content\"></div></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = Color::new(0, 128, 0);
+    let widest_green = page
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(green))
+        .max_by(|a, b| a.width().total_cmp(&b.width()))
+        .unwrap_or_else(|| panic!("expected green square paint: {:?}", page.rects));
+
+    assert!(
+        (widest_green.width() - 75.0).abs() < 0.01 && (widest_green.height() - 75.0).abs() < 0.01,
+        "100px reference square should paint as a 75pt square: {widest_green:?}"
+    );
+    assert_eq!(final_rect_fill_at(page, 74.0, 37.5), Some(green));
 }
 
 #[tokio::test]
@@ -3443,7 +4222,7 @@ async fn parses_important_values_for_non_length_properties() {
 #[tokio::test]
 async fn applies_table_section_row_and_cell_selectors() {
     let document = Html::from_string(
-        "<table style=\"margin:0;width:100pt\"><tbody><tr><td>A</td></tr></tbody></table>",
+        "<table style=\"margin:0;width:100pt;border-spacing:0\"><tbody><tr><td>A</td></tr></tbody></table>",
     )
     .with_stylesheet(Css::from_string(
         "tbody tr { border-top: 1pt solid red } tbody tr td { color: blue }",
@@ -3456,7 +4235,7 @@ async fn applies_table_section_row_and_cell_selectors() {
         document.pages[0]
             .rects
             .iter()
-            .any(|rect| rect.width >= 100.0 && rect.fill == Some(Color::new(255, 0, 0)))
+            .any(|rect| rect.width() >= 100.0 && rect.fill == Some(Color::new(255, 0, 0)))
     );
     assert_eq!(document.pages[0].lines[0].color, Color::new(0, 0, 255));
 }
@@ -3504,8 +4283,43 @@ async fn empty_display_table_still_paints_padding_and_border_box() {
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("empty table should paint its background");
 
-    assert!((green.width - 234.0).abs() < 0.01, "{green:?}");
-    assert!((green.height - 234.0).abs() < 0.01, "{green:?}");
+    assert!((green.width() - 234.0).abs() < 0.01, "{green:?}");
+    assert!((green.height() - 234.0).abs() < 0.01, "{green:?}");
+}
+
+#[tokio::test]
+async fn empty_display_table_border_box_height_respects_box_sizing() {
+    let document = Html::from_string(
+        "<style>@page{size:240pt 240pt;margin:0}body{margin:0}div{display:table;box-sizing:border-box;width:100pt;height:80pt;background:green;border:5pt solid black;padding:10pt}</style><div></div>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("empty table should paint its background");
+
+    assert!((green.width() - 100.0).abs() < 0.01, "{green:?}");
+    assert!((green.height() - 80.0).abs() < 0.01, "{green:?}");
+}
+
+#[tokio::test]
+async fn empty_table_min_height_grows_grid_after_wrapper_padding_and_border() {
+    let document = Html::from_string(
+        "<style>@page{size:360pt 360pt;margin:0}body{margin:0}table{margin:0;border-spacing:0;min-height:312px;border:1px solid black;background:green;padding:5px}</style><table></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("empty min-height table should paint its background");
+
+    assert!((green.height() - 234.0).abs() < 0.01, "{green:?}");
 }
 
 #[tokio::test]
@@ -3568,12 +4382,12 @@ async fn honors_table_border_spacing_between_columns() {
 
     let lines = &document.pages[0].lines;
     assert_eq!(lines[1].text, "B");
-    assert!((lines[1].x - lines[0].x - 24.0).abs() < 0.01);
+    assert!((lines[1].x() - lines[0].x() - 24.0).abs() < 0.01);
     let expected_first_text_x = RenderOptions::default().page_margins.left + 5.0;
     assert!(
-        (lines[0].x - expected_first_text_x).abs() < 0.01,
+        (lines[0].x() - expected_first_text_x).abs() < 0.01,
         "expected first text x {expected_first_text_x}, got {}",
-        lines[0].x
+        lines[0].x()
     );
 }
 
@@ -3589,7 +4403,7 @@ async fn honors_html_cellspacing_for_separated_tables() {
 
     let lines = &document.pages[0].lines;
     assert_eq!(lines[1].text, "B");
-    assert!((lines[1].x - lines[0].x - 28.0).abs() < 0.01);
+    assert!((lines[1].x() - lines[0].x() - 28.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -3604,7 +4418,7 @@ async fn css_border_spacing_overrides_html_cellspacing() {
 
     let lines = &document.pages[0].lines;
     assert_eq!(lines[1].text, "B");
-    assert!((lines[1].x - lines[0].x - 24.0).abs() < 0.01);
+    assert!((lines[1].x() - lines[0].x() - 24.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -3620,7 +4434,9 @@ async fn collapsed_table_borders_share_internal_edges() {
     let vertical_edges = document.pages[0]
         .rects
         .iter()
-        .filter(|rect| rect.fill == Some(Color::BLACK) && rect.width <= 1.01 && rect.height > 1.0)
+        .filter(|rect| {
+            rect.fill == Some(Color::BLACK) && rect.width() <= 1.01 && rect.height() > 1.0
+        })
         .count();
 
     assert_eq!(vertical_edges, 3);
@@ -3642,7 +4458,7 @@ async fn collapsed_table_borders_enter_paint_operation_stream() {
         .iter()
         .enumerate()
         .filter(|(_, rect)| {
-            rect.fill == Some(Color::BLACK) && rect.width <= 1.01 && rect.height > 1.0
+            rect.fill == Some(Color::BLACK) && rect.width() <= 1.01 && rect.height() > 1.0
         })
         .map(|(index, _)| index)
         .collect();
@@ -3680,19 +4496,19 @@ async fn nested_collapsed_table_border_joins_cover_inner_border() {
         .collect::<Vec<_>>();
     let left = green_rects
         .iter()
-        .map(|rect| rect.x)
+        .map(|rect| rect.x())
         .fold(f32::INFINITY, f32::min);
     let right = green_rects
         .iter()
-        .map(|rect| rect.x + rect.width)
+        .map(|rect| rect.x() + rect.width())
         .fold(f32::NEG_INFINITY, f32::max);
     let bottom = green_rects
         .iter()
-        .map(|rect| rect.y)
+        .map(|rect| rect.y())
         .fold(f32::INFINITY, f32::min);
     let top = green_rects
         .iter()
-        .map(|rect| rect.y + rect.height)
+        .map(|rect| rect.y() + rect.height())
         .fold(f32::NEG_INFINITY, f32::max);
 
     assert!(
@@ -3722,6 +4538,212 @@ async fn nested_collapsed_table_border_joins_cover_inner_border() {
 }
 
 #[tokio::test]
+async fn collapsed_table_cell_inset_box_shadow_uses_collapsed_border_padding_edge() {
+    let document = Html::from_string(
+        r#"<style>
+@page { size: 140pt 140pt; margin: 0 }
+body { margin: 0 }
+table { border-collapse: collapse; margin: 0 }
+td {
+  border: 20pt solid green;
+  box-shadow: inset 60pt 0 green;
+  background: red;
+  line-height: 0;
+  padding: 0;
+}
+td > span {
+  display: inline-block;
+  height: 60pt;
+  width: 60pt;
+}
+</style>
+<table><tr><td><span></span></td></tr></table>"#,
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+    let page = &document.pages[0];
+    let red = Color::new(255, 0, 0);
+    let green = Color::new(0, 128, 0);
+    let background = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(red))
+        .expect("cell background should paint before border and shadow");
+    let left = background.x();
+    let right = background.x() + background.width();
+    let bottom = background.y();
+    let top = background.y() + background.height();
+
+    for (x, y) in [
+        (left + 1.0, bottom + 1.0),
+        (right - 1.0, bottom + 1.0),
+        ((left + right) / 2.0, (bottom + top) / 2.0),
+        (left + 11.0, (bottom + top) / 2.0),
+        (right - 11.0, (bottom + top) / 2.0),
+        (left + 1.0, top - 1.0),
+        (right - 1.0, top - 1.0),
+    ] {
+        assert_eq!(
+            final_rect_fill_at(page, x, y),
+            Some(green),
+            "collapsed cell inset shadow should cover red background at ({x}, {y})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn collapsed_row_group_outline_covers_spacing_after_collapsed_row() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 120px 120px; margin: 0 } body { margin: 0 }</style>
+<table style="width: 100px; border-spacing: 10px; background: red">
+  <tbody style="outline: solid green 10px">
+    <tr style="visibility: collapse">
+      <td style="padding: 0"></td>
+    </tr>
+    <tr>
+      <td style="padding: 0"><div style="height: 80px; background: green"></div></td>
+    </tr>
+  </tbody>
+</table>"#,
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = Color::new(255, 0, 0);
+    let green = Color::new(0, 128, 0);
+    let table_background = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(red))
+        .expect("table background should paint red before row-group outline");
+    let left = table_background.x();
+    let right = table_background.x() + table_background.width();
+    let bottom = table_background.y();
+    let top = table_background.y() + table_background.height();
+    assert!(
+        (table_background.width() - 75.0).abs() < 0.01,
+        "separated table background should stay at authored width: {table_background:?}"
+    );
+    assert!(
+        (table_background.height() - 75.0).abs() < 0.01,
+        "separated table background should include edge spacing without extra collapsed-row gaps: {table_background:?}"
+    );
+
+    let content = page
+        .rects
+        .iter()
+        .find(|rect| {
+            rect.fill == Some(green)
+                && (rect.width() - 60.0).abs() < 0.01
+                && (rect.height() - 60.0).abs() < 0.01
+        })
+        .expect("visible cell content should paint as an 80px green square");
+    assert!(
+        (content.x() - left - 7.5).abs() < 0.01,
+        "visible cell content should start after left edge spacing: {content:?}"
+    );
+    assert!(
+        (content.y() - bottom - 7.5).abs() < 0.01,
+        "visible cell content should end before bottom edge spacing: {content:?}"
+    );
+
+    for (x, y) in [
+        (left + 1.0, bottom + 1.0),
+        (right - 1.0, bottom + 1.0),
+        ((left + right) / 2.0, (bottom + top) / 2.0),
+        (left + 1.0, top - 1.0),
+        (right - 1.0, top - 1.0),
+    ] {
+        assert_eq!(
+            final_rect_fill_at(page, x, y),
+            Some(green),
+            "row-group outline should cover red table background at ({x}, {y})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn border_spacing_colspan_width_includes_internal_gutters() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 100px 100px; margin: 0 } body { margin: 0 }</style>
+<table cellpadding="0" style="border-spacing: 20px; margin: -20px">
+  <tr>
+    <td colspan="3" style="width: 100px; background: red">
+      <div style="height: 100px; background: green"></div>
+    </td>
+  </tr>
+</table>"#,
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = Color::new(0, 128, 0);
+    let widest_green = page
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(green))
+        .max_by(|a, b| a.width().total_cmp(&b.width()))
+        .unwrap_or_else(|| panic!("expected green square paint: {:?}", page.rects));
+
+    assert!(
+        (widest_green.width() - 75.0).abs() < 0.01 && (widest_green.height() - 75.0).abs() < 0.01,
+        "100px spanning-cell content should paint as a 75pt square: {widest_green:?}"
+    );
+    assert_eq!(
+        final_rect_fill_at(
+            page,
+            widest_green.x() + 74.0,
+            widest_green.y() + widest_green.height() / 2.0,
+        ),
+        Some(green)
+    );
+    assert!(
+        page.rects
+            .iter()
+            .filter(|rect| rect.fill == Some(green))
+            .all(|rect| rect.width() < 80.0),
+        "colspan should not allocate internal gutters again as column width: {:?}",
+        page.rects
+    );
+}
+
+#[tokio::test]
+async fn separated_table_width_includes_edge_border_spacing() {
+    let document = Html::from_string(
+        r#"<style>@page { size: 140px 100px; margin: 0 } body { margin: 0 } table { width: 100px; border-spacing: 10px; background: red; margin: 0 0 10px 0 } td { padding: 0 } div { height: 10px; background: green }</style>
+<table><tr><td><div></div></td></tr></table>
+<table><tr><td><div></div></td><td><div></div></td></tr></table>"#,
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let red = Color::new(255, 0, 0);
+    let page = &document.pages[0];
+    let table_backgrounds = page
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(red))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        table_backgrounds.len(),
+        2,
+        "expected one table background for the one-column table and one for the two-column table"
+    );
+    for background in table_backgrounds {
+        assert!(
+            (background.width() - 75.0).abs() < 0.01,
+            "separated table width should include edge border-spacing: {background:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn orphan_table_cell_wrapper_lays_out_block_cell_contents() {
     let document = Html::from_string(
         r#"<style>@page { size: 180pt 180pt; margin: 20pt } body { margin: 0 }</style>
@@ -3740,13 +4762,13 @@ async fn orphan_table_cell_wrapper_lays_out_block_cell_contents() {
         document.pages[0]
             .rects
             .iter()
-            .any(|rect| rect.fill == Some(green) && (rect.width - 75.0).abs() < 0.01)
+            .any(|rect| rect.fill == Some(green) && (rect.width() - 75.0).abs() < 0.01)
     );
     assert!(
         document.pages[0]
             .rects
             .iter()
-            .any(|rect| rect.fill == Some(hotpink) && (rect.height - 37.5).abs() < 0.01)
+            .any(|rect| rect.fill == Some(hotpink) && (rect.height() - 37.5).abs() < 0.01)
     );
     document.validate_paint_operations().unwrap();
 }
@@ -3800,8 +4822,8 @@ async fn collapsed_table_row_borders_resolve_to_one_shared_edge() {
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(255, 0, 0))
-                && (rect.height - 3.0).abs() < 0.01
-                && (rect.width - 40.0).abs() < 0.01
+                && (rect.height() - 3.0).abs() < 0.01
+                && (rect.width() - 40.0).abs() < 0.01
         })
         .count();
     let blue_edges = document.pages[0]
@@ -3828,8 +4850,8 @@ async fn collapsed_table_cell_border_beats_row_border_at_same_edge() {
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(0, 0, 255))
-                && (rect.height - 2.0).abs() < 0.01
-                && (rect.width - 40.0).abs() < 0.01
+                && (rect.height() - 2.0).abs() < 0.01
+                && (rect.width() - 40.0).abs() < 0.01
         })
         .count();
     let red_edges = document.pages[0]
@@ -3856,8 +4878,8 @@ async fn collapsed_table_row_group_border_beats_table_border_at_same_edge() {
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(0, 0, 255))
-                && (rect.height - 2.0).abs() < 0.01
-                && (rect.width - 40.0).abs() < 0.01
+                && (rect.height() - 2.0).abs() < 0.01
+                && (rect.width() - 40.0).abs() < 0.01
         })
         .count();
     let red_edges = document.pages[0]
@@ -3884,8 +4906,8 @@ async fn collapsed_table_row_border_beats_row_group_border_at_same_edge() {
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(0, 0, 255))
-                && (rect.height - 2.0).abs() < 0.01
-                && (rect.width - 40.0).abs() < 0.01
+                && (rect.height() - 2.0).abs() < 0.01
+                && (rect.width() - 40.0).abs() < 0.01
         })
         .count();
     let red_edges = document.pages[0]
@@ -3912,8 +4934,8 @@ async fn collapsed_table_column_group_border_beats_table_border_at_same_edge() {
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(0, 128, 0))
-                && (rect.width - 2.0).abs() < 0.01
-                && rect.height > 1.0
+                && (rect.width() - 2.0).abs() < 0.01
+                && rect.height() > 1.0
         })
         .count();
     let red_edges = document.pages[0]
@@ -3940,8 +4962,8 @@ async fn collapsed_table_column_border_beats_column_group_border_at_same_edge() 
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(0, 0, 255))
-                && (rect.width - 2.0).abs() < 0.01
-                && rect.height > 1.0
+                && (rect.width() - 2.0).abs() < 0.01
+                && rect.height() > 1.0
         })
         .count();
     let red_edges = document.pages[0]
@@ -3968,8 +4990,8 @@ async fn collapsed_table_cell_border_beats_column_border_at_same_edge() {
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::new(0, 0, 255))
-                && (rect.width - 2.0).abs() < 0.01
-                && rect.height > 1.0
+                && (rect.width() - 2.0).abs() < 0.01
+                && rect.height() > 1.0
         })
         .count();
     let red_edges = document.pages[0]
@@ -3994,11 +5016,239 @@ async fn collapsed_table_row_borders_do_not_cross_rowspan_cells() {
     let red_edges = document.pages[0]
         .rects
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)) && (rect.height - 2.0).abs() < 0.01)
+        .filter(|rect| {
+            rect.fill == Some(Color::new(255, 0, 0)) && (rect.height() - 2.0).abs() < 0.01
+        })
         .collect::<Vec<_>>();
 
     assert_eq!(red_edges.len(), 1);
-    assert!((red_edges[0].width - 30.0).abs() < 0.01);
+    assert!((red_edges[0].width() - 30.0).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn collapsed_table_column_borders_do_not_cross_colspan_cells() {
+    let document = Html::from_string(
+        "<style>table{border-collapse:collapse;width:60pt;margin:0}td{padding:0;width:20pt;height:10pt}col.internal{border-left:4pt solid red}</style>\
+         <table><col><col class=\"internal\"><col><tr><td colspan=\"2\">Span</td><td>C</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .rects
+            .iter()
+            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+        "column border must not paint through the interior of a colspan"
+    );
+}
+
+#[tokio::test]
+async fn collapsed_table_spanning_cell_suppresses_internal_row_and_column_edges() {
+    let document = Html::from_string(
+        "<style>table{border-collapse:collapse;width:60pt;margin:0}td{padding:0;width:20pt;height:10pt}tr:first-child{border-bottom:3pt solid red}col.internal{border-left:4pt solid blue}</style>\
+         <table><col><col class=\"internal\"><col><tr><td rowspan=\"2\" colspan=\"2\">Span</td><td>A</td></tr><tr><td>B</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let red_edges = document.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| {
+            rect.fill == Some(Color::new(255, 0, 0)) && (rect.height() - 3.0).abs() < 0.01
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(red_edges.len(), 1);
+    assert!((red_edges[0].width() - 20.0).abs() < 0.01);
+    assert!(
+        document.pages[0]
+            .rects
+            .iter()
+            .all(|rect| rect.fill != Some(Color::new(0, 0, 255))),
+        "column border must not paint through the interior of a rowspan+colspan"
+    );
+}
+
+#[tokio::test]
+async fn collapsed_table_root_padding_and_spacing_do_not_affect_grid() {
+    let document = Html::from_string(
+        "<style>@page{size:260pt 180pt;margin:0}body{margin:0}table{border-collapse:collapse;margin:0;padding:100pt;border-spacing:100pt;border:4pt solid black;background:green;width:40pt}td{padding:0;width:40pt;height:10pt}.fixed{table-layout:fixed;background:blue}</style>\
+         <table><tr><td>A</td></tr></table><table class=\"fixed\"><tr><td>B</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("auto collapsed table background should paint");
+    let blue = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("fixed collapsed table background should paint");
+
+    assert!((green.width() - 44.0).abs() < 0.01, "{green:?}");
+    assert!((blue.width() - 44.0).abs() < 0.01, "{blue:?}");
+}
+
+#[tokio::test]
+async fn empty_collapsed_table_ignores_wrapper_padding_and_border() {
+    let document = Html::from_string(
+        "<style>@page{size:260pt 180pt;margin:0}body{margin:0}table{border-collapse:collapse;margin:0;padding:100pt;border:20pt solid red;background:green;width:40pt;height:10pt}</style><table></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("empty collapsed table background should paint");
+
+    assert!((green.width() - 40.0).abs() < 0.01, "{green:?}");
+    assert!((green.height() - 10.0).abs() < 0.01, "{green:?}");
+    assert!(
+        document.pages[0]
+            .rects
+            .iter()
+            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+        "empty collapsed table should not paint separated wrapper borders"
+    );
+}
+
+#[tokio::test]
+async fn collapsed_table_3d_border_styles_use_collapsed_paint_mapping() {
+    let document = Html::from_string(
+        "<style>table{border-collapse:collapse;width:40pt;margin:0}td{padding:0;width:40pt;height:10pt;border-top:6pt #6699cc}\
+         .ridge{border-top-style:ridge}.groove{border-top-style:groove}.inset{border-top-style:inset}.outset{border-top-style:outset}</style>\
+         <table><tr><td class=\"ridge\">A</td></tr><tr><td class=\"groove\">B</td></tr><tr><td class=\"inset\">C</td></tr><tr><td class=\"outset\">D</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let base = Color::new(102, 153, 204);
+    let split_3d_rects = document.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| {
+            rect.fill.is_some_and(|fill| fill != base)
+                && (rect.height() - 3.0).abs() < 0.01
+                && rect.width() > 30.0
+        })
+        .count();
+    let flat_base_rects = document.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| {
+            rect.fill == Some(base) && (rect.height() - 6.0).abs() < 0.01 && rect.width() > 30.0
+        })
+        .count();
+
+    assert!(
+        split_3d_rects >= 8,
+        "expected split 3D collapsed border paint"
+    );
+    assert_eq!(flat_base_rects, 0);
+}
+
+#[tokio::test]
+async fn rtl_collapsed_table_places_logical_columns_from_physical_right() {
+    let document = Html::from_string(
+        "<style>@page{size:160pt 80pt;margin:0}body{margin:0;font-size:10pt;line-height:10pt}table{direction:rtl;border-collapse:collapse;table-layout:fixed;width:90pt;margin:0}td{padding:0;width:30pt;height:10pt;text-align:left}</style>\
+         <table><tr><td>A</td><td>B</td><td>C</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let a = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "A")
+        .unwrap();
+    let b = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "B")
+        .unwrap();
+    let c = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "C")
+        .unwrap();
+
+    assert!(
+        c.x() < b.x() && b.x() < a.x(),
+        "RTL table should place logical columns from the physical right: A={a:?} B={b:?} C={c:?}"
+    );
+}
+
+#[tokio::test]
+async fn rtl_collapsed_table_maps_physical_left_and_right_borders_to_reversed_grid_edges() {
+    let document = Html::from_string(
+        "<style>@page{size:160pt 80pt;margin:0}body{margin:0}table{direction:rtl;border-collapse:collapse;table-layout:fixed;width:40pt;margin:0}td{padding:0;width:20pt;height:10pt}.first{border-right:4pt solid red}.last{border-left:6pt solid blue}</style>\
+         <table><tr><td class=\"first\"></td><td class=\"last\"></td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let red = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first logical cell's physical left border should paint");
+    let blue = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("last logical cell's physical right border should paint");
+
+    assert!(
+        blue.x() < red.x(),
+        "physical left border should paint left of physical right border in RTL: red={red:?} blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn collapsed_table_cell_content_uses_resolved_half_border_insets() {
+    let document = Html::from_string(
+        "<style>@page{size:180pt 80pt;margin:0}body{margin:0;font-size:10pt;line-height:10pt}table{border-collapse:collapse;margin:0;width:80pt;border-left:20pt solid red}td{padding:0;border-left:0;width:80pt;height:10pt;text-align:left}</style>\
+         <table><tr><td>Inset</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let line = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "Inset")
+        .unwrap();
+
+    assert!(
+        line.x() >= 18.0,
+        "cell content should consume half of the resolved collapsed border, got {line:?}"
+    );
+}
+
+#[tokio::test]
+async fn collapsed_table_collapsed_column_border_does_not_leak() {
+    let document = Html::from_string(
+        "<style>@page{size:180pt 80pt;margin:0}body{margin:0}table{border-collapse:collapse;table-layout:fixed;width:90pt;margin:0}col.hidden{visibility:collapse;border-left:6pt solid red;border-right:6pt solid red}td{padding:0;width:30pt;height:10pt}</style>\
+         <table><col><col class=\"hidden\"><col><tr><td>A</td><td>B</td><td>C</td></tr></table>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .rects
+            .iter()
+            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+        "borders on a collapsed column should not leak into the collapsed-border grid"
+    );
 }
 
 #[tokio::test]

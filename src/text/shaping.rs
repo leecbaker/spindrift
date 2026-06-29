@@ -156,6 +156,7 @@ pub(super) fn push_visual_range(ranges: &mut Vec<Range<usize>>, range: Range<usi
     ranges.push(range);
 }
 
+#[allow(dead_code)]
 pub(super) fn visual_text_from_ranges(text: &str, ranges: &[Range<usize>]) -> String {
     let mut output = String::new();
     for range in ranges {
@@ -171,6 +172,7 @@ pub(super) fn visual_text_from_ranges(text: &str, ranges: &[Range<usize>]) -> St
 /// Unicode space separators remain visible text whose break opportunities come
 /// from UAX #14 instead of this CSS-only preserved-space rule:
 /// <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces>.
+#[allow(dead_code)]
 pub(super) fn character_is_break_spaces_preserved_space(character: char) -> bool {
     is_css_collapsible_whitespace(character)
 }
@@ -184,6 +186,7 @@ pub(super) fn character_is_break_spaces_preserved_space(character: char) -> bool
 /// directly for preserved `break-spaces` line fitting:
 /// <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces> and
 /// <https://www.unicode.org/reports/tr14/#BA>.
+#[allow(dead_code)]
 pub(super) fn break_spaces_other_space_separator_allows_break_after(character: char) -> bool {
     character_is_css_other_space_separator(character)
         && matches!(
@@ -200,6 +203,7 @@ pub(super) fn break_spaces_other_space_separator_allows_break_after(character: c
 /// class-specific behavior after it:
 /// <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces> and
 /// <https://www.unicode.org/reports/tr14/#Properties>.
+#[allow(dead_code)]
 pub(super) fn break_spaces_character_suppresses_break_before(character: char) -> bool {
     matches!(
         line_break_class(character),
@@ -217,6 +221,7 @@ pub(super) fn break_spaces_character_suppresses_break_before(character: char) ->
 /// <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces>,
 /// <https://www.w3.org/TR/css-text-3/#valdef-word-break-break-all>, and
 /// <https://www.w3.org/TR/css-text-3/#valdef-line-break-anywhere>.
+#[allow(dead_code)]
 pub(super) fn break_spaces_anywhere_break_allowed(
     line_break_anywhere: bool,
     characters: &[(usize, usize, bool, bool, bool)],

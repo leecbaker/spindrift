@@ -119,7 +119,30 @@ pub(crate) struct InlineBox<'a> {
     pub signature: ElementSignature,
     pub style: ComputedStyle,
     pub marker: Option<MarkerBox>,
+    pub fragment_edges: InlineBoxFragmentEdges,
     pub children: Vec<FormattingBox<'a>>,
+}
+
+/// Inline-start and inline-end decorations owned by one inline box fragment.
+///
+/// CSS 2.2 splits an inline box containing in-flow block-level descendants
+/// into separate inline fragments around those blocks. The generated fragments
+/// share one logical inline box, so only the first fragment owns the
+/// inline-start margin/border/padding and only the last fragment owns the
+/// inline-end margin/border/padding:
+/// <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level> and
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InlineBoxFragmentEdges {
+    pub(crate) owns_start: bool,
+    pub(crate) owns_end: bool,
+}
+
+impl InlineBoxFragmentEdges {
+    pub(crate) const ALL: Self = Self {
+        owns_start: true,
+        owns_end: true,
+    };
 }
 
 #[derive(Debug, Clone, PartialEq)]

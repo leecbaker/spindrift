@@ -1,5 +1,18 @@
 use super::*;
 
+/// Wraps a raw Taffy layout result in the Taffy coordinate space.
+///
+/// Taffy returns physical x/y coordinates after Quire has mapped CSS flex axes
+/// and writing direction into Taffy's row/column model. The returned rect must
+/// be converted to container coordinates before storage in flex layout data:
+/// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>.
+pub(super) fn taffy_rect_from_layout(layout: &taffy_layout::Layout) -> TaffyRect {
+    TaffyRect::new(
+        TaffyPoint::new(layout.location.x, layout.location.y),
+        TaffySize::new(layout.size.width, layout.size.height),
+    )
+}
+
 /// Converts computed CSS margins to Taffy's flex-item margin representation.
 ///
 /// CSS Flexible Box Layout uses margin boxes during flex item sizing and
@@ -72,6 +85,8 @@ pub(super) fn taffy_gap(value: css::ComputedGap) -> taffy_layout::LengthPercenta
 pub(super) fn flex_item_size_dimension(
     value: css::ComputedLengthPercentageOrAuto,
     fallback: f32,
+    min_content: f32,
+    max_content: f32,
     flex_direction: FlexDirection,
     dimension_axis: FlexDirection,
     percentage_basis: Option<f32>,
@@ -81,10 +96,23 @@ pub(super) fn flex_item_size_dimension(
             css::ComputedLengthPercentageOrAuto::Auto => {
                 taffy_layout::Dimension::length(fallback.max(1.0))
             }
-            _ => taffy_optional_dimension_with_basis(value, percentage_basis),
+            _ => taffy_intrinsic_dimension_with_basis(
+                value,
+                percentage_basis,
+                min_content,
+                max_content,
+            ),
         }
     } else {
-        taffy_optional_dimension_with_basis(value, percentage_basis)
+        match value {
+            css::ComputedLengthPercentageOrAuto::Auto => taffy_layout::Dimension::auto(),
+            _ => taffy_intrinsic_dimension_with_basis(
+                value,
+                percentage_basis,
+                min_content,
+                max_content,
+            ),
+        }
     }
 }
 
@@ -147,7 +175,11 @@ pub(super) fn taffy_intrinsic_dimension_with_basis(
         css::ComputedLengthPercentageOrAuto::FitContent(limit) => {
             let stretch = limit
                 .and_then(|value| {
-                    percentage_basis.map(|basis| used_length_percentage(value, basis).max(0.0))
+                    if value.percent == 0.0 {
+                        Some(value.length.max(0.0))
+                    } else {
+                        percentage_basis.map(|basis| used_length_percentage(value, basis).max(0.0))
+                    }
                 })
                 .unwrap_or_else(|| max_content.max(min_content).max(0.0));
             taffy_layout::Dimension::length(
@@ -181,6 +213,8 @@ pub(super) fn measure_flex_item(
         content_height: 0.0,
         first_baseline: None,
         last_baseline: None,
+        first_horizontal_baseline: None,
+        last_horizontal_baseline: None,
     });
     taffy_layout::Size {
         width: known_dimensions.width.unwrap_or(estimate.width).max(0.0),
@@ -373,7 +407,14 @@ pub(super) fn taffy_flex_basis(
     // and if that is also auto the used flex basis is `content`.
     if direction.is_row_axis() {
         if !style.box_values.width.is_auto() {
-            taffy_optional_dimension(style.box_values.width)
+            taffy_flex_basis_from_main_size(
+                style,
+                style.box_values.width,
+                estimate,
+                available_main_size,
+                main_size_is_definite,
+                FlexDirection::Row,
+            )
         } else {
             taffy_layout::Dimension::length(flex_auto_content_basis(
                 style,
@@ -382,7 +423,14 @@ pub(super) fn taffy_flex_basis(
             ))
         }
     } else if !style.box_values.height.is_auto() {
-        taffy_optional_dimension(style.box_values.height)
+        taffy_flex_basis_from_main_size(
+            style,
+            style.box_values.height,
+            estimate,
+            available_main_size,
+            main_size_is_definite,
+            FlexDirection::Column,
+        )
     } else {
         taffy_layout::Dimension::length(flex_auto_content_basis(
             style,
@@ -390,6 +438,36 @@ pub(super) fn taffy_flex_basis(
             FlexDirection::Column,
         ))
     }
+}
+
+fn taffy_flex_basis_from_main_size(
+    style: &ComputedStyle,
+    value: css::ComputedLengthPercentageOrAuto,
+    estimate: &FlexItemEstimate,
+    available_main_size: f32,
+    main_size_is_definite: bool,
+    direction: FlexDirection,
+) -> taffy_layout::Dimension {
+    let (min_content, max_content) = if direction.is_row_axis() {
+        (estimate.min_width, estimate.content_width)
+    } else {
+        (estimate.min_height, estimate.content_height)
+    };
+    if matches!(value, css::ComputedLengthPercentageOrAuto::LengthPercentage(value) if value.percent != 0.0 && !main_size_is_definite)
+    {
+        return taffy_layout::Dimension::length(flex_auto_content_basis(
+            style,
+            max_content,
+            direction,
+        ));
+    }
+
+    taffy_intrinsic_dimension_with_basis(
+        value,
+        main_size_is_definite.then_some(available_main_size),
+        min_content,
+        max_content,
+    )
 }
 
 /// Computes the intrinsic `fit-content` size clamp for `flex-basis`.

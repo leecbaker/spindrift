@@ -5,6 +5,8 @@ static JOIN_CONTROLS: OnceLock<CodePointSetDataBorrowed<'static>> = OnceLock::ne
 static BIDI_CONTROLS: OnceLock<CodePointSetDataBorrowed<'static>> = OnceLock::new();
 static BIDI_CLASSES: OnceLock<CodePointMapDataBorrowed<'static, BidiClass>> = OnceLock::new();
 static LINE_BREAK_CLASSES: OnceLock<CodePointMapDataBorrowed<'static, LineBreak>> = OnceLock::new();
+static VERTICAL_ORIENTATIONS: OnceLock<CodePointMapDataBorrowed<'static, VerticalOrientation>> =
+    OnceLock::new();
 static WORD_BREAK_CLASSES: OnceLock<CodePointMapDataBorrowed<'static, IcuWordBreak>> =
     OnceLock::new();
 static GENERAL_CATEGORIES: OnceLock<CodePointMapDataBorrowed<'static, GeneralCategory>> =
@@ -68,6 +70,16 @@ pub(crate) fn character_is_join_control(character: char) -> bool {
         .contains(character)
 }
 
+/// Return whether a character is U+0640 ARABIC TATWEEL.
+///
+/// ALReq describes tatweel as a joining character used to extend Arabic
+/// cursive connections. It is visible text, unlike ZWJ/ZWNJ, but it must still
+/// provide joining context across font and inline style boundaries:
+/// <https://www.w3.org/TR/alreq/#h_joining_enforcement>.
+pub(crate) fn character_is_arabic_tatweel(character: char) -> bool {
+    character == '\u{0640}'
+}
+
 /// Return the Unicode Line_Break class for CSS Text line breaking.
 ///
 /// CSS Text line breaking is based on UAX #14 classes, with CSS-specific
@@ -78,6 +90,42 @@ pub(super) fn line_break_class(character: char) -> LineBreak {
     LINE_BREAK_CLASSES
         .get_or_init(CodePointMapData::<LineBreak>::new)
         .get(character)
+}
+
+/// Return the Unicode `Vertical_Orientation` class for a character.
+///
+/// CSS Writing Modes defines `text-orientation: mixed` in terms of Unicode
+/// Vertical_Orientation. Keeping this lookup in the shared text property layer
+/// lets vertical placement, diagnostics, and tests use the same policy:
+/// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation> and
+/// <https://www.unicode.org/reports/tr50/#vo>.
+pub(crate) fn character_vertical_orientation(character: char) -> VerticalOrientation {
+    VERTICAL_ORIENTATIONS
+        .get_or_init(CodePointMapData::<VerticalOrientation>::new)
+        .get(character)
+}
+
+/// Return whether one typographic unit is upright under `text-orientation: mixed`.
+///
+/// Unicode `Vertical_Orientation=U` and `Tu` are treated as upright for
+/// placement. `R` and `Tr` are emitted sideways in this pass; OpenType vertical
+/// alternates and transformed glyph substitution are tracked separately.
+/// Combining marks and default-ignorable controls inherit the first visible
+/// base character in the unit instead of deciding orientation on their own.
+pub(crate) fn typographic_unit_is_upright_in_mixed_orientation(text: &str) -> bool {
+    text.chars()
+        .find(|character| !character_inherits_vertical_orientation(*character))
+        .is_some_and(|character| {
+            matches!(
+                character_vertical_orientation(character),
+                VerticalOrientation::Upright | VerticalOrientation::TransformedUpright
+            )
+        })
+}
+
+pub(crate) fn character_inherits_vertical_orientation(character: char) -> bool {
+    character_is_default_ignorable_code_point(character)
+        || GeneralCategoryGroup::Mark.contains(general_category(character))
 }
 
 /// Return whether a character is a CSS Text "other space separator".
@@ -246,6 +294,28 @@ pub(crate) fn character_is_unicode_punctuation(character: char) -> bool {
     GeneralCategoryGroup::Punctuation.contains(general_category(character))
 }
 
+/// Return whether a character belongs to a Unicode symbol category.
+///
+/// CSS Text Decoration's `text-emphasis-skip: symbols` is defined in terms of
+/// typographic character classes. Unicode General Category provides the symbol
+/// class used by the prepared emphasis annotation policy:
+/// <https://drafts.csswg.org/css-text-decor-4/#text-emphasis-skip-property>
+/// and <https://www.unicode.org/reports/tr44/#General_Category_Values>.
+pub(crate) fn character_is_unicode_symbol(character: char) -> bool {
+    GeneralCategoryGroup::Symbol.contains(general_category(character))
+}
+
+/// Return whether a character belongs to a Unicode mark category.
+///
+/// CSS text emphasis is assigned to typographic character units, so combining
+/// marks must inherit the decision from their base character instead of
+/// independently creating emphasis annotations:
+/// <https://www.w3.org/TR/css-text-3/#typographic-character-unit> and
+/// <https://www.unicode.org/reports/tr44/#General_Category_Values>.
+pub(crate) fn character_is_unicode_mark(character: char) -> bool {
+    GeneralCategoryGroup::Mark.contains(general_category(character))
+}
+
 /// Return whether a character is an ideograph for CSS `text-autospace`.
 ///
 /// CSS Text Level 4 automatic spacing is defined around Han ideographs. UAX
@@ -408,4 +478,53 @@ fn general_category(character: char) -> GeneralCategory {
     GENERAL_CATEGORIES
         .get_or_init(CodePointMapData::<GeneralCategory>::new)
         .get(character)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_vertical_orientation_helper_returns_expected_classes() {
+        assert_eq!(
+            character_vertical_orientation('a'),
+            VerticalOrientation::Rotated
+        );
+        assert_eq!(
+            character_vertical_orientation('§'),
+            VerticalOrientation::Upright
+        );
+        assert_eq!(
+            character_vertical_orientation('、'),
+            VerticalOrientation::TransformedUpright
+        );
+        assert_eq!(
+            character_vertical_orientation('中'),
+            VerticalOrientation::Upright
+        );
+        assert_eq!(
+            character_vertical_orientation('！'),
+            VerticalOrientation::TransformedUpright
+        );
+        assert_eq!(
+            character_vertical_orientation('\u{2329}'),
+            VerticalOrientation::TransformedRotated
+        );
+    }
+
+    #[test]
+    fn mixed_orientation_policy_uses_visible_base_character() {
+        assert!(!typographic_unit_is_upright_in_mixed_orientation("a"));
+        assert!(typographic_unit_is_upright_in_mixed_orientation("§"));
+        assert!(typographic_unit_is_upright_in_mixed_orientation("、"));
+        assert!(!typographic_unit_is_upright_in_mixed_orientation(
+            "\u{0301}"
+        ));
+        assert!(!typographic_unit_is_upright_in_mixed_orientation(
+            "\u{0301}a"
+        ));
+        assert!(typographic_unit_is_upright_in_mixed_orientation(
+            "\u{200d}中"
+        ));
+    }
 }

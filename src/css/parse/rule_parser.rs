@@ -1,10 +1,12 @@
 use super::*;
 use crate::css::values::{
+    parse_alignment_baseline, parse_baseline_shift, parse_baseline_source, parse_dominant_baseline,
     parse_font_feature_settings, parse_font_kerning, parse_font_shorthand, parse_font_size_adjust,
     parse_font_variant, parse_font_variant_alternates, parse_font_variant_caps,
     parse_font_variant_east_asian, parse_font_variant_emoji, parse_font_variant_ligatures,
     parse_font_variant_numeric, parse_font_variant_position, parse_hanging_punctuation,
-    parse_letter_spacing, parse_tab_size, parse_text_indent, parse_word_spacing,
+    parse_letter_spacing, parse_tab_size, parse_text_indent, parse_vertical_align,
+    parse_word_spacing,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -192,26 +194,20 @@ impl<'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser {
             self.base_url.as_deref(),
             self.root_url.as_deref(),
         );
-        if let Some((pseudo, base_selector_text, base_selector)) = classify_pseudo_element_rule(
+        let routed_rules = split_pseudo_element_rule(
             &selector_text,
             &self.namespaces.borrow().selector_parser(),
-        ) {
-            let rule = StyleRule {
-                selector_text: base_selector_text,
-                selector: base_selector,
-                declarations,
-                specificity,
-                order: 0,
-                layer_name: self.current_layer.clone(),
-                scopes: self.current_scopes.clone(),
+            &declarations,
+            specificity,
+            self.current_layer.clone(),
+            self.current_scopes.clone(),
+        );
+        if !routed_rules.is_empty() {
+            return if routed_rules.len() == 1 {
+                Ok(routed_rules.into_iter().next().expect("one routed rule"))
+            } else {
+                Ok(ParsedCssRule::Nested(routed_rules))
             };
-            return Ok(match pseudo {
-                RoutedPseudoElement::Marker => ParsedCssRule::Marker(rule),
-                RoutedPseudoElement::Before => ParsedCssRule::Before(rule),
-                RoutedPseudoElement::After => ParsedCssRule::After(rule),
-                RoutedPseudoElement::FirstLine => ParsedCssRule::FirstLine(rule),
-                RoutedPseudoElement::FirstLetter => ParsedCssRule::FirstLetter(rule),
-            });
         }
         Ok(ParsedCssRule::Style(StyleRule {
             selector_text,
@@ -652,6 +648,10 @@ fn supports_declaration_condition(condition: &str) -> bool {
             value.to_ascii_lowercase().as_str(),
             "horizontal-tb" | "vertical-rl" | "vertical-lr"
         ),
+        "text-orientation" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "mixed" | "upright" | "sideways"
+        ),
         "text-align" => supports_text_align_value(value),
         "text-align-all" => supports_text_align_all_value(value),
         "text-align-last" => supports_text_align_last_value(value),
@@ -688,6 +688,7 @@ fn supports_declaration_condition(condition: &str) -> bool {
         "text-emphasis-position" => supports_text_emphasis_position_value(value),
         "text-emphasis-skip" => supports_text_emphasis_skip_value(value),
         "text-shadow" => supports_text_shadow_value(value),
+        "box-shadow" => supports_box_shadow_value(value),
         "letter-spacing" => {
             value.eq_ignore_ascii_case("normal") || parse_letter_spacing(value, 12.0).is_some()
         }
@@ -708,6 +709,11 @@ fn supports_declaration_condition(condition: &str) -> bool {
         "font-variant-emoji" => parse_font_variant_emoji(value).is_some(),
         "text-indent" => parse_text_indent(value, 12.0).is_some(),
         "hanging-punctuation" => parse_hanging_punctuation(value).is_some(),
+        "vertical-align" => parse_vertical_align(value, 12.0).is_some(),
+        "dominant-baseline" => parse_dominant_baseline(value).is_some(),
+        "alignment-baseline" => parse_alignment_baseline(value).is_some(),
+        "baseline-source" => parse_baseline_source(value).is_some(),
+        "baseline-shift" => parse_baseline_shift(value, 12.0).is_some(),
         "margin-block" | "margin-inline" => supports_box_edge_axis_value(value, true),
         "padding-block" | "padding-inline" => supports_box_edge_axis_value(value, false),
         "color"
@@ -728,10 +734,16 @@ fn supports_declaration_condition(condition: &str) -> bool {
         "font-size"
         | "width"
         | "height"
+        | "inline-size"
+        | "block-size"
         | "min-width"
         | "max-width"
         | "min-height"
         | "max-height"
+        | "min-inline-size"
+        | "max-inline-size"
+        | "min-block-size"
+        | "max-block-size"
         | "left"
         | "top"
         | "right"
@@ -770,7 +782,41 @@ fn supports_declaration_condition(condition: &str) -> bool {
         | "column-gap" => value.eq_ignore_ascii_case("auto") || parse_length(value).is_some(),
         "position" => matches!(
             value.to_ascii_lowercase().as_str(),
-            "static" | "relative" | "absolute" | "fixed"
+            "static" | "relative" | "absolute" | "fixed" | "sticky"
+        ),
+        "isolation" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "isolate"),
+        "mix-blend-mode" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "normal"
+                | "multiply"
+                | "screen"
+                | "overlay"
+                | "darken"
+                | "lighten"
+                | "color-dodge"
+                | "color-burn"
+                | "hard-light"
+                | "soft-light"
+                | "difference"
+                | "exclusion"
+                | "hue"
+                | "saturation"
+                | "color"
+                | "luminosity"
+        ),
+        "filter" | "clip-path" | "mask" | "mask-image" | "will-change" => true,
+        "contain" => {
+            let value = value.to_ascii_lowercase();
+            value == "none"
+                || value == "strict"
+                || value == "content"
+                || value.split_whitespace().all(|token| {
+                    matches!(token, "size" | "inline-size" | "layout" | "style" | "paint")
+                })
+        }
+        "content-visibility" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "visible" | "auto" | "hidden"
         ),
         "float" => matches!(
             value.to_ascii_lowercase().as_str(),
@@ -939,14 +985,28 @@ fn supported_property_name(name: &str) -> bool {
             | "line-height"
             | "box-sizing"
             | "z-index"
+            | "isolation"
+            | "mix-blend-mode"
+            | "filter"
+            | "clip-path"
+            | "mask"
+            | "mask-image"
+            | "contain"
+            | "content-visibility"
+            | "will-change"
             | "text-align"
             | "text-align-all"
             | "text-align-last"
             | "text-justify"
             | "text-autospace"
+            | "text-orientation"
             | "text-indent"
             | "hanging-punctuation"
             | "vertical-align"
+            | "dominant-baseline"
+            | "alignment-baseline"
+            | "baseline-source"
+            | "baseline-shift"
             | "font-weight"
             | "font-style"
             | "font-width"
@@ -1006,6 +1066,7 @@ fn supported_property_name(name: &str) -> bool {
             | "text-emphasis-position"
             | "text-emphasis-skip"
             | "text-shadow"
+            | "box-shadow"
             | "white-space"
             | "word-break"
             | "overflow"
@@ -1405,6 +1466,38 @@ fn supports_text_shadow_layer_value(value: &str) -> bool {
     (2..=4).contains(&lengths)
 }
 
+fn supports_box_shadow_value(value: &str) -> bool {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("none") {
+        return true;
+    }
+    split_css_args(value, ',')
+        .into_iter()
+        .all(supports_box_shadow_layer_value)
+}
+
+fn supports_box_shadow_layer_value(value: &str) -> bool {
+    let mut color = false;
+    let mut inset = false;
+    let mut lengths = Vec::new();
+    for part in split_css_component_values(value) {
+        if part.eq_ignore_ascii_case("inset") && !inset {
+            inset = true;
+            continue;
+        }
+        if !color && (part.eq_ignore_ascii_case("currentcolor") || parse_color(part).is_some()) {
+            color = true;
+            continue;
+        }
+        if let Some(length) = parse_length(part) {
+            lengths.push(length);
+            continue;
+        }
+        return false;
+    }
+    (2..=4).contains(&lengths.len()) && !lengths.get(2).is_some_and(|blur| *blur < 0.0)
+}
+
 /// Returns whether a logical margin/padding axis value has valid arity.
 ///
 /// CSS Logical Properties defines `margin-block`/`margin-inline` and
@@ -1526,15 +1619,6 @@ fn word_boundary_after(bytes: &[u8], index: usize) -> bool {
         .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-' && *byte != b'_')
 }
 
-pub(super) fn strip_pseudo_selector_list(selector_text: &str, pseudo: &str) -> Option<String> {
-    let mut bases = Vec::new();
-    for selector in split_selector_list(selector_text) {
-        let base = strip_pseudo_selector(selector, pseudo)?;
-        bases.push(base.to_string());
-    }
-    (!bases.is_empty()).then(|| bases.join(", "))
-}
-
 pub(super) fn strip_pseudo_selector<'a>(selector: &'a str, pseudo: &str) -> Option<&'a str> {
     let trimmed = selector.trim();
     let double_colon = format!("::{pseudo}");
@@ -1546,33 +1630,96 @@ pub(super) fn strip_pseudo_selector<'a>(selector: &'a str, pseudo: &str) -> Opti
     (!base.is_empty()).then_some(base)
 }
 
-fn classify_pseudo_element_rule(
+fn split_pseudo_element_rule(
     selector_text: &str,
     selector_parser: &ReasySelectorParser,
-) -> Option<(RoutedPseudoElement, String, SelectorList<ReasySelectorImpl>)> {
+    declarations: &Declarations,
+    specificity: u32,
+    layer_name: Option<String>,
+    scopes: Vec<ScopeRule>,
+) -> Vec<ParsedCssRule> {
     // CSS Pseudo-Elements 4 pseudo rules are matched against their originating
     // elements, then applied in pseudo-specific cascade/layout paths.
     // <https://www.w3.org/TR/css-pseudo-4/#pseudo-elements>
-    for (pseudo, name) in [
+    let pseudo_names = [
         (RoutedPseudoElement::Marker, "marker"),
         (RoutedPseudoElement::Before, "before"),
         (RoutedPseudoElement::After, "after"),
         (RoutedPseudoElement::FirstLine, "first-line"),
         (RoutedPseudoElement::FirstLetter, "first-letter"),
-    ] {
-        let Some(base_selector_text) = strip_pseudo_selector_list(selector_text, name) else {
-            continue;
-        };
-        let base_selector = {
-            let parse_text = base_selector_text.clone();
-            let mut input = ParserInput::new(&parse_text);
-            let mut parser = Parser::new(&mut input);
-            SelectorList::parse(selector_parser, &mut parser, ParseRelative::No).ok()
-        };
-        let Some(base_selector) = base_selector else {
-            continue;
-        };
-        return Some((pseudo, base_selector_text, base_selector));
+    ];
+    let mut normal_selectors = Vec::new();
+    let mut routed_selectors = Vec::new();
+    for selector in split_selector_list(selector_text) {
+        let mut routed = false;
+        for (pseudo, name) in pseudo_names {
+            if let Some(base) = strip_pseudo_selector(selector, name) {
+                routed_selectors.push((pseudo, base.to_string()));
+                routed = true;
+                break;
+            }
+        }
+        if !routed {
+            normal_selectors.push(selector.trim().to_string());
+        }
     }
-    None
+    if routed_selectors.is_empty() {
+        return Vec::new();
+    }
+
+    let mut rules = Vec::new();
+    if !normal_selectors.is_empty() {
+        let selector_text = normal_selectors.join(", ");
+        if let Some(selector) = parse_selector_list_text(&selector_text, selector_parser) {
+            rules.push(ParsedCssRule::Style(StyleRule {
+                selector_text,
+                selector,
+                declarations: declarations.clone(),
+                specificity,
+                order: 0,
+                layer_name: layer_name.clone(),
+                scopes: scopes.clone(),
+            }));
+        }
+    }
+    for (pseudo, _name) in pseudo_names {
+        let base_selectors = routed_selectors
+            .iter()
+            .filter_map(|(routed_pseudo, selector)| (*routed_pseudo == pseudo).then_some(selector))
+            .cloned()
+            .collect::<Vec<_>>();
+        if base_selectors.is_empty() {
+            continue;
+        }
+        let selector_text = base_selectors.join(", ");
+        let Some(selector) = parse_selector_list_text(&selector_text, selector_parser) else {
+            continue;
+        };
+        let rule = StyleRule {
+            selector_text,
+            selector,
+            declarations: declarations.clone(),
+            specificity,
+            order: 0,
+            layer_name: layer_name.clone(),
+            scopes: scopes.clone(),
+        };
+        rules.push(match pseudo {
+            RoutedPseudoElement::Marker => ParsedCssRule::Marker(rule),
+            RoutedPseudoElement::Before => ParsedCssRule::Before(rule),
+            RoutedPseudoElement::After => ParsedCssRule::After(rule),
+            RoutedPseudoElement::FirstLine => ParsedCssRule::FirstLine(rule),
+            RoutedPseudoElement::FirstLetter => ParsedCssRule::FirstLetter(rule),
+        });
+    }
+    rules
+}
+
+fn parse_selector_list_text(
+    selector_text: &str,
+    selector_parser: &ReasySelectorParser,
+) -> Option<SelectorList<ReasySelectorImpl>> {
+    let mut input = ParserInput::new(selector_text);
+    let mut parser = Parser::new(&mut input);
+    SelectorList::parse(selector_parser, &mut parser, ParseRelative::No).ok()
 }

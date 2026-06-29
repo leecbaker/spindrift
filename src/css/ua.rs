@@ -30,11 +30,13 @@ pub(crate) fn html5_presentational_hints_stylesheet() -> Stylesheet {
             // overrides instead of adding attribute checks to layout code.
             // https://html.spec.whatwg.org/multipage/rendering.html#presentational-hints
             // https://www.w3.org/TR/css-cascade-5/#cascade-sort
-            parse_stylesheet(
+            let mut stylesheet = parse_stylesheet(
                 &Css::from_string(HTML5_PH_CSS)
                     .with_author_origin()
                     .with_specificity_override(0),
-            )
+            );
+            stylesheet.html_presentational_hints = true;
+            stylesheet
         })
         .clone()
 }

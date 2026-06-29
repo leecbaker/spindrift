@@ -195,49 +195,37 @@ pub(crate) fn circle_path(
     clip: Option<RenderedPathClip>,
 ) -> RenderedPath {
     let ratio = radius / std::f32::consts::PI.sqrt();
-    RenderedPath {
-        clip,
-        commands: vec![
-            RenderedPathCommand::MoveTo(cx + radius, cy),
-            RenderedPathCommand::CurveTo {
-                x1: cx + radius,
-                y1: cy + ratio,
-                x2: cx + ratio,
-                y2: cy + radius,
-                x3: cx,
-                y3: cy + radius,
-            },
-            RenderedPathCommand::CurveTo {
-                x1: cx - ratio,
-                y1: cy + radius,
-                x2: cx - radius,
-                y2: cy + ratio,
-                x3: cx - radius,
-                y3: cy,
-            },
-            RenderedPathCommand::CurveTo {
-                x1: cx - radius,
-                y1: cy - ratio,
-                x2: cx - ratio,
-                y2: cy - radius,
-                x3: cx,
-                y3: cy - radius,
-            },
-            RenderedPathCommand::CurveTo {
-                x1: cx + ratio,
-                y1: cy - radius,
-                x2: cx + radius,
-                y2: cy - ratio,
-                x3: cx + radius,
-                y3: cy,
-            },
+    RenderedPath::new(
+        vec![
+            RenderedPathCommand::move_to(paint_space_point(cx + radius, cy)),
+            RenderedPathCommand::curve_to(
+                paint_space_point(cx + radius, cy + ratio),
+                paint_space_point(cx + ratio, cy + radius),
+                paint_space_point(cx, cy + radius),
+            ),
+            RenderedPathCommand::curve_to(
+                paint_space_point(cx - ratio, cy + radius),
+                paint_space_point(cx - radius, cy + ratio),
+                paint_space_point(cx - radius, cy),
+            ),
+            RenderedPathCommand::curve_to(
+                paint_space_point(cx - radius, cy - ratio),
+                paint_space_point(cx - ratio, cy - radius),
+                paint_space_point(cx, cy - radius),
+            ),
+            RenderedPathCommand::curve_to(
+                paint_space_point(cx + ratio, cy - radius),
+                paint_space_point(cx + radius, cy - ratio),
+                paint_space_point(cx + radius, cy),
+            ),
             RenderedPathCommand::Close,
         ],
-        fill: Some(color),
-        fill_rule: RenderedPathFillRule::NonZero,
-        stroke: None,
-        stroke_width: 0.0,
-    }
+        Some(color),
+        RenderedPathFillRule::NonZero,
+        None,
+        0.0,
+        clip,
+    )
 }
 
 /// Build a filled rectangle path for clipped CSS border dash paint.
@@ -253,20 +241,20 @@ pub(crate) fn rect_path(
     color: Color,
     clip: Option<RenderedPathClip>,
 ) -> RenderedPath {
-    RenderedPath {
-        clip,
-        commands: vec![
-            RenderedPathCommand::MoveTo(x, y),
-            RenderedPathCommand::LineTo(x + width, y),
-            RenderedPathCommand::LineTo(x + width, y + height),
-            RenderedPathCommand::LineTo(x, y + height),
+    RenderedPath::new(
+        vec![
+            RenderedPathCommand::move_to(paint_space_point(x, y)),
+            RenderedPathCommand::line_to(paint_space_point(x + width, y)),
+            RenderedPathCommand::line_to(paint_space_point(x + width, y + height)),
+            RenderedPathCommand::line_to(paint_space_point(x, y + height)),
             RenderedPathCommand::Close,
         ],
-        fill: Some(color),
-        fill_rule: RenderedPathFillRule::NonZero,
-        stroke: None,
-        stroke_width: 0.0,
-    }
+        Some(color),
+        RenderedPathFillRule::NonZero,
+        None,
+        0.0,
+        clip,
+    )
 }
 
 pub(crate) fn push_border_rect(
@@ -283,13 +271,8 @@ pub(crate) fn push_border_rect(
     } else {
         (cross_start, axis_start, cross_width, axis_length)
     };
-    rects.push(RenderedRect {
-        x,
-        y,
-        width,
-        height,
-        fill: Some(color),
-        stroke: None,
-        stroke_width: 0.0,
-    });
+    rects.push(RenderedRect::from_paint_rect(
+        paint_space_rect(x, y, width, height),
+        Some(color),
+    ));
 }

@@ -189,6 +189,19 @@ pub(crate) enum WritingMode {
     VerticalLr,
 }
 
+/// Computed CSS `text-orientation`.
+///
+/// CSS Writing Modes defines the orientation of typographic character units in
+/// vertical writing modes. Horizontal writing ignores this property at used
+/// value time:
+/// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextOrientation {
+    Mixed,
+    Upright,
+    Sideways,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct BorderSpacing {
     pub horizontal: f32,
@@ -345,6 +358,7 @@ impl FlexDirection {
 /// <https://www.w3.org/TR/css-align-3/#overflow-values>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AlignmentSafety {
+    Default,
     Unsafe,
     Safe,
 }
@@ -403,7 +417,7 @@ impl ContentAlignment {
     pub const fn new(keyword: ContentAlignmentKeyword) -> Self {
         Self {
             keyword,
-            safety: AlignmentSafety::Unsafe,
+            safety: AlignmentSafety::Default,
         }
     }
 
@@ -411,6 +425,13 @@ impl ContentAlignment {
         Self {
             keyword,
             safety: AlignmentSafety::Safe,
+        }
+    }
+
+    pub const fn unsafe_position(keyword: ContentAlignmentKeyword) -> Self {
+        Self {
+            keyword,
+            safety: AlignmentSafety::Unsafe,
         }
     }
 
@@ -505,7 +526,7 @@ impl SelfAlignment {
     pub const fn new(keyword: SelfAlignmentKeyword) -> Self {
         Self {
             keyword,
-            safety: AlignmentSafety::Unsafe,
+            safety: AlignmentSafety::Default,
         }
     }
 
@@ -513,6 +534,13 @@ impl SelfAlignment {
         Self {
             keyword,
             safety: AlignmentSafety::Safe,
+        }
+    }
+
+    pub const fn unsafe_position(keyword: SelfAlignmentKeyword) -> Self {
+        Self {
+            keyword,
+            safety: AlignmentSafety::Unsafe,
         }
     }
 
@@ -657,6 +685,7 @@ pub(crate) enum TextAlignLast {
 }
 
 impl TextAlignLast {
+    #[allow(dead_code)]
     pub(crate) fn effective(self, text_align: TextAlign, direction: Direction) -> TextAlign {
         match self {
             Self::Align(align) => align,
@@ -728,15 +757,124 @@ pub(crate) fn logical_end_align(direction: Direction) -> TextAlign {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerticalAlign {
+pub(crate) enum BaselineMetric {
+    TextBottom,
+    Alphabetic,
+    Ideographic,
+    Middle,
+    Central,
+    Mathematical,
+    Hanging,
+    TextTop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DominantBaseline {
+    Auto,
+    Metric(BaselineMetric),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlignmentBaseline {
     Baseline,
+    Metric(BaselineMetric),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BaselineSource {
+    Auto,
+    First,
+    Last,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum BaselineShift {
+    LengthPercentage(ComputedLengthPercentage),
     Sub,
     Super,
     Top,
+    Center,
+    Bottom,
+}
+
+impl BaselineShift {
+    pub(crate) const ZERO: Self = Self::LengthPercentage(ComputedLengthPercentage::ZERO);
+
+    /// Resolve `<length-percentage>` against the element's own line-height.
+    ///
+    /// CSS Inline Layout Level 3 defines percentages on `baseline-shift` as
+    /// percentages of the element's own line-height:
+    /// <https://drafts.csswg.org/css-inline-3/#baseline-shift-property>.
+    pub(crate) fn length_percentage_shift(self, line_height: f32) -> f32 {
+        match self {
+            Self::LengthPercentage(value) => value.length + value.percent * line_height,
+            _ => 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TableCellVerticalAlign {
+    Baseline,
+    Top,
     Middle,
     Bottom,
-    TextTop,
-    TextBottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct VerticalAlign {
+    pub(crate) dominant_baseline: DominantBaseline,
+    pub(crate) alignment_baseline: AlignmentBaseline,
+    pub(crate) baseline_source: BaselineSource,
+    pub(crate) baseline_shift: BaselineShift,
+    pub(crate) table_cell_align: TableCellVerticalAlign,
+}
+
+impl VerticalAlign {
+    pub(crate) const BASELINE: Self = Self {
+        dominant_baseline: DominantBaseline::Auto,
+        alignment_baseline: AlignmentBaseline::Baseline,
+        baseline_source: BaselineSource::Auto,
+        baseline_shift: BaselineShift::ZERO,
+        table_cell_align: TableCellVerticalAlign::Baseline,
+    };
+
+    pub(crate) fn with_alignment_baseline(mut self, alignment_baseline: AlignmentBaseline) -> Self {
+        self.alignment_baseline = alignment_baseline;
+        self
+    }
+
+    pub(crate) fn with_baseline_source(mut self, baseline_source: BaselineSource) -> Self {
+        self.baseline_source = baseline_source;
+        self
+    }
+
+    pub(crate) fn with_baseline_shift(mut self, baseline_shift: BaselineShift) -> Self {
+        self.baseline_shift = baseline_shift;
+        self
+    }
+
+    pub(crate) fn with_table_cell_align(
+        mut self,
+        table_cell_align: TableCellVerticalAlign,
+    ) -> Self {
+        self.table_cell_align = table_cell_align;
+        self
+    }
+
+    pub(crate) fn aligns_to_line_box_edge(self) -> bool {
+        matches!(
+            self.baseline_shift,
+            BaselineShift::Top | BaselineShift::Bottom
+        )
+    }
+
+    /// Resolve the `baseline-shift` longhand against the element's own line-height.
+    ///
+    /// Positive values raise the box and negative values lower it.
+    pub(crate) fn length_percentage_shift(self, line_height: f32) -> f32 {
+        self.baseline_shift.length_percentage_shift(line_height)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -765,6 +903,7 @@ impl WhiteSpace {
         !matches!(self, Self::NoWrap | Self::Pre)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn preserves_space_edges(self) -> bool {
         matches!(self, Self::Pre | Self::PreWrap | Self::BreakSpaces)
     }

@@ -1,5 +1,4 @@
 use super::*;
-use crate::layout::assets::paint_effects_for_box;
 use crate::text::trim_css_collapsible_whitespace;
 
 #[derive(Debug, Clone)]
@@ -45,6 +44,7 @@ impl<'a> LayoutBuilder<'a> {
         let page_context = PageContext::from_options(config.options);
         let mut builder = Self {
             options: config.options,
+            stylesheets: config.stylesheets,
             base_url: config.base_url,
             root_url: config.root_url,
             resource_cache: config.resource_cache,
@@ -67,17 +67,22 @@ impl<'a> LayoutBuilder<'a> {
             content_left: page_context.left(),
             content_right: page_context.right(),
             inline_static_baseline_y: None,
+            block_static_position_y_offset: None,
             containing_block_direction: Direction::Ltr,
+            containing_block_writing_mode: WritingMode::HorizontalTb,
             fragment_top_offsets: Vec::new(),
             definite_block_size_stack: Vec::new(),
             truncate_page_start_margins: false,
             avoid_inside_retry_depth: 0,
+            out_of_flow_prebreak_suppression_depth: 0,
             containing_blocks: Vec::new(),
             list_stack: Vec::new(),
             counter_set: CounterSet::new(),
             quote_depth: 0,
             current_page_named_strings: HashMap::new(),
             current_page_running_elements: HashMap::new(),
+            next_assignment_id: 0,
+            assignment_capture_stack: Vec::new(),
             ancestors: Vec::new(),
             page_counter_initial_values: config.page_counter_initial_values,
             page_rules,
@@ -92,8 +97,11 @@ impl<'a> LayoutBuilder<'a> {
             fixed_layers: Vec::new(),
             next_paint_source_order: 1,
             overflow_clips: Vec::new(),
+            next_float_id: 1,
             float_contexts: vec![FloatContext { shapes: Vec::new() }],
             pending_float_fragments: Vec::new(),
+            pending_float_side_effects: Vec::new(),
+            applied_clearance_count: 0,
             preserve_scoped_paint_public_order: false,
         };
         builder.rebuild_empty_current_page_context();
@@ -456,18 +464,57 @@ impl<'a> LayoutBuilder<'a> {
         };
         let counter_scope =
             (!style.display.is_none()).then(|| self.begin_counter_scope(element, style));
+        let source_page_index = self.pages.len();
+        let source_paint_checkpoint = self.current_page.paint_checkpoint();
+        let source_starts_page_fragment = !self.current_page_has_content();
+        let source_content_left = self.content_left;
+        let source_cursor_y = self.cursor_y;
         if !style.display.is_none() {
-            self.capture_named_strings(element, style);
+            let named_assignment_ids = self.capture_named_strings(element, style);
             if self.capture_running_element(element, style) {
+                let placement = AssignmentPlacement {
+                    page_index: source_page_index,
+                    starts_page_fragment: source_starts_page_fragment,
+                    border_box: Some(PaintClip::from_paint_rect(paint_space_rect(
+                        source_content_left,
+                        source_cursor_y,
+                        0.0,
+                        0.0,
+                    ))),
+                };
+                self.update_named_assignment_placements(&named_assignment_ids, placement);
                 if let Some(counter_scope) = counter_scope {
                     self.end_counter_scope(counter_scope);
                 }
                 self.exit_page_name_scope(page_name_scope);
                 return;
             }
-        }
-        if self.should_try_avoid_break_inside(style) {
-            self.layout_avoiding_break_inside(
+            if self.should_try_avoid_break_inside(style) {
+                self.layout_avoiding_break_inside(
+                    element,
+                    style,
+                    stylesheets,
+                    run_in_children,
+                    child_boxes,
+                    table_fragment,
+                );
+                let placement = self.final_source_assignment_placement(
+                    style,
+                    source_page_index,
+                    source_paint_checkpoint,
+                    source_starts_page_fragment,
+                    source_content_left,
+                    source_cursor_y,
+                );
+                self.update_named_assignment_placements(&named_assignment_ids, placement);
+                if let Some(counter_scope) = counter_scope {
+                    self.end_counter_scope(counter_scope);
+                }
+                self.materialize_empty_named_page_scope(style, page_name_scope.as_ref());
+                self.exit_page_name_scope(page_name_scope);
+                return;
+            }
+            self.layout_element_inner(
                 element,
                 style,
                 stylesheets,
@@ -475,6 +522,15 @@ impl<'a> LayoutBuilder<'a> {
                 child_boxes,
                 table_fragment,
             );
+            let placement = self.final_source_assignment_placement(
+                style,
+                source_page_index,
+                source_paint_checkpoint,
+                source_starts_page_fragment,
+                source_content_left,
+                source_cursor_y,
+            );
+            self.update_named_assignment_placements(&named_assignment_ids, placement);
             if let Some(counter_scope) = counter_scope {
                 self.end_counter_scope(counter_scope);
             }
@@ -530,14 +586,6 @@ impl<'a> LayoutBuilder<'a> {
             || style.running_element_name.is_some()
         {
             return None;
-        }
-        if style.display.is_flex() {
-            if !style.page_name_specified {
-                return None;
-            }
-            let page_name = style.page_name.as_deref();
-            self.enter_page_name_scope_for_value(page_name);
-            return Some(self.page_name_scope_checkpoint(style.page_name.clone()));
         }
         if !style.page_name_specified
             && child_boxes
@@ -769,7 +817,6 @@ impl<'a> LayoutBuilder<'a> {
                     table_fragment,
                 );
             }
-            ElementLayoutKind::HorizontalRule => self.layout_hr(style),
             ElementLayoutKind::Canvas => self.layout_canvas(element, style),
             ElementLayoutKind::Image => self.layout_image(element, style),
             ElementLayoutKind::GeneratedImage => self.layout_generated_image(element, style),
@@ -839,7 +886,7 @@ impl<'a> LayoutBuilder<'a> {
         !matches!(
             layout_kind,
             ElementLayoutKind::None | ElementLayoutKind::Positioned
-        ) && (style.opacity < 1.0 || !style.transform.is_empty() || style.overflow.clips_overflow())
+        ) && StackingContextPolicy::style_needs_non_positioned_scope(style)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -856,6 +903,10 @@ impl<'a> LayoutBuilder<'a> {
         let paint_checkpoint = self.current_page.paint_checkpoint();
         let paint_page_index = self.pages.len();
         let positioned_layer_start = self.positioned_layers.len();
+        let initial_policy = StackingContextPolicy::for_non_positioned_effect(
+            style,
+            PaintClip::from_paint_rect(paint_space_rect(0.0, 0.0, 0.0, 0.0)),
+        );
         self.layout_element_inner_kind(
             layout_kind,
             element,
@@ -865,46 +916,81 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             table_fragment,
         );
-        let child_layers = if positioned_layer_start < self.positioned_layers.len() {
+        let child_layers = if positioned_layer_start < self.positioned_layers.len()
+            && !matches!(
+                initial_policy.child_layer_policy,
+                ChildLayerPolicy::EscapeAll
+            ) {
             self.positioned_layers.split_off(positioned_layer_start)
         } else {
             Vec::new()
         };
-        let fragments = self.take_positioned_fragments_since(paint_page_index, paint_checkpoint);
-        for (page_index, fragment) in fragments {
-            if fragment.is_empty() {
-                continue;
+        let (child_layers, escaped_layers): (Vec<_>, Vec<_>) =
+            match initial_policy.child_layer_policy {
+                ChildLayerPolicy::CaptureAll => (child_layers, Vec::new()),
+                ChildLayerPolicy::CaptureAutoLevel => child_layers
+                    .into_iter()
+                    .partition(|layer| matches!(layer.stack_level, StackLevel::Auto)),
+                ChildLayerPolicy::EscapeAll => (Vec::new(), child_layers),
+            };
+        self.positioned_layers.extend(escaped_layers);
+        let mut fragments =
+            self.take_positioned_fragments_since(paint_page_index, paint_checkpoint);
+        for layer in &child_layers {
+            if !fragments
+                .iter()
+                .any(|(page_index, _)| *page_index == layer.page_index)
+            {
+                fragments.push((
+                    layer.page_index,
+                    PaintFragment::from_primitives(Vec::new(), Vec::new()),
+                ));
             }
+        }
+        for (page_index, fragment) in fragments {
             let child_contexts = child_layers
                 .iter()
                 .filter(|layer| layer.page_index == page_index)
                 .cloned()
                 .map(|layer| layer.context.with_links(layer.links))
                 .collect::<Vec<_>>();
+            if fragment.is_empty() && child_contexts.is_empty() {
+                continue;
+            }
             let source_order = self.next_paint_source_order();
             let (page_width, page_height) = if page_index < self.pages.len() {
-                (self.pages[page_index].width, self.pages[page_index].height)
+                (
+                    self.pages[page_index].width(),
+                    self.pages[page_index].height(),
+                )
             } else {
-                (self.current_page.width, self.current_page.height)
+                (self.current_page.width(), self.current_page.height())
             };
             let target_page = if page_index < self.pages.len() {
                 &mut self.pages[page_index]
             } else {
                 &mut self.current_page
             };
-            let bounds = fragment.bounds().unwrap_or(PaintClip {
-                x: 0.0,
-                y: 0.0,
-                width: page_width,
-                height: page_height,
-            });
-            let context = PaintStackingContext::from_banded_fragment(fragment, child_contexts)
-                .with_source_order(source_order)
-                .with_effects(paint_effects_for_box(style, bounds))
-                .with_bounds(bounds);
+            let bounds = fragment
+                .bounds()
+                .unwrap_or(PaintClip::from_paint_rect(paint_space_rect(
+                    0.0,
+                    0.0,
+                    page_width,
+                    page_height,
+                )));
+            let policy = StackingContextPolicy::for_non_positioned_effect(style, bounds);
+            let context = PaintStackingContext::from_banded_fragment_with_stack_level(
+                policy.stack_level,
+                fragment,
+                child_contexts,
+            )
+            .with_source_order(source_order)
+            .with_effects(policy.effects)
+            .with_bounds(bounds);
             let context_fragment =
-                PaintFragment::from_stacking_context_in_band(PaintBand::InFlowBlock, context);
-            target_page.append_paint_fragment(&context_fragment, 0.0, 0.0);
+                PaintFragment::from_stacking_context_in_band(policy.parent_band, context);
+            target_page.append_paint_fragment(&context_fragment, PaintVector::new(0.0, 0.0));
         }
     }
 
@@ -917,7 +1003,7 @@ impl<'a> LayoutBuilder<'a> {
         table_fragment: Option<&box_tree::TableFragment<'_>>,
     ) {
         if style.abspos_static_source_was_inline_level
-            && let Some(static_baseline_y) = self.current_page.lines.last().map(|line| line.y)
+            && let Some(static_baseline_y) = self.current_page.lines.last().map(|line| line.y())
         {
             self.layout_positioned_block_with_inline_static_baseline(
                 element,
@@ -979,6 +1065,7 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             None,
             0.0,
+            style,
             style.text_decoration,
             &mut items,
         );
@@ -1088,7 +1175,7 @@ impl<'a> LayoutBuilder<'a> {
     /// fragments:
     /// <https://www.w3.org/TR/css-page-3/#page-model> and
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
-    fn apply_page_context(&mut self, context: PageContext, offsets: FragmentOffsets) {
+    pub(super) fn apply_page_context(&mut self, context: PageContext, offsets: FragmentOffsets) {
         self.current_page_context = context;
         self.current_page.rotation = context.rotation;
         self.cursor_y = context.top() - offsets.top;
@@ -1222,6 +1309,56 @@ impl<'a> LayoutBuilder<'a> {
         (self.cursor_y - self.page_top()).abs() < 0.01
     }
 
+    /// Resolves a captured assignment to the first source fragment's final page.
+    ///
+    /// CSS GCPM `start` lookups are based on the source fragment at the page
+    /// boundary, not on the earlier style/counter capture point. If layout
+    /// pushes a page after capture, the original page checkpoint tells whether
+    /// the source painted there or moved wholly to the new current page:
+    /// <https://www.w3.org/TR/css-gcpm-3/#named-strings>.
+    fn final_source_assignment_placement(
+        &self,
+        style: &ComputedStyle,
+        captured_page_index: usize,
+        captured_paint_checkpoint: PaintCheckpoint,
+        captured_starts_page_fragment: bool,
+        captured_content_left: f32,
+        captured_cursor_y: f32,
+    ) -> AssignmentPlacement {
+        let height = style.line_height.max(0.0);
+        let width = (self.content_right - self.content_left).max(0.0);
+        if captured_page_index < self.pages.len() {
+            let original_page_changed =
+                self.pages[captured_page_index].paint_checkpoint() != captured_paint_checkpoint;
+            if original_page_changed {
+                return AssignmentPlacement {
+                    page_index: captured_page_index,
+                    starts_page_fragment: captured_starts_page_fragment,
+                    border_box: Some(
+                        PageTopRect::new(captured_content_left, captured_cursor_y, width, height)
+                            .paint_clip(),
+                    ),
+                };
+            }
+            return AssignmentPlacement {
+                page_index: self.pages.len(),
+                starts_page_fragment: true,
+                border_box: Some(
+                    PageTopRect::new(self.content_left, self.page_top(), width, height)
+                        .paint_clip(),
+                ),
+            };
+        }
+        AssignmentPlacement {
+            page_index: captured_page_index,
+            starts_page_fragment: captured_starts_page_fragment,
+            border_box: Some(
+                PageTopRect::new(captured_content_left, captured_cursor_y, width, height)
+                    .paint_clip(),
+            ),
+        }
+    }
+
     pub(super) fn snapshot(&self) -> LayoutSnapshot {
         LayoutSnapshot {
             pages: self.pages.clone(),
@@ -1243,22 +1380,31 @@ impl<'a> LayoutBuilder<'a> {
             content_left: self.content_left,
             content_right: self.content_right,
             inline_static_baseline_y: self.inline_static_baseline_y,
+            block_static_position_y_offset: self.block_static_position_y_offset,
+            containing_block_writing_mode: self.containing_block_writing_mode,
             fragment_top_offsets: self.fragment_top_offsets.clone(),
             definite_block_size_stack: self.definite_block_size_stack.clone(),
             truncate_page_start_margins: self.truncate_page_start_margins,
             avoid_inside_retry_depth: self.avoid_inside_retry_depth,
+            out_of_flow_prebreak_suppression_depth: self.out_of_flow_prebreak_suppression_depth,
             containing_blocks: self.containing_blocks.clone(),
             list_stack: self.list_stack.clone(),
             counter_set: self.counter_set.clone(),
+            quote_depth: self.quote_depth,
             current_page_named_strings: self.current_page_named_strings.clone(),
             current_page_running_elements: self.current_page_running_elements.clone(),
+            next_assignment_id: self.next_assignment_id,
+            assignment_capture_stack: self.assignment_capture_stack.clone(),
             ancestors: self.ancestors.clone(),
             bookmarks: self.bookmarks.clone(),
             positioned_layers: self.positioned_layers.clone(),
             fixed_layers: self.fixed_layers.clone(),
             next_paint_source_order: self.next_paint_source_order,
+            next_float_id: self.next_float_id,
             float_contexts: self.float_contexts.clone(),
             pending_float_fragments: self.pending_float_fragments.clone(),
+            pending_float_side_effects: self.pending_float_side_effects.clone(),
+            applied_clearance_count: self.applied_clearance_count,
             preserve_scoped_paint_public_order: self.preserve_scoped_paint_public_order,
         }
     }
@@ -1283,22 +1429,32 @@ impl<'a> LayoutBuilder<'a> {
         self.content_left = snapshot.content_left;
         self.content_right = snapshot.content_right;
         self.inline_static_baseline_y = snapshot.inline_static_baseline_y;
+        self.block_static_position_y_offset = snapshot.block_static_position_y_offset;
+        self.containing_block_writing_mode = snapshot.containing_block_writing_mode;
         self.fragment_top_offsets = snapshot.fragment_top_offsets;
         self.definite_block_size_stack = snapshot.definite_block_size_stack;
         self.truncate_page_start_margins = snapshot.truncate_page_start_margins;
         self.avoid_inside_retry_depth = snapshot.avoid_inside_retry_depth;
+        self.out_of_flow_prebreak_suppression_depth =
+            snapshot.out_of_flow_prebreak_suppression_depth;
         self.containing_blocks = snapshot.containing_blocks;
         self.list_stack = snapshot.list_stack;
         self.counter_set = snapshot.counter_set;
+        self.quote_depth = snapshot.quote_depth;
         self.current_page_named_strings = snapshot.current_page_named_strings;
         self.current_page_running_elements = snapshot.current_page_running_elements;
+        self.next_assignment_id = snapshot.next_assignment_id;
+        self.assignment_capture_stack = snapshot.assignment_capture_stack;
         self.ancestors = snapshot.ancestors;
         self.bookmarks = snapshot.bookmarks;
         self.positioned_layers = snapshot.positioned_layers;
         self.fixed_layers = snapshot.fixed_layers;
         self.next_paint_source_order = snapshot.next_paint_source_order;
+        self.next_float_id = snapshot.next_float_id;
         self.float_contexts = snapshot.float_contexts;
         self.pending_float_fragments = snapshot.pending_float_fragments;
+        self.pending_float_side_effects = snapshot.pending_float_side_effects;
+        self.applied_clearance_count = snapshot.applied_clearance_count;
         self.preserve_scoped_paint_public_order = snapshot.preserve_scoped_paint_public_order;
     }
 
@@ -1308,7 +1464,9 @@ impl<'a> LayoutBuilder<'a> {
         if self.current_page_has_content() {
             self.push_page();
         }
-        while !self.pending_float_fragments.is_empty() {
+        while !self.pending_float_fragments.is_empty()
+            || !self.pending_float_side_effects.is_empty()
+        {
             self.apply_pending_float_fragments_for_current_page();
             if self.current_page_has_content() {
                 self.push_page();
@@ -1318,12 +1476,11 @@ impl<'a> LayoutBuilder<'a> {
         }
         if self.pages.is_empty() {
             let mut page = page_for_context(self.current_page_context);
-            page.push_line(RenderedLine {
-                text: String::new(),
-                x: self.page_left(),
-                y: self.page_top() - self.options.font_size,
-                font_size: self.options.font_size,
-                font_id: {
+            page.push_line(RenderedLine::from_paint_origin(
+                String::new(),
+                paint_space_point(self.page_left(), self.page_top() - self.options.font_size),
+                self.options.font_size,
+                {
                     let mut style = ComputedStyle::initial();
                     style.font_size = self.options.font_size;
                     style.line_height_value =
@@ -1333,9 +1490,9 @@ impl<'a> LayoutBuilder<'a> {
                     style.line_height_is_normal = false;
                     self.font_system.resolve_style(&style)
                 },
-                color: Color::BLACK,
-                runs: Vec::new(),
-            });
+                Color::BLACK,
+                Vec::new(),
+            ));
             self.pages.push(page);
             self.page_names.push(self.current_page_name.clone());
             self.page_blanks.push(false);
@@ -1377,8 +1534,8 @@ impl<'a> LayoutBuilder<'a> {
         for page_index in 0..self.pages.len() {
             let page_number = page_index + 1;
             let declarations = self.page_declarations_for(page_number);
-            let page_width = self.pages[page_index].width;
-            let page_height = self.pages[page_index].height;
+            let page_width = self.pages[page_index].width();
+            let page_height = self.pages[page_index].height();
             let page_size = PageSize {
                 width: page_width,
                 height: page_height,
@@ -1388,19 +1545,43 @@ impl<'a> LayoutBuilder<'a> {
                 let mut style = ComputedStyle::initial();
                 css::apply_declarations(&mut style, &declarations);
                 has_visible_page_paint = page_style_has_visible_paint(&style);
-                let image_area = page_background_positioning_area(
-                    &declarations,
-                    PageContext::from_options(self.options).margins,
-                    page_size,
-                    style.background_origin,
-                );
-                let images = self.background_images(
-                    image_area.x,
-                    image_area.y,
-                    image_area.width,
-                    image_area.height,
-                    &style,
-                );
+                let page_margins = PageContext::from_options(self.options).margins;
+                let mut images = Vec::new();
+                for layer in page_background_layers_for_paint(&style).iter().rev() {
+                    let mut layer_style = style.clone();
+                    layer_style.background_image = layer.image.clone();
+                    layer_style.background_size = layer.size;
+                    layer_style.background_position = layer.position;
+                    layer_style.background_repeat = layer.repeat;
+                    layer_style.background_origin = css::BackgroundBox::Border;
+                    layer_style.background_clip = css::BackgroundBox::Border;
+                    let mut paint_layer = layer.clone();
+                    paint_layer.origin = css::BackgroundBox::Border;
+                    paint_layer.clip = css::BackgroundBox::Border;
+                    layer_style.background_layers = vec![paint_layer];
+                    let image_area = page_background_positioning_area(
+                        &declarations,
+                        page_margins,
+                        page_size,
+                        layer.origin,
+                    );
+                    let clip_area = page_background_positioning_area(
+                        &declarations,
+                        page_margins,
+                        page_size,
+                        layer.clip,
+                    );
+                    images.extend(clip_background_images_to_area(
+                        self.background_images(
+                            image_area.x,
+                            image_area.y,
+                            image_area.width,
+                            image_area.height,
+                            &layer_style,
+                        ),
+                        clip_area,
+                    ));
+                }
                 let page = &mut self.pages[page_index];
 
                 let mut background_style = style.clone();
@@ -1410,37 +1591,38 @@ impl<'a> LayoutBuilder<'a> {
                 let (rects, rounded_rects, paths, strokes) =
                     block_paint_ops(0.0, 0.0, page_width, page_height, &background_style);
                 for rect in rects {
-                    page.push_rect_in_band(PaintBand::BackgroundBorder, rect);
+                    page.push_rect_in_band(PaintBand::PageBackground, rect);
                 }
                 for rounded_rect in rounded_rects {
-                    page.push_rounded_rect_in_band(PaintBand::BackgroundBorder, rounded_rect);
+                    page.push_rounded_rect_in_band(PaintBand::PageBackground, rounded_rect);
                 }
                 for path in paths {
-                    page.push_path_in_band(PaintBand::BackgroundBorder, path);
+                    page.push_path_in_band(PaintBand::PageBackground, path);
                 }
                 for stroke in strokes {
-                    page.push_stroke_in_band(PaintBand::BackgroundBorder, stroke);
+                    page.push_stroke_in_band(PaintBand::PageBackground, stroke);
                 }
                 for image in images {
-                    page.push_image_in_band(PaintBand::BackgroundBorder, image);
+                    page.push_image_in_band(PaintBand::PageBackground, image);
                 }
 
                 let mut border_style = style;
                 border_style.background_color = None;
                 border_style.background_image = None;
+                border_style.background_layers.clear();
                 let (rects, rounded_rects, paths, strokes) =
                     block_paint_ops(0.0, 0.0, page_width, page_height, &border_style);
                 for rect in rects {
-                    page.push_rect_in_band(PaintBand::BackgroundBorder, rect);
+                    page.push_rect_in_band(PaintBand::PageBackground, rect);
                 }
                 for rounded_rect in rounded_rects {
-                    page.push_rounded_rect_in_band(PaintBand::BackgroundBorder, rounded_rect);
+                    page.push_rounded_rect_in_band(PaintBand::PageBackground, rounded_rect);
                 }
                 for path in paths {
-                    page.push_path_in_band(PaintBand::BackgroundBorder, path);
+                    page.push_path_in_band(PaintBand::PageBackground, path);
                 }
                 for stroke in strokes {
-                    page.push_stroke_in_band(PaintBand::BackgroundBorder, stroke);
+                    page.push_stroke_in_band(PaintBand::PageBackground, stroke);
                 }
             }
             self.add_document_canvas_background(
@@ -1515,17 +1697,17 @@ impl<'a> LayoutBuilder<'a> {
         if label.is_empty() {
             return;
         }
-        self.bookmarks.push(Bookmark {
+        self.bookmarks.push(Bookmark::new(
             level,
             label,
-            page_index: self.pages.len(),
+            self.pages.len(),
             x,
             y,
-            state: match style.bookmark_state {
+            match style.bookmark_state {
                 CssBookmarkState::Open => BookmarkState::Open,
                 CssBookmarkState::Closed => BookmarkState::Closed,
             },
-        });
+        ));
     }
 
     /// Captures the propagated document-canvas background source.
@@ -1615,7 +1797,13 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         let mut positioned_layers = std::mem::take(&mut self.positioned_layers);
-        positioned_layers.sort_by_key(|layer| (layer.page_index, layer.z_index));
+        positioned_layers.sort_by_key(|layer| {
+            (
+                layer.page_index,
+                layer.stack_level.sort_key(),
+                layer.context.source_order,
+            )
+        });
         for layer in positioned_layers {
             let fragment = positioned_layer_fragment(&layer);
             let target_page = if layer.page_index < self.pages.len() {
@@ -1623,12 +1811,9 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 &mut self.current_page
             };
-            let recorded = target_page.record_paint_fragment(&fragment, 0.0, 0.0);
-            if layer.z_index < 0 {
-                target_page.prepend_recorded_paint_fragment(recorded);
-            } else {
-                target_page.append_recorded_paint_fragment(recorded);
-            }
+            let recorded = target_page.record_paint_fragment(&fragment, PaintVector::new(0.0, 0.0));
+            target_page.append_recorded_paint_fragment(recorded);
+            target_page.sort_paint_tree_stacking_contexts();
         }
     }
 
@@ -1641,10 +1826,11 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         let mut subtree_layers = self.positioned_layers.split_off(start_index);
-        subtree_layers.sort_by_key(|layer| layer.z_index);
+        subtree_layers.sort_by_key(|layer| layer.stack_level.sort_key());
         for layer in subtree_layers {
             let fragment = positioned_layer_fragment(&layer);
-            self.current_page.append_paint_fragment(&fragment, 0.0, 0.0);
+            self.current_page
+                .append_paint_fragment(&fragment, PaintVector::new(0.0, 0.0));
         }
     }
 
@@ -1652,7 +1838,8 @@ impl<'a> LayoutBuilder<'a> {
         if self.fixed_layers.is_empty() {
             return;
         }
-        self.fixed_layers.sort_by_key(|layer| layer.z_index);
+        self.fixed_layers
+            .sort_by_key(|layer| (layer.stack_level.sort_key(), layer.context.source_order));
         let fixed_layers = self.fixed_layers.clone();
         for page in &mut self.pages {
             for layer in &fixed_layers {
@@ -1662,7 +1849,7 @@ impl<'a> LayoutBuilder<'a> {
     }
 }
 
-fn page_for_context(context: PageContext) -> Page {
+pub(super) fn page_for_context(context: PageContext) -> Page {
     let mut page = Page::new(context.size.width, context.size.height);
     page.rotation = context.rotation;
     page
@@ -1788,6 +1975,73 @@ fn page_background_positioning_area(
     }
 }
 
+fn page_background_layers_for_paint(style: &ComputedStyle) -> Vec<css::BackgroundLayer> {
+    if !style.background_layers.is_empty() {
+        return style.background_layers.clone();
+    }
+    vec![css::BackgroundLayer {
+        image: style.background_image.clone(),
+        position: style.background_position,
+        size: style.background_size,
+        repeat: style.background_repeat,
+        origin: style.background_origin,
+        clip: style.background_clip,
+    }]
+}
+
+/// Clips page background image tiles to the selected background painting area.
+///
+/// CSS Backgrounds separates `background-origin`, which positions the image,
+/// from `background-clip`, which clips painting:
+/// <https://www.w3.org/TR/css-backgrounds-3/#the-background-origin> and
+/// <https://www.w3.org/TR/css-backgrounds-3/#the-background-clip>. Page boxes
+/// use the same border/padding/content boxes through CSS Paged Media:
+/// <https://www.w3.org/TR/css-page-3/#page-model>.
+fn clip_background_images_to_area(
+    images: Vec<RenderedImage>,
+    clip: PageBackgroundArea,
+) -> Vec<RenderedImage> {
+    images
+        .into_iter()
+        .filter_map(|image| clip_background_image_to_area(image, clip))
+        .collect()
+}
+
+fn clip_background_image_to_area(
+    mut image: RenderedImage,
+    clip: PageBackgroundArea,
+) -> Option<RenderedImage> {
+    let image_x = image.x();
+    let image_y = image.y();
+    let image_width = image.width();
+    let image_height = image.height();
+    let x1 = image_x.max(clip.x);
+    let y1 = image_y.max(clip.y);
+    let x2 = (image_x + image_width).min(clip.x + clip.width);
+    let y2 = (image_y + image_height).min(clip.y + clip.height);
+    if x2 <= x1 || y2 <= y1 || image_width <= 0.0 || image_height <= 0.0 {
+        return None;
+    }
+    let source = image.source_rect.unwrap_or(RenderedImageSourceRect {
+        x: 0,
+        y: 0,
+        width: image.pixel_width,
+        height: image.pixel_height,
+    });
+    let source_x = source.x as f32 + ((x1 - image_x) / image_width) * source.width as f32;
+    let source_y = source.y as f32 + ((y1 - image_y) / image_height) * source.height as f32;
+    let source_width = ((x2 - x1) / image_width) * source.width as f32;
+    let source_height = ((y2 - y1) / image_height) * source.height as f32;
+    image.set_paint_rect(paint_space_rect(x1, y1, x2 - x1, y2 - y1));
+    image.source_rect = Some(RenderedImageSourceRect {
+        x: source_x.floor().max(0.0) as u32,
+        y: source_y.floor().max(0.0) as u32,
+        width: source_width.ceil().max(1.0) as u32,
+        height: source_height.ceil().max(1.0) as u32,
+    });
+    Some(image)
+}
+
 /// Returns whether a forced break target is satisfied by the next page number.
 ///
 /// CSS Fragmentation defines `left`/`right` as spread sides and `recto`/`verso`
@@ -1843,12 +2097,9 @@ fn is_recto_page(page_number: usize, page_progression_direction: Direction) -> b
 
 fn append_fixed_layer_to_page(page: &mut Page, layer: &FixedPaintLayer) {
     let fragment = fixed_layer_fragment(layer);
-    let recorded = page.record_paint_fragment(&fragment, 0.0, 0.0);
-    if layer.z_index < 0 {
-        page.prepend_recorded_paint_fragment(recorded);
-    } else {
-        page.append_recorded_paint_fragment(recorded);
-    }
+    let recorded = page.record_paint_fragment(&fragment, PaintVector::new(0.0, 0.0));
+    page.append_recorded_paint_fragment(recorded);
+    page.sort_paint_tree_stacking_contexts();
 }
 
 fn positioned_layer_fragment(layer: &PositionedPaintLayer) -> PaintFragment {

@@ -1,10 +1,14 @@
 use super::assets::{BackgroundPaintArea, background_images_for_style, paint_effects_for_box};
 use super::page_generated::{
-    PageContentResolveContext, ResolvedPageContent, resolve_page_content_parts,
+    PageContentResolveContext, PageMarginContentItem, ResolvedPageContent,
+    resolve_page_content_parts,
 };
 use super::*;
-use crate::css::{TextDecoration, TextEmphasisSkip, TextEmphasisStyle, TextShadow};
-use crate::text::{character_is_text_decoration_spacer, character_receives_text_emphasis_mark};
+use crate::layout::inline_collect::normalize_inline_whitespace_items;
+
+mod paint;
+
+use paint::{page_margin_box_paint_order, replay_page_margin_box_fragments};
 
 impl<'a> LayoutBuilder<'a> {
     pub(super) fn page_name_for_number(&self, page_number: usize) -> Option<&str> {
@@ -70,7 +74,6 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         let total_pages = self.pages.len();
-        let font_system = &mut self.font_system;
         let page_rules = self.page_rules.clone();
         let fallback_page_declarations = self.page_declarations.clone();
         let fallback_margin_boxes = self.page_margin_boxes.clone();
@@ -91,7 +94,7 @@ impl<'a> LayoutBuilder<'a> {
             &self.page_blanks,
             &self.page_counter_initial_values,
         );
-        for (index, page) in self.pages.iter_mut().enumerate() {
+        for index in 0..self.pages.len() {
             let page_number = index + 1;
             let page_name = self.page_names.get(index).and_then(Option::as_deref);
             let is_blank = self.page_blanks.get(index).copied().unwrap_or(false);
@@ -103,19 +106,16 @@ impl<'a> LayoutBuilder<'a> {
                 page_progression_direction,
                 &fallback_page_declarations,
             );
-            let boxes = page_margin_boxes_for_rules(
-                PageMarginCascadeContext {
-                    page_rules: &page_rules,
-                    page_number,
-                    page_name,
-                    is_blank,
-                    page_progression_direction,
-                    fallback: &fallback_margin_boxes,
-                    page_declarations: &page_declarations,
-                    base_page_style: &base_page_style,
-                },
-                font_system,
-            );
+            let boxes = page_margin_boxes_for_rules(PageMarginCascadeContext {
+                page_rules: &page_rules,
+                page_number,
+                page_name,
+                is_blank,
+                page_progression_direction,
+                fallback: &fallback_margin_boxes,
+                page_declarations: &page_declarations,
+                base_page_style: &base_page_style,
+            });
             let page_size = css::page_size_from(&page_declarations, base_page_context.size);
             let page_edges =
                 super::builder::page_box_edges_from_declarations(&page_declarations, page_size);
@@ -125,6 +125,10 @@ impl<'a> LayoutBuilder<'a> {
                 page_size,
                 page_edges.total(),
             );
+            let page_counters = page_counter_values
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| self.page_counter_initial_values.clone());
             let context = PageMarginPaintContext {
                 page_margins,
                 page_edges,
@@ -139,25 +143,253 @@ impl<'a> LayoutBuilder<'a> {
                 page_anchors: &page_anchors,
                 page_anchor_text: &page_anchor_text,
                 counter_styles: &counter_styles,
-                page_counters: page_counter_values
-                    .get(index)
-                    .unwrap_or(&self.page_counter_initial_values),
+                page_counters: &page_counters,
             };
-            let layouts = layout_page_margin_boxes(page, &boxes, context, font_system);
+            let layouts = layout_page_margin_boxes(
+                &self.pages[index],
+                &boxes,
+                context,
+                &mut self.font_system,
+            );
             let mut painted_boxes = Vec::new();
             for layout in &layouts {
-                let checkpoint = page.paint_checkpoint();
-                paint_page_margin_box(page, layout, context, font_system);
+                let checkpoint = self.pages[index].paint_checkpoint();
+                self.paint_page_margin_box_with_replay(index, layout, context);
                 painted_boxes.push(PageMarginPaintedBox {
                     z_index: layout.spec.style.z_index.unwrap_or(0),
                     order: page_margin_box_paint_order(&layout.spec.name),
                     effects: paint_effects_for_box(&layout.spec.style, layout.border_clip()),
                     bounds: layout.border_clip(),
-                    fragment: page.take_paint_fragment_since(checkpoint),
+                    fragment: self.pages[index].take_paint_fragment_since(checkpoint),
                 });
             }
-            replay_page_margin_box_fragments(page, painted_boxes);
+            replay_page_margin_box_fragments(&mut self.pages[index], painted_boxes);
         }
+    }
+
+    fn paint_page_margin_box_with_replay(
+        &mut self,
+        page_index: usize,
+        layout: &PageMarginBoxLayout<'_>,
+        context: PageMarginPaintContext<'_>,
+    ) {
+        let content_sequence =
+            if layout.content.is_empty() || layout.spec.style.visibility != Visibility::Visible {
+                None
+            } else {
+                let available_width = layout.content_width().max(1.0);
+                self.page_margin_inline_sequence_with_replay(
+                    &layout.content,
+                    &layout.spec.style,
+                    available_width,
+                    layout.content_height().max(layout.spec.style.line_height),
+                    context,
+                )
+            };
+        paint_page_margin_box(&mut self.pages[page_index], layout, context);
+        if let Some(sequence) = content_sequence {
+            self.paint_page_margin_inline_sequence(page_index, layout, &sequence);
+        }
+    }
+
+    fn page_margin_inline_sequence_with_replay(
+        &mut self,
+        content: &ResolvedPageContent,
+        style: &ComputedStyle,
+        available_width: f32,
+        available_height: f32,
+        context: PageMarginPaintContext<'_>,
+    ) -> Option<inline_layout::InlineLineSequence> {
+        let mut items = Vec::new();
+        let mut quote_depth = 0usize;
+        let inline_style = page_margin_inline_content_style(style);
+        for item in &content.items {
+            match item {
+                PageMarginContentItem::EmbeddedRunningElement(capture) => {
+                    if let Some(fragment) = self.replay_running_element_capture(
+                        capture,
+                        available_width,
+                        available_height,
+                    ) {
+                        items.push(fragment);
+                    } else {
+                        for part in &running_element_inline_parts(capture) {
+                            append_page_margin_inline_part(
+                                &mut items,
+                                part,
+                                &inline_style,
+                                style,
+                                available_width,
+                                context.base_url,
+                                context.root_url,
+                                context.resource_cache,
+                                &mut quote_depth,
+                            );
+                        }
+                    }
+                }
+                PageMarginContentItem::Inline(part) => append_page_margin_inline_part(
+                    &mut items,
+                    part,
+                    &inline_style,
+                    style,
+                    available_width,
+                    context.base_url,
+                    context.root_url,
+                    context.resource_cache,
+                    &mut quote_depth,
+                ),
+            }
+        }
+        (!items.is_empty())
+            .then(|| self.collect_inline_line_sequence(items, style, available_width, 0.0, 0.0))
+    }
+
+    fn paint_page_margin_inline_sequence(
+        &mut self,
+        page_index: usize,
+        layout: &PageMarginBoxLayout<'_>,
+        sequence: &inline_layout::InlineLineSequence,
+    ) {
+        let style = &layout.spec.style;
+        let total_height = sequence
+            .total_height()
+            .max(self.font_system.used_line_height(style));
+        let line_top = page_margin_text_stack_top(layout, style.vertical_align, total_height);
+        std::mem::swap(&mut self.current_page, &mut self.pages[page_index]);
+        self.paint_inline_line_sequence_in_fixed_box(
+            sequence,
+            style,
+            layout.content_x(),
+            layout.content_width().max(1.0),
+            line_top,
+        );
+        std::mem::swap(&mut self.current_page, &mut self.pages[page_index]);
+    }
+
+    /// Replays a captured running element into an isolated margin-box fragment.
+    ///
+    /// CSS Generated Content for Paged Media defines `element()` as placing the
+    /// captured running element in generated content, not as serializing its
+    /// text. The temporary page below gives the captured source a normal block,
+    /// table, flex, replaced, float, and positioned layout environment, then
+    /// extracts the resulting paint fragment before restoring document layout:
+    /// <https://www.w3.org/TR/css-gcpm-3/#running-elements>.
+    fn replay_running_element_capture(
+        &mut self,
+        capture: &RunningElementCapture,
+        available_width: f32,
+        available_height: f32,
+    ) -> Option<InlineItem> {
+        let snapshot = self.snapshot();
+        let replay_width = available_width.max(1.0);
+        let replay_height = available_height.max(capture.style.line_height).max(1.0);
+        let replay_context = PageContext {
+            size: PageSize {
+                width: replay_width,
+                height: replay_height,
+            },
+            margins: PageMargins::all(0.0),
+            edges: PageBoxEdges::ZERO,
+            rotation: 0,
+        };
+
+        self.pages.clear();
+        self.page_names.clear();
+        self.page_blanks.clear();
+        self.page_named_strings.clear();
+        self.page_running_elements.clear();
+        self.page_anchors.clear();
+        self.page_anchor_text.clear();
+        self.document_canvas_background = None;
+        self.root_canvas_background_defined = false;
+        self.current_page = super::builder::page_for_context(replay_context);
+        self.current_page_has_flow_content = false;
+        self.current_page_name = None;
+        self.apply_page_context(
+            replay_context,
+            FragmentOffsets {
+                left: 0.0,
+                right: 0.0,
+                top: 0.0,
+            },
+        );
+        self.inline_static_baseline_y = None;
+        self.block_static_position_y_offset = None;
+        self.fragment_top_offsets.clear();
+        self.definite_block_size_stack.clear();
+        self.truncate_page_start_margins = false;
+        self.avoid_inside_retry_depth = 0;
+        self.containing_blocks.clear();
+        self.list_stack.clear();
+        self.counter_set = capture.counter_set.clone();
+        self.quote_depth = capture.quote_depth;
+        self.current_page_named_strings.clear();
+        self.current_page_running_elements.clear();
+        self.ancestors.clear();
+        self.bookmarks.clear();
+        self.positioned_layers.clear();
+        self.fixed_layers.clear();
+        self.overflow_clips.clear();
+        self.next_float_id = 1;
+        self.float_contexts = vec![FloatContext { shapes: Vec::new() }];
+        self.pending_float_fragments.clear();
+        self.pending_float_side_effects.clear();
+        self.preserve_scoped_paint_public_order = false;
+
+        let mut replay_style = (*capture.style).clone();
+        replay_style.running_element_name = None;
+        replay_style.break_before = PageBreak::Auto;
+        replay_style.break_after = PageBreak::Auto;
+        replay_style.page_name_specified = false;
+        replay_style.page_name = None;
+        replay_style.counter_resets.clear();
+        replay_style.counter_increments.clear();
+        replay_style.counter_sets.clear();
+
+        let stylesheets = self.stylesheets;
+        let root_signature =
+            ElementSignature::new(capture.element.tag.clone(), capture.element.attrs.clone());
+        self.ancestors.push(root_signature.clone());
+        let child_boxes = box_tree::build_child_boxes(
+            &capture.element,
+            stylesheets,
+            &replay_style,
+            &[root_signature],
+        );
+        self.layout_element_with_child_boxes(
+            &capture.element,
+            &replay_style,
+            stylesheets,
+            Some(&child_boxes),
+        );
+        self.flush_positioned_layers_since(0);
+        self.apply_pending_float_fragments_for_current_page();
+
+        let current_fragment = self.current_page.take_paint_fragment();
+        let fragment = if !current_fragment.is_empty() {
+            current_fragment
+        } else if let Some(page) = self.pages.first_mut() {
+            page.take_paint_fragment()
+        } else {
+            PaintFragment::from_primitives(Vec::new(), Vec::new())
+        };
+        let bounds = fragment.bounds();
+        self.restore(snapshot);
+        let bounds = bounds?;
+        let width = bounds.width().max(0.0);
+        let height = bounds.height().max(0.0);
+        Some(InlineItem::Atom(Box::new(InlineAtom {
+            content: InlineAtomContent::InlineFragment(fragment),
+            style: (*capture.style).clone(),
+            escaped_positioned_layers: None,
+            width,
+            height,
+            baseline_offset: height,
+            baseline_shift: 0.0,
+            link_target: None,
+            alt_text: None,
+        })))
     }
 }
 
@@ -254,10 +486,7 @@ struct PageMarginCascadeContext<'a> {
     base_page_style: &'a ComputedStyle,
 }
 
-fn page_margin_boxes_for_rules(
-    context: PageMarginCascadeContext<'_>,
-    font_system: &mut FontSystem,
-) -> Vec<PageMarginBoxSpec> {
+fn page_margin_boxes_for_rules(context: PageMarginCascadeContext<'_>) -> Vec<PageMarginBoxSpec> {
     let mut boxes = Vec::new();
     for name in PAGE_MARGIN_BOX_NAMES {
         let page_specific_declarations =
@@ -304,12 +533,10 @@ fn page_margin_boxes_for_rules(
         style
             .quotes
             .resolve_auto_language(page_style.language.as_deref());
-        let font_id = font_system.resolve_style(&style);
         boxes.push(PageMarginBoxSpec {
             name: (*name).to_string(),
             declarations,
             style,
-            font_id,
         });
     }
     boxes
@@ -335,9 +562,12 @@ fn apply_page_margin_box_ua_defaults(style: &mut ComputedStyle, name: &str) {
         }
     }
     style.vertical_align = match name {
-        "left-top" | "right-top" => VerticalAlign::Top,
-        "left-bottom" | "right-bottom" => VerticalAlign::Bottom,
-        _ => VerticalAlign::Middle,
+        "left-top" | "right-top" => VerticalAlign::BASELINE.with_baseline_shift(BaselineShift::Top),
+        "left-bottom" | "right-bottom" => {
+            VerticalAlign::BASELINE.with_baseline_shift(BaselineShift::Bottom)
+        }
+        _ => VerticalAlign::BASELINE
+            .with_alignment_baseline(AlignmentBaseline::Metric(BaselineMetric::Middle)),
     };
 }
 
@@ -593,30 +823,63 @@ struct PageMarginBoxSpec {
     name: String,
     declarations: Declarations,
     style: ComputedStyle,
-    font_id: Option<usize>,
 }
 
 struct PageMarginBoxLayout<'a> {
     spec: &'a PageMarginBoxSpec,
     content: ResolvedPageContent,
-    border_x: f32,
-    border_y: f32,
-    border_width: f32,
-    border_height: f32,
-    content_x: f32,
-    content_y: f32,
-    content_width: f32,
-    content_height: f32,
+    /// Border box of a CSS page-margin box in page-local paint coordinates.
+    ///
+    /// CSS Paged Media defines generated page-margin boxes around the page
+    /// area. At this point their used rectangles have already been projected
+    /// into Quire paint space: origin at the page bottom-left, `x` increasing
+    /// rightward, and `y` increasing upward:
+    /// <https://www.w3.org/TR/css-page-3/#page-margin-boxes>.
+    border_rect: PaintRect,
+    /// Content box of a CSS page-margin box in page-local paint coordinates.
+    ///
+    /// This is the containing area for generated margin-box inline content
+    /// after margin, border, and padding have been applied according to the CSS
+    /// box model:
+    /// <https://www.w3.org/TR/CSS22/box.html#box-dimensions>.
+    content_rect: PaintRect,
 }
 
 impl PageMarginBoxLayout<'_> {
     fn border_clip(&self) -> PaintClip {
-        PaintClip {
-            x: self.border_x,
-            y: self.border_y,
-            width: self.border_width,
-            height: self.border_height,
-        }
+        PaintClip::from_paint_rect(self.border_rect)
+    }
+
+    fn border_x(&self) -> f32 {
+        self.border_rect.min_x()
+    }
+
+    fn border_y(&self) -> f32 {
+        self.border_rect.min_y()
+    }
+
+    fn border_width(&self) -> f32 {
+        self.border_rect.width()
+    }
+
+    fn border_height(&self) -> f32 {
+        self.border_rect.height()
+    }
+
+    fn content_x(&self) -> f32 {
+        self.content_rect.min_x()
+    }
+
+    fn content_y(&self) -> f32 {
+        self.content_rect.min_y()
+    }
+
+    fn content_width(&self) -> f32 {
+        self.content_rect.width()
+    }
+
+    fn content_height(&self) -> f32 {
+        self.content_rect.height()
     }
 }
 
@@ -626,42 +889,6 @@ struct PageMarginPaintedBox {
     effects: PaintEffects,
     bounds: PaintClip,
     fragment: PaintFragment,
-}
-
-/// Replays page-margin boxes into the page display list in stacking order.
-///
-/// CSS Paged Media paints generated page-margin boxes using clockwise tree
-/// order by default, but each page-margin box establishes a stacking context
-/// and honors `z-index` relative to the document canvas/content stack:
-/// <https://www.w3.org/TR/css-page-3/#painting>.
-fn replay_page_margin_box_fragments(page: &mut Page, mut boxes: Vec<PageMarginPaintedBox>) {
-    boxes.sort_by_key(|box_| (box_.z_index, box_.order));
-
-    for box_ in boxes {
-        if box_.z_index < 0 {
-            let fragment = PaintFragment::from_primitives_in_band(
-                PaintBand::BackgroundBorder,
-                box_.fragment.flattened_primitives(),
-                box_.fragment.links,
-            );
-            let recorded = page.record_paint_fragment(&fragment, 0.0, 0.0);
-            page.prepend_recorded_paint_fragment(recorded);
-        } else {
-            let context = PaintStackingContext::new(box_.z_index, box_.fragment, Vec::new())
-                .with_effects(box_.effects)
-                .with_bounds(box_.bounds)
-                .with_source_order(box_.order);
-            let fragment = PaintFragment::from_stacking_context(context);
-            page.append_paint_fragment(&fragment, 0.0, 0.0);
-        }
-    }
-}
-
-fn page_margin_box_paint_order(name: &str) -> usize {
-    PAGE_MARGIN_BOX_NAMES
-        .iter()
-        .position(|candidate| *candidate == name)
-        .unwrap_or(PAGE_MARGIN_BOX_NAMES.len())
 }
 
 #[derive(Clone, Copy)]
@@ -707,13 +934,13 @@ fn layout_page_margin_boxes<'a>(
     }
     let page_margins = context.page_margins;
     let page_edges = context.page_edges;
-    let page_area_width = (page.width
+    let page_area_width = (page.width()
         - page_margins.left
         - page_margins.right
         - page_edges.left()
         - page_edges.right())
     .max(0.0);
-    let page_area_height = (page.height
+    let page_area_height = (page.height()
         - page_margins.top
         - page_margins.bottom
         - page_edges.top()
@@ -728,7 +955,7 @@ fn layout_page_margin_boxes<'a>(
         &generated,
         "top-left-corner",
         0.0,
-        page.height - page_margins.top,
+        page.height() - page_margins.top,
         page_margins.left,
         page_margins.top,
     );
@@ -736,8 +963,8 @@ fn layout_page_margin_boxes<'a>(
         &mut layouts,
         &generated,
         "top-right-corner",
-        page.width - page_margins.right,
-        page.height - page_margins.top,
+        page.width() - page_margins.right,
+        page.height() - page_margins.top,
         page_margins.right,
         page_margins.top,
     );
@@ -745,7 +972,7 @@ fn layout_page_margin_boxes<'a>(
         &mut layouts,
         &generated,
         "bottom-right-corner",
-        page.width - page_margins.right,
+        page.width() - page_margins.right,
         0.0,
         page_margins.right,
         page_margins.bottom,
@@ -767,7 +994,7 @@ fn layout_page_margin_boxes<'a>(
         ["top-left", "top-center", "top-right"],
         HorizontalMarginGroupGeometry {
             x: page_margins.left,
-            y: page.height - page_margins.top,
+            y: page.height() - page_margins.top,
             available_width,
             row_height: page_margins.top,
             side: HorizontalPageMarginSide::Top,
@@ -808,7 +1035,7 @@ fn layout_page_margin_boxes<'a>(
         font_system,
         ["right-top", "right-middle", "right-bottom"],
         VerticalMarginGroupGeometry {
-            x: page.width - page_margins.right,
+            x: page.width() - page_margins.right,
             y: page_margins.bottom,
             column_width: page_margins.right,
             available_height,
@@ -1027,24 +1254,21 @@ fn push_layout_from_outer_rect<'a>(
     layouts.push(PageMarginBoxLayout {
         spec: box_.spec,
         content: box_.content.clone(),
-        border_x,
-        border_y,
-        border_width,
-        border_height,
-        content_x: border_x + edges.border.left + edges.padding.left,
-        content_y: border_y + edges.border.bottom + edges.padding.bottom,
-        content_width: (border_width
-            - edges.border.left
-            - edges.border.right
-            - edges.padding.left
-            - edges.padding.right)
-            .max(0.0),
-        content_height: (border_height
-            - edges.border.top
-            - edges.border.bottom
-            - edges.padding.top
-            - edges.padding.bottom)
-            .max(0.0),
+        border_rect: paint_space_rect(border_x, border_y, border_width, border_height),
+        content_rect: paint_space_rect(
+            border_x + edges.border.left + edges.padding.left,
+            border_y + edges.border.bottom + edges.padding.bottom,
+            border_width
+                - edges.border.left
+                - edges.border.right
+                - edges.padding.left
+                - edges.padding.right,
+            border_height
+                - edges.border.top
+                - edges.border.bottom
+                - edges.padding.top
+                - edges.padding.bottom,
+        ),
     });
 }
 
@@ -1401,7 +1625,7 @@ fn horizontal_margin_box_measure(
         + edges.border.right
         + edges.padding.left
         + edges.padding.right;
-    let intrinsic = margin_box_intrinsic_inline_sizes(
+    let intrinsic_widths = margin_box_intrinsic_inline_sizes(
         font_system,
         &box_.content,
         style,
@@ -1410,12 +1634,21 @@ fn horizontal_margin_box_measure(
         context.root_url,
         context.resource_cache,
     );
+    let specified_content = used_content_width_or_auto(style, available_width, non_content)
+        .or_else(|| {
+            intrinsic::intrinsic_width_keyword(
+                style.box_values.width,
+                intrinsic_widths.0,
+                intrinsic_widths.1,
+                available_width,
+                non_content,
+            )
+        });
     PageMarginBoxMeasure {
         generated: true,
-        specified_outer: used_content_width_or_auto(style, available_width, non_content)
-            .map(|width| width + non_content),
-        min_outer: intrinsic.0 + non_content,
-        max_outer: intrinsic.1 + non_content,
+        specified_outer: specified_content.map(|width| width + non_content),
+        min_outer: intrinsic_widths.0 + non_content,
+        max_outer: intrinsic_widths.1 + non_content,
         min_constraint: used_min_width(style, available_width).map(|value| value + non_content),
         max_constraint: used_max_width(style, available_width).map(|value| value + non_content),
     }
@@ -1423,7 +1656,7 @@ fn horizontal_margin_box_measure(
 
 fn vertical_margin_box_measure(
     box_: &GeneratedMarginBox<'_>,
-    font_system: &mut FontSystem,
+    _font_system: &mut FontSystem,
     available_height: f32,
     context: PageMarginPaintContext<'_>,
 ) -> PageMarginBoxMeasure {
@@ -1435,10 +1668,9 @@ fn vertical_margin_box_measure(
         + edges.border.bottom
         + edges.padding.top
         + edges.padding.bottom;
-    let content = resolved_page_margin_inline_content(
+    let content = page_margin_intrinsic_inline_items(
         &box_.content,
         style,
-        font_system,
         available_height,
         context.base_url,
         context.root_url,
@@ -1446,13 +1678,17 @@ fn vertical_margin_box_measure(
     );
     let line_count = content
         .iter()
-        .filter(|item| matches!(item, PageMarginInlineItem::Break))
+        .filter(|item| matches!(item, InlineItem::Break))
         .count()
         + 1;
     let atomic_height = content.iter().fold(style.line_height, |height, item| {
         height.max(match item {
-            PageMarginInlineItem::Image { height, .. } => *height,
-            PageMarginInlineItem::Text { .. } | PageMarginInlineItem::Break => style.line_height,
+            InlineItem::Atom(atom) => atom.height,
+            InlineItem::Word(_)
+            | InlineItem::Float(_)
+            | InlineItem::Break
+            | InlineItem::PageScopeStart(_)
+            | InlineItem::PageScopeEnd => style.line_height,
         })
     });
     let intrinsic = line_count as f32 * atomic_height;
@@ -1574,17 +1810,16 @@ fn paint_page_margin_box(
     page: &mut Page,
     layout: &PageMarginBoxLayout<'_>,
     context: PageMarginPaintContext<'_>,
-    font_system: &mut FontSystem,
 ) {
     let style = &layout.spec.style;
     if style.visibility != Visibility::Visible {
         return;
     }
     let (rects, rounded_rects, paths, strokes) = block_paint_ops(
-        layout.border_x,
-        layout.border_y,
-        layout.border_width,
-        layout.border_height,
+        layout.border_x(),
+        layout.border_y(),
+        layout.border_width(),
+        layout.border_height(),
         style,
     );
     for rect in rects {
@@ -1601,10 +1836,10 @@ fn paint_page_margin_box(
     }
     for image in background_images_for_style(
         BackgroundPaintArea {
-            x: layout.border_x,
-            y: layout.border_y,
-            width: layout.border_width,
-            height: layout.border_height,
+            x: layout.border_x(),
+            y: layout.border_y(),
+            width: layout.border_width(),
+            height: layout.border_height(),
         },
         style,
         context.base_url,
@@ -1616,21 +1851,6 @@ fn paint_page_margin_box(
     for primitive in page_margin_box_outline_primitives(layout, style) {
         push_page_margin_primitive(page, PaintBand::Outline, primitive);
     }
-
-    if layout.content.is_empty() {
-        return;
-    }
-    let available_width = layout.content_width.max(1.0);
-    let content_items = resolved_page_margin_inline_content(
-        &layout.content,
-        style,
-        font_system,
-        available_width,
-        context.base_url,
-        context.root_url,
-        context.resource_cache,
-    );
-    paint_page_margin_inline_content(page, layout, &content_items, font_system);
 }
 
 fn push_page_margin_primitive(page: &mut Page, band: PaintBand, primitive: PaintPrimitive) {
@@ -1658,13 +1878,14 @@ fn page_margin_box_outline_primitives(
     if style.outline_width <= 0.0 || style.outline_style.suppresses_used_width() {
         return Vec::new();
     }
-    if layout.border_width <= 0.0 || layout.border_height <= 0.0 {
+    if layout.border_width() <= 0.0 || layout.border_height() <= 0.0 {
         return Vec::new();
     }
 
     let mut outline_style = style.clone();
     outline_style.background_color = None;
     outline_style.background_image = None;
+    outline_style.background_layers.clear();
     outline_style.border_image = css::BorderImage::initial();
     outline_style.border_width = style.outline_width;
     outline_style.border_widths = css::Edges {
@@ -1689,10 +1910,10 @@ fn page_margin_box_outline_primitives(
 
     let outset = style.outline_offset + style.outline_width;
     let (rects, rounded_rects, paths, strokes) = block_paint_ops(
-        layout.border_x - outset,
-        layout.border_y - outset,
-        layout.border_width + outset * 2.0,
-        layout.border_height + outset * 2.0,
+        layout.border_x() - outset,
+        layout.border_y() - outset,
+        layout.border_width() + outset * 2.0,
+        layout.border_height() + outset * 2.0,
         &outline_style,
     );
     let mut primitives = Vec::new();
@@ -1716,29 +1937,23 @@ fn page_margin_text_stack_top(
     vertical_align: VerticalAlign,
     total_height: f32,
 ) -> f32 {
-    match vertical_align {
-        VerticalAlign::Bottom | VerticalAlign::TextBottom => layout.content_y + total_height,
-        VerticalAlign::Top | VerticalAlign::TextTop => layout.content_y + layout.content_height,
-        VerticalAlign::Middle
-        | VerticalAlign::Baseline
-        | VerticalAlign::Sub
-        | VerticalAlign::Super => layout.content_y + ((layout.content_height + total_height) / 2.0),
+    if matches!(vertical_align.baseline_shift, BaselineShift::Bottom)
+        || matches!(
+            vertical_align.alignment_baseline,
+            AlignmentBaseline::Metric(BaselineMetric::TextBottom)
+        )
+    {
+        layout.content_y() + total_height
+    } else if matches!(vertical_align.baseline_shift, BaselineShift::Top)
+        || matches!(
+            vertical_align.alignment_baseline,
+            AlignmentBaseline::Metric(BaselineMetric::TextTop)
+        )
+    {
+        layout.content_y() + layout.content_height()
+    } else {
+        layout.content_y() + ((layout.content_height() + total_height) / 2.0)
     }
-}
-
-/// Returns the rendered first text baseline offset from a page-margin line top.
-///
-/// Page-margin generated content paints text using the same PDF baseline
-/// projection as normal inline content. CSS Inline defines baselines from font
-/// metrics inside the line box; the renderer's `RenderedLine::y` stores the PDF
-/// text baseline after applying the selected font ascent adjustment:
-/// <https://www.w3.org/TR/css-inline-3/#line-box> and
-/// <https://www.w3.org/TR/CSS22/visudet.html#line-height>.
-fn page_margin_text_baseline_offset(font_system: &mut FontSystem, style: &ComputedStyle) -> f32 {
-    let font_id = font_system.resolve_style(style);
-    let line_height = font_system.line_height_for_font(font_id, style);
-    let adjustment = font_system.font_ascent_baseline_adjustment(font_id, style, line_height);
-    style.font_size - adjustment
 }
 
 fn margin_box_intrinsic_inline_sizes(
@@ -1806,49 +2021,111 @@ fn page_margin_intrinsic_inline_items(
     let mut items = Vec::new();
     let mut quote_depth = 0usize;
     let mut text_buffer = String::new();
-    for part in &content.parts {
-        match part {
-            GeneratedContentPart::Text(text) | GeneratedContentPart::Leader(text) => {
-                text_buffer.push_str(text);
-            }
-            GeneratedContentPart::Quote(quote) => {
-                let text = page_margin_quote_text(*quote, style, &mut quote_depth);
-                text_buffer.push_str(&text);
-            }
-            GeneratedContentPart::Image {
-                url,
-                base_url: image_base_url,
-                root_url: image_root_url,
-            } => {
-                flush_page_margin_intrinsic_text_buffer(&mut items, &mut text_buffer, style);
-                if let Some(image) = used_generated_image(
-                    url,
-                    style,
-                    available_width,
-                    image_base_url.as_deref().or(base_url),
-                    image_root_url.as_deref().or(root_url),
-                    resource_cache,
-                ) {
-                    items.push(InlineItem::Atom(Box::new(InlineAtom {
-                        content: InlineAtomContent::Image(image.decoded),
-                        style: style.clone(),
-                        width: image.border_box_width,
-                        height: image.border_box_height,
-                        baseline_offset: image.border_box_height,
-                        baseline_shift: 0.0,
-                        link_target: None,
-                        alt_text: None,
-                    })));
+    let inline_style = page_margin_inline_content_style(style);
+    for item in &content.items {
+        match item {
+            PageMarginContentItem::EmbeddedRunningElement(capture) => {
+                let parts = running_element_inline_parts(capture);
+                for part in &parts {
+                    append_page_margin_intrinsic_part(
+                        &mut items,
+                        &mut text_buffer,
+                        &mut quote_depth,
+                        part,
+                        &inline_style,
+                        style,
+                        available_width,
+                        base_url,
+                        root_url,
+                        resource_cache,
+                    );
                 }
             }
-            GeneratedContentPart::Contents
-            | GeneratedContentPart::Attr { .. }
-            | GeneratedContentPart::Counter { .. }
-            | GeneratedContentPart::Counters { .. } => {}
+            PageMarginContentItem::Inline(part) => append_page_margin_intrinsic_part(
+                &mut items,
+                &mut text_buffer,
+                &mut quote_depth,
+                part,
+                &inline_style,
+                style,
+                available_width,
+                base_url,
+                root_url,
+                resource_cache,
+            ),
         }
     }
     flush_page_margin_intrinsic_text_buffer(&mut items, &mut text_buffer, style);
     items
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_page_margin_intrinsic_part(
+    items: &mut Vec<InlineItem>,
+    text_buffer: &mut String,
+    quote_depth: &mut usize,
+    part: &GeneratedContentPart,
+    inline_style: &ComputedStyle,
+    box_style: &ComputedStyle,
+    available_width: f32,
+    base_url: Option<&std::path::Path>,
+    root_url: Option<&std::path::Path>,
+    resource_cache: &ResourceCache,
+) {
+    match part {
+        GeneratedContentPart::Text(text) => {
+            text_buffer.push_str(text);
+        }
+        GeneratedContentPart::Leader(text) => {
+            flush_page_margin_intrinsic_text_buffer(items, text_buffer, inline_style);
+            items.push(InlineItem::Atom(Box::new(InlineAtom {
+                content: InlineAtomContent::Leader(text.clone()),
+                style: inline_style.clone(),
+                escaped_positioned_layers: None,
+                width: 0.0,
+                height: inline_style.line_height,
+                baseline_offset: inline_style.font_size,
+                baseline_shift: 0.0,
+                link_target: None,
+                alt_text: None,
+            })));
+        }
+        GeneratedContentPart::Quote(quote) => {
+            let text = page_margin_quote_text(*quote, inline_style, quote_depth);
+            text_buffer.push_str(&text);
+        }
+        GeneratedContentPart::Image {
+            url,
+            base_url: image_base_url,
+            root_url: image_root_url,
+        } => {
+            flush_page_margin_intrinsic_text_buffer(items, text_buffer, inline_style);
+            if let Some(image) = used_generated_image(
+                url,
+                box_style,
+                available_width,
+                image_base_url.as_deref().or(base_url),
+                image_root_url.as_deref().or(root_url),
+                resource_cache,
+            ) {
+                items.push(InlineItem::Atom(Box::new(InlineAtom {
+                    content: InlineAtomContent::Image(image.decoded),
+                    style: inline_style.clone(),
+                    escaped_positioned_layers: None,
+                    width: image.border_box_width,
+                    height: image.border_box_height,
+                    baseline_offset: image.border_box_height,
+                    baseline_shift: 0.0,
+                    link_target: None,
+                    alt_text: None,
+                })));
+            }
+        }
+        GeneratedContentPart::Contents
+        | GeneratedContentPart::Attr { .. }
+        | GeneratedContentPart::Counter { .. }
+        | GeneratedContentPart::Counters { .. } => {}
+    }
 }
 
 fn flush_page_margin_intrinsic_text_buffer(
@@ -1858,6 +2135,7 @@ fn flush_page_margin_intrinsic_text_buffer(
 ) {
     if !text.is_empty() {
         push_inline_words_for_style(text, style, None, 0.0, output);
+        normalize_inline_whitespace_items(output);
         text.clear();
     }
 }
@@ -1873,185 +2151,116 @@ fn accumulate_page_margin_intrinsic_paragraph(
     if paragraph.is_empty() {
         return;
     }
-    let graph = inline_layout::build_inline_opportunity_graph(font_system, paragraph);
+    let graph = inline_layout::build_inline_opportunity_graph(font_system, paragraph, style);
     let contribution = graph.intrinsic_contribution(font_system, style);
     *min_content = (*min_content).max(contribution.min_content);
     *max_content = (*max_content).max(contribution.max_content);
     paragraph.clear();
 }
 
-#[derive(Debug, Clone)]
-enum PageMarginInlineItem {
-    Text {
-        text: String,
-        width: f32,
-        runs: Vec<RenderedTextRun>,
-    },
-    Image {
-        image: DecodedPngImage,
-        width: f32,
-        height: f32,
-        alt_text: Option<String>,
-    },
-    Break,
-}
-
-impl PageMarginInlineItem {
-    fn width(&self) -> f32 {
-        match self {
-            Self::Text { width, .. } | Self::Image { width, .. } => *width,
-            Self::Break => 0.0,
-        }
+fn running_element_inline_parts(capture: &RunningElementCapture) -> Vec<GeneratedContentPart> {
+    if !capture.content_parts.is_empty() {
+        return capture.content_parts.clone();
     }
-
-    fn height(&self, style: &ComputedStyle) -> f32 {
-        match self {
-            Self::Image { height, .. } => *height,
-            Self::Text { .. } | Self::Break => style.line_height,
-        }
+    if capture.fallback_text.is_empty() {
+        Vec::new()
+    } else {
+        vec![GeneratedContentPart::Text(capture.fallback_text.clone())]
     }
 }
 
-fn resolved_page_margin_inline_content(
-    content: &ResolvedPageContent,
-    style: &ComputedStyle,
-    font_system: &mut FontSystem,
+/// Derives the inline content style used by generated page-margin text.
+///
+/// CSS Paged Media creates a margin box whose background, border, padding, and
+/// outline paint on the margin box itself, while CSS Generated Content supplies
+/// inline content inside that box. Reusing the box style directly for inline
+/// fragments would duplicate the margin-box border/background around each text
+/// run:
+/// <https://www.w3.org/TR/css-page-3/#page-margin-boxes> and
+/// <https://www.w3.org/TR/css-content-3/#content-property>.
+fn page_margin_inline_content_style(style: &ComputedStyle) -> ComputedStyle {
+    let mut inline_style = style.clone();
+    inline_style.margin = css::Edges::ZERO;
+    inline_style.ua_margin_em = css::OptionalEdges::NONE;
+    inline_style.padding = css::Edges::ZERO;
+    inline_style.border_width = 0.0;
+    inline_style.border_widths = css::Edges::ZERO;
+    inline_style.border_styles = css::BorderStyles::NONE;
+    inline_style.border_radius = css::BorderRadius::ZERO;
+    inline_style.corner_shapes = css::CornerShapes::ROUND;
+    inline_style.border_image = css::BorderImage::initial();
+    inline_style.outline_width = 0.0;
+    inline_style.outline_style = css::BorderStyle::None;
+    inline_style.outline_offset = 0.0;
+    inline_style.background_color = None;
+    inline_style.background_image = None;
+    inline_style.background_layers.clear();
+    inline_style
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_page_margin_inline_part(
+    items: &mut Vec<InlineItem>,
+    part: &GeneratedContentPart,
+    inline_style: &ComputedStyle,
+    box_style: &ComputedStyle,
     available_width: f32,
     base_url: Option<&std::path::Path>,
     root_url: Option<&std::path::Path>,
     resource_cache: &ResourceCache,
-) -> Vec<PageMarginInlineItem> {
-    let mut items = Vec::new();
-    let mut quote_depth = 0usize;
-    let mut text_buffer = String::new();
-    for part in &content.parts {
-        match part {
-            GeneratedContentPart::Text(text) => {
-                text_buffer.push_str(text);
-            }
-            GeneratedContentPart::Leader(text) => {
-                text_buffer.push_str(text);
-            }
-            GeneratedContentPart::Quote(quote) => {
-                let text = page_margin_quote_text(*quote, style, &mut quote_depth);
-                text_buffer.push_str(&text);
-            }
-            GeneratedContentPart::Image {
+    quote_depth: &mut usize,
+) {
+    match part {
+        GeneratedContentPart::Text(text) => {
+            push_inline_words_for_style(text, inline_style, None, 0.0, items);
+        }
+        GeneratedContentPart::Leader(text) => {
+            items.push(InlineItem::Atom(Box::new(InlineAtom {
+                content: InlineAtomContent::Leader(text.clone()),
+                style: inline_style.clone(),
+                escaped_positioned_layers: None,
+                width: 0.0,
+                height: inline_style.line_height,
+                baseline_offset: inline_style.font_size,
+                baseline_shift: 0.0,
+                link_target: None,
+                alt_text: None,
+            })));
+        }
+        GeneratedContentPart::Quote(quote) => {
+            let text = page_margin_quote_text(*quote, inline_style, quote_depth);
+            push_inline_words_for_style(&text, inline_style, None, 0.0, items);
+        }
+        GeneratedContentPart::Image {
+            url,
+            base_url: image_base_url,
+            root_url: image_root_url,
+        } => {
+            if let Some(image) = used_generated_image(
                 url,
-                base_url: image_base_url,
-                root_url: image_root_url,
-            } => {
-                flush_page_margin_text_buffer(
-                    &mut items,
-                    &mut text_buffer,
-                    style,
-                    font_system,
-                    available_width,
-                );
-                if let Some(image) = used_generated_image(
-                    url,
-                    style,
-                    available_width,
-                    image_base_url.as_deref().or(base_url),
-                    image_root_url.as_deref().or(root_url),
-                    resource_cache,
-                ) {
-                    items.push(PageMarginInlineItem::Image {
-                        image: image.decoded,
-                        width: image.border_box_width,
-                        height: image.border_box_height,
-                        alt_text: None,
-                    });
-                }
-            }
-            GeneratedContentPart::Contents
-            | GeneratedContentPart::Attr { .. }
-            | GeneratedContentPart::Counter { .. }
-            | GeneratedContentPart::Counters { .. } => {}
-        }
-    }
-    flush_page_margin_text_buffer(
-        &mut items,
-        &mut text_buffer,
-        style,
-        font_system,
-        available_width,
-    );
-    items
-}
-
-fn flush_page_margin_text_buffer(
-    output: &mut Vec<PageMarginInlineItem>,
-    text: &mut String,
-    style: &ComputedStyle,
-    font_system: &mut FontSystem,
-    available_width: f32,
-) {
-    if text.is_empty() {
-        return;
-    }
-    let mut inline_items = Vec::new();
-    push_inline_words_for_style(text, style, None, 0.0, &mut inline_items);
-
-    let mut paragraph = Vec::new();
-    let mut emitted_line_in_buffer = false;
-    for item in inline_items {
-        if matches!(item, InlineItem::Break) {
-            flush_page_margin_graph_paragraph(
-                output,
-                &mut paragraph,
-                style,
-                font_system,
+                box_style,
                 available_width,
-                &mut emitted_line_in_buffer,
-            );
-            output.push(PageMarginInlineItem::Break);
-            emitted_line_in_buffer = false;
-        } else {
-            paragraph.push(item);
+                image_base_url.as_deref().or(base_url),
+                image_root_url.as_deref().or(root_url),
+                resource_cache,
+            ) {
+                items.push(InlineItem::Atom(Box::new(InlineAtom {
+                    content: InlineAtomContent::Image(image.decoded),
+                    style: inline_style.clone(),
+                    escaped_positioned_layers: None,
+                    width: image.border_box_width,
+                    height: image.border_box_height,
+                    baseline_offset: image.border_box_height,
+                    baseline_shift: 0.0,
+                    link_target: None,
+                    alt_text: None,
+                })));
+            }
         }
-    }
-    flush_page_margin_graph_paragraph(
-        output,
-        &mut paragraph,
-        style,
-        font_system,
-        available_width,
-        &mut emitted_line_in_buffer,
-    );
-    text.clear();
-}
-
-/// Select page-margin generated text lines through the normal CSS Text graph.
-///
-/// CSS Paged Media margin boxes use generated inline content, and CSS Text
-/// applies the same white-space processing, transforms, tab stops, soft wraps,
-/// hyphenation, and hanging punctuation to generated text as to authored text:
-/// <https://www.w3.org/TR/css-page-3/#margin-boxes> and
-/// <https://www.w3.org/TR/css-text-3/#text-processing-order>.
-fn flush_page_margin_graph_paragraph(
-    output: &mut Vec<PageMarginInlineItem>,
-    paragraph: &mut Vec<InlineItem>,
-    style: &ComputedStyle,
-    font_system: &mut FontSystem,
-    available_width: f32,
-    emitted_line_in_buffer: &mut bool,
-) {
-    let lines = graph_text_lines_for_paragraph(font_system, paragraph, style, available_width);
-    for line in lines {
-        if *emitted_line_in_buffer {
-            output.push(PageMarginInlineItem::Break);
-        }
-        let runs = line.shaped.map_or_else(
-            || font_system.shape_text_runs_with_parley(&line.text, style),
-            |shaped| shaped.rendered_runs(),
-        );
-        output.push(PageMarginInlineItem::Text {
-            text: line.text,
-            width: line.width,
-            runs,
-        });
-        *emitted_line_in_buffer = true;
+        GeneratedContentPart::Contents
+        | GeneratedContentPart::Attr { .. }
+        | GeneratedContentPart::Counter { .. }
+        | GeneratedContentPart::Counters { .. } => {}
     }
 }
 
@@ -2094,534 +2303,4 @@ fn page_margin_quote_pair(style: &ComputedStyle, depth: usize) -> (String, Strin
             (open.to_string(), close.to_string())
         }
     }
-}
-
-fn paint_page_margin_inline_content(
-    page: &mut Page,
-    layout: &PageMarginBoxLayout<'_>,
-    items: &[PageMarginInlineItem],
-    font_system: &mut FontSystem,
-) {
-    let style = &layout.spec.style;
-    let available_width = layout.content_width.max(1.0);
-    let lines = page_margin_inline_lines(items, available_width, style);
-    let total_height = lines
-        .iter()
-        .map(|line| line.height)
-        .sum::<f32>()
-        .max(font_system.used_line_height(style));
-    let mut line_top = page_margin_text_stack_top(layout, style.vertical_align, total_height);
-    for line in lines {
-        let line_x = aligned_x_with_width(
-            layout.content_x,
-            available_width,
-            line.width,
-            style.text_align.physical(style.direction),
-        );
-        let mut cursor_x = line_x;
-        let baseline_y = line_top - page_margin_text_baseline_offset(font_system, style);
-        for item in line.items {
-            match item {
-                PageMarginInlineItem::Text { text, width, runs } => {
-                    let first_font_id = runs.first().and_then(|run| run.font_id);
-                    let line = RenderedLine {
-                        text,
-                        x: cursor_x,
-                        y: baseline_y,
-                        font_size: style.font_size,
-                        font_id: first_font_id.or(layout.spec.font_id),
-                        color: style.color,
-                        runs,
-                    };
-                    paint_page_margin_text_shadows(page, &line, width, style);
-                    paint_page_margin_text_decoration(
-                        page,
-                        cursor_x,
-                        baseline_y,
-                        width,
-                        style,
-                        PageMarginDecorationPhase::BeforeText,
-                        None,
-                    );
-                    page.push_line_in_band(PaintBand::Inline, line.clone());
-                    paint_page_margin_emphasis_marks(page, &line, style, font_system);
-                    paint_page_margin_text_decoration(
-                        page,
-                        cursor_x,
-                        baseline_y,
-                        width,
-                        style,
-                        PageMarginDecorationPhase::AfterText,
-                        None,
-                    );
-                    cursor_x += width;
-                }
-                PageMarginInlineItem::Image {
-                    image,
-                    width,
-                    height,
-                    alt_text,
-                } => {
-                    page.push_image_in_band(
-                        PaintBand::Inline,
-                        RenderedImage {
-                            background: false,
-                            x: cursor_x,
-                            y: line_top - height,
-                            width,
-                            height,
-                            pixel_width: image.pixel_width,
-                            pixel_height: image.pixel_height,
-                            source_rect: None,
-                            interpolate: false,
-                            rgb: image.rgb,
-                            alpha: image.alpha,
-                            alt_text,
-                        },
-                    );
-                    cursor_x += width;
-                }
-                PageMarginInlineItem::Break => {}
-            }
-        }
-        line_top -= line.height;
-    }
-}
-
-#[derive(Debug)]
-struct PageMarginInlineLine {
-    items: Vec<PageMarginInlineItem>,
-    width: f32,
-    height: f32,
-}
-
-fn page_margin_inline_lines(
-    items: &[PageMarginInlineItem],
-    available_width: f32,
-    style: &ComputedStyle,
-) -> Vec<PageMarginInlineLine> {
-    let mut lines = Vec::new();
-    let mut current = PageMarginInlineLine {
-        items: Vec::new(),
-        width: 0.0,
-        height: style.line_height,
-    };
-    for item in items {
-        if matches!(item, PageMarginInlineItem::Break) {
-            lines.push(current);
-            current = PageMarginInlineLine {
-                items: Vec::new(),
-                width: 0.0,
-                height: style.line_height,
-            };
-            continue;
-        }
-        let item_width = item.width();
-        if !current.items.is_empty() && current.width + item_width > available_width {
-            lines.push(current);
-            current = PageMarginInlineLine {
-                items: Vec::new(),
-                width: 0.0,
-                height: style.line_height,
-            };
-        }
-        current.height = current.height.max(item.height(style));
-        current.width += item_width;
-        current.items.push(item.clone());
-    }
-    if !current.items.is_empty() || lines.is_empty() {
-        lines.push(current);
-    }
-    lines
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PageMarginDecorationPhase {
-    BeforeText,
-    AfterText,
-    All,
-}
-
-impl PageMarginDecorationPhase {
-    fn paints_before_text(self) -> bool {
-        matches!(self, Self::BeforeText | Self::All)
-    }
-
-    fn paints_after_text(self) -> bool {
-        matches!(self, Self::AfterText | Self::All)
-    }
-}
-
-fn paint_page_margin_text_shadows(
-    page: &mut Page,
-    line: &RenderedLine,
-    width: f32,
-    style: &ComputedStyle,
-) {
-    for shadow in style.text_shadow.iter().rev() {
-        let color = shadow.color.resolve(style.color);
-        if shadow.inset || !color.is_visible() {
-            continue;
-        }
-        for pass in page_margin_text_shadow_paint_passes(*shadow, color) {
-            let mut shadow_line = line.clone();
-            shadow_line.x += shadow.offset_x + pass.x_offset;
-            shadow_line.y -= shadow.offset_y + pass.y_offset;
-            shadow_line.color = pass.color;
-            paint_page_margin_text_decoration(
-                page,
-                shadow_line.x,
-                shadow_line.y,
-                width,
-                style,
-                PageMarginDecorationPhase::All,
-                Some(pass.color),
-            );
-            page.push_line_in_band(PaintBand::Inline, shadow_line);
-        }
-    }
-}
-
-fn paint_page_margin_emphasis_marks(
-    page: &mut Page,
-    line: &RenderedLine,
-    style: &ComputedStyle,
-    font_system: &mut FontSystem,
-) {
-    let Some(mark) = style
-        .text_emphasis_style
-        .mark_for_writing_mode(style.writing_mode)
-    else {
-        return;
-    };
-    if mark.is_empty() {
-        return;
-    }
-
-    let mut mark_style = style.clone();
-    mark_style.text_decoration_layers.clear();
-    mark_style.text_decoration = ComputedStyle::initial().text_decoration;
-    mark_style.text_shadow.clear();
-    mark_style.text_emphasis_style = TextEmphasisStyle::None;
-    mark_style.color = style.text_emphasis_color.unwrap_or(style.color);
-    mark_style.font_size = (style.font_size * 0.5).max(1.0);
-    let mark_width = font_system.measure_text(mark, &mark_style);
-    let vertical = style.writing_mode != WritingMode::HorizontalTb;
-    for run in &line.runs {
-        let Some(glyphs) = &run.glyphs else {
-            continue;
-        };
-        let mut pen_x = line.x + run.x_offset;
-        for glyph in glyphs {
-            if glyph.unicode.chars().any(|character| {
-                page_margin_character_receives_text_emphasis_mark(
-                    character,
-                    style.text_emphasis_skip,
-                )
-            }) {
-                let mark_x = if vertical {
-                    let side_offset = if style.text_emphasis_position.right {
-                        style.font_size * 0.55
-                    } else {
-                        -style.font_size * 0.55 - mark_width
-                    };
-                    line.x + run.x_offset + glyph.x_offset + side_offset
-                } else {
-                    pen_x + glyph.x_offset + (glyph.x_advance - mark_width) / 2.0
-                };
-                let mark_y = if vertical {
-                    line.y
-                } else if style.text_emphasis_position.over {
-                    line.y + style.font_size * 0.55
-                } else {
-                    line.y - style.font_size * 0.35
-                };
-                push_page_margin_text_run(page, mark, mark_x, mark_y, &mark_style, font_system);
-            }
-            pen_x += glyph.x_advance;
-        }
-    }
-}
-
-fn push_page_margin_text_run(
-    page: &mut Page,
-    text: &str,
-    x: f32,
-    y: f32,
-    style: &ComputedStyle,
-    font_system: &mut FontSystem,
-) {
-    let Some(shaped) = font_system.shape_unwrapped_line(text, style, style.line_height) else {
-        return;
-    };
-    let runs = shaped.rendered_runs();
-    if runs.is_empty() {
-        return;
-    }
-    let font_id = shaped.first_font_id();
-    page.push_line_in_band(
-        PaintBand::Inline,
-        RenderedLine {
-            text: shaped.text,
-            x,
-            y: y + shaped.baseline_adjustment,
-            font_size: style.font_size,
-            font_id,
-            color: style.color,
-            runs,
-        },
-    );
-}
-
-fn paint_page_margin_text_decoration(
-    page: &mut Page,
-    x: f32,
-    baseline_y: f32,
-    width: f32,
-    style: &ComputedStyle,
-    phase: PageMarginDecorationPhase,
-    color_override: Option<Color>,
-) {
-    let decorations = page_margin_active_text_decoration_layers(style);
-    if decorations.is_empty() || width <= 0.0 {
-        return;
-    }
-    for decoration in decorations {
-        if !decoration.has_visible_line() {
-            continue;
-        }
-        let color = color_override.or(decoration.color).unwrap_or(style.color);
-        if !color.is_visible() {
-            continue;
-        }
-        let (inset_start, inset_end) = decoration.inset.used(style.font_size);
-        let (x, width) = match style.direction {
-            Direction::Ltr => (x + inset_start, width - inset_start - inset_end),
-            Direction::Rtl => (x + inset_end, width - inset_start - inset_end),
-        };
-        let width = width.max(0.0);
-        if width <= 0.0 {
-            continue;
-        }
-        let thickness = match decoration.thickness {
-            TextDecorationThickness::LengthPercentage(value) => {
-                used_length_percentage(value, style.font_size).max(0.5)
-            }
-            TextDecorationThickness::Auto | TextDecorationThickness::FromFont => {
-                (style.font_size / 16.0).max(0.5)
-            }
-        };
-        if phase.paints_before_text() && decoration.underline {
-            push_page_margin_text_decoration_stroke(
-                page,
-                x,
-                page_margin_used_underline_y(
-                    baseline_y,
-                    decoration.underline_position,
-                    style.font_size,
-                    thickness,
-                ),
-                width,
-                thickness,
-                color,
-                decoration.style,
-            );
-        }
-        if phase.paints_before_text() && decoration.overline {
-            push_page_margin_text_decoration_stroke(
-                page,
-                x,
-                baseline_y + style.font_size,
-                width,
-                thickness,
-                color,
-                decoration.style,
-            );
-        }
-        if phase.paints_before_text() && decoration.spelling_error {
-            push_page_margin_text_decoration_stroke(
-                page,
-                x,
-                page_margin_used_underline_y(
-                    baseline_y,
-                    decoration.underline_position,
-                    style.font_size,
-                    thickness,
-                ),
-                width,
-                thickness,
-                color_override.unwrap_or(Color::new(255, 0, 0)),
-                TextDecorationStyle::Wavy,
-            );
-        }
-        if phase.paints_before_text() && decoration.grammar_error {
-            push_page_margin_text_decoration_stroke(
-                page,
-                x,
-                page_margin_used_underline_y(
-                    baseline_y,
-                    decoration.underline_position,
-                    style.font_size,
-                    thickness,
-                ),
-                width,
-                thickness,
-                color_override.unwrap_or(Color::new(0, 128, 0)),
-                TextDecorationStyle::Wavy,
-            );
-        }
-        if phase.paints_after_text() && decoration.line_through {
-            push_page_margin_text_decoration_stroke(
-                page,
-                x,
-                baseline_y + style.font_size * 0.35,
-                width,
-                thickness,
-                color,
-                decoration.style,
-            );
-        }
-    }
-}
-
-fn push_page_margin_text_decoration_stroke(
-    page: &mut Page,
-    x: f32,
-    y: f32,
-    width: f32,
-    thickness: f32,
-    color: Color,
-    style: TextDecorationStyle,
-) {
-    match style {
-        TextDecorationStyle::Double if thickness >= 1.5 => {
-            let stripe = (thickness / 3.0).max(0.5);
-            push_page_margin_text_decoration_stroke(
-                page,
-                x,
-                y + stripe,
-                width,
-                stripe,
-                color,
-                TextDecorationStyle::Solid,
-            );
-            push_page_margin_text_decoration_stroke(
-                page,
-                x,
-                y - stripe,
-                width,
-                stripe,
-                color,
-                TextDecorationStyle::Solid,
-            );
-        }
-        _ => {
-            let dash = match style {
-                TextDecorationStyle::Dotted => Some((thickness, thickness * 2.0)),
-                TextDecorationStyle::Dashed => Some((thickness * 3.0, thickness * 2.0)),
-                TextDecorationStyle::Wavy => Some((thickness * 1.5, thickness)),
-                TextDecorationStyle::Solid | TextDecorationStyle::Double => None,
-            };
-            page.push_stroke_in_band(
-                PaintBand::Inline,
-                RenderedStroke {
-                    x1: x,
-                    y1: y,
-                    x2: x + width,
-                    y2: y,
-                    width: thickness,
-                    color,
-                    dash,
-                },
-            );
-        }
-    }
-}
-
-fn page_margin_active_text_decoration_layers(style: &ComputedStyle) -> Vec<TextDecoration> {
-    if !style.text_decoration_layers.is_empty() {
-        return style.text_decoration_layers.clone();
-    }
-    if style.text_decoration.has_visible_line() {
-        return vec![style.text_decoration];
-    }
-    Vec::new()
-}
-
-fn page_margin_used_underline_y(
-    baseline_y: f32,
-    position: TextUnderlinePosition,
-    font_size: f32,
-    thickness: f32,
-) -> f32 {
-    if position.under {
-        baseline_y - font_size * 0.3 - thickness
-    } else {
-        baseline_y - thickness * 2.0
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PageMarginTextShadowPaintPass {
-    x_offset: f32,
-    y_offset: f32,
-    color: Color,
-}
-
-fn page_margin_text_shadow_paint_passes(
-    shadow: TextShadow,
-    color: Color,
-) -> Vec<PageMarginTextShadowPaintPass> {
-    if shadow.blur_radius <= 0.0 {
-        return vec![PageMarginTextShadowPaintPass {
-            x_offset: 0.0,
-            y_offset: 0.0,
-            color,
-        }];
-    }
-    let radius = shadow.blur_radius.max(0.0);
-    let samples = [
-        (0.0, 0.0, 0.22),
-        (1.0, 0.0, 0.08),
-        (-1.0, 0.0, 0.08),
-        (0.0, 1.0, 0.08),
-        (0.0, -1.0, 0.08),
-        (0.707, 0.707, 0.06),
-        (-0.707, 0.707, 0.06),
-        (0.707, -0.707, 0.06),
-        (-0.707, -0.707, 0.06),
-    ];
-    samples
-        .into_iter()
-        .map(|(x, y, alpha)| PageMarginTextShadowPaintPass {
-            x_offset: x * radius * 0.45,
-            y_offset: y * radius * 0.45,
-            color: Color {
-                a: (color.a * alpha).clamp(0.0, 1.0),
-                ..color
-            },
-        })
-        .collect()
-}
-
-fn page_margin_character_receives_text_emphasis_mark(
-    character: char,
-    skip: TextEmphasisSkip,
-) -> bool {
-    if !character_receives_text_emphasis_mark(character) {
-        return false;
-    }
-    if skip.spaces && character_is_text_decoration_spacer(character) {
-        return false;
-    }
-    if skip.punctuation && character.is_ascii_punctuation() {
-        return false;
-    }
-    if skip.symbols && character.is_ascii() && !character.is_ascii_alphanumeric() {
-        return false;
-    }
-    if skip.narrow && character.is_ascii() {
-        return false;
-    }
-    true
 }

@@ -293,55 +293,6 @@ async fn same_face_bold_request_gets_synthesized_document_font_label() {
 }
 
 #[tokio::test]
-async fn parley_wraps_text_with_shaped_widths() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-
-    let available_width = system.measure_text("one two", &style) + 0.1;
-    assert!(system.measure_text("one two three", &style) > available_width);
-
-    let lines = system
-        .break_text("one two three", &style, available_width)
-        .into_iter()
-        .map(|line| line.text)
-        .collect::<Vec<_>>();
-
-    assert_eq!(lines, vec!["one two", "three"]);
-}
-
-#[tokio::test]
-async fn broken_lines_carry_shaped_font_and_glyph_data() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-
-    let line = system
-        .break_text("one two", &style, 500.0)
-        .into_iter()
-        .next()
-        .unwrap();
-    let shaped = line.shaped.as_ref().expect("line should be shaped once");
-    let advance = shaped.advance_width();
-
-    assert_eq!(shaped.text, line.text);
-    assert!(shaped.first_font_id().is_some());
-    assert!((advance - line.width).abs() < 0.01);
-    assert!(shaped.runs.iter().all(|run| run.font_id.is_some()));
-    assert!(
-        shaped
-            .runs
-            .iter()
-            .flat_map(|run| &run.glyphs)
-            .any(|glyph| !glyph.source_text.is_empty())
-    );
-}
-
-#[tokio::test]
 async fn inter_word_justification_mutates_shaped_separator_advances() {
     let mut system = FontSystem::new();
     let mut style = ComputedStyle::initial();
@@ -451,7 +402,7 @@ async fn inter_word_justification_preserves_bidi_visual_glyph_order() {
 }
 
 #[tokio::test]
-async fn broken_line_width_uses_shaped_css_measure_without_losing_hanging_glyphs() {
+async fn shape_measured_line_excludes_hanging_glyphs_from_css_measure() {
     let mut system = FontSystem::new();
     let mut style = ComputedStyle::initial();
     style.font_family = FontFamily::SansSerif;
@@ -459,610 +410,20 @@ async fn broken_line_width_uses_shaped_css_measure_without_losing_hanging_glyphs
     style.line_height = 14.4;
     style.white_space = crate::css::WhiteSpace::Normal;
 
-    let line = system
-        .break_text("X\u{3000}", &style, 500.0)
-        .into_iter()
-        .next()
-        .unwrap();
-    let shaped = line.shaped.as_ref().expect("line should be shaped once");
+    let shaped = system
+        .shape_measured_line("X\u{3000}", &style, style.line_height)
+        .expect("line should shape");
     let visible_width = system.measure_text("X", &style);
 
-    assert_eq!(line.text, "X\u{3000}");
+    assert_eq!(shaped.text, "X\u{3000}");
     assert!(
-        (line.width - visible_width).abs() < 0.01,
+        (shaped.width - visible_width).abs() < 0.01,
         "CSS line measure should exclude hanging ideographic space"
     );
     assert!(
-        shaped.advance_width() > line.width,
+        shaped.advance_width() > shaped.width,
         "shaped payload should keep the hanging glyph for painting"
     );
-}
-
-#[tokio::test]
-async fn shaped_lines_keep_controls_for_shaping_without_visible_glyphs() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-
-    let line = system
-        .break_text("A\u{200c}B", &style, 500.0)
-        .into_iter()
-        .next()
-        .unwrap();
-    let shaped = line.shaped.as_ref().expect("line should be shaped once");
-
-    assert_eq!(shaped.text, "A\u{200c}B");
-    assert!(
-        shaped
-            .runs
-            .iter()
-            .flat_map(|run| &run.glyphs)
-            .all(|glyph| !glyph.source_text.chars().any(character_is_join_control)),
-        "{shaped:?}"
-    );
-}
-
-#[tokio::test]
-async fn break_spaces_wraps_at_preserved_spaces() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.white_space = crate::css::WhiteSpace::BreakSpaces;
-
-    let available_width = system.measure_text("A  ", &style) + 0.1;
-    assert!(system.measure_text("A   ", &style) > available_width);
-
-    let lines = system
-        .break_text("A   B", &style, available_width)
-        .into_iter()
-        .map(|line| line.text)
-        .collect::<Vec<_>>();
-
-    assert_eq!(lines, vec!["A  ", " B"]);
-}
-
-#[tokio::test]
-async fn break_spaces_preserves_trailing_space_advance() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.white_space = crate::css::WhiteSpace::BreakSpaces;
-
-    let line = system
-        .break_text("A  ", &style, 100.0)
-        .into_iter()
-        .next()
-        .unwrap();
-
-    assert_eq!(line.text, "A  ");
-    assert!((line.width - system.measure_text("A  ", &style)).abs() < 0.01);
-    let shaped = line
-        .shaped
-        .as_ref()
-        .expect("break-spaces line should carry selected shaped payload");
-    assert_eq!(shaped.text, line.text);
-    assert!((shaped.advance_width() - line.width).abs() < 0.01);
-    assert!(shaped.runs.iter().any(|run| !run.glyphs.is_empty()));
-}
-
-#[tokio::test]
-async fn parley_lines_expose_bidi_visual_text_order() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-
-    let line = system
-        .break_text("abc אבג def", &style, 500.0)
-        .into_iter()
-        .next()
-        .unwrap();
-
-    assert_eq!(line.text, "abc גבא def");
-}
-
-#[tokio::test]
-async fn css_ltr_direction_overrides_first_strong_rtl_paragraph_direction() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.direction = Direction::Ltr;
-
-    let line = system
-        .break_text("אבג abc", &style, 500.0)
-        .into_iter()
-        .next()
-        .unwrap();
-
-    assert_eq!(line.text, "גבא abc");
-}
-
-#[tokio::test]
-async fn css_rtl_direction_overrides_first_strong_ltr_paragraph_direction() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.direction = Direction::Rtl;
-
-    let line = system
-        .break_text("abc אבג def", &style, 500.0)
-        .into_iter()
-        .next()
-        .unwrap();
-
-    assert_eq!(line.text, "def גבא abc");
-}
-
-#[tokio::test]
-async fn css_direction_controls_neutral_only_bidi_paragraphs_without_painting_controls() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.direction = Direction::Rtl;
-
-    let line = system
-        .break_text("?!", &style, 500.0)
-        .into_iter()
-        .next()
-        .unwrap();
-
-    assert_eq!(line.text, "!?");
-    assert!(!line.text.chars().any(character_is_bidi_format_control));
-}
-
-#[tokio::test]
-async fn unicode_bidi_override_uses_uba_controls_without_painting_them() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.direction = Direction::Rtl;
-    style.unicode_bidi = UnicodeBidi::BidiOverride;
-
-    let line = system
-        .break_text("abc def", &style, 500.0)
-        .into_iter()
-        .next()
-        .unwrap();
-
-    assert_eq!(line.text, "fed cba");
-    assert!(!line.text.chars().any(character_is_bidi_format_control));
-}
-
-#[tokio::test]
-async fn bidi_control_only_line_carries_shaped_payload_without_rewrite() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-
-    let line = system
-        .break_text("A\u{200e}B", &style, 500.0)
-        .into_iter()
-        .next()
-        .unwrap();
-    let shaped = line
-        .shaped
-        .as_ref()
-        .expect("bidi-control line should carry shaped payload");
-
-    assert_eq!(line.text, "AB");
-    assert_eq!(shaped.text, line.text);
-    assert!((shaped.width - line.width).abs() < 0.01);
-    assert!(shaped.runs.iter().flat_map(|run| &run.glyphs).all(|glyph| {
-        !glyph
-            .source_text
-            .chars()
-            .any(character_is_bidi_format_control)
-    }));
-}
-
-#[tokio::test]
-async fn overflow_wrap_anywhere_breaks_long_words() {
-    let mut system = FontSystem::new();
-    let mut normal = ComputedStyle::initial();
-    normal.font_family = FontFamily::SansSerif;
-    normal.font_size = 12.0;
-    normal.line_height = 14.4;
-    normal.overflow_wrap = CssOverflowWrap::Normal;
-
-    let mut anywhere = normal.clone();
-    anywhere.overflow_wrap = CssOverflowWrap::Anywhere;
-
-    let available_width = system.measure_text("abc", &normal) + 0.1;
-    let normal_lines = system.break_text("abcdefgh", &normal, available_width);
-    let anywhere_lines = system.break_text("abcdefgh", &anywhere, available_width);
-
-    assert_eq!(normal_lines.len(), 1);
-    assert!(anywhere_lines.len() > 1);
-    assert_eq!(
-        anywhere_lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<String>(),
-        "abcdefgh"
-    );
-    assert!(
-        anywhere_lines.iter().all(|line| line.shaped.is_some()),
-        "emergency wrapped lines should keep shaped selected candidates"
-    );
-    for line in &anywhere_lines {
-        let shaped = line.shaped.as_ref().unwrap();
-        assert_eq!(shaped.text, line.text);
-        assert!(
-            (shaped.width - line.width).abs() < 0.01,
-            "selected emergency candidate should supply measured width"
-        );
-    }
-}
-
-#[tokio::test]
-async fn break_word_prefers_pre_wrap_space_opportunities() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.white_space = crate::css::WhiteSpace::PreWrap;
-    style.overflow_wrap = CssOverflowWrap::BreakWord;
-
-    let available_width = system
-        .measure_text(" XX ", &style)
-        .max(system.measure_text("XXX ", &style))
-        + 0.1;
-    let lines = system.break_text(" XX XXX ", &style, available_width);
-
-    assert_eq!(
-        lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>(),
-        vec![" XX", "XXX "]
-    );
-}
-
-#[tokio::test]
-async fn pre_wrap_soft_wrap_hangs_trailing_space_and_consumes_break_space() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.white_space = crate::css::WhiteSpace::PreWrap;
-
-    let available_width = system.measure_text("one two three", &style) + 0.1;
-    assert!(system.measure_text("one two three four", &style) > available_width);
-
-    let lines = system.break_text("one two three four five", &style, available_width);
-
-    assert_eq!(
-        lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>(),
-        vec!["one two three", "four five"]
-    );
-    assert!(
-        (lines[0].width - system.measure_text("one two three", &style)).abs() < 0.01,
-        "soft-wrap trailing space must not contribute to line width"
-    );
-}
-
-#[tokio::test]
-async fn normal_white_space_wraps_after_leading_ideographic_space_sequence() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.white_space = crate::css::WhiteSpace::Normal;
-
-    let leading_spaces = "\u{3000}\u{3000}";
-    let available_width = system.measure_text(leading_spaces, &style) + 0.1;
-    assert!(system.measure_text("\u{3000}\u{3000}XX", &style) > available_width);
-
-    let lines = system.break_text("\u{3000}\u{3000}XX", &style, available_width);
-
-    assert_eq!(
-        lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>(),
-        vec![leading_spaces, "XX"]
-    );
-}
-
-#[tokio::test]
-async fn normal_white_space_hangs_trailing_ideographic_space_from_line_measure() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.white_space = crate::css::WhiteSpace::Normal;
-
-    let available_width = system.measure_text("X", &style) + 0.1;
-    let line = system
-        .break_text("X\u{3000}", &style, available_width)
-        .into_iter()
-        .next()
-        .unwrap();
-
-    assert_eq!(line.text, "X\u{3000}");
-    assert!(
-        (line.width - system.measure_text("X", &style)).abs() < 0.01,
-        "trailing ideographic space must hang from line measurement"
-    );
-}
-
-#[tokio::test]
-async fn forced_break_hangs_trailing_ideographic_space() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.white_space = crate::css::WhiteSpace::Normal;
-
-    let available_width = system.measure_text("X", &style) + 0.1;
-    let lines = system.break_text("X\u{3000}\nXX", &style, available_width);
-
-    assert_eq!(lines[0].text, "X\u{3000}");
-    assert!(
-        (lines[0].width - system.measure_text("X", &style)).abs() < 0.01,
-        "forced-break trailing ideographic space must not affect line width"
-    );
-}
-
-#[tokio::test]
-async fn plaintext_bidi_hangs_trailing_ideographic_space() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.white_space = crate::css::WhiteSpace::Normal;
-    style.unicode_bidi = UnicodeBidi::Plaintext;
-
-    let available_width = system.measure_text("X", &style) + 0.1;
-    let line = system
-        .break_text("X\u{3000}", &style, available_width)
-        .into_iter()
-        .next()
-        .unwrap();
-
-    assert_eq!(line.text, "X\u{3000}");
-    assert!(
-        (line.width - system.measure_text("X", &style)).abs() < 0.01,
-        "unicode-bidi: plaintext must not disable CSS Text hanging"
-    );
-}
-
-#[tokio::test]
-async fn break_spaces_keeps_trailing_ideographic_space_advance() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.white_space = crate::css::WhiteSpace::BreakSpaces;
-
-    let line = system
-        .break_text("X\u{3000}", &style, 500.0)
-        .into_iter()
-        .next()
-        .unwrap();
-
-    assert_eq!(line.text, "X\u{3000}");
-    assert!(
-        (line.width - system.measure_text("X\u{3000}", &style)).abs() < 0.01,
-        "break-spaces must keep separator advance"
-    );
-}
-
-#[tokio::test]
-async fn break_spaces_breaks_after_ba_space_separator_without_hanging() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.white_space = crate::css::WhiteSpace::BreakSpaces;
-
-    assert_eq!(line_break_class('\u{2002}'), LineBreak::BreakAfter);
-    let available_width = system.measure_text("xx", &style) + 0.1;
-    let lines = system
-        .break_text("xx\u{2002}A", &style, available_width)
-        .into_iter()
-        .map(|line| (line.text, line.width))
-        .collect::<Vec<_>>();
-
-    assert_eq!(lines[0].0, "xx\u{2002}");
-    assert!(
-        lines[0].1 > available_width,
-        "break-spaces keeps the U+2002 advance instead of hanging it"
-    );
-    assert_eq!(lines[1].0, "A");
-}
-
-#[tokio::test]
-async fn break_spaces_keeps_other_separator_uax14_breaks_between_ideographs() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.white_space = crate::css::WhiteSpace::BreakSpaces;
-
-    let available_width = system.measure_text("xx", &style) + 0.1;
-    let lines = system
-        .break_text(
-            "xx\u{2002}ああ\u{2002}ああ\u{2002}xx",
-            &style,
-            available_width,
-        )
-        .into_iter()
-        .map(|line| line.text)
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        lines,
-        vec!["xx\u{2002}", "あ", "あ\u{2002}", "あ", "あ\u{2002}", "xx"]
-    );
-}
-
-#[tokio::test]
-async fn word_break_break_all_breaks_long_words() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.word_break = CssWordBreak::BreakAll;
-
-    let available_width = system.measure_text("abc", &style) + 0.1;
-    let lines = system.break_text("abcdefgh", &style, available_width);
-
-    assert!(lines.len() > 1);
-    assert_eq!(
-        lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<String>(),
-        "abcdefgh"
-    );
-}
-
-#[tokio::test]
-async fn unbroken_soft_hyphens_are_hidden() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-
-    let lines = system.break_text("hyphen\u{00ad}ation", &style, 500.0);
-
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].text, "hyphenation");
-}
-
-#[tokio::test]
-async fn broken_soft_hyphens_are_visible() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-
-    let available_width = system.measure_text("hyphen", &style) + 0.1;
-    let lines = system.break_text("hyphen\u{00ad}ation", &style, available_width);
-
-    assert!(lines.len() > 1);
-    assert_eq!(lines[0].text, "hyphen-");
-    assert_eq!(
-        lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<String>(),
-        "hyphen-ation"
-    );
-}
-
-#[tokio::test]
-async fn hyphens_none_suppresses_soft_hyphen_breaks() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.hyphens = Hyphens::None;
-
-    let available_width = system.measure_text("hyphen", &style) + 0.1;
-    let lines = system.break_text("hyphen\u{00ad}ation", &style, available_width);
-
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].text, "hyphenation");
-}
-
-#[tokio::test]
-async fn line_break_anywhere_adds_break_opportunities_without_visible_markers() {
-    let mut system = FontSystem::new();
-    let mut normal = ComputedStyle::initial();
-    normal.font_family = FontFamily::SansSerif;
-    normal.font_size = 12.0;
-    normal.line_height = 14.4;
-
-    let mut anywhere = normal.clone();
-    anywhere.line_break = CssLineBreak::Anywhere;
-
-    let available_width = system.measure_text("abc", &normal) + 0.1;
-    let normal_lines = system.break_text("abcdefgh", &normal, available_width);
-    let anywhere_lines = system.break_text("abcdefgh", &anywhere, available_width);
-
-    assert_eq!(normal_lines.len(), 1);
-    assert!(anywhere_lines.len() > 1);
-    assert_eq!(
-        anywhere_lines
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<String>(),
-        "abcdefgh"
-    );
-    assert!(
-        anywhere_lines
-            .iter()
-            .all(|line| !line.text.contains(ZERO_WIDTH_SPACE))
-    );
-}
-
-#[tokio::test]
-async fn line_break_anywhere_respects_white_space_pre_no_wrap_suppression() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.line_break = CssLineBreak::Anywhere;
-    style.white_space = crate::css::WhiteSpace::Pre;
-
-    let available_width = system.measure_text(" X", &style) + 0.1;
-    let lines = system.break_text(" XXX", &style, available_width);
-
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].text, " XXX");
-}
-
-#[tokio::test]
-async fn line_break_anywhere_respects_white_space_nowrap_suppression() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.line_break = CssLineBreak::Anywhere;
-    style.white_space = crate::css::WhiteSpace::NoWrap;
-
-    let available_width = system.measure_text("XX", &style) + 0.1;
-    let lines = system.break_text("XXXX XX", &style, available_width);
-
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].text, "XXXX XX");
 }
 
 #[tokio::test]
@@ -1074,6 +435,8 @@ async fn letter_spacing_uses_unicode_joining_properties() {
     assert!(character_can_join_following('ب'));
     assert!(character_can_join_preceding('ا'));
     assert!(!character_can_join_following('ا'));
+    assert!(character_is_arabic_tatweel('\u{0640}'));
+    assert!(character_has_joining_behavior('\u{0640}'));
     assert!(character_is_join_control('\u{200c}'));
     assert!(character_is_join_control('\u{200d}'));
     assert!(!character_is_join_control('\u{200e}'));
@@ -1131,6 +494,100 @@ async fn join_controls_shape_but_do_not_emit_visible_glyphs() {
             .all(|glyph| !glyph.unicode.chars().any(character_is_join_control)),
         "{glyphs:?}"
     );
+}
+
+#[tokio::test]
+async fn zwj_wrapped_arabic_letter_shapes_with_wpt_font() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: AlreqNaskh;
+                src: url("tests/resources/fonts/NotoNaskhArabic-regular.woff2");
+            }"#,
+        )
+        .with_base_url(Some(PathBuf::from("."))),
+    );
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::Names(vec!["AlreqNaskh".to_string()]);
+    style.font_size = 20.0;
+    style.line_height = 24.0;
+    style.direction = Direction::Rtl;
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+
+    assert!(
+        system
+            .shape_unwrapped_line("\u{0627}", &style, style.line_height)
+            .is_some(),
+        "plain alef should shape with the WPT font"
+    );
+    let shaped = system
+        .shape_unwrapped_line("\u{200d}\u{0627}\u{200d}", &style, style.line_height)
+        .expect("ZWJ-wrapped alef should shape");
+
+    assert!(shaped.advance_width() > 0.0, "{shaped:?}");
+    assert!(
+        shaped
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .all(|glyph| !glyph
+                .rendered
+                .unicode
+                .chars()
+                .any(character_is_join_control)),
+        "{shaped:?}"
+    );
+}
+
+#[tokio::test]
+async fn styled_tatweel_fragment_shapes_adjacent_arabic_letter() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: AlreqNaskh;
+                src: url("tests/resources/fonts/NotoNaskhArabic-regular.woff2");
+            }
+            @font-face {
+                font-family: AlreqTatweel;
+                src: url("tests/resources/fonts/Scheherazade-Regular.woff");
+            }"#,
+        )
+        .with_base_url(Some(PathBuf::from("."))),
+    );
+    let mut arabic = ComputedStyle::initial();
+    arabic.font_family = FontFamily::Names(vec!["AlreqNaskh".to_string()]);
+    arabic.font_size = 20.0;
+    arabic.line_height = 24.0;
+    arabic.direction = Direction::Rtl;
+    let mut tatweel = arabic.clone();
+    tatweel.font_family = FontFamily::Names(vec!["AlreqTatweel".to_string()]);
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+
+    let isolated_beh = shaped_glyph_ids(&mut system, "\u{0628}", &arabic);
+    let shaped = system.shape_styled_text_runs_with_parley(&[
+        StyledTextSpan {
+            text: "\u{0628}",
+            style: &arabic,
+        },
+        StyledTextSpan {
+            text: "\u{0640}",
+            style: &tatweel,
+        },
+    ]);
+    let glyph_ids = shaped
+        .into_iter()
+        .flat_map(|run| run.glyphs.unwrap_or_default())
+        .filter(|glyph| glyph.x_advance != 0.0)
+        .map(|glyph| glyph.id)
+        .collect::<Vec<_>>();
+
+    assert_ne!(glyph_ids.first(), isolated_beh.first(), "{glyph_ids:?}");
 }
 
 #[tokio::test]
@@ -1205,46 +662,6 @@ async fn unicode_general_categories_back_text_classification_helpers() {
     assert!(!character_is_default_ignorable_code_point('字'));
     assert!(character_preserves_word_boundary_context('’'));
     assert!(!character_preserves_word_boundary_context(' '));
-}
-
-#[tokio::test]
-async fn hanging_punctuation_fit_width_uses_css_text_end_policy() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.white_space = crate::css::WhiteSpace::Normal;
-
-    let raw_width = system.measure_line_text("Hello。", &style);
-    let stop_width = system.measure_text("。", &style);
-    assert!(stop_width > 0.0);
-
-    let none_width =
-        system.hanging_punctuation_fit_width("Hello。", 0.."Hello。".len(), &style, raw_width);
-    assert!((none_width - raw_width).abs() < 0.01);
-
-    style.hanging_punctuation.force_end = true;
-    let force_width =
-        system.hanging_punctuation_fit_width("Hello。", 0.."Hello。".len(), &style, raw_width);
-    assert!((force_width - (raw_width - stop_width)).abs() < 0.01);
-
-    style.hanging_punctuation.force_end = false;
-    style.hanging_punctuation.allow_end = true;
-    let allow_width =
-        system.hanging_punctuation_fit_width("Hello。", 0.."Hello。".len(), &style, raw_width);
-    assert!((allow_width - (raw_width - stop_width)).abs() < 0.01);
-
-    style.hanging_punctuation.allow_end = false;
-    style.hanging_punctuation.last = true;
-    let raw_close_width = system.measure_line_text("Hello」", &style);
-    let last_width = system.hanging_punctuation_fit_width(
-        "Hello」",
-        0.."Hello」".len(),
-        &style,
-        raw_close_width,
-    );
-    let close_width = system.measure_text("」", &style);
-    assert!((last_width - (raw_close_width - close_width)).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -1397,89 +814,6 @@ async fn measured_anywhere_breaks_do_not_split_grapheme_clusters() {
 }
 
 #[tokio::test]
-async fn break_spaces_break_all_wraps_before_overflowing_character() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.white_space = crate::css::WhiteSpace::BreakSpaces;
-    style.word_break = CssWordBreak::BreakAll;
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-
-    let available_width = system.measure_text("  A", &style) + 0.1;
-    let lines = system.break_text("  AB", &style, available_width);
-
-    assert_eq!(lines[0].text, "  A");
-    assert_eq!(lines[1].text, "B");
-}
-
-#[tokio::test]
-async fn break_spaces_break_all_prefers_non_space_run_break_before_preserved_space() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.white_space = crate::css::WhiteSpace::BreakSpaces;
-    style.word_break = CssWordBreak::BreakAll;
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-
-    let available_width = system.measure_text("X XX", &style) + 0.1;
-    let lines = system
-        .break_text("X XX X", &style, available_width)
-        .into_iter()
-        .map(|line| line.text)
-        .collect::<Vec<_>>();
-
-    assert_eq!(lines, vec!["X X", "X X"]);
-}
-
-#[tokio::test]
-async fn break_spaces_line_break_anywhere_can_break_before_preserved_space() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.white_space = crate::css::WhiteSpace::BreakSpaces;
-    style.word_break = CssWordBreak::BreakAll;
-    style.line_break = CssLineBreak::Anywhere;
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-
-    let available_width = system.measure_text("X XX", &style) + 0.1;
-    let lines = system
-        .break_text("X XX X", &style, available_width)
-        .into_iter()
-        .map(|line| line.text)
-        .collect::<Vec<_>>();
-
-    assert_eq!(lines, vec!["X XX", " X"]);
-}
-
-#[tokio::test]
-async fn hyphens_auto_uses_dictionary_for_known_language() {
-    let mut system = FontSystem::new();
-    let mut manual = ComputedStyle::initial();
-    manual.font_family = FontFamily::SansSerif;
-    manual.font_size = 12.0;
-    manual.line_height = 14.4;
-
-    let mut auto = manual.clone();
-    auto.hyphens = Hyphens::Auto;
-    auto.language = Some("en".to_string());
-
-    let available_width = system.measure_text("ribo", &manual) + 0.1;
-    let manual_lines = system.break_text("ribonuclease", &manual, available_width);
-    let auto_lines = system.break_text("ribonuclease", &auto, available_width);
-
-    assert_eq!(manual_lines.len(), 1);
-    assert!(auto_lines.len() > 1);
-    assert!(auto_lines.iter().any(|line| line.text.ends_with('-')));
-    assert_eq!(
-        auto_lines
-            .iter()
-            .map(|line| line.text.replace('-', ""))
-            .collect::<String>(),
-        "ribonuclease"
-    );
-}
-
-#[tokio::test]
 async fn hyphenate_limit_chars_filters_automatic_hyphenation_breaks() {
     let hyphenator = hyphenator_for_language("en-us").expect("embedded en-us hyphenator");
 
@@ -1535,20 +869,4 @@ async fn hyphenate_limit_chars_filters_automatic_hyphenation_breaks() {
         ),
         "example"
     );
-}
-
-#[tokio::test]
-async fn hyphens_auto_requires_known_language() {
-    let mut system = FontSystem::new();
-    let mut style = ComputedStyle::initial();
-    style.font_family = FontFamily::SansSerif;
-    style.font_size = 12.0;
-    style.line_height = 14.4;
-    style.hyphens = Hyphens::Auto;
-
-    let available_width = system.measure_text("ribo", &style) + 0.1;
-    let lines = system.break_text("ribonuclease", &style, available_width);
-
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].text, "ribonuclease");
 }

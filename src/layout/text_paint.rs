@@ -1,6 +1,12 @@
 use super::*;
-use crate::css::{TextDecoration, TextDecorationSkipSelf, TextEmphasisSkip, TextEmphasisStyle};
-use crate::text::character_is_text_decoration_spacer;
+use crate::css::{
+    TextDecoration, TextDecorationSkipSelf, TextEmphasisSkip, TextEmphasisStyle, TextOrientation,
+};
+use crate::text::trim_start_css_collapsible_whitespace;
+use crate::text::{
+    character_is_text_decoration_spacer, typographic_unit_is_upright_in_mixed_orientation,
+    typographic_unit_ranges,
+};
 
 /// Used values for one CSS text-decoration stroke.
 ///
@@ -8,15 +14,39 @@ use crate::text::character_is_text_decoration_spacer;
 /// skip-ink before painting each decoration line:
 /// <https://www.w3.org/TR/css-text-decor-4/#painting>.
 #[derive(Debug, Clone, Copy)]
-struct TextDecorationStroke {
-    x: f32,
-    y: f32,
-    width: f32,
+struct PreparedTextDecorationStroke {
+    axis: TextDecorationStrokeAxis,
+    line_x: f32,
+    line_y: f32,
+    inline_start: f32,
+    inline_length: f32,
+    block_position: f32,
     thickness: f32,
     color: Color,
     style: TextDecorationStyle,
     skip_ink: TextDecorationSkipInk,
     skip_spaces: TextDecorationSkipSpaces,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDecorationStrokeAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDecorationSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedTextEmphasisMark {
+    mark: String,
+    #[allow(dead_code)]
+    source_text: String,
+    x: f32,
+    y: f32,
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -36,14 +66,14 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let available_width =
             (self.content_right - self.content_left - padding_left - padding_right).max(1.0);
-        let plan = self.inline_fragmentation_plan_for_text(
+        let sequence = self.inline_line_sequence_for_text(
             text,
             style,
             available_width,
             padding_left,
             link_target,
         );
-        self.paint_inline_fragmentation_plan(&plan, style);
+        self.paint_inline_line_sequence(&sequence, style);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -60,20 +90,14 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let available_width =
             (self.content_right - self.content_left - padding_left - padding_right).max(1.0);
-        let plan = self.inline_fragmentation_plan_for_text(
+        let sequence = self.inline_line_sequence_for_text(
             text,
             style,
             available_width,
             padding_left,
             link_target,
         );
-        self.paint_inline_fragmentation_plan_slice(
-            &plan,
-            style,
-            block_top,
-            slice_top,
-            slice_bottom,
-        );
+        self.paint_inline_line_sequence_slice(&sequence, style, block_top, slice_top, slice_bottom);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -117,32 +141,21 @@ impl<'a> LayoutBuilder<'a> {
             GeneratedPseudoCounterMode::Commit,
             &mut items,
         );
-        let plan = self.collect_inline_fragmentation_plan(
-            items,
-            style,
-            available_width,
-            padding_left,
-            0.0,
-        );
-        self.paint_inline_fragmentation_plan_slice(
-            &plan,
-            style,
-            block_top,
-            slice_top,
-            slice_bottom,
-        );
+        let sequence =
+            self.collect_inline_line_sequence(items, style, available_width, padding_left, 0.0);
+        self.paint_inline_line_sequence_slice(&sequence, style, block_top, slice_top, slice_bottom);
     }
 
-    pub(in crate::layout) fn inline_fragmentation_plan_for_text(
+    pub(in crate::layout) fn inline_line_sequence_for_text(
         &mut self,
         text: &str,
         style: &ComputedStyle,
         available_width: f32,
         padding_left: f32,
         link_target: Option<&str>,
-    ) -> inline_layout::InlineFragmentationPlan {
+    ) -> inline_layout::InlineLineSequence {
         let text = transform_text(text, style);
-        self.inline_fragmentation_plan_for_prepared_text(
+        self.inline_line_sequence_for_prepared_text(
             &text,
             style,
             available_width,
@@ -151,14 +164,15 @@ impl<'a> LayoutBuilder<'a> {
         )
     }
 
-    pub(in crate::layout) fn inline_fragmentation_plan_for_prepared_text(
+    #[allow(dead_code)]
+    pub(in crate::layout) fn inline_line_sequence_for_raw_inline_text(
         &mut self,
         text: &str,
         style: &ComputedStyle,
         available_width: f32,
         padding_left: f32,
         link_target: Option<&str>,
-    ) -> inline_layout::InlineFragmentationPlan {
+    ) -> inline_layout::InlineLineSequence {
         let mut items = Vec::new();
         self.push_inline_words(
             text,
@@ -167,7 +181,26 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             &mut items,
         );
-        self.collect_inline_fragmentation_plan(items, style, available_width, padding_left, 0.0)
+        self.collect_inline_line_sequence(items, style, available_width, padding_left, 0.0)
+    }
+
+    pub(in crate::layout) fn inline_line_sequence_for_prepared_text(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        available_width: f32,
+        padding_left: f32,
+        link_target: Option<&str>,
+    ) -> inline_layout::InlineLineSequence {
+        let mut items = Vec::new();
+        self.push_inline_words(
+            text,
+            style,
+            link_target.map(str::to_string),
+            0.0,
+            &mut items,
+        );
+        self.collect_inline_line_sequence(items, style, available_width, padding_left, 0.0)
     }
 
     pub(super) fn layout_list_text_block(
@@ -198,82 +231,26 @@ impl<'a> LayoutBuilder<'a> {
             if block_bidi_scope_needs_inline_controls(style) {
                 self.push_bidi_scope_end(style, None, 0.0, &mut items);
             }
-            let plan = self.collect_inline_fragmentation_plan(
-                items,
-                style,
-                available_width,
-                padding_left,
-                0.0,
-            );
-            self.paint_inline_fragmentation_plan(&plan, style);
+            let sequence =
+                self.collect_inline_line_sequence(items, style, available_width, padding_left, 0.0);
+            self.paint_inline_line_sequence(&sequence, style);
             return;
         }
 
-        let plan = self.inline_fragmentation_plan_for_prepared_text(
+        let sequence = self.inline_line_sequence_for_prepared_text(
             &text,
             style,
             available_width,
             padding_left,
             link_target,
         );
-        self.paint_inline_fragmentation_plan_with_outside_marker(
-            &plan,
+        self.paint_inline_line_sequence_with_outside_marker(
+            &sequence,
             style,
             marker,
             self.content_left + padding_left,
             self.content_right - padding_right,
         );
-    }
-
-    pub(in crate::layout) fn fragment_line_count<F>(
-        &self,
-        total_lines: usize,
-        start_index: usize,
-        style: &ComputedStyle,
-        mut line_height: F,
-    ) -> usize
-    where
-        F: FnMut(usize) -> f32,
-    {
-        let remaining_total = total_lines.saturating_sub(start_index);
-        if remaining_total == 0 {
-            return 0;
-        }
-
-        let available_height = self.cursor_y - self.page_bottom();
-        let mut used_height = 0.0;
-        let mut fitting = 0;
-        for index in start_index..total_lines {
-            let height = line_height(index);
-            if used_height + height > available_height + 0.01 {
-                break;
-            }
-            used_height += height;
-            fitting += 1;
-        }
-
-        if fitting == 0 {
-            return usize::from(self.cursor_is_at_page_top());
-        }
-        if fitting >= remaining_total {
-            return remaining_total;
-        }
-
-        // CSS Fragmentation 3 defines `orphans` and `widows` as constraints on
-        // unforced line breaks inside a block container.
-        // https://www.w3.org/TR/css-break-3/#widows-orphans
-        let orphans = style.orphans.min(remaining_total).max(1);
-        let widows = style.widows.min(remaining_total).max(1);
-        if fitting < orphans && !self.cursor_is_at_page_top() {
-            return 0;
-        }
-
-        let remaining_after_break = remaining_total - fitting;
-        if remaining_after_break < widows && fitting > orphans {
-            return (remaining_total - widows).max(orphans);
-        }
-
-        fitting
     }
 
     pub(super) fn paint_text_runs(
@@ -305,36 +282,35 @@ impl<'a> LayoutBuilder<'a> {
         y: f32,
         style: &ComputedStyle,
     ) -> Option<RenderedLine> {
-        let rendered_runs = shaped.rendered_runs();
+        let rendered_runs = positioned_rendered_runs_for_writing_mode(shaped, style);
         if rendered_runs.is_empty() {
             return None;
         }
         debug_assert!(shaped.advance_width().is_finite());
         let first_font_id = shaped.first_font_id();
         let y = y + shaped.baseline_adjustment;
-        let rendered_line = RenderedLine {
-            text: shaped.text.clone(),
-            x,
-            y,
-            font_size: rendered_line_font_size(&rendered_runs, style.font_size),
-            font_id: first_font_id,
-            color: style.color,
-            runs: rendered_runs,
-        };
+        let rendered_line = RenderedLine::from_paint_origin(
+            shaped.text.clone(),
+            paint_space_point(x, y),
+            rendered_line_font_size(&rendered_runs, style.font_size),
+            first_font_id,
+            style.color,
+            rendered_runs,
+        );
         self.paint_text_shadows(&rendered_line, style);
         self.paint_text_decoration_lines_for_phase(
-            rendered_line.x,
-            rendered_line.y,
+            rendered_line.x(),
+            rendered_line.y(),
             shaped.advance_width(),
             style,
             &rendered_line.runs,
             TextDecorationPaintPhase::BeforeText,
         );
         self.push_line_in_band(PaintBand::Inline, rendered_line.clone());
-        self.paint_emphasis_marks_for_line(&rendered_line, style);
+        self.paint_prepared_text_emphasis_marks_for_line(&rendered_line, style);
         self.paint_text_decoration_lines_for_phase(
-            rendered_line.x,
-            rendered_line.y,
+            rendered_line.x(),
+            rendered_line.y(),
             shaped.advance_width(),
             style,
             &rendered_line.runs,
@@ -351,10 +327,20 @@ impl<'a> LayoutBuilder<'a> {
     /// stored shaped artifact:
     /// <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
     /// <https://www.w3.org/TR/css-inline-3/#line-box>.
+    #[cfg(test)]
     pub(super) fn prepare_inline_text_group(
         &mut self,
         fragments: &[InlineFragment],
         x: f32,
+    ) -> Option<PreparedInlineTextGroup> {
+        self.prepare_inline_text_group_with_summary_policy(fragments, x, false)
+    }
+
+    pub(in crate::layout) fn prepare_inline_text_group_with_summary_policy(
+        &mut self,
+        fragments: &[InlineFragment],
+        x: f32,
+        preserve_leading_summary_space: bool,
     ) -> Option<PreparedInlineTextGroup> {
         let visible_fragments = fragments.to_vec();
         let first = visible_fragments.first()?;
@@ -420,7 +406,8 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
 
-        let text_summary = inline_fragment_text_summary(&visible_fragments);
+        let text_summary =
+            inline_fragment_text_summary(&visible_fragments, preserve_leading_summary_space);
         if shaped_runs.is_empty() || text_summary.is_empty() {
             return None;
         }
@@ -445,27 +432,30 @@ impl<'a> LayoutBuilder<'a> {
             runs: shaped_runs,
         };
         Some(PreparedInlineTextGroup {
-            x,
-            y: y + baseline_adjustment,
-            width,
+            bounds: PhysicalInlineTextBounds::new(x, y + baseline_adjustment, width),
             style: first.style.clone(),
             link_target: first.link_target.clone(),
             shaped,
         })
     }
 
-    pub(super) fn prepare_justified_inline_text_group(
+    pub(in crate::layout) fn prepare_justified_inline_text_group_with_summary_policy(
         &mut self,
         fragments: &[InlineFragment],
         x: f32,
         extra_per_separator: f32,
+        preserve_leading_summary_space: bool,
     ) -> Option<PreparedInlineTextGroup> {
-        let mut group = self.prepare_inline_text_group(fragments, x)?;
+        let mut group = self.prepare_inline_text_group_with_summary_policy(
+            fragments,
+            x,
+            preserve_leading_summary_space,
+        )?;
         let separator_count = justifiable_fragment_space_count(fragments);
         let added_width = group
             .shaped
             .apply_inter_word_justification(extra_per_separator, separator_count);
-        group.width += added_width;
+        group.set_width(group.width() + added_width);
         Some(group)
     }
 
@@ -476,49 +466,46 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm> and
     /// ISO 32000-2:2020, 9.4 "Text".
     pub(super) fn paint_prepared_inline_text_group(&mut self, group: &PreparedInlineTextGroup) {
-        let rendered_runs = group.shaped.rendered_runs();
+        let rendered_runs = positioned_rendered_runs_for_writing_mode(&group.shaped, &group.style);
         if rendered_runs.is_empty() {
             return;
         }
         let first_font_id = group.shaped.first_font_id();
-        let rendered_line = RenderedLine {
-            text: group.shaped.text.clone(),
-            x: group.x,
-            y: group.y,
-            font_size: rendered_line_font_size(&rendered_runs, group.style.font_size),
-            font_id: first_font_id,
-            color: group.style.color,
-            runs: rendered_runs,
-        };
+        let text_origin = group.bounds.text_origin();
+        let rendered_line = RenderedLine::from_paint_origin(
+            group.shaped.text.clone(),
+            text_origin,
+            rendered_line_font_size(&rendered_runs, group.style.font_size),
+            first_font_id,
+            group.style.color,
+            rendered_runs,
+        );
         let decoration_runs = rendered_line.runs.clone();
         self.paint_text_shadows(&rendered_line, &group.style);
         self.paint_text_decoration_lines_for_phase(
-            group.x,
-            group.y,
-            group.width,
+            group.x(),
+            group.y(),
+            group.width(),
             &group.style,
             &decoration_runs,
             TextDecorationPaintPhase::BeforeText,
         );
         self.push_line_in_band(PaintBand::Inline, rendered_line.clone());
-        self.paint_emphasis_marks_for_line(&rendered_line, &group.style);
+        self.paint_prepared_text_emphasis_marks_for_line(&rendered_line, &group.style);
         self.paint_text_decoration_lines_for_phase(
-            group.x,
-            group.y,
-            group.width,
+            group.x(),
+            group.y(),
+            group.width(),
             &group.style,
             &decoration_runs,
             TextDecorationPaintPhase::AfterText,
         );
 
         if let Some(target) = &group.link_target {
-            self.current_page.push_link(RenderedLink {
-                x: group.x,
-                y: group.y - 2.0,
-                width: group.width,
-                height: group.style.font_size + 4.0,
-                target: target.clone(),
-            });
+            self.current_page.push_link(RenderedLink::from_paint_rect(
+                group.link_paint_rect(),
+                target.clone(),
+            ));
         }
     }
 
@@ -540,6 +527,7 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         if fragment.style.visibility != Visibility::Visible
             || !fragment.style.display.is_inline_level()
+            || fragment.style.display.is_atomic_inline()
             || width <= 0.0
             || height <= 0.0
             || (fragment.style.background_color.is_none()
@@ -574,12 +562,14 @@ impl<'a> LayoutBuilder<'a> {
             }
             for pass in text_shadow_paint_passes(*shadow, color) {
                 let mut shadow_line = line.clone();
-                shadow_line.x += shadow.offset_x + pass.x_offset;
-                shadow_line.y -= shadow.offset_y + pass.y_offset;
+                shadow_line.translate_origin(PaintVector::new(
+                    shadow.offset_x + pass.x_offset,
+                    -shadow.offset_y - pass.y_offset,
+                ));
                 shadow_line.color = pass.color;
                 self.paint_text_decoration_lines_for_phase_with_color(
-                    shadow_line.x,
-                    shadow_line.y,
+                    shadow_line.x(),
+                    shadow_line.y(),
                     rendered_text_line_width(&shadow_line),
                     style,
                     &shadow_line.runs,
@@ -591,7 +581,11 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
-    fn paint_emphasis_marks_for_line(&mut self, line: &RenderedLine, style: &ComputedStyle) {
+    fn paint_prepared_text_emphasis_marks_for_line(
+        &mut self,
+        line: &RenderedLine,
+        style: &ComputedStyle,
+    ) {
         let Some(mark) = style
             .text_emphasis_style
             .mark_for_writing_mode(style.writing_mode)
@@ -608,67 +602,10 @@ impl<'a> LayoutBuilder<'a> {
         emphasis_style.text_emphasis_style = TextEmphasisStyle::None;
         emphasis_style.color = style.text_emphasis_color.unwrap_or(style.color);
         emphasis_style.font_size = (style.font_size * 0.5).max(1.0);
-        let vertical = style.writing_mode != WritingMode::HorizontalTb;
-        for run in &line.runs {
-            let Some(glyphs) = &run.glyphs else {
-                continue;
-            };
-            let mut pen_x = line.x + run.x_offset;
-            for glyph in glyphs {
-                let receives_mark = glyph.unicode.chars().any(|character| {
-                    character_receives_text_emphasis_mark_with_skip(
-                        character,
-                        style.text_emphasis_skip,
-                    )
-                });
-                if receives_mark {
-                    let mark_width = self.font_system.measure_text(mark, &emphasis_style);
-                    let mark_x = if vertical {
-                        let side_offset = if style.text_emphasis_position.right {
-                            style.font_size * 0.55
-                        } else {
-                            -style.font_size * 0.55 - mark_width
-                        };
-                        line.x + run.x_offset + glyph.x_offset + side_offset
-                    } else {
-                        pen_x + glyph.x_offset + (glyph.x_advance - mark_width) / 2.0
-                    };
-                    let mark_y = if vertical {
-                        line.y
-                    } else if style.text_emphasis_position.over {
-                        line.y + style.font_size * 0.55
-                    } else {
-                        line.y - style.font_size * 0.35
-                    };
-                    let _ = self.paint_text_runs(mark, mark_x, mark_y, &emphasis_style);
-                }
-                pen_x += glyph.x_advance;
-            }
+        let mark_width = self.font_system.measure_text(mark, &emphasis_style);
+        for mark in prepared_text_emphasis_marks_for_line(line, style, mark, mark_width) {
+            let _ = self.paint_text_runs(&mark.mark, mark.x, mark.y, &emphasis_style);
         }
-    }
-
-    /// Paint CSS text decoration lines for one rendered text line.
-    ///
-    /// CSS Text Decoration defines underline, overline, and line-through as
-    /// decoration lines painted with the element's `text-decoration-color`,
-    /// `text-decoration-style`, and `text-decoration-thickness`:
-    /// <https://www.w3.org/TR/css-text-decor-3/#line-decoration>.
-    pub(super) fn paint_text_decoration_lines(
-        &mut self,
-        x: f32,
-        baseline_y: f32,
-        width: f32,
-        style: &ComputedStyle,
-        runs: &[RenderedTextRun],
-    ) {
-        self.paint_text_decoration_lines_for_phase(
-            x,
-            baseline_y,
-            width,
-            style,
-            runs,
-            TextDecorationPaintPhase::All,
-        );
     }
 
     fn paint_text_decoration_lines_for_phase(
@@ -731,133 +668,23 @@ impl<'a> LayoutBuilder<'a> {
         }
         let color = color_override.or(decoration.color).unwrap_or(style.color);
         let (inset_start, inset_end) = decoration.inset.used(style.font_size);
-        let (x, width) = match style.direction {
-            Direction::Ltr => (x + inset_start, width - inset_start - inset_end),
-            Direction::Rtl => (x + inset_end, width - inset_start - inset_end),
-        };
-        let width = width.max(0.0);
-        if width <= 0.0 {
-            return;
-        }
         let font_id = self.font_system.resolve_style(style);
         let metrics = self.font_system.text_decoration_metrics(font_id, style);
         let ink_boxes = self.font_system.glyph_ink_boxes_for_runs(runs, baseline_y);
-        let underline_thickness =
-            used_text_decoration_thickness(decoration.thickness, style.font_size, &metrics, false);
-        let strikeout_thickness =
-            used_text_decoration_thickness(decoration.thickness, style.font_size, &metrics, true);
-        if phase.paints_before_text()
-            && decoration.underline
-            && !text_decoration_skip_self_suppresses(style, TextDecorationLineKind::Underline)
-        {
-            let y = used_underline_y(
-                baseline_y,
-                decoration.underline_position,
-                decoration.underline_offset,
-                style.font_size,
-                &metrics,
-                underline_thickness,
-            );
-            self.paint_text_decoration_stroke(
-                TextDecorationStroke {
-                    x,
-                    y,
-                    width,
-                    thickness: underline_thickness,
-                    color,
-                    style: decoration.style,
-                    skip_ink: decoration.skip_ink,
-                    skip_spaces: decoration.skip_spaces,
-                },
-                runs,
-                &ink_boxes,
-            );
-        }
-        if phase.paints_before_text()
-            && decoration.overline
-            && !text_decoration_skip_self_suppresses(style, TextDecorationLineKind::Overline)
-        {
-            self.paint_text_decoration_stroke(
-                TextDecorationStroke {
-                    x,
-                    y: baseline_y + style.font_size,
-                    width,
-                    thickness: underline_thickness,
-                    color,
-                    style: decoration.style,
-                    skip_ink: decoration.skip_ink,
-                    skip_spaces: decoration.skip_spaces,
-                },
-                runs,
-                &ink_boxes,
-            );
-        }
-        if phase.paints_after_text()
-            && decoration.line_through
-            && !text_decoration_skip_self_suppresses(style, TextDecorationLineKind::LineThrough)
-        {
-            self.paint_text_decoration_stroke(
-                TextDecorationStroke {
-                    x,
-                    y: baseline_y + metrics.strikeout_position,
-                    width,
-                    thickness: strikeout_thickness,
-                    color,
-                    style: decoration.style,
-                    skip_ink: decoration.skip_ink,
-                    skip_spaces: decoration.skip_spaces,
-                },
-                runs,
-                &ink_boxes,
-            );
-        }
-        if phase.paints_before_text() && decoration.spelling_error {
-            let y = used_underline_y(
-                baseline_y,
-                decoration.underline_position,
-                decoration.underline_offset,
-                style.font_size,
-                &metrics,
-                underline_thickness,
-            );
-            self.paint_text_decoration_stroke(
-                TextDecorationStroke {
-                    x,
-                    y,
-                    width,
-                    thickness: underline_thickness,
-                    color: color_override.unwrap_or(Color::new(255, 0, 0)),
-                    style: TextDecorationStyle::Wavy,
-                    skip_ink: TextDecorationSkipInk::None,
-                    skip_spaces: TextDecorationSkipSpaces::NONE,
-                },
-                runs,
-                &ink_boxes,
-            );
-        }
-        if phase.paints_before_text() && decoration.grammar_error {
-            let y = used_underline_y(
-                baseline_y,
-                decoration.underline_position,
-                decoration.underline_offset,
-                style.font_size,
-                &metrics,
-                underline_thickness,
-            );
-            self.paint_text_decoration_stroke(
-                TextDecorationStroke {
-                    x,
-                    y,
-                    width,
-                    thickness: underline_thickness,
-                    color: color_override.unwrap_or(Color::new(0, 128, 0)),
-                    style: TextDecorationStyle::Wavy,
-                    skip_ink: TextDecorationSkipInk::None,
-                    skip_spaces: TextDecorationSkipSpaces::NONE,
-                },
-                runs,
-                &ink_boxes,
-            );
+        for stroke in prepare_text_decoration_strokes(TextDecorationPreparationInput {
+            x,
+            baseline_y,
+            width,
+            inset_start,
+            inset_end,
+            style,
+            decoration,
+            phase,
+            color,
+            color_override,
+            metrics,
+        }) {
+            self.paint_text_decoration_stroke(stroke, runs, &ink_boxes);
         }
     }
 
@@ -869,14 +696,17 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://www.w3.org/TR/css-text-decor-3/#text-decoration-style-property>.
     fn paint_text_decoration_stroke(
         &mut self,
-        stroke: TextDecorationStroke,
+        stroke: PreparedTextDecorationStroke,
         runs: &[RenderedTextRun],
         ink_boxes: &[GlyphInkBox],
     ) {
-        let TextDecorationStroke {
-            x,
-            y,
-            width,
+        let PreparedTextDecorationStroke {
+            axis,
+            line_x,
+            line_y,
+            inline_start,
+            inline_length,
+            block_position,
             thickness,
             color,
             style,
@@ -885,9 +715,12 @@ impl<'a> LayoutBuilder<'a> {
         } = stroke;
         let segments = text_decoration_segments(
             TextDecorationSegmentInputs {
-                x,
-                width,
-                y,
+                axis,
+                line_x,
+                line_y,
+                inline_start,
+                inline_length,
+                block_position,
                 thickness,
                 skip_ink,
                 skip_spaces,
@@ -898,18 +731,20 @@ impl<'a> LayoutBuilder<'a> {
         match style {
             TextDecorationStyle::Double if thickness >= 1.5 => {
                 let stripe = (thickness / 3.0).max(0.5);
-                for (segment_x, segment_width) in segments {
-                    self.push_text_decoration_rect(
-                        segment_x,
-                        y + stripe,
-                        segment_width,
+                for segment in segments {
+                    self.push_text_decoration_rect_for_axis(
+                        axis,
+                        segment.start,
+                        block_position + stripe,
+                        segment.length,
                         stripe,
                         color,
                     );
-                    self.push_text_decoration_rect(
-                        segment_x,
-                        y - stripe,
-                        segment_width,
+                    self.push_text_decoration_rect_for_axis(
+                        axis,
+                        segment.start,
+                        block_position - stripe,
+                        segment.length,
                         stripe,
                         color,
                     );
@@ -918,13 +753,14 @@ impl<'a> LayoutBuilder<'a> {
             TextDecorationStyle::Dotted => {
                 let dot = thickness.max(1.0);
                 let step = dot * 2.0;
-                for (segment_x, segment_width) in segments {
-                    let mut cursor = segment_x;
-                    while cursor < segment_x + segment_width {
-                        self.push_text_decoration_rect(
+                for segment in segments {
+                    let mut cursor = segment.start;
+                    while cursor < segment.start + segment.length {
+                        self.push_text_decoration_rect_for_axis(
+                            axis,
                             cursor,
-                            y,
-                            dot.min(segment_x + segment_width - cursor),
+                            block_position,
+                            dot.min(segment.start + segment.length - cursor),
                             dot,
                             color,
                         );
@@ -935,13 +771,14 @@ impl<'a> LayoutBuilder<'a> {
             TextDecorationStyle::Dashed => {
                 let dash = (thickness * 3.0).max(3.0);
                 let gap = thickness.max(1.0);
-                for (segment_x, segment_width) in segments {
-                    let mut cursor = segment_x;
-                    while cursor < segment_x + segment_width {
-                        self.push_text_decoration_rect(
+                for segment in segments {
+                    let mut cursor = segment.start;
+                    while cursor < segment.start + segment.length {
+                        self.push_text_decoration_rect_for_axis(
+                            axis,
                             cursor,
-                            y,
-                            dash.min(segment_x + segment_width - cursor),
+                            block_position,
+                            dash.min(segment.start + segment.length - cursor),
                             thickness,
                             color,
                         );
@@ -950,20 +787,59 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
             TextDecorationStyle::Wavy => {
-                for (segment_x, segment_width) in segments {
+                for segment in segments {
                     self.push_text_decoration_wavy_path(
-                        segment_x,
-                        y,
-                        segment_width,
+                        axis,
+                        segment.start,
+                        block_position,
+                        segment.length,
                         thickness,
                         color,
                     );
                 }
             }
             TextDecorationStyle::Solid | TextDecorationStyle::Double => {
-                for (segment_x, segment_width) in segments {
-                    self.push_text_decoration_rect(segment_x, y, segment_width, thickness, color);
+                for segment in segments {
+                    self.push_text_decoration_rect_for_axis(
+                        axis,
+                        segment.start,
+                        block_position,
+                        segment.length,
+                        thickness,
+                        color,
+                    );
                 }
+            }
+        }
+    }
+
+    fn push_text_decoration_rect_for_axis(
+        &mut self,
+        axis: TextDecorationStrokeAxis,
+        inline_start: f32,
+        block_position: f32,
+        inline_length: f32,
+        thickness: f32,
+        color: Color,
+    ) {
+        match axis {
+            TextDecorationStrokeAxis::Horizontal => {
+                self.push_text_decoration_rect(
+                    inline_start,
+                    block_position,
+                    inline_length,
+                    thickness,
+                    color,
+                );
+            }
+            TextDecorationStrokeAxis::Vertical => {
+                self.push_text_decoration_rect(
+                    block_position,
+                    inline_start,
+                    thickness,
+                    inline_length,
+                    color,
+                );
             }
         }
     }
@@ -971,15 +847,7 @@ impl<'a> LayoutBuilder<'a> {
     fn push_text_decoration_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
         self.push_rect_in_band(
             PaintBand::Inline,
-            RenderedRect {
-                x,
-                y,
-                width,
-                height,
-                fill: Some(color),
-                stroke: None,
-                stroke_width: 0.0,
-            },
+            RenderedRect::from_paint_rect(paint_space_rect(x, y, width, height), Some(color)),
         );
     }
 
@@ -991,50 +859,68 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://www.w3.org/TR/css-text-decor-3/#text-decoration-style-property>.
     fn push_text_decoration_wavy_path(
         &mut self,
-        x: f32,
-        y: f32,
-        width: f32,
+        axis: TextDecorationStrokeAxis,
+        inline_start: f32,
+        block_position: f32,
+        inline_length: f32,
         thickness: f32,
         color: Color,
     ) {
-        if width <= 0.0 || thickness <= 0.0 {
+        if inline_length <= 0.0 || thickness <= 0.0 {
             return;
         }
         let amplitude = (thickness * 1.25).max(1.0);
         let half_wave = (amplitude * 2.0).max(2.0);
-        let center_y = y + thickness / 2.0;
-        let mut commands = vec![RenderedPathCommand::MoveTo(x, center_y)];
-        let mut cursor = x;
+        let center = block_position + thickness / 2.0;
+        let mut commands = match axis {
+            TextDecorationStrokeAxis::Horizontal => {
+                vec![RenderedPathCommand::move_to(paint_space_point(
+                    inline_start,
+                    center,
+                ))]
+            }
+            TextDecorationStrokeAxis::Vertical => {
+                vec![RenderedPathCommand::move_to(paint_space_point(
+                    center,
+                    inline_start,
+                ))]
+            }
+        };
+        let mut cursor = inline_start;
         let mut crest = true;
-        while cursor < x + width {
-            let next = (cursor + half_wave).min(x + width);
-            let control_x = (cursor + next) / 2.0;
-            let control_y = if crest {
-                center_y + amplitude
+        while cursor < inline_start + inline_length {
+            let next = (cursor + half_wave).min(inline_start + inline_length);
+            let control_inline = (cursor + next) / 2.0;
+            let control_block = if crest {
+                center + amplitude
             } else {
-                center_y - amplitude
+                center - amplitude
             };
-            commands.push(RenderedPathCommand::CurveTo {
-                x1: control_x,
-                y1: control_y,
-                x2: control_x,
-                y2: control_y,
-                x3: next,
-                y3: center_y,
+            commands.push(match axis {
+                TextDecorationStrokeAxis::Horizontal => RenderedPathCommand::curve_to(
+                    paint_space_point(control_inline, control_block),
+                    paint_space_point(control_inline, control_block),
+                    paint_space_point(next, center),
+                ),
+                TextDecorationStrokeAxis::Vertical => RenderedPathCommand::curve_to(
+                    paint_space_point(control_block, control_inline),
+                    paint_space_point(control_block, control_inline),
+                    paint_space_point(center, next),
+                ),
             });
             cursor = next;
             crest = !crest;
         }
         self.push_path_in_band(
             PaintBand::Inline,
-            RenderedPath {
+            RenderedPath::new(
                 commands,
-                fill: None,
-                stroke: Some(color),
-                stroke_width: thickness.max(0.5),
-                fill_rule: RenderedPathFillRule::NonZero,
-                clip: None,
-            },
+                None,
+                RenderedPathFillRule::NonZero,
+                Some(color),
+                thickness.max(0.5),
+                None,
+            ),
         );
     }
 }
@@ -1049,13 +935,200 @@ fn rendered_line_font_size(rendered_runs: &[RenderedTextRun], fallback: f32) -> 
 
 fn rendered_text_line_width(line: &RenderedLine) -> f32 {
     line.runs.iter().fold(0.0_f32, |width, run| {
-        let run_width = run
-            .glyphs
-            .as_ref()
-            .map(|glyphs| glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>())
-            .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.5);
+        let run_width = if run.text_matrix.is_identity() {
+            run.glyphs
+                .as_ref()
+                .map(|glyphs| glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>())
+                .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.5)
+        } else {
+            run.font_size
+        };
         width.max(run.x_offset + run_width)
     })
+}
+
+pub(in crate::layout) fn positioned_rendered_runs_for_writing_mode(
+    shaped: &ShapedInlineLine,
+    style: &ComputedStyle,
+) -> Vec<RenderedTextRun> {
+    position_rendered_runs_for_writing_mode(shaped.rendered_runs(), style)
+}
+
+pub(in crate::layout) fn position_rendered_runs_for_writing_mode(
+    runs: Vec<RenderedTextRun>,
+    style: &ComputedStyle,
+) -> Vec<RenderedTextRun> {
+    if style.writing_mode == WritingMode::HorizontalTb {
+        return runs;
+    }
+    let placement_direction = if matches!(style.text_orientation, TextOrientation::Upright) {
+        Direction::Ltr
+    } else {
+        style.direction
+    };
+    let advance_sign = match placement_direction {
+        Direction::Ltr => -1.0,
+        Direction::Rtl => 1.0,
+    };
+    let sideways_matrix = match placement_direction {
+        Direction::Ltr => RenderedTextMatrix::ROTATE_CW,
+        Direction::Rtl => RenderedTextMatrix::ROTATE_CCW,
+    };
+    runs.into_iter()
+        .flat_map(|run| {
+            vertical_positioned_text_runs(
+                run,
+                style.text_orientation,
+                advance_sign,
+                sideways_matrix,
+            )
+        })
+        .collect()
+}
+
+fn vertical_positioned_text_runs(
+    mut run: RenderedTextRun,
+    text_orientation: TextOrientation,
+    advance_sign: f32,
+    sideways_matrix: RenderedTextMatrix,
+) -> Vec<RenderedTextRun> {
+    let Some(glyphs) = run.glyphs.take() else {
+        let text_matrix = if matches!(text_orientation, TextOrientation::Upright) {
+            RenderedTextMatrix::IDENTITY
+        } else {
+            sideways_matrix
+        };
+        return vec![RenderedTextRun {
+            y_offset: advance_sign * run.x_offset,
+            text_matrix,
+            glyphs: None,
+            ..run
+        }];
+    };
+    if glyphs.is_empty() {
+        return Vec::new();
+    }
+    let mut output = Vec::new();
+    let mut pending_sideways: Option<RenderedTextRun> = None;
+    let mut cursor = run.x_offset;
+    let mut cluster_text = String::new();
+    let mut cluster_glyphs = Vec::new();
+    let mut consumed_text_bytes = 0usize;
+    let unit_ends = typographic_unit_ranges(&run.text)
+        .into_iter()
+        .map(|range| range.end)
+        .collect::<Vec<_>>();
+    let mut unit_index = 0usize;
+    let mut cluster_end = unit_ends.first().copied().unwrap_or(run.text.len());
+    for glyph in glyphs {
+        if !glyph.unicode.is_empty()
+            && !cluster_glyphs.is_empty()
+            && consumed_text_bytes >= cluster_end
+        {
+            flush_vertical_cluster(
+                &run,
+                &mut output,
+                &mut pending_sideways,
+                cursor,
+                text_orientation,
+                advance_sign,
+                sideways_matrix,
+                std::mem::take(&mut cluster_text),
+                std::mem::take(&mut cluster_glyphs),
+            );
+            while unit_index + 1 < unit_ends.len() && consumed_text_bytes >= cluster_end {
+                unit_index += 1;
+                cluster_end = unit_ends[unit_index];
+            }
+        }
+        if !glyph.unicode.is_empty() {
+            consumed_text_bytes += glyph.unicode.len();
+            cluster_text.push_str(&glyph.unicode);
+        }
+        cursor += glyph.x_advance;
+        cluster_glyphs.push(glyph);
+    }
+    if !cluster_glyphs.is_empty() {
+        flush_vertical_cluster(
+            &run,
+            &mut output,
+            &mut pending_sideways,
+            cursor,
+            text_orientation,
+            advance_sign,
+            sideways_matrix,
+            cluster_text,
+            cluster_glyphs,
+        );
+    }
+    if let Some(run) = pending_sideways {
+        output.push(run);
+    }
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_vertical_cluster(
+    source: &RenderedTextRun,
+    output: &mut Vec<RenderedTextRun>,
+    pending_sideways: &mut Option<RenderedTextRun>,
+    cursor_after_cluster: f32,
+    text_orientation: TextOrientation,
+    advance_sign: f32,
+    sideways_matrix: RenderedTextMatrix,
+    text: String,
+    glyphs: Vec<RenderedGlyph>,
+) {
+    let advance = glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>();
+    let cluster_start = cursor_after_cluster - advance;
+    if vertical_text_cluster_is_upright(text_orientation, &text) {
+        if let Some(run) = pending_sideways.take() {
+            output.push(run);
+        }
+        output.push(RenderedTextRun {
+            text,
+            x_offset: 0.0,
+            y_offset: advance_sign * cluster_start,
+            text_matrix: RenderedTextMatrix::IDENTITY,
+            font_size: source.font_size,
+            font_id: source.font_id,
+            glyphs: Some(glyphs),
+        });
+        return;
+    }
+    match pending_sideways {
+        Some(run) => {
+            run.text.push_str(&text);
+            if let Some(existing_glyphs) = &mut run.glyphs {
+                existing_glyphs.extend(glyphs);
+            }
+        }
+        None => {
+            *pending_sideways = Some(RenderedTextRun {
+                text,
+                x_offset: 0.0,
+                y_offset: advance_sign * cluster_start,
+                text_matrix: sideways_matrix,
+                font_size: source.font_size,
+                font_id: source.font_id,
+                glyphs: Some(glyphs),
+            });
+        }
+    }
+}
+
+/// Return whether a shaped text cluster is painted upright in vertical writing.
+///
+/// CSS Writing Modes defines `text-orientation` as the policy for orienting
+/// typographic character units in vertical lines. `mixed` uses Unicode
+/// Vertical_Orientation through the shared text property policy:
+/// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>.
+fn vertical_text_cluster_is_upright(text_orientation: TextOrientation, text: &str) -> bool {
+    match text_orientation {
+        TextOrientation::Sideways => false,
+        TextOrientation::Upright => !text.is_empty(),
+        TextOrientation::Mixed => typographic_unit_is_upright_in_mixed_orientation(text),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1117,6 +1190,173 @@ fn color_with_alpha_factor(color: Color, factor: f32) -> Color {
     }
 }
 
+/// Build prepared CSS text-emphasis annotations for one rendered line.
+///
+/// CSS Text Decoration attaches one emphasis mark to each eligible
+/// typographic character unit. Building annotation records before paint keeps
+/// mark selection aligned with CSS Text unit policy and lets writing-mode
+/// placement use the same positioned rendered runs as normal text:
+/// <https://www.w3.org/TR/css-text-decor-3/#text-emphasis-style-property> and
+/// <https://www.w3.org/TR/css-text-3/#typographic-character-unit>.
+fn prepared_text_emphasis_marks_for_line(
+    line: &RenderedLine,
+    style: &ComputedStyle,
+    mark: &str,
+    mark_width: f32,
+) -> Vec<PreparedTextEmphasisMark> {
+    if mark.is_empty() {
+        return Vec::new();
+    }
+    let mut marks = Vec::new();
+    for run in &line.runs {
+        let Some(glyphs) = &run.glyphs else {
+            continue;
+        };
+        for unit in rendered_text_run_typographic_units(&run.text, glyphs) {
+            if !text_emphasis_unit_receives_mark(&unit.text, style.text_emphasis_skip) {
+                continue;
+            }
+            let (x, y) = text_emphasis_mark_position(line, run, &unit, style, mark_width);
+            marks.push(PreparedTextEmphasisMark {
+                mark: mark.to_string(),
+                source_text: unit.text,
+                x,
+                y,
+            });
+        }
+    }
+    marks
+}
+
+#[derive(Debug, Clone)]
+struct RenderedTextUnit {
+    text: String,
+    start: f32,
+    end: f32,
+}
+
+fn rendered_text_run_typographic_units(
+    text: &str,
+    glyphs: &[RenderedGlyph],
+) -> Vec<RenderedTextUnit> {
+    let unit_ranges = typographic_unit_ranges(text);
+    let Some(first_range) = unit_ranges.first() else {
+        return Vec::new();
+    };
+    let mut units = Vec::new();
+    let mut unit_index = 0usize;
+    let mut unit_end = first_range.end;
+    let mut consumed_text_bytes = 0usize;
+    let mut pending_text = String::new();
+    let mut pending_start: Option<f32> = None;
+    let mut pending_end = 0.0;
+    let mut cursor = 0.0;
+
+    for glyph in glyphs {
+        if !glyph.unicode.is_empty() && pending_start.is_some() && consumed_text_bytes >= unit_end {
+            push_rendered_text_unit(
+                &mut units,
+                &mut pending_text,
+                &mut pending_start,
+                &mut pending_end,
+            );
+            while unit_index + 1 < unit_ranges.len() && consumed_text_bytes >= unit_end {
+                unit_index += 1;
+                unit_end = unit_ranges[unit_index].end;
+            }
+        }
+
+        let glyph_start = cursor + glyph.x_offset;
+        let glyph_end = glyph_start + glyph.x_advance;
+        pending_start = Some(pending_start.map_or(glyph_start, |start| start.min(glyph_start)));
+        pending_end = pending_end.max(glyph_end);
+        if !glyph.unicode.is_empty() {
+            consumed_text_bytes += glyph.unicode.len();
+            pending_text.push_str(&glyph.unicode);
+        }
+        cursor += glyph.x_advance;
+    }
+
+    push_rendered_text_unit(
+        &mut units,
+        &mut pending_text,
+        &mut pending_start,
+        &mut pending_end,
+    );
+    units
+}
+
+fn push_rendered_text_unit(
+    units: &mut Vec<RenderedTextUnit>,
+    text: &mut String,
+    start: &mut Option<f32>,
+    end: &mut f32,
+) {
+    let Some(start_value) = start.take() else {
+        return;
+    };
+    units.push(RenderedTextUnit {
+        text: std::mem::take(text),
+        start: start_value,
+        end: *end,
+    });
+    *end = 0.0;
+}
+
+fn text_emphasis_unit_receives_mark(text: &str, skip: TextEmphasisSkip) -> bool {
+    text.chars()
+        .find(|character| {
+            !character_is_unicode_mark(*character)
+                && !character_is_default_ignorable_code_point(*character)
+        })
+        .is_some_and(|character| character_receives_text_emphasis_mark_with_skip(character, skip))
+}
+
+fn text_emphasis_mark_position(
+    line: &RenderedLine,
+    run: &RenderedTextRun,
+    unit: &RenderedTextUnit,
+    style: &ComputedStyle,
+    mark_width: f32,
+) -> (f32, f32) {
+    let vertical = style.writing_mode != WritingMode::HorizontalTb;
+    if !vertical {
+        let center = (unit.start + unit.end) / 2.0;
+        let x = line.x() + run.x_offset + center - mark_width / 2.0;
+        let y = if style.text_emphasis_position.over {
+            line.y() + style.font_size * 0.55
+        } else {
+            line.y() - style.font_size * 0.35
+        };
+        return (x, y);
+    }
+
+    let side_offset = if style.text_emphasis_position.right {
+        style.font_size * 0.55
+    } else {
+        -style.font_size * 0.55 - mark_width
+    };
+    let inline_anchor = if run.text_matrix.is_identity() {
+        unit.start
+    } else {
+        (unit.start + unit.end) / 2.0
+    };
+    let (x, y) = transformed_text_run_point(line, run, inline_anchor, 0.0);
+    (x + side_offset, y)
+}
+
+fn transformed_text_run_point(
+    line: &RenderedLine,
+    run: &RenderedTextRun,
+    x: f32,
+    y: f32,
+) -> (f32, f32) {
+    (
+        line.x() + run.x_offset + run.text_matrix.a * x + run.text_matrix.c * y,
+        line.y() + run.y_offset + run.text_matrix.b * x + run.text_matrix.d * y,
+    )
+}
+
 fn character_receives_text_emphasis_mark_with_skip(
     character: char,
     skip: TextEmphasisSkip,
@@ -1127,16 +1367,326 @@ fn character_receives_text_emphasis_mark_with_skip(
     if skip.spaces && character_is_text_decoration_spacer(character) {
         return false;
     }
-    if skip.punctuation && character.is_ascii_punctuation() {
+    if skip.punctuation && character_is_unicode_punctuation(character) {
         return false;
     }
-    if skip.symbols && character.is_ascii() && !character.is_ascii_alphanumeric() {
+    if skip.symbols && character_is_unicode_symbol(character) {
         return false;
     }
     if skip.narrow && character.is_ascii() {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::css::ComputedLengthPercentage;
+
+    fn glyph(unicode: &str, advance: f32) -> RenderedGlyph {
+        RenderedGlyph {
+            id: 1,
+            x_advance: advance,
+            nominal_x_advance: advance,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            unicode: unicode.to_string(),
+        }
+    }
+
+    fn rendered_line_with_run(
+        text: &str,
+        glyphs: Vec<RenderedGlyph>,
+        run_y_offset: f32,
+        matrix: RenderedTextMatrix,
+    ) -> RenderedLine {
+        RenderedLine::from_paint_origin(
+            text.to_string(),
+            paint_space_point(10.0, 20.0),
+            10.0,
+            None,
+            Color::BLACK,
+            vec![RenderedTextRun {
+                text: text.to_string(),
+                x_offset: 0.0,
+                y_offset: run_y_offset,
+                text_matrix: matrix,
+                font_size: 10.0,
+                font_id: None,
+                glyphs: Some(glyphs),
+            }],
+        )
+    }
+
+    fn decoration_metrics() -> TextDecorationFontMetrics {
+        TextDecorationFontMetrics {
+            underline_position: -1.0,
+            underline_thickness: 2.0,
+            strikeout_position: 3.0,
+            strikeout_thickness: 1.5,
+            descender_depth: 2.0,
+        }
+    }
+
+    fn prepared_decoration_strokes_for_style(
+        style: &ComputedStyle,
+        decoration: TextDecoration,
+        phase: TextDecorationPaintPhase,
+    ) -> Vec<PreparedTextDecorationStroke> {
+        prepare_text_decoration_strokes(TextDecorationPreparationInput {
+            x: 10.0,
+            baseline_y: 20.0,
+            width: 40.0,
+            inset_start: 0.0,
+            inset_end: 0.0,
+            style,
+            decoration,
+            phase,
+            color: Color::BLACK,
+            color_override: None,
+            metrics: decoration_metrics(),
+        })
+    }
+
+    #[test]
+    fn prepared_decoration_horizontal_positions_match_legacy_offsets() {
+        let mut style = ComputedStyle::initial();
+        style.font_size = 10.0;
+        let mut decoration = style.text_decoration;
+        decoration.underline = true;
+        decoration.overline = true;
+        decoration.line_through = true;
+
+        let before = prepared_decoration_strokes_for_style(
+            &style,
+            decoration,
+            TextDecorationPaintPhase::BeforeText,
+        );
+        let after = prepared_decoration_strokes_for_style(
+            &style,
+            decoration,
+            TextDecorationPaintPhase::AfterText,
+        );
+
+        assert_eq!(before.len(), 2);
+        assert_eq!(after.len(), 1);
+        assert_eq!(before[0].axis, TextDecorationStrokeAxis::Horizontal);
+        assert!((before[0].inline_start - 10.0).abs() < 0.01);
+        assert!((before[0].inline_length - 40.0).abs() < 0.01);
+        assert!((before[0].block_position - 19.0).abs() < 0.01);
+        assert!((before[1].block_position - 30.0).abs() < 0.01);
+        assert!((after[0].block_position - 23.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn prepared_decoration_vertical_underline_resolves_to_logical_side() {
+        let mut style = ComputedStyle::initial();
+        style.font_size = 10.0;
+        style.writing_mode = WritingMode::VerticalRl;
+        let mut decoration = style.text_decoration;
+        decoration.underline = true;
+        decoration.underline_position.left = true;
+        decoration.underline_position.auto = false;
+
+        let left = prepared_decoration_strokes_for_style(
+            &style,
+            decoration,
+            TextDecorationPaintPhase::BeforeText,
+        );
+        decoration.underline_position.left = false;
+        decoration.underline_position.right = true;
+        let right = prepared_decoration_strokes_for_style(
+            &style,
+            decoration,
+            TextDecorationPaintPhase::BeforeText,
+        );
+
+        assert_eq!(left.len(), 1);
+        assert_eq!(right.len(), 1);
+        assert_eq!(left[0].axis, TextDecorationStrokeAxis::Vertical);
+        assert!((left[0].inline_start + 20.0).abs() < 0.01, "{left:?}");
+        assert!(left[0].block_position < 10.0, "{left:?}");
+        assert!(right[0].block_position > 10.0, "{right:?}");
+    }
+
+    #[test]
+    fn prepared_decoration_vertical_offset_moves_away_from_text() {
+        let mut style = ComputedStyle::initial();
+        style.font_size = 10.0;
+        style.writing_mode = WritingMode::VerticalRl;
+        let mut decoration = style.text_decoration;
+        decoration.underline = true;
+        decoration.underline_position.left = true;
+        decoration.underline_position.auto = false;
+
+        let without_offset = prepared_decoration_strokes_for_style(
+            &style,
+            decoration,
+            TextDecorationPaintPhase::BeforeText,
+        );
+        decoration.underline_offset =
+            TextUnderlineOffset::LengthPercentage(ComputedLengthPercentage::from_length(4.0));
+        let with_offset = prepared_decoration_strokes_for_style(
+            &style,
+            decoration,
+            TextDecorationPaintPhase::BeforeText,
+        );
+
+        assert!(with_offset[0].block_position < without_offset[0].block_position);
+    }
+
+    #[test]
+    fn prepared_decoration_skip_spaces_uses_rotated_run_offsets() {
+        let runs = vec![RenderedTextRun {
+            text: " A".to_string(),
+            x_offset: 0.0,
+            y_offset: 0.0,
+            text_matrix: RenderedTextMatrix::ROTATE_CW,
+            font_size: 10.0,
+            font_id: None,
+            glyphs: Some(vec![glyph(" ", 10.0), glyph("A", 10.0)]),
+        }];
+
+        let ranges = text_decoration_space_skip_ranges(
+            TextDecorationStrokeAxis::Vertical,
+            10.0,
+            100.0,
+            80.0,
+            30.0,
+            TextDecorationSkipSpaces::START_END,
+            &runs,
+        );
+
+        assert_eq!(ranges.len(), 1);
+        assert!((ranges[0].0 - 90.0).abs() < 0.01, "{ranges:?}");
+        assert!((ranges[0].1 - 100.0).abs() < 0.01, "{ranges:?}");
+    }
+
+    #[test]
+    fn prepared_decoration_errors_use_wavy_annotation_path() {
+        let mut style = ComputedStyle::initial();
+        style.font_size = 10.0;
+        let mut decoration = style.text_decoration;
+        decoration.spelling_error = true;
+        decoration.grammar_error = true;
+
+        let strokes = prepared_decoration_strokes_for_style(
+            &style,
+            decoration,
+            TextDecorationPaintPhase::BeforeText,
+        );
+
+        assert_eq!(strokes.len(), 2);
+        assert!(
+            strokes
+                .iter()
+                .all(|stroke| stroke.style == TextDecorationStyle::Wavy)
+        );
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == Color::new(255, 0, 0))
+        );
+        assert!(
+            strokes
+                .iter()
+                .any(|stroke| stroke.color == Color::new(0, 128, 0))
+        );
+    }
+
+    #[test]
+    fn prepared_emphasis_annotations_use_typographic_units() {
+        let text = "e\u{301}A";
+        let line = rendered_line_with_run(
+            text,
+            vec![glyph("e", 8.0), glyph("\u{301}", 0.0), glyph("A", 10.0)],
+            0.0,
+            RenderedTextMatrix::IDENTITY,
+        );
+        let mut style = ComputedStyle::initial();
+        style.font_size = 10.0;
+
+        let marks = prepared_text_emphasis_marks_for_line(&line, &style, "•", 2.0);
+
+        assert_eq!(
+            marks
+                .iter()
+                .map(|mark| mark.source_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e\u{301}", "A"]
+        );
+        assert_eq!(marks.len(), 2);
+        assert!((marks[0].x - 13.0).abs() < 0.01, "{marks:?}");
+        assert!((marks[1].x - 22.0).abs() < 0.01, "{marks:?}");
+    }
+
+    #[test]
+    fn prepared_emphasis_annotations_apply_unicode_skip_policy() {
+        let text = "A!★";
+        let line = rendered_line_with_run(
+            text,
+            vec![glyph("A", 10.0), glyph("!", 10.0), glyph("★", 10.0)],
+            0.0,
+            RenderedTextMatrix::IDENTITY,
+        );
+        let mut style = ComputedStyle::initial();
+        style.font_size = 10.0;
+
+        let default_marks = prepared_text_emphasis_marks_for_line(&line, &style, "•", 2.0);
+        assert_eq!(
+            default_marks
+                .iter()
+                .map(|mark| mark.source_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "★"]
+        );
+
+        style.text_emphasis_skip.symbols = true;
+        let symbol_skipping_marks = prepared_text_emphasis_marks_for_line(&line, &style, "•", 2.0);
+        assert_eq!(
+            symbol_skipping_marks
+                .iter()
+                .map(|mark| mark.source_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A"]
+        );
+
+        let punctuation_with_mark = rendered_line_with_run(
+            "!\u{301}",
+            vec![glyph("!", 10.0), glyph("\u{301}", 0.0)],
+            0.0,
+            RenderedTextMatrix::IDENTITY,
+        );
+        let marks = prepared_text_emphasis_marks_for_line(&punctuation_with_mark, &style, "•", 2.0);
+        assert!(marks.is_empty(), "{marks:?}");
+    }
+
+    #[test]
+    fn prepared_vertical_emphasis_uses_logical_side_and_run_offset() {
+        let line = rendered_line_with_run(
+            "中",
+            vec![glyph("中", 10.0)],
+            -12.0,
+            RenderedTextMatrix::IDENTITY,
+        );
+        let mut style = ComputedStyle::initial();
+        style.font_size = 10.0;
+        style.writing_mode = WritingMode::VerticalRl;
+
+        let right_marks = prepared_text_emphasis_marks_for_line(&line, &style, "﹅", 2.0);
+        style.text_emphasis_position.right = false;
+        let left_marks = prepared_text_emphasis_marks_for_line(&line, &style, "﹅", 2.0);
+
+        assert_eq!(right_marks.len(), 1);
+        assert_eq!(left_marks.len(), 1);
+        assert!(
+            right_marks[0].x > left_marks[0].x,
+            "{right_marks:?} {left_marks:?}"
+        );
+        assert!((right_marks[0].y - 8.0).abs() < 0.01, "{right_marks:?}");
+        assert!((left_marks[0].y - 8.0).abs() < 0.01, "{left_marks:?}");
+    }
 }
 
 fn active_text_decoration_layers(style: &ComputedStyle) -> Vec<TextDecoration> {
@@ -1189,6 +1739,347 @@ fn text_decoration_skip_self_suppresses(
             TextDecorationLineKind::Overline => overline,
             TextDecorationLineKind::LineThrough => line_through,
         },
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextDecorationPreparationInput<'a> {
+    x: f32,
+    baseline_y: f32,
+    width: f32,
+    inset_start: f32,
+    inset_end: f32,
+    style: &'a ComputedStyle,
+    decoration: TextDecoration,
+    phase: TextDecorationPaintPhase,
+    color: Color,
+    color_override: Option<Color>,
+    metrics: TextDecorationFontMetrics,
+}
+
+/// Prepare CSS text-decoration strokes for one rendered inline line.
+///
+/// CSS Text Decoration paints decoration lines relative to the decorated text's
+/// inline axis. Preparing strokes in an axis-aware form before emitting PDF
+/// primitives lets horizontal and vertical writing share the same skip and
+/// style pipeline:
+/// <https://www.w3.org/TR/css-text-decor-3/#line-decoration> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#line-directions>.
+fn prepare_text_decoration_strokes(
+    input: TextDecorationPreparationInput<'_>,
+) -> Vec<PreparedTextDecorationStroke> {
+    let TextDecorationPreparationInput {
+        x,
+        baseline_y,
+        width,
+        inset_start,
+        inset_end,
+        style,
+        decoration,
+        phase,
+        color,
+        color_override,
+        metrics,
+    } = input;
+    if width <= 0.0 {
+        return Vec::new();
+    }
+
+    let axis = if style.writing_mode == WritingMode::HorizontalTb {
+        TextDecorationStrokeAxis::Horizontal
+    } else {
+        TextDecorationStrokeAxis::Vertical
+    };
+    let Some((inline_start, inline_length)) =
+        text_decoration_inline_span(axis, x, baseline_y, width, inset_start, inset_end, style)
+    else {
+        return Vec::new();
+    };
+
+    let underline_thickness =
+        used_text_decoration_thickness(decoration.thickness, style.font_size, &metrics, false);
+    let strikeout_thickness =
+        used_text_decoration_thickness(decoration.thickness, style.font_size, &metrics, true);
+    let mut strokes = Vec::new();
+
+    if phase.paints_before_text()
+        && decoration.underline
+        && !text_decoration_skip_self_suppresses(style, TextDecorationLineKind::Underline)
+    {
+        strokes.push(PreparedTextDecorationStroke {
+            axis,
+            line_x: x,
+            line_y: baseline_y,
+            inline_start,
+            inline_length,
+            block_position: text_decoration_block_position(
+                axis,
+                x,
+                baseline_y,
+                style,
+                decoration.underline_position,
+                decoration.underline_offset,
+                &metrics,
+                underline_thickness,
+                TextDecorationPreparedLineKind::Underline,
+            ),
+            thickness: underline_thickness,
+            color,
+            style: decoration.style,
+            skip_ink: decoration.skip_ink,
+            skip_spaces: decoration.skip_spaces,
+        });
+    }
+
+    if phase.paints_before_text()
+        && decoration.overline
+        && !text_decoration_skip_self_suppresses(style, TextDecorationLineKind::Overline)
+    {
+        strokes.push(PreparedTextDecorationStroke {
+            axis,
+            line_x: x,
+            line_y: baseline_y,
+            inline_start,
+            inline_length,
+            block_position: text_decoration_block_position(
+                axis,
+                x,
+                baseline_y,
+                style,
+                decoration.underline_position,
+                decoration.underline_offset,
+                &metrics,
+                underline_thickness,
+                TextDecorationPreparedLineKind::Overline,
+            ),
+            thickness: underline_thickness,
+            color,
+            style: decoration.style,
+            skip_ink: decoration.skip_ink,
+            skip_spaces: decoration.skip_spaces,
+        });
+    }
+
+    if phase.paints_after_text()
+        && decoration.line_through
+        && !text_decoration_skip_self_suppresses(style, TextDecorationLineKind::LineThrough)
+    {
+        strokes.push(PreparedTextDecorationStroke {
+            axis,
+            line_x: x,
+            line_y: baseline_y,
+            inline_start,
+            inline_length,
+            block_position: text_decoration_block_position(
+                axis,
+                x,
+                baseline_y,
+                style,
+                decoration.underline_position,
+                decoration.underline_offset,
+                &metrics,
+                strikeout_thickness,
+                TextDecorationPreparedLineKind::LineThrough,
+            ),
+            thickness: strikeout_thickness,
+            color,
+            style: decoration.style,
+            skip_ink: decoration.skip_ink,
+            skip_spaces: decoration.skip_spaces,
+        });
+    }
+
+    if phase.paints_before_text() && decoration.spelling_error {
+        strokes.push(PreparedTextDecorationStroke {
+            axis,
+            line_x: x,
+            line_y: baseline_y,
+            inline_start,
+            inline_length,
+            block_position: text_decoration_block_position(
+                axis,
+                x,
+                baseline_y,
+                style,
+                decoration.underline_position,
+                decoration.underline_offset,
+                &metrics,
+                underline_thickness,
+                TextDecorationPreparedLineKind::Underline,
+            ),
+            thickness: underline_thickness,
+            color: color_override.unwrap_or(Color::new(255, 0, 0)),
+            style: TextDecorationStyle::Wavy,
+            skip_ink: TextDecorationSkipInk::None,
+            skip_spaces: TextDecorationSkipSpaces::NONE,
+        });
+    }
+
+    if phase.paints_before_text() && decoration.grammar_error {
+        strokes.push(PreparedTextDecorationStroke {
+            axis,
+            line_x: x,
+            line_y: baseline_y,
+            inline_start,
+            inline_length,
+            block_position: text_decoration_block_position(
+                axis,
+                x,
+                baseline_y,
+                style,
+                decoration.underline_position,
+                decoration.underline_offset,
+                &metrics,
+                underline_thickness,
+                TextDecorationPreparedLineKind::Underline,
+            ),
+            thickness: underline_thickness,
+            color: color_override.unwrap_or(Color::new(0, 128, 0)),
+            style: TextDecorationStyle::Wavy,
+            skip_ink: TextDecorationSkipInk::None,
+            skip_spaces: TextDecorationSkipSpaces::NONE,
+        });
+    }
+
+    strokes
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDecorationPreparedLineKind {
+    Underline,
+    Overline,
+    LineThrough,
+}
+
+fn text_decoration_inline_span(
+    axis: TextDecorationStrokeAxis,
+    x: f32,
+    baseline_y: f32,
+    width: f32,
+    inset_start: f32,
+    inset_end: f32,
+    style: &ComputedStyle,
+) -> Option<(f32, f32)> {
+    let length = (width - inset_start - inset_end).max(0.0);
+    if length <= 0.0 {
+        return None;
+    }
+    match axis {
+        TextDecorationStrokeAxis::Horizontal => {
+            let start = match style.direction {
+                Direction::Ltr => x + inset_start,
+                Direction::Rtl => x + inset_end,
+            };
+            Some((start, length))
+        }
+        TextDecorationStrokeAxis::Vertical => {
+            if vertical_text_advance_sign(style) < 0.0 {
+                Some((baseline_y - width + inset_end, length))
+            } else {
+                Some((baseline_y + inset_start, length))
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn text_decoration_block_position(
+    axis: TextDecorationStrokeAxis,
+    x: f32,
+    baseline_y: f32,
+    style: &ComputedStyle,
+    underline_position: TextUnderlinePosition,
+    underline_offset: TextUnderlineOffset,
+    metrics: &TextDecorationFontMetrics,
+    thickness: f32,
+    kind: TextDecorationPreparedLineKind,
+) -> f32 {
+    match axis {
+        TextDecorationStrokeAxis::Horizontal => match kind {
+            TextDecorationPreparedLineKind::Underline => used_underline_y(
+                baseline_y,
+                underline_position,
+                underline_offset,
+                style.font_size,
+                metrics,
+                thickness,
+            ),
+            TextDecorationPreparedLineKind::Overline => baseline_y + style.font_size,
+            TextDecorationPreparedLineKind::LineThrough => baseline_y + metrics.strikeout_position,
+        },
+        TextDecorationStrokeAxis::Vertical => {
+            let offset = used_text_underline_offset(underline_offset, style.font_size).max(0.0);
+            match kind {
+                TextDecorationPreparedLineKind::Underline => {
+                    vertical_text_decoration_side_position(
+                        x,
+                        style,
+                        resolve_vertical_underline_side(underline_position, style.writing_mode),
+                        thickness,
+                        offset,
+                    )
+                }
+                TextDecorationPreparedLineKind::Overline => vertical_text_decoration_side_position(
+                    x,
+                    style,
+                    opposite_text_decoration_side(resolve_vertical_underline_side(
+                        underline_position,
+                        style.writing_mode,
+                    )),
+                    thickness,
+                    offset,
+                ),
+                TextDecorationPreparedLineKind::LineThrough => x + style.font_size * 0.5,
+            }
+        }
+    }
+}
+
+fn vertical_text_advance_sign(style: &ComputedStyle) -> f32 {
+    let placement_direction = if matches!(style.text_orientation, TextOrientation::Upright) {
+        Direction::Ltr
+    } else {
+        style.direction
+    };
+    match placement_direction {
+        Direction::Ltr => -1.0,
+        Direction::Rtl => 1.0,
+    }
+}
+
+fn resolve_vertical_underline_side(
+    position: TextUnderlinePosition,
+    writing_mode: WritingMode,
+) -> TextDecorationSide {
+    if position.left {
+        return TextDecorationSide::Left;
+    }
+    if position.right {
+        return TextDecorationSide::Right;
+    }
+    match writing_mode {
+        WritingMode::HorizontalTb | WritingMode::VerticalRl => TextDecorationSide::Right,
+        WritingMode::VerticalLr => TextDecorationSide::Left,
+    }
+}
+
+fn opposite_text_decoration_side(side: TextDecorationSide) -> TextDecorationSide {
+    match side {
+        TextDecorationSide::Left => TextDecorationSide::Right,
+        TextDecorationSide::Right => TextDecorationSide::Left,
+    }
+}
+
+fn vertical_text_decoration_side_position(
+    x: f32,
+    style: &ComputedStyle,
+    side: TextDecorationSide,
+    thickness: f32,
+    offset: f32,
+) -> f32 {
+    match side {
+        TextDecorationSide::Left => x - thickness - offset,
+        TextDecorationSide::Right => x + style.font_size + offset,
     }
 }
 
@@ -1266,11 +2157,22 @@ fn apply_inline_fragment_edge_painting(
 /// several PDF text objects:
 /// <https://www.w3.org/TR/css-text-3/#white-space-processing> and
 /// <https://www.w3.org/TR/css-inline-3/#line-box>.
-fn inline_fragment_text_summary(fragments: &[InlineFragment]) -> String {
-    fragments
-        .iter()
-        .map(|fragment| fragment.text.as_str())
-        .collect()
+fn inline_fragment_text_summary(
+    fragments: &[InlineFragment],
+    preserve_leading_summary_space: bool,
+) -> String {
+    let mut summary = String::new();
+    for (index, fragment) in fragments.iter().enumerate() {
+        if index == 0
+            && !preserve_leading_summary_space
+            && fragment.style.white_space.collapses_spaces()
+        {
+            summary.push_str(trim_start_css_collapsible_whitespace(&fragment.text));
+        } else {
+            summary.push_str(&fragment.text);
+        }
+    }
+    summary
 }
 
 /// Resolve CSS `text-decoration-thickness` to a used line thickness.
@@ -1321,12 +2223,21 @@ fn used_underline_y(
 
 #[derive(Debug, Clone, Copy)]
 struct TextDecorationSegmentInputs {
-    x: f32,
-    width: f32,
-    y: f32,
+    axis: TextDecorationStrokeAxis,
+    line_x: f32,
+    line_y: f32,
+    inline_start: f32,
+    inline_length: f32,
+    block_position: f32,
     thickness: f32,
     skip_ink: TextDecorationSkipInk,
     skip_spaces: TextDecorationSkipSpaces,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextDecorationSegment {
+    start: f32,
+    length: f32,
 }
 
 /// Split a text-decoration stroke around skipped spaces and glyph ink.
@@ -1341,37 +2252,59 @@ fn text_decoration_segments(
     inputs: TextDecorationSegmentInputs,
     runs: &[RenderedTextRun],
     ink_boxes: &[GlyphInkBox],
-) -> Vec<(f32, f32)> {
+) -> Vec<TextDecorationSegment> {
     let TextDecorationSegmentInputs {
-        x,
-        width,
-        y,
+        axis,
+        line_x,
+        line_y,
+        inline_start,
+        inline_length,
+        block_position,
         thickness,
         skip_ink,
         skip_spaces,
     } = inputs;
-    if width <= 0.0 {
+    if inline_length <= 0.0 {
         return Vec::new();
     }
 
-    let stroke_min_y = y;
-    let stroke_max_y = y + thickness;
+    let inline_end = inline_start + inline_length;
     let padding = thickness.max(0.5);
-    let mut skips = text_decoration_space_skip_ranges(x, width, skip_spaces, runs);
+    let mut skips = text_decoration_space_skip_ranges(
+        axis,
+        line_x,
+        line_y,
+        inline_start,
+        inline_length,
+        skip_spaces,
+        runs,
+    );
     if skip_ink != TextDecorationSkipInk::None {
         skips.extend(
             ink_boxes
                 .iter()
-                .filter(|ink| ink.y_min <= stroke_max_y && ink.y_max >= stroke_min_y)
+                .filter(|ink| {
+                    text_decoration_ink_intersects_cross_axis(
+                        axis,
+                        line_x,
+                        block_position,
+                        thickness,
+                        ink,
+                    )
+                })
                 .filter_map(|ink| {
-                    let start = (x + ink.x_min - padding).max(x);
-                    let end = (x + ink.x_max + padding).min(x + width);
+                    let (ink_start, ink_end) = text_decoration_ink_inline_range(axis, line_x, ink);
+                    let start = (ink_start - padding).max(inline_start);
+                    let end = (ink_end + padding).min(inline_end);
                     (end > start).then_some((start, end))
                 }),
         );
     }
     if skips.is_empty() {
-        return vec![(x, width)];
+        return vec![TextDecorationSegment {
+            start: inline_start,
+            length: inline_length,
+        }];
     }
 
     skips.sort_by(|left, right| {
@@ -1391,17 +2324,51 @@ fn text_decoration_segments(
     }
 
     let mut segments = Vec::new();
-    let mut cursor = x;
+    let mut cursor = inline_start;
     for (start, end) in merged {
         if start > cursor {
-            segments.push((cursor, start - cursor));
+            segments.push(TextDecorationSegment {
+                start: cursor,
+                length: start - cursor,
+            });
         }
         cursor = cursor.max(end);
     }
-    if cursor < x + width {
-        segments.push((cursor, x + width - cursor));
+    if cursor < inline_end {
+        segments.push(TextDecorationSegment {
+            start: cursor,
+            length: inline_end - cursor,
+        });
     }
     segments
+}
+
+fn text_decoration_ink_intersects_cross_axis(
+    axis: TextDecorationStrokeAxis,
+    line_x: f32,
+    block_position: f32,
+    thickness: f32,
+    ink: &GlyphInkBox,
+) -> bool {
+    match axis {
+        TextDecorationStrokeAxis::Horizontal => {
+            ink.y_min <= block_position + thickness && ink.y_max >= block_position
+        }
+        TextDecorationStrokeAxis::Vertical => {
+            line_x + ink.x_min <= block_position + thickness && line_x + ink.x_max >= block_position
+        }
+    }
+}
+
+fn text_decoration_ink_inline_range(
+    axis: TextDecorationStrokeAxis,
+    line_x: f32,
+    ink: &GlyphInkBox,
+) -> (f32, f32) {
+    match axis {
+        TextDecorationStrokeAxis::Horizontal => (line_x + ink.x_min, line_x + ink.x_max),
+        TextDecorationStrokeAxis::Vertical => (ink.y_min, ink.y_max),
+    }
 }
 
 /// Return decoration clipping ranges for CSS `text-decoration-skip-spaces`.
@@ -1413,16 +2380,20 @@ fn text_decoration_segments(
 /// used-value positions:
 /// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-skip-spaces-property>.
 fn text_decoration_space_skip_ranges(
-    x: f32,
-    width: f32,
+    axis: TextDecorationStrokeAxis,
+    line_x: f32,
+    line_y: f32,
+    inline_start: f32,
+    inline_length: f32,
     skip_spaces: TextDecorationSkipSpaces,
     runs: &[RenderedTextRun],
 ) -> Vec<(f32, f32)> {
-    if width <= 0.0 || skip_spaces == TextDecorationSkipSpaces::NONE {
+    if inline_length <= 0.0 || skip_spaces == TextDecorationSkipSpaces::NONE {
         return Vec::new();
     }
 
-    let glyphs = text_decoration_positioned_glyphs(x, width, runs);
+    let glyphs =
+        text_decoration_positioned_glyphs(axis, line_x, line_y, inline_start, inline_length, runs);
     if glyphs.is_empty() {
         return Vec::new();
     }
@@ -1438,8 +2409,8 @@ fn text_decoration_space_skip_ranges(
             } else {
                 0.0
             };
-            let start = (glyph.x_start - previous_extra_spacing).max(x);
-            let end = glyph.x_end.min(x + width);
+            let start = (glyph.inline_start - previous_extra_spacing).max(inline_start);
+            let end = glyph.inline_end.min(inline_start + inline_length);
             if end > start {
                 ranges.push((start, end));
             }
@@ -1452,8 +2423,8 @@ fn text_decoration_space_skip_ranges(
             if !text_decoration_glyph_is_spacer(&glyph.unicode) {
                 break;
             }
-            let start = glyph.x_start.max(x);
-            let end = glyph.x_end.min(x + width);
+            let start = glyph.inline_start.max(inline_start);
+            let end = glyph.inline_end.min(inline_start + inline_length);
             if end > start {
                 ranges.push((start, end));
             }
@@ -1473,8 +2444,8 @@ fn text_decoration_space_skip_ranges(
                 0.0
             };
             trailing.push((
-                (glyph.x_start - previous_extra_spacing).max(x),
-                glyph.x_end.min(x + width),
+                (glyph.inline_start - previous_extra_spacing).max(inline_start),
+                glyph.inline_end.min(inline_start + inline_length),
             ));
         }
         for (start, end) in trailing.into_iter().rev() {
@@ -1490,8 +2461,8 @@ fn text_decoration_space_skip_ranges(
 #[derive(Debug, Clone)]
 struct TextDecorationPositionedGlyph {
     unicode: String,
-    x_start: f32,
-    x_end: f32,
+    inline_start: f32,
+    inline_end: f32,
     extra_spacing: f32,
 }
 
@@ -1502,25 +2473,36 @@ struct TextDecorationPositionedGlyph {
 /// instead of remeasuring flattened source text:
 /// <https://www.w3.org/TR/css-text-decor-4/#painting>.
 fn text_decoration_positioned_glyphs(
-    x: f32,
-    width: f32,
+    axis: TextDecorationStrokeAxis,
+    line_x: f32,
+    line_y: f32,
+    inline_start: f32,
+    inline_length: f32,
     runs: &[RenderedTextRun],
 ) -> Vec<TextDecorationPositionedGlyph> {
-    let line_end = x + width;
+    let inline_end = inline_start + inline_length;
     let mut positioned = Vec::new();
     for run in runs {
         let Some(glyphs) = &run.glyphs else {
             continue;
         };
-        let mut pen_x = x + run.x_offset;
+        let mut pen_x = 0.0;
         for glyph in glyphs {
-            let start = pen_x + glyph.x_offset;
-            let end = (pen_x + glyph.x_advance).max(start);
-            if end > x && start < line_end {
+            let local_start = pen_x + glyph.x_offset;
+            let local_end = (pen_x + glyph.x_advance).max(local_start);
+            let (start, end) = text_decoration_glyph_inline_range(
+                axis,
+                line_x,
+                line_y,
+                run,
+                local_start,
+                local_end,
+            );
+            if end > inline_start && start < inline_end {
                 positioned.push(TextDecorationPositionedGlyph {
                     unicode: glyph.unicode.clone(),
-                    x_start: start.max(x),
-                    x_end: end.min(line_end),
+                    inline_start: start.max(inline_start),
+                    inline_end: end.min(inline_end),
                     extra_spacing: (glyph.x_advance - glyph.nominal_x_advance).max(0.0),
                 });
             }
@@ -1528,6 +2510,38 @@ fn text_decoration_positioned_glyphs(
         }
     }
     positioned
+}
+
+fn text_decoration_glyph_inline_range(
+    axis: TextDecorationStrokeAxis,
+    line_x: f32,
+    line_y: f32,
+    run: &RenderedTextRun,
+    local_start: f32,
+    local_end: f32,
+) -> (f32, f32) {
+    let (start, end) = match axis {
+        TextDecorationStrokeAxis::Horizontal => (
+            line_x + run.x_offset + run.text_matrix.a * local_start,
+            line_x + run.x_offset + run.text_matrix.a * local_end,
+        ),
+        TextDecorationStrokeAxis::Vertical if run.text_matrix.is_identity() => {
+            let baseline = line_y + run.y_offset;
+            (
+                baseline - run.font_size * 0.5,
+                baseline + run.font_size * 0.5,
+            )
+        }
+        TextDecorationStrokeAxis::Vertical => (
+            line_y + run.y_offset + run.text_matrix.b * local_start,
+            line_y + run.y_offset + run.text_matrix.b * local_end,
+        ),
+    };
+    if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    }
 }
 
 fn text_decoration_glyph_is_spacer(unicode: &str) -> bool {

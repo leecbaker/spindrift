@@ -2,14 +2,17 @@ mod graph;
 mod items;
 mod mixed;
 mod paint_mixed;
-mod paint_text;
 mod paragraph;
 
 pub(in crate::layout) use graph::{
     InlineIntrinsicContribution, InlineIntrinsicMeasurement, InlineMeasuredParagraph,
-    InlineOpportunityGraph, build_inline_opportunity_graph,
+    build_inline_opportunity_graph, measured_inline_items,
 };
-pub(in crate::layout) use items::InlineFragmentationPlan;
+pub(in crate::layout) use items::{InlineLineRecord, InlineLineSequence};
 
 #[cfg(test)]
-pub(in crate::layout) use graph::{InlineBreakKind, InlineLineFragment, MeasuredInlineItem};
+pub(in crate::layout) use graph::MeasuredInlineItem;
+#[cfg(test)]
+pub(in crate::layout) use graph::{
+    InlineBreakKind, InlineGraphPosition, InlineGraphRange, InlineLineFragment,
+};

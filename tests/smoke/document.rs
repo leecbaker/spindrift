@@ -8,7 +8,7 @@ async fn renders_hello_world_pdf() {
         .unwrap();
 
     let rendered = String::from_utf8_lossy(&pdf);
-    assert!(rendered.starts_with("%PDF-1.4"));
+    assert!(rendered.starts_with("%PDF-1.7"));
     assert!(rendered.contains("/Subtype /Type0"));
     assert!(rendered.contains("/FontFile2"));
     assert!(rendered.contains("/ToUnicode"));
@@ -27,17 +27,386 @@ async fn exposes_document_pages() {
 }
 
 #[tokio::test]
+async fn block_align_content_center_aligns_contents_in_definite_height() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { width: 50pt; height: 80pt; align-content: center; background: red }\
+         .item { height: 20pt; background: green }</style>\
+         <div class=\"block\"><div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("block container background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("block child background should paint");
+
+    assert!(
+        (green.y() - red.y() - 30.0).abs() < 0.01,
+        "red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
+async fn block_align_content_center_aligns_contents_in_definite_min_height() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { width: 50pt; min-height: 80pt; align-content: center; background: red }\
+         .item { height: 20pt; background: green }</style>\
+         <div class=\"block\"><div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("block container background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("block child background should paint");
+
+    assert!(
+        (green.y() - red.y() - 30.0).abs() < 0.01,
+        "align-content:center should use the min-height-constrained block size: red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_lr_block_align_content_center_uses_horizontal_block_axis() {
+    let document = Html::from_string(
+        "<style>@page { size: 140pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { writing-mode: vertical-lr; width: 80pt; height: 50pt; align-content: center; background: red }\
+         .item { width: 20pt; height: 40pt; background: green }</style>\
+         <div class=\"block\"><div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("vertical block container background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("vertical block child background should paint");
+
+    assert!(
+        (green.x() - red.x() - 30.0).abs() < 0.01,
+        "vertical-lr align-content:center should center on the horizontal block axis: red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_rl_block_align_content_end_uses_right_to_left_block_axis() {
+    let document = Html::from_string(
+        "<style>@page { size: 140pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { writing-mode: vertical-rl; width: 80pt; height: 50pt; align-content: end; background: red }\
+         .item { width: 20pt; height: 40pt; background: green }</style>\
+         <div class=\"block\"><div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("vertical block container background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("vertical block child background should paint");
+
+    assert!(
+        (green.x() - red.x()).abs() < 0.01,
+        "vertical-rl align-content:end should pack content against physical left/block-end: red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
+async fn block_align_content_translates_descendant_bookmark_targets() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { width: 80pt; height: 80pt; align-content: center; background: red }\
+         h2 { margin: 0; font-size: 10pt; line-height: 10pt; bookmark-level: 2; background: green }</style>\
+         <div class=\"block\"><h2>Target</h2></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let bookmark = document
+        .bookmarks
+        .iter()
+        .find(|bookmark| bookmark.label == "Target")
+        .expect("heading bookmark should be exposed");
+    let heading_background = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("heading background should paint");
+
+    assert!(
+        (bookmark.y() - (heading_background.y() + heading_background.height())).abs() < 0.01,
+        "bookmark target should follow align-content translation: bookmark={bookmark:?}, heading={heading_background:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_block_align_content_translates_descendant_bookmark_targets() {
+    let document = Html::from_string(
+        "<style>@page { size: 140pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { writing-mode: vertical-lr; width: 80pt; height: 50pt; align-content: center; background: red }\
+         h2 { margin: 0; width: 20pt; height: 40pt; font-size: 10pt; line-height: 10pt; bookmark-level: 2; background: green }</style>\
+         <div class=\"block\"><h2>Target</h2></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let bookmark = document
+        .bookmarks
+        .iter()
+        .find(|bookmark| bookmark.label == "Target")
+        .expect("heading bookmark should be exposed");
+    let heading_background = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("heading background should paint");
+
+    assert!(
+        (bookmark.x() - heading_background.x()).abs() < 0.01,
+        "vertical bookmark target should follow align-content translation: bookmark={bookmark:?}, heading={heading_background:?}"
+    );
+}
+
+#[tokio::test]
+async fn block_align_content_translates_descendant_link_annotations() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { width: 80pt; height: 80pt; align-content: center; font-size: 10pt; line-height: 10pt; background: red }\
+         a { color: black; text-decoration: none }</style>\
+         <div class=\"block\"><a href=\"https://example.com\">Link</a></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "Link")
+        .expect("linked text should render");
+    let link = document.pages[0]
+        .links
+        .iter()
+        .find(|link| link.target == "https://example.com")
+        .expect("link annotation should be exposed");
+
+    assert!(
+        (link.y() - (line.y() - 2.0)).abs() < 0.01,
+        "link annotation should follow align-content translation: link={link:?}, line={line:?}"
+    );
+}
+
+#[tokio::test]
+async fn block_align_content_does_not_translate_absolute_descendants() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { position: relative; width: 80pt; height: 80pt; align-content: center; background: red }\
+         .flow { height: 20pt; background: green }\
+         .abs { position: absolute; left: 20pt; top: 0; width: 20pt; height: 10pt; background: blue }</style>\
+         <div class=\"block\"><div class=\"flow\"></div><div class=\"abs\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("block container background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("normal-flow child should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("absolute child should paint");
+
+    assert!(
+        (green.y() - red.y() - 30.0).abs() < 0.01,
+        "normal-flow child should be aligned: red={red:?}, green={green:?}"
+    );
+    assert!(
+        (blue.y() + blue.height() - (red.y() + red.height())).abs() < 0.01,
+        "absolute child should stay at its inset position: red={red:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn block_align_content_safe_center_overflow_falls_back_to_start() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { width: 50pt; height: 20pt; align-content: safe center; background: red }\
+         .item { height: 40pt; background: green }</style>\
+         <div class=\"block\"><div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("block container background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("block child background should paint");
+
+    assert!(
+        (green.y() + green.height() - red.y() - red.height()).abs() < 0.01,
+        "safe center overflow should keep the child against block-start: red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
+async fn block_align_content_center_overflow_defaults_to_safe_start() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { width: 50pt; height: 20pt; align-content: center; background: red }\
+         .item { height: 40pt; background: green }</style>\
+         <div class=\"block\"><div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("block container background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("block child background should paint");
+
+    assert!(
+        (green.y() + green.height() - red.y() - red.height()).abs() < 0.01,
+        "default center overflow should use safe block-start fallback: red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
+async fn block_align_content_scroll_container_overflow_defaults_to_unsafe() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { width: 50pt; height: 20pt; overflow-y: auto; align-content: center; background: red }\
+         .item { height: 40pt; background: green }</style>\
+         <div class=\"block\"><div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("block container background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("block child background should paint");
+
+    assert!(
+        (green.y() - (red.y() - 10.0)).abs() < 0.01
+            && (green.y() + green.height() - (red.y() + red.height() + 10.0)).abs() < 0.01,
+        "default center overflow in a scroll container should remain unsafe: red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
+async fn block_align_content_unsafe_center_allows_symmetric_overflow() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 }\
+         .block { width: 50pt; height: 20pt; align-content: unsafe center; background: red }\
+         .item { height: 40pt; background: green }</style>\
+         <div class=\"block\"><div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("block container background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("block child background should paint");
+
+    assert!(
+        (green.y() - (red.y() - 10.0)).abs() < 0.01
+            && (green.y() + green.height() - (red.y() + red.height() + 10.0)).abs() < 0.01,
+        "unsafe center should allow equal overflow on both block sides: red={red:?}, green={green:?}"
+    );
+}
+
+#[tokio::test]
 async fn legacy_pages_without_operations_synthesize_paint_order() {
     let mut page = quire::Page::new(100.0, 100.0);
-    page.rects = vec![quire::RenderedRect {
-        x: 0.0,
-        y: 0.0,
-        width: 10.0,
-        height: 10.0,
-        fill: Some(Color::BLACK),
-        stroke: None,
-        stroke_width: 0.0,
-    }];
+    page.rects = vec![quire::RenderedRect::new(
+        0.0,
+        0.0,
+        10.0,
+        10.0,
+        Some(Color::BLACK),
+        None,
+        0.0,
+    )];
     let document = quire::Document {
         pages: vec![page],
         metadata: quire::DocumentMetadata::default(),
@@ -56,21 +425,21 @@ async fn legacy_pages_without_operations_synthesize_paint_order() {
 async fn rounded_rects_participate_in_paint_order_and_pdf_serialization() {
     let mut page = quire::Page::new(100.0, 100.0);
     page.operations = vec![quire::PaintOperation::RoundedRect(0)];
-    page.rounded_rects = vec![quire::RenderedRoundedRect {
-        x: 10.0,
-        y: 10.0,
-        width: 30.0,
-        height: 20.0,
-        radii: quire::RenderedRoundedRectRadii {
-            top_left: quire::RenderedCornerRadius { x: 4.0, y: 4.0 },
-            top_right: quire::RenderedCornerRadius { x: 4.0, y: 4.0 },
-            bottom_right: quire::RenderedCornerRadius { x: 4.0, y: 4.0 },
-            bottom_left: quire::RenderedCornerRadius { x: 4.0, y: 4.0 },
+    page.rounded_rects = vec![quire::RenderedRoundedRect::new(
+        10.0,
+        10.0,
+        30.0,
+        20.0,
+        quire::RenderedRoundedRectRadii {
+            top_left: quire::RenderedCornerRadius::new(4.0, 4.0),
+            top_right: quire::RenderedCornerRadius::new(4.0, 4.0),
+            bottom_right: quire::RenderedCornerRadius::new(4.0, 4.0),
+            bottom_left: quire::RenderedCornerRadius::new(4.0, 4.0),
         },
-        fill: Some(Color::BLACK),
-        stroke: None,
-        stroke_width: 0.0,
-    }];
+        Some(Color::BLACK),
+        None,
+        0.0,
+    )];
     let document = quire::Document {
         pages: vec![page],
         metadata: quire::DocumentMetadata::default(),
@@ -89,15 +458,15 @@ async fn rounded_rects_participate_in_paint_order_and_pdf_serialization() {
 async fn invalid_paint_operation_indexes_fail_before_pdf_serialization() {
     let mut page = quire::Page::new(100.0, 100.0);
     page.operations = vec![quire::PaintOperation::Rect(1)];
-    page.rects = vec![quire::RenderedRect {
-        x: 0.0,
-        y: 0.0,
-        width: 10.0,
-        height: 10.0,
-        fill: Some(Color::BLACK),
-        stroke: None,
-        stroke_width: 0.0,
-    }];
+    page.rects = vec![quire::RenderedRect::new(
+        0.0,
+        0.0,
+        10.0,
+        10.0,
+        Some(Color::BLACK),
+        None,
+        0.0,
+    )];
     let document = quire::Document {
         pages: vec![page],
         metadata: quire::DocumentMetadata::default(),
@@ -114,24 +483,8 @@ async fn incomplete_paint_operation_streams_fail_before_pdf_serialization() {
     let mut page = quire::Page::new(100.0, 100.0);
     page.operations = vec![quire::PaintOperation::Rect(0)];
     page.rects = vec![
-        quire::RenderedRect {
-            x: 0.0,
-            y: 0.0,
-            width: 10.0,
-            height: 10.0,
-            fill: Some(Color::BLACK),
-            stroke: None,
-            stroke_width: 0.0,
-        },
-        quire::RenderedRect {
-            x: 10.0,
-            y: 10.0,
-            width: 10.0,
-            height: 10.0,
-            fill: Some(Color::WHITE),
-            stroke: None,
-            stroke_width: 0.0,
-        },
+        quire::RenderedRect::new(0.0, 0.0, 10.0, 10.0, Some(Color::BLACK), None, 0.0),
+        quire::RenderedRect::new(10.0, 10.0, 10.0, 10.0, Some(Color::WHITE), None, 0.0),
     ];
     let document = quire::Document {
         pages: vec![page],
@@ -209,9 +562,9 @@ async fn applies_minimal_page_css() {
         .await
         .unwrap();
 
-    assert_eq!(document.pages[0].width, 200.0);
-    assert_eq!(document.pages[0].height, 100.0);
-    assert_eq!(document.pages[0].lines[0].x, 10.0);
+    assert_eq!(document.pages[0].width(), 200.0);
+    assert_eq!(document.pages[0].height(), 100.0);
+    assert_eq!(document.pages[0].lines[0].x(), 10.0);
 }
 
 #[tokio::test]
@@ -234,8 +587,8 @@ async fn css_absolute_lengths_use_spec_ratios_in_layout() {
         .expect("black div background should be painted");
 
     // CSS Values and Units defines 1in = 96px = 72pt and 1cm = 1in / 2.54.
-    assert!((rect.width - (25.0 * 72.0 / 2.54)).abs() < 0.001);
-    assert!((rect.height - (8.0 * 72.0 / 2.54)).abs() < 0.001);
+    assert!((rect.width() - (25.0 * 72.0 / 2.54)).abs() < 0.001);
+    assert!((rect.height() - (8.0 * 72.0 / 2.54)).abs() < 0.001);
 }
 
 #[tokio::test]
@@ -249,7 +602,7 @@ async fn applies_asymmetric_page_margins_to_page_area() {
             .await
             .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].x, 10.0);
+    assert_eq!(document.pages[0].lines[0].x(), 10.0);
     assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 100.0);
 }
 
@@ -275,7 +628,7 @@ async fn viewport_units_resolve_to_paged_media_page_area() {
     ]) {
         assert_eq!(final_rect_fill_at(page, 35.0, 30.0), Some(color));
         assert_eq!(
-            final_rect_fill_at(page, page.width - 20.0, page.height - 10.0),
+            final_rect_fill_at(page, page.width() - 20.0, page.height() - 10.0),
             Some(color)
         );
         assert_ne!(final_rect_fill_at(page, 20.0, 30.0), Some(color));
@@ -306,12 +659,12 @@ async fn left_and_right_page_selectors_set_alternating_page_areas() {
                 Some(Color::new(255, 255, 0))
             );
             assert_ne!(
-                final_rect_fill_at(page, page.width - 10.0, page.height - 10.0),
+                final_rect_fill_at(page, page.width() - 10.0, page.height() - 10.0),
                 Some(Color::new(255, 255, 0))
             );
         } else {
             assert_eq!(
-                final_rect_fill_at(page, page.width - 10.0, page.height - 10.0),
+                final_rect_fill_at(page, page.width() - 10.0, page.height() - 10.0),
                 Some(Color::new(255, 255, 0))
             );
             assert_ne!(
@@ -344,7 +697,7 @@ async fn page_margin_box_default_alignment_matches_wpt() {
             page.lines
                 .iter()
                 .find(|line| line.text == text)
-                .map(|line| (letter, (line.x, line.y)))
+                .map(|line| (letter, (line.x(), line.y())))
         })
         .collect::<std::collections::HashMap<_, _>>();
 
@@ -388,8 +741,8 @@ async fn logical_viewport_units_use_writing_mode_axes() {
         .iter()
         .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .expect("horizontal vi/vb box should paint");
-    assert!((red.width - 100.0).abs() < 0.01);
-    assert!((red.height - 50.0).abs() < 0.01);
+    assert!((red.width() - 100.0).abs() < 0.01);
+    assert!((red.height() - 50.0).abs() < 0.01);
 
     assert_eq!(document.pages.len(), 2);
     let blue = document.pages[1]
@@ -397,8 +750,8 @@ async fn logical_viewport_units_use_writing_mode_axes() {
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("vertical vi/vb box should paint");
-    assert!((blue.width - 50.0).abs() < 0.01);
-    assert!((blue.height - 100.0).abs() < 0.01);
+    assert!((blue.width() - 50.0).abs() < 0.01);
+    assert!((blue.height() - 100.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -414,7 +767,7 @@ async fn page_border_and_padding_shrink_page_content_area() {
     .unwrap();
 
     let line = &document.pages[0].lines[0];
-    assert_eq!(line.x, 22.0);
+    assert_eq!(line.x(), 22.0);
     assert_line_baseline_at_top(&document, line, 78.0);
 }
 
@@ -435,7 +788,7 @@ async fn logical_page_margins_and_padding_use_page_writing_mode() {
     .unwrap();
 
     let line = &document.pages[0].lines[0];
-    assert_eq!(line.x, 160.0);
+    assert_eq!(line.x(), 160.0);
     assert_line_baseline_at_top(&document, line, 768.0);
 }
 
@@ -473,8 +826,8 @@ async fn page_border_paints_below_document_content() {
     assert!(border_operation < line_operation);
     assert!(page.rects.iter().any(|rect| {
         rect.fill == Some(green)
-            && ((rect.width - 120.0).abs() < 0.01 && (rect.height - 5.0).abs() < 0.01
-                || (rect.width - 5.0).abs() < 0.01 && (rect.height - 100.0).abs() < 0.01)
+            && ((rect.width() - 120.0).abs() < 0.01 && (rect.height() - 5.0).abs() < 0.01
+                || (rect.width() - 5.0).abs() < 0.01 && (rect.height() - 100.0).abs() < 0.01)
     }));
 }
 
@@ -491,7 +844,7 @@ async fn renders_page_margin_box_counters() {
         document.pages[0]
             .rects
             .iter()
-            .any(|rect| rect.y == 0.0 && rect.fill == Some(Color::BLACK))
+            .any(|rect| rect.y() == 0.0 && rect.fill == Some(Color::BLACK))
     );
     assert!(document.pages[0].operations.iter().any(|operation| {
         matches!(
@@ -500,7 +853,7 @@ async fn renders_page_margin_box_counters() {
                 if document.pages[0]
                     .rects
                     .get(*index)
-                    .is_some_and(|rect| rect.y == 0.0 && rect.fill == Some(Color::BLACK))
+                    .is_some_and(|rect| rect.y() == 0.0 && rect.fill == Some(Color::BLACK))
         )
     }));
     let footer = document.pages[0]
@@ -637,7 +990,7 @@ async fn page_margin_box_background_images_repeat_across_margin_area() {
     let top_margin_tiles = document.pages[0]
         .images
         .iter()
-        .filter(|image| image.background && (image.y - 50.0).abs() < 0.01)
+        .filter(|image| image.background && (image.y() - 50.0).abs() < 0.01)
         .collect::<Vec<_>>();
 
     assert!(
@@ -647,12 +1000,12 @@ async fn page_margin_box_background_images_repeat_across_margin_area() {
     assert!(
         top_margin_tiles
             .iter()
-            .any(|image| (image.x - 10.0).abs() < 0.01)
+            .any(|image| (image.x() - 10.0).abs() < 0.01)
     );
     assert!(
         top_margin_tiles
             .iter()
-            .any(|image| (image.x - 60.0).abs() < 0.01)
+            .any(|image| (image.x() - 60.0).abs() < 0.01)
     );
 }
 
@@ -744,6 +1097,27 @@ async fn target_text_can_capture_generated_counter_and_attr_text() {
 }
 
 #[tokio::test]
+async fn page_margin_generated_forced_breaks_use_inline_line_sequence() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 140pt 90pt; margin: 10pt; @top-center { content: \"Head\\A Tail\"; white-space: pre-line; font-size: 8pt; line-height: 8pt; height: 18pt } }\
+         body, p { margin: 0; font-size: 10pt; line-height: 10pt }\
+         </style><p>Body</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let texts = document.pages[0]
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    assert!(texts.contains(&"Head"), "{texts:?}");
+    assert!(texts.contains(&"Tail"), "{texts:?}");
+}
+
+#[tokio::test]
 async fn page_margin_box_string_function_uses_named_string_from_page() {
     let document = Html::from_string(
         "<style>\
@@ -761,13 +1135,13 @@ async fn page_margin_box_string_function_uses_named_string_from_page() {
         document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "Intro" && line.y > 65.0)
+            .any(|line| line.text == "Intro" && line.y() > 65.0)
     );
     assert!(
         document.pages[1]
             .lines
             .iter()
-            .any(|line| line.text == "Methods" && line.y > 65.0)
+            .any(|line| line.text == "Methods" && line.y() > 65.0)
     );
     assert!(
         !document.pages[0]
@@ -794,13 +1168,86 @@ async fn named_string_break_before_is_assigned_to_target_page() {
         !document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "Methods" && line.y > 65.0)
+            .any(|line| line.text == "Methods" && line.y() > 65.0)
     );
     assert!(
         document.pages[1]
             .lines
             .iter()
-            .any(|line| line.text == "Methods" && line.y > 65.0)
+            .any(|line| line.text == "Methods" && line.y() > 65.0)
+    );
+}
+
+#[tokio::test]
+async fn named_string_start_uses_only_page_start_assignment() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 140pt 80pt; margin: 10pt; @top-center { content: string(chapter, start); font-size: 8pt; height: 10pt } }\
+         body, p, h1, section { margin: 0; font-size: 10pt; line-height: 10pt }\
+         h1 { string-set: chapter content(text) }\
+         section { display: block; break-before: page }\
+         </style>\
+         <h1>First</h1>\
+         <p>Intro</p>\
+         <section><p>Lead</p><h1>Later</h1><p>Body</p></section>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 2);
+    assert!(
+        document.pages[0]
+            .lines
+            .iter()
+            .any(|line| line.text == "First" && line.y() > 65.0)
+    );
+    assert!(
+        document.pages[1]
+            .lines
+            .iter()
+            .any(|line| line.text == "First" && line.y() > 65.0),
+        "{:?}",
+        document.pages[1].lines
+    );
+    assert!(
+        !document.pages[1]
+            .lines
+            .iter()
+            .any(|line| line.text == "Later" && line.y() > 65.0)
+    );
+}
+
+#[tokio::test]
+async fn running_element_start_uses_zero_size_source_marker() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 140pt 80pt; margin: 10pt; @top-center { content: element(header, start); font-size: 8pt; height: 10pt } }\
+         body, p, h1 { margin: 0; font-size: 10pt; line-height: 10pt }\
+         h1 { position: running(header) }\
+         .next { break-before: page }\
+         </style>\
+         <h1>First</h1>\
+         <p>Intro</p><p class=\"next\">Lead</p><h1>Later</h1><p>Body</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 2);
+    assert!(
+        document.pages[1]
+            .lines
+            .iter()
+            .any(|line| line.text == "First" && line.y() > 65.0),
+        "{:?}",
+        document.pages[1].lines
+    );
+    assert!(
+        !document.pages[1]
+            .lines
+            .iter()
+            .any(|line| line.text == "Later" && line.y() > 65.0)
     );
 }
 
@@ -824,13 +1271,13 @@ async fn page_margin_box_named_string_keywords_use_page_assignments() {
         document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "First" && line.y > 65.0)
+            .any(|line| line.text == "First" && line.y() > 65.0)
     );
     assert!(
         document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "Last" && line.y < 15.0)
+            .any(|line| line.text == "Last" && line.y() < 15.0)
     );
 }
 
@@ -851,13 +1298,13 @@ async fn page_margin_box_named_string_first_except_skips_assignment_page() {
         !document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "Intro" && line.y > 65.0)
+            .any(|line| line.text == "Intro" && line.y() > 65.0)
     );
     assert!(
         document.pages[1]
             .lines
             .iter()
-            .any(|line| line.text == "Intro" && line.y > 65.0)
+            .any(|line| line.text == "Intro" && line.y() > 65.0)
     );
 }
 
@@ -878,7 +1325,7 @@ async fn page_margin_box_named_strings_are_case_sensitive() {
         document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "lower upper" && line.y > 65.0)
+            .any(|line| line.text == "lower upper" && line.y() > 65.0)
     );
 }
 
@@ -902,7 +1349,7 @@ async fn string_set_can_capture_before_and_after_generated_content() {
         document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "Before 1 Intro-Text-After" && line.y > 65.0)
+            .any(|line| line.text == "Before 1 Intro-Text-After" && line.y() > 65.0)
     );
 }
 
@@ -926,7 +1373,32 @@ async fn string_set_captures_pseudo_counter_without_double_incrementing_layout()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
     assert!(texts.contains(&"1-0"), "{texts:?}");
-    assert!(texts.windows(2).any(|pair| pair == ["1", "Text"]));
+    assert!(texts.contains(&"1Text"), "{texts:?}");
+}
+
+#[tokio::test]
+async fn string_set_can_capture_image_items_for_page_margin_content() {
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let document = Html::from_string(format!(
+        "<style>\
+         @page {{ size: 160pt 80pt; margin: 12pt; @top-left {{ content: string(label); font-size: 8pt; height: 10pt }} }}\
+         body, h1 {{ margin: 0; font-size: 10pt; line-height: 10pt }}\
+         h1 {{ string-set: label \"Icon\" url({png}) }}\
+         </style><h1>Heading</h1>",
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .lines
+            .iter()
+            .any(|line| line.text == "Icon" && line.y() > 65.0)
+    );
+    assert_eq!(document.pages[0].images.len(), 1);
+    assert_eq!(document.pages[0].images[0].pixel_width, 1);
+    assert_eq!(document.pages[0].images[0].pixel_height, 1);
 }
 
 #[tokio::test]
@@ -948,7 +1420,82 @@ async fn running_element_capture_includes_generated_counter_and_attr_text() {
         document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "Chapter 1 Intro Heading done" && line.y > 65.0)
+            .any(|line| line.text == "Chapter 1 Intro Heading done" && line.y() > 65.0)
+    );
+}
+
+#[tokio::test]
+async fn running_element_image_replays_into_page_margin_content() {
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let document = Html::from_string(format!(
+        "<style>\
+         @page {{ size: 120pt 80pt; margin: 12pt; @top-center {{ content: element(logo); height: 10pt }} }}\
+         body {{ margin: 0 }}\
+         img {{ position: running(logo); width: 8pt; height: 8pt }}\
+         </style><img src=\"{png}\"><p>Body</p>",
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages[0].images.len(), 1);
+    assert_eq!(document.pages[0].images[0].pixel_width, 1);
+    assert_eq!(document.pages[0].images[0].pixel_height, 1);
+}
+
+#[tokio::test]
+async fn running_element_replays_source_box_background_and_dimensions() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 140pt 90pt; margin: 12pt; @top-center { content: element(header); width: 70pt; height: 14pt } }\
+         body, h1, p { margin: 0; font-size: 8pt; line-height: 8pt }\
+         h1 { position: running(header); width: 40pt; height: 8pt; background: rgb(255, 0, 0); border: 1pt solid rgb(0, 0, 255) }\
+         </style><h1>Box Header</h1><p>Body</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let replayed_background = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("running element source background should paint in the page margin");
+    assert!((replayed_background.width() - 42.0).abs() < 0.01);
+    assert!((replayed_background.height() - 10.0).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn running_element_keywords_match_page_local_assignments() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 160pt 90pt; margin: 12pt; @bottom-left { content: element(title, first); font-size: 8pt; height: 10pt }\
+           @bottom-center { content: element(title, last); font-size: 8pt; height: 10pt }\
+           @bottom-right { content: element(title, first-except); font-size: 8pt; height: 10pt } }\
+         body, article, h1, p { margin: 0; font-size: 10pt; line-height: 10pt }\
+         h1 { position: running(title) }\
+         </style>\
+         <h1>Two first</h1><h1>Two last</h1><p>Body</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 1);
+    let page_margin_text = document.pages[0]
+        .lines
+        .iter()
+        .filter(|line| line.y() < 15.0)
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    assert!(page_margin_text.contains(&"Two first"));
+    assert!(page_margin_text.contains(&"Two last"));
+    assert_eq!(
+        page_margin_text
+            .iter()
+            .filter(|text| **text == "Two first" || **text == "Two last")
+            .count(),
+        2
     );
 }
 
@@ -969,7 +1516,7 @@ async fn string_set_can_capture_counters() {
         document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "Chapter I: Methods" && line.y > 65.0)
+            .any(|line| line.text == "Chapter I: Methods" && line.y() > 65.0)
     );
 }
 
@@ -989,13 +1536,13 @@ async fn page_margin_box_element_function_uses_running_element_text() {
         document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "Running Header" && line.y > 65.0)
+            .any(|line| line.text == "Running Header" && line.y() > 65.0)
     );
     assert!(
         !document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "Running Header" && line.y < 65.0)
+            .any(|line| line.text == "Running Header" && line.y() < 65.0)
     );
     assert!(
         document.pages[0]
@@ -1020,9 +1567,9 @@ async fn positions_page_margin_boxes_in_page_margins() {
         .find(|rect| rect.fill == Some(Color::BLACK))
         .unwrap();
 
-    assert_eq!(footer.width, 80.0);
-    assert_eq!(footer.x, 90.0);
-    assert_eq!(footer.y, 30.0);
+    assert_eq!(footer.width(), 80.0);
+    assert_eq!(footer.x(), 90.0);
+    assert_eq!(footer.y(), 30.0);
 }
 
 #[tokio::test]
@@ -1042,10 +1589,10 @@ async fn page_margin_box_auto_margins_center_fixed_axis() {
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("generated page-margin box should paint a green background");
 
-    assert_eq!(header.x, 40.0);
-    assert_eq!(header.y, 175.0);
-    assert_eq!(header.width, 20.0);
-    assert_eq!(header.height, 10.0);
+    assert_eq!(header.x(), 40.0);
+    assert_eq!(header.y(), 175.0);
+    assert_eq!(header.width(), 20.0);
+    assert_eq!(header.height(), 10.0);
 }
 
 #[tokio::test]
@@ -1065,10 +1612,10 @@ async fn page_margin_box_overconstrained_fixed_axis_ignores_outer_margin() {
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("generated page-margin box should paint a green background");
 
-    assert_eq!(header.x, 48.0);
-    assert_eq!(header.y, 168.0);
-    assert_eq!(header.width, 20.0);
-    assert_eq!(header.height, 30.0);
+    assert_eq!(header.x(), 48.0);
+    assert_eq!(header.y(), 168.0);
+    assert_eq!(header.width(), 20.0);
+    assert_eq!(header.height(), 30.0);
 }
 
 #[tokio::test]
@@ -1091,16 +1638,16 @@ async fn page_margin_box_fixed_axis_allows_negative_used_margins() {
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("left margin box should paint");
-    assert_eq!(left.x, -40.0);
-    assert_eq!(left.width, 130.0);
+    assert_eq!(left.x(), -40.0);
+    assert_eq!(left.width(), 130.0);
 
     let bottom = document.pages[0]
         .rects
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("bottom margin box should paint");
-    assert_eq!(bottom.y, -50.0);
-    assert_eq!(bottom.height, 150.0);
+    assert_eq!(bottom.y(), -50.0);
+    assert_eq!(bottom.height(), 150.0);
 }
 
 #[tokio::test]
@@ -1123,10 +1670,10 @@ async fn page_margin_boxes_use_page_border_and_padding_for_page_area_margins() {
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("page margin box should paint in the top margin");
 
-    assert_eq!(header.x, 30.0);
-    assert_eq!(header.y, 170.0);
-    assert_eq!(header.width, 10.0);
-    assert_eq!(header.height, 10.0);
+    assert_eq!(header.x(), 30.0);
+    assert_eq!(header.y(), 170.0);
+    assert_eq!(header.width(), 10.0);
+    assert_eq!(header.height(), 10.0);
 }
 
 #[tokio::test]
@@ -1208,8 +1755,8 @@ async fn page_margin_box_outline_paints_without_affecting_layout() {
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("page margin box background should paint");
-    assert_eq!(header.x, 20.0);
-    assert_eq!(header.width, 20.0);
+    assert_eq!(header.x(), 20.0);
+    assert_eq!(header.width(), 20.0);
     assert!(
         document.pages[0]
             .rects
@@ -1283,13 +1830,13 @@ async fn first_page_rule_size_and_margins_define_first_page_area() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].width, 120.0);
-    assert_eq!(document.pages[0].height, 120.0);
-    assert_eq!(document.pages[0].lines[0].x, 20.0);
+    assert_eq!(document.pages[0].width(), 120.0);
+    assert_eq!(document.pages[0].height(), 120.0);
+    assert_eq!(document.pages[0].lines[0].x(), 20.0);
     assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 100.0);
-    assert_eq!(document.pages[1].width, 100.0);
-    assert_eq!(document.pages[1].height, 100.0);
-    assert_eq!(document.pages[1].lines[0].x, 10.0);
+    assert_eq!(document.pages[1].width(), 100.0);
+    assert_eq!(document.pages[1].height(), 100.0);
+    assert_eq!(document.pages[1].lines[0].x(), 10.0);
     assert_line_baseline_at_top(&document, &document.pages[1].lines[0], 90.0);
 }
 
@@ -1320,10 +1867,10 @@ async fn generic_first_page_rule_preserves_body_margin_for_named_page_content() 
         .expect("pink second-page box should be painted");
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(first_rect.x, 26.0);
-    assert_eq!(first_rect.y, 84.0);
-    assert_eq!(second_rect.x, 6.0);
-    assert_eq!(second_rect.y, 104.0);
+    assert_eq!(first_rect.x(), 26.0);
+    assert_eq!(first_rect.y(), 84.0);
+    assert_eq!(second_rect.x(), 6.0);
+    assert_eq!(second_rect.y(), 104.0);
 }
 
 #[tokio::test]
@@ -1341,7 +1888,7 @@ async fn left_page_rule_margins_define_left_page_area() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[1].lines[0].x, 30.0);
+    assert_eq!(document.pages[1].lines[0].x(), 30.0);
     assert_line_baseline_at_top(&document, &document.pages[1].lines[0], 75.0);
 }
 
@@ -1364,9 +1911,9 @@ async fn page_specific_margins_define_page_margin_box_regions() {
         .find(|rect| rect.fill == Some(Color::BLACK))
         .unwrap();
 
-    assert_eq!(footer.width, 30.0);
-    assert_eq!(footer.x, 50.0);
-    assert_eq!(footer.y, 10.0);
+    assert_eq!(footer.width(), 30.0);
+    assert_eq!(footer.x(), 50.0);
+    assert_eq!(footer.y(), 10.0);
 }
 
 #[tokio::test]
@@ -1384,12 +1931,12 @@ async fn named_page_rule_size_and_margins_define_named_page_area() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[1].width, 160.0);
-    assert_eq!(document.pages[1].height, 120.0);
-    assert_eq!(document.pages[1].lines[0].x, 20.0);
+    assert_eq!(document.pages[1].width(), 160.0);
+    assert_eq!(document.pages[1].height(), 120.0);
+    assert_eq!(document.pages[1].lines[0].x(), 20.0);
     assert_line_baseline_at_top(&document, &document.pages[1].lines[0], 100.0);
-    assert_eq!(document.pages[2].width, 100.0);
-    assert_eq!(document.pages[2].height, 100.0);
+    assert_eq!(document.pages[2].width(), 100.0);
+    assert_eq!(document.pages[2].height(), 100.0);
 }
 
 #[tokio::test]
@@ -1409,11 +1956,11 @@ async fn page_auto_margins_center_and_pin_specified_page_area() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[0].lines[0].x, 48.0);
+    assert_eq!(document.pages[0].lines[0].x(), 48.0);
     assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 60.0);
-    assert_eq!(document.pages[1].lines[0].x, 0.0);
+    assert_eq!(document.pages[1].lines[0].x(), 0.0);
     assert_line_baseline_at_top(&document, &document.pages[1].lines[0], 84.0);
-    assert_eq!(document.pages[2].lines[0].x, 96.0);
+    assert_eq!(document.pages[2].lines[0].x(), 96.0);
     assert_line_baseline_at_top(&document, &document.pages[2].lines[0], 84.0);
 }
 
@@ -1428,7 +1975,7 @@ async fn page_auto_margins_with_border_and_padding_center_specified_page_area() 
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].x, 30.0);
+    assert_eq!(document.pages[0].lines[0].x(), 30.0);
     assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 50.0);
 }
 
@@ -1449,11 +1996,11 @@ async fn page_auto_margins_are_zero_when_page_area_size_is_auto() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[0].lines[0].x, 30.0);
+    assert_eq!(document.pages[0].lines[0].x(), 30.0);
     assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 54.0);
-    assert_eq!(document.pages[1].lines[0].x, 0.0);
+    assert_eq!(document.pages[1].lines[0].x(), 0.0);
     assert_line_baseline_at_top(&document, &document.pages[1].lines[0], 84.0);
-    assert_eq!(document.pages[2].lines[0].x, 30.0);
+    assert_eq!(document.pages[2].lines[0].x(), 30.0);
     assert_line_baseline_at_top(&document, &document.pages[2].lines[0], 84.0);
 }
 
@@ -1469,7 +2016,7 @@ async fn negative_page_margins_expand_page_area_beyond_page_box() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].x, -15.0);
+    assert_eq!(document.pages[0].lines[0].x(), -15.0);
     assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 240.0);
 }
 
@@ -1607,7 +2154,7 @@ async fn page_margin_boxes_inherit_page_font_properties() {
     assert_eq!(thank.color, Color::new(30, 228, 148));
     assert!(line_has_font_containing(&document, thank, "pacifico"));
     assert_eq!(contact.color, Color::new(170, 153, 170));
-    assert!((contact.x + rendered_line_advance(contact) - 510.2).abs() < 1.0);
+    assert!((contact.x() + rendered_line_advance(contact) - 510.2).abs() < 1.0);
 }
 
 #[tokio::test]
@@ -1660,8 +2207,8 @@ async fn supports_named_page_size_orientation() {
         .await
         .unwrap();
 
-    assert_eq!(document.pages[0].width, 792.0);
-    assert_eq!(document.pages[0].height, 612.0);
+    assert_eq!(document.pages[0].width(), 792.0);
+    assert_eq!(document.pages[0].height(), 612.0);
 }
 
 #[tokio::test]
@@ -1679,10 +2226,10 @@ async fn supports_standard_named_page_sizes() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].width, 792.0);
-    assert_eq!(document.pages[0].height, 1224.0);
-    assert!((document.pages[1].width - 257.0 * 72.0 / 25.4).abs() < 0.001);
-    assert!((document.pages[1].height - 182.0 * 72.0 / 25.4).abs() < 0.001);
+    assert_eq!(document.pages[0].width(), 792.0);
+    assert_eq!(document.pages[0].height(), 1224.0);
+    assert!((document.pages[1].width() - 257.0 * 72.0 / 25.4).abs() < 0.001);
+    assert!((document.pages[1].height() - 182.0 * 72.0 / 25.4).abs() < 0.001);
 }
 
 #[tokio::test]
@@ -1693,8 +2240,8 @@ async fn supports_bare_page_orientation() {
         .await
         .unwrap();
 
-    assert!((document.pages[0].width - 841.8898).abs() < 0.001);
-    assert!((document.pages[0].height - 595.2756).abs() < 0.001);
+    assert!((document.pages[0].width() - 841.8898).abs() < 0.001);
+    assert!((document.pages[0].height() - 595.2756).abs() < 0.001);
 }
 
 #[tokio::test]
@@ -1705,8 +2252,8 @@ async fn invalid_page_size_descriptor_does_not_partially_apply_lengths() {
         .await
         .unwrap();
 
-    assert!((document.pages[0].width - quire::PageSize::A4_POINTS.width).abs() < 0.001);
-    assert!((document.pages[0].height - quire::PageSize::A4_POINTS.height).abs() < 0.001);
+    assert!((document.pages[0].width() - quire::PageSize::A4_POINTS.width()).abs() < 0.001);
+    assert!((document.pages[0].height() - quire::PageSize::A4_POINTS.height()).abs() < 0.001);
 }
 
 #[tokio::test]
@@ -1743,17 +2290,17 @@ async fn page_background_paints_margins_while_canvas_background_paints_page_area
     let yellow = Color::new(255, 255, 0);
     for (page, margin_color) in [(&document.pages[0], white), (&document.pages[1], blue)] {
         assert!(page.rects.iter().any(|rect| {
-            rect.x == 0.0
-                && rect.y == 0.0
-                && (rect.width - 300.0).abs() < 0.01
-                && (rect.height - 300.0).abs() < 0.01
+            rect.x() == 0.0
+                && rect.y() == 0.0
+                && (rect.width() - 300.0).abs() < 0.01
+                && (rect.height() - 300.0).abs() < 0.01
                 && rect.fill == Some(margin_color)
         }));
         assert!(page.rects.iter().any(|rect| {
-            (rect.x - 37.5).abs() < 0.01
-                && (rect.y - 37.5).abs() < 0.01
-                && (rect.width - 225.0).abs() < 0.01
-                && (rect.height - 225.0).abs() < 0.01
+            (rect.x() - 37.5).abs() < 0.01
+                && (rect.y() - 37.5).abs() < 0.01
+                && (rect.width() - 225.0).abs() < 0.01
+                && (rect.height() - 225.0).abs() < 0.01
                 && rect.fill == Some(yellow)
         }));
     }
@@ -1926,48 +2473,47 @@ async fn page_margin_box_dimensions_match_wpt_edge_references() {
 
 #[tokio::test]
 async fn page_margin_box_auto_widths_include_margin_border_and_padding_flex() {
-    let wpt_root = std::path::Path::new("/Users/lee/oss/quire-wpt/third_party/wpt");
-    if !wpt_root.exists() {
-        return;
-    }
-    let source = std::fs::read_to_string(
-        wpt_root.join("css/css-page/margin-boxes/dimensions-003-print.html"),
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 384pt 336pt; margin: 72pt; font: 12pt/12pt monospace;\
+           @top-left { content: \"x\"; background: black; width: 120pt; height: 12pt; margin-right: 12pt }\
+           @top-right { content: \"x\"; background: yellow; width: 72pt; height: 72pt; margin-left: 12pt }\
+         }\
+         body { margin: 0 }\
+         </style>x",
     )
-    .unwrap();
-    let document = Html::from_string(source)
-        .with_base_url(wpt_root)
         .render_async(&RenderOptions::default())
         .await
         .unwrap();
 
     let page = &document.pages[0];
-    assert_eq!(page.width, 384.0);
-    assert_eq!(page.height, 336.0);
+    assert_eq!(page.width(), 384.0);
+    assert_eq!(page.height(), 336.0);
     assert!(
         page.rects.iter().any(|rect| {
-            (rect.x - 72.0).abs() < 0.01
-                && (rect.y - 333.0).abs() < 0.01
-                && (rect.width - 132.0).abs() < 0.01
-                && (rect.height - 3.0).abs() < 0.01
+            (rect.x() - 72.0).abs() < 0.01
+                && (rect.y() - 264.0).abs() < 0.01
+                && (rect.width() - 120.0).abs() < 0.01
+                && (rect.height() - 12.0).abs() < 0.01
                 && rect.fill == Some(Color::BLACK)
         }),
-        "top-left border-box outer width should resolve to 12em including 1em margin-right"
+        "top-left border box should exclude its trailing margin from background paint"
     );
     assert!(
         page.rects.iter().any(|rect| {
-            (rect.x - 228.0).abs() < 0.01
-                && (rect.y - 264.0).abs() < 0.01
-                && (rect.width - 84.0).abs() < 0.01
-                && (rect.height - 72.0).abs() < 0.01
+            (rect.x() - 240.0).abs() < 0.01
+                && (rect.y() - 264.0).abs() < 0.01
+                && (rect.width() - 72.0).abs() < 0.01
+                && (rect.height() - 72.0).abs() < 0.01
                 && rect.fill == Some(Color::new(255, 255, 0))
         }),
-        "top-right outer width should resolve to 8em including 1em margin-left"
+        "top-right border box should exclude its leading margin from background paint"
     );
     assert!(page.lines.iter().any(|line| {
-        line.text == "x" && (line.x - 78.0).abs() < 0.01 && line.y > 320.0 && line.y < 321.0
+        line.text == "x" && line.x() >= 72.0 && line.x() < 100.0 && line.y() >= 260.0
     }));
     assert!(page.lines.iter().any(|line| {
-        line.text == "x" && (line.x - 228.0).abs() < 0.01 && line.y > 326.0 && line.y < 327.0
+        line.text == "x" && line.x() >= 300.0 && line.x() < 312.0 && line.y() >= 290.0
     }));
 }
 
@@ -1996,31 +2542,56 @@ async fn page_margin_auto_widths_use_css_text_min_content_opportunities() {
         .expect("expected top-right margin box background");
 
     assert!(
-        right.width >= 20.0,
+        right.width() >= 20.0,
         "right box should keep its unbreakable min-content width; left={left:?} right={right:?}"
     );
     assert!(
-        left.width > right.width,
+        left.width() > right.width(),
         "breakable left text should receive the remaining auto width; left={left:?} right={right:?}"
     );
 }
 
 #[tokio::test]
-async fn page_margin_box_generated_text_wraps_inside_content_width() {
-    let ahem = std::path::Path::new("/Users/lee/oss/quire-wpt/third_party/wpt/fonts/Ahem.ttf");
-    if !ahem.exists() {
-        return;
-    }
-    let html = format!(
-        "<style>\
-         @font-face {{ font-family: Ahem; src: url(file://{}) }}\
-         @page {{ size: 200pt 120pt; margin: 40pt 0 0 0; font: 12pt/12pt Ahem;\
-           @top-left {{ content: \"xxxxxxxxxxxxxxxxxx xxxxxxx\"; width: 90pt; height: 24pt; text-align: left; vertical-align: top }}\
-         }}\
-         </style>",
-        ahem.display()
+async fn page_margin_box_width_intrinsic_keywords_use_min_fit_and_max_content() {
+    let document = Html::from_string("<p>Body</p>")
+        .with_stylesheet(Css::from_string(
+            "@page { size: 240pt 120pt; margin: 20pt; font: 10pt/10pt monospace; \
+             @top-left { content: \"aa bb\"; width: min-content; background: green; height: 10pt }\
+             @top-center { content: \"aa bb\"; width: fit-content(18pt); background: blue; height: 10pt }\
+             @top-right { content: \"aa bb\"; width: max-content; background: black; height: 10pt } }\
+             body, p { margin: 0 }",
+        ))
+        .render_async(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    let width_for = |color| {
+        document.pages[0]
+            .rects
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("expected page-margin rect with color {color:?}"))
+            .width()
+    };
+    let min = width_for(Color::new(0, 128, 0));
+    let fit = width_for(Color::new(0, 0, 255));
+    let max = width_for(Color::new(0, 0, 0));
+
+    assert!(
+        min < fit && fit < max,
+        "page-margin intrinsic widths should order min < fit < max: min={min}, fit={fit}, max={max}"
     );
-    let document = Html::from_string(html)
+}
+
+#[tokio::test]
+async fn page_margin_box_generated_text_wraps_inside_content_width() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 120pt; margin: 40pt 0 0 0; font: 12pt/12pt monospace;\
+           @top-left { content: \"alpha beta gamma\"; width: 48pt; height: 36pt; text-align: left; vertical-align: top }\
+         }\
+         </style>x",
+    )
         .render_async(&RenderOptions::default())
         .await
         .unwrap();
@@ -2031,15 +2602,15 @@ async fn page_margin_box_generated_text_wraps_inside_content_width() {
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
     assert!(
-        page_margin_lines.contains(&"xxxxxxxxxxxxxxxxxx"),
-        "first unbreakable segment should stay on the first generated line: {page_margin_lines:?}"
+        page_margin_lines.contains(&"alpha"),
+        "first word should stay on the first generated line: {page_margin_lines:?}"
     );
     assert!(
-        page_margin_lines.contains(&"xxxxxxx"),
+        page_margin_lines.contains(&"beta") || page_margin_lines.contains(&"gamma"),
         "text after the soft wrap opportunity should flow to a second generated line: {page_margin_lines:?}"
     );
     assert!(
-        !page_margin_lines.contains(&"xxxxxxxxxxxxxxxxxx xxxxxxx"),
+        !page_margin_lines.contains(&"alpha beta gamma"),
         "page-margin generated text should be line-broken inside the resolved content width"
     );
 }
@@ -2065,12 +2636,58 @@ async fn page_margin_generated_tabs_use_computed_tab_size() {
         .filter(|line| line.text == "A\tB")
         .collect::<Vec<_>>();
     assert_eq!(margin_lines.len(), 2, "{:?}", document.pages[0].lines);
-    margin_lines.sort_by(|a, b| b.y.total_cmp(&a.y));
+    margin_lines.sort_by(|a, b| b.y().total_cmp(&a.y()));
     let top_advance = rendered_line_advance(margin_lines[0]);
     let bottom_advance = rendered_line_advance(margin_lines[1]);
     assert!(
         top_advance < bottom_advance,
         "expected page-margin tab-size:2 advance to be smaller than tab-size:4, got {top_advance} and {bottom_advance}"
+    );
+}
+
+#[tokio::test]
+async fn page_margin_generated_text_uses_sequence_for_forced_breaks_and_zwsp() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 180pt 120pt; margin: 30pt 0 10pt 0; font: 10pt/10pt monospace;\
+           @top-left { content: \"A\\A\\A B\\200B C\"; white-space: pre-line; width: 80pt; height: 50pt; text-align: left; vertical-align: top }\
+         }\
+         body { margin: 0 }\
+         </style>x",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let margin_lines = document.pages[0]
+        .lines
+        .iter()
+        .filter(|line| matches!(line.text.as_str(), "A" | "BC"))
+        .collect::<Vec<_>>();
+    let texts = margin_lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(texts.contains(&"A"), "{texts:?}");
+    assert!(texts.contains(&"BC"), "{texts:?}");
+    assert!(
+        texts
+            .iter()
+            .all(|text| !text.chars().any(|character| character == '\u{200b}')),
+        "{texts:?}"
+    );
+    let a = margin_lines
+        .iter()
+        .find(|line| line.text == "A")
+        .expect("expected first margin line");
+    let b = margin_lines
+        .iter()
+        .find(|line| line.text == "BC")
+        .expect("expected line after forced empty line");
+    assert!(
+        a.y() > b.y() + 15.0,
+        "forced empty page-margin line should affect line positions: {margin_lines:?}"
     );
 }
 
@@ -2080,10 +2697,10 @@ fn rounded_page_rects(page: &quire::Page) -> Vec<(i32, i32, i32, i32)> {
         .iter()
         .map(|rect| {
             (
-                rounded_hundredths(rect.x),
-                rounded_hundredths(rect.y),
-                rounded_hundredths(rect.width),
-                rounded_hundredths(rect.height),
+                rounded_hundredths(rect.x()),
+                rounded_hundredths(rect.y()),
+                rounded_hundredths(rect.width()),
+                rounded_hundredths(rect.height()),
             )
         })
         .collect::<Vec<_>>();
@@ -2099,8 +2716,8 @@ fn rounded_page_lines(page: &quire::Page) -> Vec<(String, i32, i32)> {
         .map(|line| {
             (
                 line.text.clone(),
-                rounded_hundredths(line.x),
-                rounded_hundredths(line.y),
+                rounded_hundredths(line.x()),
+                rounded_hundredths(line.y()),
             )
         })
         .collect::<Vec<_>>();

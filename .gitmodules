@@ -1,0 +1,3 @@
+[submodule "weasyprint-samples"]
+	path = weasyprint-samples
+	url = https://github.com/CourtBouillon/weasyprint-samples

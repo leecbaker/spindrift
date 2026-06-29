@@ -42,10 +42,18 @@ pub(crate) fn logical_box_side(
         (_, Direction::Rtl) => BoxSide::Top,
     };
     match name {
-        "block-start" | "margin-block-start" | "padding-block-start" => Some(block_start),
-        "block-end" | "margin-block-end" | "padding-block-end" => Some(block_end),
-        "inline-start" | "margin-inline-start" | "padding-inline-start" => Some(inline_start),
-        "inline-end" | "margin-inline-end" | "padding-inline-end" => Some(inline_end),
+        "block-start" | "margin-block-start" | "padding-block-start" | "inset-block-start" => {
+            Some(block_start)
+        }
+        "block-end" | "margin-block-end" | "padding-block-end" | "inset-block-end" => {
+            Some(block_end)
+        }
+        "inline-start" | "margin-inline-start" | "padding-inline-start" | "inset-inline-start" => {
+            Some(inline_start)
+        }
+        "inline-end" | "margin-inline-end" | "padding-inline-end" | "inset-inline-end" => {
+            Some(inline_end)
+        }
         _ => None,
     }
 }

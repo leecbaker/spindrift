@@ -14,21 +14,40 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &StyledChild<'_>,
         stylesheets: &[Stylesheet],
-        containing_width: f32,
-        containing_width_is_definite: bool,
+        available: FlexItemAvailableSpace,
     ) -> FlexItemEstimate {
         let style = &child.style;
-        let containing_width_basis = containing_width_is_definite.then_some(containing_width);
-        if let Some(text) = child.anonymous_text() {
-            let measurement =
-                self.anonymous_flex_inline_measurement(text, style, containing_width.max(1.0));
+        let containing_width = available.width;
+        let containing_width_basis = available.width_is_definite.then_some(containing_width);
+        let containing_inline_size = available.inline_size(style);
+        let containing_inline_basis = available.inline_basis(style);
+        if let Some(children) = child.anonymous_content() {
+            let measurement = self.anonymous_flex_inline_measurement(
+                children,
+                style,
+                stylesheets,
+                containing_inline_size.max(1.0),
+            );
             let contribution = measurement.contribution;
-            let preferred_width =
-                intrinsic::guarded_max_content_width(contribution.max_content, style)
-                    .max(style.font_size * 0.25);
-            let preferred_min_width = contribution.min_content.max(style.font_size * 0.25);
+            let logical_inline_size = contribution.max_content.max(style.font_size * 0.25);
+            let logical_min_inline_size = contribution.min_content.max(style.font_size * 0.25);
             let used_line_height = self.font_system.used_line_height(style);
-            let intrinsic_content_height = measurement.height.max(used_line_height);
+            let logical_block_size = measurement.height().max(used_line_height);
+            let (preferred_width, preferred_min_width, intrinsic_content_height) =
+                match style.writing_mode {
+                    WritingMode::HorizontalTb => (
+                        logical_inline_size,
+                        logical_min_inline_size,
+                        logical_block_size,
+                    ),
+                    WritingMode::VerticalRl | WritingMode::VerticalLr => {
+                        (logical_block_size, logical_block_size, logical_inline_size)
+                    }
+                };
+            let min_content_height = match style.writing_mode {
+                WritingMode::HorizontalTb => intrinsic_content_height,
+                WritingMode::VerticalRl | WritingMode::VerticalLr => logical_min_inline_size,
+            };
             let content_width = used_length_percentage_or_auto_with_optional_basis(
                 style.box_values.width,
                 containing_width_basis,
@@ -41,15 +60,20 @@ impl<'a> LayoutBuilder<'a> {
                 width: constrain_width(style, content_width, containing_width),
                 height: constrain_height(style, content_height, containing_width),
                 min_width: constrain_width(style, preferred_min_width, containing_width),
-                min_height: constrain_height(style, intrinsic_content_height, containing_width),
+                min_height: constrain_height(style, min_content_height, containing_width),
                 content_width: preferred_width,
                 content_height: intrinsic_content_height,
                 first_baseline: Some(first_text_baseline_offset(&mut self.font_system, style)),
                 last_baseline: Some(last_text_baseline_offset(
                     &mut self.font_system,
                     style,
-                    measurement.line_count.max(1),
+                    measurement.line_count().max(1),
                 )),
+                first_horizontal_baseline: first_horizontal_text_baseline_offset(style),
+                last_horizontal_baseline: last_horizontal_text_baseline_offset(
+                    style,
+                    measurement.line_count().max(1),
+                ),
             };
         }
 
@@ -57,15 +81,17 @@ impl<'a> LayoutBuilder<'a> {
             return FlexItemEstimate::fixed(0.0, 0.0);
         };
         if style.display.is_flex() {
-            let children = self.with_ancestor_signature(signature.clone(), |layout| {
-                child_boxes
-                    .map(flex_children_from_boxes)
-                    .unwrap_or_else(|| {
-                        flex_children(element, style, stylesheets, &layout.ancestors)
-                    })
-            });
-            if !children.is_empty() {
-                let intrinsic_size = self.with_ancestor_signature(signature.clone(), |layout| {
+            let intrinsic_size = self.with_ancestor_signature(signature.clone(), |layout| {
+                let built_child_boxes;
+                let child_boxes = if let Some(child_boxes) = child_boxes {
+                    child_boxes
+                } else {
+                    built_child_boxes =
+                        box_tree::build_child_boxes(element, stylesheets, style, &layout.ancestors);
+                    &built_child_boxes
+                };
+                let children = flex_children_from_boxes(element, signature, style, child_boxes);
+                (!children.is_empty()).then(|| {
                     layout.estimate_intrinsic_flex_container_size(
                         &children,
                         style,
@@ -84,7 +110,9 @@ impl<'a> LayoutBuilder<'a> {
                             height_is_definite: !style.box_values.height.is_auto(),
                         },
                     )
-                });
+                })
+            });
+            if let Some(intrinsic_size) = intrinsic_size {
                 let content_width = used_length_percentage_or_auto_with_optional_basis(
                     style.box_values.width,
                     containing_width_basis,
@@ -107,8 +135,10 @@ impl<'a> LayoutBuilder<'a> {
                     ),
                     content_width: intrinsic_size.content_width,
                     content_height: intrinsic_size.content_height,
-                    first_baseline: None,
-                    last_baseline: None,
+                    first_baseline: intrinsic_size.first_baseline,
+                    last_baseline: intrinsic_size.last_baseline,
+                    first_horizontal_baseline: intrinsic_size.first_horizontal_baseline,
+                    last_horizontal_baseline: intrinsic_size.last_horizontal_baseline,
                 };
             }
         }
@@ -170,44 +200,37 @@ impl<'a> LayoutBuilder<'a> {
                 content_height: row_height,
                 first_baseline: Some(first_text_baseline_offset(&mut self.font_system, style)),
                 last_baseline: Some(last_text_baseline_offset(&mut self.font_system, style, 1)),
+                first_horizontal_baseline: first_horizontal_text_baseline_offset(style),
+                last_horizontal_baseline: last_horizontal_text_baseline_offset(style, 1),
             };
         }
 
         let definition_list_column_height =
-            self.estimate_definition_list_column_height(child, stylesheets, containing_width);
+            self.estimate_definition_list_column_height(child, stylesheets, containing_inline_size);
         let inline_content_width =
-            (containing_width - style.padding.left - style.padding.right).max(1.0);
+            (containing_inline_size - style.padding.left - style.padding.right).max(1.0);
         let inline_measurement =
             self.estimate_child_inline_measurement(child, stylesheets, inline_content_width);
         let child_intrinsic = self.estimate_child_intrinsic_widths(
             child,
             stylesheets,
-            containing_width,
+            containing_inline_size,
             inline_measurement.contribution,
         );
         let child_preferred_block_height = self.estimate_child_min_content_block_size(
             child,
             stylesheets,
-            containing_width,
-            inline_measurement.height,
+            containing_inline_size,
+            inline_measurement.height(),
         );
 
-        let preferred_width = if inline_measurement.line_count > 0 {
-            intrinsic::guarded_max_content_width(child_intrinsic.max_content, style)
-        } else {
-            child_intrinsic.max_content
-        };
-        let preferred_min_width = child_intrinsic.min_content;
-        let content_width = used_length_percentage_or_auto_with_optional_basis(
-            style.box_values.width,
-            containing_width_basis,
-        )
-        .unwrap_or(preferred_width);
+        let logical_inline_size = child_intrinsic.max_content;
+        let logical_min_inline_size = child_intrinsic.min_content;
         let used_line_height = style.line_height;
-        let fallback_content_height = if inline_measurement.line_count > 0 {
+        let fallback_logical_block_size = if inline_measurement.line_count() > 0 {
             inline_measurement
-                .height
-                .max(inline_measurement.line_count as f32 * used_line_height)
+                .height()
+                .max(inline_measurement.line_count() as f32 * used_line_height)
         } else if element.children.is_empty() && child_intrinsic.max_content == 0.0 {
             // CSS Flexbox determines the hypothetical cross size by laying the
             // item out as a block. A genuinely empty block has zero content
@@ -218,12 +241,37 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             used_line_height
         };
-        let intrinsic_content_height = definition_list_column_height
-            .unwrap_or_else(|| fallback_content_height.max(child_preferred_block_height));
+        let logical_block_size = definition_list_column_height
+            .unwrap_or_else(|| fallback_logical_block_size.max(child_preferred_block_height));
+        let (preferred_width, preferred_min_width, intrinsic_content_height, min_content_height) =
+            match style.writing_mode {
+                WritingMode::HorizontalTb => (
+                    logical_inline_size,
+                    logical_min_inline_size,
+                    logical_block_size,
+                    logical_block_size.max(0.0),
+                ),
+                // Block descendants report physical inline-width
+                // contributions. In vertical writing modes that physical
+                // width is the flex item's logical block size and therefore
+                // its physical main-size contribution in a row flex container:
+                // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+                // and <https://www.w3.org/TR/css-flexbox-1/#intrinsic-sizes>.
+                WritingMode::VerticalRl | WritingMode::VerticalLr => (
+                    logical_block_size.max(child_intrinsic.max_content),
+                    logical_block_size.max(child_intrinsic.min_content),
+                    logical_inline_size,
+                    logical_min_inline_size.max(0.0),
+                ),
+            };
+        let content_width = used_length_percentage_or_auto_with_optional_basis(
+            style.box_values.width,
+            containing_inline_basis.or(containing_width_basis),
+        )
+        .unwrap_or(preferred_width);
         let content_height =
             used_length_percentage_or_auto(style.box_values.height, used_line_height.max(1.0))
                 .unwrap_or(intrinsic_content_height);
-        let min_content_height = intrinsic_content_height.max(0.0);
 
         FlexItemEstimate {
             width: constrain_width(style, content_width, containing_width),
@@ -232,15 +280,23 @@ impl<'a> LayoutBuilder<'a> {
             min_height: constrain_height(style, min_content_height, containing_width),
             content_width: preferred_width,
             content_height: intrinsic_content_height,
-            first_baseline: (inline_measurement.line_count > 0)
+            first_baseline: (inline_measurement.line_count() > 0)
                 .then(|| first_text_baseline_offset(&mut self.font_system, style)),
-            last_baseline: (inline_measurement.line_count > 0).then(|| {
+            last_baseline: (inline_measurement.line_count() > 0).then(|| {
                 last_text_baseline_offset(
                     &mut self.font_system,
                     style,
-                    inline_measurement.line_count,
+                    inline_measurement.line_count(),
                 )
             }),
+            first_horizontal_baseline: (inline_measurement.line_count() > 0)
+                .then(|| first_horizontal_text_baseline_offset(style))
+                .flatten(),
+            last_horizontal_baseline: (inline_measurement.line_count() > 0)
+                .then(|| {
+                    last_horizontal_text_baseline_offset(style, inline_measurement.line_count())
+                })
+                .flatten(),
         }
     }
 
@@ -254,11 +310,12 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://www.w3.org/TR/css-text-3/#line-breaking>.
     fn anonymous_flex_inline_measurement(
         &mut self,
-        text: &str,
+        children: &[box_tree::FormattingBox<'_>],
         style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
         available_width: f32,
     ) -> inline_layout::InlineIntrinsicMeasurement {
-        self.intrinsic_inline_measurement_for_text(text, style, available_width)
+        self.intrinsic_inline_measurement_for_boxes(children, style, stylesheets, available_width)
     }
 
     fn estimate_child_inline_measurement(
@@ -269,9 +326,14 @@ impl<'a> LayoutBuilder<'a> {
     ) -> inline_layout::InlineIntrinsicMeasurement {
         let Some((element, signature, child_boxes)) = child.element_parts() else {
             return child
-                .anonymous_text()
-                .map(|text| {
-                    self.anonymous_flex_inline_measurement(text, &child.style, available_width)
+                .anonymous_content()
+                .map(|children| {
+                    self.anonymous_flex_inline_measurement(
+                        children,
+                        &child.style,
+                        stylesheets,
+                        available_width,
+                    )
                 })
                 .unwrap_or_default();
         };
@@ -375,7 +437,12 @@ impl<'a> LayoutBuilder<'a> {
                         )
                     })
                 });
-            merge_outer_intrinsic_widths(contribution, child_contribution, child_style);
+            merge_outer_intrinsic_widths(
+                contribution,
+                child_contribution,
+                child_style,
+                containing_width,
+            );
         }
     }
 
@@ -425,7 +492,12 @@ impl<'a> LayoutBuilder<'a> {
                         )
                     })
                 });
-            merge_outer_intrinsic_widths(contribution, child_contribution, &child_style);
+            merge_outer_intrinsic_widths(
+                contribution,
+                child_contribution,
+                &child_style,
+                containing_width,
+            );
         }
     }
 
@@ -566,7 +638,7 @@ impl<'a> LayoutBuilder<'a> {
                         stylesheets,
                         child_boxes,
                         containing_width,
-                        inline_measurement.height,
+                        inline_measurement.height(),
                     )
                 });
         let constrained_content_size =
@@ -581,6 +653,13 @@ impl<'a> LayoutBuilder<'a> {
             + child_style.margin.bottom
     }
 
+    /// Estimate a flex container's intrinsic size and exported row baselines.
+    ///
+    /// CSS Flexbox defines intrinsic flex container sizes from flex-item
+    /// contributions and exports first/last main-axis baselines from row flex
+    /// lines for parent baseline alignment:
+    /// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-sizes> and
+    /// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>.
     pub(super) fn estimate_intrinsic_flex_container_size(
         &mut self,
         children: &[StyledChild<'_>],
@@ -588,73 +667,129 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
         available: FlexAvailableSpace,
     ) -> FlexItemEstimate {
-        let mut width = 0.0f32;
-        let mut height = 0.0f32;
-        let mut min_width = 0.0f32;
-        let mut min_height = 0.0f32;
-        let mut child_count = 0usize;
+        let border_widths = used_border_widths(style);
+        let mut intrinsic_items = Vec::with_capacity(children.len());
+        let mut estimated_baseline_items = Vec::with_capacity(children.len());
+        let physical_direction = physical_flex_direction(style);
+        let (physical_gap_width, physical_gap_height) = physical_flex_gaps(style);
+        let container_inline_size = FlexItemAvailableSpace::from_container(available)
+            .inline_size(style)
+            .max(0.0);
 
         for child in children {
-            let size = self.estimate_flex_item_size(
-                child,
-                stylesheets,
-                available.width,
-                available.width_is_definite,
+            let item_available = estimated_flex_item_available_space(
+                &child.style,
+                style,
+                physical_direction,
+                available,
             );
-            let outer_width = size.width
-                + child.style.padding.left
-                + child.style.padding.right
-                + horizontal_border_width(&child.style)
-                + child.style.margin.left
-                + child.style.margin.right;
-            let outer_min_width =
-                flex_item_min_content_contribution(style.flex_direction, child, size, outer_width);
-            let outer_height = size.height
-                + child.style.padding.top
-                + child.style.padding.bottom
-                + vertical_border_width(&child.style)
-                + child.style.margin.top
-                + child.style.margin.bottom;
-            let outer_min_height = size.min_height
-                + child.style.padding.top
-                + child.style.padding.bottom
-                + vertical_border_width(&child.style)
-                + child.style.margin.top
-                + child.style.margin.bottom;
-            if style.flex_direction.is_column_axis() {
-                width = width.max(outer_width);
-                min_width = min_width.max(outer_min_width);
-                height += outer_height;
-                min_height += outer_min_height;
-            } else {
-                width += outer_width;
-                min_width += outer_min_width;
-                height = height.max(outer_height);
-                min_height = min_height.max(outer_min_height);
-            }
-            child_count += 1;
+            let size = self.estimate_flex_item_size(child, stylesheets, item_available);
+            let item = FlexIntrinsicItem::new(
+                child,
+                size,
+                physical_direction,
+                available,
+                container_inline_size,
+            );
+            let (first_baseline, last_baseline) =
+                estimated_flex_item_cross_axis_baselines(size, physical_direction);
+            estimated_baseline_items.push(EstimatedFlexBaselineItem {
+                outer_main_size: item.flex_base_size,
+                outer_cross_size: item.max_cross_contribution,
+                margin_cross_start: if physical_direction.is_row_axis() {
+                    child.style.margin.top
+                } else {
+                    child.style.margin.left
+                },
+                cross_alignment: estimated_flex_item_cross_alignment(&child.style, style),
+                first_baseline,
+                last_baseline,
+            });
+            intrinsic_items.push(item);
         }
 
-        if child_count > 1 {
-            let physical_direction = physical_flex_direction(style);
-            let (physical_gap_width, physical_gap_height) = physical_flex_gaps(style);
-            let main_gap = if physical_direction.is_column_axis() {
-                used_flex_gap(physical_gap_height, 0.0)
+        let intrinsic_main_gap =
+            estimated_intrinsic_flex_gap(if physical_direction.is_column_axis() {
+                physical_gap_height
             } else {
-                used_flex_gap(physical_gap_width, available.width)
-            };
-            let gaps = main_gap * (child_count - 1) as f32;
+                physical_gap_width
+            });
+        let intrinsic_cross_gap =
+            estimated_intrinsic_flex_gap(if physical_direction.is_column_axis() {
+                physical_gap_width
+            } else {
+                physical_gap_height
+            });
+        let min_main = intrinsic_flex_container_min_main_size(
+            style,
+            physical_direction,
+            &intrinsic_items,
+            intrinsic_main_gap,
+            available,
+        );
+        let max_main = intrinsic_flex_container_max_main_size(
+            style,
+            physical_direction,
+            &intrinsic_items,
+            intrinsic_main_gap,
+            available,
+        );
+        let (min_cross, max_cross) = intrinsic_flex_container_cross_sizes(
+            style,
+            physical_direction,
+            &intrinsic_items,
+            intrinsic_cross_gap,
+            available,
+            min_main,
+            max_main,
+        );
+        let (mut min_width, mut width, mut min_height, mut height) =
             if physical_direction.is_column_axis() {
-                height += gaps;
-                min_height += gaps;
+                (min_cross, max_cross, min_main, max_main)
             } else {
-                width += gaps;
-                min_width += gaps;
+                (min_main, max_main, min_cross, max_cross)
+            };
+
+        let line_metrics =
+            estimate_row_flex_container_line_metrics(style, available, &estimated_baseline_items);
+        if let Some(metrics) = line_metrics
+            && style.flex_wrap != FlexWrap::NoWrap
+            && metrics.line_count > 1
+        {
+            if physical_direction.is_row_axis() {
+                height = height.max(metrics.cross_size);
+                min_height = min_height.max(metrics.cross_size);
+            } else {
+                width = width.max(metrics.cross_size);
+                min_width = min_width.max(metrics.cross_size);
             }
         }
 
         let content_width = width;
         let content_height = height;
+        let (first_baseline, last_baseline) = line_metrics
+            .map(|metrics| (metrics.first_baseline, metrics.last_baseline))
+            .unwrap_or((None, None));
+        let (first_baseline, last_baseline, first_horizontal_baseline, last_horizontal_baseline) =
+            if physical_direction.is_row_axis() {
+                (
+                    first_baseline.map(|baseline| border_widths.top + style.padding.top + baseline),
+                    last_baseline.map(|baseline| border_widths.top + style.padding.top + baseline),
+                    None,
+                    None,
+                )
+            } else if style.flex_direction.is_row_axis() {
+                (
+                    None,
+                    None,
+                    first_baseline
+                        .map(|baseline| border_widths.left + style.padding.left + baseline),
+                    last_baseline
+                        .map(|baseline| border_widths.left + style.padding.left + baseline),
+                )
+            } else {
+                (None, None, None, None)
+            };
         let width = used_length_percentage_or_auto_with_optional_basis(
             style.box_values.width,
             available.width_is_definite.then_some(available.width),
@@ -676,8 +811,10 @@ impl<'a> LayoutBuilder<'a> {
             min_height: min_height.max(style.line_height),
             content_width,
             content_height,
-            first_baseline: None,
-            last_baseline: None,
+            first_baseline,
+            last_baseline,
+            first_horizontal_baseline,
+            last_horizontal_baseline,
         }
     }
 
@@ -825,6 +962,8 @@ fn estimate_replaced_image_flex_item(
         content_height: base_height.max(1.0),
         first_baseline: None,
         last_baseline: None,
+        first_horizontal_baseline: None,
+        last_horizontal_baseline: None,
     })
 }
 
@@ -858,16 +997,42 @@ fn last_text_baseline_offset(
         + line_count.saturating_sub(1) as f32 * style.line_height
 }
 
+/// Return a vertical-writing flex item's first text baseline offset from its
+/// border-box left edge.
+///
+/// CSS Flexbox baseline alignment can align row flex lines in the horizontal
+/// cross axis when the row main axis is vertical. Quire's vertical inline
+/// painter records text groups at the content left edge, so the flex estimate
+/// exposes the same physical x-coordinate as a border-box offset:
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+fn first_horizontal_text_baseline_offset(style: &ComputedStyle) -> Option<f32> {
+    if style.writing_mode == WritingMode::HorizontalTb {
+        return None;
+    }
+    let borders = used_border_widths(style);
+    Some(borders.left + style.padding.left)
+}
+
+/// Return a vertical-writing flex item's last text baseline offset from its
+/// border-box left edge.
+///
+/// Quire currently stores vertical inline lines at their physical text-group
+/// x-coordinate; this mirrors that coordinate for flex baseline sharing and
+/// keeps multi-line vertical baseline export conservative until vertical line
+/// fragmentation exposes durable per-line horizontal positions.
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>.
+fn last_horizontal_text_baseline_offset(style: &ComputedStyle, _line_count: usize) -> Option<f32> {
+    first_horizontal_text_baseline_offset(style)
+}
+
 fn merge_outer_intrinsic_widths(
     contribution: &mut inline_layout::InlineIntrinsicContribution,
     child_contribution: (f32, f32),
     child_style: &ComputedStyle,
+    containing_inline_size: f32,
 ) {
-    let outer_edges = child_style.padding.left
-        + child_style.padding.right
-        + horizontal_border_width(child_style)
-        + child_style.margin.left
-        + child_style.margin.right;
+    let outer_edges = intrinsic_horizontal_outer_edges(child_style, containing_inline_size);
     contribution.min_content = contribution
         .min_content
         .max(child_contribution.0 + outer_edges);
@@ -878,12 +1043,21 @@ fn merge_outer_intrinsic_widths(
 
 fn explicit_child_intrinsic_width(
     child_style: &ComputedStyle,
-    containing_width: f32,
+    containing_inline_size: f32,
 ) -> Option<(f32, f32)> {
-    let horizontal_extras =
-        horizontal_border_width(child_style) + child_style.padding.left + child_style.padding.right;
-    used_content_width_or_auto(child_style, containing_width, horizontal_extras)
+    let horizontal_extras = intrinsic_horizontal_non_content(child_style, containing_inline_size);
+    used_content_width_or_auto(child_style, containing_inline_size, horizontal_extras)
         .map(|width| (width, width))
+}
+
+fn intrinsic_horizontal_non_content(style: &ComputedStyle, containing_inline_size: f32) -> f32 {
+    let padding = used_padding_edges(style, containing_inline_size);
+    horizontal_border_width(style) + padding.left + padding.right
+}
+
+fn intrinsic_horizontal_outer_edges(style: &ComputedStyle, containing_inline_size: f32) -> f32 {
+    let margin = used_margin_edges(style, containing_inline_size);
+    intrinsic_horizontal_non_content(style, containing_inline_size) + margin.left + margin.right
 }
 
 fn flex_min_content_block_child_participates(element: &Element, style: &ComputedStyle) -> bool {
@@ -894,31 +1068,1230 @@ fn flex_min_content_block_child_participates(element: &Element, style: &Computed
             || is_replaced_element(element))
 }
 
-/// Returns the main-axis min-content contribution for a flex item.
+/// Intrinsic contribution record for one flex item.
 ///
-/// CSS Flexbox says an inflexible item with `flex-basis: auto` contributes its
-/// max-content contribution to the flex container's min-content main size:
-/// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-sizes>.
-fn flex_item_min_content_contribution(
-    direction: FlexDirection,
-    child: &StyledChild<'_>,
-    size: FlexItemEstimate,
-    outer_width: f32,
-) -> f32 {
-    let min_width = size.min_width
-        + child.style.padding.left
-        + child.style.padding.right
-        + horizontal_border_width(&child.style)
-        + child.style.margin.left
-        + child.style.margin.right;
+/// CSS Flexbox defines flex container intrinsic sizes in terms of each item's
+/// outer min/max-content contribution, flex base size, hypothetical main size,
+/// and grow/shrink factor. Keeping those values explicit avoids reusing one
+/// estimated layout size for several distinct spec concepts:
+/// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-sizes> and
+/// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-item-contributions>.
+#[derive(Debug, Clone, Copy)]
+struct FlexIntrinsicItem {
+    min_main_contribution: f32,
+    max_main_contribution: f32,
+    min_cross_contribution: f32,
+    max_cross_contribution: f32,
+    flex_base_size: f32,
+    hypothetical_main_size: f32,
+    grow: f32,
+    shrink: f32,
+}
 
-    if direction.is_row_axis()
-        && child.style.flex_grow == 0.0
-        && child.style.flex_shrink == 0.0
-        && child.style.flex_basis.is_auto()
-    {
-        outer_width
+impl FlexIntrinsicItem {
+    fn new(
+        child: &StyledChild<'_>,
+        size: FlexItemEstimate,
+        direction: FlexDirection,
+        available: FlexAvailableSpace,
+        container_inline_size: f32,
+    ) -> Self {
+        let style = &child.style;
+        let edges = FlexIntrinsicAxisEdges::for_style(style, direction, container_inline_size);
+        let main_basis = if direction.is_row_axis() {
+            available.width_is_definite.then_some(available.width)
+        } else {
+            available.height.filter(|_| available.height_is_definite)
+        };
+        let cross_basis = if direction.is_row_axis() {
+            available.height.filter(|_| available.height_is_definite)
+        } else {
+            available.width_is_definite.then_some(available.width)
+        };
+        let definite_main = definite_flex_item_main_content_size(style, direction, main_basis);
+        let definite_cross = definite_flex_item_cross_content_size(style, direction, cross_basis);
+        let min_main_content = if direction.is_row_axis() {
+            size.min_width
+        } else {
+            size.min_height
+        };
+        let max_main_content = if direction.is_row_axis() {
+            size.content_width
+        } else {
+            size.content_height
+        };
+        let min_cross_content = if direction.is_row_axis() {
+            size.min_height
+        } else {
+            size.min_width
+        };
+        let max_cross_content = if direction.is_row_axis() {
+            size.content_height
+        } else {
+            size.content_width
+        };
+        let flex_base_content =
+            estimated_flex_main_content_size(style, size, direction, main_basis);
+        let flex_base_size = (flex_base_content + edges.main).max(0.0);
+        let min_main_constraint =
+            definite_flex_item_min_main_content_size(style, direction, main_basis)
+                .map(|size| size + edges.main);
+        let max_main_constraint =
+            definite_flex_item_max_main_content_size(style, direction, main_basis)
+                .map(|size| size + edges.main);
+        let min_main_contribution = flex_intrinsic_main_size_contribution(
+            min_main_content + edges.main,
+            definite_main.map(|size| size + edges.main),
+            flex_base_size,
+            style.flex_grow,
+            style.flex_shrink,
+            min_main_constraint,
+            max_main_constraint,
+        );
+        let max_main_contribution = flex_intrinsic_main_size_contribution(
+            max_main_content + edges.main,
+            definite_main.map(|size| size + edges.main),
+            flex_base_size,
+            style.flex_grow,
+            style.flex_shrink,
+            min_main_constraint,
+            max_main_constraint,
+        );
+        let hypothetical_main_size = flex_base_size
+            .max(min_main_contribution)
+            .min(max_main_contribution.max(min_main_contribution));
+
+        let (min_cross_contribution, max_cross_contribution) =
+            if let Some(definite_cross) = definite_cross {
+                let contribution = (definite_cross + edges.cross).max(0.0);
+                (contribution, contribution)
+            } else {
+                (
+                    (min_cross_content + edges.cross).max(0.0),
+                    (max_cross_content + edges.cross).max(0.0),
+                )
+            };
+
+        Self {
+            min_main_contribution,
+            max_main_contribution,
+            min_cross_contribution,
+            max_cross_contribution,
+            flex_base_size,
+            hypothetical_main_size,
+            grow: style.flex_grow.max(0.0),
+            shrink: style.flex_shrink.max(0.0),
+        }
+    }
+
+    fn resolved_with_flex_fraction(self, flex_fraction: f32) -> f32 {
+        let unclamped = if flex_fraction > 0.0 {
+            self.flex_base_size + self.grow * flex_fraction
+        } else if flex_fraction < 0.0 {
+            self.flex_base_size + self.shrink * self.flex_base_size * flex_fraction
+        } else {
+            self.flex_base_size
+        };
+        unclamped
+            .max(self.min_main_contribution)
+            .min(self.max_main_contribution.max(self.min_main_contribution))
+            .max(0.0)
+    }
+}
+
+/// Computes a flex item's intrinsic main-size contribution.
+///
+/// CSS Flexbox clamps each item contribution by the outer flex base size when
+/// the item cannot grow or cannot shrink, and then by definite min/max main
+/// sizes:
+/// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-item-contributions>.
+fn flex_intrinsic_main_size_contribution(
+    content_contribution: f32,
+    preferred_main_size: Option<f32>,
+    flex_base_size: f32,
+    grow: f32,
+    shrink: f32,
+    min_main_size: Option<f32>,
+    max_main_size: Option<f32>,
+) -> f32 {
+    let mut contribution = preferred_main_size
+        .map(|preferred| content_contribution.max(preferred))
+        .unwrap_or(content_contribution)
+        .max(0.0);
+    if grow <= 0.0 {
+        contribution = contribution.min(flex_base_size.max(0.0));
+    }
+    if shrink <= 0.0 {
+        contribution = contribution.max(flex_base_size.max(0.0));
+    }
+    constrain(
+        contribution,
+        min_main_size.map(|size| size.max(0.0)),
+        max_main_size.map(|size| size.max(0.0)),
+    )
+    .max(0.0)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FlexIntrinsicAxisEdges {
+    main: f32,
+    cross: f32,
+}
+
+impl FlexIntrinsicAxisEdges {
+    fn for_style(
+        style: &ComputedStyle,
+        direction: FlexDirection,
+        container_inline_size: f32,
+    ) -> Self {
+        let padding = used_padding_edges(style, container_inline_size);
+        let margin = used_margin_edges(style, container_inline_size);
+        let border = used_border_widths(style);
+        let horizontal =
+            padding.left + padding.right + border.left + border.right + margin.left + margin.right;
+        let vertical =
+            padding.top + padding.bottom + border.top + border.bottom + margin.top + margin.bottom;
+        if direction.is_row_axis() {
+            Self {
+                main: horizontal,
+                cross: vertical,
+            }
+        } else {
+            Self {
+                main: vertical,
+                cross: horizontal,
+            }
+        }
+    }
+}
+
+fn definite_flex_item_main_content_size(
+    style: &ComputedStyle,
+    direction: FlexDirection,
+    main_basis: Option<f32>,
+) -> Option<f32> {
+    if direction.is_row_axis() {
+        let horizontal_non_content = main_basis
+            .map(|basis| intrinsic_horizontal_non_content(style, basis))
+            .unwrap_or_else(|| {
+                style.padding.left + style.padding.right + horizontal_border_width(style)
+            });
+        used_content_width_or_auto_with_optional_basis(style, main_basis, horizontal_non_content)
     } else {
-        min_width
+        let vertical_non_content =
+            style.padding.top + style.padding.bottom + vertical_border_width(style);
+        used_content_height_or_auto_with_optional_basis(style, main_basis, vertical_non_content)
+    }
+}
+
+fn definite_flex_item_cross_content_size(
+    style: &ComputedStyle,
+    direction: FlexDirection,
+    cross_basis: Option<f32>,
+) -> Option<f32> {
+    if direction.is_row_axis() {
+        let vertical_non_content =
+            style.padding.top + style.padding.bottom + vertical_border_width(style);
+        used_content_height_or_auto_with_optional_basis(style, cross_basis, vertical_non_content)
+    } else {
+        let horizontal_non_content = cross_basis
+            .map(|basis| intrinsic_horizontal_non_content(style, basis))
+            .unwrap_or_else(|| {
+                style.padding.left + style.padding.right + horizontal_border_width(style)
+            });
+        used_content_width_or_auto_with_optional_basis(style, cross_basis, horizontal_non_content)
+    }
+}
+
+fn definite_flex_item_min_main_content_size(
+    style: &ComputedStyle,
+    direction: FlexDirection,
+    main_basis: Option<f32>,
+) -> Option<f32> {
+    definite_flex_item_main_axis_content_size(
+        if direction.is_row_axis() {
+            style.box_values.min_width
+        } else {
+            style.box_values.min_height
+        },
+        main_basis,
+    )
+}
+
+fn definite_flex_item_max_main_content_size(
+    style: &ComputedStyle,
+    direction: FlexDirection,
+    main_basis: Option<f32>,
+) -> Option<f32> {
+    definite_flex_item_main_axis_content_size(
+        if direction.is_row_axis() {
+            style.box_values.max_width
+        } else {
+            style.box_values.max_height
+        },
+        main_basis,
+    )
+}
+
+fn definite_flex_item_main_axis_content_size(
+    value: css::ComputedLengthPercentageOrAuto,
+    main_basis: Option<f32>,
+) -> Option<f32> {
+    used_length_percentage_or_auto_with_optional_basis(value, main_basis).map(|size| size.max(0.0))
+}
+
+fn intrinsic_flex_container_min_main_size(
+    style: &ComputedStyle,
+    direction: FlexDirection,
+    items: &[FlexIntrinsicItem],
+    gap: f32,
+    available: FlexAvailableSpace,
+) -> f32 {
+    if items.is_empty() {
+        return 0.0;
+    }
+    if style.flex_wrap == FlexWrap::NoWrap {
+        return items
+            .iter()
+            .map(|item| item.min_main_contribution)
+            .sum::<f32>()
+            + intrinsic_gap_total(gap, items.len());
+    }
+
+    let line_limit = definite_flex_container_main_size(style, direction, available);
+    if let Some(line_limit) = line_limit {
+        return intrinsic_flex_lines(items, line_limit, gap)
+            .iter()
+            .map(|line| line.min_main)
+            .fold(0.0f32, f32::max);
+    }
+
+    items
+        .iter()
+        .map(|item| item.hypothetical_main_size.max(item.min_main_contribution))
+        .fold(0.0f32, f32::max)
+}
+
+fn intrinsic_flex_container_max_main_size(
+    style: &ComputedStyle,
+    direction: FlexDirection,
+    items: &[FlexIntrinsicItem],
+    gap: f32,
+    available: FlexAvailableSpace,
+) -> f32 {
+    if items.is_empty() {
+        return 0.0;
+    }
+    if style.flex_wrap != FlexWrap::NoWrap
+        && let Some(line_limit) = definite_flex_container_main_size(style, direction, available)
+    {
+        return intrinsic_flex_lines(items, line_limit, gap)
+            .iter()
+            .map(|line| line.max_main)
+            .fold(0.0f32, f32::max);
+    }
+
+    let flex_fraction = intrinsic_max_content_flex_fraction(items);
+    items
+        .iter()
+        .map(|item| item.resolved_with_flex_fraction(flex_fraction))
+        .sum::<f32>()
+        + intrinsic_gap_total(gap, items.len())
+}
+
+/// Return the ideal-algorithm max-content flex fraction from Flexbox 9.9.1.1.
+///
+/// The current Flexbox draft leaves the web-compatible algorithm in 9.9.1.2
+/// partially unresolved. Quire therefore implements the concrete ideal
+/// flex-fraction algorithm and records any remaining browser-compatibility
+/// mismatch as a spec divergence rather than encoding undefined behavior.
+/// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-main-sizes>.
+fn intrinsic_max_content_flex_fraction(items: &[FlexIntrinsicItem]) -> f32 {
+    items
+        .iter()
+        .map(|item| {
+            if item.flex_base_size < item.max_main_contribution {
+                if item.grow > 0.0 {
+                    (item.max_main_contribution - item.flex_base_size) / item.grow
+                } else {
+                    0.0
+                }
+            } else if item.flex_base_size > item.max_main_contribution {
+                let scaled_shrink = item.shrink * item.flex_base_size;
+                if scaled_shrink > 0.0 {
+                    (item.max_main_contribution - item.flex_base_size) / scaled_shrink
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        })
+        .fold(0.0f32, |largest, fraction| largest.max(fraction))
+}
+
+fn intrinsic_flex_container_cross_sizes(
+    style: &ComputedStyle,
+    direction: FlexDirection,
+    items: &[FlexIntrinsicItem],
+    gap: f32,
+    available: FlexAvailableSpace,
+    min_main: f32,
+    max_main: f32,
+) -> (f32, f32) {
+    if items.is_empty() {
+        return (0.0, 0.0);
+    }
+    if style.flex_wrap == FlexWrap::NoWrap {
+        let min_cross = items
+            .iter()
+            .map(|item| item.min_cross_contribution)
+            .fold(0.0f32, f32::max);
+        let max_cross = items
+            .iter()
+            .map(|item| item.max_cross_contribution)
+            .fold(0.0f32, f32::max);
+        return (min_cross, max_cross.max(min_cross));
+    }
+
+    if let Some(line_limit) =
+        intrinsic_flex_container_line_limit(style, direction, available, min_main, max_main)
+    {
+        let lines = intrinsic_flex_lines(items, line_limit, gap);
+        let min_cross = lines.iter().map(|line| line.min_cross).sum::<f32>()
+            + intrinsic_gap_total(gap, lines.len());
+        let max_cross = lines.iter().map(|line| line.max_cross).sum::<f32>()
+            + intrinsic_gap_total(gap, lines.len());
+        return (min_cross, max_cross.max(min_cross));
+    }
+
+    let min_cross = items
+        .iter()
+        .map(|item| item.min_cross_contribution)
+        .fold(0.0f32, f32::max);
+    if direction.is_column_axis() {
+        let max_cross = items
+            .iter()
+            .map(|item| item.max_cross_contribution)
+            .sum::<f32>()
+            + intrinsic_gap_total(gap, items.len());
+        (min_cross, max_cross.max(min_cross))
+    } else {
+        let max_cross = items
+            .iter()
+            .map(|item| item.max_cross_contribution)
+            .fold(0.0f32, f32::max);
+        (min_cross, max_cross.max(min_cross))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IntrinsicFlexLine {
+    min_main: f32,
+    max_main: f32,
+    min_cross: f32,
+    max_cross: f32,
+}
+
+fn intrinsic_flex_lines(
+    items: &[FlexIntrinsicItem],
+    line_limit: f32,
+    gap: f32,
+) -> Vec<IntrinsicFlexLine> {
+    let mut lines = Vec::new();
+    let mut line_start = 0usize;
+    let mut line_main = 0.0f32;
+
+    for (index, item) in items.iter().enumerate() {
+        let item_main = item.hypothetical_main_size.max(0.0);
+        let candidate = if index == line_start {
+            item_main
+        } else {
+            line_main + gap.max(0.0) + item_main
+        };
+        if index > line_start && candidate > line_limit.max(0.0) + 0.01 {
+            lines.push(intrinsic_flex_line(&items[line_start..index], gap));
+            line_start = index;
+            line_main = item_main;
+        } else {
+            line_main = candidate;
+        }
+    }
+
+    lines.push(intrinsic_flex_line(&items[line_start..], gap));
+    lines
+}
+
+fn intrinsic_flex_line(items: &[FlexIntrinsicItem], gap: f32) -> IntrinsicFlexLine {
+    IntrinsicFlexLine {
+        min_main: items
+            .iter()
+            .map(|item| item.min_main_contribution)
+            .sum::<f32>()
+            + intrinsic_gap_total(gap, items.len()),
+        max_main: intrinsic_flex_container_max_main_size_no_wrap(items, gap),
+        min_cross: items
+            .iter()
+            .map(|item| item.min_cross_contribution)
+            .fold(0.0f32, f32::max),
+        max_cross: items
+            .iter()
+            .map(|item| item.max_cross_contribution)
+            .fold(0.0f32, f32::max),
+    }
+}
+
+fn intrinsic_flex_container_max_main_size_no_wrap(items: &[FlexIntrinsicItem], gap: f32) -> f32 {
+    let flex_fraction = intrinsic_max_content_flex_fraction(items);
+    items
+        .iter()
+        .map(|item| item.resolved_with_flex_fraction(flex_fraction))
+        .sum::<f32>()
+        + intrinsic_gap_total(gap, items.len())
+}
+
+fn definite_flex_container_main_size(
+    style: &ComputedStyle,
+    direction: FlexDirection,
+    available: FlexAvailableSpace,
+) -> Option<f32> {
+    if direction.is_row_axis() {
+        definite_flex_container_axis_size(
+            style.box_values.width,
+            available.width_is_definite.then_some(available.width),
+        )
+    } else {
+        definite_flex_container_axis_size(
+            style.box_values.height,
+            available.height.filter(|_| available.height_is_definite),
+        )
+    }
+}
+
+fn definite_flex_container_axis_size(
+    value: css::ComputedLengthPercentageOrAuto,
+    percentage_basis: Option<f32>,
+) -> Option<f32> {
+    match value {
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
+            if value.percent == 0.0 {
+                Some(value.length.max(0.0))
+            } else {
+                Some(used_length_percentage(value, percentage_basis?).max(0.0))
+            }
+        }
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::MinContent
+        | css::ComputedLengthPercentageOrAuto::MaxContent
+        | css::ComputedLengthPercentageOrAuto::FitContent(_) => percentage_basis,
+    }
+}
+
+fn intrinsic_flex_container_line_limit(
+    style: &ComputedStyle,
+    direction: FlexDirection,
+    available: FlexAvailableSpace,
+    min_main: f32,
+    max_main: f32,
+) -> Option<f32> {
+    let (value, percentage_basis) = if direction.is_row_axis() {
+        (
+            style.box_values.width,
+            available.width_is_definite.then_some(available.width),
+        )
+    } else {
+        (
+            style.box_values.height,
+            available.height.filter(|_| available.height_is_definite),
+        )
+    };
+    match value {
+        css::ComputedLengthPercentageOrAuto::MinContent => Some(min_main.max(0.0)),
+        css::ComputedLengthPercentageOrAuto::MaxContent => Some(max_main.max(min_main).max(0.0)),
+        css::ComputedLengthPercentageOrAuto::FitContent(limit) => {
+            let stretch = limit
+                .and_then(|limit| {
+                    if limit.percent == 0.0 {
+                        Some(limit.length.max(0.0))
+                    } else {
+                        percentage_basis.map(|basis| used_length_percentage(limit, basis).max(0.0))
+                    }
+                })
+                .or(percentage_basis)
+                .unwrap_or(max_main);
+            Some(max_main.max(min_main).min(min_main.max(stretch)).max(0.0))
+        }
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::LengthPercentage(_) => {
+            definite_flex_container_axis_size(value, percentage_basis)
+        }
+    }
+}
+
+fn intrinsic_gap_total(gap: f32, item_count: usize) -> f32 {
+    gap.max(0.0) * item_count.saturating_sub(1) as f32
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EstimatedFlexBaselineItem {
+    outer_main_size: f32,
+    outer_cross_size: f32,
+    margin_cross_start: f32,
+    cross_alignment: EstimatedFlexItemCrossAlignment,
+    first_baseline: Option<f32>,
+    last_baseline: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EstimatedFlexItemCrossAlignment {
+    Side(PhysicalSide),
+    Center,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EstimatedFlexLineMetrics {
+    line_count: usize,
+    cross_size: f32,
+    first_baseline: Option<f32>,
+    last_baseline: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct EstimatedFlexLine {
+    item_indices: Vec<usize>,
+    cross_start: f32,
+    cross_size: f32,
+}
+
+fn estimated_flex_item_cross_axis_baselines(
+    size: FlexItemEstimate,
+    physical_direction: FlexDirection,
+) -> (Option<f32>, Option<f32>) {
+    if physical_direction.is_row_axis() {
+        (size.first_baseline, size.last_baseline)
+    } else {
+        (
+            size.first_horizontal_baseline,
+            size.last_horizontal_baseline,
+        )
+    }
+}
+
+/// Estimate a row flex container's exported baselines from flex lines.
+///
+/// CSS Flexbox generates a row flex container's first and last main-axis
+/// baseline sets from the first and last flex lines, using the startmost or
+/// endmost item on those lines when that item has a parallel baseline. In
+/// vertical writing modes the CSS row axis is physical y, so the exported
+/// baseline is a horizontal x-axis offset:
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>.
+fn estimate_row_flex_container_line_metrics(
+    style: &ComputedStyle,
+    available: FlexAvailableSpace,
+    items: &[EstimatedFlexBaselineItem],
+) -> Option<EstimatedFlexLineMetrics> {
+    if items.is_empty() {
+        return None;
+    }
+
+    if !style.flex_direction.is_row_axis() {
+        return None;
+    }
+
+    let physical_direction = physical_flex_direction(style);
+    let (physical_gap_width, physical_gap_height) = physical_flex_gaps(style);
+    let main_gap_value = if physical_direction.is_row_axis() {
+        physical_gap_width
+    } else {
+        physical_gap_height
+    };
+    let cross_gap_value = if physical_direction.is_row_axis() {
+        physical_gap_height
+    } else {
+        physical_gap_width
+    };
+    let available_main_size = if physical_direction.is_row_axis() {
+        available.width
+    } else {
+        available.height.unwrap_or(available.width)
+    };
+    let available_cross_size = if physical_direction.is_row_axis() {
+        available.height.unwrap_or(0.0)
+    } else {
+        available.width
+    };
+    let intrinsic_main_gap = estimated_intrinsic_flex_gap(main_gap_value);
+    let main_size =
+        estimated_row_flex_container_main_size(style, available, items, intrinsic_main_gap);
+    let main_gap = used_flex_gap(main_gap_value, main_size.unwrap_or(available_main_size));
+    let cross_gap = used_flex_gap(cross_gap_value, available_cross_size);
+    let mut lines = if style.flex_wrap == FlexWrap::NoWrap {
+        vec![estimated_flex_line(0, items.len(), 0.0, items)]
+    } else if let Some(main_size) = main_size {
+        estimate_wrapped_row_flex_lines(items, main_size.max(0.0), main_gap, cross_gap)
+    } else {
+        vec![estimated_flex_line(0, items.len(), 0.0, items)]
+    };
+    if style.flex_wrap != FlexWrap::NoWrap
+        && matches!(
+            style.align_content.keyword,
+            ContentAlignmentKeyword::Normal | ContentAlignmentKeyword::Stretch
+        )
+        && let Some(container_cross_size) =
+            estimated_row_flex_container_cross_size(style, available, physical_direction)
+    {
+        stretch_estimated_flex_line_cross_positions(
+            &mut lines,
+            container_cross_size.max(0.0),
+            cross_gap,
+        );
+    }
+    if style.flex_wrap == FlexWrap::WrapReverse {
+        reverse_estimated_flex_line_cross_positions(&mut lines);
+    }
+    let first_line = lines.first()?;
+    let last_line = lines.last()?;
+    let cross_size = lines
+        .iter()
+        .map(|line| line.cross_start + line.cross_size)
+        .fold(0.0f32, f32::max);
+
+    Some(EstimatedFlexLineMetrics {
+        line_count: lines.len(),
+        cross_size,
+        first_baseline: estimated_flex_line_baseline(
+            first_line,
+            items,
+            style.flex_direction,
+            EstimatedFlexBaselineSet::First,
+        ),
+        last_baseline: estimated_flex_line_baseline(
+            last_line,
+            items,
+            style.flex_direction,
+            EstimatedFlexBaselineSet::Last,
+        ),
+    })
+}
+
+fn estimate_wrapped_row_flex_lines(
+    items: &[EstimatedFlexBaselineItem],
+    main_size: f32,
+    main_gap: f32,
+    cross_gap: f32,
+) -> Vec<EstimatedFlexLine> {
+    let mut lines = Vec::new();
+    let mut line_start = 0usize;
+    let mut line_main_size = 0.0f32;
+
+    for (index, item) in items.iter().enumerate() {
+        let item_outer_main = item.outer_main_size.max(0.0);
+        let candidate_main_size = if index == line_start {
+            item_outer_main
+        } else {
+            line_main_size + main_gap + item_outer_main
+        };
+        if index > line_start && candidate_main_size > main_size + 0.01 {
+            let cross_start = estimated_next_flex_line_cross_start(&lines, cross_gap);
+            lines.push(estimated_flex_line(line_start, index, cross_start, items));
+            line_start = index;
+            line_main_size = item_outer_main;
+        } else {
+            line_main_size = candidate_main_size;
+        }
+    }
+
+    let cross_start = estimated_next_flex_line_cross_start(&lines, cross_gap);
+    lines.push(estimated_flex_line(
+        line_start,
+        items.len(),
+        cross_start,
+        items,
+    ));
+    lines
+}
+
+fn estimated_row_flex_container_main_size(
+    style: &ComputedStyle,
+    available: FlexAvailableSpace,
+    items: &[EstimatedFlexBaselineItem],
+    intrinsic_main_gap: f32,
+) -> Option<f32> {
+    let physical_direction = physical_flex_direction(style);
+    let (size_property, min_size_property, max_size_property, percentage_basis) =
+        if physical_direction.is_row_axis() {
+            (
+                style.box_values.width,
+                style.box_values.min_width,
+                style.box_values.max_width,
+                available.width_is_definite.then_some(available.width),
+            )
+        } else {
+            (
+                style.box_values.height,
+                style.box_values.min_height,
+                style.box_values.max_height,
+                available.height.filter(|_| available.height_is_definite),
+            )
+        };
+    let (min_content, max_content) =
+        estimated_row_flex_container_intrinsic_main_sizes(items, intrinsic_main_gap);
+    let size = estimated_intrinsic_length_percentage_or_auto(
+        size_property,
+        percentage_basis,
+        min_content,
+        max_content,
+    )
+    .or(percentage_basis);
+    let max_size = estimated_intrinsic_length_percentage_or_auto(
+        max_size_property,
+        percentage_basis,
+        min_content,
+        max_content,
+    );
+    let min_size = estimated_intrinsic_length_percentage_or_auto(
+        min_size_property,
+        percentage_basis,
+        min_content,
+        max_content,
+    );
+
+    match (size, max_size) {
+        (Some(size), Some(max_size)) => Some(
+            min_size
+                .map_or(size, |min_size| size.max(min_size))
+                .min(max_size),
+        ),
+        (Some(size), None) => Some(min_size.map_or(size, |min_size| size.max(min_size))),
+        (None, Some(max_size)) => {
+            Some(min_size.map_or(max_size, |min_size| max_size.max(min_size)))
+        }
+        (None, None) => None,
+    }
+}
+
+fn estimated_row_flex_container_cross_size(
+    style: &ComputedStyle,
+    available: FlexAvailableSpace,
+    physical_direction: FlexDirection,
+) -> Option<f32> {
+    if physical_direction.is_row_axis() {
+        estimated_intrinsic_length_percentage_or_auto(
+            style.box_values.height,
+            available.height.filter(|_| available.height_is_definite),
+            0.0,
+            0.0,
+        )
+        .or_else(|| available.height.filter(|_| available.height_is_definite))
+    } else {
+        estimated_intrinsic_length_percentage_or_auto(
+            style.box_values.width,
+            available.width_is_definite.then_some(available.width),
+            0.0,
+            0.0,
+        )
+        .or_else(|| available.width_is_definite.then_some(available.width))
+    }
+}
+
+fn estimated_row_flex_container_intrinsic_main_sizes(
+    items: &[EstimatedFlexBaselineItem],
+    intrinsic_main_gap: f32,
+) -> (f32, f32) {
+    let min_content = items
+        .iter()
+        .map(|item| item.outer_main_size.max(0.0))
+        .fold(0.0f32, f32::max);
+    let max_content_items = items
+        .iter()
+        .map(|item| item.outer_main_size.max(0.0))
+        .sum::<f32>();
+    let max_content_gaps = intrinsic_main_gap.max(0.0) * items.len().saturating_sub(1) as f32;
+    let max_content = max_content_items + max_content_gaps;
+    (min_content, max_content.max(min_content))
+}
+
+/// Returns the flex gap contribution used by intrinsic max-content estimates.
+///
+/// CSS Box Alignment resolves cyclic percentage gaps against zero for
+/// intrinsic size contributions, while preserving any non-percentage length
+/// component:
+/// <https://www.w3.org/TR/css-align-3/#gaps>.
+fn estimated_intrinsic_flex_gap(value: css::ComputedGap) -> f32 {
+    match value {
+        css::ComputedGap::Normal => 0.0,
+        css::ComputedGap::LengthPercentage(value) => value.length.max(0.0),
+    }
+}
+
+fn estimated_intrinsic_length_percentage_or_auto(
+    value: css::ComputedLengthPercentageOrAuto,
+    percentage_basis: Option<f32>,
+    min_content: f32,
+    max_content: f32,
+) -> Option<f32> {
+    match value {
+        css::ComputedLengthPercentageOrAuto::Auto => None,
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
+            if value.percent == 0.0 {
+                Some(value.length.max(0.0))
+            } else {
+                percentage_basis.map(|basis| used_length_percentage(value, basis).max(0.0))
+            }
+        }
+        css::ComputedLengthPercentageOrAuto::MinContent => Some(min_content.max(0.0)),
+        css::ComputedLengthPercentageOrAuto::MaxContent => {
+            Some(max_content.max(min_content).max(0.0))
+        }
+        css::ComputedLengthPercentageOrAuto::FitContent(limit) => {
+            let stretch = limit
+                .and_then(|limit| {
+                    percentage_basis.map(|basis| used_length_percentage(limit, basis))
+                })
+                .or_else(|| {
+                    limit
+                        .filter(|limit| limit.percent == 0.0)
+                        .map(|limit| limit.length)
+                })
+                .or(percentage_basis)
+                .unwrap_or(max_content);
+            Some(
+                max_content
+                    .max(min_content)
+                    .max(0.0)
+                    .min(min_content.max(0.0).max(stretch.max(0.0))),
+            )
+        }
+    }
+}
+
+fn reverse_estimated_flex_line_cross_positions(lines: &mut [EstimatedFlexLine]) {
+    let cross_size = lines
+        .iter()
+        .map(|line| line.cross_start + line.cross_size)
+        .fold(0.0f32, f32::max);
+    for line in lines {
+        line.cross_start = (cross_size - line.cross_start - line.cross_size).max(0.0);
+    }
+}
+
+fn stretch_estimated_flex_line_cross_positions(
+    lines: &mut [EstimatedFlexLine],
+    container_cross_size: f32,
+    cross_gap: f32,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let total_line_cross_size = lines.iter().map(|line| line.cross_size).sum::<f32>();
+    let total_gap = cross_gap.max(0.0) * lines.len().saturating_sub(1) as f32;
+    let extra_per_line =
+        ((container_cross_size - total_line_cross_size - total_gap) / lines.len() as f32).max(0.0);
+    let mut cross_start = 0.0;
+    for line in lines {
+        line.cross_start = cross_start;
+        line.cross_size += extra_per_line;
+        cross_start += line.cross_size + cross_gap.max(0.0);
+    }
+}
+
+fn estimated_next_flex_line_cross_start(lines: &[EstimatedFlexLine], cross_gap: f32) -> f32 {
+    lines
+        .last()
+        .map(|line| line.cross_start + line.cross_size + cross_gap)
+        .unwrap_or(0.0)
+}
+
+fn estimated_flex_line(
+    start: usize,
+    end: usize,
+    cross_start: f32,
+    items: &[EstimatedFlexBaselineItem],
+) -> EstimatedFlexLine {
+    let item_indices = (start..end).collect::<Vec<_>>();
+    let cross_size = item_indices
+        .iter()
+        .copied()
+        .map(|index| items[index].outer_cross_size)
+        .fold(0.0f32, f32::max);
+    EstimatedFlexLine {
+        item_indices,
+        cross_start,
+        cross_size,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EstimatedFlexBaselineSet {
+    First,
+    Last,
+}
+
+fn estimated_flex_line_baseline(
+    line: &EstimatedFlexLine,
+    items: &[EstimatedFlexBaselineItem],
+    direction: FlexDirection,
+    baseline_set: EstimatedFlexBaselineSet,
+) -> Option<f32> {
+    estimated_flex_line_baseline_item_index(line, direction, baseline_set).and_then(|index| {
+        let item = items[index];
+        let baseline = match baseline_set {
+            EstimatedFlexBaselineSet::First => item.first_baseline,
+            EstimatedFlexBaselineSet::Last => item.last_baseline,
+        }?;
+        Some(
+            line.cross_start
+                + estimated_flex_item_cross_start_offset(line, item)
+                + item.margin_cross_start
+                + baseline,
+        )
+    })
+}
+
+fn estimated_flex_item_cross_start_offset(
+    line: &EstimatedFlexLine,
+    item: EstimatedFlexBaselineItem,
+) -> f32 {
+    let free_space = (line.cross_size - item.outer_cross_size).max(0.0);
+    match item.cross_alignment {
+        EstimatedFlexItemCrossAlignment::Side(side) if side.is_end_edge() => free_space,
+        EstimatedFlexItemCrossAlignment::Side(_) => 0.0,
+        EstimatedFlexItemCrossAlignment::Center => free_space / 2.0,
+    }
+}
+
+fn estimated_flex_item_cross_alignment(
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+) -> EstimatedFlexItemCrossAlignment {
+    match estimated_effective_align_self(child_style, container_style).keyword {
+        SelfAlignmentKeyword::Center => EstimatedFlexItemCrossAlignment::Center,
+        SelfAlignmentKeyword::End => EstimatedFlexItemCrossAlignment::Side(
+            estimated_flex_base_cross_end_side(container_style),
+        ),
+        SelfAlignmentKeyword::FlexEnd => {
+            EstimatedFlexItemCrossAlignment::Side(estimated_flex_cross_end_side(container_style))
+        }
+        SelfAlignmentKeyword::SelfStart => EstimatedFlexItemCrossAlignment::Side(
+            estimated_child_self_start_side(child_style, container_style),
+        ),
+        SelfAlignmentKeyword::SelfEnd => EstimatedFlexItemCrossAlignment::Side(
+            estimated_child_self_end_side(child_style, container_style),
+        ),
+        SelfAlignmentKeyword::Auto
+        | SelfAlignmentKeyword::Normal
+        | SelfAlignmentKeyword::Start
+        | SelfAlignmentKeyword::FlexStart
+        | SelfAlignmentKeyword::Left
+        | SelfAlignmentKeyword::Right
+        | SelfAlignmentKeyword::Stretch
+        | SelfAlignmentKeyword::Baseline
+        | SelfAlignmentKeyword::LastBaseline => {
+            EstimatedFlexItemCrossAlignment::Side(estimated_flex_cross_start_side(container_style))
+        }
+    }
+}
+
+fn estimated_effective_align_self(
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+) -> AlignSelf {
+    if child_style.align_self.keyword == SelfAlignmentKeyword::Auto {
+        container_style.align_items
+    } else {
+        child_style.align_self
+    }
+}
+
+fn estimated_flex_item_available_space(
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+    physical_direction: FlexDirection,
+    available: FlexAvailableSpace,
+) -> FlexItemAvailableSpace {
+    let mut item_available = FlexItemAvailableSpace::from_container(available);
+    let Some(stretched_cross_size) = estimated_stretched_flex_item_cross_size(
+        child_style,
+        container_style,
+        physical_direction,
+        available,
+    ) else {
+        return item_available;
+    };
+
+    if physical_direction.is_row_axis() {
+        item_available.height = Some(stretched_cross_size);
+        item_available.height_is_definite = true;
+    } else {
+        item_available.width = stretched_cross_size;
+        item_available.width_is_definite = true;
+    }
+    item_available
+}
+
+fn estimated_stretched_flex_item_cross_size(
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+    physical_direction: FlexDirection,
+    available: FlexAvailableSpace,
+) -> Option<f32> {
+    if !matches!(
+        estimated_effective_align_self(child_style, container_style).keyword,
+        SelfAlignmentKeyword::Auto | SelfAlignmentKeyword::Normal | SelfAlignmentKeyword::Stretch
+    ) || estimated_flex_item_has_auto_cross_margin(child_style, physical_direction)
+    {
+        return None;
+    }
+
+    if physical_direction.is_row_axis() {
+        if !child_style.box_values.height.is_auto() {
+            return None;
+        }
+        let container_cross_size = available.height.filter(|_| available.height_is_definite)?;
+        Some((container_cross_size - child_style.margin.top - child_style.margin.bottom).max(0.0))
+    } else {
+        if !child_style.box_values.width.is_auto() {
+            return None;
+        }
+        let container_cross_size = available.width_is_definite.then_some(available.width)?;
+        Some((container_cross_size - child_style.margin.left - child_style.margin.right).max(0.0))
+    }
+}
+
+fn estimated_flex_item_has_auto_cross_margin(
+    style: &ComputedStyle,
+    physical_direction: FlexDirection,
+) -> bool {
+    if physical_direction.is_row_axis() {
+        style.box_values.margin.top.is_auto() || style.box_values.margin.bottom.is_auto()
+    } else {
+        style.box_values.margin.left.is_auto() || style.box_values.margin.right.is_auto()
+    }
+}
+
+fn estimated_flex_base_cross_start_side(style: &ComputedStyle) -> PhysicalSide {
+    if style.flex_direction.is_row_axis() {
+        block_start_side(style.writing_mode)
+    } else {
+        inline_start_side(style.writing_mode, style.direction)
+    }
+}
+
+fn estimated_flex_base_cross_end_side(style: &ComputedStyle) -> PhysicalSide {
+    if style.flex_direction.is_row_axis() {
+        block_end_side(style.writing_mode)
+    } else {
+        inline_end_side(style.writing_mode, style.direction)
+    }
+}
+
+fn estimated_flex_cross_start_side(style: &ComputedStyle) -> PhysicalSide {
+    if style.flex_wrap == FlexWrap::WrapReverse {
+        estimated_flex_base_cross_end_side(style)
+    } else {
+        estimated_flex_base_cross_start_side(style)
+    }
+}
+
+fn estimated_flex_cross_end_side(style: &ComputedStyle) -> PhysicalSide {
+    if style.flex_wrap == FlexWrap::WrapReverse {
+        estimated_flex_base_cross_start_side(style)
+    } else {
+        estimated_flex_base_cross_end_side(style)
+    }
+}
+
+fn estimated_child_self_start_side(
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+) -> PhysicalSide {
+    let cross_axis = estimated_flex_base_cross_start_side(container_style).axis();
+    let block_start = block_start_side(child_style.writing_mode);
+    if block_start.axis() == cross_axis {
+        block_start
+    } else {
+        inline_start_side(child_style.writing_mode, child_style.direction)
+    }
+}
+
+fn estimated_child_self_end_side(
+    child_style: &ComputedStyle,
+    container_style: &ComputedStyle,
+) -> PhysicalSide {
+    let cross_axis = estimated_flex_base_cross_start_side(container_style).axis();
+    let block_end = block_end_side(child_style.writing_mode);
+    if block_end.axis() == cross_axis {
+        block_end
+    } else {
+        inline_end_side(child_style.writing_mode, child_style.direction)
+    }
+}
+
+fn estimated_flex_line_baseline_item_index(
+    line: &EstimatedFlexLine,
+    direction: FlexDirection,
+    baseline_set: EstimatedFlexBaselineSet,
+) -> Option<usize> {
+    match (baseline_set, direction) {
+        (EstimatedFlexBaselineSet::First, FlexDirection::Row | FlexDirection::RowReverse) => {
+            line.item_indices.first().copied()
+        }
+        (EstimatedFlexBaselineSet::First, FlexDirection::Column) => {
+            line.item_indices.first().copied()
+        }
+        (EstimatedFlexBaselineSet::First, FlexDirection::ColumnReverse) => {
+            line.item_indices.last().copied()
+        }
+        (EstimatedFlexBaselineSet::Last, FlexDirection::Row | FlexDirection::RowReverse) => {
+            line.item_indices.last().copied()
+        }
+        (EstimatedFlexBaselineSet::Last, FlexDirection::Column) => {
+            line.item_indices.last().copied()
+        }
+        (EstimatedFlexBaselineSet::Last, FlexDirection::ColumnReverse) => {
+            line.item_indices.first().copied()
+        }
+    }
+}
+
+fn estimated_flex_main_content_size(
+    style: &ComputedStyle,
+    size: FlexItemEstimate,
+    direction: FlexDirection,
+    percentage_basis: Option<f32>,
+) -> f32 {
+    let (preferred_size, min_size, specified_size) = if direction.is_row_axis() {
+        (size.content_width, size.min_width, style.box_values.width)
+    } else {
+        (
+            size.content_height,
+            size.min_height,
+            style.box_values.height,
+        )
+    };
+
+    match style.flex_basis {
+        css::ComputedFlexBasis::LengthPercentage(value) => {
+            if value.percent != 0.0 && percentage_basis.is_none() {
+                preferred_size
+            } else {
+                used_length_percentage(value, percentage_basis.unwrap_or(0.0))
+            }
+        }
+        css::ComputedFlexBasis::Content | css::ComputedFlexBasis::MaxContent => preferred_size,
+        css::ComputedFlexBasis::MinContent => min_size,
+        css::ComputedFlexBasis::FitContent(limit) => {
+            let limit = limit
+                .map(|limit| used_length_percentage(limit, percentage_basis.unwrap_or(0.0)))
+                .or(percentage_basis)
+                .unwrap_or(preferred_size);
+            preferred_size
+                .max(0.0)
+                .min(min_size.max(0.0).max(limit.max(0.0)))
+        }
+        css::ComputedFlexBasis::Auto => {
+            used_length_percentage_or_auto_with_optional_basis(specified_size, percentage_basis)
+                .unwrap_or(preferred_size)
+        }
     }
 }

@@ -28,9 +28,16 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> (f32, f32) {
-        let children = child_boxes
-            .map(flex_children_from_boxes)
-            .unwrap_or_else(|| flex_children(element, style, stylesheets, &self.ancestors));
+        let built_child_boxes;
+        let child_boxes = if let Some(child_boxes) = child_boxes {
+            child_boxes
+        } else {
+            built_child_boxes =
+                box_tree::build_child_boxes(element, stylesheets, style, &self.ancestors);
+            &built_child_boxes
+        };
+        let container_signature = self.flex_container_signature(element);
+        let children = flex_children_from_boxes(element, &container_signature, style, child_boxes);
         let intrinsic = self.estimate_intrinsic_flex_container_size(
             &children,
             style,
@@ -50,29 +57,10 @@ impl<'a> LayoutBuilder<'a> {
         (intrinsic.min_width.max(0.0), intrinsic.width.max(0.0))
     }
 
-    /// Estimate the shrink-to-fit content width of a flex container.
-    ///
-    /// CSS 2.2 uses shrink-to-fit sizing for floats and absolutely positioned
-    /// boxes with automatic inline size, while CSS Flexbox defines flex
-    /// container intrinsic sizes from flex item max-content and min-content
-    /// contributions:
-    /// <https://www.w3.org/TR/CSS22/visudet.html#float-width> and
-    /// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-sizes>.
-    pub(super) fn estimate_flex_shrink_to_fit_width(
-        &mut self,
-        element: &Element,
-        style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
-        available_width: f32,
-        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
-    ) -> f32 {
-        let (min_width, width) = self.estimate_flex_intrinsic_widths(
-            element,
-            style,
-            stylesheets,
-            available_width,
-            child_boxes,
-        );
-        intrinsic::shrink_to_fit_width(min_width, width, available_width.max(0.0))
+    fn flex_container_signature(&self, element: &Element) -> ElementSignature {
+        self.ancestors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| ElementSignature::new(element.tag.clone(), element.attrs.clone()))
     }
 }

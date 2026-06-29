@@ -241,18 +241,28 @@ fn split_block_in_inline_child<'a>(child: FormattingBox<'a>) -> Vec<FormattingBo
 fn split_inline_box_around_blocks<'a>(mut box_: InlineBox<'a>) -> Vec<FormattingBox<'a>> {
     let mut output = Vec::new();
     let mut inline_run = Vec::new();
+    let mut saw_block = false;
     let children = std::mem::take(&mut box_.children);
     for child in children {
         for part in split_block_in_inline_child(child) {
             if is_in_flow_block_level_box(&part) {
-                flush_split_inline_run(&mut output, &mut inline_run, &box_);
+                let fragment_edges = InlineBoxFragmentEdges {
+                    owns_start: !saw_block && box_.fragment_edges.owns_start,
+                    owns_end: false,
+                };
+                flush_split_inline_run(&mut output, &mut inline_run, &box_, fragment_edges);
                 output.push(part);
+                saw_block = true;
             } else {
                 inline_run.push(part);
             }
         }
     }
-    flush_split_inline_run(&mut output, &mut inline_run, &box_);
+    let fragment_edges = InlineBoxFragmentEdges {
+        owns_start: !saw_block && box_.fragment_edges.owns_start,
+        owns_end: box_.fragment_edges.owns_end,
+    };
+    flush_split_inline_run(&mut output, &mut inline_run, &box_, fragment_edges);
     output
 }
 
@@ -260,9 +270,10 @@ fn flush_split_inline_run<'a>(
     output: &mut Vec<FormattingBox<'a>>,
     inline_run: &mut Vec<FormattingBox<'a>>,
     box_: &InlineBox<'a>,
+    fragment_edges: InlineBoxFragmentEdges,
 ) {
     trim_split_inline_run_edges(inline_run);
-    if inline_run.is_empty() {
+    if inline_run.is_empty() && !split_inline_fragment_has_owned_edge(&box_.style, fragment_edges) {
         return;
     }
     output.push(FormattingBox::Inline(InlineBox {
@@ -270,8 +281,44 @@ fn flush_split_inline_run<'a>(
         signature: box_.signature.clone(),
         style: box_.style.clone(),
         marker: box_.marker.clone(),
+        fragment_edges,
         children: std::mem::take(inline_run),
     }));
+}
+
+fn split_inline_fragment_has_owned_edge(
+    style: &ComputedStyle,
+    fragment_edges: InlineBoxFragmentEdges,
+) -> bool {
+    (fragment_edges.owns_start
+        && inline_box_edge_has_nonzero_component(style, InlineBoxEdge::Start))
+        || (fragment_edges.owns_end
+            && inline_box_edge_has_nonzero_component(style, InlineBoxEdge::End))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InlineBoxEdge {
+    Start,
+    End,
+}
+
+fn inline_box_edge_has_nonzero_component(style: &ComputedStyle, edge: InlineBoxEdge) -> bool {
+    let borders = used_border_widths(style);
+    let (margin, border, padding) = match (style.direction, edge) {
+        (Direction::Ltr, InlineBoxEdge::Start) => {
+            (style.margin.left, borders.left, style.padding.left)
+        }
+        (Direction::Ltr, InlineBoxEdge::End) => {
+            (style.margin.right, borders.right, style.padding.right)
+        }
+        (Direction::Rtl, InlineBoxEdge::Start) => {
+            (style.margin.right, borders.right, style.padding.right)
+        }
+        (Direction::Rtl, InlineBoxEdge::End) => {
+            (style.margin.left, borders.left, style.padding.left)
+        }
+    };
+    margin.abs() > 0.001 || border.abs() > 0.001 || padding.abs() > 0.001
 }
 
 /// Trim collapsible whitespace exposed by splitting an inline around a block.
@@ -406,17 +453,33 @@ pub(crate) fn flush_anonymous_table<'a>(
     else {
         return;
     };
+    let mut style = anonymous_table_style(parent_style);
+    if parent_style.display.is_inline_level() {
+        style.display = Display::INLINE_TABLE;
+    }
     let fragment = build_table_fragment(element, signature, &children);
     // CSS 2.2 table model: internal table boxes that lack a table parent
-    // generate an anonymous table wrapper object around the consecutive run.
-    normalized.push(FormattingBox::Table(TableBox {
-        element,
-        signature: signature.clone(),
-        style: anonymous_table_style(parent_style),
-        marker: None,
-        children,
-        fragment,
-    }));
+    // generate an anonymous `table` wrapper, or an `inline-table` wrapper when
+    // the missing parent is generated inside an inline box.
+    if style.display.is_inline_level() {
+        normalized.push(FormattingBox::AtomicInline(AtomicInlineBox {
+            element,
+            signature: signature.clone(),
+            style,
+            marker: None,
+            children,
+            table_fragment: Some(fragment),
+        }));
+    } else {
+        normalized.push(FormattingBox::Table(TableBox {
+            element,
+            signature: signature.clone(),
+            style,
+            marker: None,
+            children,
+            fragment,
+        }));
+    }
 }
 
 pub(crate) fn anonymous_table_style(parent_style: &ComputedStyle) -> ComputedStyle {

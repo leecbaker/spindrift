@@ -67,42 +67,6 @@ pub(super) struct ImageResourceData {
     pub(super) alpha: Option<Vec<u8>>,
 }
 
-pub(super) fn image_object_dictionary(
-    pixel_width: u32,
-    pixel_height: u32,
-    interpolate: bool,
-    rgb: &[u8],
-    alpha_mask_id: Option<usize>,
-) -> Vec<u8> {
-    let soft_mask = alpha_mask_id
-        .map(|id| format!(" /SMask {id} 0 R"))
-        .unwrap_or_default();
-    let mut object = format!(
-        "<< /Type /XObject /Subtype /Image /Width {pixel_width} /Height {pixel_height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Interpolate {interpolate}{soft_mask} /Length {} >>\nstream\n",
-        rgb.len()
-    )
-    .into_bytes();
-    object.extend_from_slice(rgb);
-    object.extend_from_slice(b"\nendstream\n");
-    object
-}
-
-pub(super) fn image_alpha_mask_object(
-    pixel_width: u32,
-    pixel_height: u32,
-    interpolate: bool,
-    alpha: &[u8],
-) -> Vec<u8> {
-    let mut object = format!(
-        "<< /Type /XObject /Subtype /Image /Width {pixel_width} /Height {pixel_height} /ColorSpace /DeviceGray /BitsPerComponent 8 /Interpolate {interpolate} /Length {} >>\nstream\n",
-        alpha.len()
-    )
-    .into_bytes();
-    object.extend_from_slice(alpha);
-    object.extend_from_slice(b"\nendstream\n");
-    object
-}
-
 /// Return the PDF graphics-state resource name for a semi-transparent color.
 ///
 /// PDF 1.4 transparency uses ExtGState dictionaries with stroking (`CA`) and
@@ -112,14 +76,42 @@ pub(super) fn paint_alpha_resource_name(color: Color) -> Option<String> {
     alpha_key(color).map(|key| format!("GSalpha{key:03}"))
 }
 
-/// Build a page-local `/ExtGState` resource dictionary for alpha paints.
+/// Plan a page-local `/ExtGState` resource for alpha paints.
 ///
-/// PDF page resources can contain direct ExtGState dictionaries, and content
-/// streams activate them with the `gs` operator:
+/// PDF page resource dictionaries name ExtGState resources, and content streams
+/// activate them with the `gs` operator:
 /// ISO 32000-1:2008, 7.8.3 "Resource Dictionaries" and 8.4.5 "Graphics State
 /// Parameter Dictionaries".
-pub(super) fn page_ext_gstate_resource_dictionary(page: &Page) -> String {
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum ExtGStateResource {
+    Alpha {
+        name: String,
+        alpha: f32,
+    },
+    Blend {
+        name: String,
+        mode: crate::document::PaintBlendMode,
+    },
+}
+
+impl ExtGStateResource {
+    pub(super) fn name(&self) -> &str {
+        match self {
+            Self::Alpha { name, .. } | Self::Blend { name, .. } => name,
+        }
+    }
+}
+
+/// Collect page-local `/ExtGState` resource entries for alpha and blend modes.
+///
+/// PDF 1.4 transparency uses ExtGState dictionaries with stroking (`CA`) and
+/// nonstroking (`ca`) alpha constants, and blend modes are selected with the
+/// `/BM` graphics-state parameter:
+/// ISO 32000-1:2008, 8.4.5 "Graphics State Parameter Dictionaries" and
+/// 11.3.5 "Blend Mode".
+pub(super) fn page_ext_gstate_resources(page: &Page) -> Vec<ExtGStateResource> {
     let mut alpha_keys = BTreeMap::new();
+    let mut blend_modes = BTreeMap::new();
     for rect in &page.rects {
         if let Some(fill) = rect.fill {
             collect_alpha_key(&mut alpha_keys, fill);
@@ -143,20 +135,28 @@ pub(super) fn page_ext_gstate_resource_dictionary(page: &Page) -> String {
         collect_alpha_key(&mut alpha_keys, line.color);
     }
     if let Some(tree) = page.paint_tree() {
-        collect_paint_tree_alpha_keys(&mut alpha_keys, &tree.root);
+        collect_paint_tree_ext_gstates(&mut alpha_keys, &mut blend_modes, &tree.root);
     }
-    if alpha_keys.is_empty() {
-        return String::new();
+    if alpha_keys.is_empty() && blend_modes.is_empty() {
+        return Vec::new();
     }
-    let entries = alpha_keys
+    let mut entries = alpha_keys
         .into_keys()
         .map(|key| {
             let alpha = key as f32 / 1000.0;
-            format!("/GSalpha{key:03} << /Type /ExtGState /ca {alpha:.3} /CA {alpha:.3} >>")
+            ExtGStateResource::Alpha {
+                name: format!("GSalpha{key:03}"),
+                alpha,
+            }
         })
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(" /ExtGState << {entries} >>")
+        .collect::<Vec<_>>();
+    entries.extend(blend_modes.into_keys().filter_map(|mode| {
+        Some(ExtGStateResource::Blend {
+            name: mode.resource_name()?,
+            mode,
+        })
+    }));
+    entries
 }
 
 fn collect_alpha_key(alpha_keys: &mut BTreeMap<u16, ()>, color: Color) {
@@ -177,15 +177,19 @@ fn collect_opacity_key(alpha_keys: &mut BTreeMap<u16, ()>, opacity: f32) {
     );
 }
 
-fn collect_paint_tree_alpha_keys(
+fn collect_paint_tree_ext_gstates(
     alpha_keys: &mut BTreeMap<u16, ()>,
+    blend_modes: &mut BTreeMap<crate::document::PaintBlendMode, ()>,
     context: &crate::document::PaintStackingContext,
 ) {
     collect_opacity_key(alpha_keys, context.effects.opacity);
+    if context.effects.blend_mode != crate::document::PaintBlendMode::Normal {
+        blend_modes.insert(context.effects.blend_mode, ());
+    }
     for band in crate::document::PaintBand::ORDER {
         for item in &context.bands.bands[band.index()] {
             if let crate::document::PaintDisplayItem::StackingContext(child) = item {
-                collect_paint_tree_alpha_keys(alpha_keys, child);
+                collect_paint_tree_ext_gstates(alpha_keys, blend_modes, child);
             }
         }
     }
@@ -197,33 +201,4 @@ fn alpha_key(color: Color) -> Option<u16> {
     } else {
         None
     }
-}
-
-pub(super) fn annotation_dictionary(link: &RenderedLink) -> String {
-    format!(
-        "<< /Type /Annot /Subtype /Link /Rect [{:.3} {:.3} {:.3} {:.3}] /Border [0 0 0] /A << /S /URI /URI ({}) >> >>\n",
-        link.x,
-        link.y,
-        link.x + link.width,
-        link.y + link.height,
-        escape_pdf_string(&link.target)
-    )
-}
-
-pub(super) fn info_dictionary(document: &Document) -> String {
-    let mut info = format!(
-        "<< /Producer ({})",
-        escape_pdf_string(&document.metadata.producer)
-    );
-    if let Some(title) = &document.metadata.title {
-        info.push_str(&format!(" /Title ({})", escape_pdf_string(title)));
-    }
-    if let Some(author) = &document.metadata.author {
-        info.push_str(&format!(" /Author ({})", escape_pdf_string(author)));
-    }
-    if let Some(creator) = &document.metadata.creator {
-        info.push_str(&format!(" /Creator ({})", escape_pdf_string(creator)));
-    }
-    info.push_str(" >>\n");
-    info
 }

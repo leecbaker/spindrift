@@ -35,6 +35,9 @@ pub(super) fn parse_font_faces(css: &Css) -> Vec<CssFontFace> {
                 faces.push(CssFontFace {
                     family,
                     sources,
+                    unicode_range: declarations
+                        .get("unicode-range")
+                        .and_then(|value| parse_unicode_range(value)),
                     weight: declarations
                         .get("font-weight")
                         .and_then(|value| parse_font_weight(value, FontWeight::NORMAL))
@@ -67,6 +70,64 @@ pub(super) fn parse_font_faces(css: &Css) -> Vec<CssFontFace> {
         rest = &rest[close + 1..];
     }
     faces
+}
+
+/// Parse CSS Fonts' `unicode-range` descriptor.
+///
+/// The descriptor is an inclusive comma-separated list of `U+` ranges, single
+/// code points, or wildcard ranges. Font matching later treats absent
+/// `unicode-range` as the full Unicode scalar range:
+/// <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>.
+pub(crate) fn parse_unicode_range(value: &str) -> Option<Vec<UnicodeRange>> {
+    let ranges = value
+        .split(',')
+        .map(|part| parse_unicode_range_part(part.trim()))
+        .collect::<Option<Vec<_>>>()?;
+    (!ranges.is_empty()).then_some(ranges)
+}
+
+fn parse_unicode_range_part(value: &str) -> Option<UnicodeRange> {
+    let body = value
+        .strip_prefix("U+")
+        .or_else(|| value.strip_prefix("u+"))?
+        .trim();
+    if body.is_empty() || !body.is_ascii() {
+        return None;
+    }
+    if body.contains('?') {
+        return parse_wildcard_unicode_range(body);
+    }
+    if let Some((start, end)) = body.split_once('-') {
+        let start = parse_unicode_scalar_hex(start.trim())?;
+        let end = parse_unicode_scalar_hex(end.trim())?;
+        return (start <= end).then_some(UnicodeRange { start, end });
+    }
+    let scalar = parse_unicode_scalar_hex(body)?;
+    Some(UnicodeRange {
+        start: scalar,
+        end: scalar,
+    })
+}
+
+fn parse_wildcard_unicode_range(body: &str) -> Option<UnicodeRange> {
+    if body.len() > 6
+        || !body
+            .bytes()
+            .all(|byte| byte == b'?' || byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let start = parse_unicode_scalar_hex(&body.replace('?', "0"))?;
+    let end = parse_unicode_scalar_hex(&body.replace('?', "F"))?;
+    (start <= end).then_some(UnicodeRange { start, end })
+}
+
+fn parse_unicode_scalar_hex(value: &str) -> Option<u32> {
+    if value.is_empty() || value.len() > 6 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let scalar = u32::from_str_radix(value, 16).ok()?;
+    (scalar <= UnicodeRange::ALL.end).then_some(scalar)
 }
 
 fn apply_font_face_variant_descriptors(face: &mut CssFontFace, declarations: &Declarations) {

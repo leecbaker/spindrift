@@ -26,103 +26,7 @@ pub(super) fn push_inline_words_for_style(
     } else {
         style
     };
-    if style.white_space.collapses_spaces() {
-        push_collapsed_inline_text(text, style, link_target, baseline_shift, output);
-    } else {
-        for text in normalize_pre_wrap_text_for_style(text, style).split_inclusive('\n') {
-            let line = text.strip_suffix('\n').unwrap_or(text);
-            push_preserved_inline_text(line, style, link_target.clone(), baseline_shift, output);
-            if text.ends_with('\n') {
-                trim_trailing_inline_spaces(output);
-                output.push(InlineItem::Break);
-            }
-        }
-    }
-}
-
-fn push_collapsed_inline_text(
-    text: &str,
-    style: &ComputedStyle,
-    link_target: Option<String>,
-    baseline_shift: f32,
-    output: &mut Vec<InlineItem>,
-) {
-    let mut word = String::new();
-    let text = dom::decode_entities_public(text)
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
-    for character in text.chars() {
-        if character == INLINE_BREAK
-            || (style.white_space.preserves_newlines() && matches!(character, '\n' | '\r'))
-        {
-            push_inline_text_run(&word, style, link_target.clone(), baseline_shift, output);
-            word.clear();
-            trim_trailing_inline_spaces(output);
-            output.push(InlineItem::Break);
-        } else if is_css_collapsible_whitespace(character) {
-            push_inline_text_run(&word, style, link_target.clone(), baseline_shift, output);
-            word.clear();
-            push_collapsed_inline_space(style, link_target.clone(), baseline_shift, output);
-        } else {
-            word.push(character);
-        }
-    }
-    push_inline_text_run(&word, style, link_target, baseline_shift, output);
-}
-
-fn push_preserved_inline_text(
-    text: &str,
-    style: &ComputedStyle,
-    link_target: Option<String>,
-    baseline_shift: f32,
-    output: &mut Vec<InlineItem>,
-) {
-    if style.white_space == WhiteSpace::BreakSpaces {
-        for character in text.chars() {
-            let mut buffer = [0; 4];
-            let text = character.encode_utf8(&mut buffer);
-            push_inline_text_run(text, style, link_target.clone(), baseline_shift, output);
-        }
-        return;
-    }
-
-    let mut run = String::new();
-    let mut run_is_space = false;
-    for character in text.chars() {
-        let character_is_space = character == ' ' || character == '\t';
-        if run.is_empty() {
-            run_is_space = character_is_space;
-        } else if run_is_space != character_is_space {
-            push_inline_text_run(&run, style, link_target.clone(), baseline_shift, output);
-            run.clear();
-            run_is_space = character_is_space;
-        }
-        run.push(character);
-    }
-    push_inline_text_run(&run, style, link_target, baseline_shift, output);
-}
-
-fn push_collapsed_inline_space(
-    style: &ComputedStyle,
-    link_target: Option<String>,
-    baseline_shift: f32,
-    output: &mut Vec<InlineItem>,
-) {
-    if output.is_empty()
-        || output.last().is_some_and(|item| {
-            matches!(item, InlineItem::Break) || inline_item_is_collapsible_space(item)
-        })
-    {
-        return;
-    }
-    output.push(InlineItem::Word(Box::new(InlineWord {
-        text: " ".to_string(),
-        style: style.clone(),
-        baseline_shift,
-        link_target,
-        mergeable: true,
-        hanging_edges: InlineHangingEdges::default(),
-    })));
+    push_inline_text_run(text, style, link_target, baseline_shift, output);
 }
 
 fn push_inline_text_run(
@@ -133,15 +37,304 @@ fn push_inline_text_run(
     output: &mut Vec<InlineItem>,
 ) {
     if !text.is_empty() {
-        let text = text_with_visible_control_characters(text);
         output.push(InlineItem::Word(Box::new(InlineWord {
-            text,
+            text: text.to_string(),
             style: style.clone(),
             baseline_shift,
             link_target: link_target.clone(),
             mergeable: true,
+            source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
         })));
+    }
+}
+
+/// Normalize one collected inline paragraph with CSS Text whitespace phases.
+///
+/// Inline collection preserves source text, generated content, inline edges,
+/// bidi controls, and atomic boxes as a single item stream. This processor runs
+/// before autospace and graph construction so segment-break transformation and
+/// whitespace collapse can see across text nodes and transparent inline box
+/// edges:
+/// <https://www.w3.org/TR/css-text-3/#white-space-processing>.
+pub(in crate::layout) fn normalize_inline_whitespace_items(items: &mut Vec<InlineItem>) {
+    let mut processor = InlineWhitespaceProcessor::default();
+    for item in std::mem::take(items) {
+        processor.push_item(item);
+    }
+    processor.flush();
+    *items = processor.output;
+}
+
+#[derive(Default)]
+struct InlineWhitespaceProcessor {
+    output: Vec<InlineItem>,
+    run: String,
+    run_meta: Option<InlineTextRunMeta>,
+    run_is_document_space: bool,
+    last_text_character: Option<char>,
+    pending_segment_break: Option<InlineTextRunMeta>,
+    pending_forced_segment_break: bool,
+}
+
+#[derive(Clone)]
+struct InlineTextRunMeta {
+    style: ComputedStyle,
+    baseline_shift: f32,
+    link_target: Option<String>,
+    mergeable: bool,
+    source: InlineTextSource,
+    hanging_edges: InlineHangingEdges,
+}
+
+#[derive(Clone, Copy)]
+struct IntrinsicInlineCollectionContext<'a> {
+    baseline_shift: f32,
+    block_style: &'a ComputedStyle,
+    propagated_decoration: css::TextDecoration,
+}
+
+impl<'a> IntrinsicInlineCollectionContext<'a> {
+    fn with_baseline_shift(self, baseline_shift: f32) -> Self {
+        Self {
+            baseline_shift,
+            ..self
+        }
+    }
+
+    fn with_block_style(self, block_style: &'a ComputedStyle) -> Self {
+        Self {
+            block_style,
+            ..self
+        }
+    }
+
+    fn with_propagated_decoration(self, propagated_decoration: css::TextDecoration) -> Self {
+        Self {
+            propagated_decoration,
+            ..self
+        }
+    }
+}
+
+impl InlineWhitespaceProcessor {
+    fn push_item(&mut self, item: InlineItem) {
+        let role = inline_item_boundary_role(&item);
+        match role {
+            InlineBoundaryRole::Text => {
+                let InlineItem::Word(word) = item else {
+                    unreachable!("text boundary role must come from a word")
+                };
+                self.push_word(*word);
+            }
+            InlineBoundaryRole::TransparentTextBoundary
+            | InlineBoundaryRole::PageScopeStart
+            | InlineBoundaryRole::PageScopeEnd => {
+                debug_assert!(role.is_transparent_to_whitespace());
+                self.flush_run();
+                self.output.push(item);
+            }
+            InlineBoundaryRole::OpaqueAtomic
+            | InlineBoundaryRole::IndependentFormattingContext
+            | InlineBoundaryRole::Float => {
+                self.resolve_pending_before_boundary();
+                self.flush_run();
+                self.output.push(item);
+                if role.resets_text_context() {
+                    self.reset_text_context();
+                }
+            }
+            InlineBoundaryRole::ForcedBreak => {
+                self.discard_pending_segment_breaks();
+                self.emit_forced_break();
+            }
+        }
+    }
+
+    fn push_word(&mut self, word: InlineWord) {
+        let meta = InlineTextRunMeta {
+            style: word.style,
+            baseline_shift: word.baseline_shift,
+            link_target: word.link_target,
+            mergeable: word.mergeable,
+            source: word.source,
+            hanging_edges: word.hanging_edges,
+        };
+        let text = dom::decode_entities_public(&word.text);
+        let mut chars = text.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character == '\r' {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                self.push_segment_break(&meta, false);
+            } else if character == '\n' || character == '\u{000c}' {
+                self.push_segment_break(&meta, false);
+            } else if character == INLINE_BREAK {
+                self.push_segment_break(&meta, true);
+            } else if meta.style.white_space.collapses_spaces() && matches!(character, ' ' | '\t') {
+                self.push_collapsible_space(&meta);
+            } else {
+                self.push_text_character(character, &meta);
+            }
+        }
+    }
+
+    fn push_segment_break(&mut self, meta: &InlineTextRunMeta, forced: bool) {
+        if forced || meta.style.white_space.preserves_newlines() {
+            if self.pending_forced_segment_break {
+                self.emit_forced_break();
+            }
+            self.flush_run();
+            self.pending_segment_break = None;
+            self.pending_forced_segment_break = true;
+        } else if meta.style.white_space.collapses_spaces() {
+            self.flush_run();
+            self.pending_segment_break = Some(meta.clone());
+        } else {
+            self.push_text_character('\n', meta);
+        }
+    }
+
+    fn push_collapsible_space(&mut self, meta: &InlineTextRunMeta) {
+        if self.pending_forced_segment_break || self.pending_segment_break.is_some() {
+            return;
+        }
+        self.flush_run();
+        if self.output_ends_at_space_or_line_start() {
+            return;
+        }
+        self.push_word_run(" ", meta);
+        self.last_text_character = Some(' ');
+    }
+
+    fn push_text_character(&mut self, character: char, meta: &InlineTextRunMeta) {
+        self.resolve_pending_before_character(character);
+        if meta.style.white_space == WhiteSpace::BreakSpaces {
+            self.flush_run();
+            let mut buffer = [0; 4];
+            self.push_word_run(character.encode_utf8(&mut buffer), meta);
+        } else {
+            let character_is_document_space = matches!(character, ' ' | '\t');
+            if self.run.is_empty() {
+                self.run_meta = Some(meta.clone());
+                self.run_is_document_space = character_is_document_space;
+            } else if self.run_is_document_space != character_is_document_space
+                || !self.run_meta_matches(meta)
+            {
+                self.flush_run();
+                self.run_meta = Some(meta.clone());
+                self.run_is_document_space = character_is_document_space;
+            }
+            self.run.push(character);
+        }
+        if !character_is_bidi_format_control(character) {
+            self.last_text_character = Some(character);
+        }
+    }
+
+    fn resolve_pending_before_character(&mut self, next: char) {
+        if self.pending_forced_segment_break {
+            self.emit_forced_break();
+        }
+        let Some(meta) = self.pending_segment_break.take() else {
+            return;
+        };
+        if self
+            .last_text_character
+            .is_some_and(character_is_autospace_ideograph)
+            && character_is_autospace_ideograph(next)
+        {
+            return;
+        }
+        self.push_collapsible_space(&meta);
+    }
+
+    fn resolve_pending_before_boundary(&mut self) {
+        if self.pending_forced_segment_break {
+            self.emit_forced_break();
+        }
+        if let Some(meta) = self.pending_segment_break.take()
+            && self.last_text_character.is_some()
+        {
+            self.push_collapsible_space(&meta);
+        }
+    }
+
+    fn emit_forced_break(&mut self) {
+        self.flush_run();
+        self.pending_forced_segment_break = false;
+        self.pending_segment_break = None;
+        trim_trailing_inline_spaces(&mut self.output);
+        self.output.push(InlineItem::Break);
+        self.last_text_character = None;
+    }
+
+    fn flush(&mut self) {
+        self.flush_run();
+        self.discard_pending_segment_breaks();
+    }
+
+    fn flush_run(&mut self) {
+        if self.run.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.run);
+        let meta = self
+            .run_meta
+            .take()
+            .expect("non-empty inline text run must carry metadata");
+        self.push_word_run(&text, &meta);
+    }
+
+    fn push_word_run(&mut self, text: &str, meta: &InlineTextRunMeta) {
+        if text.is_empty() {
+            return;
+        }
+        let text = text_with_visible_control_characters(text);
+        self.output.push(InlineItem::Word(Box::new(InlineWord {
+            text,
+            style: meta.style.clone(),
+            baseline_shift: meta.baseline_shift,
+            link_target: meta.link_target.clone(),
+            mergeable: meta.mergeable,
+            source: meta.source,
+            hanging_edges: meta.hanging_edges,
+        })));
+    }
+
+    fn run_meta_matches(&self, meta: &InlineTextRunMeta) -> bool {
+        self.run_meta.as_ref().is_some_and(|current| {
+            current.style == meta.style
+                && current.baseline_shift == meta.baseline_shift
+                && current.link_target == meta.link_target
+                && current.mergeable == meta.mergeable
+                && current.source == meta.source
+                && current.hanging_edges == meta.hanging_edges
+        })
+    }
+
+    fn discard_pending_segment_breaks(&mut self) {
+        self.pending_segment_break = None;
+        self.pending_forced_segment_break = false;
+    }
+
+    fn reset_text_context(&mut self) {
+        self.last_text_character = None;
+        self.discard_pending_segment_breaks();
+    }
+
+    fn output_ends_at_space_or_line_start(&self) -> bool {
+        for item in self.output.iter().rev() {
+            match item {
+                InlineItem::Atom(atom) if atom.content.is_box_edge() => {}
+                InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd => {}
+                InlineItem::Word(_) => return inline_item_is_collapsible_space(item),
+                InlineItem::Break => return true,
+                InlineItem::Atom(_) | InlineItem::Float(_) => return false,
+            }
+        }
+        true
     }
 }
 
@@ -253,8 +446,11 @@ impl<'a> LayoutBuilder<'a> {
                     child_boxes,
                     stylesheets,
                     None,
-                    0.0,
-                    style.text_decoration,
+                    IntrinsicInlineCollectionContext {
+                        baseline_shift: 0.0,
+                        block_style: style,
+                        propagated_decoration: style.text_decoration,
+                    },
                     &mut items,
                 );
             }
@@ -293,8 +489,11 @@ impl<'a> LayoutBuilder<'a> {
             children,
             stylesheets,
             None,
-            0.0,
-            style.text_decoration,
+            IntrinsicInlineCollectionContext {
+                baseline_shift: 0.0,
+                block_style: style,
+                propagated_decoration: style.text_decoration,
+            },
             &mut items,
         );
         items
@@ -306,42 +505,53 @@ impl<'a> LayoutBuilder<'a> {
         block_style: &ComputedStyle,
         available_width: f32,
     ) -> inline_layout::InlineIntrinsicMeasurement {
+        normalize_inline_whitespace_items(&mut items);
         insert_text_autospace_items(&mut items);
         trim_inline_item_edges(&mut items);
         let context = InlineParagraphContext {
             block_style,
+            stylesheets: &[],
             available_width: available_width.max(1.0),
             padding_left: 0.0,
             hanging_indent: 0.0,
             hanging_punctuation_reserve: 0.0,
         };
         let mut output = inline_layout::InlineIntrinsicMeasurement::default();
+        output.sequence.available_width = context.available_width;
         let mut paragraph = Vec::new();
+        let mut starts_after_forced_break = false;
         for item in items {
-            match item {
-                InlineItem::Break => {
+            match inline_item_boundary_role(&item) {
+                InlineBoundaryRole::ForcedBreak => {
                     self.flush_intrinsic_inline_measurement_paragraph(
                         &mut paragraph,
                         context,
                         true,
+                        starts_after_forced_break,
                         &mut output,
                     );
+                    starts_after_forced_break = true;
                 }
-                InlineItem::Float(_) | InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd => {
-                    self.flush_intrinsic_inline_measurement_paragraph(
+                role if role == InlineBoundaryRole::Float || role.is_page_scope() => {
+                    let flushed = self.flush_intrinsic_inline_measurement_paragraph(
                         &mut paragraph,
                         context,
                         false,
+                        starts_after_forced_break,
                         &mut output,
                     );
+                    if flushed {
+                        starts_after_forced_break = false;
+                    }
                 }
-                item => paragraph.push(item),
+                _ => paragraph.push(item),
             }
         }
         self.flush_intrinsic_inline_measurement_paragraph(
             &mut paragraph,
             context,
             false,
+            starts_after_forced_break,
             &mut output,
         );
         output
@@ -370,7 +580,7 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             available_width,
         );
-        (measurement.height, measurement.line_count)
+        (measurement.height(), measurement.line_count())
     }
 
     pub(in crate::layout) fn intrinsic_inline_block_metrics_for_boxes(
@@ -386,7 +596,7 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             available_width,
         );
-        (measurement.height, measurement.line_count)
+        (measurement.height(), measurement.line_count())
     }
 
     fn flush_intrinsic_inline_measurement_paragraph(
@@ -394,25 +604,49 @@ impl<'a> LayoutBuilder<'a> {
         paragraph: &mut Vec<InlineItem>,
         context: InlineParagraphContext<'_>,
         force_empty_line: bool,
+        starts_after_forced_break: bool,
         output: &mut inline_layout::InlineIntrinsicMeasurement,
-    ) {
+    ) -> bool {
         trim_inline_item_edges(paragraph);
         if paragraph.is_empty() {
             if force_empty_line {
-                output.height += context.block_style.line_height;
-                output.line_count += 1;
+                let line_index = output.sequence.records.len();
+                output
+                    .sequence
+                    .records
+                    .push(inline_layout::InlineLineRecord {
+                        paragraph_index: output.paragraphs.len(),
+                        block_line_index: line_index,
+                        paragraph_line_index: 0,
+                        fragment: None,
+                        is_first_formatted_line: line_index == 0,
+                        is_last_line_in_paragraph: true,
+                        is_forced_empty: true,
+                        paragraph_last_hanging_width: 0.0,
+                        used_indent: used_line_indent(
+                            line_index,
+                            starts_after_forced_break,
+                            context.hanging_indent,
+                            context.block_style,
+                            context.available_width,
+                        ),
+                        available_width: context.available_width,
+                        line_height: context.block_style.line_height,
+                    });
+                return true;
             }
-            return;
+            return false;
         }
-        let graph = self.build_inline_opportunity_graph(paragraph);
+        let paragraph_index = output.paragraphs.len();
+        let paragraph_start_line_index = output.sequence.records.len();
+        let graph = self.build_inline_opportunity_graph(paragraph, context.block_style);
         let contribution = graph.intrinsic_contribution(&mut self.font_system, context.block_style);
-        let (lines, next_line_count) =
-            self.select_inline_lines_from_graph(&graph, context, output.line_count, false);
-        output.height += lines
-            .iter()
-            .map(|line| line.metrics.height.max(context.block_style.line_height))
-            .sum::<f32>();
-        output.line_count = next_line_count;
+        let (lines, next_line_count) = self.select_inline_lines_from_graph(
+            &graph,
+            context,
+            paragraph_start_line_index,
+            starts_after_forced_break,
+        );
         output.contribution.min_content = output
             .contribution
             .min_content
@@ -421,14 +655,45 @@ impl<'a> LayoutBuilder<'a> {
             .contribution
             .max_content
             .max(contribution.max_content);
+        let paragraph_last_hanging_width = lines
+            .last()
+            .map(|line| {
+                last_hanging_punctuation_width_for_line_items(
+                    &mut self.font_system,
+                    &inline_layout::measured_inline_items(&line.items),
+                    context.block_style,
+                )
+            })
+            .unwrap_or(0.0);
+        let line_count = lines.len();
+        for (offset, line) in lines.into_iter().enumerate() {
+            let line_index = paragraph_start_line_index + offset;
+            output
+                .sequence
+                .records
+                .push(inline_layout::InlineLineRecord {
+                    paragraph_index,
+                    block_line_index: line_index,
+                    paragraph_line_index: offset,
+                    is_first_formatted_line: line_index == 0,
+                    is_last_line_in_paragraph: offset + 1 == line_count,
+                    is_forced_empty: false,
+                    paragraph_last_hanging_width,
+                    used_indent: line.indent,
+                    available_width: line.available_width,
+                    line_height: line.metrics.height.max(context.block_style.line_height),
+                    fragment: Some(line),
+                });
+        }
+        debug_assert_eq!(output.sequence.records.len(), next_line_count);
         output
             .paragraphs
             .push(inline_layout::InlineMeasuredParagraph {
                 graph,
                 contribution,
-                lines,
             });
         paragraph.clear();
+        true
     }
 
     pub(super) fn layout_inline_items_block(
@@ -547,6 +812,7 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             link_target.clone(),
             0.0,
+            style,
             style.text_decoration,
             &mut items,
         );
@@ -566,6 +832,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 link_target.clone(),
                 0.0,
+                style,
                 style.text_decoration,
                 &mut items,
             );
@@ -575,6 +842,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 link_target.clone(),
                 0.0,
+                style,
                 style.text_decoration,
                 &mut items,
             );
@@ -647,17 +915,19 @@ impl<'a> LayoutBuilder<'a> {
                         .get("href")
                         .cloned()
                         .or_else(|| inherited_link.clone());
-                    let child_baseline_shift =
-                        baseline_shift + vertical_align_baseline_shift(&child_style);
-                    if let Some(atom) = self.intrinsic_inline_atom_for_element(
+                    let child_baseline_shift = baseline_shift
+                        + self.vertical_align_baseline_shift_for_inline_style(&child_style, style);
+                    if let Some(mut atom) = self.intrinsic_inline_atom_for_element(
                         child_element,
                         &child_style,
                         &[],
                         None,
                         stylesheets,
-                        child_baseline_shift,
+                        baseline_shift,
                         link.clone(),
                     ) {
+                        atom.baseline_shift +=
+                            self.vertical_align_baseline_shift_for_atom(&atom, style);
                         output.push(InlineItem::Atom(Box::new(atom)));
                         continue;
                     }
@@ -795,8 +1065,11 @@ impl<'a> LayoutBuilder<'a> {
                         children,
                         stylesheets,
                         inherited_link.clone(),
-                        baseline_shift,
-                        propagated_decoration,
+                        IntrinsicInlineCollectionContext {
+                            baseline_shift,
+                            block_style: style,
+                            propagated_decoration,
+                        },
                         output,
                     );
                 }
@@ -818,9 +1091,9 @@ impl<'a> LayoutBuilder<'a> {
     ///
     /// CSS Inline treats inline-level margin, border, and padding as part of
     /// the inline box fragments. Keeping the start/end edges as explicit
-    /// zero-height atomic items lets line fitting account for positive and
-    /// negative inline margins without turning them into text or shaping
-    /// boundaries:
+    /// non-painting atomic items lets line fitting account for positive,
+    /// negative, and zero-net inline margins/borders without turning them into
+    /// text or shaping boundaries:
     /// <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting> and
     /// <https://www.w3.org/TR/css-inline-3/#model>.
     fn push_inline_box_edge_item(
@@ -832,15 +1105,17 @@ impl<'a> LayoutBuilder<'a> {
         output: &mut Vec<InlineItem>,
     ) {
         let width = inline_box_edge_width(style, edge);
-        if width.abs() < 0.001 {
+        if !inline_box_edge_has_nonzero_component(style, edge) {
             return;
         }
+        let baseline_offset = self.inline_box_text_line_layout_baseline_offset(style);
         output.push(InlineItem::Atom(Box::new(InlineAtom {
-            content: InlineAtomContent::InlineEdge,
+            content: InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge),
             style: style.clone(),
+            escaped_positioned_layers: None,
             width,
-            height: 0.0,
-            baseline_offset: 0.0,
+            height: style.line_height,
+            baseline_offset,
             baseline_shift,
             link_target,
             alt_text: None,
@@ -858,7 +1133,15 @@ impl<'a> LayoutBuilder<'a> {
     ) -> InlineElementScopeState {
         let counter_scope = self.begin_counter_scope(element, style);
         let inline_box_start = output.len();
-        self.push_inline_box_edge_item(style, InlineBoxEdge::Start, baseline_shift, None, output);
+        if options.fragment_edges.owns_start {
+            self.push_inline_box_edge_item(
+                style,
+                InlineBoxEdge::Start,
+                baseline_shift,
+                None,
+                output,
+            );
+        }
         let pushed_page_scope = options.push_page_scope && style.page_name_specified;
         if pushed_page_scope {
             output.push(InlineItem::PageScopeStart(style.page_name.clone()));
@@ -878,6 +1161,7 @@ impl<'a> LayoutBuilder<'a> {
             baseline_shift,
             pushed_page_scope,
             mark_hanging_edges: options.mark_hanging_edges,
+            fragment_edges: options.fragment_edges,
             counter_scope,
         }
     }
@@ -892,15 +1176,22 @@ impl<'a> LayoutBuilder<'a> {
         if state.pushed_page_scope {
             output.push(InlineItem::PageScopeEnd);
         }
-        self.push_inline_box_edge_item(
-            style,
-            InlineBoxEdge::End,
-            state.baseline_shift,
-            None,
-            output,
-        );
+        if state.fragment_edges.owns_end {
+            self.push_inline_box_edge_item(
+                style,
+                InlineBoxEdge::End,
+                state.baseline_shift,
+                None,
+                output,
+            );
+        }
         if state.mark_hanging_edges {
-            mark_inline_box_hanging_edges(output, state.inline_box_start, style);
+            mark_inline_box_hanging_edges(
+                output,
+                state.inline_box_start,
+                style,
+                state.fragment_edges,
+            );
         }
         self.end_counter_scope(state.counter_scope);
     }
@@ -985,6 +1276,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
         inherited_link: Option<String>,
         baseline_shift: f32,
+        block_style: &ComputedStyle,
         propagated_decoration: css::TextDecoration,
         output: &mut Vec<InlineItem>,
     ) {
@@ -1002,6 +1294,7 @@ impl<'a> LayoutBuilder<'a> {
                         stylesheets,
                         inherited_link.clone(),
                         baseline_shift,
+                        block_style,
                         propagated_decoration,
                         output,
                     );
@@ -1066,15 +1359,14 @@ impl<'a> LayoutBuilder<'a> {
                         continue;
                     }
                     if matches!(child_style.position, Position::Absolute | Position::Fixed) {
-                        let static_baseline_y =
-                            self.inline_static_baseline_y_from_buffer(output, &child_style);
-                        self.layout_positioned_block_with_inline_static_baseline(
+                        self.layout_positioned_inline_descendant(
                             child_element,
                             &child_style,
                             stylesheets,
                             None,
                             None,
-                            static_baseline_y,
+                            style,
+                            output,
                         );
                         continue;
                     }
@@ -1092,8 +1384,8 @@ impl<'a> LayoutBuilder<'a> {
                         .get("href")
                         .cloned()
                         .or_else(|| inherited_link.clone());
-                    let child_baseline_shift =
-                        baseline_shift + vertical_align_baseline_shift(&child_style);
+                    let child_baseline_shift = baseline_shift
+                        + self.vertical_align_baseline_shift_for_inline_style(&child_style, style);
                     let scope = self.begin_inline_element_scope(
                         child_element,
                         &child_style,
@@ -1132,12 +1424,14 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn collect_inline_box_items(
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
         stylesheets: &[Stylesheet],
         inherited_link: Option<String>,
         baseline_shift: f32,
+        block_style: &ComputedStyle,
         propagated_decoration: css::TextDecoration,
         output: &mut Vec<InlineItem>,
     ) {
@@ -1145,18 +1439,19 @@ impl<'a> LayoutBuilder<'a> {
             if let Some((element, _, style, child_boxes)) = child.element_parts()
                 && matches!(style.position, Position::Absolute | Position::Fixed)
             {
-                let static_baseline_y = self.inline_static_baseline_y_from_buffer(output, style);
-                self.layout_positioned_block_with_inline_static_baseline(
+                let table_fragment = match child {
+                    box_tree::FormattingBox::AtomicInline(box_) => box_.table_fragment.as_ref(),
+                    box_tree::FormattingBox::Table(box_) => Some(&box_.fragment),
+                    _ => None,
+                };
+                self.layout_positioned_inline_descendant(
                     element,
                     style,
                     stylesheets,
                     Some(child_boxes),
-                    match child {
-                        box_tree::FormattingBox::AtomicInline(box_) => box_.table_fragment.as_ref(),
-                        box_tree::FormattingBox::Table(box_) => Some(&box_.fragment),
-                        _ => None,
-                    },
-                    static_baseline_y,
+                    table_fragment,
+                    block_style,
+                    output,
                 );
                 continue;
             }
@@ -1198,14 +1493,18 @@ impl<'a> LayoutBuilder<'a> {
                         .get("href")
                         .cloned()
                         .or_else(|| inherited_link.clone());
-                    let child_baseline_shift =
-                        baseline_shift + vertical_align_baseline_shift(&inline_style);
+                    let child_baseline_shift = baseline_shift
+                        + self.vertical_align_baseline_shift_for_inline_style(
+                            &inline_style,
+                            block_style,
+                        );
                     let scope = self.begin_inline_element_scope(
                         box_.element,
                         &inline_style,
                         link.clone(),
                         child_baseline_shift,
-                        InlineElementScopeOptions::BOX_PAINT,
+                        InlineElementScopeOptions::BOX_PAINT
+                            .with_fragment_edges(box_.fragment_edges),
                         output,
                     );
                     self.push_generated_pseudo_items(
@@ -1224,6 +1523,7 @@ impl<'a> LayoutBuilder<'a> {
                             stylesheets,
                             link.clone(),
                             child_baseline_shift,
+                            block_style,
                             inline_style.text_decoration,
                             output,
                         );
@@ -1233,6 +1533,7 @@ impl<'a> LayoutBuilder<'a> {
                             stylesheets,
                             link.clone(),
                             child_baseline_shift,
+                            block_style,
                             inline_style.text_decoration,
                             output,
                         );
@@ -1262,15 +1563,18 @@ impl<'a> LayoutBuilder<'a> {
                         .get("href")
                         .cloned()
                         .or_else(|| inherited_link.clone());
-                    if let Some(atom) = self.inline_atom_for_element(
+                    if let Some(mut atom) = self.inline_atom_for_element(
                         box_.element,
+                        &box_.signature,
                         &box_.style,
                         &box_.children,
                         box_.table_fragment.as_ref(),
                         stylesheets,
-                        baseline_shift + vertical_align_baseline_shift(&box_.style),
+                        baseline_shift,
                         link.clone(),
                     ) {
+                        atom.baseline_shift +=
+                            self.vertical_align_baseline_shift_for_atom(&atom, block_style);
                         output.push(InlineItem::Atom(Box::new(atom)));
                     } else {
                         let text = inline_text_for_style(box_.element, &box_.style);
@@ -1293,6 +1597,7 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     inherited_link.clone(),
                     baseline_shift,
+                    block_style,
                     box_.style
                         .text_decoration
                         .with_propagated_lines(propagated_decoration),
@@ -1306,13 +1611,47 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn layout_positioned_inline_descendant(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+        block_style: &ComputedStyle,
+        output: &[InlineItem],
+    ) {
+        if style.abspos_static_source_was_inline_level || style.position == Position::Fixed {
+            let static_baseline_y = self.inline_static_baseline_y_from_buffer(output, style);
+            self.layout_positioned_block_with_inline_static_baseline(
+                element,
+                style,
+                stylesheets,
+                child_boxes,
+                table_fragment,
+                static_baseline_y,
+            );
+            return;
+        }
+
+        let static_y_offset = self.block_static_position_y_offset_from_buffer(output, block_style);
+        self.layout_positioned_block_with_block_static_y_offset(
+            element,
+            style,
+            stylesheets,
+            child_boxes,
+            table_fragment,
+            static_y_offset,
+        );
+    }
+
     fn collect_intrinsic_inline_box_items(
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
         stylesheets: &[Stylesheet],
         inherited_link: Option<String>,
-        baseline_shift: f32,
-        propagated_decoration: css::TextDecoration,
+        context: IntrinsicInlineCollectionContext<'_>,
         output: &mut Vec<InlineItem>,
     ) {
         for (child_index, child) in children.iter().enumerate() {
@@ -1327,7 +1666,7 @@ impl<'a> LayoutBuilder<'a> {
                     let mut text_style = box_.style.clone();
                     text_style.text_decoration = text_style
                         .text_decoration
-                        .with_propagated_lines(propagated_decoration);
+                        .with_propagated_lines(context.propagated_decoration);
                     let text = if child_index + 1 == children.len() {
                         trim_terminal_preserved_segment_breaks(&box_.text, &text_style)
                     } else {
@@ -1337,7 +1676,7 @@ impl<'a> LayoutBuilder<'a> {
                         text,
                         &text_style,
                         inherited_link.clone(),
-                        baseline_shift,
+                        context.baseline_shift,
                         output,
                     );
                 }
@@ -1345,21 +1684,25 @@ impl<'a> LayoutBuilder<'a> {
                     let mut inline_style = box_.style.clone();
                     inline_style.text_decoration = inline_style
                         .text_decoration
-                        .with_propagated_lines(propagated_decoration);
+                        .with_propagated_lines(context.propagated_decoration);
                     let link = box_
                         .element
                         .attrs
                         .get("href")
                         .cloned()
                         .or_else(|| inherited_link.clone());
-                    let child_baseline_shift =
-                        baseline_shift + vertical_align_baseline_shift(&inline_style);
+                    let child_baseline_shift = context.baseline_shift
+                        + self.vertical_align_baseline_shift_for_inline_style(
+                            &inline_style,
+                            context.block_style,
+                        );
                     let scope = self.begin_inline_element_scope(
                         box_.element,
                         &inline_style,
                         link.clone(),
                         child_baseline_shift,
-                        InlineElementScopeOptions::BOX_INTRINSIC,
+                        InlineElementScopeOptions::BOX_INTRINSIC
+                            .with_fragment_edges(box_.fragment_edges),
                         output,
                     );
                     self.push_generated_pseudo_items(
@@ -1386,8 +1729,10 @@ impl<'a> LayoutBuilder<'a> {
                             &box_.children,
                             stylesheets,
                             link.clone(),
-                            child_baseline_shift,
-                            inline_style.text_decoration,
+                            context
+                                .with_baseline_shift(child_baseline_shift)
+                                .with_block_style(&inline_style)
+                                .with_propagated_decoration(inline_style.text_decoration),
                             output,
                         );
                     }
@@ -1408,15 +1753,17 @@ impl<'a> LayoutBuilder<'a> {
                         .get("href")
                         .cloned()
                         .or_else(|| inherited_link.clone());
-                    if let Some(atom) = self.intrinsic_inline_atom_for_element(
+                    if let Some(mut atom) = self.intrinsic_inline_atom_for_element(
                         box_.element,
                         &box_.style,
                         &box_.children,
                         box_.table_fragment.as_ref(),
                         stylesheets,
-                        baseline_shift + vertical_align_baseline_shift(&box_.style),
+                        context.baseline_shift,
                         link,
                     ) {
+                        atom.baseline_shift +=
+                            self.vertical_align_baseline_shift_for_atom(&atom, context.block_style);
                         output.push(InlineItem::Atom(Box::new(atom)));
                     } else {
                         let text = inline_text_for_style(box_.element, &box_.style);
@@ -1424,7 +1771,7 @@ impl<'a> LayoutBuilder<'a> {
                             &text,
                             &box_.style,
                             inherited_link.clone(),
-                            baseline_shift,
+                            context.baseline_shift,
                             output,
                         );
                     }
@@ -1435,7 +1782,7 @@ impl<'a> LayoutBuilder<'a> {
                             &text.text,
                             &text.style,
                             inherited_link.clone(),
-                            baseline_shift,
+                            context.baseline_shift,
                             output,
                         );
                     }
@@ -1445,10 +1792,13 @@ impl<'a> LayoutBuilder<'a> {
                         &box_.children,
                         stylesheets,
                         inherited_link.clone(),
-                        baseline_shift,
-                        box_.style
-                            .text_decoration
-                            .with_propagated_lines(propagated_decoration),
+                        context
+                            .with_block_style(&box_.style)
+                            .with_propagated_decoration(
+                                box_.style
+                                    .text_decoration
+                                    .with_propagated_lines(context.propagated_decoration),
+                            ),
                         output,
                     ),
                 box_tree::FormattingBox::Block(_)
@@ -1494,6 +1844,7 @@ impl<'a> LayoutBuilder<'a> {
             return Some(InlineAtom {
                 content: InlineAtomContent::Image(image.decoded),
                 style: style.clone(),
+                escaped_positioned_layers: None,
                 width: image.border_box_width + style.margin.left + style.margin.right,
                 height: image.border_box_height + style.margin.top + style.margin.bottom,
                 baseline_offset: image.border_box_height,
@@ -1536,24 +1887,32 @@ impl<'a> LayoutBuilder<'a> {
             }
             None if style.display.is_table() => {
                 let fragment = table_fragment?;
+                let horizontal_extras =
+                    style.padding.left + style.padding.right + horizontal_border_width(style);
+                let (min_width, width) = self.table_parent_intrinsic_content_widths_from_fragment(
+                    element,
+                    style,
+                    stylesheets,
+                    fragment,
+                    available_width,
+                );
+                let content_width = intrinsic::shrink_to_fit_width(
+                    min_width,
+                    width,
+                    (available_width - horizontal_extras).max(0.0),
+                );
                 (
-                    self.table_shrink_to_fit_width_from_fragment(
-                        element,
-                        style,
-                        stylesheets,
-                        fragment,
-                        available_width,
-                    ) + style.margin.left
+                    constrain_width(style, content_width, available_width)
+                        + horizontal_extras
+                        + style.margin.left
                         + style.margin.right,
                     style.line_height,
                     style.line_height,
                 )
             }
             None if style.display.is_flex() && style.display.is_inline_level() => {
-                let used_edges = used_box_edges(style, available_width);
-                let horizontal_extras = used_edges.padding.left
-                    + used_edges.padding.right
-                    + horizontal_border_width(style);
+                let box_metrics = used_box_metrics(style, available_width);
+                let horizontal_extras = box_metrics.horizontal_non_content();
                 let (min_width, width) = self.estimate_flex_intrinsic_widths(
                     element,
                     style,
@@ -1561,14 +1920,14 @@ impl<'a> LayoutBuilder<'a> {
                     available_width,
                     Some(children),
                 );
-                let auto_content_width = intrinsic::shrink_to_fit_width(
+                let content_width = intrinsic::content_width_from_intrinsic(
+                    style,
+                    available_width,
+                    horizontal_extras,
                     min_width,
                     width,
-                    (available_width - horizontal_extras).max(0.0),
+                    intrinsic::IntrinsicAutoWidth::ShrinkToFit,
                 );
-                let content_width =
-                    used_content_width_or_auto(style, available_width, horizontal_extras)
-                        .unwrap_or(auto_content_width);
                 (
                     constrain_width(style, content_width, available_width)
                         + horizontal_extras
@@ -1579,13 +1938,9 @@ impl<'a> LayoutBuilder<'a> {
                 )
             }
             None if style.display.is_atomic_inline() => {
-                let used_edges = used_box_edges(style, available_width);
-                let horizontal_extras = used_edges.padding.left
-                    + used_edges.padding.right
-                    + horizontal_border_width(style);
-                let vertical_extras = used_edges.padding.top
-                    + used_edges.padding.bottom
-                    + vertical_border_width(style);
+                let box_metrics = used_box_metrics(style, available_width);
+                let horizontal_extras = box_metrics.horizontal_non_content();
+                let vertical_extras = box_metrics.vertical_non_content();
                 let contribution = if children.is_empty() {
                     let text = inline_text_for_style(element, style);
                     let contribution = self
@@ -1603,19 +1958,23 @@ impl<'a> LayoutBuilder<'a> {
                         Some(children),
                     )
                 };
-                let auto_content_width = intrinsic::shrink_to_fit_width(
+                let content_width = intrinsic::content_width_from_intrinsic(
+                    style,
+                    available_width,
+                    horizontal_extras,
                     contribution.min_content,
                     contribution.max_content,
-                    (available_width - horizontal_extras).max(0.0),
-                )
-                .max(style.font_size);
-                let content_width =
-                    used_content_width_or_auto(style, available_width, horizontal_extras)
-                        .unwrap_or(auto_content_width);
+                    intrinsic::IntrinsicAutoWidth::ShrinkToFit,
+                );
+                let content_width = if style.box_values.width.is_auto() {
+                    content_width.max(style.font_size)
+                } else {
+                    content_width
+                };
                 let measured_content_height = if children.is_empty() {
                     let text = inline_text_for_style(element, style);
                     self.intrinsic_inline_measurement_for_text(&text, style, content_width)
-                        .height
+                        .height()
                         .max(style.line_height)
                 } else {
                     self.intrinsic_inline_measurement_for_element(
@@ -1625,7 +1984,7 @@ impl<'a> LayoutBuilder<'a> {
                         Some(children),
                         content_width,
                     )
-                    .height
+                    .height()
                     .max(style.line_height)
                 };
                 let content_height =
@@ -1649,6 +2008,7 @@ impl<'a> LayoutBuilder<'a> {
                 fill: Color::TRANSPARENT,
             },
             style: style.clone(),
+            escaped_positioned_layers: None,
             width,
             height,
             baseline_offset,
@@ -1664,9 +2024,7 @@ impl<'a> LayoutBuilder<'a> {
         fallback_style: &ComputedStyle,
     ) -> f32 {
         if let Some(atom) = output.iter().rev().find_map(|item| match item {
-            InlineItem::Atom(atom) if !matches!(atom.content, InlineAtomContent::InlineEdge) => {
-                Some(atom)
-            }
+            InlineItem::Atom(atom) if !atom.content.is_inline_edge() => Some(atom),
             _ => None,
         }) {
             let borders = used_border_widths(&atom.style);
@@ -1688,6 +2046,26 @@ impl<'a> LayoutBuilder<'a> {
             - self
                 .font_system
                 .rendered_first_line_baseline_offset(fallback_style)
+    }
+
+    fn block_static_position_y_offset_from_buffer(
+        &mut self,
+        output: &[InlineItem],
+        block_style: &ComputedStyle,
+    ) -> f32 {
+        if output.is_empty() {
+            return 0.0;
+        }
+        let available_width = (self.content_right - self.content_left).max(1.0);
+        // CSS Positioned Layout removes the abspos from flow, but CSS 2.2
+        // computes auto inset static position from its hypothetical normal-flow
+        // box. For a block-level source after inline content, the placeholder
+        // sits after the line boxes already selected for the buffered inline
+        // run:
+        // https://www.w3.org/TR/css-position-3/#absolute-positioning
+        // https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height
+        self.collect_inline_line_sequence(output.to_vec(), block_style, available_width, 0.0, 0.0)
+            .total_height()
     }
 
     pub(in crate::layout) fn push_generated_pseudo_items(
@@ -1791,6 +2169,7 @@ impl<'a> LayoutBuilder<'a> {
                 output.push(InlineItem::Atom(Box::new(InlineAtom {
                     content: InlineAtomContent::Leader(text.clone()),
                     style: style.clone(),
+                    escaped_positioned_layers: None,
                     width: 0.0,
                     height: style.line_height,
                     baseline_offset: style.font_size,
@@ -1832,9 +2211,7 @@ impl<'a> LayoutBuilder<'a> {
     ) -> Option<InlineAtom> {
         let available_width = (self.content_right - self.content_left).max(1.0);
         let mut used_style = self.style_with_current_viewport_lengths(style);
-        let used_edges = used_box_edges(&used_style, available_width);
-        used_style.margin = used_edges.margin.to_css_edges();
-        used_style.padding = used_edges.padding.to_css_edges();
+        apply_used_box_metrics(&mut used_style, available_width);
         let style = &used_style;
         let image = used_generated_image(
             url,
@@ -1847,6 +2224,7 @@ impl<'a> LayoutBuilder<'a> {
         Some(InlineAtom {
             content: InlineAtomContent::Image(image.decoded),
             style: style.clone(),
+            escaped_positioned_layers: None,
             width: image.border_box_width + style.margin.left + style.margin.right,
             height: image.border_box_height + style.margin.top + style.margin.bottom,
             baseline_offset: image.border_box_height,
@@ -1906,8 +2284,25 @@ impl<'a> LayoutBuilder<'a> {
         baseline_shift: f32,
         output: &mut Vec<InlineItem>,
     ) {
+        self.push_bidi_scope_start_with_source(
+            style,
+            link_target,
+            baseline_shift,
+            InlineTextSource::Normal,
+            output,
+        );
+    }
+
+    pub(super) fn push_bidi_scope_start_with_source(
+        &mut self,
+        style: &ComputedStyle,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        source: InlineTextSource,
+        output: &mut Vec<InlineItem>,
+    ) {
         if let Some((start, _)) = bidi_control_scope_for_style(style) {
-            self.push_bidi_control_text(start, style, link_target, baseline_shift, output);
+            self.push_bidi_control_text(start, style, link_target, baseline_shift, source, output);
         }
     }
 
@@ -1924,8 +2319,25 @@ impl<'a> LayoutBuilder<'a> {
         baseline_shift: f32,
         output: &mut Vec<InlineItem>,
     ) {
+        self.push_bidi_scope_end_with_source(
+            style,
+            link_target,
+            baseline_shift,
+            InlineTextSource::Normal,
+            output,
+        );
+    }
+
+    pub(super) fn push_bidi_scope_end_with_source(
+        &mut self,
+        style: &ComputedStyle,
+        link_target: Option<String>,
+        baseline_shift: f32,
+        source: InlineTextSource,
+        output: &mut Vec<InlineItem>,
+    ) {
         if let Some((_, end)) = bidi_control_scope_for_style(style) {
-            self.push_bidi_control_text(end, style, link_target, baseline_shift, output);
+            self.push_bidi_control_text(end, style, link_target, baseline_shift, source, output);
         }
     }
 
@@ -1940,6 +2352,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         link_target: Option<String>,
         baseline_shift: f32,
+        source: InlineTextSource,
         output: &mut Vec<InlineItem>,
     ) {
         if !text.is_empty() {
@@ -1949,6 +2362,7 @@ impl<'a> LayoutBuilder<'a> {
                 baseline_shift,
                 link_target,
                 mergeable: true,
+                source,
                 hanging_edges: InlineHangingEdges::default(),
             })));
         }
@@ -1965,92 +2379,11 @@ impl<'a> LayoutBuilder<'a> {
         push_inline_words_for_style(text, style, link_target, baseline_shift, output);
     }
 
-    pub(super) fn push_collapsed_inline_space(
-        &mut self,
-        style: &ComputedStyle,
-        link_target: Option<String>,
-        baseline_shift: f32,
-        output: &mut Vec<InlineItem>,
-    ) {
-        // CSS Text whitespace processing removes collapsible spaces at line
-        // boundaries; a preserved newline starts a fresh line here.
-        if output.is_empty()
-            || output.last().is_some_and(|item| {
-                matches!(item, InlineItem::Break) || inline_item_is_collapsible_space(item)
-            })
-        {
-            return;
-        }
-        output.push(InlineItem::Word(Box::new(InlineWord {
-            text: " ".to_string(),
-            style: style.clone(),
-            baseline_shift,
-            link_target,
-            mergeable: true,
-            hanging_edges: InlineHangingEdges::default(),
-        })));
-    }
-
-    fn graph_text_lines_for_text(
-        &mut self,
-        text: &str,
-        style: &ComputedStyle,
-        available_width: f32,
-    ) -> Vec<TextLine> {
-        let mut inline_items = Vec::new();
-        push_inline_words_for_style(text, style, None, 0.0, &mut inline_items);
-
-        let mut lines = Vec::new();
-        let mut paragraph = Vec::new();
-        let mut starts_after_forced_break = false;
-        for item in inline_items {
-            if matches!(item, InlineItem::Break) {
-                self.append_graph_text_paragraph_lines(
-                    &mut lines,
-                    &mut paragraph,
-                    style,
-                    available_width,
-                    starts_after_forced_break,
-                );
-                starts_after_forced_break = true;
-            } else {
-                paragraph.push(item);
-            }
-        }
-        self.append_graph_text_paragraph_lines(
-            &mut lines,
-            &mut paragraph,
-            style,
-            available_width,
-            starts_after_forced_break,
-        );
-        lines
-    }
-
-    fn append_graph_text_paragraph_lines(
-        &mut self,
-        output: &mut Vec<TextLine>,
-        paragraph: &mut Vec<InlineItem>,
-        style: &ComputedStyle,
-        available_width: f32,
-        starts_after_forced_break: bool,
-    ) {
-        let mut lines = graph_text_lines_for_paragraph(
-            &mut self.font_system,
-            paragraph,
-            style,
-            available_width,
-        );
-        if starts_after_forced_break && let Some(first) = lines.first_mut() {
-            first.starts_after_forced_break = true;
-        }
-        output.extend(lines);
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn inline_atom_for_element(
         &mut self,
         element: &Element,
+        signature: &ElementSignature,
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
         table_fragment: Option<&box_tree::TableFragment<'_>>,
@@ -2088,6 +2421,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(InlineAtom {
                     content: InlineAtomContent::Canvas,
                     style,
+                    escaped_positioned_layers: None,
                     width: atom_width,
                     height,
                     baseline_offset: height,
@@ -2099,9 +2433,7 @@ impl<'a> LayoutBuilder<'a> {
             Some(ReplacedElementKind::Image) => {
                 let available_width = (self.content_right - self.content_left).max(1.0);
                 let mut used_style = self.style_with_current_viewport_lengths(style);
-                let used_edges = used_box_edges(&used_style, available_width);
-                used_style.margin = used_edges.margin.to_css_edges();
-                used_style.padding = used_edges.padding.to_css_edges();
+                apply_used_box_metrics(&mut used_style, available_width);
                 let style = &used_style;
                 let image = used_image(
                     element,
@@ -2114,6 +2446,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(InlineAtom {
                     content: InlineAtomContent::Image(image.decoded),
                     style: style.clone(),
+                    escaped_positioned_layers: None,
                     width: image.border_box_width + style.margin.left + style.margin.right,
                     height: image.border_box_height + style.margin.top + style.margin.bottom,
                     baseline_offset: image.border_box_height,
@@ -2127,6 +2460,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(InlineAtom {
                     content: InlineAtomContent::Svg { fill },
                     style: style.clone(),
+                    escaped_positioned_layers: None,
                     width: width + style.margin.left + style.margin.right,
                     height,
                     baseline_offset: height,
@@ -2146,6 +2480,8 @@ impl<'a> LayoutBuilder<'a> {
             ),
             None if style.display.is_flex() && style.display.is_inline_level() => {
                 Some(self.inline_flex_atom_for_element(
+                    element,
+                    signature,
                     style,
                     children,
                     stylesheets,
@@ -2167,53 +2503,88 @@ impl<'a> LayoutBuilder<'a> {
                         link_target,
                     ));
                 }
-                let text = inline_text_for_style(element, style);
                 let available_width = (self.content_right
                     - self.content_left
                     - style.margin.left
                     - style.margin.right)
                     .max(style.font_size);
                 let mut used_style = self.style_with_current_viewport_lengths(style);
-                let used_edges = used_box_edges(&used_style, available_width);
-                used_style.margin = used_edges.margin.to_css_edges();
-                used_style.padding = used_edges.padding.to_css_edges();
+                let box_metrics = apply_used_box_metrics(&mut used_style, available_width);
                 let style = &used_style;
-                let border_widths = used_border_widths(style);
-                let horizontal_extras = border_widths.left
-                    + border_widths.right
-                    + style.padding.left
-                    + style.padding.right;
-                let vertical_extras = border_widths.top
-                    + border_widths.bottom
-                    + style.padding.top
-                    + style.padding.bottom;
-                let intrinsic_width = self
-                    .graph_max_content_text_width(&text, style, available_width)
-                    .max(style.font_size);
-                let requested_content_width =
-                    used_content_width_or_auto(style, available_width, horizontal_extras)
-                        .unwrap_or(intrinsic_width);
+                let border_widths = box_metrics.border;
+                let horizontal_extras = box_metrics.horizontal_non_content();
+                let vertical_extras = box_metrics.vertical_non_content();
+                let intrinsic = self.intrinsic_inline_measurement_for_element(
+                    element,
+                    style,
+                    stylesheets,
+                    Some(children),
+                    available_width,
+                );
+                let requested_content_width = intrinsic::content_width_from_intrinsic(
+                    style,
+                    available_width,
+                    horizontal_extras,
+                    intrinsic.contribution.min_content,
+                    intrinsic.contribution.max_content,
+                    intrinsic::IntrinsicAutoWidth::ShrinkToFit,
+                );
+                let requested_content_width = if style.box_values.width.is_auto() {
+                    requested_content_width.max(style.font_size)
+                } else {
+                    requested_content_width
+                };
                 let content_width =
                     constrain_width(style, requested_content_width, available_width)
                         .max(style.font_size);
-                let mut lines = self.graph_text_lines_for_text(&text, style, content_width);
-                if lines.is_empty() && !crate::text::text_is_css_collapsible_whitespace(&text) {
-                    let text =
-                        transform_text(crate::text::trim_css_collapsible_whitespace(&text), style);
-                    let shaped =
-                        self.font_system
-                            .shape_measured_line(&text, style, style.line_height);
-                    let width = shaped
-                        .as_ref()
-                        .map(|line| line.width)
-                        .unwrap_or_else(|| self.font_system.measure_line_text(&text, style));
-                    lines.push(TextLine::new(text, width, style.line_height).with_shaped(shaped));
+                let mut sequence_items = Vec::new();
+                self.push_generated_pseudo_items(
+                    element,
+                    style.before_style.as_deref(),
+                    link_target.clone(),
+                    0.0,
+                    GeneratedPseudoCounterMode::Commit,
+                    &mut sequence_items,
+                );
+                if style.content.is_generated() {
+                    self.push_element_content_items_from_boxes(
+                        element,
+                        style,
+                        children,
+                        stylesheets,
+                        link_target.clone(),
+                        0.0,
+                        style,
+                        style.text_decoration,
+                        &mut sequence_items,
+                    );
+                } else {
+                    self.collect_inline_box_items(
+                        children,
+                        stylesheets,
+                        link_target.clone(),
+                        0.0,
+                        style,
+                        style.text_decoration,
+                        &mut sequence_items,
+                    );
                 }
-                let measured_content_height = lines
-                    .iter()
-                    .map(|line| line.line_height)
-                    .sum::<f32>()
-                    .max(style.line_height);
+                self.push_generated_pseudo_items(
+                    element,
+                    style.after_style.as_deref(),
+                    link_target.clone(),
+                    0.0,
+                    GeneratedPseudoCounterMode::Commit,
+                    &mut sequence_items,
+                );
+                let sequence = self.collect_inline_line_sequence(
+                    sequence_items,
+                    style,
+                    content_width,
+                    0.0,
+                    0.0,
+                );
+                let measured_content_height = sequence.total_height().max(style.line_height);
                 let requested_content_height =
                     used_content_height_or_auto(style, measured_content_height, vertical_extras)
                         .unwrap_or(measured_content_height);
@@ -2225,11 +2596,12 @@ impl<'a> LayoutBuilder<'a> {
                     constrain_height(style, requested_content_height, available_width);
                 let border_box_height = content_height + vertical_extras;
                 let baseline_offset = self
-                    .inline_box_text_lines_baseline_offset(&lines, style, border_widths)
+                    .inline_box_sequence_baseline_offset(&sequence, style, border_widths)
                     .unwrap_or(border_box_height);
                 Some(InlineAtom {
-                    content: InlineAtomContent::InlineBox { lines },
+                    content: InlineAtomContent::InlineBox { sequence },
                     style: style.clone(),
+                    escaped_positioned_layers: None,
                     width: content_width
                         + horizontal_extras
                         + style.margin.left
@@ -2257,15 +2629,14 @@ impl<'a> LayoutBuilder<'a> {
             (self.content_right - self.content_left - style.margin.left - style.margin.right)
                 .max(style.font_size);
         let mut used_style = self.style_with_current_viewport_lengths(style);
-        let used_edges = used_box_edges(&used_style, available_width);
-        used_style.margin = used_edges.margin.to_css_edges();
-        used_style.padding = used_edges.padding.to_css_edges();
+        let box_metrics = apply_used_box_metrics(&mut used_style, available_width);
         let style = &used_style;
-        let borders = used_border_widths(style);
-        let horizontal_extras =
-            borders.left + borders.right + style.padding.left + style.padding.right;
-        let vertical_extras =
-            borders.top + borders.bottom + style.padding.top + style.padding.bottom;
+        let borders = box_metrics.border;
+        let horizontal_extras = box_metrics.horizontal_non_content();
+        let vertical_extras = box_metrics.vertical_non_content();
+        let contribution =
+            self.intrinsic_inline_contribution_for_boxes(children, style, stylesheets);
+        let preferred_min = contribution.min_content.max(style.font_size);
         let preferred = self
             .inline_boxes_max_content_width(children, stylesheets, available_width)
             .max(self.inline_block_float_row_max_content_width(
@@ -2274,10 +2645,14 @@ impl<'a> LayoutBuilder<'a> {
                 available_width,
             ))
             .max(style.font_size);
-        let auto_width = preferred.min((available_width - horizontal_extras).max(style.font_size));
-        let requested_content_width =
-            used_content_width_or_auto(style, available_width, horizontal_extras)
-                .unwrap_or(auto_width);
+        let requested_content_width = intrinsic::content_width_from_intrinsic(
+            style,
+            available_width,
+            horizontal_extras,
+            preferred_min,
+            preferred,
+            intrinsic::IntrinsicAutoWidth::ShrinkToFit,
+        );
         let content_width =
             constrain_width(style, requested_content_width, available_width).max(style.font_size);
 
@@ -2292,22 +2667,24 @@ impl<'a> LayoutBuilder<'a> {
         self.cursor_y = content_top;
         self.truncate_page_start_margins = false;
         let establishes_positioning_containing_block =
-            style.position == Position::Relative || !style.transform.is_empty();
+            matches!(style.position, Position::Relative | Position::Sticky)
+                || !style.transform.is_empty();
         if establishes_positioning_containing_block {
             // CSS Positioned Layout uses the padding box of a positioned
             // or transformed ancestor as the containing block for absolute
             // descendants. This inline-block fragment is laid out in a
             // temporary page whose border-box origin is (0, top).
-            self.containing_blocks.push(ContainingBlock {
-                x: borders.left,
-                top_y: top - borders.top,
-                width: content_width + style.padding.left + style.padding.right,
-                height: used_content_height_or_auto(style, top, 0.0)
-                    .unwrap_or(style.line_height)
-                    .max(0.0)
-                    + style.padding.top
-                    + style.padding.bottom,
-            });
+            self.containing_blocks
+                .push(ContainingBlock::from_page_top_rect(PageTopRect::new(
+                    borders.left,
+                    top - borders.top,
+                    content_width + style.padding.left + style.padding.right,
+                    used_content_height_or_auto(style, top, 0.0)
+                        .unwrap_or(style.line_height)
+                        .max(0.0)
+                        + style.padding.top
+                        + style.padding.bottom,
+                )));
         }
         self.push_page_name_scope_suppression();
         self.push_float_context();
@@ -2320,6 +2697,11 @@ impl<'a> LayoutBuilder<'a> {
             self.layout_anonymous_block(style, children, stylesheets, None);
         } else {
             self.layout_flow_root_child_boxes(children, stylesheets);
+        }
+        if has_auto_height(style)
+            && let Some(float_bottom) = self.current_float_context_lowest_bottom()
+        {
+            self.cursor_y = self.cursor_y.min(float_bottom);
         }
         self.pop_float_context();
         self.pop_page_name_scope_suppression();
@@ -2336,12 +2718,39 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>.
         let content_height = constrain_height(style, requested_content_height, available_width);
         let border_box_height = content_height + vertical_extras;
-        let border_bottom = top - border_box_height;
+        let border_box = PageTopRect::new(
+            0.0,
+            top,
+            content_width + horizontal_extras,
+            border_box_height,
+        )
+        .paint_clip();
+        let border_bottom = border_box.y();
+        let policy = StackingContextPolicy::for_atomic(style, PaintBand::Inline, border_box);
+        let escaped_positioned_layers =
+            if matches!(policy.child_layer_policy, ChildLayerPolicy::EscapeAll)
+                && positioned_layer_start < self.positioned_layers.len()
+            {
+                let child_layers = self.positioned_layers.split_off(positioned_layer_start);
+                let (captured_layers, escaped_layers): (Vec<_>, Vec<_>) = child_layers
+                    .into_iter()
+                    .partition(|layer| matches!(layer.stack_level, StackLevel::Auto));
+                self.positioned_layers.extend(captured_layers);
+                escaped_layers
+            } else {
+                Vec::new()
+            };
         self.flush_positioned_layers_since(positioned_layer_start);
         let fragment = self
             .current_page
             .paint_fragment()
-            .translated(0.0, -border_bottom);
+            .translated(PaintVector::new(0.0, -border_bottom));
+        let escaped_positioned_layers = escaped_positioned_layers
+            .into_iter()
+            .map(|layer| layer.translated(PaintVector::new(0.0, -border_bottom)))
+            .collect::<Vec<_>>();
+        let escaped_positioned_layers = (!escaped_positioned_layers.is_empty())
+            .then(|| escaped_positioned_layers.into_boxed_slice());
         // CSS 2.2 defines an inline-block baseline as the baseline of its
         // last in-flow line box, falling back to the bottom margin edge if no
         // such line exists:
@@ -2355,6 +2764,7 @@ impl<'a> LayoutBuilder<'a> {
         InlineAtom {
             content: InlineAtomContent::InlineFragment(fragment),
             style: style.clone(),
+            escaped_positioned_layers,
             width: content_width + horizontal_extras + style.margin.left + style.margin.right,
             height: border_box_height + style.margin.top + style.margin.bottom,
             baseline_offset,
@@ -2441,18 +2851,19 @@ impl<'a> LayoutBuilder<'a> {
     /// The bottom edge is only the fallback for inline-blocks without a
     /// suitable line box:
     /// <https://www.w3.org/TR/CSS22/visudet.html#inlineblock-width>.
-    fn inline_box_text_lines_baseline_offset(
+    fn inline_box_sequence_baseline_offset(
         &mut self,
-        lines: &[TextLine],
+        sequence: &inline_layout::InlineLineSequence,
         style: &ComputedStyle,
         borders: css::Edges,
     ) -> Option<f32> {
-        if lines.is_empty() {
+        if sequence.records.is_empty() {
             return None;
         }
-        let preceding_line_height = lines
+        let preceding_line_height = sequence
+            .records
             .iter()
-            .take(lines.len().saturating_sub(1))
+            .take(sequence.records.len().saturating_sub(1))
             .map(|line| line.line_height)
             .sum::<f32>();
         Some(
@@ -2543,6 +2954,7 @@ struct InlineElementScopeOptions {
     push_page_scope: bool,
     push_inside_marker: bool,
     mark_hanging_edges: bool,
+    fragment_edges: box_tree::InlineBoxFragmentEdges,
 }
 
 impl InlineElementScopeOptions {
@@ -2550,22 +2962,31 @@ impl InlineElementScopeOptions {
         push_page_scope: false,
         push_inside_marker: false,
         mark_hanging_edges: true,
+        fragment_edges: box_tree::InlineBoxFragmentEdges::ALL,
     };
     const DOM_PAINT: Self = Self {
         push_page_scope: true,
         push_inside_marker: false,
         mark_hanging_edges: true,
+        fragment_edges: box_tree::InlineBoxFragmentEdges::ALL,
     };
     const BOX_PAINT: Self = Self {
         push_page_scope: true,
         push_inside_marker: true,
         mark_hanging_edges: true,
+        fragment_edges: box_tree::InlineBoxFragmentEdges::ALL,
     };
     const BOX_INTRINSIC: Self = Self {
         push_page_scope: false,
         push_inside_marker: false,
         mark_hanging_edges: true,
+        fragment_edges: box_tree::InlineBoxFragmentEdges::ALL,
     };
+
+    fn with_fragment_edges(mut self, fragment_edges: box_tree::InlineBoxFragmentEdges) -> Self {
+        self.fragment_edges = fragment_edges;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -2575,6 +2996,7 @@ struct InlineElementScopeState {
     baseline_shift: f32,
     pushed_page_scope: bool,
     mark_hanging_edges: bool,
+    fragment_edges: box_tree::InlineBoxFragmentEdges,
     counter_scope: CounterScopeState,
 }
 
@@ -2603,6 +3025,25 @@ fn inline_box_edge_width(style: &ComputedStyle, edge: InlineBoxEdge) -> f32 {
     }
 }
 
+fn inline_box_edge_has_nonzero_component(style: &ComputedStyle, edge: InlineBoxEdge) -> bool {
+    let borders = used_border_widths(style);
+    let (margin, border, padding) = match (style.direction, edge) {
+        (Direction::Ltr, InlineBoxEdge::Start) => {
+            (style.margin.left, borders.left, style.padding.left)
+        }
+        (Direction::Ltr, InlineBoxEdge::End) => {
+            (style.margin.right, borders.right, style.padding.right)
+        }
+        (Direction::Rtl, InlineBoxEdge::Start) => {
+            (style.margin.right, borders.right, style.padding.right)
+        }
+        (Direction::Rtl, InlineBoxEdge::End) => {
+            (style.margin.left, borders.left, style.padding.left)
+        }
+    };
+    margin.abs() > 0.001 || border.abs() > 0.001 || padding.abs() > 0.001
+}
+
 /// Mark the text items blocked by an inline box's edge decorations.
 ///
 /// CSS Text disallows hanging punctuation when inline-start or inline-end
@@ -2614,10 +3055,11 @@ fn mark_inline_box_hanging_edges(
     output: &mut [InlineItem],
     inline_box_start: usize,
     style: &ComputedStyle,
+    fragment_edges: box_tree::InlineBoxFragmentEdges,
 ) {
     let items = &mut output[inline_box_start..];
-    let blocks_start = inline_box_blocks_hanging_start(style);
-    let blocks_end = inline_box_blocks_hanging_end(style);
+    let blocks_start = fragment_edges.owns_start && inline_box_blocks_hanging_start(style);
+    let blocks_end = fragment_edges.owns_end && inline_box_blocks_hanging_end(style);
     let has_blocking_edge = blocks_start || blocks_end;
     let mut marked_visible_item = false;
     if blocks_start && let Some(word) = items.iter_mut().find_map(visible_hanging_edge_word_mut) {
@@ -2685,8 +3127,7 @@ pub(in crate::layout) fn insert_text_autospace_items(items: &mut Vec<InlineItem>
                 push_autospaced_word(&mut output, *word, &mut previous_text);
             }
             InlineItem::Atom(atom) => {
-                if !matches!(atom.content, InlineAtomContent::InlineEdge) || atom.width.abs() > 0.0
-                {
+                if !atom.content.is_inline_edge() || atom.width.abs() > 0.0 {
                     previous_text = None;
                 }
                 output.push(InlineItem::Atom(atom));
@@ -2773,6 +3214,7 @@ fn push_autospaced_word_run(
         baseline_shift: word.baseline_shift,
         link_target: word.link_target.clone(),
         mergeable: word.mergeable && run_start_index == 0,
+        source: word.source,
         hanging_edges: word.hanging_edges,
     };
     push_autospace_boundary(output, previous_text, &run_word);
@@ -2814,8 +3256,9 @@ fn push_text_autospace_atom(
     baseline_shift: f32,
 ) {
     output.push(InlineItem::Atom(Box::new(InlineAtom {
-        content: InlineAtomContent::InlineEdge,
+        content: InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace),
         style: style.clone(),
+        escaped_positioned_layers: None,
         width: style.font_size / 8.0,
         height: 0.0,
         baseline_offset: 0.0,

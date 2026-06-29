@@ -33,7 +33,11 @@ clap = { version = "4.5.53", features = ["derive"] }
 clap_complete = "4.6.5"
 cssparser = "0.37.0"
 env_logger = "0.11.10"
+euclid = "0.22.14"
 fontique = "0.10.0"
+fontcull = { version = "2.0.1", default-features = false }
+fontcull-klippa = "0.1.2"
+fontcull-write-fonts = { version = "0.44.3", features = ["read"] }
 html5ever = "0.39.0"
 hyphenation = { version = "0.8.4", features = ["embed_all"] }
 icu_casemap = "2.2.0"
@@ -45,6 +49,7 @@ log = "0.4.32"
 markup5ever_rcdom = "0.39.0"
 miniz_oxide = "0.8.9"
 parley = "0.10.0"
+pdf-writer = "0.15.0"
 precomputed-hash = "0.1.1"
 reqwest = { version = "0.13.4", default-features = false }
 selectors = "0.38.0"

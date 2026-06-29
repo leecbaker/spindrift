@@ -6,21 +6,10 @@ impl<'a> LayoutBuilder<'a> {
         let mut used_style = self.style_with_current_viewport_lengths(style);
         let (content_width, content_height) =
             used_canvas_size(element, &used_style, available_width);
-        let used_edges = used_box_edges(&used_style, available_width);
-        used_style.margin = used_edges.margin.to_css_edges();
-        used_style.padding = used_edges.padding.to_css_edges();
+        let box_metrics = apply_used_box_metrics(&mut used_style, available_width);
         let style = &used_style;
-        let border_widths = used_border_widths(style);
-        let border_box_width = content_width
-            + style.padding.left
-            + style.padding.right
-            + border_widths.left
-            + border_widths.right;
-        let border_box_height = content_height
-            + style.padding.top
-            + style.padding.bottom
-            + border_widths.top
-            + border_widths.bottom;
+        let border_box_width = content_width + box_metrics.horizontal_non_content();
+        let border_box_height = content_height + box_metrics.vertical_non_content();
 
         let (border_x, border_y) =
             self.place_block_replaced_box(style, border_box_width, border_box_height);
@@ -51,12 +40,12 @@ impl<'a> LayoutBuilder<'a> {
         self.scope_current_page_atomic_paint_since(
             &paint_checkpoint,
             PaintBand::InFlowBlock,
-            PaintClip {
-                x: border_x,
-                y: border_y,
-                width: border_box_width,
-                height: border_box_height,
-            },
+            PaintClip::from_paint_rect(paint_space_rect(
+                border_x,
+                border_y,
+                border_box_width,
+                border_box_height,
+            )),
             style,
             Vec::new(),
         );
@@ -66,9 +55,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(super) fn layout_image(&mut self, element: &Element, style: &ComputedStyle) {
         let available_width = (self.content_right - self.content_left).max(1.0);
         let mut used_style = self.style_with_current_viewport_lengths(style);
-        let used_edges = used_box_edges(&used_style, available_width);
-        used_style.margin = used_edges.margin.to_css_edges();
-        used_style.padding = used_edges.padding.to_css_edges();
+        let box_metrics = apply_used_box_metrics(&mut used_style, available_width);
         let style = &used_style;
         let Some(image) = used_image(
             element,
@@ -80,7 +67,7 @@ impl<'a> LayoutBuilder<'a> {
         ) else {
             return;
         };
-        let border_widths = used_border_widths(style);
+        let border_widths = box_metrics.border;
 
         let (border_x, border_y) =
             self.place_block_replaced_box(style, image.border_box_width, image.border_box_height);
@@ -108,41 +95,33 @@ impl<'a> LayoutBuilder<'a> {
             let image_x = border_x + border_widths.left + style.padding.left;
             let image_y = border_y + border_widths.bottom + style.padding.bottom;
             if let Some(fill) = solid_opaque_image_fill(&image.decoded) {
-                self.push_rect(RenderedRect {
-                    x: image_x,
-                    y: image_y,
-                    width: image.content_width,
-                    height: image.content_height,
-                    fill: Some(fill),
-                    stroke: None,
-                    stroke_width: 0.0,
-                });
+                self.push_rect(RenderedRect::from_paint_rect(
+                    paint_space_rect(image_x, image_y, image.content_width, image.content_height),
+                    Some(fill),
+                ));
             } else {
-                self.push_image(RenderedImage {
-                    background: false,
-                    x: image_x,
-                    y: image_y,
-                    width: image.content_width,
-                    height: image.content_height,
-                    pixel_width: image.decoded.pixel_width,
-                    pixel_height: image.decoded.pixel_height,
-                    source_rect: None,
-                    interpolate: false,
-                    rgb: image.decoded.rgb,
-                    alpha: image.decoded.alpha,
-                    alt_text: element.attrs.get("alt").cloned(),
-                });
+                self.push_image(RenderedImage::from_paint_rect(
+                    paint_space_rect(image_x, image_y, image.content_width, image.content_height),
+                    false,
+                    image.decoded.pixel_width,
+                    image.decoded.pixel_height,
+                    None,
+                    false,
+                    image.decoded.rgb,
+                    image.decoded.alpha,
+                    element.attrs.get("alt").cloned(),
+                ));
             }
         }
         self.scope_current_page_atomic_paint_since(
             &paint_checkpoint,
             PaintBand::InFlowBlock,
-            PaintClip {
-                x: border_x,
-                y: border_y,
-                width: image.border_box_width,
-                height: image.border_box_height,
-            },
+            PaintClip::from_paint_rect(paint_space_rect(
+                border_x,
+                border_y,
+                image.border_box_width,
+                image.border_box_height,
+            )),
             style,
             Vec::new(),
         );
@@ -164,9 +143,7 @@ impl<'a> LayoutBuilder<'a> {
         };
         let available_width = (self.content_right - self.content_left).max(1.0);
         let mut used_style = self.style_with_current_viewport_lengths(style);
-        let used_edges = used_box_edges(&used_style, available_width);
-        used_style.margin = used_edges.margin.to_css_edges();
-        used_style.padding = used_edges.padding.to_css_edges();
+        let box_metrics = apply_used_box_metrics(&mut used_style, available_width);
         let style = &used_style;
         let image = used_generated_image(
             url,
@@ -178,7 +155,7 @@ impl<'a> LayoutBuilder<'a> {
         )
         .unwrap_or_else(|| used_invalid_replacement_image(style, available_width));
         let alt_text = self.generated_alt_text(element, style);
-        let border_widths = used_border_widths(style);
+        let border_widths = box_metrics.border;
         let (border_x, border_y) =
             self.place_block_replaced_box(style, image.border_box_width, image.border_box_height);
         let paint_checkpoint = self.current_page.paint_checkpoint();
@@ -205,31 +182,28 @@ impl<'a> LayoutBuilder<'a> {
             let image_x = border_x + border_widths.left + style.padding.left;
             let image_y = border_y + border_widths.bottom + style.padding.bottom;
             if image.content_width > 0.0 && image.content_height > 0.0 {
-                self.push_image(RenderedImage {
-                    background: false,
-                    x: image_x,
-                    y: image_y,
-                    width: image.content_width,
-                    height: image.content_height,
-                    pixel_width: image.decoded.pixel_width,
-                    pixel_height: image.decoded.pixel_height,
-                    source_rect: None,
-                    interpolate: false,
-                    rgb: image.decoded.rgb,
-                    alpha: image.decoded.alpha,
+                self.push_image(RenderedImage::from_paint_rect(
+                    paint_space_rect(image_x, image_y, image.content_width, image.content_height),
+                    false,
+                    image.decoded.pixel_width,
+                    image.decoded.pixel_height,
+                    None,
+                    false,
+                    image.decoded.rgb,
+                    image.decoded.alpha,
                     alt_text,
-                });
+                ));
             }
         }
         self.scope_current_page_atomic_paint_since(
             &paint_checkpoint,
             PaintBand::InFlowBlock,
-            PaintClip {
-                x: border_x,
-                y: border_y,
-                width: image.border_box_width,
-                height: image.border_box_height,
-            },
+            PaintClip::from_paint_rect(paint_space_rect(
+                border_x,
+                border_y,
+                image.border_box_width,
+                image.border_box_height,
+            )),
             style,
             Vec::new(),
         );
@@ -242,21 +216,11 @@ impl<'a> LayoutBuilder<'a> {
         };
         let available_width = (self.content_right - self.content_left).max(1.0);
         let mut used_style = self.style_with_current_viewport_lengths(style);
-        let used_edges = used_box_edges(&used_style, available_width);
-        used_style.margin = used_edges.margin.to_css_edges();
-        used_style.padding = used_edges.padding.to_css_edges();
+        let box_metrics = apply_used_box_metrics(&mut used_style, available_width);
         let style = &used_style;
-        let border_widths = used_border_widths(style);
-        let border_box_width = content_width
-            + style.padding.left
-            + style.padding.right
-            + border_widths.left
-            + border_widths.right;
-        let border_box_height = content_height
-            + style.padding.top
-            + style.padding.bottom
-            + border_widths.top
-            + border_widths.bottom;
+        let border_widths = box_metrics.border;
+        let border_box_width = content_width + box_metrics.horizontal_non_content();
+        let border_box_height = content_height + box_metrics.vertical_non_content();
         let (border_x, border_y) =
             self.place_block_replaced_box(style, border_box_width, border_box_height);
         let paint_checkpoint = self.current_page.paint_checkpoint();
@@ -282,25 +246,25 @@ impl<'a> LayoutBuilder<'a> {
             self.extend_strokes_in_band(PaintBand::InFlowBlock, strokes);
         }
         if style.visibility == Visibility::Visible {
-            self.push_rect(RenderedRect {
-                x: border_x + border_widths.left + style.padding.left,
-                y: border_y + border_widths.bottom + style.padding.bottom,
-                width: content_width,
-                height: content_height,
-                fill: Some(fill),
-                stroke: None,
-                stroke_width: 0.0,
-            });
+            self.push_rect(RenderedRect::from_paint_rect(
+                paint_space_rect(
+                    border_x + border_widths.left + style.padding.left,
+                    border_y + border_widths.bottom + style.padding.bottom,
+                    content_width,
+                    content_height,
+                ),
+                Some(fill),
+            ));
         }
         self.scope_current_page_atomic_paint_since(
             &paint_checkpoint,
             PaintBand::InFlowBlock,
-            PaintClip {
-                x: border_x,
-                y: border_y,
-                width: border_box_width,
-                height: border_box_height,
-            },
+            PaintClip::from_paint_rect(paint_space_rect(
+                border_x,
+                border_y,
+                border_box_width,
+                border_box_height,
+            )),
             style,
             Vec::new(),
         );
@@ -322,6 +286,8 @@ impl<'a> LayoutBuilder<'a> {
             margin_box_width,
             margin_box_height,
             style.clear,
+            style.writing_mode,
+            style.direction,
             self.containing_block_direction,
         );
         self.cursor_y = avoided_top;
@@ -480,12 +446,12 @@ impl<'a> LayoutBuilder<'a> {
                 push_border_image_tiles(
                     &mut images,
                     &decoded,
-                    RenderedImageTileRect {
-                        x: dest_x[col],
-                        y: dest_y[row],
-                        width: dest_width[col],
-                        height: dest_height[row],
-                    },
+                    RenderedImageTileRect::new(
+                        dest_x[col],
+                        dest_y[row],
+                        dest_width[col],
+                        dest_height[row],
+                    ),
                     RenderedImageSourceRect {
                         x: source_x[col],
                         y: source_y[row],
@@ -524,9 +490,7 @@ impl<'a> LayoutBuilder<'a> {
                 .unwrap_or_else(|| self.page_containing_block())
         };
         let mut used_style = self.style_with_current_viewport_lengths(style);
-        let used_edges = used_box_edges(&used_style, containing_block.width);
-        used_style.margin = used_edges.margin.to_css_edges();
-        used_style.padding = used_edges.padding.to_css_edges();
+        apply_used_box_metrics(&mut used_style, containing_block.width());
         if used_style.display.is_inline_level() {
             // CSS Display blockifies the outer display type of absolutely
             // positioned boxes for layout while preserving the static-position
@@ -535,37 +499,52 @@ impl<'a> LayoutBuilder<'a> {
             used_style.display = used_style.display.blockified();
         }
         let style = &used_style;
-        let positioned_available_width = (containing_block.width
-            - style.margin.left
-            - style.margin.right
-            - style.padding.left
-            - style.padding.right
-            - horizontal_border_width(style))
-        .max(style.font_size);
-        let static_horizontal_start = (previous_left - containing_block.x).max(0.0);
+        let positioned_available_outer_width =
+            (containing_block.width() - style.margin.left - style.margin.right)
+                .max(style.font_size);
+        let static_horizontal_start = (previous_left - containing_block.x()).max(0.0);
         let inline_auto_static_y = style.abspos_static_source_was_inline_level
             && used_inset_top(style, containing_block).is_none()
             && used_inset_bottom(style, containing_block).is_none();
         let inline_static_baseline_y = inline_auto_static_y
             .then_some(self.inline_static_baseline_y)
             .flatten();
-        let static_vertical_start = (containing_block.top_y - previous_cursor_y).max(0.0);
-        let shrink_to_fit_width = self.estimate_shrink_to_fit_width(
+        let static_vertical_base = containing_block.top_y() - previous_cursor_y;
+        let mut static_vertical_start = static_vertical_base.max(0.0);
+        if !inline_auto_static_y
+            && used_inset_top(style, containing_block).is_none()
+            && used_inset_bottom(style, containing_block).is_none()
+            && let Some(offset) = self.block_static_position_y_offset
+        {
+            // CSS 2.2 defines the auto vertical static position from the
+            // hypothetical normal-flow box. A block-level abspos appearing
+            // after buffered inline content uses the line boxes that would
+            // precede that hypothetical block:
+            // https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height
+            static_vertical_start = static_vertical_base + offset;
+        }
+        let horizontal_non_content =
+            style.padding.left + style.padding.right + horizontal_border_width(style);
+        let auto_or_intrinsic_width = self.used_intrinsic_or_shrink_to_fit_width(
             element,
             style,
             stylesheets,
-            positioned_available_width,
+            positioned_available_outer_width,
+            horizontal_non_content,
             child_boxes,
             table_fragment,
         );
         let positioned_x = resolve_absolute_horizontal(
             style,
             containing_block,
-            shrink_to_fit_width,
+            auto_or_intrinsic_width,
             static_horizontal_start,
+            self.containing_block_direction,
         );
         let positioned_content_width = positioned_x.size;
 
+        let vertical_border_width_for_positioning =
+            self.positioned_vertical_border_width(element, style, stylesheets, table_fragment);
         let auto_height = {
             let mut estimate_style = style.clone();
             estimate_style.position = Position::Static;
@@ -583,12 +562,6 @@ impl<'a> LayoutBuilder<'a> {
             )
             .max(style.line_height)
         };
-        let vertical_border_width_for_positioning = if is_html_table_element(element) {
-            self.collapsed_table_outer_vertical_insets(style, stylesheets, table_fragment)
-                .unwrap_or_else(|| vertical_border_width(style))
-        } else {
-            vertical_border_width(style)
-        };
         let positioned_y = resolve_absolute_vertical(
             style,
             containing_block,
@@ -601,7 +574,7 @@ impl<'a> LayoutBuilder<'a> {
             + style.padding.left
             + style.padding.right
             + horizontal_border_width(style);
-        self.content_left = containing_block.x + positioned_x.start + style.margin.left;
+        self.content_left = containing_block.x() + positioned_x.start + positioned_x.margin_start;
         self.content_right = self.content_left + positioned_border_box_width;
         // CSS Positioned Layout defines the auto inset static-position
         // rectangle from the box's hypothetical normal-flow position. Inline
@@ -611,19 +584,25 @@ impl<'a> LayoutBuilder<'a> {
         let positioned_margin_top = if inline_auto_static_y {
             ((style.line_height - style.font_size) / 2.0).max(0.0)
         } else {
-            style.margin.top
+            positioned_y.margin_start
         };
-        self.cursor_y = containing_block.top_y - positioned_y.start - positioned_margin_top;
+        self.cursor_y = containing_block.top_y() - positioned_y.start - positioned_margin_top;
         let positioned_border_box_height = positioned_content_height
             + style.padding.top
             + style.padding.bottom
             + vertical_border_width(style);
-        let positioned_border_box = PaintClip {
-            x: self.content_left,
-            y: self.cursor_y - positioned_border_box_height,
-            width: positioned_border_box_width,
-            height: positioned_border_box_height,
-        };
+        let positioned_border_box = PageTopRect::new(
+            self.content_left,
+            self.cursor_y,
+            positioned_border_box_width,
+            positioned_border_box_height,
+        )
+        .paint_clip();
+        // CSS Positioned Layout and CSS 2.2 Appendix E order positioned
+        // boxes in tree order in their containing stacking context. Reserve
+        // this box's order before laying out descendants so child positioned
+        // contexts, including fixed descendants, sort after their parent.
+        let positioned_source_order = self.next_paint_source_order();
 
         let mut flow_style = style.clone();
         flow_style.position = Position::Static;
@@ -632,13 +611,18 @@ impl<'a> LayoutBuilder<'a> {
         set_style_used_height(&mut flow_style, positioned_content_height);
         clear_position_insets(&mut flow_style);
         let border_widths = used_border_widths(&flow_style);
-        self.containing_blocks.push(ContainingBlock {
-            x: self.content_left + border_widths.left,
-            top_y: self.cursor_y - border_widths.top,
-            width: positioned_content_width + flow_style.padding.left + flow_style.padding.right,
-            height: positioned_content_height + flow_style.padding.top + flow_style.padding.bottom,
-        });
+        self.containing_blocks
+            .push(ContainingBlock::from_page_top_rect(PageTopRect::new(
+                self.content_left + border_widths.left,
+                self.cursor_y - border_widths.top,
+                positioned_content_width + flow_style.padding.left + flow_style.padding.right,
+                positioned_content_height + flow_style.padding.top + flow_style.padding.bottom,
+            )));
         self.push_page_name_scope_suppression();
+        self.out_of_flow_prebreak_suppression_depth += 1;
+        let previous_overflow_clips = self.overflow_clips.clone();
+        self.overflow_clips =
+            positioned_applicable_overflow_clips(&previous_overflow_clips, containing_block);
         self.layout_element_inner(
             element,
             &flow_style,
@@ -647,6 +631,8 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             table_fragment,
         );
+        self.overflow_clips = previous_overflow_clips;
+        self.out_of_flow_prebreak_suppression_depth -= 1;
         self.pop_page_name_scope_suppression();
         self.containing_blocks.pop();
         let child_positioned_layers = if positioned_layer_start < self.positioned_layers.len() {
@@ -672,9 +658,10 @@ impl<'a> LayoutBuilder<'a> {
             if let (Some(static_baseline_y), Some(fragment_baseline_y)) =
                 (inline_static_baseline_y, positioned_fragment.first_line_y())
             {
-                *positioned_fragment = positioned_fragment
-                    .clone()
-                    .translated(0.0, static_baseline_y - fragment_baseline_y);
+                *positioned_fragment = positioned_fragment.clone().translated(PaintVector::new(
+                    0.0,
+                    static_baseline_y - fragment_baseline_y,
+                ));
             }
         }
         if positioned_fragments
@@ -684,7 +671,6 @@ impl<'a> LayoutBuilder<'a> {
         {
             return;
         }
-        let z_index = style.z_index.unwrap_or(0);
         let child_layers_by_page = child_positioned_layers;
         for (page_index, positioned_fragment) in positioned_fragments {
             let child_layers = child_layers_by_page
@@ -693,33 +679,49 @@ impl<'a> LayoutBuilder<'a> {
                 .cloned()
                 .collect::<Vec<_>>();
             let mut links = positioned_fragment.links.clone();
-            for layer in &child_layers {
-                links.extend(layer.links.clone());
-            }
-            let child_contexts = child_layers
-                .into_iter()
-                .map(|layer| layer.context)
-                .collect();
             let bounds = positioned_border_box;
-            let effects = paint_effects_for_box(style, bounds);
-            let context = PaintStackingContext::new(z_index, positioned_fragment, child_contexts)
-                .with_source_order(self.next_paint_source_order())
-                .with_effects(effects)
+            let policy = StackingContextPolicy::for_positioned(style, bounds);
+            let isolates_positioned_descendants =
+                policy.is_real_stacking_context && policy.captures_positioned_descendants;
+            let child_contexts = if isolates_positioned_descendants {
+                for layer in &child_layers {
+                    links.extend(layer.links.clone());
+                }
+                child_layers
+                    .iter()
+                    .cloned()
+                    .map(|layer| layer.context)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if !positioned_fragment.is_empty() || !child_contexts.is_empty() {
+                let context = PaintStackingContext::from_banded_fragment_with_stack_level(
+                    policy.stack_level,
+                    positioned_fragment,
+                    child_contexts,
+                )
+                .with_source_order(positioned_source_order)
+                .with_effects(policy.effects)
                 .with_bounds(bounds);
-            if style.position == Position::Fixed {
-                self.fixed_layers.push(FixedPaintLayer {
-                    z_index,
+                if style.position == Position::Fixed {
+                    self.fixed_layers.push(FixedPaintLayer {
+                        stack_level: policy.stack_level,
+                        context,
+                        links,
+                    });
+                    continue;
+                }
+                self.positioned_layers.push(PositionedPaintLayer {
+                    page_index,
+                    stack_level: policy.stack_level,
                     context,
                     links,
                 });
-                continue;
             }
-            self.positioned_layers.push(PositionedPaintLayer {
-                page_index,
-                z_index,
-                context,
-                links,
-            });
+            if !isolates_positioned_descendants {
+                self.positioned_layers.extend(child_layers);
+            }
         }
     }
 
@@ -736,6 +738,21 @@ impl<'a> LayoutBuilder<'a> {
         self.inline_static_baseline_y = Some(static_baseline_y);
         self.layout_positioned_block(element, style, stylesheets, child_boxes, table_fragment);
         self.inline_static_baseline_y = previous;
+    }
+
+    pub(super) fn layout_positioned_block_with_block_static_y_offset(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+        static_y_offset: f32,
+    ) {
+        let previous = self.block_static_position_y_offset;
+        self.block_static_position_y_offset = Some(static_y_offset);
+        self.layout_positioned_block(element, style, stylesheets, child_boxes, table_fragment);
+        self.block_static_position_y_offset = previous;
     }
 
     /// Ensures absolutely positioned boxes that overflow page areas generate pages.
@@ -759,13 +776,13 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         let page_height = self.page_area_height().max(1.0);
-        let margin_box_top = containing_block.top_y - positioned_y.start;
-        let margin_box_height = style.margin.top
+        let margin_box_top = containing_block.top_y() - positioned_y.start;
+        let margin_box_height = positioned_y.margin_start
             + positioned_y.size
             + style.padding.top
             + style.padding.bottom
             + vertical_border_width
-            + style.margin.bottom;
+            + positioned_y.margin_end;
         if margin_box_height <= 0.0 {
             return;
         }
@@ -833,26 +850,86 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
     ) -> f32 {
+        let (preferred_min, preferred) = self.formatting_context_intrinsic_widths(
+            element,
+            style,
+            stylesheets,
+            available_width,
+            child_boxes,
+            table_fragment,
+        );
+        intrinsic::shrink_to_fit_width(preferred_min, preferred, available_width)
+            .max(style.font_size)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn used_intrinsic_or_shrink_to_fit_width(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        horizontal_non_content: f32,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+    ) -> f32 {
+        let content_available_width = (available_width - horizontal_non_content).max(0.0);
+        let (preferred_min, preferred) = self.formatting_context_intrinsic_widths(
+            element,
+            style,
+            stylesheets,
+            content_available_width,
+            child_boxes,
+            table_fragment,
+        );
+        intrinsic::intrinsic_width_keyword(
+            style.box_values.width,
+            preferred_min,
+            preferred,
+            available_width,
+            horizontal_non_content,
+        )
+        .unwrap_or_else(|| {
+            intrinsic::shrink_to_fit_width(preferred_min, preferred, content_available_width)
+        })
+        .max(style.font_size)
+    }
+
+    fn formatting_context_intrinsic_widths(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+    ) -> (f32, f32) {
         if style.display.is_flex() {
-            return self
-                .estimate_flex_shrink_to_fit_width(
-                    element,
-                    style,
-                    stylesheets,
-                    available_width,
-                    child_boxes,
-                )
-                .max(0.0);
+            let (preferred_min, preferred) = self.estimate_flex_intrinsic_widths(
+                element,
+                style,
+                stylesheets,
+                available_width,
+                child_boxes,
+            );
+            return (
+                preferred_min.max(0.0),
+                preferred.max(preferred_min).max(0.0),
+            );
         }
         if style.display.is_table()
             && let Some(fragment) = table_fragment
         {
-            return self.table_shrink_to_fit_width_from_fragment(
+            let (preferred_min, preferred) = self.table_intrinsic_widths_from_fragment(
                 element,
                 style,
                 stylesheets,
                 fragment,
                 available_width,
+            );
+            return (
+                preferred_min.max(0.0),
+                preferred.max(preferred_min).max(0.0),
             );
         }
 
@@ -862,7 +939,7 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             child_boxes,
         );
-        let mut preferred = intrinsic::guarded_max_content_width(contribution.max_content, style);
+        let mut preferred = contribution.max_content;
         let mut preferred_min = contribution.min_content;
 
         if let Some(child_boxes) = child_boxes {
@@ -892,21 +969,26 @@ impl<'a> LayoutBuilder<'a> {
                 if child_style.display.is_inline_level() {
                     continue;
                 }
+                if let box_tree::FormattingBox::Table(table_box) = child_box {
+                    let (child_preferred_min, child_preferred) = self
+                        .table_outer_intrinsic_widths_from_fragment(
+                            table_box.element,
+                            child_style,
+                            stylesheets,
+                            &table_box.fragment,
+                            available_width,
+                        );
+                    preferred = preferred.max(child_preferred);
+                    preferred_min = preferred_min.max(child_preferred_min);
+                    continue;
+                }
                 let child_extras = child_style.margin.left
                     + child_style.margin.right
                     + child_style.padding.left
                     + child_style.padding.right
                     + horizontal_border_width(child_style);
                 let (intrinsic_preferred_min, intrinsic_preferred) =
-                    if let box_tree::FormattingBox::Table(table_box) = child_box {
-                        self.table_intrinsic_widths_from_fragment(
-                            table_box.element,
-                            child_style,
-                            stylesheets,
-                            &table_box.fragment,
-                            available_width,
-                        )
-                    } else if child_style.display.is_flex() {
+                    if child_style.display.is_flex() {
                         self.estimate_flex_intrinsic_widths(
                             child_element,
                             child_style,
@@ -921,13 +1003,7 @@ impl<'a> LayoutBuilder<'a> {
                             stylesheets,
                             Some(child_children),
                         );
-                        (
-                            contribution.min_content,
-                            intrinsic::guarded_max_content_width(
-                                contribution.max_content,
-                                child_style,
-                            ),
-                        )
+                        (contribution.min_content, contribution.max_content)
                     };
                 let child_content_width =
                     used_content_width_or_auto(child_style, available_width, child_extras)
@@ -1001,13 +1077,7 @@ impl<'a> LayoutBuilder<'a> {
                             stylesheets,
                             None,
                         );
-                        (
-                            contribution.min_content,
-                            intrinsic::guarded_max_content_width(
-                                contribution.max_content,
-                                &child_style,
-                            ),
-                        )
+                        (contribution.min_content, contribution.max_content)
                     };
                 let child_content_width =
                     used_content_width_or_auto(&child_style, available_width, child_extras)
@@ -1021,8 +1091,10 @@ impl<'a> LayoutBuilder<'a> {
             preferred_min = preferred_min.max(max_float_width);
         }
 
-        intrinsic::shrink_to_fit_width(preferred_min, preferred, available_width)
-            .max(style.font_size)
+        (
+            preferred_min.max(0.0),
+            preferred.max(preferred_min).max(0.0),
+        )
     }
 
     pub(super) fn measure_auto_positioned_block_height(
@@ -1034,17 +1106,20 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
     ) -> f32 {
+        let vertical_border_width_for_positioning =
+            self.positioned_vertical_border_width(element, style, stylesheets, table_fragment);
         let snapshot = self.snapshot();
         self.content_left = 0.0;
         self.content_right = width.max(style.font_size);
         self.cursor_y = self.page_bottom() + 10_000.0;
         let start_y = self.cursor_y;
-        self.containing_blocks.push(ContainingBlock {
-            x: self.content_left,
-            top_y: self.cursor_y,
-            width: self.content_right - self.content_left,
-            height: 10_000.0,
-        });
+        self.containing_blocks
+            .push(ContainingBlock::from_page_top_rect(PageTopRect::new(
+                self.content_left,
+                self.cursor_y,
+                self.content_right - self.content_left,
+                10_000.0,
+            )));
         self.layout_element_inner(
             element,
             style,
@@ -1057,18 +1132,39 @@ impl<'a> LayoutBuilder<'a> {
         let consumed = (start_y - self.cursor_y).max(0.0);
         self.restore(snapshot);
         // CSS 2.2 absolute positioning equations use content height as the
-        // `height` term and add padding/borders separately.
-        (consumed - style.padding.top - style.padding.bottom - vertical_border_width(style))
+        // `height` term and add padding/borders separately. Collapsed table
+        // borders contribute resolved outer grid insets rather than authored
+        // full border widths, so use the same vertical non-content size that
+        // will be used by the absolute-position equation.
+        (consumed
+            - style.padding.top
+            - style.padding.bottom
+            - vertical_border_width_for_positioning)
             .max(0.0)
     }
 
-    pub(super) fn page_containing_block(&self) -> ContainingBlock {
-        ContainingBlock {
-            x: self.page_left(),
-            top_y: self.page_top(),
-            width: self.page_area_width(),
-            height: self.page_area_height(),
+    fn positioned_vertical_border_width(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+    ) -> f32 {
+        if is_html_table_element(element) {
+            self.collapsed_table_outer_vertical_insets(style, stylesheets, table_fragment)
+                .unwrap_or_else(|| vertical_border_width(style))
+        } else {
+            vertical_border_width(style)
         }
+    }
+
+    pub(super) fn page_containing_block(&self) -> ContainingBlock {
+        ContainingBlock::from_page_top_rect(PageTopRect::new(
+            self.page_left(),
+            self.page_top(),
+            self.page_area_width(),
+            self.page_area_height(),
+        ))
     }
 
     pub(super) fn current_containing_block(&self) -> ContainingBlock {
@@ -1102,68 +1198,149 @@ pub(super) fn background_images_for_style(
     fallback_root_url: Option<&Path>,
     resource_cache: &ResourceCache,
 ) -> Vec<RenderedImage> {
-    let Some(BackgroundImage::Url {
-        src,
-        base_url,
-        root_url,
-    }) = style.background_image.as_ref()
-    else {
-        return Vec::new();
-    };
-    let Some(decoded) = load_image_source(
-        src,
-        base_url.as_deref().or(fallback_base_url),
-        root_url.as_deref().or(fallback_root_url),
-        resource_cache,
-    ) else {
-        return Vec::new();
-    };
-    let (image_width, image_height) =
-        used_background_size(&decoded, area.width, area.height, style.background_size);
-    if image_width <= 0.0 || image_height <= 0.0 {
-        return Vec::new();
-    }
-    let (offset_x, offset_y) = background_position(
-        style.background_position,
-        area.width,
-        area.height,
-        image_width,
-        image_height,
-    );
-    let tile_xs = background_tile_positions(
-        area.x + offset_x,
-        area.x,
-        area.width,
-        image_width,
-        style.background_repeat.repeats_x(),
-    );
-    let tile_ys = background_tile_positions(
-        area.y + offset_y,
-        area.y,
-        area.height,
-        image_height,
-        style.background_repeat.repeats_y(),
-    );
     let mut images = Vec::new();
-    for tile_y in tile_ys {
-        for tile_x in &tile_xs {
-            images.push(RenderedImage {
-                background: true,
-                x: *tile_x,
-                y: tile_y,
-                width: image_width,
-                height: image_height,
-                pixel_width: decoded.pixel_width,
-                pixel_height: decoded.pixel_height,
-                source_rect: None,
-                interpolate: true,
-                rgb: decoded.rgb.clone(),
-                alpha: decoded.alpha.clone(),
-                alt_text: None,
-            });
+    for layer in background_layers_for_paint(style).iter().rev() {
+        let positioning_area = background_paint_area_for_box(area, style, layer.origin);
+        let clip_area = background_paint_area_for_box(area, style, layer.clip);
+        let Some(BackgroundImage::Url {
+            src,
+            base_url,
+            root_url,
+        }) = layer.image.as_ref()
+        else {
+            continue;
+        };
+        let Some(decoded) = load_image_source(
+            src.as_str(),
+            base_url.as_deref().or(fallback_base_url),
+            root_url.as_deref().or(fallback_root_url),
+            resource_cache,
+        ) else {
+            continue;
+        };
+        let (image_width, image_height) = used_background_size(
+            &decoded,
+            positioning_area.width,
+            positioning_area.height,
+            layer.size,
+        );
+        if image_width <= 0.0 || image_height <= 0.0 {
+            continue;
+        }
+        let (offset_x, offset_y) = background_position(
+            layer.position,
+            positioning_area.width,
+            positioning_area.height,
+            image_width,
+            image_height,
+        );
+        let tile_xs = background_tile_positions(
+            positioning_area.x + offset_x,
+            positioning_area.x,
+            positioning_area.width,
+            image_width,
+            layer.repeat.repeats_x(),
+        );
+        let tile_ys = background_tile_positions(
+            positioning_area.y + offset_y,
+            positioning_area.y,
+            positioning_area.height,
+            image_height,
+            layer.repeat.repeats_y(),
+        );
+        for tile_y in tile_ys {
+            for tile_x in &tile_xs {
+                let image = RenderedImage::from_paint_rect(
+                    paint_space_rect(*tile_x, tile_y, image_width, image_height),
+                    true,
+                    decoded.pixel_width,
+                    decoded.pixel_height,
+                    None,
+                    true,
+                    decoded.rgb.clone(),
+                    decoded.alpha.clone(),
+                    None,
+                );
+                if let Some(image) = clip_background_image_to_area(image, clip_area) {
+                    images.push(image);
+                }
+            }
         }
     }
     images
+}
+
+fn background_layers_for_paint(style: &ComputedStyle) -> Vec<css::BackgroundLayer> {
+    if !style.background_layers.is_empty() {
+        return style.background_layers.clone();
+    }
+    vec![css::BackgroundLayer {
+        image: style.background_image.clone(),
+        position: style.background_position,
+        size: style.background_size,
+        repeat: style.background_repeat,
+        origin: style.background_origin,
+        clip: style.background_clip,
+    }]
+}
+
+fn background_paint_area_for_box(
+    area: BackgroundPaintArea,
+    style: &ComputedStyle,
+    box_: css::BackgroundBox,
+) -> BackgroundPaintArea {
+    let border = used_border_widths(style);
+    match box_ {
+        css::BackgroundBox::Border => area,
+        css::BackgroundBox::Padding => area.inset(border),
+        css::BackgroundBox::Content => area.inset(border).inset(style.padding),
+    }
+}
+
+fn clip_background_image_to_area(
+    mut image: RenderedImage,
+    clip: BackgroundPaintArea,
+) -> Option<RenderedImage> {
+    let image_x = image.x();
+    let image_y = image.y();
+    let image_width = image.width();
+    let image_height = image.height();
+    let x1 = image_x.max(clip.x);
+    let y1 = image_y.max(clip.y);
+    let x2 = (image_x + image_width).min(clip.x + clip.width);
+    let y2 = (image_y + image_height).min(clip.y + clip.height);
+    if x2 <= x1 || y2 <= y1 || image_width <= 0.0 || image_height <= 0.0 {
+        return None;
+    }
+    let source = image.source_rect.unwrap_or(RenderedImageSourceRect {
+        x: 0,
+        y: 0,
+        width: image.pixel_width,
+        height: image.pixel_height,
+    });
+    let source_x = source.x as f32 + ((x1 - image_x) / image_width) * source.width as f32;
+    let source_y = source.y as f32 + ((y1 - image_y) / image_height) * source.height as f32;
+    let source_width = ((x2 - x1) / image_width) * source.width as f32;
+    let source_height = ((y2 - y1) / image_height) * source.height as f32;
+    image.set_paint_rect(paint_space_rect(x1, y1, x2 - x1, y2 - y1));
+    image.source_rect = Some(RenderedImageSourceRect {
+        x: source_x.floor().max(0.0) as u32,
+        y: source_y.floor().max(0.0) as u32,
+        width: source_width.ceil().max(1.0) as u32,
+        height: source_height.ceil().max(1.0) as u32,
+    });
+    Some(image)
+}
+
+impl BackgroundPaintArea {
+    fn inset(self, edges: css::Edges) -> Self {
+        Self {
+            x: self.x + edges.left,
+            y: self.y + edges.bottom,
+            width: (self.width - edges.left - edges.right).max(0.0),
+            height: (self.height - edges.top - edges.bottom).max(0.0),
+        }
+    }
 }
 
 fn clear_position_insets(style: &mut ComputedStyle) {
@@ -1172,10 +1349,38 @@ fn clear_position_insets(style: &mut ComputedStyle) {
 
 #[derive(Debug, Clone, Copy)]
 struct RenderedImageTileRect {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    /// Destination tile region in page-local CSS paint coordinates.
+    ///
+    /// CSS Backgrounds and Borders slices `border-image` into destination
+    /// regions that are painted into the border-image area. At this stage the
+    /// layout box has already been projected into paint space, so the rectangle
+    /// uses the same bottom-left-origin coordinate system as rendered images:
+    /// <https://www.w3.org/TR/css-backgrounds-3/#border-image-process>.
+    rect: PaintRect,
+}
+
+impl RenderedImageTileRect {
+    fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            rect: paint_space_rect(x, y, width, height),
+        }
+    }
+
+    fn x(self) -> f32 {
+        self.rect.origin.x
+    }
+
+    fn y(self) -> f32 {
+        self.rect.origin.y
+    }
+
+    fn width(self) -> f32 {
+        self.rect.size.width
+    }
+
+    fn height(self) -> f32 {
+        self.rect.size.height
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1204,9 +1409,9 @@ fn push_border_image_tiles(
     let (tile_width, tile_height) =
         border_image_base_tile_size(destination, source, repeat_x, repeat_y);
     let x_segments =
-        border_image_tile_segments(repeat_x, destination.width, tile_width, source.width);
+        border_image_tile_segments(repeat_x, destination.width(), tile_width, source.width);
     let y_segments =
-        border_image_tile_segments(repeat_y, destination.height, tile_height, source.height);
+        border_image_tile_segments(repeat_y, destination.height(), tile_height, source.height);
     for y_segment in &y_segments {
         for x_segment in &x_segments {
             if x_segment.destination_size <= 0.0
@@ -1216,25 +1421,27 @@ fn push_border_image_tiles(
             {
                 continue;
             }
-            images.push(RenderedImage {
-                background: true,
-                x: destination.x + x_segment.destination_offset,
-                y: destination.y + y_segment.destination_offset,
-                width: x_segment.destination_size,
-                height: y_segment.destination_size,
-                pixel_width: decoded.pixel_width,
-                pixel_height: decoded.pixel_height,
-                source_rect: Some(RenderedImageSourceRect {
+            images.push(RenderedImage::from_paint_rect(
+                paint_space_rect(
+                    destination.x() + x_segment.destination_offset,
+                    destination.y() + y_segment.destination_offset,
+                    x_segment.destination_size,
+                    y_segment.destination_size,
+                ),
+                true,
+                decoded.pixel_width,
+                decoded.pixel_height,
+                Some(RenderedImageSourceRect {
                     x: source.x + x_segment.source_offset,
                     y: source.y + y_segment.source_offset,
                     width: x_segment.source_size,
                     height: y_segment.source_size,
                 }),
-                interpolate: true,
-                rgb: decoded.rgb.clone(),
-                alpha: decoded.alpha.clone(),
-                alt_text: None,
-            });
+                true,
+                decoded.rgb.clone(),
+                decoded.alpha.clone(),
+                None,
+            ));
         }
     }
 }
@@ -1251,21 +1458,21 @@ fn border_image_base_tile_size(
         && repeat_y == css::BorderImageRepeatKeyword::Stretch
         && source.height > 0
     {
-        let scale = destination.height / source.height as f32;
+        let scale = destination.height() / source.height as f32;
         tile_width *= scale;
     }
     if repeat_y != css::BorderImageRepeatKeyword::Stretch
         && repeat_x == css::BorderImageRepeatKeyword::Stretch
         && source.width > 0
     {
-        let scale = destination.width / source.width as f32;
+        let scale = destination.width() / source.width as f32;
         tile_height *= scale;
     }
     if repeat_x == css::BorderImageRepeatKeyword::Stretch {
-        tile_width = destination.width;
+        tile_width = destination.width();
     }
     if repeat_y == css::BorderImageRepeatKeyword::Stretch {
-        tile_height = destination.height;
+        tile_height = destination.height();
     }
     (tile_width.max(0.0), tile_height.max(0.0))
 }
@@ -1362,6 +1569,106 @@ fn repeat_border_image_tile_segments(
 struct PositionedAxis {
     start: f32,
     size: f32,
+    margin_start: f32,
+    margin_end: f32,
+}
+
+impl PositionedAxis {
+    fn new(start: f32, size: f32, margin_start: f32, margin_end: f32) -> Self {
+        Self {
+            start,
+            size,
+            margin_start,
+            margin_end,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AbsoluteAxisDirection {
+    HorizontalLtr,
+    HorizontalRtl,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AbsoluteDefiniteAxis {
+    start: f32,
+    size: f32,
+    end: f32,
+    margin_start: f32,
+    margin_end: f32,
+    non_content: f32,
+    containing_size: f32,
+}
+
+/// Resolve auto margins for a fully definite absolutely positioned axis.
+///
+/// CSS 2.2 defines absolute-position sizing by a constraint equation over
+/// start inset, margins, padding, borders, content size, and end inset. Auto
+/// margins remain zero for the other non-replaced absolute-position cases, but
+/// when both insets and the used size are definite, auto margins absorb the
+/// equation's remaining space before overconstraint handling:
+/// <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-width> and
+/// <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height>.
+fn resolve_absolute_definite_axis_auto_margins(
+    start_auto: bool,
+    end_auto: bool,
+    axis: AbsoluteDefiniteAxis,
+    direction: AbsoluteAxisDirection,
+) -> PositionedAxis {
+    let remaining = axis.containing_size
+        - axis.start
+        - axis.margin_start
+        - axis.non_content
+        - axis.size
+        - axis.margin_end
+        - axis.end;
+
+    match (start_auto, end_auto) {
+        (true, true) => {
+            if matches!(direction, AbsoluteAxisDirection::HorizontalLtr) && remaining < 0.0 {
+                return PositionedAxis::new(axis.start, axis.size, 0.0, remaining);
+            }
+            if matches!(direction, AbsoluteAxisDirection::HorizontalRtl) && remaining < 0.0 {
+                return PositionedAxis::new(axis.start, axis.size, remaining, 0.0);
+            }
+            PositionedAxis::new(
+                axis.start,
+                axis.size,
+                axis.margin_start + remaining / 2.0,
+                axis.margin_end + remaining / 2.0,
+            )
+        }
+        (true, false) => PositionedAxis::new(
+            axis.start,
+            axis.size,
+            axis.margin_start + remaining,
+            axis.margin_end,
+        ),
+        (false, true) => PositionedAxis::new(
+            axis.start,
+            axis.size,
+            axis.margin_start,
+            axis.margin_end + remaining,
+        ),
+        (false, false) => match direction {
+            AbsoluteAxisDirection::HorizontalRtl => PositionedAxis::new(
+                axis.containing_size
+                    - axis.end
+                    - axis.margin_start
+                    - axis.margin_end
+                    - axis.non_content
+                    - axis.size,
+                axis.size,
+                axis.margin_start,
+                axis.margin_end,
+            ),
+            AbsoluteAxisDirection::HorizontalLtr | AbsoluteAxisDirection::Vertical => {
+                PositionedAxis::new(axis.start, axis.size, axis.margin_start, axis.margin_end)
+            }
+        },
+    }
 }
 
 /// Returns tile origins that intersect a background positioning area.
@@ -1405,8 +1712,9 @@ fn background_tile_positions(
 fn resolve_absolute_horizontal(
     style: &ComputedStyle,
     containing_block: ContainingBlock,
-    shrink_to_fit_width: f32,
+    auto_or_intrinsic_width: f32,
     static_start: f32,
+    containing_direction: Direction,
 ) -> PositionedAxis {
     // CSS 2.1 10.3.7, non-replaced absolutely positioned elements. Static
     // position is approximated from the layout cursor/content edge at the
@@ -1415,48 +1723,92 @@ fn resolve_absolute_horizontal(
     let right = used_inset_right(style, containing_block);
     let width = used_content_width_or_auto(
         style,
-        containing_block.width,
+        containing_block.width(),
         style.padding.left + style.padding.right + horizontal_border_width(style),
-    );
-    let static_start = static_start.clamp(0.0, containing_block.width);
+    )
+    .or_else(|| {
+        matches!(
+            style.box_values.width,
+            css::ComputedLengthPercentageOrAuto::MinContent
+                | css::ComputedLengthPercentageOrAuto::MaxContent
+                | css::ComputedLengthPercentageOrAuto::FitContent(_)
+        )
+        .then_some(auto_or_intrinsic_width)
+    })
+    .map(|width| constrain_width(style, width, containing_block.width()));
+    let shrink_to_fit_width =
+        constrain_width(style, auto_or_intrinsic_width, containing_block.width());
+    let static_start = static_start.clamp(0.0, containing_block.width());
     let margin_start = style.margin.left;
     let margin_end = style.margin.right;
     let non_content = style.padding.left + style.padding.right + horizontal_border_width(style);
     let fill_between = |start: f32, end: f32| {
-        (containing_block.width - start - margin_start - non_content - margin_end - end)
+        (containing_block.width() - start - margin_start - non_content - margin_end - end)
             .max(style.font_size)
     };
     let border_box_size = |content_size: f32| content_size + non_content;
     let start_for_end = |content_size: f32, end: f32| {
-        containing_block.width - end - margin_start - margin_end - border_box_size(content_size)
+        containing_block.width() - end - margin_start - margin_end - border_box_size(content_size)
     };
 
     match (left, width, right) {
-        (Some(start), Some(size), _) => PositionedAxis { start, size },
-        (Some(start), None, Some(end)) => PositionedAxis {
+        (Some(start), Some(size), Some(end)) => match containing_direction {
+            Direction::Ltr => resolve_absolute_definite_axis_auto_margins(
+                style.box_values.margin.left.is_auto(),
+                style.box_values.margin.right.is_auto(),
+                AbsoluteDefiniteAxis {
+                    start,
+                    size,
+                    end,
+                    margin_start,
+                    margin_end,
+                    non_content,
+                    containing_size: containing_block.width(),
+                },
+                AbsoluteAxisDirection::HorizontalLtr,
+            ),
+            Direction::Rtl => resolve_absolute_definite_axis_auto_margins(
+                style.box_values.margin.left.is_auto(),
+                style.box_values.margin.right.is_auto(),
+                AbsoluteDefiniteAxis {
+                    start,
+                    size,
+                    end,
+                    margin_start,
+                    margin_end,
+                    non_content,
+                    containing_size: containing_block.width(),
+                },
+                AbsoluteAxisDirection::HorizontalRtl,
+            ),
+        },
+        (Some(start), Some(size), None) => {
+            PositionedAxis::new(start, size, margin_start, margin_end)
+        }
+        (Some(start), None, Some(end)) => PositionedAxis::new(
             start,
-            size: fill_between(start, end),
-        },
-        (Some(start), None, None) => PositionedAxis {
-            start,
-            size: shrink_to_fit_width,
-        },
-        (None, Some(size), Some(end)) => PositionedAxis {
-            start: start_for_end(size, end),
-            size,
-        },
-        (None, Some(size), None) => PositionedAxis {
-            start: static_start,
-            size,
-        },
-        (None, None, Some(end)) => PositionedAxis {
-            start: start_for_end(shrink_to_fit_width, end),
-            size: shrink_to_fit_width,
-        },
-        (None, None, None) => PositionedAxis {
-            start: static_start,
-            size: shrink_to_fit_width,
-        },
+            constrain_width(style, fill_between(start, end), containing_block.width()),
+            margin_start,
+            margin_end,
+        ),
+        (Some(start), None, None) => {
+            PositionedAxis::new(start, shrink_to_fit_width, margin_start, margin_end)
+        }
+        (None, Some(size), Some(end)) => {
+            PositionedAxis::new(start_for_end(size, end), size, margin_start, margin_end)
+        }
+        (None, Some(size), None) => {
+            PositionedAxis::new(static_start, size, margin_start, margin_end)
+        }
+        (None, None, Some(end)) => PositionedAxis::new(
+            start_for_end(shrink_to_fit_width, end),
+            shrink_to_fit_width,
+            margin_start,
+            margin_end,
+        ),
+        (None, None, None) => {
+            PositionedAxis::new(static_start, shrink_to_fit_width, margin_start, margin_end)
+        }
     }
 }
 
@@ -1474,47 +1826,65 @@ fn resolve_absolute_vertical(
     let bottom = used_inset_bottom(style, containing_block);
     let height = used_content_height_or_auto(
         style,
-        containing_block.height,
+        containing_block.height(),
         style.padding.top + style.padding.bottom + vertical_border_width,
-    );
-    let static_start = static_start.clamp(0.0, containing_block.height);
+    )
+    .map(|height| constrain_height(style, height, containing_block.height()));
+    let auto_height = constrain_height(style, auto_height, containing_block.height());
+    let static_start = static_start.clamp(0.0, containing_block.height());
     let margin_start = style.margin.top;
     let margin_end = style.margin.bottom;
     let non_content = style.padding.top + style.padding.bottom + vertical_border_width;
     let fill_between = |start: f32, end: f32| {
-        (containing_block.height - start - margin_start - non_content - margin_end - end).max(0.0)
+        (containing_block.height() - start - margin_start - non_content - margin_end - end).max(0.0)
     };
     let border_box_size = |content_size: f32| content_size + non_content;
     let start_for_end = |content_size: f32, end: f32| {
-        containing_block.height - end - margin_start - margin_end - border_box_size(content_size)
+        containing_block.height() - end - margin_start - margin_end - border_box_size(content_size)
     };
 
     match (top, height, bottom) {
-        (Some(start), Some(size), _) => PositionedAxis { start, size },
-        (Some(start), None, Some(end)) => PositionedAxis {
+        (Some(start), Some(size), Some(end)) => resolve_absolute_definite_axis_auto_margins(
+            style.box_values.margin.top.is_auto(),
+            style.box_values.margin.bottom.is_auto(),
+            AbsoluteDefiniteAxis {
+                start,
+                size,
+                end,
+                margin_start,
+                margin_end,
+                non_content,
+                containing_size: containing_block.height(),
+            },
+            AbsoluteAxisDirection::Vertical,
+        ),
+        (Some(start), Some(size), None) => {
+            PositionedAxis::new(start, size, margin_start, margin_end)
+        }
+        (Some(start), None, Some(end)) => PositionedAxis::new(
             start,
-            size: fill_between(start, end),
-        },
-        (Some(start), None, None) => PositionedAxis {
-            start,
-            size: auto_height,
-        },
-        (None, Some(size), Some(end)) => PositionedAxis {
-            start: start_for_end(size, end),
-            size,
-        },
-        (None, Some(size), None) => PositionedAxis {
-            start: static_start,
-            size,
-        },
-        (None, None, Some(end)) => PositionedAxis {
-            start: start_for_end(auto_height, end),
-            size: auto_height,
-        },
-        (None, None, None) => PositionedAxis {
-            start: static_start,
-            size: auto_height,
-        },
+            constrain_height(style, fill_between(start, end), containing_block.height()),
+            margin_start,
+            margin_end,
+        ),
+        (Some(start), None, None) => {
+            PositionedAxis::new(start, auto_height, margin_start, margin_end)
+        }
+        (None, Some(size), Some(end)) => {
+            PositionedAxis::new(start_for_end(size, end), size, margin_start, margin_end)
+        }
+        (None, Some(size), None) => {
+            PositionedAxis::new(static_start, size, margin_start, margin_end)
+        }
+        (None, None, Some(end)) => PositionedAxis::new(
+            start_for_end(auto_height, end),
+            auto_height,
+            margin_start,
+            margin_end,
+        ),
+        (None, None, None) => {
+            PositionedAxis::new(static_start, auto_height, margin_start, margin_end)
+        }
     }
 }
 
@@ -1546,14 +1916,107 @@ pub(super) fn paint_effects_for_box(style: &ComputedStyle, border_box: PaintClip
     PaintEffects {
         opacity: style.opacity,
         transform: paint_transform_for_box(style, border_box),
-        overflow_clip: style.overflow.clips_overflow().then_some(PaintClip {
-            x: border_box.x + borders.left,
-            y: border_box.y + borders.bottom,
-            width: (border_box.width - borders.left - borders.right).max(0.0),
-            height: (border_box.height - borders.top - borders.bottom).max(0.0),
-        }),
+        overflow_clip: style
+            .overflow
+            .clips_overflow()
+            .then_some(PaintClip::from_paint_rect(paint_space_rect(
+                border_box.x() + borders.left,
+                border_box.y() + borders.bottom,
+                border_box.width() - borders.left - borders.right,
+                border_box.height() - borders.top - borders.bottom,
+            ))),
         absolute_clip: None,
+        clip_path: paint_clip_path_effect(style),
+        mask: paint_mask_effect(style),
+        filter: paint_filter_effect(style),
+        blend_mode: paint_blend_mode(style.mix_blend_mode),
+        isolation: style.isolation == Isolation::Isolate || style.will_change.isolation,
     }
+}
+
+fn paint_clip_path_effect(style: &ComputedStyle) -> PaintClipPathEffect {
+    match style.clip_path {
+        ClipPath::None if style.will_change.clip_path => PaintClipPathEffect::WillChange,
+        ClipPath::None => PaintClipPathEffect::None,
+        ClipPath::Inset => PaintClipPathEffect::Inset,
+        ClipPath::Shape => PaintClipPathEffect::Shape,
+        ClipPath::Url => PaintClipPathEffect::Url,
+    }
+}
+
+fn paint_mask_effect(style: &ComputedStyle) -> PaintMaskEffect {
+    if !matches!(style.mask, MaskValue::None) {
+        PaintMaskEffect::MaskImage
+    } else if style.will_change.mask {
+        PaintMaskEffect::WillChange
+    } else {
+        PaintMaskEffect::None
+    }
+}
+
+fn paint_filter_effect(style: &ComputedStyle) -> PaintFilterEffect {
+    if !matches!(style.filter, FilterValue::None) {
+        PaintFilterEffect::FilterList
+    } else if style.will_change.filter {
+        PaintFilterEffect::WillChange
+    } else {
+        PaintFilterEffect::None
+    }
+}
+
+fn paint_blend_mode(mode: MixBlendMode) -> PaintBlendMode {
+    match mode {
+        MixBlendMode::Normal => PaintBlendMode::Normal,
+        MixBlendMode::Multiply => PaintBlendMode::Multiply,
+        MixBlendMode::Screen => PaintBlendMode::Screen,
+        MixBlendMode::Overlay => PaintBlendMode::Overlay,
+        MixBlendMode::Darken => PaintBlendMode::Darken,
+        MixBlendMode::Lighten => PaintBlendMode::Lighten,
+        MixBlendMode::ColorDodge => PaintBlendMode::ColorDodge,
+        MixBlendMode::ColorBurn => PaintBlendMode::ColorBurn,
+        MixBlendMode::HardLight => PaintBlendMode::HardLight,
+        MixBlendMode::SoftLight => PaintBlendMode::SoftLight,
+        MixBlendMode::Difference => PaintBlendMode::Difference,
+        MixBlendMode::Exclusion => PaintBlendMode::Exclusion,
+        MixBlendMode::Hue => PaintBlendMode::Hue,
+        MixBlendMode::Saturation => PaintBlendMode::Saturation,
+        MixBlendMode::Color => PaintBlendMode::Color,
+        MixBlendMode::Luminosity => PaintBlendMode::Luminosity,
+    }
+}
+
+fn positioned_applicable_overflow_clips(
+    clips: &[OverflowClip],
+    containing_block: ContainingBlock,
+) -> Vec<OverflowClip> {
+    let containing_block_rect = PageTopRect::new(
+        containing_block.x(),
+        containing_block.top_y(),
+        containing_block.width(),
+        containing_block.height(),
+    )
+    .paint_rect();
+    clips
+        .iter()
+        .copied()
+        .filter(|clip| paint_rect_contains(clip.paint_rect(), containing_block_rect))
+        .collect()
+}
+
+fn paint_rect_contains(outer: PaintRect, inner: PaintRect) -> bool {
+    const EPSILON: f32 = 0.01;
+    let outer_left = outer.origin.x;
+    let outer_right = outer.origin.x + outer.size.width;
+    let outer_bottom = outer.origin.y;
+    let outer_top = outer.origin.y + outer.size.height;
+    let inner_left = inner.origin.x;
+    let inner_right = inner.origin.x + inner.size.width;
+    let inner_bottom = inner.origin.y;
+    let inner_top = inner.origin.y + inner.size.height;
+    outer_left <= inner_left + EPSILON
+        && outer_right + EPSILON >= inner_right
+        && outer_bottom <= inner_bottom + EPSILON
+        && outer_top + EPSILON >= inner_top
 }
 
 fn paint_transform_for_box(style: &ComputedStyle, border_box: PaintClip) -> Option<PaintTransform> {
@@ -1561,18 +2024,20 @@ fn paint_transform_for_box(style: &ComputedStyle, border_box: PaintClip) -> Opti
         return None;
     }
     let origin_x =
-        border_box.x + used_length_percentage(style.transform_origin.x, border_box.width);
+        border_box.x() + used_length_percentage(style.transform_origin.x, border_box.width());
     let origin_y =
-        border_box.y + used_length_percentage(style.transform_origin.y, border_box.height);
-    let mut transform = PaintTransform::translate(origin_x, origin_y);
+        border_box.y() + used_length_percentage(style.transform_origin.y, border_box.height());
+    let mut transform = PaintTransform::translate(PaintVector::new(origin_x, origin_y));
     for function in &style.transform {
         transform = transform.multiply(transform_function_matrix(
             *function,
-            border_box.width,
-            border_box.height,
+            border_box.width(),
+            border_box.height(),
         ));
     }
-    transform = transform.multiply(PaintTransform::translate(-origin_x, -origin_y));
+    transform = transform.multiply(PaintTransform::translate(PaintVector::new(
+        -origin_x, -origin_y,
+    )));
     Some(transform)
 }
 
@@ -1583,10 +2048,10 @@ fn transform_function_matrix(
 ) -> PaintTransform {
     match function {
         css::TransformFunction::Matrix(a, b, c, d, e, f) => PaintTransform { a, b, c, d, e, f },
-        css::TransformFunction::Translate(x, y) => PaintTransform::translate(
+        css::TransformFunction::Translate(x, y) => PaintTransform::translate(PaintVector::new(
             used_length_percentage(x, border_box_width),
             used_length_percentage(y, border_box_height),
-        ),
+        )),
         css::TransformFunction::Scale(x, y) => PaintTransform {
             a: x,
             b: 0.0,

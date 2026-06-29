@@ -19,6 +19,30 @@ pub(crate) fn block_paint_ops(
     Vec<RenderedPath>,
     Vec<RenderedStroke>,
 ) {
+    block_paint_ops_with_border_insets(x, y, width, height, style, used_border_widths(style), true)
+}
+
+/// Builds PDF paint primitives for a CSS block with caller-supplied border
+/// insets.
+///
+/// Collapsed table cells use resolved grid half-widths for decoration
+/// geometry, while their actual borders are painted later from the collapsed
+/// border grid:
+/// <https://drafts.csswg.org/css-tables-3/#in-collapsed-borders-mode>.
+pub(crate) fn block_paint_ops_with_border_insets(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+    paint_borders: bool,
+) -> (
+    Vec<RenderedRect>,
+    Vec<RenderedRoundedRect>,
+    Vec<RenderedPath>,
+    Vec<RenderedStroke>,
+) {
     let mut rects = Vec::new();
     let mut rounded_rects = Vec::new();
     let mut paths = Vec::new();
@@ -26,34 +50,33 @@ pub(crate) fn block_paint_ops(
     if width <= 0.0 || height <= 0.0 {
         return (rects, rounded_rects, paths, strokes);
     }
+    let geometry = BoxPaintGeometry {
+        x,
+        y,
+        width,
+        height,
+        border_insets,
+    };
+    paint_box_shadows(&mut rects, geometry, style, false);
     if let Some(fill) = style.background_color
         && fill.is_visible()
     {
         if style.border_radius.is_zero() {
-            rects.push(RenderedRect {
-                x,
-                y,
-                width,
-                height,
-                fill: Some(fill),
-                stroke: None,
-                stroke_width: 0.0,
-            });
+            rects.push(RenderedRect::from_paint_rect(
+                paint_space_rect(x, y, width, height),
+                Some(fill),
+            ));
         } else if style.corner_shapes.all_round() {
-            rounded_rects.push(RenderedRoundedRect {
-                x,
-                y,
-                width,
-                height,
-                radii: used_rounded_rect_radii(style.border_radius, width, height),
-                fill: Some(fill),
-                stroke: None,
-                stroke_width: 0.0,
-            });
+            rounded_rects.push(RenderedRoundedRect::from_paint_rect(
+                paint_space_rect(x, y, width, height),
+                used_rounded_rect_radii(style.border_radius, width, height),
+                Some(fill),
+                None,
+                0.0,
+            ));
         } else {
-            paths.push(RenderedPath {
-                clip: None,
-                commands: shaped_rect_path_commands(
+            paths.push(RenderedPath::new(
+                shaped_rect_path_commands(
                     x,
                     y,
                     width,
@@ -61,15 +84,24 @@ pub(crate) fn block_paint_ops(
                     used_rounded_rect_radii(style.border_radius, width, height),
                     style.corner_shapes,
                 ),
-                fill: Some(fill),
-                fill_rule: RenderedPathFillRule::NonZero,
-                stroke: None,
-                stroke_width: 0.0,
-            });
+                Some(fill),
+                RenderedPathFillRule::NonZero,
+                None,
+                0.0,
+                None,
+            ));
         }
     }
-    rects.extend(linear_gradient_rects(x, y, width, height, style));
-    if style.border_image.source.is_some() {
+    rects.extend(linear_gradient_rects(
+        x,
+        y,
+        width,
+        height,
+        style,
+        border_insets,
+    ));
+    paint_box_shadows(&mut rects, geometry, style, true);
+    if !paint_borders || style.border_image.source.is_some() {
         return (rects, rounded_rects, paths, strokes);
     }
     if !paint_uniform_rounded_border(&mut rounded_rects, x, y, width, height, style)
@@ -95,57 +127,312 @@ fn linear_gradient_rects(
     width: f32,
     height: f32,
     style: &ComputedStyle,
+    border_insets: css::Edges,
 ) -> Vec<RenderedRect> {
-    let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_image else {
-        return Vec::new();
-    };
-    let axis_length = match gradient.direction {
-        LinearGradientDirection::Bottom | LinearGradientDirection::Top => height,
-        LinearGradientDirection::Right | LinearGradientDirection::Left => width,
-    };
-    if axis_length <= 0.0 || gradient.stops.len() < 2 {
-        return Vec::new();
-    }
-
     let mut rects = Vec::new();
-    let first = gradient.stops[0];
-    push_gradient_band(
-        &mut rects,
-        gradient.direction,
-        x,
-        y,
-        width,
-        height,
-        0.0,
-        first.position,
-        first.color,
-    );
-    for pair in gradient.stops.windows(2) {
+    for layer in background_layers_for_gradient_paint(style).iter().rev() {
+        let Some(BackgroundImage::LinearGradient(gradient)) = &layer.image else {
+            continue;
+        };
+        let area =
+            background_rect_area_for_box(x, y, width, height, style, border_insets, layer.origin);
+        let clip =
+            background_rect_area_for_box(x, y, width, height, style, border_insets, layer.clip);
+        let axis_length = match gradient.direction {
+            LinearGradientDirection::Bottom | LinearGradientDirection::Top => area.height,
+            LinearGradientDirection::Right | LinearGradientDirection::Left => area.width,
+        };
+        if axis_length <= 0.0 || gradient.stops.len() < 2 {
+            continue;
+        }
+
+        let before = rects.len();
+        let first = gradient.stops[0];
         push_gradient_band(
             &mut rects,
             gradient.direction,
-            x,
-            y,
-            width,
-            height,
-            pair[0].position,
-            pair[1].position,
-            pair[0].color,
+            area.x,
+            area.y,
+            area.width,
+            area.height,
+            0.0,
+            first.position,
+            first.color,
         );
+        for pair in gradient.stops.windows(2) {
+            push_gradient_band(
+                &mut rects,
+                gradient.direction,
+                area.x,
+                area.y,
+                area.width,
+                area.height,
+                pair[0].position,
+                pair[1].position,
+                pair[0].color,
+            );
+        }
+        let last = *gradient.stops.last().expect("checked length above");
+        push_gradient_band(
+            &mut rects,
+            gradient.direction,
+            area.x,
+            area.y,
+            area.width,
+            area.height,
+            last.position,
+            axis_length,
+            last.color,
+        );
+        for rect in &mut rects[before..] {
+            clip_gradient_rect(rect, clip);
+        }
     }
-    let last = *gradient.stops.last().expect("checked length above");
-    push_gradient_band(
-        &mut rects,
-        gradient.direction,
+    rects.retain(|rect| rect.width() > 0.0 && rect.height() > 0.0);
+    rects
+}
+
+fn background_layers_for_gradient_paint(style: &ComputedStyle) -> Vec<css::BackgroundLayer> {
+    if !style.background_layers.is_empty() {
+        return style.background_layers.clone();
+    }
+    vec![css::BackgroundLayer {
+        image: style.background_image.clone(),
+        position: style.background_position,
+        size: style.background_size,
+        repeat: style.background_repeat,
+        origin: style.background_origin,
+        clip: style.background_clip,
+    }]
+}
+
+fn background_rect_area_for_box(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    style: &ComputedStyle,
+    border: css::Edges,
+    box_: css::BackgroundBox,
+) -> BackgroundRectArea {
+    let area = BackgroundRectArea {
         x,
         y,
         width,
         height,
-        last.position,
-        axis_length,
-        last.color,
+    };
+    match box_ {
+        css::BackgroundBox::Border => area,
+        css::BackgroundBox::Padding => area.inset(border),
+        css::BackgroundBox::Content => area.inset(border).inset(style.padding),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BoxPaintGeometry {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    border_insets: css::Edges,
+}
+
+#[derive(Clone, Copy)]
+struct BackgroundRectArea {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl BackgroundRectArea {
+    fn inset(self, edges: css::Edges) -> Self {
+        Self {
+            x: self.x + edges.left,
+            y: self.y + edges.bottom,
+            width: (self.width - edges.left - edges.right).max(0.0),
+            height: (self.height - edges.top - edges.bottom).max(0.0),
+        }
+    }
+}
+
+fn paint_box_shadows(
+    rects: &mut Vec<RenderedRect>,
+    geometry: BoxPaintGeometry,
+    style: &ComputedStyle,
+    inset: bool,
+) {
+    for shadow in style
+        .box_shadow
+        .iter()
+        .rev()
+        .filter(|shadow| shadow.inset == inset)
+    {
+        let color = shadow.color.resolve(style.color);
+        if !color.is_visible() || shadow.blur_radius > 0.0 || !style.border_radius.is_zero() {
+            continue;
+        }
+        if shadow.inset {
+            paint_inset_box_shadow(rects, geometry, *shadow, color);
+        } else {
+            paint_outer_box_shadow(rects, geometry, *shadow, color);
+        }
+    }
+}
+
+fn paint_outer_box_shadow(
+    rects: &mut Vec<RenderedRect>,
+    geometry: BoxPaintGeometry,
+    shadow: css::BoxShadow,
+    color: Color,
+) {
+    let shadow_x = geometry.x + shadow.offset_x - shadow.spread;
+    let shadow_y = geometry.y - shadow.offset_y - shadow.spread;
+    let shadow_width = geometry.width + shadow.spread * 2.0;
+    let shadow_height = geometry.height + shadow.spread * 2.0;
+    if shadow_width <= 0.0 || shadow_height <= 0.0 {
+        return;
+    }
+
+    push_rect_difference(
+        rects,
+        BackgroundRectArea {
+            x: shadow_x,
+            y: shadow_y,
+            width: shadow_width,
+            height: shadow_height,
+        },
+        BackgroundRectArea {
+            x: geometry.x,
+            y: geometry.y,
+            width: geometry.width,
+            height: geometry.height,
+        },
+        color,
     );
-    rects
+}
+
+fn paint_inset_box_shadow(
+    rects: &mut Vec<RenderedRect>,
+    geometry: BoxPaintGeometry,
+    shadow: css::BoxShadow,
+    color: Color,
+) {
+    let padding = BackgroundRectArea {
+        x: geometry.x,
+        y: geometry.y,
+        width: geometry.width,
+        height: geometry.height,
+    }
+    .inset(geometry.border_insets);
+    if padding.width <= 0.0 || padding.height <= 0.0 {
+        return;
+    }
+
+    let spread = shadow.spread.max(0.0);
+    let left = inset_shadow_edge_width(shadow.offset_x, spread, true).min(padding.width);
+    let right = inset_shadow_edge_width(shadow.offset_x, spread, false).min(padding.width);
+    let top = inset_shadow_edge_width(shadow.offset_y, spread, true).min(padding.height);
+    let bottom = inset_shadow_edge_width(shadow.offset_y, spread, false).min(padding.height);
+
+    push_shadow_rect(rects, padding.x, padding.y, left, padding.height, color);
+    push_shadow_rect(
+        rects,
+        padding.x + padding.width - right,
+        padding.y,
+        right,
+        padding.height,
+        color,
+    );
+    push_shadow_rect(
+        rects,
+        padding.x,
+        padding.y + padding.height - top,
+        padding.width,
+        top,
+        color,
+    );
+    push_shadow_rect(rects, padding.x, padding.y, padding.width, bottom, color);
+}
+
+fn inset_shadow_edge_width(offset: f32, spread: f32, start_edge: bool) -> f32 {
+    match (offset > 0.0, offset < 0.0, offset == 0.0 && spread > 0.0) {
+        (true, _, _) if start_edge => offset + spread,
+        (_, true, _) if !start_edge => -offset + spread,
+        (_, _, true) => spread,
+        _ => 0.0,
+    }
+}
+
+fn push_rect_difference(
+    rects: &mut Vec<RenderedRect>,
+    subject: BackgroundRectArea,
+    cutout: BackgroundRectArea,
+    color: Color,
+) {
+    let left = subject.x;
+    let right = subject.x + subject.width;
+    let bottom = subject.y;
+    let top = subject.y + subject.height;
+    let cut_left = cutout.x.max(left).min(right);
+    let cut_right = (cutout.x + cutout.width).max(left).min(right);
+    let cut_bottom = cutout.y.max(bottom).min(top);
+    let cut_top = (cutout.y + cutout.height).max(bottom).min(top);
+
+    push_shadow_rect(
+        rects,
+        left,
+        bottom,
+        subject.width,
+        cut_bottom - bottom,
+        color,
+    );
+    push_shadow_rect(rects, left, cut_top, subject.width, top - cut_top, color);
+    push_shadow_rect(
+        rects,
+        left,
+        cut_bottom,
+        cut_left - left,
+        cut_top - cut_bottom,
+        color,
+    );
+    push_shadow_rect(
+        rects,
+        cut_right,
+        cut_bottom,
+        right - cut_right,
+        cut_top - cut_bottom,
+        color,
+    );
+}
+
+fn push_shadow_rect(
+    rects: &mut Vec<RenderedRect>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    color: Color,
+) {
+    if width > 0.0 && height > 0.0 {
+        rects.push(RenderedRect::from_paint_rect(
+            paint_space_rect(x, y, width, height),
+            Some(color),
+        ));
+    }
+}
+
+fn clip_gradient_rect(rect: &mut RenderedRect, clip: BackgroundRectArea) {
+    let x1 = rect.x().max(clip.x);
+    let y1 = rect.y().max(clip.y);
+    let x2 = (rect.x() + rect.width()).min(clip.x + clip.width);
+    let y2 = (rect.y() + rect.height()).min(clip.y + clip.height);
+    rect.set_paint_rect(paint_space_rect(
+        x1,
+        y1,
+        (x2 - x1).max(0.0),
+        (y2 - y1).max(0.0),
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -173,42 +460,22 @@ fn push_gradient_band(
         return;
     }
     let rect = match direction {
-        LinearGradientDirection::Bottom => RenderedRect {
-            x,
-            y: y + height - end,
-            width,
-            height: end - start,
-            fill: Some(color),
-            stroke: None,
-            stroke_width: 0.0,
-        },
-        LinearGradientDirection::Top => RenderedRect {
-            x,
-            y: y + start,
-            width,
-            height: end - start,
-            fill: Some(color),
-            stroke: None,
-            stroke_width: 0.0,
-        },
-        LinearGradientDirection::Right => RenderedRect {
-            x: x + start,
-            y,
-            width: end - start,
-            height,
-            fill: Some(color),
-            stroke: None,
-            stroke_width: 0.0,
-        },
-        LinearGradientDirection::Left => RenderedRect {
-            x: x + width - end,
-            y,
-            width: end - start,
-            height,
-            fill: Some(color),
-            stroke: None,
-            stroke_width: 0.0,
-        },
+        LinearGradientDirection::Bottom => RenderedRect::from_paint_rect(
+            paint_space_rect(x, y + height - end, width, end - start),
+            Some(color),
+        ),
+        LinearGradientDirection::Top => RenderedRect::from_paint_rect(
+            paint_space_rect(x, y + start, width, end - start),
+            Some(color),
+        ),
+        LinearGradientDirection::Right => RenderedRect::from_paint_rect(
+            paint_space_rect(x + start, y, end - start, height),
+            Some(color),
+        ),
+        LinearGradientDirection::Left => RenderedRect::from_paint_rect(
+            paint_space_rect(x + width - end, y, end - start, height),
+            Some(color),
+        ),
     };
     rects.push(rect);
 }
@@ -264,16 +531,18 @@ pub(crate) fn paint_uniform_rounded_border(
     let inset = border_width / 2.0;
     let mut radii = used_rounded_rect_radii(style.border_radius, width, height);
     inset_rounded_rect_radii(&mut radii, inset);
-    rounded_rects.push(RenderedRoundedRect {
-        x: x + inset,
-        y: y + inset,
-        width: (width - border_width).max(0.0),
-        height: (height - border_width).max(0.0),
+    rounded_rects.push(RenderedRoundedRect::from_paint_rect(
+        paint_space_rect(
+            x + inset,
+            y + inset,
+            width - border_width,
+            height - border_width,
+        ),
         radii,
-        fill: None,
-        stroke: Some(top.color),
-        stroke_width: border_width,
-    });
+        None,
+        Some(top.color),
+        border_width,
+    ));
     true
 }
 
@@ -412,22 +681,22 @@ pub(crate) fn paint_solid_rounded_border_ring(
 
     let outer_radii = used_rounded_rect_radii(style.border_radius, width, height);
     let inner_radii = RenderedRoundedRectRadii {
-        top_left: RenderedCornerRadius {
-            x: (outer_radii.top_left.x - left.used_width).max(0.0),
-            y: (outer_radii.top_left.y - top.used_width).max(0.0),
-        },
-        top_right: RenderedCornerRadius {
-            x: (outer_radii.top_right.x - right.used_width).max(0.0),
-            y: (outer_radii.top_right.y - top.used_width).max(0.0),
-        },
-        bottom_right: RenderedCornerRadius {
-            x: (outer_radii.bottom_right.x - right.used_width).max(0.0),
-            y: (outer_radii.bottom_right.y - bottom.used_width).max(0.0),
-        },
-        bottom_left: RenderedCornerRadius {
-            x: (outer_radii.bottom_left.x - left.used_width).max(0.0),
-            y: (outer_radii.bottom_left.y - bottom.used_width).max(0.0),
-        },
+        top_left: RenderedCornerRadius::new(
+            outer_radii.top_left.x() - left.used_width,
+            outer_radii.top_left.y() - top.used_width,
+        ),
+        top_right: RenderedCornerRadius::new(
+            outer_radii.top_right.x() - right.used_width,
+            outer_radii.top_right.y() - top.used_width,
+        ),
+        bottom_right: RenderedCornerRadius::new(
+            outer_radii.bottom_right.x() - right.used_width,
+            outer_radii.bottom_right.y() - bottom.used_width,
+        ),
+        bottom_left: RenderedCornerRadius::new(
+            outer_radii.bottom_left.x() - left.used_width,
+            outer_radii.bottom_left.y() - bottom.used_width,
+        ),
     };
 
     let mut commands =
@@ -442,14 +711,14 @@ pub(crate) fn paint_solid_rounded_border_ring(
             style.corner_shapes,
         ));
     }
-    paths.push(RenderedPath {
-        clip: None,
+    paths.push(RenderedPath::new(
         commands,
-        fill: Some(top.color),
-        fill_rule: RenderedPathFillRule::EvenOdd,
-        stroke: None,
-        stroke_width: 0.0,
-    });
+        Some(top.color),
+        RenderedPathFillRule::EvenOdd,
+        None,
+        0.0,
+        None,
+    ));
     true
 }
 
@@ -680,14 +949,14 @@ fn uniform_rounded_ring_path(
             css::CornerShapes::ROUND,
         ));
     }
-    RenderedPath {
-        clip: None,
+    RenderedPath::new(
         commands,
-        fill: Some(color),
-        fill_rule: RenderedPathFillRule::EvenOdd,
-        stroke: None,
-        stroke_width: 0.0,
-    }
+        Some(color),
+        RenderedPathFillRule::EvenOdd,
+        None,
+        0.0,
+        None,
+    )
 }
 
 fn solid_rounded_border_ring_path(
@@ -738,14 +1007,14 @@ fn rounded_border_ring_between_path(
             inner_inset,
         ));
     }
-    RenderedPath {
-        clip,
+    RenderedPath::new(
         commands,
-        fill: Some(color),
-        fill_rule: RenderedPathFillRule::EvenOdd,
-        stroke: None,
-        stroke_width: 0.0,
-    }
+        Some(color),
+        RenderedPathFillRule::EvenOdd,
+        None,
+        0.0,
+        clip,
+    )
 }
 
 fn rounded_box_path_commands_for_insets(
@@ -760,22 +1029,22 @@ fn rounded_box_path_commands_for_insets(
     let inset_height = (height - inset.top - inset.bottom).max(0.0);
     let outer_radii = used_rounded_rect_radii(style.border_radius, width, height);
     let radii = RenderedRoundedRectRadii {
-        top_left: RenderedCornerRadius {
-            x: (outer_radii.top_left.x - inset.left).max(0.0),
-            y: (outer_radii.top_left.y - inset.top).max(0.0),
-        },
-        top_right: RenderedCornerRadius {
-            x: (outer_radii.top_right.x - inset.right).max(0.0),
-            y: (outer_radii.top_right.y - inset.top).max(0.0),
-        },
-        bottom_right: RenderedCornerRadius {
-            x: (outer_radii.bottom_right.x - inset.right).max(0.0),
-            y: (outer_radii.bottom_right.y - inset.bottom).max(0.0),
-        },
-        bottom_left: RenderedCornerRadius {
-            x: (outer_radii.bottom_left.x - inset.left).max(0.0),
-            y: (outer_radii.bottom_left.y - inset.bottom).max(0.0),
-        },
+        top_left: RenderedCornerRadius::new(
+            outer_radii.top_left.x() - inset.left,
+            outer_radii.top_left.y() - inset.top,
+        ),
+        top_right: RenderedCornerRadius::new(
+            outer_radii.top_right.x() - inset.right,
+            outer_radii.top_right.y() - inset.top,
+        ),
+        bottom_right: RenderedCornerRadius::new(
+            outer_radii.bottom_right.x() - inset.right,
+            outer_radii.bottom_right.y() - inset.bottom,
+        ),
+        bottom_left: RenderedCornerRadius::new(
+            outer_radii.bottom_left.x() - inset.left,
+            outer_radii.bottom_left.y() - inset.bottom,
+        ),
     };
     shaped_rect_path_commands(
         x + inset.left,
@@ -829,17 +1098,17 @@ fn rounded_border_side_clip(
             (inner_left, inner_bottom),
         ],
     };
-    RenderedPathClip {
-        commands: vec![
-            RenderedPathCommand::MoveTo(points[0].0, points[0].1),
-            RenderedPathCommand::LineTo(points[1].0, points[1].1),
-            RenderedPathCommand::LineTo(points[2].0, points[2].1),
-            RenderedPathCommand::LineTo(points[3].0, points[3].1),
+    RenderedPathClip::new(
+        vec![
+            RenderedPathCommand::move_to(paint_tuple_point(points[0])),
+            RenderedPathCommand::line_to(paint_tuple_point(points[1])),
+            RenderedPathCommand::line_to(paint_tuple_point(points[2])),
+            RenderedPathCommand::line_to(paint_tuple_point(points[3])),
             RenderedPathCommand::Close,
         ],
-        fill_rule: RenderedPathFillRule::NonZero,
-        additional_clips: Vec::new(),
-    }
+        RenderedPathFillRule::NonZero,
+        Vec::new(),
+    )
 }
 
 fn rounded_border_pattern_clip(
@@ -876,10 +1145,7 @@ fn rounded_border_ring_clip_path(
         style,
         border_insets(borders),
     ));
-    RenderedPathClipPath {
-        commands,
-        fill_rule: RenderedPathFillRule::EvenOdd,
-    }
+    RenderedPathClipPath::new(commands, RenderedPathFillRule::EvenOdd)
 }
 
 fn border_side_has_area(side: UsedBorderSide) -> bool {
@@ -967,50 +1233,53 @@ pub(crate) fn rounded_rect_path_commands(
     let bl = radii.bottom_left;
 
     let mut commands = Vec::with_capacity(10);
-    commands.push(RenderedPathCommand::MoveTo(x0 + bl.x, y0));
-    commands.push(RenderedPathCommand::LineTo(x1 - br.x, y0));
-    if br.x > 0.0 || br.y > 0.0 {
-        commands.push(RenderedPathCommand::CurveTo {
-            x1: x1 - br.x + br.x * KAPPA,
-            y1: y0,
-            x2: x1,
-            y2: y0 + br.y - br.y * KAPPA,
-            x3: x1,
-            y3: y0 + br.y,
-        });
+    commands.push(RenderedPathCommand::move_to(paint_space_point(
+        x0 + bl.x(),
+        y0,
+    )));
+    commands.push(RenderedPathCommand::line_to(paint_space_point(
+        x1 - br.x(),
+        y0,
+    )));
+    if br.x() > 0.0 || br.y() > 0.0 {
+        commands.push(RenderedPathCommand::curve_to(
+            paint_space_point(x1 - br.x() + br.x() * KAPPA, y0),
+            paint_space_point(x1, y0 + br.y() - br.y() * KAPPA),
+            paint_space_point(x1, y0 + br.y()),
+        ));
     }
-    commands.push(RenderedPathCommand::LineTo(x1, y1 - tr.y));
-    if tr.x > 0.0 || tr.y > 0.0 {
-        commands.push(RenderedPathCommand::CurveTo {
-            x1,
-            y1: y1 - tr.y + tr.y * KAPPA,
-            x2: x1 - tr.x + tr.x * KAPPA,
-            y2: y1,
-            x3: x1 - tr.x,
-            y3: y1,
-        });
+    commands.push(RenderedPathCommand::line_to(paint_space_point(
+        x1,
+        y1 - tr.y(),
+    )));
+    if tr.x() > 0.0 || tr.y() > 0.0 {
+        commands.push(RenderedPathCommand::curve_to(
+            paint_space_point(x1, y1 - tr.y() + tr.y() * KAPPA),
+            paint_space_point(x1 - tr.x() + tr.x() * KAPPA, y1),
+            paint_space_point(x1 - tr.x(), y1),
+        ));
     }
-    commands.push(RenderedPathCommand::LineTo(x0 + tl.x, y1));
-    if tl.x > 0.0 || tl.y > 0.0 {
-        commands.push(RenderedPathCommand::CurveTo {
-            x1: x0 + tl.x - tl.x * KAPPA,
-            y1,
-            x2: x0,
-            y2: y1 - tl.y + tl.y * KAPPA,
-            x3: x0,
-            y3: y1 - tl.y,
-        });
+    commands.push(RenderedPathCommand::line_to(paint_space_point(
+        x0 + tl.x(),
+        y1,
+    )));
+    if tl.x() > 0.0 || tl.y() > 0.0 {
+        commands.push(RenderedPathCommand::curve_to(
+            paint_space_point(x0 + tl.x() - tl.x() * KAPPA, y1),
+            paint_space_point(x0, y1 - tl.y() + tl.y() * KAPPA),
+            paint_space_point(x0, y1 - tl.y()),
+        ));
     }
-    commands.push(RenderedPathCommand::LineTo(x0, y0 + bl.y));
-    if bl.x > 0.0 || bl.y > 0.0 {
-        commands.push(RenderedPathCommand::CurveTo {
-            x1: x0,
-            y1: y0 + bl.y - bl.y * KAPPA,
-            x2: x0 + bl.x - bl.x * KAPPA,
-            y2: y0,
-            x3: x0 + bl.x,
-            y3: y0,
-        });
+    commands.push(RenderedPathCommand::line_to(paint_space_point(
+        x0,
+        y0 + bl.y(),
+    )));
+    if bl.x() > 0.0 || bl.y() > 0.0 {
+        commands.push(RenderedPathCommand::curve_to(
+            paint_space_point(x0, y0 + bl.y() - bl.y() * KAPPA),
+            paint_space_point(x0 + bl.x() - bl.x() * KAPPA, y0),
+            paint_space_point(x0 + bl.x(), y0),
+        ));
     }
     commands.push(RenderedPathCommand::Close);
     commands
@@ -1046,44 +1315,59 @@ pub(crate) fn shaped_rect_path_commands(
     let bl = radii.bottom_left;
 
     let mut commands = Vec::with_capacity(14);
-    commands.push(RenderedPathCommand::MoveTo(x0 + bl.x, y0));
-    commands.push(RenderedPathCommand::LineTo(x1 - br.x, y0));
+    commands.push(RenderedPathCommand::move_to(paint_space_point(
+        x0 + bl.x(),
+        y0,
+    )));
+    commands.push(RenderedPathCommand::line_to(paint_space_point(
+        x1 - br.x(),
+        y0,
+    )));
     append_corner_shape(
         &mut commands,
         shapes.bottom_right,
-        (x1 - br.x, y0),
-        (x1, y0 + br.y),
-        (x1 - br.x, y0 + br.y),
+        (x1 - br.x(), y0),
+        (x1, y0 + br.y()),
+        (x1 - br.x(), y0 + br.y()),
         br,
         CornerPathKind::BottomRight,
     );
-    commands.push(RenderedPathCommand::LineTo(x1, y1 - tr.y));
+    commands.push(RenderedPathCommand::line_to(paint_space_point(
+        x1,
+        y1 - tr.y(),
+    )));
     append_corner_shape(
         &mut commands,
         shapes.top_right,
-        (x1, y1 - tr.y),
-        (x1 - tr.x, y1),
-        (x1 - tr.x, y1 - tr.y),
+        (x1, y1 - tr.y()),
+        (x1 - tr.x(), y1),
+        (x1 - tr.x(), y1 - tr.y()),
         tr,
         CornerPathKind::TopRight,
     );
-    commands.push(RenderedPathCommand::LineTo(x0 + tl.x, y1));
+    commands.push(RenderedPathCommand::line_to(paint_space_point(
+        x0 + tl.x(),
+        y1,
+    )));
     append_corner_shape(
         &mut commands,
         shapes.top_left,
-        (x0 + tl.x, y1),
-        (x0, y1 - tl.y),
-        (x0 + tl.x, y1 - tl.y),
+        (x0 + tl.x(), y1),
+        (x0, y1 - tl.y()),
+        (x0 + tl.x(), y1 - tl.y()),
         tl,
         CornerPathKind::TopLeft,
     );
-    commands.push(RenderedPathCommand::LineTo(x0, y0 + bl.y));
+    commands.push(RenderedPathCommand::line_to(paint_space_point(
+        x0,
+        y0 + bl.y(),
+    )));
     append_corner_shape(
         &mut commands,
         shapes.bottom_left,
-        (x0, y0 + bl.y),
-        (x0 + bl.x, y0),
-        (x0 + bl.x, y0 + bl.y),
+        (x0, y0 + bl.y()),
+        (x0 + bl.x(), y0),
+        (x0 + bl.x(), y0 + bl.y()),
         bl,
         CornerPathKind::BottomLeft,
     );
@@ -1109,44 +1393,43 @@ fn append_corner_shape(
     kind: CornerPathKind,
 ) {
     const KAPPA: f32 = 0.552_284_8;
-    if radius.x <= 0.0 && radius.y <= 0.0 {
-        commands.push(RenderedPathCommand::LineTo(end.0, end.1));
+    if radius.x() <= 0.0 && radius.y() <= 0.0 {
+        commands.push(RenderedPathCommand::line_to(paint_tuple_point(end)));
         return;
     }
     match shape {
         css::CornerShape::Round => append_round_corner(commands, start, end, radius, kind),
-        css::CornerShape::Bevel => commands.push(RenderedPathCommand::LineTo(end.0, end.1)),
+        css::CornerShape::Bevel => {
+            commands.push(RenderedPathCommand::line_to(paint_tuple_point(end)))
+        }
         css::CornerShape::Notch => {
-            commands.push(RenderedPathCommand::LineTo(inner.0, inner.1));
-            commands.push(RenderedPathCommand::LineTo(end.0, end.1));
+            commands.push(RenderedPathCommand::line_to(paint_tuple_point(inner)));
+            commands.push(RenderedPathCommand::line_to(paint_tuple_point(end)));
         }
         css::CornerShape::Scoop => {
             let (c1, c2) = match kind {
                 CornerPathKind::BottomRight => (
-                    (start.0, start.1 + radius.y * KAPPA),
-                    (end.0 - radius.x * KAPPA, end.1),
+                    (start.0, start.1 + radius.y() * KAPPA),
+                    (end.0 - radius.x() * KAPPA, end.1),
                 ),
                 CornerPathKind::TopRight => (
-                    (start.0 - radius.x * KAPPA, start.1),
-                    (end.0, end.1 - radius.y * KAPPA),
+                    (start.0 - radius.x() * KAPPA, start.1),
+                    (end.0, end.1 - radius.y() * KAPPA),
                 ),
                 CornerPathKind::TopLeft => (
-                    (start.0, start.1 - radius.y * KAPPA),
-                    (end.0 + radius.x * KAPPA, end.1),
+                    (start.0, start.1 - radius.y() * KAPPA),
+                    (end.0 + radius.x() * KAPPA, end.1),
                 ),
                 CornerPathKind::BottomLeft => (
-                    (start.0 + radius.x * KAPPA, start.1),
-                    (end.0, end.1 + radius.y * KAPPA),
+                    (start.0 + radius.x() * KAPPA, start.1),
+                    (end.0, end.1 + radius.y() * KAPPA),
                 ),
             };
-            commands.push(RenderedPathCommand::CurveTo {
-                x1: c1.0,
-                y1: c1.1,
-                x2: c2.0,
-                y2: c2.1,
-                x3: end.0,
-                y3: end.1,
-            });
+            commands.push(RenderedPathCommand::curve_to(
+                paint_tuple_point(c1),
+                paint_tuple_point(c2),
+                paint_tuple_point(end),
+            ));
         }
     }
 }
@@ -1161,30 +1444,31 @@ fn append_round_corner(
     const KAPPA: f32 = 0.552_284_8;
     let (c1, c2) = match kind {
         CornerPathKind::BottomRight => (
-            (start.0 + radius.x * KAPPA, start.1),
-            (end.0, end.1 - radius.y * KAPPA),
+            (start.0 + radius.x() * KAPPA, start.1),
+            (end.0, end.1 - radius.y() * KAPPA),
         ),
         CornerPathKind::TopRight => (
-            (start.0, start.1 + radius.y * KAPPA),
-            (end.0 + radius.x * KAPPA, end.1),
+            (start.0, start.1 + radius.y() * KAPPA),
+            (end.0 + radius.x() * KAPPA, end.1),
         ),
         CornerPathKind::TopLeft => (
-            (start.0 - radius.x * KAPPA, start.1),
-            (end.0, end.1 + radius.y * KAPPA),
+            (start.0 - radius.x() * KAPPA, start.1),
+            (end.0, end.1 + radius.y() * KAPPA),
         ),
         CornerPathKind::BottomLeft => (
-            (start.0, start.1 - radius.y * KAPPA),
-            (end.0 - radius.x * KAPPA, end.1),
+            (start.0, start.1 - radius.y() * KAPPA),
+            (end.0 - radius.x() * KAPPA, end.1),
         ),
     };
-    commands.push(RenderedPathCommand::CurveTo {
-        x1: c1.0,
-        y1: c1.1,
-        x2: c2.0,
-        y2: c2.1,
-        x3: end.0,
-        y3: end.1,
-    });
+    commands.push(RenderedPathCommand::curve_to(
+        paint_tuple_point(c1),
+        paint_tuple_point(c2),
+        paint_tuple_point(end),
+    ));
+}
+
+fn paint_tuple_point(point: (f32, f32)) -> PaintPoint {
+    paint_space_point(point.0, point.1)
 }
 
 fn same_width(left: f32, right: f32) -> bool {
@@ -1192,14 +1476,10 @@ fn same_width(left: f32, right: f32) -> bool {
 }
 
 fn inset_rounded_rect_radii(radii: &mut RenderedRoundedRectRadii, inset: f32) {
-    radii.top_left.x = (radii.top_left.x - inset).max(0.0);
-    radii.top_left.y = (radii.top_left.y - inset).max(0.0);
-    radii.top_right.x = (radii.top_right.x - inset).max(0.0);
-    radii.top_right.y = (radii.top_right.y - inset).max(0.0);
-    radii.bottom_right.x = (radii.bottom_right.x - inset).max(0.0);
-    radii.bottom_right.y = (radii.bottom_right.y - inset).max(0.0);
-    radii.bottom_left.x = (radii.bottom_left.x - inset).max(0.0);
-    radii.bottom_left.y = (radii.bottom_left.y - inset).max(0.0);
+    radii.top_left.inset(inset);
+    radii.top_right.inset(inset);
+    radii.bottom_right.inset(inset);
+    radii.bottom_left.inset(inset);
 }
 
 /// Resolve border-radius used values for a border box.
@@ -1212,40 +1492,36 @@ pub(crate) fn used_rounded_rect_radii(
     height: f32,
 ) -> RenderedRoundedRectRadii {
     let mut radii = RenderedRoundedRectRadii {
-        top_left: RenderedCornerRadius {
-            x: radius.top_left.x.resolve(width),
-            y: radius.top_left.y.resolve(height),
-        },
-        top_right: RenderedCornerRadius {
-            x: radius.top_right.x.resolve(width),
-            y: radius.top_right.y.resolve(height),
-        },
-        bottom_right: RenderedCornerRadius {
-            x: radius.bottom_right.x.resolve(width),
-            y: radius.bottom_right.y.resolve(height),
-        },
-        bottom_left: RenderedCornerRadius {
-            x: radius.bottom_left.x.resolve(width),
-            y: radius.bottom_left.y.resolve(height),
-        },
+        top_left: RenderedCornerRadius::new(
+            radius.top_left.x.resolve(width),
+            radius.top_left.y.resolve(height),
+        ),
+        top_right: RenderedCornerRadius::new(
+            radius.top_right.x.resolve(width),
+            radius.top_right.y.resolve(height),
+        ),
+        bottom_right: RenderedCornerRadius::new(
+            radius.bottom_right.x.resolve(width),
+            radius.bottom_right.y.resolve(height),
+        ),
+        bottom_left: RenderedCornerRadius::new(
+            radius.bottom_left.x.resolve(width),
+            radius.bottom_left.y.resolve(height),
+        ),
     };
     let scale = [
-        edge_radius_scale(width, radii.top_left.x + radii.top_right.x),
-        edge_radius_scale(height, radii.top_right.y + radii.bottom_right.y),
-        edge_radius_scale(width, radii.bottom_left.x + radii.bottom_right.x),
-        edge_radius_scale(height, radii.top_left.y + radii.bottom_left.y),
+        edge_radius_scale(width, radii.top_left.x() + radii.top_right.x()),
+        edge_radius_scale(height, radii.top_right.y() + radii.bottom_right.y()),
+        edge_radius_scale(width, radii.bottom_left.x() + radii.bottom_right.x()),
+        edge_radius_scale(height, radii.top_left.y() + radii.bottom_left.y()),
     ]
     .into_iter()
     .fold(1.0_f32, f32::min);
     if scale < 1.0 {
-        radii.top_left.x *= scale;
-        radii.top_left.y *= scale;
-        radii.top_right.x *= scale;
-        radii.top_right.y *= scale;
-        radii.bottom_right.x *= scale;
-        radii.bottom_right.y *= scale;
-        radii.bottom_left.x *= scale;
-        radii.bottom_left.y *= scale;
+        radii.top_left.scale(scale);
+        radii.top_right.scale(scale);
+        radii.bottom_right.scale(scale);
+        radii.bottom_left.scale(scale);
     }
     radii
 }

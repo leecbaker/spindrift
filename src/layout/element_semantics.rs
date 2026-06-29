@@ -11,7 +11,6 @@ pub(super) enum ReplacedElementKind {
 pub(super) enum ElementLayoutKind {
     None,
     Positioned,
-    HorizontalRule,
     Canvas,
     Image,
     GeneratedImage,
@@ -42,9 +41,6 @@ pub(super) fn element_layout_kind(element: &Element, style: &ComputedStyle) -> E
     }
     if matches!(style.position, Position::Absolute | Position::Fixed) {
         return ElementLayoutKind::Positioned;
-    }
-    if is_horizontal_rule_element(element) {
-        return ElementLayoutKind::HorizontalRule;
     }
     if matches!(style.content, Content::Replacement { .. }) {
         return ElementLayoutKind::GeneratedImage;
@@ -88,14 +84,10 @@ pub(super) fn is_replaced_element(element: &Element) -> bool {
     replaced_element_kind(element).is_some()
 }
 
-pub(super) fn is_replaced_or_thematic_break(element: &Element) -> bool {
-    is_replaced_element(element) || is_horizontal_rule_element(element)
-}
-
 pub(super) fn is_horizontal_rule_element(element: &Element) -> bool {
-    // HTML `hr` is a thematic break, not a CSS replaced element. It remains a
-    // named semantic hook while generic empty block border painting is not yet
-    // complete enough to replace the dedicated horizontal-rule layout path.
+    // HTML `hr` is a thematic break, not a CSS replaced element. Keep this as
+    // a semantic hook for void/childless box-tree construction; layout and
+    // painting are ordinary CSS block behavior from the UA stylesheet.
     // https://html.spec.whatwg.org/multipage/grouping-content.html#the-hr-element
     element.tag == "hr"
 }

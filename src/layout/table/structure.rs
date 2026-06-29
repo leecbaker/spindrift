@@ -141,10 +141,10 @@ pub(super) fn table_grid(rows: &[TableRow<'_>]) -> TableGrid {
                 column += 1;
             }
 
-            let colspan = cell.element.map(cell_colspan).unwrap_or(1);
+            let colspan = cell.element.map(html_table_colspan).unwrap_or(1);
             let rowspan = cell
                 .element
-                .map(|element| cell_rowspan(element, row_index, row_group_ends[row_index]))
+                .map(|element| html_table_rowspan(element, row_index, row_group_ends[row_index]))
                 .unwrap_or(1);
             let end = column + colspan;
             if active_rowspans.len() < end {
@@ -335,45 +335,6 @@ pub(super) fn column_group_signature<'a>(
     group: &'a Option<TableColumnGroup<'_>>,
 ) -> Option<&'a ElementSignature> {
     group.as_ref().map(|group| &group.signature)
-}
-
-pub(super) fn cell_colspan(cell: &Element) -> usize {
-    cell.attrs
-        .get("colspan")
-        .and_then(|value| parse_html_positive_integer(value))
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
-}
-
-pub(super) fn cell_rowspan(cell: &Element, row_index: usize, row_group_end: usize) -> usize {
-    // HTML tables define rowspan=0 as spanning every remaining row in the row group.
-    let remaining_rows = row_group_end.saturating_sub(row_index).max(1);
-    match cell
-        .attrs
-        .get("rowspan")
-        .and_then(|value| parse_html_non_negative_integer(value))
-    {
-        Some(0) => remaining_rows,
-        Some(value) => value.max(1).min(remaining_rows),
-        None => 1,
-    }
-}
-
-pub(super) fn parse_html_positive_integer(value: &str) -> Option<usize> {
-    parse_html_non_negative_integer(value).filter(|value| *value > 0)
-}
-
-pub(super) fn parse_html_non_negative_integer(value: &str) -> Option<usize> {
-    // HTML's non-negative integer microsyntax consumes the leading ASCII digit
-    // run and ignores following junk, so `2px` and `100%` parse as 2 and 100.
-    let digits = value
-        .trim_start()
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    (!digits.is_empty())
-        .then(|| digits.parse::<usize>().ok())
-        .flatten()
 }
 
 pub(super) fn apply_table_cellpadding(style: &mut ComputedStyle, table_cellpadding: Option<f32>) {
@@ -612,18 +573,6 @@ fn table_cell_element_outer_height(
     (content_height + vertical_non_content + style.margin.top + style.margin.bottom).max(0.0)
 }
 
-pub(super) fn table_cell_border_box_height(style: &ComputedStyle, content_height: f32) -> f32 {
-    constrain_height(
-        style,
-        used_length_percentage_or_auto(style.box_values.height, content_height)
-            .unwrap_or(0.0)
-            .max(content_height),
-        content_height,
-    ) + style.padding.top
-        + style.padding.bottom
-        + table_vertical_borders(style)
-}
-
 pub(super) fn table_cell_content_offset(
     style: &ComputedStyle,
     content_height: f32,
@@ -632,8 +581,10 @@ pub(super) fn table_cell_content_offset(
     cell_baseline_offset: f32,
 ) -> f32 {
     // CSS 2.2 table height algorithms align cell boxes within row boxes using
-    // `vertical-align`; top/text-top/baseline start at the row top, middle and
-    // bottom distribute the remaining content-box space.
+    // `vertical-align`; CSS Box Alignment keeps that legacy behavior for
+    // `align-content: normal`, while non-normal values align the table-cell
+    // contents in the block axis:
+    // <https://www.w3.org/TR/css-align-3/#align-content-property>.
     let borders = table_cell_used_border_edges(style);
     let content_box_height = (border_box_height
         - borders.top
@@ -641,16 +592,35 @@ pub(super) fn table_cell_content_offset(
         - style.padding.top
         - style.padding.bottom)
         .max(0.0);
-    let extra = (content_box_height - content_height).max(0.0);
-    match style.vertical_align {
-        VerticalAlign::Top => 0.0,
-        VerticalAlign::Middle => extra / 2.0,
-        VerticalAlign::Bottom => extra,
-        VerticalAlign::Baseline
-        | VerticalAlign::Sub
-        | VerticalAlign::Super
-        | VerticalAlign::TextTop
-        | VerticalAlign::TextBottom => row_baseline_offset
+    let free_space = content_box_height - content_height;
+    if style.align_content.keyword != ContentAlignmentKeyword::Normal {
+        if matches!(
+            style.align_content.keyword,
+            ContentAlignmentKeyword::Baseline | ContentAlignmentKeyword::LastBaseline
+        ) {
+            if let Some(baseline) = row_baseline_offset {
+                return (baseline - cell_baseline_offset)
+                    .max(0.0)
+                    .min(free_space.max(0.0));
+            }
+            if block_start_side(style.writing_mode).axis() == PhysicalAxis::Vertical {
+                return content_alignment_offset_toward_end(
+                    style.align_content,
+                    free_space,
+                    block_align_content_defaults_to_safe_overflow(style),
+                );
+            }
+            return 0.0;
+        }
+        return -block_align_content_y_offset_for_style(style, free_space);
+    }
+
+    let extra = free_space.max(0.0);
+    match style.vertical_align.table_cell_align {
+        TableCellVerticalAlign::Top => 0.0,
+        TableCellVerticalAlign::Middle => extra / 2.0,
+        TableCellVerticalAlign::Bottom => extra,
+        TableCellVerticalAlign::Baseline => row_baseline_offset
             .map(|baseline| (baseline - cell_baseline_offset).max(0.0))
             .unwrap_or(0.0)
             .min(extra),

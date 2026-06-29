@@ -91,9 +91,11 @@ fn horizontal_table_border_widths(document: &quire::Document) -> Vec<f32> {
     document.pages[0]
         .rects
         .iter()
-        .filter(|rect| rect.fill == Some(Color::BLACK) && rect.height <= 1.01 && rect.width > 1.01)
+        .filter(|rect| {
+            rect.fill == Some(Color::BLACK) && rect.height() <= 1.01 && rect.width() > 1.01
+        })
         .step_by(2)
-        .map(|rect| rect.width)
+        .map(|rect| rect.width())
         .collect()
 }
 
@@ -101,8 +103,10 @@ fn vertical_table_border_heights(document: &quire::Document) -> Vec<f32> {
     document.pages[0]
         .rects
         .iter()
-        .filter(|rect| rect.fill == Some(Color::BLACK) && rect.width <= 1.01 && rect.height > 1.01)
-        .map(|rect| rect.height)
+        .filter(|rect| {
+            rect.fill == Some(Color::BLACK) && rect.width() <= 1.01 && rect.height() > 1.01
+        })
+        .map(|rect| rect.height())
         .collect()
 }
 
@@ -120,16 +124,19 @@ fn first_rect_paint_operation_index(page: &quire::Page, color: Color) -> usize {
 }
 
 fn final_rect_fill_at(page: &quire::Page, x: f32, y: f32) -> Option<Color> {
-    page.operations
+    page.paint_operations()
         .iter()
         .filter_map(|operation| {
             let quire::PaintOperation::Rect(index) = operation else {
                 return None;
             };
             let rect = page.rects.get(*index)?;
-            (x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height)
-                .then_some(rect.fill)
-                .flatten()
+            (x >= rect.x()
+                && x <= rect.x() + rect.width()
+                && y >= rect.y()
+                && y <= rect.y() + rect.height())
+            .then_some(rect.fill)
+            .flatten()
         })
         .next_back()
 }
@@ -167,18 +174,18 @@ fn rendered_line_baseline_top(document: &quire::Document, line: &quire::Rendered
             line.font_size - ascent
         })
         .unwrap_or(0.0);
-    line.y + line.font_size - adjustment
+    line.y() + line.font_size - adjustment
 }
 
 fn assert_line_baseline_at_top(document: &quire::Document, line: &quire::RenderedLine, top_y: f32) {
     let expected = rendered_line_baseline_y_for_top(document, line, top_y);
     assert!(
-        (line.y - expected).abs() < 0.01,
+        (line.y() - expected).abs() < 0.01,
         "expected {:?} baseline y {:.4} for top {:.4}, got {:.4}",
         line.text,
         expected,
         top_y,
-        line.y
+        line.y()
     );
 }
 
@@ -186,6 +193,8 @@ fn assert_line_baseline_at_top(document: &quire::Document, line: &quire::Rendere
 mod css_assets;
 #[path = "smoke/document.rs"]
 mod document;
+#[path = "smoke/flex_conformance.rs"]
+mod flex_conformance;
 #[path = "smoke/fonts.rs"]
 mod fonts;
 #[path = "smoke/layout_inline_flex.rs"]

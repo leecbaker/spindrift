@@ -15,6 +15,7 @@ use selectors::parser::{
     SelectorParseErrorKind,
 };
 use selectors::{Element as SelectorElement, OpaqueElement};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
@@ -47,7 +48,7 @@ fn element_namespace_matches(element_namespace: &str, selector_namespace: &str) 
 pub(super) fn selector_matches_with_scope_proximity(
     selector: &SelectorList<ReasySelectorImpl>,
     scopes: &[ScopeRule],
-    current: ElementSignature,
+    current: &ElementSignature,
     ancestors: &[ElementSignature],
 ) -> Option<usize> {
     let chain = selector_chain(current, ancestors);
@@ -64,19 +65,19 @@ pub(super) fn selector_matches_with_scope_proximity(
     selector_matches_at(selector, &chain, ancestors.len(), scope_root_index).then_some(proximity)
 }
 
-fn selector_chain(
-    current: ElementSignature,
-    ancestors: &[ElementSignature],
-) -> Arc<Vec<ElementSignature>> {
+fn selector_chain<'a>(
+    current: &'a ElementSignature,
+    ancestors: &'a [ElementSignature],
+) -> Arc<Vec<Cow<'a, ElementSignature>>> {
     let mut chain = Vec::with_capacity(ancestors.len() + 1);
-    chain.extend_from_slice(ancestors);
-    chain.push(current);
+    chain.extend(ancestors.iter().map(Cow::Borrowed));
+    chain.push(Cow::Borrowed(current));
     Arc::new(chain)
 }
 
-fn selector_matches_at(
+fn selector_matches_at<'a>(
     selector: &SelectorList<ReasySelectorImpl>,
-    chain: &Arc<Vec<ElementSignature>>,
+    chain: &Arc<Vec<Cow<'a, ElementSignature>>>,
     index: usize,
     scope_index: Option<usize>,
 ) -> bool {
@@ -98,9 +99,9 @@ fn selector_matches_at(
     matches_selector_list(selector, &element, &mut context)
 }
 
-fn scope_rule_distance(
+fn scope_rule_distance<'a>(
     scope: &ScopeRule,
-    chain: &Arc<Vec<ElementSignature>>,
+    chain: &Arc<Vec<Cow<'a, ElementSignature>>>,
     current_index: usize,
 ) -> Option<(usize, usize)> {
     for root_index in (0..=current_index).rev() {
@@ -119,12 +120,12 @@ fn scope_rule_distance(
 }
 
 #[derive(Clone, Debug)]
-struct StyleElement {
-    chain: Arc<Vec<ElementSignature>>,
+struct StyleElement<'a> {
+    chain: Arc<Vec<Cow<'a, ElementSignature>>>,
     index: usize,
 }
 
-impl StyleElement {
+impl StyleElement<'_> {
     fn signature(&self) -> &ElementSignature {
         &self.chain[self.index]
     }
@@ -132,7 +133,7 @@ impl StyleElement {
     fn sibling_element_at(&self, sibling_index: usize) -> Option<Self> {
         let sibling = self.signature().sibling_at(sibling_index)?;
         let mut chain = self.chain[..self.index].to_vec();
-        chain.push(sibling);
+        chain.push(Cow::Owned(sibling));
         Some(Self {
             chain: Arc::new(chain),
             index: self.index,
@@ -142,7 +143,7 @@ impl StyleElement {
     fn child_element_at(&self, child_index: usize) -> Option<Self> {
         let child = self.signature().child_at(child_index)?;
         let mut chain = self.chain.as_ref().clone();
-        chain.push(child);
+        chain.push(Cow::Owned(child));
         let index = chain.len() - 1;
         Some(Self {
             chain: Arc::new(chain),
@@ -462,7 +463,7 @@ fn is_language_range_subtag(value: &str) -> bool {
     !value.is_empty() && value.len() <= 8 && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
-impl SelectorElement for StyleElement {
+impl SelectorElement for StyleElement<'_> {
     type Impl = ReasySelectorImpl;
 
     fn opaque(&self) -> OpaqueElement {

@@ -27,9 +27,18 @@ pub(super) fn used_table_width(
     style: &ComputedStyle,
     available_outer_width: f32,
 ) -> UsedTableWidth {
-    let border_widths = used_border_widths(style);
-    let padding = used_padding_edges(style, available_outer_width).to_css_edges();
-    let horizontal_border_non_content = if style.border_collapse == css::BorderCollapse::Collapse {
+    let collapsed = style.border_collapse == css::BorderCollapse::Collapse;
+    let border_widths = if collapsed {
+        css::Edges::ZERO
+    } else {
+        used_border_widths(style)
+    };
+    let padding = if collapsed {
+        css::Edges::ZERO
+    } else {
+        used_padding_edges(style, available_outer_width).to_css_edges()
+    };
+    let horizontal_border_non_content = if collapsed {
         0.0
     } else {
         border_widths.left + border_widths.right
@@ -50,11 +59,11 @@ pub(super) fn used_table_width(
 /// Resolves the row-grid content width for a table with no rows or cells.
 ///
 /// CSS Tables 3 keeps an empty table's grid box in layout: if the grid has no
-/// slots and `width` is auto, the grid content width is zero, but table padding
-/// and borders still contribute to the table wrapper box. Definite widths and
-/// min/max constraints still apply to the grid content box:
+/// slots and `width` is auto, the grid content width is zero. In collapsed
+/// border mode CSS 2.2 derives wrapper border insets from the collapsed grid;
+/// with no slots that grid contributes no padding or border inset.
 /// <https://drafts.csswg.org/css-tables/#computing-the-table-width> and
-/// <https://drafts.csswg.org/css-tables/#computing-the-table-height>.
+/// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>.
 pub(super) fn used_empty_table_grid_width(
     style: &ComputedStyle,
     available_outer_width: f32,
@@ -77,22 +86,78 @@ pub(super) fn used_empty_table_grid_width(
 ///
 /// CSS Tables 3 treats a definite table grid box height as the table's minimum
 /// row-grid height. With no rows and auto height, that grid content height is
-/// zero; padding and borders are added outside it by table wrapper painting:
+/// zero; collapsed tables have no separated wrapper padding or border around
+/// that empty grid:
 /// <https://drafts.csswg.org/css-tables/#computing-the-table-height>.
 pub(super) fn used_empty_table_grid_height(
     style: &ComputedStyle,
     available_outer_height: f32,
-    content_width: f32,
     table_width: UsedTableWidth,
 ) -> f32 {
     let vertical_non_content = table_width.border_widths.top
         + table_width.border_widths.bottom
         + table_width.padding.top
         + table_width.padding.bottom;
-    let requested_content_height =
-        used_content_height_or_auto(style, available_outer_height, vertical_non_content)
-            .unwrap_or(0.0);
-    constrain_height(style, requested_content_height, content_width).max(0.0)
+    used_table_target_content_height(style, available_outer_height, vertical_non_content)
+        .unwrap_or(0.0)
+}
+
+/// Resolve a table wrapper's definite block-size constraints to a grid target.
+///
+/// CSS Tables computes row heights inside the table grid box, while `height`,
+/// `min-height`, and `max-height` apply to the table wrapper box. In separated
+/// border mode, wrapper padding and border sit outside the grid and must be
+/// removed from definite wrapper sizes before row height distribution sees
+/// them; collapsed borders do not contribute ordinary wrapper non-content.
+/// `max-height` caps a target created by `height` or `min-height`, but does
+/// not create a target by itself and shrink intrinsic rows:
+/// <https://drafts.csswg.org/css-tables/#computing-the-table-height> and
+/// <https://www.w3.org/TR/css-sizing-3/#box-sizing>.
+pub(super) fn used_table_target_content_height(
+    style: &ComputedStyle,
+    available_outer_height: f32,
+    vertical_non_content: f32,
+) -> Option<f32> {
+    let height = table_wrapper_size_to_grid_content_height(
+        style.box_values.height,
+        style.box_sizing,
+        available_outer_height,
+        vertical_non_content,
+    );
+    let min_height = table_wrapper_size_to_grid_content_height(
+        style.box_values.min_height,
+        style.box_sizing,
+        available_outer_height,
+        vertical_non_content,
+    );
+    let max_height = table_wrapper_size_to_grid_content_height(
+        style.box_values.max_height,
+        style.box_sizing,
+        available_outer_height,
+        vertical_non_content,
+    );
+
+    let mut target = height.or(min_height)?;
+    if let Some(max_height) = max_height {
+        target = target.min(max_height);
+    }
+    if let Some(min_height) = min_height {
+        target = target.max(min_height);
+    }
+    Some(target.max(0.0))
+}
+
+fn table_wrapper_size_to_grid_content_height(
+    value: css::ComputedLengthPercentageOrAuto,
+    box_sizing: BoxSizing,
+    percentage_basis: f32,
+    vertical_non_content: f32,
+) -> Option<f32> {
+    let specified = used_length_percentage_or_auto(value, percentage_basis)?;
+    Some(match box_sizing {
+        BoxSizing::BorderBox => (specified - vertical_non_content).max(0.0),
+        BoxSizing::ContentBox => specified.max(0.0),
+    })
 }
 
 pub(super) fn declared_table_cell_width(
@@ -606,30 +671,26 @@ fn table_cell_formatting_box_intrinsic_width(
     children: &[box_tree::FormattingBox<'_>],
     stylesheets: &[Stylesheet],
 ) -> (f32, f32) {
+    if let box_tree::FormattingBox::Table(box_) = child {
+        return layout.table_outer_intrinsic_widths_from_fragment(
+            box_.element,
+            style,
+            stylesheets,
+            &box_.fragment,
+            10_000.0,
+        );
+    }
+
     let used_edges = used_box_edges(style, 0.0);
     let horizontal_non_content =
         used_edges.padding.left + used_edges.padding.right + horizontal_border_width(style);
     let explicit_width = used_content_width_or_auto(style, 0.0, horizontal_non_content);
-    let (intrinsic_min, intrinsic_max) = match child {
-        box_tree::FormattingBox::Table(box_) => layout.table_intrinsic_widths_from_fragment(
-            box_.element,
-            &box_.style,
-            stylesheets,
-            &box_.fragment,
-            10_000.0,
-        ),
-        _ => {
-            let inline_contribution =
-                layout.intrinsic_inline_contribution_for_boxes(children, style, &[]);
-            (
-                inline_contribution
-                    .min_content
-                    .min(inline_contribution.max_content)
-                    .max(0.0),
-                inline_contribution.max_content,
-            )
-        }
-    };
+    let inline_contribution = layout.intrinsic_inline_contribution_for_boxes(children, style, &[]);
+    let intrinsic_min = inline_contribution
+        .min_content
+        .min(inline_contribution.max_content)
+        .max(0.0);
+    let intrinsic_max = inline_contribution.max_content;
     let preferred_min = explicit_width.unwrap_or(intrinsic_min);
     let preferred = explicit_width.unwrap_or(intrinsic_max.max(preferred_min));
     let min = constrain_width(style, preferred_min, 0.0);

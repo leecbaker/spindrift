@@ -1,12 +1,5 @@
 use super::*;
 
-pub(super) fn catalog_dictionary(outline_plan: Option<&OutlinePlan>) -> String {
-    let outlines = outline_plan
-        .map(|plan| format!(" /Outlines {} 0 R", plan.root_id))
-        .unwrap_or_default();
-    format!("<< /Type /Catalog /Pages 2 0 R{outlines} >>\n")
-}
-
 pub(super) fn outline_plan(document: &Document, first_outline_id: usize) -> Option<OutlinePlan> {
     let tree = bookmark_tree(&document.bookmarks);
     if tree.is_empty() {
@@ -130,80 +123,4 @@ pub(super) fn append_outline_nodes(
         });
     }
     visible_count
-}
-
-pub(super) fn outline_objects(
-    plan: &OutlinePlan,
-    first_page_id: usize,
-    document: &Document,
-) -> Vec<(usize, Vec<u8>)> {
-    let mut objects = Vec::new();
-    let top_level_ids = plan
-        .nodes
-        .iter()
-        .filter(|node| node.parent_id == plan.root_id)
-        .map(|node| node.id)
-        .collect::<Vec<_>>();
-    let first = top_level_ids.iter().min().copied();
-    let last = top_level_ids.iter().max().copied();
-    objects.push((
-        plan.root_id,
-        format!(
-            "<< /Count {}{}{} >>\n",
-            plan.visible_count,
-            first
-                .map(|id| format!(" /First {id} 0 R"))
-                .unwrap_or_default(),
-            last.map(|id| format!(" /Last {id} 0 R"))
-                .unwrap_or_default()
-        )
-        .into_bytes(),
-    ));
-
-    let mut node_objects = plan
-        .nodes
-        .iter()
-        .map(|node| {
-            (
-                node.id,
-                outline_node_object(node, first_page_id, document).into_bytes(),
-            )
-        })
-        .collect::<Vec<_>>();
-    node_objects.sort_by_key(|(id, _)| *id);
-    objects.extend(node_objects);
-    objects
-}
-
-pub(super) fn outline_node_object(
-    node: &OutlineNodePlan,
-    first_page_id: usize,
-    document: &Document,
-) -> String {
-    let page_index = node
-        .bookmark
-        .page_index
-        .min(document.pages.len().saturating_sub(1));
-    let page_id = first_page_id + page_index;
-    format!(
-        "<< /Title ({}) /Parent {} 0 R{}{}{}{} /Count {} /Dest [{} 0 R /XYZ {:.3} {:.3} 0] >>\n",
-        escape_pdf_string(&node.bookmark.label),
-        node.parent_id,
-        node.prev_id
-            .map(|id| format!(" /Prev {id} 0 R"))
-            .unwrap_or_default(),
-        node.next_id
-            .map(|id| format!(" /Next {id} 0 R"))
-            .unwrap_or_default(),
-        node.first_child_id
-            .map(|id| format!(" /First {id} 0 R"))
-            .unwrap_or_default(),
-        node.last_child_id
-            .map(|id| format!(" /Last {id} 0 R"))
-            .unwrap_or_default(),
-        node.child_count,
-        page_id,
-        node.bookmark.x,
-        node.bookmark.y
-    )
 }

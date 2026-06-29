@@ -83,20 +83,17 @@ impl<'a> LayoutBuilder<'a> {
                 Direction::Ltr => content_inline_start - image.width - gap,
                 Direction::Rtl => content_inline_end + gap,
             };
-            self.push_image(RenderedImage {
-                background: false,
-                x,
-                y: row_top - image.height,
-                width: image.width,
-                height: image.height,
-                pixel_width: image.decoded.pixel_width,
-                pixel_height: image.decoded.pixel_height,
-                source_rect: None,
-                interpolate: false,
-                rgb: image.decoded.rgb.clone(),
-                alpha: image.decoded.alpha.clone(),
-                alt_text: None,
-            });
+            self.push_image(RenderedImage::from_paint_rect(
+                PageTopRect::new(x, row_top, image.width, image.height).paint_rect(),
+                false,
+                image.decoded.pixel_width,
+                image.decoded.pixel_height,
+                None,
+                false,
+                image.decoded.rgb.clone(),
+                image.decoded.alpha.clone(),
+                None,
+            ));
             return;
         }
         let marker_width = self.font_system.measure_text(&marker.text, &marker.style);
@@ -125,11 +122,18 @@ impl<'a> LayoutBuilder<'a> {
         items: &mut Vec<InlineItem>,
     ) {
         let marker_scope_style = marker_inline_scope_style(&marker.style);
-        self.push_bidi_scope_start(&marker_scope_style, link_target.clone(), 0.0, items);
+        self.push_bidi_scope_start_with_source(
+            &marker_scope_style,
+            link_target.clone(),
+            0.0,
+            InlineTextSource::Marker,
+            items,
+        );
         if let Some(image) = &marker.image {
             items.push(InlineItem::Atom(Box::new(InlineAtom {
                 content: InlineAtomContent::Image(image.decoded.clone()),
                 style: marker.style.clone(),
+                escaped_positioned_layers: None,
                 width: image.width,
                 height: image.height + inline_replaced_descent(&marker.style),
                 baseline_offset: image.height,
@@ -143,14 +147,29 @@ impl<'a> LayoutBuilder<'a> {
                 style: marker.style.clone(),
                 baseline_shift: 0.0,
                 link_target: link_target.clone(),
-                mergeable: false,
+                mergeable: true,
+                source: InlineTextSource::Marker,
                 hanging_edges: InlineHangingEdges::default(),
             })));
         }
         if marker.suffix_space {
-            self.push_collapsed_inline_space(&marker.style, link_target.clone(), 0.0, items);
+            items.push(InlineItem::Word(Box::new(InlineWord {
+                text: " ".to_string(),
+                style: marker.style.clone(),
+                baseline_shift: 0.0,
+                link_target: link_target.clone(),
+                mergeable: true,
+                source: InlineTextSource::Normal,
+                hanging_edges: InlineHangingEdges::default(),
+            })));
         }
-        self.push_bidi_scope_end(&marker_scope_style, link_target, 0.0, items);
+        self.push_bidi_scope_end_with_source(
+            &marker_scope_style,
+            link_target,
+            0.0,
+            InlineTextSource::Marker,
+            items,
+        );
     }
 
     fn marker_image_for_style(&self, style: &ComputedStyle) -> Option<MarkerImage> {

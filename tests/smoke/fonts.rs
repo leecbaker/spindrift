@@ -13,8 +13,8 @@ async fn visibility_hidden_preserves_layout_space() {
     assert_eq!(document.pages[0].lines.len(), 1);
     assert_eq!(document.pages[0].lines[0].text, "Visible");
     assert!(
-        document.pages[0].lines[0].y
-            < options.page_size.height - options.page_margins.top - options.line_height
+        document.pages[0].lines[0].y()
+            < options.page_size.height() - options.page_margins.top - options.line_height
     );
 }
 
@@ -483,6 +483,104 @@ async fn font_style_boundary_preserves_arabic_shaping_context() {
 }
 
 #[tokio::test]
+async fn local_alreq_text_encoding_subset_matches_presentation_forms() {
+    let variants = [
+        AlreqVariant::plain("shaping-join-001", AlreqExpectation::Join),
+        AlreqVariant::unicode_range(
+            "shaping-join-002",
+            AlreqExpectation::Join,
+            AlreqSpecialFont::JoinControls,
+        ),
+        AlreqVariant::explicit(
+            "shaping-join-003",
+            AlreqExpectation::Join,
+            AlreqSpecialFont::JoinControls,
+        ),
+        AlreqVariant::plain("shaping-no-join-001", AlreqExpectation::NoJoin),
+        AlreqVariant::unicode_range(
+            "shaping-no-join-002",
+            AlreqExpectation::NoJoin,
+            AlreqSpecialFont::JoinControls,
+        ),
+        AlreqVariant::explicit(
+            "shaping-no-join-003",
+            AlreqExpectation::NoJoin,
+            AlreqSpecialFont::JoinControls,
+        ),
+        AlreqVariant::plain("shaping-tatweel-001", AlreqExpectation::Tatweel),
+        AlreqVariant::unicode_range(
+            "shaping-tatweel-002",
+            AlreqExpectation::Tatweel,
+            AlreqSpecialFont::Tatweel,
+        ),
+        AlreqVariant::explicit(
+            "shaping-tatweel-003",
+            AlreqExpectation::Tatweel,
+            AlreqSpecialFont::Tatweel,
+        ),
+    ];
+
+    for variant in variants {
+        for (index, (actual_text, reference_text)) in variant.cases().into_iter().enumerate() {
+            let actual_document = Html::from_string(&variant.html_for_text(actual_text))
+                .with_base_url(".")
+                .render_async(&RenderOptions::default())
+                .await
+                .unwrap();
+            let reference_document = Html::from_string(&variant.html_for_text(reference_text))
+                .with_base_url(".")
+                .render_async(&RenderOptions::default())
+                .await
+                .unwrap();
+            let actual = alreq_first_line_glyphs(&actual_document).unwrap_or_else(|| {
+                panic!(
+                    "{} row {} actual should produce visible glyphs: {:?}",
+                    variant.name,
+                    index,
+                    actual_document
+                        .pages
+                        .iter()
+                        .flat_map(|page| page.lines.iter())
+                        .collect::<Vec<_>>()
+                )
+            });
+            let reference = alreq_first_line_glyphs(&reference_document).unwrap_or_else(|| {
+                panic!(
+                    "{} row {} reference should produce visible glyphs: {:?}",
+                    variant.name,
+                    index,
+                    reference_document
+                        .pages
+                        .iter()
+                        .flat_map(|page| page.lines.iter())
+                        .collect::<Vec<_>>()
+                )
+            });
+            assert_eq!(
+                actual.visible_glyphs, reference.visible_glyphs,
+                "{} row {} should match its presentation-form reference: actual {:?}, reference {:?}",
+                variant.name, index, actual, reference
+            );
+            if matches!(
+                variant.expectation,
+                AlreqExpectation::Join | AlreqExpectation::NoJoin
+            ) {
+                assert!(
+                    !actual
+                        .unicode
+                        .iter()
+                        .any(|text| text.contains('\u{200c}') || text.contains('\u{200d}')),
+                    "{} row {} should not emit join-control glyphs: {:?}",
+                    variant.name,
+                    index,
+                    actual
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn uses_later_font_family_for_missing_glyph_runs() {
     let Some((primary_font, fallback_font, fallback_character)) = fallback_font_fixture() else {
         eprintln!("no standalone system TrueType fallback-font fixture available");
@@ -611,6 +709,219 @@ fn fallback_font_fixture() -> Option<(Vec<u8>, Vec<u8>, char)> {
     }
 
     None
+}
+
+#[derive(Clone, Copy)]
+enum AlreqExpectation {
+    Join,
+    NoJoin,
+    Tatweel,
+}
+
+#[derive(Clone, Copy)]
+enum AlreqSpecialFont {
+    JoinControls,
+    Tatweel,
+}
+
+#[derive(Clone, Copy)]
+enum AlreqFontMode {
+    Plain,
+    UnicodeRange(AlreqSpecialFont),
+    Explicit(AlreqSpecialFont),
+}
+
+#[derive(Clone, Copy)]
+struct AlreqVariant {
+    name: &'static str,
+    expectation: AlreqExpectation,
+    mode: AlreqFontMode,
+}
+
+impl AlreqVariant {
+    fn plain(name: &'static str, expectation: AlreqExpectation) -> Self {
+        Self {
+            name,
+            expectation,
+            mode: AlreqFontMode::Plain,
+        }
+    }
+
+    fn unicode_range(
+        name: &'static str,
+        expectation: AlreqExpectation,
+        special_font: AlreqSpecialFont,
+    ) -> Self {
+        Self {
+            name,
+            expectation,
+            mode: AlreqFontMode::UnicodeRange(special_font),
+        }
+    }
+
+    fn explicit(
+        name: &'static str,
+        expectation: AlreqExpectation,
+        special_font: AlreqSpecialFont,
+    ) -> Self {
+        Self {
+            name,
+            expectation,
+            mode: AlreqFontMode::Explicit(special_font),
+        }
+    }
+
+    fn html_for_text(self, text: &'static str) -> String {
+        let special_font = match self.mode {
+            AlreqFontMode::Plain => AlreqSpecialFont::JoinControls,
+            AlreqFontMode::UnicodeRange(special_font) | AlreqFontMode::Explicit(special_font) => {
+                special_font
+            }
+        };
+        let stack = match self.mode {
+            AlreqFontMode::Plain | AlreqFontMode::Explicit(_) => "AlreqArabic",
+            AlreqFontMode::UnicodeRange(_) => "AlreqPrimary, AlreqSpecial, AlreqArabic",
+        };
+        let case = format!(
+            "<p class=\"case\" dir=\"rtl\" lang=\"ar\">{}</p>",
+            self.markup(text)
+        );
+        format!(
+            "<style>\
+             @font-face {{ font-family: AlreqPrimary; src: url('tests/resources/fonts/NotoNaskhArabic-regular.woff2') format('woff2'); unicode-range: U+20; }}\
+             @font-face {{ font-family: AlreqSpecial; src: url('{}') format('{}'); unicode-range: {}; }}\
+             @font-face {{ font-family: AlreqArabic; src: url('tests/resources/fonts/NotoNaskhArabic-regular.woff2') format('woff2'); }}\
+             body {{ margin: 0; }}\
+             .case {{ margin: 0; font-family: {stack}; font-size: 20pt; line-height: 24pt; }}\
+             .special {{ font-family: AlreqSpecial; }}\
+             </style>{case}",
+            match special_font {
+                AlreqSpecialFont::JoinControls => {
+                    "tests/resources/fonts/noto-sans-v8-latin-regular.woff"
+                }
+                AlreqSpecialFont::Tatweel => "tests/resources/fonts/Scheherazade-Regular.woff",
+            },
+            "woff",
+            match special_font {
+                AlreqSpecialFont::JoinControls => "U+200C-200D",
+                AlreqSpecialFont::Tatweel => "U+0640",
+            }
+        )
+    }
+
+    fn cases(self) -> Vec<(&'static str, &'static str)> {
+        match self.expectation {
+            AlreqExpectation::Join => vec![
+                ("\u{200d}\u{0627}\u{200d}", "\u{fe8e}"),
+                ("\u{200d}\u{0627}", "\u{fe8e}"),
+                ("\u{0628}\u{200d}", "\u{fe91}"),
+                ("\u{200d}\u{0628}\u{200d}", "\u{fe92}"),
+                ("\u{200d}\u{0628}", "\u{fe90}"),
+            ],
+            AlreqExpectation::NoJoin => vec![
+                ("\u{0640}\u{200c}\u{0627}", "\u{0640}\u{fe8d}"),
+                ("\u{0628}\u{200c}\u{0640}", "\u{fe8f}\u{0640}"),
+                (
+                    "\u{0640}\u{0628}\u{200c}\u{0640}",
+                    "\u{0640}\u{fe90}\u{0640}",
+                ),
+                (
+                    "\u{0640}\u{200c}\u{0628}\u{200c}\u{0640}",
+                    "\u{0640}\u{fe8f}\u{0640}",
+                ),
+                (
+                    "\u{0640}\u{200c}\u{0628}\u{0640}",
+                    "\u{0640}\u{fe91}\u{0640}",
+                ),
+                ("\u{0640}\u{200c}\u{0628}", "\u{0640}\u{fe8f}"),
+            ],
+            AlreqExpectation::Tatweel => vec![
+                ("\u{0640}\u{0627}\u{0640}", "\u{0640}\u{fe8e}\u{0640}"),
+                ("\u{0640}\u{0627}", "\u{0640}\u{fe8e}"),
+                ("\u{0628}\u{0640}", "\u{fe91}\u{0640}"),
+                ("\u{0640}\u{0628}\u{0640}", "\u{0640}\u{fe92}\u{0640}"),
+                ("\u{0640}\u{0628}", "\u{0640}\u{fe90}"),
+            ],
+        }
+    }
+
+    fn markup(self, text: &'static str) -> String {
+        match self.mode {
+            AlreqFontMode::Explicit(AlreqSpecialFont::JoinControls) => text
+                .chars()
+                .map(|character| match character {
+                    '\u{200c}' | '\u{200d}' => {
+                        format!(
+                            "<span class=\"special\">{}</span>",
+                            alreq_numeric_character_reference(character)
+                        )
+                    }
+                    _ => alreq_numeric_character_reference(character),
+                })
+                .collect(),
+            AlreqFontMode::Explicit(AlreqSpecialFont::Tatweel) => text
+                .chars()
+                .map(|character| match character {
+                    '\u{0640}' => {
+                        format!(
+                            "<span class=\"special\">{}</span>",
+                            alreq_numeric_character_reference(character)
+                        )
+                    }
+                    _ => alreq_numeric_character_reference(character),
+                })
+                .collect(),
+            AlreqFontMode::Plain | AlreqFontMode::UnicodeRange(_) => text
+                .chars()
+                .map(alreq_numeric_character_reference)
+                .collect(),
+        }
+    }
+}
+
+fn alreq_numeric_character_reference(character: char) -> String {
+    format!("&#x{:X};", character as u32)
+}
+
+#[derive(Debug)]
+struct AlreqLineGlyphs {
+    visible_glyphs: Vec<u16>,
+    unicode: Vec<String>,
+}
+
+fn alreq_first_line_glyphs(document: &quire::Document) -> Option<AlreqLineGlyphs> {
+    document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines.iter())
+        .filter(|line| {
+            line.runs
+                .iter()
+                .flat_map(|run| run.glyphs.as_deref().unwrap_or_default())
+                .any(|glyph| glyph.x_advance != 0.0)
+        })
+        .map(|line| AlreqLineGlyphs {
+            visible_glyphs: line
+                .runs
+                .iter()
+                .flat_map(|run| {
+                    run.glyphs
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|glyph| glyph.x_advance != 0.0)
+                        .map(|glyph| glyph.id)
+                })
+                .collect(),
+            unicode: line
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.as_deref().unwrap_or_default())
+                .filter(|glyph| glyph.x_advance != 0.0)
+                .map(|glyph| glyph.unicode.clone())
+                .collect(),
+        })
+        .next()
 }
 
 fn standalone_system_font_faces() -> Vec<(Vec<u8>, u32)> {

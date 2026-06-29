@@ -50,6 +50,8 @@ pub(crate) struct ComputedStyle {
     pub background_repeat: BackgroundRepeat,
     pub background_origin: BackgroundBox,
     pub background_clip: BackgroundBox,
+    pub background_layers: Vec<BackgroundLayer>,
+    pub box_shadow: Vec<BoxShadow>,
     pub color: Color,
     pub font_size: f32,
     pub font_size_adjust: FontSizeAdjust,
@@ -63,6 +65,7 @@ pub(crate) struct ComputedStyle {
     pub direction: Direction,
     pub unicode_bidi: UnicodeBidi,
     pub writing_mode: WritingMode,
+    pub text_orientation: TextOrientation,
     pub text_align: TextAlign,
     pub text_align_last: TextAlignLast,
     pub text_justify: TextJustify,
@@ -149,6 +152,14 @@ pub(crate) struct ComputedStyle {
     pub opacity: f32,
     pub transform: TransformList,
     pub transform_origin: TransformOrigin,
+    pub isolation: Isolation,
+    pub mix_blend_mode: MixBlendMode,
+    pub filter: FilterValue,
+    pub clip_path: ClipPath,
+    pub mask: MaskValue,
+    pub contain: Contain,
+    pub content_visibility: ContentVisibility,
+    pub will_change: WillChange,
     pub bookmark_level: Option<u32>,
     pub bookmark_label: BookmarkLabel,
     pub bookmark_state: CssBookmarkState,
@@ -209,6 +220,8 @@ impl ComputedStyle {
             background_repeat: BackgroundRepeat::Repeat,
             background_origin: BackgroundBox::Padding,
             background_clip: BackgroundBox::Border,
+            background_layers: Vec::new(),
+            box_shadow: Vec::new(),
             color: Color::BLACK,
             font_size,
             font_size_adjust: FontSizeAdjust::None,
@@ -222,13 +235,14 @@ impl ComputedStyle {
             direction: Direction::Ltr,
             unicode_bidi: UnicodeBidi::Normal,
             writing_mode: WritingMode::HorizontalTb,
+            text_orientation: TextOrientation::Mixed,
             text_align: TextAlign::Start,
             text_align_last: TextAlignLast::Auto,
             text_justify: TextJustify::Auto,
             text_autospace: TextAutospace::NORMAL,
             text_indent: ComputedTextIndent::ZERO,
             hanging_punctuation: HangingPunctuation::NONE,
-            vertical_align: VerticalAlign::Baseline,
+            vertical_align: VerticalAlign::BASELINE,
             font_weight: FontWeight::NORMAL,
             font_style: FontStyle::Normal,
             font_width: FontWidth::NORMAL,
@@ -313,6 +327,14 @@ impl ComputedStyle {
             opacity: 1.0,
             transform: Vec::new(),
             transform_origin: TransformOrigin::INITIAL,
+            isolation: Isolation::Auto,
+            mix_blend_mode: MixBlendMode::Normal,
+            filter: FilterValue::None,
+            clip_path: ClipPath::None,
+            mask: MaskValue::None,
+            contain: Contain::NONE,
+            content_visibility: ContentVisibility::Visible,
+            will_change: WillChange::default(),
             bookmark_level: None,
             bookmark_label: BookmarkLabel::content_text(),
             bookmark_state: CssBookmarkState::Open,
@@ -342,6 +364,9 @@ impl ComputedStyle {
         self.background_size.resolve_font_metric_lengths(ch_advance);
         self.background_position
             .resolve_font_metric_lengths(ch_advance);
+        for layer in &mut self.background_layers {
+            layer.resolve_font_metric_lengths(ch_advance);
+        }
         self.border_image.resolve_font_metric_lengths(ch_advance);
         self.text_decoration.resolve_font_metric_lengths(ch_advance);
     }
@@ -419,6 +444,14 @@ impl ComputedStyle {
             viewport_inline,
             viewport_block,
         );
+        for layer in &mut self.background_layers {
+            layer.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
         self.border_image.resolve_viewport_lengths(
             viewport_width,
             viewport_height,

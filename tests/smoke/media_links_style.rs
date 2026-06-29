@@ -9,7 +9,7 @@ async fn renders_png_data_uri_images() {
 
     assert_eq!(document.pages[0].images.len(), 1);
     assert_eq!(document.pages[0].images[0].pixel_width, 1);
-    assert_eq!(document.pages[0].images[0].height, 10.0);
+    assert_eq!(document.pages[0].images[0].height(), 10.0);
 
     let pdf = document.write_pdf_bytes().unwrap();
     let rendered = String::from_utf8_lossy(&pdf);
@@ -45,7 +45,7 @@ async fn supports_percentage_image_widths() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].images[0].width, 90.0);
+    assert_eq!(document.pages[0].images[0].width(), 90.0);
 }
 
 #[tokio::test]
@@ -64,7 +64,7 @@ async fn direct_inline_images_reserve_baseline_descent_in_line_box() {
         .find(|line| line.text == "After")
         .unwrap();
 
-    assert!(image.y - after.y >= 12.0 - 0.01);
+    assert!(image.y() - after.y() >= 12.0 - 0.01);
 }
 
 #[tokio::test]
@@ -88,9 +88,9 @@ async fn anonymous_inline_runs_layout_replaced_atoms_with_text() {
         .find(|line| line.text.trim() == "After")
         .unwrap();
 
-    assert!(image.x > before.x);
-    assert!(after.x > image.x);
-    assert!((before.y - after.y).abs() < 0.1);
+    assert!(image.x() > before.x());
+    assert!(after.x() > image.x());
+    assert!((before.y() - after.y()).abs() < 0.1);
 }
 
 #[tokio::test]
@@ -114,9 +114,9 @@ async fn inline_formatting_context_places_atomic_image_between_text_fragments() 
         .find(|line| line.text.trim() == "After")
         .unwrap();
 
-    assert!(image.x > before.x);
-    assert!(after.x > image.x);
-    assert!((before.y - after.y).abs() < 0.1);
+    assert!(image.x() > before.x());
+    assert!(after.x() > image.x());
+    assert!((before.y() - after.y()).abs() < 0.1);
 }
 
 #[tokio::test]
@@ -132,9 +132,9 @@ async fn flex_replaced_images_use_border_box_for_flex_distribution() {
 
     let images = &document.pages[0].images;
     assert_eq!(images.len(), 2);
-    assert!((images[0].width - 122.5).abs() < 0.01);
-    assert!((images[1].width - 73.5).abs() < 0.01);
-    assert!((images[1].x - images[0].x - 124.5).abs() < 0.01);
+    assert!((images[0].width() - 122.5).abs() < 0.01);
+    assert!((images[1].width() - 73.5).abs() < 0.01);
+    assert!((images[1].x() - images[0].x() - 124.5).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -151,8 +151,8 @@ async fn column_flex_replaced_image_min_height_transfers_through_aspect_ratio() 
     .unwrap();
 
     let image = &document.pages[0].images[0];
-    assert!((image.width - 75.0).abs() < 0.01, "image={image:?}");
-    assert!((image.height - 75.0).abs() < 0.01, "image={image:?}");
+    assert!((image.width() - 75.0).abs() < 0.01, "image={image:?}");
+    assert!((image.height() - 75.0).abs() < 0.01, "image={image:?}");
 }
 
 #[tokio::test]
@@ -171,8 +171,8 @@ async fn inline_floated_image_is_removed_from_text_flow_and_shifted_right() {
         .find(|line| line.text == "some words")
         .unwrap();
     let image = &document.pages[0].images[0];
-    assert!((text.x - 10.0).abs() < 0.01);
-    assert!((image.x - 199.0).abs() < 0.01);
+    assert!((text.x() - 10.0).abs() < 0.01);
+    assert!((image.x() - 199.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -197,20 +197,20 @@ async fn inline_text_after_left_float_uses_float_exclusion_and_line_end_tracking
         .iter()
         .filter(|line| line.text == "a")
         .max_by(|left, right| {
-            left.x
-                .partial_cmp(&right.x)
+            left.x()
+                .partial_cmp(&right.x())
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .unwrap();
     let ch = rendered_line_advance(ruler) / 5.0;
 
-    assert!((floated.x - ruler.x).abs() < 0.01);
+    assert!((floated.x() - ruler.x()).abs() < 0.01);
     assert!(
-        (following.x - (ruler.x + ch * 3.0)).abs() < ch * 0.2,
+        (following.x() - (ruler.x() + ch * 3.0)).abs() < ch * 0.2,
         "expected following a under the fourth ruler column: ruler x={}, ch={}, following x={}",
-        ruler.x,
+        ruler.x(),
         ch,
-        following.x
+        following.x()
     );
 }
 
@@ -228,7 +228,7 @@ async fn block_image_avoids_active_left_float() {
 
     let image = &document.pages[0].images[0];
     assert!(
-        image.x >= 39.0,
+        image.x() >= 39.0,
         "block image should avoid active float: {image:?}"
     );
 }
@@ -253,7 +253,7 @@ async fn clear_both_moves_block_image_below_active_float() {
     let image = &document.pages[0].images[0];
 
     assert!(
-        image.y + image.height <= green.y + 0.01,
+        image.y() + image.height() <= green.y() + 0.01,
         "clear block image should start below float: green={green:?} image={image:?}"
     );
 }
@@ -277,9 +277,9 @@ async fn overwide_block_image_moves_below_active_float() {
         .unwrap();
     let image = &document.pages[0].images[0];
 
-    assert!((image.x - 10.0).abs() < 0.01, "image={image:?}");
+    assert!((image.x() - 10.0).abs() < 0.01, "image={image:?}");
     assert!(
-        image.y + image.height <= green.y + 0.01,
+        image.y() + image.height() <= green.y() + 0.01,
         "overwide block image should move below float: green={green:?} image={image:?}"
     );
 }
@@ -309,12 +309,72 @@ async fn block_canvas_and_svg_avoid_active_float() {
         .unwrap();
 
     assert!(
-        blue.x >= 39.0,
+        blue.x() >= 39.0,
         "block canvas should avoid active float: {blue:?}"
     );
     assert!(
-        red.x >= 39.0,
+        red.x() >= 39.0,
         "block svg should avoid active float: {red:?}"
+    );
+}
+
+#[tokio::test]
+async fn flow_root_auto_height_expands_to_contain_internal_float() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 160pt 140pt; margin: 10pt }\
+         body, div { margin: 0 }\
+         .root { display: flow-root; width: 100pt; background: rgb(0 128 0) }\
+         .float { float: left; width: 30pt; height: 40pt; background: rgb(0 0 255) }\
+         </style>\
+         <div class=\"root\"><div class=\"float\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let root = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap();
+
+    assert!(
+        root.height() >= 39.99,
+        "flow-root background should include its internal float: {root:?}"
+    );
+}
+
+#[tokio::test]
+async fn internal_flow_root_float_does_not_leak_to_following_sibling() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 160pt 160pt; margin: 10pt }\
+         body, div { margin: 0 }\
+         .root { display: flow-root; width: 100pt; background: rgb(0 128 0) }\
+         .float { float: left; width: 30pt; height: 40pt; background: rgb(0 0 255) }\
+         .after { width: 100pt; height: 10pt; background: rgb(255 0 0) }\
+         </style>\
+         <div class=\"root\"><div class=\"float\"></div></div><div class=\"after\"></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let root = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap();
+    let after = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .unwrap();
+
+    assert!(
+        after.y() + after.height() <= root.y() + 0.01,
+        "following sibling should start below the flow-root: root={root:?} after={after:?}"
     );
 }
 
@@ -326,9 +386,14 @@ async fn renders_simple_svg_rects_in_table_cells() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert!(document.pages[0].rects.iter().any(|rect| rect.width == 15.0
-        && rect.height == 15.0
-        && rect.fill == Some(Color::new(34, 146, 212))));
+    assert!(
+        document.pages[0]
+            .rects
+            .iter()
+            .any(|rect| rect.width() == 15.0
+                && rect.height() == 15.0
+                && rect.fill == Some(Color::new(34, 146, 212)))
+    );
     let text = document.pages[0]
         .lines
         .iter()
@@ -425,7 +490,7 @@ async fn preserves_basic_styled_inline_runs() {
     let reference = lines.iter().find(|line| line.text == "ref").unwrap();
     let superscript = lines.iter().find(|line| line.text == "1").unwrap();
     assert!(superscript.font_size < reference.font_size);
-    assert!(superscript.y > reference.y);
+    assert!(superscript.y() > reference.y());
 }
 
 #[tokio::test]
@@ -442,7 +507,62 @@ async fn supports_authored_vertical_align_super_and_sub() {
     let down = lines.iter().find(|line| line.text == "down").unwrap();
     let flat = lines.iter().find(|line| line.text == "flat").unwrap();
 
-    assert!(up.y > base.y);
-    assert!(down.y < base.y);
-    assert!(flat.y < up.y);
+    assert!(up.y() > base.y());
+    assert!(down.y() < base.y());
+    assert!(flat.y() < up.y());
+}
+
+#[tokio::test]
+async fn vertical_align_length_and_percentage_shift_inline_baselines() {
+    let document = Html::from_string(
+        "<p style=\"margin:0;font-size:20pt;line-height:20pt\">\
+         Base<span style=\"vertical-align:10pt\">up</span>\
+         <span style=\"vertical-align:-10pt\">down</span>\
+         <span style=\"vertical-align:50%;line-height:20pt\">pct</span></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = &document.pages[0].lines;
+    let base = lines.iter().find(|line| line.text == "Base").unwrap();
+    let up = lines.iter().find(|line| line.text == "up").unwrap();
+    let down = lines.iter().find(|line| line.text == "down").unwrap();
+    let pct = lines.iter().find(|line| line.text == "pct").unwrap();
+
+    assert!(
+        up.y() > base.y() + 9.0,
+        "positive vertical-align length should raise the inline box: base={base:?}, up={up:?}"
+    );
+    assert!(
+        down.y() < base.y() - 9.0,
+        "negative vertical-align length should lower the inline box: base={base:?}, down={down:?}"
+    );
+    assert!(
+        (pct.y() - up.y()).abs() < 1.0,
+        "50% of a 20pt line-height should match a 10pt shift: up={up:?}, pct={pct:?}"
+    );
+}
+
+#[tokio::test]
+async fn baseline_shift_longhand_moves_inline_baselines() {
+    let document = Html::from_string(
+        "<p style=\"margin:0;font-size:20pt;line-height:20pt\">\
+         Base<span style=\"baseline-shift:10pt\">up</span>\
+         <span style=\"baseline-shift:-10pt\">down</span>\
+         <span style=\"baseline-shift:50%;line-height:20pt\">pct</span></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = &document.pages[0].lines;
+    let base = lines.iter().find(|line| line.text == "Base").unwrap();
+    let up = lines.iter().find(|line| line.text == "up").unwrap();
+    let down = lines.iter().find(|line| line.text == "down").unwrap();
+    let pct = lines.iter().find(|line| line.text == "pct").unwrap();
+
+    assert!(up.y() > base.y() + 9.0);
+    assert!(down.y() < base.y() - 9.0);
+    assert!((pct.y() - up.y()).abs() < 1.0);
 }

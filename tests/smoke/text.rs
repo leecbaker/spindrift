@@ -4,7 +4,7 @@ fn fragments_share_visual_line(lines: &[quire::RenderedLine]) -> bool {
     let Some(first) = lines.first() else {
         return true;
     };
-    lines.iter().all(|line| (line.y - first.y).abs() < 3.0)
+    lines.iter().all(|line| (line.y() - first.y()).abs() < 3.0)
 }
 
 #[tokio::test]
@@ -36,8 +36,8 @@ async fn text_shadow_paints_offset_text_without_affecting_layout_text() {
         .iter()
         .find(|line| line.color == Color::new(255, 0, 0))
         .unwrap();
-    assert!((red.x - black.x - 4.0).abs() < 0.1);
-    assert!((black.y - red.y - 2.0).abs() < 0.1);
+    assert!((red.x() - black.x() - 4.0).abs() < 0.1);
+    assert!((black.y() - red.y() - 2.0).abs() < 0.1);
 }
 
 #[tokio::test]
@@ -116,6 +116,52 @@ async fn text_emphasis_marks_are_painted_without_changing_base_text() {
 }
 
 #[tokio::test]
+async fn vertical_text_emphasis_marks_follow_prepared_run_offsets() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt }\
+         body { margin: 0 }\
+         p { margin: 0; width: 40pt; height: 80pt; writing-mode: vertical-rl;\
+             font-size: 12pt; line-height: 14pt; text-emphasis: filled sesame red }\
+         </style><p>中文</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let marks = document.pages[0]
+        .lines
+        .iter()
+        .filter(|line| line.text == "\u{FE45}")
+        .collect::<Vec<_>>();
+    assert_eq!(marks.len(), 2, "{marks:?}");
+    assert!(
+        (marks[0].y() - marks[1].y()).abs() > 5.0,
+        "vertical emphasis marks should be positioned per prepared text unit: {marks:?}"
+    );
+}
+
+#[tokio::test]
+async fn page_margin_text_emphasis_uses_prepared_annotations() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 20pt;\
+           @top-left { content: \"中\"; writing-mode: vertical-rl; font-size: 10pt; text-emphasis: filled sesame red } }\
+         body { margin: 0 }</style>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .lines
+            .iter()
+            .any(|line| line.text == "\u{FE45}"),
+        "{:?}",
+        document.pages[0].lines
+    );
+}
+
+#[tokio::test]
 async fn min_content_inline_sizing_counts_edges_and_atoms() {
     let document = Html::from_string(
         "<style>@page { size: 180pt 100pt; margin: 10pt } body, p { margin: 0; font-size: 10pt; line-height: 12pt }\
@@ -134,7 +180,7 @@ async fn min_content_inline_sizing_counts_edges_and_atoms() {
         .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .unwrap();
     assert!(
-        paragraph.width >= 39.5,
+        paragraph.width() >= 39.5,
         "min-content width should include the inline atom: {paragraph:?}"
     );
 }
@@ -152,7 +198,7 @@ async fn renders_dictionary_run_in_terms() {
     assert_eq!(lines[0].text, "alpha: ");
     assert_eq!(lines[1].text, "first entry");
     assert!(fragments_share_visual_line(&lines[..2]));
-    assert!(lines[0].x < lines[1].x);
+    assert!(lines[0].x() < lines[1].x());
 }
 
 #[tokio::test]
@@ -220,7 +266,7 @@ async fn renders_basic_unordered_lists() {
     assert_eq!(document.pages[0].lines[1].text, "One");
     assert_eq!(document.pages[0].lines[2].text, "\u{2022}");
     assert_eq!(document.pages[0].lines[3].text, "Two");
-    assert!(document.pages[0].lines[0].x < document.pages[0].lines[1].x);
+    assert!(document.pages[0].lines[0].x() < document.pages[0].lines[1].x());
 }
 
 #[tokio::test]
@@ -452,8 +498,9 @@ async fn generated_counter_content_renders_outside_marker() {
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
-    assert!(texts.windows(2).any(|pair| pair == ["1.", "Alpha"]));
-    assert!(texts.windows(2).any(|pair| pair == ["2.", "Beta"]));
+    let text = texts.join("");
+    assert!(text.contains("1. Alpha"), "{text}");
+    assert!(text.contains("2. Beta"), "{text}");
 }
 
 #[tokio::test]
@@ -470,7 +517,7 @@ async fn generated_counter_names_preserve_custom_ident_case() {
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
-    assert!(texts.windows(2).any(|pair| pair == ["1", "Alpha"]));
+    assert!(texts.join("").contains("1Alpha"), "{texts:?}");
 }
 
 #[tokio::test]
@@ -487,7 +534,7 @@ async fn generated_pseudo_counter_increment_applies_before_content() {
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
-    assert!(texts.windows(2).any(|pair| pair == ["1", "Alpha"]));
+    assert!(texts.join("").contains("1Alpha"), "{texts:?}");
 }
 
 #[tokio::test]
@@ -563,11 +610,11 @@ async fn counter_reset_without_ancestor_scope_is_visible_to_following_siblings()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
         .join("");
-    assert!(text.contains("1.One"), "{text}");
-    assert!(text.contains("1.1A"), "{text}");
-    assert!(text.contains("1.2B"), "{text}");
-    assert!(text.contains("2.Two"), "{text}");
-    assert!(text.contains("2.1C"), "{text}");
+    assert!(text.contains("1. One"), "{text}");
+    assert!(text.contains("1.1 A"), "{text}");
+    assert!(text.contains("1.2 B"), "{text}");
+    assert!(text.contains("2. Two"), "{text}");
+    assert!(text.contains("2.1 C"), "{text}");
 }
 
 #[tokio::test]
@@ -651,8 +698,7 @@ async fn generated_attr_content_renders_and_transforms() {
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
-    assert!(texts.contains(&"NOTE"));
-    assert!(texts.contains(&"Body"));
+    assert!(texts.join("").contains("NOTE Body"), "{texts:?}");
 }
 
 #[tokio::test]
@@ -666,13 +712,13 @@ async fn generated_image_content_renders_inline_atom() {
 
     assert_eq!(document.pages[0].images.len(), 1);
     let image = &document.pages[0].images[0];
-    assert!((image.width - 8.0).abs() < 0.01);
-    assert!((image.height - 6.0).abs() < 0.01);
+    assert!((image.width() - 8.0).abs() < 0.01);
+    assert!((image.height() - 6.0).abs() < 0.01);
     assert!(
         document.pages[0]
             .lines
             .iter()
-            .any(|line| line.text == "Icon")
+            .any(|line| line.text == " Icon")
     );
 }
 
@@ -690,7 +736,7 @@ async fn invalid_generated_image_is_skipped_without_suppressing_text() {
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
-    assert!(texts.windows(2).any(|pair| pair == ["Fallback", "Body"]));
+    assert!(texts.join("").contains("Fallback Body"), "{texts:?}");
 }
 
 #[tokio::test]
@@ -831,13 +877,13 @@ async fn auto_quotes_use_q_parent_language_not_q_language() {
     let texts = document.pages[0]
         .lines
         .iter()
-        .filter(|line| (line.y - document.pages[0].lines[0].y).abs() < 0.1)
+        .filter(|line| (line.y() - document.pages[0].lines[0].y()).abs() < 0.1)
         .map(|line| line.text.as_str())
         .collect::<String>();
     let reference = document.pages[0]
         .lines
         .iter()
-        .find(|line| (line.y - document.pages[0].lines[0].y).abs() >= 0.1)
+        .find(|line| (line.y() - document.pages[0].lines[0].y()).abs() >= 0.1)
         .map(|line| line.text.as_str())
         .expect("expected literal reference line");
     assert_eq!(texts, "One “two ‘three 『four』’”");
@@ -913,6 +959,134 @@ async fn leader_content_expands_between_inline_items() {
 }
 
 #[tokio::test]
+async fn page_margin_leader_content_uses_sequence_owned_resolution() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 220pt 90pt; margin: 20pt; @top-center { content: \"Chapter\" leader(dotted) \"2\"; font-size: 10pt; line-height: 10pt; width: 160pt } }\
+         body { margin: 0 }\
+         </style><p></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let text = document.pages[0]
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(text.contains("Chapter"), "{text}");
+    assert!(text.contains("2"), "{text}");
+    assert!(text.contains("..."), "{text}");
+}
+
+#[tokio::test]
+async fn page_margin_forced_breaks_use_plaintext_alignment_without_controls() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 220pt 120pt; margin: 20pt;\
+           @top-center { content: \"אב\\A abc\"; white-space: pre-line; unicode-bidi: plaintext; text-align: start; font-size: 10pt; line-height: 10pt; width: 150pt }\
+         }\
+         body { margin: 0 }\
+         </style><p></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let margin_lines = document.pages[0]
+        .lines
+        .iter()
+        .filter(|line| line.text.contains('א') || line.text.contains('ב') || line.text == "abc")
+        .collect::<Vec<_>>();
+    assert_eq!(margin_lines.len(), 2, "{:?}", document.pages[0].lines);
+    assert!(
+        margin_lines
+            .iter()
+            .all(|line| !line.text.chars().any(char::is_control)),
+        "{margin_lines:?}"
+    );
+    let hebrew = margin_lines
+        .iter()
+        .find(|line| line.text.contains('א') || line.text.contains('ב'))
+        .expect("expected Hebrew plaintext line");
+    let latin = margin_lines
+        .iter()
+        .find(|line| line.text == "abc")
+        .expect("expected Latin plaintext line");
+    assert!(
+        hebrew.x() > latin.x() + 50.0,
+        "hebrew={hebrew:?}, latin={latin:?}"
+    );
+}
+
+#[tokio::test]
+async fn inline_block_leader_content_matches_normal_inline_resolution() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 220pt 100pt; margin: 10pt }\
+         body { margin: 0; font: 10pt/12pt monospace }\
+         span { display: inline-block; width: 120pt; content: \"Chapter\" leader(dotted) \"2\" }\
+         </style><span>Ignored</span>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let text = document.pages[0]
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(text.contains("Chapter"), "{text}");
+    assert!(text.contains("2"), "{text}");
+    assert!(text.contains("..."), "{text}");
+}
+
+#[tokio::test]
+async fn rtl_and_vertical_leaders_use_prepared_text_placement() {
+    let rtl = Html::from_string(
+        "<style>@page { size: 220pt 100pt; margin: 10pt } body { margin: 0; font: 10pt/12pt monospace } p { margin: 0; width: 160pt; direction: rtl } p::after { content: leader(dotted) \"2\" }</style><p>Chapter</p>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+    let vertical = Html::from_string(
+        "<style>@page { size: 160pt 180pt; margin: 10pt } body { margin: 0; font: 10pt/12pt monospace } p { margin: 0; writing-mode: vertical-rl; width: 80pt; height: 140pt } p::after { content: leader(dotted) \"2\" }</style><p>章</p>",
+    )
+    .render_async(&RenderOptions::default()).await
+    .unwrap();
+
+    let rtl_text = rtl.pages[0]
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    let vertical_text = vertical.pages[0]
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+
+    assert!(rtl_text.contains("..."), "{rtl_text}");
+    assert!(vertical_text.contains("..."), "{vertical_text}");
+    assert!(
+        vertical.pages[0]
+            .lines
+            .iter()
+            .flat_map(|line| line.runs.iter())
+            .any(|run| {
+                run.text.contains('.') && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+            }),
+        "{:?}",
+        vertical.pages[0].lines
+    );
+}
+
+#[tokio::test]
 async fn generated_image_alt_text_is_captured() {
     let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
     let document = Html::from_string(format!(
@@ -938,8 +1112,8 @@ async fn supports_string_list_style_type() {
 
     assert_eq!(document.pages[0].lines[0].text, "Note: ");
     assert_eq!(document.pages[0].lines[1].text.trim_start(), "Alpha");
-    assert!((document.pages[0].lines[0].y - document.pages[0].lines[1].y).abs() < 0.01);
-    assert!(document.pages[0].lines[0].x < document.pages[0].lines[1].x);
+    assert!((document.pages[0].lines[0].y() - document.pages[0].lines[1].y()).abs() < 0.01);
+    assert!(document.pages[0].lines[0].x() < document.pages[0].lines[1].x());
 }
 
 #[tokio::test]
@@ -953,7 +1127,7 @@ async fn supports_string_list_style_type_in_shorthand() {
     let lines = &document.pages[0].lines;
     let first_visual_line = lines
         .iter()
-        .take_while(|line| (line.y - lines[0].y).abs() < 0.01)
+        .take_while(|line| (line.y() - lines[0].y()).abs() < 0.01)
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
         .join("");
@@ -977,8 +1151,8 @@ async fn outside_list_markers_do_not_indent_wrapped_content_lines() {
     assert_eq!(lines[0].text, "\u{2022}");
     assert!(lines[1].text.starts_with("Alpha"));
     assert!(!lines[2].text.starts_with("\u{2022}"));
-    assert!((lines[1].x - lines[2].x).abs() < 0.01);
-    assert!(lines[0].x < lines[1].x);
+    assert!((lines[1].x() - lines[2].x()).abs() < 0.01);
+    assert!(lines[0].x() < lines[1].x());
 }
 
 #[tokio::test]
@@ -993,9 +1167,46 @@ async fn inside_list_markers_participate_in_first_line() {
     assert!(lines.len() > 1);
     assert_eq!(lines[0].text, "1.");
     assert!(lines[1].text.trim_start().starts_with("Alpha"));
-    assert!((lines[0].y - lines[1].y).abs() < 0.01);
-    assert!(lines[0].x < lines[1].x);
+    assert!((lines[0].y() - lines[1].y()).abs() < 0.01);
+    assert!(lines[0].x() < lines[1].x());
     assert!(!lines[2].text.starts_with("1."));
+}
+
+#[tokio::test]
+async fn inside_generated_marker_segment_breaks_use_shared_whitespace_context() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 180pt 100pt; margin: 10pt }\
+         body, ul, li { margin: 0; padding: 0; font-size: 10pt; line-height: 10pt }\
+         ul { list-style-position: inside }\
+         li::marker { content: \"中文\\A\"; white-space: normal }\
+         </style><ul><li>english</li></ul>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec!["中文 english"]);
+}
+
+#[tokio::test]
+async fn inside_image_marker_keeps_following_space_extractable() {
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let document = Html::from_string(format!(
+        "<style>\
+         @page {{ size: 180pt 100pt; margin: 10pt }}\
+         body, ul, li {{ margin: 0; padding: 0; font-size: 10pt; line-height: 10pt }}\
+         ul {{ list-style-position: inside; list-style-image: url({png}) }}\
+         </style><ul><li>Item</li></ul>",
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages[0].images.len(), 1);
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec![" Item"]);
 }
 
 #[tokio::test]
@@ -1016,7 +1227,7 @@ async fn rtl_outside_list_markers_paint_on_inline_start_right_side() {
         .iter()
         .find(|line| line.text == "Alpha")
         .expect("expected content");
-    assert!(marker.x > content.x + rendered_line_advance(content));
+    assert!(marker.x() > content.x() + rendered_line_advance(content));
 }
 
 #[tokio::test]
@@ -1037,7 +1248,7 @@ async fn html_dir_rtl_outside_list_markers_match_css_direction_rtl() {
         .iter()
         .find(|line| line.text == "Alpha")
         .expect("expected content");
-    assert!(marker.x > content.x + rendered_line_advance(content));
+    assert!(marker.x() > content.x() + rendered_line_advance(content));
 }
 
 #[tokio::test]
@@ -1058,7 +1269,7 @@ async fn rtl_outside_image_markers_paint_on_inline_start_right_side() {
         .iter()
         .find(|line| line.text == "Alpha")
         .expect("expected content");
-    assert!(image.x > content.x + rendered_line_advance(content));
+    assert!(image.x() > content.x() + rendered_line_advance(content));
 }
 
 #[tokio::test]
@@ -1081,29 +1292,49 @@ async fn rtl_outside_list_marker_only_paints_on_first_wrapped_line() {
         .filter(|line| line.text != "\u{2022}")
         .collect::<Vec<_>>();
     assert!(content_lines.len() > 1);
-    let first_right = content_lines[0].x + rendered_line_advance(content_lines[0]);
-    let second_right = content_lines[1].x + rendered_line_advance(content_lines[1]);
+    let first_right = content_lines[0].x() + rendered_line_advance(content_lines[0]);
+    let second_right = content_lines[1].x() + rendered_line_advance(content_lines[1]);
     assert!((first_right - second_right).abs() < 0.01);
-    assert!(markers[0].x > content_lines[0].x + rendered_line_advance(content_lines[0]));
+    assert!(markers[0].x() > content_lines[0].x() + rendered_line_advance(content_lines[0]));
 }
 
 #[tokio::test]
-async fn rtl_inside_list_markers_start_first_line_before_generated_before() {
+async fn outside_list_marker_only_paints_on_first_fragmented_sequence_line() {
+    let document = Html::from_string(
+        "<style>@page { size: 140pt 44pt; margin: 10pt } body { margin: 0; font-size: 10pt; line-height: 10pt } ul { margin: 0; padding: 0 } li { margin: 0; width: 70pt }</style><ul><li>Alpha beta gamma delta epsilon zeta eta theta iota kappa</li></ul>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let markers = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines.iter())
+        .filter(|line| line.text == "\u{2022}")
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 1);
+    let pages_with_content = document
+        .pages
+        .iter()
+        .filter(|page| page.lines.iter().any(|line| line.text != "\u{2022}"))
+        .count();
+    assert!(pages_with_content > 1);
+}
+
+#[tokio::test]
+async fn rtl_inside_list_markers_share_first_line_with_generated_before() {
     let document = Html::from_string(
         "<style>@page { size: 180pt 100pt; margin: 10pt } body { margin: 0; font-size: 10pt; line-height: 12pt } ol { margin: 0; padding: 0; direction: rtl; list-style-position: inside } li { margin: 0 } li::before { content: \"Before\" }</style><ol><li>Alpha</li></ol>",
     )
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let text = document.pages[0]
-        .lines
-        .iter()
-        .map(|line| line.text.as_str())
-        .collect::<Vec<_>>()
-        .join("");
-    assert!(text.contains('1'));
-    assert!(text.contains("Before"));
-    assert!(text.find('1').unwrap() < text.find("Before").unwrap());
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains('1'), "{lines:?}");
+    assert!(lines[0].contains("Before"), "{lines:?}");
+    assert!(lines[0].contains("Alpha"), "{lines:?}");
 }
 
 #[tokio::test]
@@ -1133,8 +1364,8 @@ async fn marker_side_controls_mixed_direction_outside_marker_side() {
         .iter()
         .find(|line| line.text == "Right")
         .expect("expected second content");
-    assert!(left_marker.x < left_content.x);
-    assert!(right_marker.x > right_content.x + rendered_line_advance(right_content));
+    assert!(left_marker.x() < left_content.x());
+    assert!(right_marker.x() > right_content.x() + rendered_line_advance(right_content));
 
     let match_parent = Html::from_string(
         "<style>@page { size: 220pt 120pt; margin: 10pt } body, ul, li { margin: 0; padding: 0; font-size: 10pt; line-height: 12pt } ul { direction: ltr; marker-side: match-parent } li { list-style-type: decimal } .rtl { direction: rtl }</style><ul><li>Left</li><li class=\"rtl\">Right</li></ul>",
@@ -1151,7 +1382,7 @@ async fn marker_side_controls_mixed_direction_outside_marker_side() {
         .iter()
         .find(|line| line.text == "Right")
         .expect("expected second content");
-    assert!(second_marker.x < second_content.x);
+    assert!(second_marker.x() < second_content.x());
 }
 
 #[tokio::test]
@@ -1186,7 +1417,25 @@ async fn text_justify_inter_character_distributes_between_letters() {
         .filter(|line| line.text == "X")
         .collect::<Vec<_>>();
     assert_eq!(x_lines.len(), 2);
-    assert!(x_lines[1].x - x_lines[0].x > rendered_line_advance(x_lines[0]) + 50.0);
+    assert!(x_lines[1].x() - x_lines[0].x() > rendered_line_advance(x_lines[0]) + 50.0);
+}
+
+#[tokio::test]
+async fn text_justify_inter_character_preserves_arabic_joining_sequences() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 100pt; margin: 10pt } body { margin: 0 } p { margin: 0; width: 100pt; font-size: 10pt; line-height: 12pt; text-align: justify; text-align-last: justify; text-justify: inter-character }</style><p>سلام</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0]
+        .lines
+        .iter()
+        .filter(|line| line.text == "سلام" || line.text.chars().rev().collect::<String>() == "سلام")
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1);
+    assert!(rendered_line_advance(lines[0]) < 80.0);
 }
 
 #[tokio::test]
@@ -1214,12 +1463,12 @@ async fn supports_inline_display_list_item_markers() {
     let lines = &document.pages[0].lines;
     assert_eq!(lines[0].text, "1.");
     assert_eq!(lines[1].text.trim_start(), "Inline one");
-    assert!((lines[0].y - lines[1].y).abs() < 0.01);
-    assert!(lines[0].x < lines[1].x);
+    assert!((lines[0].y() - lines[1].y()).abs() < 0.01);
+    assert!(lines[0].x() < lines[1].x());
     assert_eq!(lines[2].text, "2.");
     assert_eq!(lines[3].text.trim_start(), "Inline two");
-    assert!((lines[2].y - lines[3].y).abs() < 0.01);
-    assert!(lines[2].x < lines[3].x);
+    assert!((lines[2].y() - lines[3].y()).abs() < 0.01);
+    assert!(lines[2].x() < lines[3].x());
 }
 
 #[tokio::test]
@@ -1320,12 +1569,12 @@ async fn marker_pseudo_element_content_overrides_automatic_marker() {
     let lines = &document.pages[0].lines;
     assert_eq!(lines[0].text, "a) ");
     assert_eq!(lines[1].text, "One");
-    assert!((lines[0].y - lines[1].y).abs() < 0.01);
-    assert!(lines[0].x < lines[1].x);
+    assert!((lines[0].y() - lines[1].y()).abs() < 0.01);
+    assert!(lines[0].x() < lines[1].x());
     assert_eq!(lines[2].text, "b) ");
     assert_eq!(lines[3].text, "Two");
-    assert!((lines[2].y - lines[3].y).abs() < 0.01);
-    assert!(lines[2].x < lines[3].x);
+    assert!((lines[2].y() - lines[3].y()).abs() < 0.01);
+    assert!(lines[2].x() < lines[3].x());
 }
 
 #[tokio::test]
@@ -1345,7 +1594,7 @@ async fn supports_outside_list_style_image_markers() {
         .iter()
         .find(|line| line.text.trim_start() == "Item")
         .unwrap();
-    assert!(image.x < item.x);
+    assert!(image.x() < item.x());
 }
 
 #[tokio::test]
@@ -1364,8 +1613,8 @@ async fn supports_inside_list_style_image_markers() {
         .iter()
         .find(|line| line.text.trim_start() == "Item")
         .unwrap();
-    assert!(image.x < item.x);
-    assert!((image.y - item.y).abs() < 20.0);
+    assert!(image.x() < item.x());
+    assert!((image.y() - item.y()).abs() < 20.0);
 }
 
 #[tokio::test]
@@ -1391,7 +1640,7 @@ async fn supports_text_alignment() {
     .render_async(&options).await
     .unwrap();
 
-    let aligned_offset = document.pages[0].lines[0].x - options.page_margins().left;
+    let aligned_offset = document.pages[0].lines[0].x() - options.page_margins().left;
     let expected_offset = 100.0 - rendered_line_advance(&document.pages[0].lines[0]);
     assert!(
         (aligned_offset - expected_offset).abs() < 0.01,
@@ -1408,7 +1657,7 @@ async fn supports_text_align_start_from_rtl_dir_attribute() {
     .render_async(&options).await
     .unwrap();
 
-    let aligned_offset = document.pages[0].lines[0].x - options.page_margins().left;
+    let aligned_offset = document.pages[0].lines[0].x() - options.page_margins().left;
     let expected_offset = 100.0 - rendered_line_advance(&document.pages[0].lines[0]);
     assert!(
         (aligned_offset - expected_offset).abs() < 0.01,
@@ -1464,7 +1713,7 @@ async fn inline_block_auto_width_uses_graph_tab_size_max_content() {
         .expect("expected tab-size:4 inline-block background");
 
     assert!(
-        four.width > two.width + 5.0,
+        four.width() > two.width() + 5.0,
         "auto inline-block max-content width should use graph tab advances, got {two:?} and {four:?}"
     );
 }
@@ -1493,12 +1742,12 @@ async fn hanging_punctuation_last_excludes_rtl_closing_punctuation_from_alignmen
         .iter()
         .find(|line| line.text == "MMMM")
         .unwrap();
-    let hang_measured_x = hang.x + rendered_line_advance(hang) - rendered_line_advance(reference);
+    let hang_measured_x = hang.x() + rendered_line_advance(hang) - rendered_line_advance(reference);
     assert!(
-        (hang_measured_x - reference.x).abs() < 0.5,
+        (hang_measured_x - reference.x()).abs() < 0.5,
         "expected hanging line and same-width reference to share measured alignment, got {} vs {}",
         hang_measured_x,
-        reference.x
+        reference.x()
     );
 }
 
@@ -1520,7 +1769,7 @@ async fn hanging_punctuation_first_places_opening_quote_outside_line_measure() {
     .unwrap();
 
     assert!(
-        hanging.pages[0].lines[0].x < normal.pages[0].lines[0].x - 1.0,
+        hanging.pages[0].lines[0].x() < normal.pages[0].lines[0].x() - 1.0,
         "expected first hanging quote to move into the line-start margin"
     );
 }
@@ -1557,20 +1806,20 @@ async fn hanging_punctuation_first_places_rtl_opening_punctuation_outside_line_m
     .unwrap();
 
     assert!(
-        hanging.pages[0].lines[0].x > normal.pages[0].lines[0].x + 1.0,
+        hanging.pages[0].lines[0].x() > normal.pages[0].lines[0].x() + 1.0,
         "expected RTL first hanging punctuation to move into the line-start margin: normal={}, hanging={}",
-        normal.pages[0].lines[0].x,
-        hanging.pages[0].lines[0].x,
+        normal.pages[0].lines[0].x(),
+        hanging.pages[0].lines[0].x(),
     );
     assert!(
-        (blocked.pages[0].lines[0].x - blocked_reference.pages[0].lines[0].x).abs() < 1.0,
+        (blocked.pages[0].lines[0].x() - blocked_reference.pages[0].lines[0].x()).abs() < 1.0,
         "expected nonzero RTL inline-start border to block first hanging punctuation: reference={}, blocked={}, blocked text={:?}",
-        blocked_reference.pages[0].lines[0].x,
-        blocked.pages[0].lines[0].x,
+        blocked_reference.pages[0].lines[0].x(),
+        blocked.pages[0].lines[0].x(),
         blocked.pages[0]
             .lines
             .iter()
-            .map(|line| (line.text.as_str(), line.x))
+            .map(|line| (line.text.as_str(), line.x()))
             .collect::<Vec<_>>()
     );
 }
@@ -1600,16 +1849,50 @@ async fn text_indent_offsets_rtl_inline_start_edge() {
     .unwrap();
 
     assert!(
-        negative_indent.pages[0].lines[0].x > normal.pages[0].lines[0].x + 1.0,
+        negative_indent.pages[0].lines[0].x() > normal.pages[0].lines[0].x() + 1.0,
         "expected negative RTL text-indent to move the inline-start edge outward: normal={}, indented={}",
-        normal.pages[0].lines[0].x,
-        negative_indent.pages[0].lines[0].x,
+        normal.pages[0].lines[0].x(),
+        negative_indent.pages[0].lines[0].x(),
     );
     assert!(
-        positive_indent.pages[0].lines[0].x < normal.pages[0].lines[0].x - 1.0,
+        positive_indent.pages[0].lines[0].x() < normal.pages[0].lines[0].x() - 1.0,
         "expected positive RTL text-indent to move the inline-start edge inward: normal={}, indented={}",
-        normal.pages[0].lines[0].x,
-        positive_indent.pages[0].lines[0].x,
+        normal.pages[0].lines[0].x(),
+        positive_indent.pages[0].lines[0].x(),
+    );
+}
+
+#[tokio::test]
+async fn text_indent_on_blank_rtl_left_aligned_line_does_not_indent_following_line() {
+    let document = Html::from_string(
+        "<style>@page{size:400pt 400pt;margin:0} body{margin:0}</style>\
+         <div style=\"text-align:left; direction:rtl; text-indent:300pt; line-height:100pt; width:200pt; background:blue\">\
+           <br>\
+           <div style=\"vertical-align:bottom; display:inline-block; width:100pt; height:100pt; background:hotpink\"></div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let blue = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("expected container background");
+    let hotpink = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 105, 180)))
+        .expect("expected inline-block background");
+
+    assert!(
+        (hotpink.x() - blue.x()).abs() < 0.01,
+        "hotpink square should align to the physical left edge of the blue square: blue={blue:?}, hotpink={hotpink:?}"
+    );
+    assert!(
+        (hotpink.y() - blue.y()).abs() < 0.01,
+        "hotpink square should align to the physical bottom edge of the blue square: blue={blue:?}, hotpink={hotpink:?}"
     );
 }
 
@@ -1631,10 +1914,10 @@ async fn fixed_width_rtl_block_ignores_overconstrained_left_margin() {
     .unwrap();
 
     assert!(
-        (both_margins.pages[0].lines[0].x - right_margin.pages[0].lines[0].x).abs() < 1.0,
+        (both_margins.pages[0].lines[0].x() - right_margin.pages[0].lines[0].x()).abs() < 1.0,
         "expected fixed-width RTL block to ignore over-constrained left margin: both={}, right={}",
-        both_margins.pages[0].lines[0].x,
-        right_margin.pages[0].lines[0].x,
+        both_margins.pages[0].lines[0].x(),
+        right_margin.pages[0].lines[0].x(),
     );
 }
 
@@ -1656,10 +1939,10 @@ async fn hanging_punctuation_force_end_excludes_terminal_stop_from_alignment() {
     .unwrap();
 
     assert!(
-        hanging.pages[0].lines[0].x > normal.pages[0].lines[0].x + 1.0,
+        hanging.pages[0].lines[0].x() > normal.pages[0].lines[0].x() + 1.0,
         "expected force-end punctuation to hang past the right line edge: normal={}, hanging={}",
-        normal.pages[0].lines[0].x,
-        hanging.pages[0].lines[0].x,
+        normal.pages[0].lines[0].x(),
+        hanging.pages[0].lines[0].x(),
     );
 }
 
@@ -1689,17 +1972,17 @@ async fn hanging_punctuation_last_is_blocked_by_inline_end_border() {
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("expected inline-end border");
     assert!(
-        (border.x - lines[1].x).abs() < 0.5,
+        (border.x() - lines[1].x()).abs() < 0.5,
         "expected inline-end border to occupy the ordinary rtl edge, got border {} vs reference {}",
-        border.x,
-        lines[1].x
+        border.x(),
+        lines[1].x()
     );
     assert!(
-        lines[0].x >= border.x + border.width - 0.5,
+        lines[0].x() >= border.x() + border.width() - 0.5,
         "expected blocked punctuation text to start after its inline-end border, got text {} border {}..{}",
-        lines[0].x,
-        border.x,
-        border.x + border.width
+        lines[0].x(),
+        border.x(),
+        border.x() + border.width()
     );
 }
 
@@ -1754,19 +2037,19 @@ async fn wpt_hanging_punctuation_allow_end_inline_boundaries() {
     let mut rendered_lines = document.pages[0].lines.clone();
     rendered_lines.sort_by(|left, right| {
         right
-            .y
-            .total_cmp(&left.y)
-            .then_with(|| left.x.total_cmp(&right.x))
+            .y()
+            .total_cmp(&left.y())
+            .then_with(|| left.x().total_cmp(&right.x()))
     });
     let mut lines: Vec<(f32, String)> = Vec::new();
     for line in &rendered_lines {
         if let Some((baseline, text)) = lines.last_mut()
-            && (line.y - *baseline).abs() < 0.01
+            && (line.y() - *baseline).abs() < 0.01
         {
             text.push_str(&line.text);
             continue;
         }
-        lines.push((line.y, line.text.clone()));
+        lines.push((line.y(), line.text.clone()));
     }
     let lines = lines
         .iter()
@@ -1812,12 +2095,12 @@ async fn wpt_hanging_punctuation_first_and_last_match_negative_margin_reference(
     let target_lines = target.pages[0]
         .lines
         .iter()
-        .map(|line| (line.text.as_str(), line.x, rendered_line_advance(line)))
+        .map(|line| (line.text.as_str(), line.x(), rendered_line_advance(line)))
         .collect::<Vec<_>>();
     let reference_lines = reference.pages[0]
         .lines
         .iter()
-        .map(|line| (line.text.as_str(), line.x, rendered_line_advance(line)))
+        .map(|line| (line.text.as_str(), line.x(), rendered_line_advance(line)))
         .collect::<Vec<_>>();
     assert_eq!(
         target_lines
@@ -1865,7 +2148,7 @@ async fn wpt_hanging_punctuation_inline_background_includes_hung_stop() {
         .collect::<Vec<_>>();
     assert_eq!(green_rects.len(), 3, "{green_rects:?}");
     assert!(
-        green_rects[1].width > green_rects[0].width,
+        green_rects[1].width() > green_rects[0].width(),
         "second line background should include the hung punctuation: {green_rects:?}"
     );
 }
@@ -1901,11 +2184,11 @@ async fn wpt_hanging_punctuation_uses_punctuation_font_size() {
     {
         assert_eq!(target_line.text, reference_line.text);
         assert!(
-            (target_line.x - reference_line.x).abs() < 1.0,
+            (target_line.x() - reference_line.x()).abs() < 1.0,
             "{} target x {}, reference x {}",
             target_line.text,
-            target_line.x,
-            reference_line.x
+            target_line.x(),
+            reference_line.x()
         );
         assert!(
             (rendered_line_advance(target_line) - rendered_line_advance(reference_line)).abs()
@@ -1938,8 +2221,8 @@ async fn supports_text_align_justify() {
         .unwrap();
 
     assert!(rendered_line_advance(first) > 40.0);
-    assert!((three.x - first.x).abs() < 0.5);
-    assert!(three.y < first.y);
+    assert!((three.x() - first.x()).abs() < 0.5);
+    assert!(three.y() < first.y());
 }
 
 #[tokio::test]
@@ -1989,7 +2272,7 @@ async fn text_justify_ignores_pre_wrap_trailing_space_ltr() {
     .unwrap();
 
     let mut groups = lines_grouped_by_y(&document.pages[0].lines);
-    groups.sort_by(|left, right| right[0].y.total_cmp(&left[0].y));
+    groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(groups.len(), 2, "{groups:?}");
     assert_eq!(
         groups[0]
@@ -2024,7 +2307,7 @@ async fn text_justify_ignores_pre_wrap_trailing_space_rtl() {
     .unwrap();
 
     let mut groups = lines_grouped_by_y(&document.pages[0].lines);
-    groups.sort_by(|left, right| right[0].y.total_cmp(&left[0].y));
+    groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(groups.len(), 2, "{groups:?}");
     assert_eq!(
         groups[0]
@@ -2059,7 +2342,7 @@ async fn wpt_text_justify_hangs_pre_wrap_trailing_space_inside_split_fragment() 
     .unwrap();
 
     let mut groups = lines_grouped_by_y(&document.pages[0].lines);
-    groups.sort_by(|left, right| right[0].y.total_cmp(&left[0].y));
+    groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(groups.len(), 2, "{groups:?}");
     let first_span = rendered_fragment_group_span(&groups[0]);
     assert!(
@@ -2102,7 +2385,7 @@ async fn wpt_text_justify_inter_word_expands_unicode_word_separators() {
     .unwrap();
 
     let mut groups = visual_line_groups(&document.pages[0].lines);
-    groups.sort_by(|left, right| right[0].y.total_cmp(&left[0].y));
+    groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(groups.len(), separators.len() * 2, "{groups:?}");
     for (index, first_line) in groups.iter().step_by(2).enumerate() {
         let span = rendered_fragment_group_span(first_line);
@@ -2169,14 +2452,14 @@ async fn supports_text_align_last_justify_over_center() {
     .unwrap();
 
     let mut line_groups = visual_line_groups(&document.pages[0].lines);
-    line_groups.sort_by(|left, right| right[0].y.total_cmp(&left[0].y));
+    line_groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(line_groups.len(), 2);
     let first_line = &line_groups[0];
     let last_line = &line_groups[1];
     assert_eq!(first_line.len(), 1);
     assert_eq!(last_line.len(), 1);
 
-    let first_offset = first_line[0].x - 10.0;
+    let first_offset = first_line[0].x() - 10.0;
     let last_span = rendered_fragment_group_span(last_line);
 
     assert!(
@@ -2280,11 +2563,11 @@ async fn wpt_text_align_justify_rtl_uses_start_on_last_line() {
     let last = &groups[2];
     let last_right = last
         .iter()
-        .map(|line| line.x + rendered_line_advance(line))
+        .map(|line| line.x() + rendered_line_advance(line))
         .fold(f32::NEG_INFINITY, f32::max);
     let previous_right = groups[0]
         .iter()
-        .map(|line| line.x + rendered_line_advance(line))
+        .map(|line| line.x() + rendered_line_advance(line))
         .fold(f32::NEG_INFINITY, f32::max);
     assert!(
         (last_right - previous_right).abs() < 1.0,
@@ -2401,13 +2684,85 @@ async fn justified_mixed_inline_shifts_atom_and_later_text() {
         .expect("expected mixed inline text group");
     assert_eq!(group.len(), 2, "{group:?}");
     let mut ordered = group.clone();
-    ordered.sort_by(|left, right| left.x.total_cmp(&right.x));
+    ordered.sort_by(|left, right| left.x().total_cmp(&right.x()));
     let first = ordered[0];
     let second = ordered[1];
     assert!(
-        second.x - first.x > 90.0 && rendered_fragment_group_span(&group) > 125.0,
+        second.x() - first.x() > 90.0 && rendered_fragment_group_span(&group) > 125.0,
         "justification should shift the atom and later text across the line: {group:?}"
     );
+}
+
+#[tokio::test]
+async fn justified_text_and_styled_spans_share_inline_paint_adjustment() {
+    let document = Html::from_string(
+        "<style>@page { size: 260pt 140pt; margin: 10pt } body { margin: 0 }\
+         .test { margin: 0; width: 170pt; font: 12pt/14pt sans-serif; text-align: justify; text-align-last: justify }</style>\
+         <p class=\"test\">Alpha Beta</p><p class=\"test\"><span>Alpha</span><span> </span><span>Beta</span></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0]
+        .lines
+        .iter()
+        .filter(|line| line.text == "Alpha Beta")
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let first_span = {
+        let (left, right) = rendered_line_visual_bounds(lines[0]);
+        right - left
+    };
+    let second_span = {
+        let (left, right) = rendered_line_visual_bounds(lines[1]);
+        right - left
+    };
+    assert!(first_span > 160.0, "{first_span}");
+    assert!(
+        (first_span - second_span).abs() < 0.5,
+        "{first_span} vs {second_span}"
+    );
+}
+
+#[tokio::test]
+async fn generated_inline_text_uses_shared_justified_paint_adjustment() {
+    let document = Html::from_string(
+        "<style>@page { size: 260pt 120pt; margin: 10pt } body { margin: 0 }\
+         .test { margin: 0; width: 170pt; font: 12pt/14pt sans-serif; text-align: justify; text-align-last: justify }\
+         .test::before { content: \"Alpha Beta\" }</style><p class=\"test\"></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "Alpha Beta")
+        .expect("generated inline text should paint");
+    let (left, right) = rendered_line_visual_bounds(line);
+    assert!(right - left > 160.0, "{line:?}");
+}
+
+#[tokio::test]
+async fn page_margin_text_uses_shared_justified_paint_adjustment() {
+    let document = Html::from_string(
+        "<style>@page { size: 260pt 120pt; margin: 20pt;\
+           @top-left { content: \"Alpha Beta\"; width: 170pt; font: 12pt/14pt sans-serif; text-align: justify; text-align-last: justify } }\
+         body { margin: 0 }</style><p></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "Alpha Beta")
+        .expect("page-margin generated inline text should paint");
+    let (left, right) = rendered_line_visual_bounds(line);
+    assert!(right - left > 160.0, "{line:?}");
 }
 
 #[tokio::test]
@@ -2454,12 +2809,12 @@ async fn wpt_text_autospace_inserts_ideograph_alpha_spacing() {
     let off_lines = document.pages[0]
         .lines
         .iter()
-        .filter(|line| line.y > 90.0)
+        .filter(|line| line.y() > 90.0)
         .collect::<Vec<_>>();
     let on_lines = document.pages[0]
         .lines
         .iter()
-        .filter(|line| line.y <= 90.0)
+        .filter(|line| line.y() <= 90.0)
         .collect::<Vec<_>>();
     let off = rendered_fragment_group_span(&off_lines);
     let on = rendered_fragment_group_span(&on_lines);
@@ -2488,7 +2843,7 @@ async fn wpt_text_autospace_does_not_treat_punctuation_as_normal_alpha_spacing()
     .unwrap();
 
     let mut groups = lines_grouped_by_y(&document.pages[0].lines);
-    groups.sort_by(|left, right| right[0].y.total_cmp(&left[0].y));
+    groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(groups.len(), 2);
     let off = rendered_fragment_group_span(&groups[0]);
     let on = rendered_fragment_group_span(&groups[1]);
@@ -2555,11 +2910,11 @@ async fn letter_spacing_crosses_text_empty_inline_boundaries() {
 fn rendered_fragment_group_span(lines: &[&quire::RenderedLine]) -> f32 {
     let left = lines
         .iter()
-        .map(|line| line.x)
+        .map(|line| line.x())
         .fold(f32::INFINITY, f32::min);
     let right = lines
         .iter()
-        .map(|line| line.x + rendered_line_advance(line))
+        .map(|line| line.x() + rendered_line_advance(line))
         .fold(f32::NEG_INFINITY, f32::max);
     right - left
 }
@@ -2569,7 +2924,7 @@ fn lines_grouped_by_y(lines: &[quire::RenderedLine]) -> Vec<Vec<&quire::Rendered
     for line in lines {
         if let Some(group) = groups
             .iter_mut()
-            .find(|group| (group[0].y - line.y).abs() < 0.01)
+            .find(|group| (group[0].y() - line.y()).abs() < 0.01)
         {
             group.push(line);
         } else {
@@ -2584,7 +2939,7 @@ fn grouped_line_texts(page: &quire::Page) -> Vec<String> {
     for line in &page.lines {
         if let Some(group) = groups
             .iter_mut()
-            .find(|group| (group[0].y - line.y).abs() < 4.0)
+            .find(|group| (group[0].y() - line.y()).abs() < 4.0)
         {
             group.push(line);
         } else {
@@ -2594,7 +2949,7 @@ fn grouped_line_texts(page: &quire::Page) -> Vec<String> {
     groups
         .into_iter()
         .map(|mut group| {
-            group.sort_by(|left, right| left.x.total_cmp(&right.x));
+            group.sort_by(|left, right| left.x().total_cmp(&right.x()));
             group
                 .into_iter()
                 .map(|line| line.text.as_str())
@@ -2607,7 +2962,7 @@ fn rendered_line_visual_bounds(line: &quire::RenderedLine) -> (f32, f32) {
     let mut left = f32::INFINITY;
     let mut right = f32::NEG_INFINITY;
     for run in &line.runs {
-        let mut pen_x = line.x + run.x_offset;
+        let mut pen_x = line.x() + run.x_offset;
         if let Some(glyphs) = &run.glyphs {
             for glyph in glyphs {
                 let start = pen_x + glyph.x_offset;
@@ -2621,7 +2976,7 @@ fn rendered_line_visual_bounds(line: &quire::RenderedLine) -> (f32, f32) {
     if left.is_finite() && right.is_finite() {
         (left, right)
     } else {
-        (line.x, line.x + rendered_line_advance(line))
+        (line.x(), line.x() + rendered_line_advance(line))
     }
 }
 
@@ -2630,7 +2985,7 @@ fn visual_line_groups(lines: &[quire::RenderedLine]) -> Vec<Vec<&quire::Rendered
     for line in lines {
         if let Some(group) = groups
             .iter_mut()
-            .find(|group| (group[0].y - line.y).abs() < 0.01)
+            .find(|group| (group[0].y() - line.y()).abs() < 0.01)
         {
             group.push(line);
         } else {
@@ -2651,8 +3006,8 @@ async fn supports_first_line_text_indent_lengths() {
     let lines = &positive.pages[0].lines;
 
     assert!(lines.len() > 1);
-    assert!((lines[0].x - (options.page_margins.left + 10.0)).abs() < 0.01);
-    assert!((lines[1].x - options.page_margins.left).abs() < 0.01);
+    assert!((lines[0].x() - (options.page_margins.left + 10.0)).abs() < 0.01);
+    assert!((lines[1].x() - options.page_margins.left).abs() < 0.01);
 
     let negative = Html::from_string(
         "<style>body { margin: 0; font-size: 10pt; line-height: 10pt } p { margin: 0; width: 40pt; text-indent: -10pt }</style><p>aa aa aa aa aa aa aa aa</p>",
@@ -2662,8 +3017,308 @@ async fn supports_first_line_text_indent_lengths() {
     let lines = &negative.pages[0].lines;
 
     assert!(lines.len() > 1);
-    assert!((lines[0].x - (options.page_margins.left - 10.0)).abs() < 0.01);
-    assert!((lines[1].x - options.page_margins.left).abs() < 0.01);
+    assert!((lines[0].x() - (options.page_margins.left - 10.0)).abs() < 0.01);
+    assert!((lines[1].x() - options.page_margins.left).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn vertical_writing_text_indent_moves_logical_inline_start() {
+    let options = RenderOptions::default();
+    let normal = Html::from_string(
+        "<style>body { margin: 0 } p { margin: 0; writing-mode: vertical-rl; width: 50pt; height: 50pt; font-size: 10pt; line-height: 12pt }</style><p>A</p>",
+    )
+    .render_async(&options)
+    .await
+    .unwrap();
+    let indented = Html::from_string(
+        "<style>body { margin: 0 } p { margin: 0; writing-mode: vertical-rl; width: 50pt; height: 50pt; font-size: 10pt; line-height: 12pt; text-indent: 10pt }</style><p>A</p>",
+    )
+    .render_async(&options)
+    .await
+    .unwrap();
+
+    let normal_line = normal.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "A")
+        .expect("normal vertical line should render");
+    let indented_line = indented.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "A")
+        .expect("indented vertical line should render");
+
+    assert!(
+        indented_line.y() < normal_line.y() - 9.0,
+        "vertical text-indent should move down the inline axis: normal={normal_line:?}, indented={indented_line:?}"
+    );
+}
+
+#[tokio::test]
+async fn vertical_writing_mixed_text_emits_writing_mode_aware_runs() {
+    let document = Html::from_string(
+        "<style>body { margin: 0 } p { margin: 0; writing-mode: vertical-rl; width: 60pt; height: 80pt; font-size: 10pt; line-height: 12pt }</style><p>中文AB</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let runs = document.pages[0]
+        .lines
+        .iter()
+        .flat_map(|line| line.runs.iter())
+        .collect::<Vec<_>>();
+
+    assert!(runs.iter().any(|run| {
+        run.text.contains('中') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+    }));
+    assert!(runs.iter().any(|run| {
+        run.text.contains("AB") && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+    }));
+}
+
+#[tokio::test]
+async fn vertical_mixed_text_uses_unicode_vertical_orientation() {
+    let document = Html::from_string(
+        "<style>body { margin: 0 } p { margin: 0; writing-mode: vertical-rl; width: 60pt; height: 90pt; font-size: 10pt; line-height: 12pt }</style><p>a§、〈</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let runs = document.pages[0]
+        .lines
+        .iter()
+        .flat_map(|line| line.runs.iter())
+        .collect::<Vec<_>>();
+
+    assert!(runs.iter().any(|run| {
+        run.text.contains('a') && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+    }));
+    assert!(runs.iter().any(|run| {
+        run.text.contains('§') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+    }));
+    assert!(runs.iter().any(|run| {
+        run.text.contains('、') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+    }));
+    assert!(runs.iter().any(|run| {
+        run.text.contains('〈') && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+    }));
+}
+
+#[tokio::test]
+async fn vertical_text_orientation_upright_paints_latin_upright() {
+    let document = Html::from_string(
+        "<style>body { margin: 0 } p { margin: 0; writing-mode: vertical-rl; text-orientation: upright; width: 60pt; height: 80pt; font-size: 10pt; line-height: 12pt }</style><p>AB中文</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let runs = document.pages[0]
+        .lines
+        .iter()
+        .flat_map(|line| line.runs.iter())
+        .collect::<Vec<_>>();
+
+    assert!(runs.iter().any(|run| {
+        run.text.contains('A') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+    }));
+    assert!(runs.iter().any(|run| {
+        run.text.contains('B') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+    }));
+    assert!(runs.iter().any(|run| {
+        run.text.contains('中') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+    }));
+}
+
+#[tokio::test]
+async fn vertical_text_orientation_sideways_rotates_cjk_and_latin() {
+    let document = Html::from_string(
+        "<style>body { margin: 0 } p { margin: 0; writing-mode: vertical-rl; text-orientation: sideways; width: 60pt; height: 80pt; font-size: 10pt; line-height: 12pt }</style><p>中文AB</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let runs = document.pages[0]
+        .lines
+        .iter()
+        .flat_map(|line| line.runs.iter())
+        .collect::<Vec<_>>();
+
+    assert!(runs.iter().any(|run| {
+        run.text.contains("中文") && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+    }));
+    assert!(runs.iter().any(|run| {
+        run.text.contains("AB") && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+    }));
+    assert!(
+        runs.iter()
+            .filter(|run| !run.text.is_empty())
+            .all(|run| run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW)
+    );
+}
+
+#[tokio::test]
+async fn page_margin_text_orientation_uses_shared_vertical_placement() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 20pt; @top-left { content: \"AB\"; writing-mode: vertical-rl; text-orientation: upright; font-size: 10pt } } body { margin: 0 }</style>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .lines
+            .iter()
+            .flat_map(|line| line.runs.iter())
+            .any(|run| {
+                run.text.contains('A') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+            })
+    );
+    assert!(
+        document.pages[0]
+            .lines
+            .iter()
+            .flat_map(|line| line.runs.iter())
+            .any(|run| {
+                run.text.contains('B') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+            })
+    );
+}
+
+#[tokio::test]
+async fn page_margin_mixed_text_uses_unicode_vertical_orientation() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 20pt; @top-left { content: \"a§\"; writing-mode: vertical-rl; font-size: 10pt } } body { margin: 0 }</style>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let runs = document.pages[0]
+        .lines
+        .iter()
+        .flat_map(|line| line.runs.iter())
+        .collect::<Vec<_>>();
+
+    assert!(runs.iter().any(|run| {
+        run.text.contains('a') && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+    }));
+    assert!(runs.iter().any(|run| {
+        run.text.contains('§') && run.text_matrix == quire::RenderedTextMatrix::IDENTITY
+    }));
+}
+
+#[tokio::test]
+async fn inline_block_text_orientation_uses_shared_vertical_placement() {
+    let document = Html::from_string(
+        "<style>body { margin: 0 } span { display: inline-block; writing-mode: vertical-rl; text-orientation: sideways; width: 50pt; height: 80pt; font-size: 10pt; line-height: 12pt }</style><span>中文</span>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .lines
+            .iter()
+            .flat_map(|line| line.runs.iter())
+            .any(|run| {
+                run.text.contains("中文") && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
+            })
+    );
+}
+
+#[tokio::test]
+async fn vertical_inline_forced_break_stacks_atomic_lines_in_block_axis() {
+    let document = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 10pt } body { margin: 0 }\
+         div { writing-mode: vertical-rl; line-height: 0; width: 30pt; height: 45pt }\
+         span { display: inline-block; width: 15pt; height: 45pt }\
+         </style><div><span style=\"background:green\"></span><br><span style=\"background:blue\"></span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let rect = |color| {
+        document.pages[0]
+            .rects
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap()
+    };
+    let green = rect(Color::new(0, 128, 0));
+    let blue = rect(Color::new(0, 0, 255));
+
+    assert!(
+        (green.y() - blue.y()).abs() < 0.01,
+        "forced-break vertical inline-block lines should share inline-start: green={green:?}, blue={blue:?}"
+    );
+    assert!(
+        blue.x() + blue.width() <= green.x() + 0.01,
+        "vertical-rl forced break should stack the next line to the physical left: green={green:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn inline_block_text_uses_sequence_for_forced_empty_lines() {
+    let document = Html::from_string(
+        "<style>body { margin: 0; font-size: 10pt; line-height: 12pt } span { display: inline-block; white-space: pre-line; width: 80pt }</style><span>alpha\n\nbeta</span>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let alpha = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "alpha")
+        .expect("inline-block first line should render");
+    let beta = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "beta")
+        .expect("inline-block second visible line should render");
+
+    assert!(
+        alpha.y() > beta.y() + 20.0,
+        "forced empty line should separate inline-block text lines: alpha={alpha:?}, beta={beta:?}"
+    );
+}
+
+#[tokio::test]
+async fn inline_block_text_atom_uses_sequence_for_zwsp_and_soft_hyphen() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 90pt 140pt; margin: 10pt }\
+         body { margin: 0; font-family: monospace; font-size: 10pt; line-height: 10pt }\
+         span { display: inline-block; width: 22pt; font: inherit; line-height: 10pt }\
+         </style><span>abc&#x200b;def<br>hyphen&shy;ation</span>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0]
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(lines.contains(&"abc"), "{lines:?}");
+    assert!(lines.contains(&"def"), "{lines:?}");
+    assert!(lines.iter().any(|line| line.ends_with('-')), "{lines:?}");
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line.replace('-', ""))
+            .collect::<String>(),
+        "abcdefhyphenation"
+    );
 }
 
 #[tokio::test]
@@ -2690,11 +3345,11 @@ async fn text_indent_each_line_applies_after_forced_breaks_only() {
     assert_eq!(lines[2].text.trim(), "red");
     assert_eq!(lines[3].text.trim(), "blue");
     assert_eq!(lines[4].text.trim(), "green");
-    assert!((lines[0].x - (options.page_margins.left + 12.0)).abs() < 0.01);
-    assert!((lines[1].x - options.page_margins.left).abs() < 0.01);
-    assert!((lines[2].x - (options.page_margins.left + 12.0)).abs() < 0.01);
-    assert!((lines[3].x - options.page_margins.left).abs() < 0.01);
-    assert!((lines[4].x - options.page_margins.left).abs() < 0.01);
+    assert!((lines[0].x() - (options.page_margins.left + 12.0)).abs() < 0.01);
+    assert!((lines[1].x() - options.page_margins.left).abs() < 0.01);
+    assert!((lines[2].x() - (options.page_margins.left + 12.0)).abs() < 0.01);
+    assert!((lines[3].x() - options.page_margins.left).abs() < 0.01);
+    assert!((lines[4].x() - options.page_margins.left).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -2840,13 +3495,13 @@ async fn renders_styled_bidi_inline_text_in_visual_order() {
     .await
     .unwrap();
 
-    let y = document.pages[0].lines[0].y;
+    let y = document.pages[0].lines[0].y();
     let mut line = document.pages[0]
         .lines
         .iter()
-        .filter(|line| (line.y - y).abs() < 0.1)
+        .filter(|line| (line.y() - y).abs() < 0.1)
         .collect::<Vec<_>>();
-    line.sort_by(|left, right| left.x.total_cmp(&right.x));
+    line.sort_by(|left, right| left.x().total_cmp(&right.x()));
     let text = line
         .into_iter()
         .map(|line| line.text.as_str())
@@ -2881,8 +3536,8 @@ async fn mixed_inline_ltr_atomic_child_inside_rtl_parent_uses_parent_base_direct
         .find(|line| line.text.trim() == "גבא")
         .expect("expected inline-start Hebrew run");
 
-    assert!(left_hebrew.x < atom.x);
-    assert!(atom.x < right_hebrew.x);
+    assert!(left_hebrew.x() < atom.x());
+    assert!(atom.x() < right_hebrew.x());
 }
 
 #[tokio::test]
@@ -2911,8 +3566,8 @@ async fn mixed_inline_rtl_atomic_child_inside_ltr_parent_uses_parent_base_direct
         .find(|line| line.text.trim() == "def")
         .expect("expected inline-end Latin run");
 
-    assert!(left_latin.x < atom.x);
-    assert!(atom.x < right_latin.x);
+    assert!(left_latin.x() < atom.x());
+    assert!(atom.x() < right_latin.x());
 }
 
 #[tokio::test]
@@ -2941,12 +3596,12 @@ async fn unicode_bidi_plaintext_aligns_lines_by_first_strong_character() {
     let latin_x = lines
         .iter()
         .filter(|line| line.text.contains("français"))
-        .map(|line| line.x)
+        .map(|line| line.x())
         .collect::<Vec<_>>();
     let persian_x = lines
         .iter()
         .filter(|line| line.text.contains("فارسی") || line.text.contains("یسراف"))
-        .map(|line| line.x)
+        .map(|line| line.x())
         .collect::<Vec<_>>();
 
     assert!(latin_x.iter().all(|x| (*x - latin_x[0]).abs() < 0.1));
@@ -2988,7 +3643,7 @@ async fn html_dir_auto_sets_direction_from_first_strong_descendant_text() {
         .find(|line| line.text == "גבא")
         .expect("expected rtl visual line");
 
-    assert!(hebrew.x > latin.x + 120.0);
+    assert!(hebrew.x() > latin.x() + 120.0);
 }
 
 #[tokio::test]
@@ -3008,7 +3663,7 @@ async fn author_direction_overrides_html_dir_auto_directionality() {
         .find(|line| line.text == "גבא")
         .expect("expected visual rtl text");
 
-    assert!(line.x < RenderOptions::default().page_margins.left + 20.0);
+    assert!(line.x() < RenderOptions::default().page_margins.left + 20.0);
 }
 
 #[tokio::test]
@@ -3063,7 +3718,7 @@ async fn supports_white_space_pre_wrap_newlines() {
 
     assert_eq!(document.pages[0].lines[0].text, "One");
     assert_eq!(document.pages[0].lines[1].text, "Two");
-    assert!(document.pages[0].lines[1].y < document.pages[0].lines[0].y);
+    assert!(document.pages[0].lines[1].y() < document.pages[0].lines[0].y());
 }
 
 #[tokio::test]
@@ -3210,6 +3865,25 @@ async fn supports_white_space_pre_line() {
 }
 
 #[tokio::test]
+async fn pre_line_consecutive_forced_breaks_keep_empty_sequence_line() {
+    let document = Html::from_string(
+        "<style>p { margin: 0; white-space: pre-line; font-size: 10pt; line-height: 10pt }</style>\
+         <p>A\n\nB</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec!["A", "B"]);
+    let y_gap = document.pages[0].lines[0].y() - document.pages[0].lines[1].y();
+    assert!(
+        (y_gap - 20.0).abs() < 0.01,
+        "expected an empty sequence line between A and B, got y gap {y_gap}"
+    );
+}
+
+#[tokio::test]
 async fn supports_white_space_break_spaces() {
     let document = Html::from_string(
         "<style>@page { size: 100pt 120pt; margin: 10pt } p { white-space: break-spaces; margin: 0; width: 14pt; font-size: 10pt; line-height: 10pt }</style><p>A   B</p>",
@@ -3219,6 +3893,148 @@ async fn supports_white_space_break_spaces() {
 
     assert_eq!(document.pages[0].lines[0].text, "A  ");
     assert_eq!(document.pages[0].lines[1].text, " B");
+}
+
+#[tokio::test]
+async fn normal_white_space_transforms_segment_breaks_by_context() {
+    let document = Html::from_string(
+        "<style>body, p { margin: 0; font-size: 10pt; line-height: 10pt }</style>\
+         <p>中文\n中文</p><p>中文\nenglish</p><p>word\nword</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec!["中文中文", "中文 english", "word word"]);
+}
+
+#[tokio::test]
+async fn white_space_collapses_across_inline_generated_and_padding_edges() {
+    let document = Html::from_string(
+        "<style>\
+         body, p { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .generated::before { content: \"  \" }\
+         .padded { padding-left: 1pt }\
+         </style>\
+         <p>A <span></span>  B</p>\
+         <p>A<span class=\"generated\"></span>  B</p>\
+         <p>A <span class=\"padded\">  B</span></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec!["A B", "A B", "A B"]);
+}
+
+#[tokio::test]
+async fn atom_adjacent_collapsed_spaces_are_preserved_in_rendered_text() {
+    let document = Html::from_string(
+        "<style>\
+         body, p { margin: 0; font-size: 10pt; line-height: 10pt }\
+         span { display: inline-block; width: 5pt; height: 5pt }\
+         </style>\
+         <p>A\n<span></span> B</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec!["A  B"]);
+}
+
+#[tokio::test]
+async fn atom_adjacent_preserved_spaces_are_preserved_in_rendered_text() {
+    let document = Html::from_string(
+        "<style>\
+         body, p { margin: 0; font: 10pt/10pt monospace }\
+         p { white-space: pre-wrap }\
+         span { display: inline-block; width: 5pt; height: 5pt }\
+         </style>\
+         <p>A <span></span> B</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec!["A  B"]);
+}
+
+#[tokio::test]
+async fn generated_inline_content_uses_shared_css_text_edge_processing() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 90pt 120pt; margin: 10pt }\
+         body, p { margin: 0; font-family: monospace; font-size: 10pt; line-height: 10pt }\
+         p { width: 100pt; overflow-wrap: anywhere }\
+         p::before { content: \"A  \" }\
+         p::after { content: \"\\200B C\" }\
+         </style><p>BBBB</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines.concat(), "A BBBBC");
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.chars().any(|character| character == '\u{200b}')),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn inside_marker_generated_content_collapses_whitespace_on_first_line() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 160pt 100pt; margin: 10pt }\
+         body, ol, li { margin: 0; padding: 0; font-size: 10pt; line-height: 10pt }\
+         ol { padding-left: 20pt; list-style-position: inside }\
+         li::marker { content: \"# \" }\
+         li::before { content: \"  before \" }\
+         </style><ol><li>  text</li></ol>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec!["# before text"]);
+}
+
+#[tokio::test]
+async fn pre_line_preserves_segment_breaks_across_inline_boundaries() {
+    let document = Html::from_string(
+        "<style>p { margin: 0; white-space: pre-line; font-size: 10pt; line-height: 10pt }</style>\
+         <p>A   <span>B\nC</span></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec!["A B", "C"]);
+}
+
+#[tokio::test]
+async fn pre_wrap_final_segment_break_trims_across_inline_boundary() {
+    let document = Html::from_string(
+        "<style>p { margin: 0; white-space: pre-wrap; font-size: 10pt; line-height: 10pt }</style>\
+         <p>One<span>\n</span></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec!["One"]);
 }
 
 #[tokio::test]
@@ -3301,9 +4117,84 @@ async fn word_break_keep_all_min_content_suppresses_letter_unit_breaks() {
         lines,
         [
             "中文english中文english".to_string(),
-            "中文english中文，english中文english".to_string()
+            "中文english中文，".to_string(),
+            "english中文english".to_string()
         ]
     );
+}
+
+#[tokio::test]
+async fn transparent_inline_padding_edge_allows_cjk_latin_wrap() {
+    let document = Html::from_string(
+        "<style>@page { size: 100pt 120pt; margin: 10pt }\
+         p { margin: 0; width: 40pt; font-size: 10pt; line-height: 10pt }\
+         span { padding-left: 1pt; background: #ddd }\
+         </style><p>中文<span>english</span></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0]
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(lines, ["中文", "english"]);
+}
+
+#[tokio::test]
+async fn transparent_inline_padding_edge_preserves_wbr_opportunity() {
+    let document = Html::from_string(
+        "<style>@page { size: 90pt 120pt; margin: 10pt }\
+         p { margin: 0; width: 20pt; font-size: 10pt; line-height: 10pt }\
+         span { padding-left: 1pt }\
+         </style><p>abc<wbr><span>def</span></p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0]
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(lines, ["abc", "def"]);
+}
+
+#[tokio::test]
+async fn generated_zero_width_space_wraps_without_visible_text() {
+    let document = Html::from_string(
+        "<style>@page { size: 90pt 120pt; margin: 10pt }\
+         p { margin: 0; width: 21pt; font-family: monospace; font-size: 10pt; line-height: 10pt }\
+         span::before { content: \"\\200B\" }\
+         </style><p>abc<span></span>def</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec!["abc", "def"]);
+}
+
+#[tokio::test]
+async fn pre_wrap_styled_boundary_trailing_spaces_hang_at_graph_break() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt }\
+         p { margin: 0; width: 15pt; white-space: pre-wrap; font-family: monospace; font-size: 10pt; line-height: 10pt }\
+         span { background: #ddd }\
+         </style><p>AA<span>   </span>BB</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines, vec!["AA", "BB"]);
 }
 
 #[tokio::test]
@@ -3380,7 +4271,7 @@ async fn mixed_inline_soft_wrap_uses_hard_break_line_metrics() {
 
     assert_eq!(boxes.len(), 2);
     assert!(
-        (boxes[0].height - boxes[1].height).abs() < 0.01,
+        (boxes[0].height() - boxes[1].height()).abs() < 0.01,
         "soft and hard line breaks should consume the same line-box height: {boxes:?}"
     );
 }
@@ -3511,7 +4402,7 @@ async fn break_spaces_exposes_breaks_before_atomic_inline_boxes() {
         .find(|line| line.text == "B")
         .unwrap();
 
-    assert!(a.y > b.y);
+    assert!(a.y() > b.y());
 }
 
 #[tokio::test]
@@ -3552,11 +4443,11 @@ async fn mixed_inline_text_decorations_paint_with_atomic_inline_boxes() {
 
     assert!(document.pages[0].rects.iter().any(|rect| {
         rect.fill == Some(Color::BLACK)
-            && (rect.x - text.x).abs() < 0.1
-            && rect.y < text.y
-            && rect.y > text.y - 4.0
-            && rect.width > 1.0
-            && rect.height >= 0.5
+            && (rect.x() - text.x()).abs() < 0.1
+            && rect.y() < text.y()
+            && rect.y() > text.y() - 4.0
+            && rect.width() > 1.0
+            && rect.height() >= 0.5
     }));
 }
 
@@ -3611,9 +4502,13 @@ async fn text_decoration_skip_ink_splits_underlines_around_glyph_ink() {
     let unskipped_width: f32 = without_skip.pages[0]
         .rects
         .iter()
-        .map(|rect| rect.width)
+        .map(|rect| rect.width())
         .sum();
-    let skipped_width: f32 = with_skip.pages[0].rects.iter().map(|rect| rect.width).sum();
+    let skipped_width: f32 = with_skip.pages[0]
+        .rects
+        .iter()
+        .map(|rect| rect.width())
+        .sum();
 
     assert!(unskipped_width > 0.0);
     assert!(skipped_width < unskipped_width);
@@ -3642,15 +4537,15 @@ async fn text_decoration_skip_spaces_trims_preserved_line_edge_spaces() {
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .max_by(|left, right| {
-            left.width
-                .partial_cmp(&right.width)
+            left.width()
+                .partial_cmp(&right.width())
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .unwrap();
 
-    let line_start = line.x;
-    let underline_start = underline.x;
-    let underline_end = underline.x + underline.width;
+    let line_start = line.x();
+    let underline_start = underline.x();
+    let underline_end = underline.x() + underline.width();
     let line_width = line
         .runs
         .iter()
@@ -3666,7 +4561,82 @@ async fn text_decoration_skip_spaces_trims_preserved_line_edge_spaces() {
 
     assert!(underline_start > line_start + 10.0);
     assert!(underline_end < line_start + line_width - 10.0);
-    assert!(underline.width < line_width * 0.75);
+    assert!(underline.width() < line_width * 0.75);
+}
+
+#[tokio::test]
+async fn vertical_text_decoration_underline_uses_logical_side() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 } \
+         p { margin: 0; writing-mode: vertical-rl; width: 40pt; height: 80pt; \
+         font-size: 12pt; line-height: 14pt; text-decoration-line: underline; \
+         text-decoration-color: red; text-decoration-thickness: 2pt; \
+         text-decoration-skip-ink: none; text-underline-position: left }</style><p>中文</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let text = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text.contains('中'))
+        .unwrap();
+    assert!(
+        document.pages[0].rects.iter().any(|rect| {
+            rect.fill == Some(Color::new(255, 0, 0))
+                && rect.height() > 10.0
+                && rect.width() >= 1.5
+                && rect.x() < text.x()
+        }),
+        "{:?}",
+        (document.pages[0].rects.clone(), text)
+    );
+}
+
+#[tokio::test]
+async fn page_margin_text_decoration_uses_prepared_strokes() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 20pt; \
+         @top-left { content: \"AB\"; font-size: 10pt; text-decoration-line: underline; \
+         text-decoration-color: blue; text-decoration-skip-ink: none } } body { margin: 0 }</style>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .rects
+            .iter()
+            .any(|rect| rect.fill == Some(Color::new(0, 0, 255)) && rect.width() > 5.0),
+        "{:?}",
+        document.pages[0].rects
+    );
+}
+
+#[tokio::test]
+async fn inline_block_vertical_text_decoration_uses_prepared_strokes() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 120pt; margin: 10pt } body { margin: 0 } \
+         span { display: inline-block; writing-mode: vertical-rl; width: 40pt; height: 70pt; \
+         font-size: 12pt; text-decoration-line: underline; text-decoration-color: green; \
+         text-decoration-thickness: 2pt; text-decoration-skip-ink: none }</style><span>中A</span>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0].rects.iter().any(|rect| {
+            rect.fill == Some(Color::new(0, 128, 0)) && rect.height() > rect.width()
+        }),
+        "{:?}",
+        (
+            document.pages[0].rects.clone(),
+            document.pages[0].lines.clone()
+        )
+    );
 }
 
 #[tokio::test]
@@ -3684,8 +4654,8 @@ async fn inline_block_text_decoration_paints_for_transparent_text() {
     assert!(
         document.pages[0].rects.iter().any(|rect| {
             rect.fill == Some(Color::new(0, 128, 0))
-                && rect.width > 20.0
-                && (rect.height - 15.0).abs() < 0.1
+                && rect.width() > 20.0
+                && (rect.height() - 15.0).abs() < 0.1
         }),
         "expected green underline rects, got {:?}",
         (
@@ -3719,10 +4689,10 @@ async fn floated_auto_width_uses_definite_child_width_not_overflow_text() {
         .unwrap();
 
     assert!(
-        second.x - first.x < 45.0,
+        second.x() - first.x() < 45.0,
         "overflowing fixed-width child text must not widen the first float: first={}, second={}",
-        first.x,
-        second.x
+        first.x(),
+        second.x()
     );
 }
 
@@ -3745,11 +4715,11 @@ async fn thick_overline_is_clipped_by_overflow_hidden_block() {
 
     assert_eq!(green_rects.len(), 1);
     assert!(
-        (green_rects[0].width - 60.0).abs() < 0.01,
+        (green_rects[0].width() - 60.0).abs() < 0.01,
         "green rect: {:?}",
         green_rects[0]
     );
-    assert!((green_rects[0].height - 15.0).abs() < 0.01);
+    assert!((green_rects[0].height() - 15.0).abs() < 0.01);
     assert!(
         !document.pages[0]
             .rects
@@ -3775,8 +4745,8 @@ async fn font_shorthand_unit_line_height_sets_inline_background_height() {
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("green background should paint");
 
-    assert!((green.width - 75.0).abs() < 0.01, "{green:?}");
-    assert!((green.height - 75.0).abs() < 0.01, "{green:?}");
+    assert!((green.width() - 75.0).abs() < 0.01, "{green:?}");
+    assert!((green.height() - 75.0).abs() < 0.01, "{green:?}");
 }
 
 #[tokio::test]
@@ -3802,8 +4772,8 @@ async fn explicit_line_height_overrides_loaded_font_metrics() {
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("green background should paint");
 
-    assert!((green.width - 75.0).abs() < 0.01, "{green:?}");
-    assert!((green.height - 75.0).abs() < 0.01, "{green:?}");
+    assert!((green.width() - 75.0).abs() < 0.01, "{green:?}");
+    assert!((green.height() - 75.0).abs() < 0.01, "{green:?}");
 }
 
 #[tokio::test]
@@ -3833,11 +4803,11 @@ async fn trailing_ideographic_space_hangs_and_paints_inline_background() {
     assert!(
         green_rects
             .iter()
-            .all(|rect| (rect.width - 75.0).abs() < 0.01 && (rect.height - 37.5).abs() < 0.01),
+            .all(|rect| (rect.width() - 75.0).abs() < 0.01 && (rect.height() - 37.5).abs() < 0.01),
         "{green_rects:?}"
     );
     assert!(
-        ((green_rects[0].y - green_rects[1].y).abs() - 37.5).abs() < 0.01,
+        ((green_rects[0].y() - green_rects[1].y()).abs() - 37.5).abs() < 0.01,
         "{green_rects:?}"
     );
 }
@@ -3873,16 +4843,16 @@ async fn combining_grapheme_joiner_suppresses_wrap_before_atomic_inline() {
     let (green_left, green_right) = rendered_line_visual_bounds(visible_green);
 
     assert!(
-        (red_background.width - 75.0).abs() < 0.01,
+        (red_background.width() - 75.0).abs() < 0.01,
         "{red_background:?}"
     );
     assert!(
-        (red_background.height - 75.0).abs() < 0.01,
+        (red_background.height() - 75.0).abs() < 0.01,
         "{red_background:?}"
     );
     assert!(
-        (green_left - red_background.x).abs() < 0.01
-            && (green_right - red_background.x - red_background.width).abs() < 0.01,
+        (green_left - red_background.x()).abs() < 0.01
+            && (green_right - red_background.x() - red_background.width()).abs() < 0.01,
         "green glyph should cover the red square horizontally: red={red_background:?}, green_line={visible_green:?}, bounds=({green_left}, {green_right})"
     );
 }

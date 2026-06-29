@@ -1,7 +1,8 @@
 use super::font_registry::FontSupportKind;
 use super::*;
 use crate::css::{
-    ComputedLengthPercentage, FontSizeAdjust, FontSizeAdjustMetric, FontSizeAdjustValue,
+    BaselineShift, ComputedLengthPercentage, FontSizeAdjust, FontSizeAdjustMetric,
+    FontSizeAdjustValue,
 };
 use crate::{RenderedLine, RenderedTextRun};
 
@@ -132,6 +133,7 @@ impl FontSystem {
     /// start and end of a line while preserving painted text:
     /// <https://www.w3.org/TR/css-text-3/#white-space-phase-2> and
     /// <https://www.w3.org/TR/css-text-3/#letter-spacing-property>.
+    #[cfg(test)]
     pub(crate) fn measure_line_text(&mut self, text: &str, style: &ComputedStyle) -> f32 {
         self.shape_unwrapped_line(text, style, style.line_height)
             .map(|line| shaped_line_measure_width(&line, style))
@@ -177,10 +179,12 @@ impl FontSystem {
             .lines()
             .next()
             .map(|line| {
-                visual_ranges_for_line(line)
+                let mut ranges = visual_ranges_for_line(line)
                     .into_iter()
                     .filter_map(|range| bidi_text.original_range(range))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                merge_join_control_visual_ranges(text, &mut ranges);
+                ranges
             })
             .filter(|ranges| !ranges.is_empty())
             .unwrap_or_else(|| std::iter::once(0..text.len()).collect())
@@ -302,13 +306,47 @@ impl FontSystem {
             let mut pen_x = 0.0;
             for glyph in glyphs {
                 if let Some(bbox) = face.glyph_bounding_box(ttf_parser::GlyphId(glyph.id)) {
-                    let origin_x = run.x_offset + pen_x + glyph.x_offset;
-                    let origin_y = baseline_y + glyph.y_offset;
+                    let origin_x = pen_x + glyph.x_offset;
+                    let origin_y = glyph.y_offset;
+                    let corners = [
+                        (
+                            origin_x + bbox.x_min as f32 * scale,
+                            origin_y + bbox.y_min as f32 * scale,
+                        ),
+                        (
+                            origin_x + bbox.x_min as f32 * scale,
+                            origin_y + bbox.y_max as f32 * scale,
+                        ),
+                        (
+                            origin_x + bbox.x_max as f32 * scale,
+                            origin_y + bbox.y_min as f32 * scale,
+                        ),
+                        (
+                            origin_x + bbox.x_max as f32 * scale,
+                            origin_y + bbox.y_max as f32 * scale,
+                        ),
+                    ];
+                    let mut x_min = f32::INFINITY;
+                    let mut x_max = f32::NEG_INFINITY;
+                    let mut y_min = f32::INFINITY;
+                    let mut y_max = f32::NEG_INFINITY;
+                    for (x, y) in corners {
+                        let transformed_x =
+                            run.x_offset + run.text_matrix.a * x + run.text_matrix.c * y;
+                        let transformed_y = baseline_y
+                            + run.y_offset
+                            + run.text_matrix.b * x
+                            + run.text_matrix.d * y;
+                        x_min = x_min.min(transformed_x);
+                        x_max = x_max.max(transformed_x);
+                        y_min = y_min.min(transformed_y);
+                        y_max = y_max.max(transformed_y);
+                    }
                     boxes.push(GlyphInkBox {
-                        x_min: origin_x + bbox.x_min as f32 * scale,
-                        x_max: origin_x + bbox.x_max as f32 * scale,
-                        y_min: origin_y + bbox.y_min as f32 * scale,
-                        y_max: origin_y + bbox.y_max as f32 * scale,
+                        x_min,
+                        x_max,
+                        y_min,
+                        y_max,
                     });
                 }
                 pen_x += glyph.x_advance;
@@ -327,6 +365,23 @@ impl FontSystem {
         let text = text.as_ref();
         if text.is_empty() {
             return Vec::new();
+        }
+        if let Some(resolved_spans) = self.unicode_range_resolved_text_spans(text, style) {
+            let spans = resolved_spans
+                .iter()
+                .filter_map(|span| {
+                    text.get(span.range.clone()).map(|text| StyledTextSpan {
+                        text,
+                        style: &span.style,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !spans.is_empty() {
+                return self.shape_styled_text_runs_with_parley(&spans);
+            }
+        }
+        if text_needs_edge_join_context(text) {
+            return self.shape_styled_text_runs_with_parley(&[StyledTextSpan { text, style }]);
         }
         let feature_context = self.font_feature_context_for_style(style);
         let mut builder = self.parley_layout_context.ranged_builder(
@@ -478,6 +533,8 @@ impl FontSystem {
                 rendered_runs.push(RenderedTextRun {
                     text: run_text.to_string(),
                     x_offset,
+                    y_offset: 0.0,
+                    text_matrix: crate::RenderedTextMatrix::IDENTITY,
                     font_size: run.font_size(),
                     font_id: Some(fallback_font_id),
                     glyphs: Some(glyphs),
@@ -496,8 +553,26 @@ impl FontSystem {
             let mut glyphs = Vec::new();
             for cluster in run.visual_clusters() {
                 let cluster_text = text.get(cluster.text_range()).unwrap_or_default();
-                let emitted_cluster_text = text_without_variation_selectors(cluster_text);
-                if cluster_is_default_ignorable_only(cluster_text, &emitted_cluster_text) {
+                let emitted_cluster_text = text_without_glyph_output_controls(cluster_text);
+                let cluster_glyphs = cluster.glyphs().collect::<Vec<_>>();
+                let default_ignorable_only =
+                    cluster_is_default_ignorable_only(cluster_text, &emitted_cluster_text);
+                if default_ignorable_only
+                    && !default_ignorable_cluster_has_shaping_glyph(
+                        &face,
+                        &run_text,
+                        &emitted_cluster_text,
+                        cluster_glyphs
+                            .iter()
+                            .filter_map(|glyph| {
+                                u16::try_from(glyph.id)
+                                    .ok()
+                                    .map(|glyph_id| (glyph_id, glyph.advance))
+                            })
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    )
+                {
                     continue;
                 }
                 if emitted_cluster_text == "\t" {
@@ -505,12 +580,16 @@ impl FontSystem {
                     continue;
                 }
                 let mut first_cluster_glyph = true;
-                for glyph in cluster.glyphs() {
+                for glyph in cluster_glyphs {
                     let Ok(glyph_id) = u16::try_from(glyph.id) else {
                         continue;
                     };
                     let unicode = if first_cluster_glyph {
-                        emitted_cluster_text.clone()
+                        if default_ignorable_only {
+                            String::new()
+                        } else {
+                            emitted_cluster_text.clone()
+                        }
                     } else {
                         String::new()
                     };
@@ -543,6 +622,8 @@ impl FontSystem {
             rendered_runs.push(RenderedTextRun {
                 text: run_text.to_string(),
                 x_offset,
+                y_offset: 0.0,
+                text_matrix: crate::RenderedTextMatrix::IDENTITY,
                 font_size,
                 font_id: Some(font_id),
                 glyphs: Some(glyphs),
@@ -553,6 +634,122 @@ impl FontSystem {
         rendered_runs
     }
 
+    /// Split a named font stack into range-limited shaping spans.
+    ///
+    /// CSS Fonts applies `@font-face unicode-range` during font matching, while
+    /// CSS Text still requires one shaping context across join controls and
+    /// cursive-script neighbors. Parley/fontique does not expose the descriptor
+    /// on registration, so Quire resolves range-limited named families before
+    /// shaping and passes the result back to Parley as styled ranges:
+    /// <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>,
+    /// <https://www.w3.org/TR/css-text-3/#text-processing-order>, and
+    /// <https://www.w3.org/TR/alreq/#h_joining_enforcement>.
+    fn unicode_range_resolved_text_spans(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+    ) -> Option<Vec<UnicodeRangeResolvedSpan>> {
+        let FontFamily::Names(names) = &style.font_family else {
+            return None;
+        };
+        let names = names.clone();
+        if names.is_empty()
+            || !names.iter().any(|name| {
+                self.resolve_single_family(
+                    name,
+                    style.font_weight,
+                    style.font_style,
+                    style.font_width,
+                )
+                .is_some_and(|font_id| self.document_fonts.font_has_unicode_range(font_id))
+            })
+        {
+            return None;
+        }
+
+        let mut selections = Vec::<(Range<usize>, Option<String>)>::new();
+        let mut previous_family = None::<String>;
+        for (start, character) in text.char_indices() {
+            let end = start + character.len_utf8();
+            let family = if character_is_join_control(character) {
+                previous_family
+                    .clone()
+                    .or_else(|| self.next_unicode_range_family_for_text(text, end, style, &names))
+            } else {
+                self.unicode_range_family_for_character(character, style, &names)
+            };
+            if let Some(family) = &family {
+                previous_family = Some(family.clone());
+            }
+            selections.push((start..end, family));
+        }
+        if selections.is_empty() || selections.iter().all(|(_, family)| family.is_none()) {
+            return None;
+        }
+
+        let mut spans = Vec::<UnicodeRangeResolvedSpan>::new();
+        for (range, family) in selections {
+            let mut span_style = style.clone();
+            if let Some(family) = family {
+                span_style.font_family = FontFamily::Names(vec![family]);
+            }
+            if let Some(previous) = spans.last_mut()
+                && previous.style == span_style
+                && previous.range.end == range.start
+            {
+                previous.range.end = range.end;
+                continue;
+            }
+            spans.push(UnicodeRangeResolvedSpan {
+                range,
+                style: span_style,
+            });
+        }
+
+        spans
+            .iter()
+            .any(|span| span.style.font_family != style.font_family)
+            .then_some(spans)
+    }
+
+    fn next_unicode_range_family_for_text(
+        &mut self,
+        text: &str,
+        start: usize,
+        style: &ComputedStyle,
+        names: &[String],
+    ) -> Option<String> {
+        text.get(start..)?.chars().find_map(|character| {
+            (!character_is_join_control(character))
+                .then(|| self.unicode_range_family_for_character(character, style, names))
+                .flatten()
+        })
+    }
+
+    fn unicode_range_family_for_character(
+        &mut self,
+        character: char,
+        style: &ComputedStyle,
+        names: &[String],
+    ) -> Option<String> {
+        for name in names {
+            let Some(font_id) = self.resolve_single_family(
+                name,
+                style.font_weight,
+                style.font_style,
+                style.font_width,
+            ) else {
+                continue;
+            };
+            if self.document_fonts.font_has_character(font_id, character) {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+
+    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn shaped_measured_line_from_parley_line<B: parley::style::Brush>(
         &mut self,
         text: &str,
@@ -612,6 +809,7 @@ impl FontSystem {
         Some(shaped)
     }
 
+    #[cfg(test)]
     pub(crate) fn shape_measured_line(
         &mut self,
         text: &str,
@@ -715,6 +913,7 @@ impl FontSystem {
         if text.is_empty() || ranges.is_empty() {
             return Vec::new();
         }
+        push_edge_join_context(&mut text, &mut ranges, &mut synthetic_join_controls);
         if ranges.len() == 1 && synthetic_join_controls.is_empty() {
             return self.shape_text_runs_with_parley(&text, ranges[0].1);
         }
@@ -830,6 +1029,8 @@ impl FontSystem {
                 rendered_runs.push(RenderedTextRun {
                     text: run_text,
                     x_offset,
+                    y_offset: 0.0,
+                    text_matrix: crate::RenderedTextMatrix::IDENTITY,
                     font_size: run.font_size(),
                     font_id: Some(fallback_font_id),
                     glyphs: Some(glyphs_without_synthetic_join_controls(
@@ -852,14 +1053,35 @@ impl FontSystem {
             let scale = run.font_size() / units_per_em;
             let mut glyphs = Vec::new();
             for cluster in run.visual_clusters() {
+                if range_is_synthetic_only(cluster.text_range(), &synthetic_join_controls) {
+                    continue;
+                }
                 let raw_cluster_text = text.get(cluster.text_range()).unwrap_or_default();
                 let cleaned_cluster_text =
-                    text_without_variation_selectors(&text_without_synthetic_join_controls(
+                    text_without_glyph_output_controls(&text_without_synthetic_join_controls(
                         &text,
                         cluster.text_range(),
                         &synthetic_join_controls,
                     ));
-                if cluster_is_default_ignorable_only(raw_cluster_text, &cleaned_cluster_text) {
+                let cluster_glyphs = cluster.glyphs().collect::<Vec<_>>();
+                let default_ignorable_only =
+                    cluster_is_default_ignorable_only(raw_cluster_text, &cleaned_cluster_text);
+                if default_ignorable_only
+                    && !default_ignorable_cluster_has_shaping_glyph(
+                        &face,
+                        raw_run_text,
+                        &cleaned_cluster_text,
+                        cluster_glyphs
+                            .iter()
+                            .filter_map(|glyph| {
+                                u16::try_from(glyph.id)
+                                    .ok()
+                                    .map(|glyph_id| (glyph_id, glyph.advance))
+                            })
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    )
+                {
                     continue;
                 }
                 if cleaned_cluster_text == "\t" {
@@ -867,16 +1089,29 @@ impl FontSystem {
                     continue;
                 }
                 let mut first_cluster_glyph = true;
-                for glyph in cluster.glyphs() {
+                for glyph in cluster_glyphs {
                     let Ok(glyph_id) = u16::try_from(glyph.id) else {
                         continue;
                     };
                     let unicode = if first_cluster_glyph {
-                        cleaned_cluster_text.clone()
+                        if default_ignorable_only {
+                            String::new()
+                        } else {
+                            cleaned_cluster_text.clone()
+                        }
                     } else {
                         String::new()
                     };
                     if unicode.is_empty() && glyph.advance == 0.0 {
+                        first_cluster_glyph = false;
+                        continue;
+                    }
+                    if unicode.is_empty()
+                        && !synthetic_join_controls.is_empty()
+                        && face
+                            .glyph_index('\u{0640}')
+                            .is_some_and(|nominal| nominal.0 == glyph_id)
+                    {
                         first_cluster_glyph = false;
                         continue;
                     }
@@ -915,6 +1150,8 @@ impl FontSystem {
             rendered_runs.push(RenderedTextRun {
                 text: run_text,
                 x_offset,
+                y_offset: 0.0,
+                text_matrix: crate::RenderedTextMatrix::IDENTITY,
                 font_size,
                 font_id: Some(font_id),
                 glyphs: Some(glyphs),
@@ -1071,6 +1308,53 @@ impl FontSystem {
         style.font_size - adjustment
     }
 
+    /// Return the selected font's x-height in layout units.
+    ///
+    /// CSS 2.2 `vertical-align: middle` aligns against half of the parent's
+    /// x-height. Font metrics are preferred, with the glyph bounding box for
+    /// `x` as a fallback:
+    /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>.
+    pub(crate) fn x_height_for_style(&mut self, style: &ComputedStyle) -> Option<f32> {
+        let font_id = self.resolve_style(style);
+        let used_font_size = font_id
+            .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
+            .unwrap_or(style.font_size);
+        let font = font_id.and_then(|id| self.document_fonts.get(id))?;
+        let face = ttf_parser::Face::parse(&font.data, font.face_index).ok()?;
+        let units_per_em = font.units_per_em.max(1) as f32;
+        let height = face
+            .x_height()
+            .map(|height| height as f32)
+            .or_else(|| glyph_bbox_height(&face, 'x'))?;
+        Some(height * used_font_size / units_per_em)
+    }
+
+    /// Return the selected font's recommended super/subscript baseline shift.
+    ///
+    /// OpenType OS/2 script offsets are used when available. Positive return
+    /// values raise the inline box; negative values lower it:
+    /// <https://learn.microsoft.com/en-us/typography/opentype/spec/os2#ysubscriptxoff-y-subscript-yoff-y-subscript-xsize-y-subscript-ysize>.
+    pub(crate) fn script_vertical_align_shift(
+        &mut self,
+        style: &ComputedStyle,
+        baseline_shift: BaselineShift,
+    ) -> Option<f32> {
+        let font_id = self.resolve_style(style);
+        let used_font_size = font_id
+            .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
+            .unwrap_or(style.font_size);
+        let font = font_id.and_then(|id| self.document_fonts.get(id))?;
+        let face = ttf_parser::Face::parse(&font.data, font.face_index).ok()?;
+        let units_per_em = font.units_per_em.max(1) as f32;
+        let offset = match baseline_shift {
+            BaselineShift::Super => face.superscript_metrics()?.y_offset as f32,
+            BaselineShift::Sub => -(face.subscript_metrics()?.y_offset as f32),
+            _ => return None,
+        };
+        let shift = offset * used_font_size / units_per_em;
+        (shift.is_finite() && shift.abs() > 0.01).then_some(shift)
+    }
+
     /// Convert a rendered PDF text line back to the CSS line alignment coordinate.
     ///
     /// CSS 2.2 positions inline content using line-box font metrics, while the
@@ -1087,7 +1371,7 @@ impl FontSystem {
                 line.font_size - ascent
             })
             .unwrap_or(0.0);
-        line.y + line.font_size - adjustment
+        line.y() + line.font_size - adjustment
     }
 }
 
@@ -1111,6 +1395,35 @@ fn style_for_text_range<'a>(
                 && (run_range.start < range.end || run_range.start == run_range.end)
         })
         .map(|(_, style)| *style)
+}
+
+fn merge_join_control_visual_ranges(text: &str, ranges: &mut Vec<Range<usize>>) {
+    let mut merged = Vec::<Range<usize>>::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(previous) = merged.last_mut()
+            && previous.start == range.end
+            && (range_text_is_join_control_only(text, &range)
+                || range_text_is_join_control_only(text, previous))
+        {
+            previous.start = range.start;
+            continue;
+        }
+        if let Some(previous) = merged.last_mut()
+            && previous.end == range.start
+            && (range_text_is_join_control_only(text, &range)
+                || range_text_is_join_control_only(text, previous))
+        {
+            previous.end = range.end;
+            continue;
+        }
+        merged.push(range);
+    }
+    *ranges = merged;
+}
+
+fn range_text_is_join_control_only(text: &str, range: &Range<usize>) -> bool {
+    text.get(range.clone())
+        .is_some_and(|slice| !slice.is_empty() && slice.chars().all(character_is_join_control))
 }
 
 /// Return a CSS Fonts 5 `font-size-adjust` metric ratio for a selected face.
@@ -1221,6 +1534,7 @@ fn tab_stop_advance(period: f32, current_x: f32) -> f32 {
     (next_stop - current_x).max(0.0)
 }
 
+#[cfg(test)]
 fn shaped_line_measure_width(line: &ShapedInlineLine, style: &ComputedStyle) -> f32 {
     let measured_text = trim_trailing_css_hanging_space_separators(&line.text, style);
     let hanging_width = shaped_suffix_advance(line, measured_text.len());
@@ -1228,6 +1542,7 @@ fn shaped_line_measure_width(line: &ShapedInlineLine, style: &ComputedStyle) -> 
         .max(0.0)
 }
 
+#[cfg(test)]
 fn shaped_suffix_advance(line: &ShapedInlineLine, prefix_len: usize) -> f32 {
     if prefix_len >= line.text.len() {
         return 0.0;
@@ -1299,6 +1614,118 @@ fn push_synthetic_join_control(text: &mut String, synthetic_ranges: &mut Vec<Ran
     synthetic_ranges.push(start..text.len());
 }
 
+fn text_needs_edge_join_context(text: &str) -> bool {
+    text_needs_leading_join_context(text) || text_needs_trailing_join_context(text)
+}
+
+fn text_needs_leading_join_context(text: &str) -> bool {
+    let mut characters = text.chars();
+    if characters.next() != Some('\u{200d}') {
+        return false;
+    }
+    characters
+        .find(|character| !character_is_join_control(*character))
+        .is_some_and(character_can_join_preceding)
+}
+
+fn text_needs_trailing_join_context(text: &str) -> bool {
+    let mut characters = text.chars().rev();
+    if characters.next() != Some('\u{200d}') {
+        return false;
+    }
+    characters
+        .find(|character| !character_is_join_control(*character))
+        .is_some_and(character_can_join_following)
+}
+
+/// Add shaping-only tatweel at run edges requested by explicit ZWJ.
+///
+/// U+200D at the start or end of an isolated shaping run asks the shaper to
+/// form a connection to a neighboring joining context. Some shaping backends
+/// do not apply that edge context without a concrete joining neighbor, so the
+/// renderer supplies U+0640 ARABIC TATWEEL as shaping-only context and removes
+/// it from emitted glyph text:
+/// <https://www.w3.org/TR/css-text-3/#text-encoding> and
+/// <https://www.w3.org/TR/alreq/#h_joining_enforcement>.
+fn push_edge_join_context(
+    text: &mut String,
+    ranges: &mut Vec<(Range<usize>, &ComputedStyle)>,
+    synthetic_ranges: &mut Vec<Range<usize>>,
+) {
+    let mut insertions = Vec::new();
+    for (range, _) in ranges.iter() {
+        let Some(slice) = text.get(range.clone()) else {
+            continue;
+        };
+        if let Some(index) = leading_join_context_insertion_index(slice) {
+            insertions.push(range.start + index);
+        }
+        if let Some(index) = trailing_join_context_insertion_index(slice) {
+            insertions.push(range.start + index);
+        }
+    }
+    insertions.sort_unstable();
+    insertions.dedup();
+    for index in insertions.into_iter().rev() {
+        insert_synthetic_join_context(text, ranges, synthetic_ranges, index);
+    }
+}
+
+fn range_is_synthetic_only(range: Range<usize>, synthetic_ranges: &[Range<usize>]) -> bool {
+    range.start < range.end
+        && synthetic_ranges
+            .iter()
+            .any(|synthetic| synthetic.start <= range.start && range.end <= synthetic.end)
+}
+
+fn leading_join_context_insertion_index(text: &str) -> Option<usize> {
+    if !text.starts_with('\u{200d}') {
+        return None;
+    }
+    text.char_indices()
+        .find(|(_, character)| !character_is_join_control(*character))
+        .and_then(|(index, character)| character_can_join_preceding(character).then_some(index))
+}
+
+fn trailing_join_context_insertion_index(text: &str) -> Option<usize> {
+    if !text.ends_with('\u{200d}') {
+        return None;
+    }
+    text.char_indices()
+        .rev()
+        .find(|(_, character)| !character_is_join_control(*character))
+        .and_then(|(index, character)| {
+            character_can_join_following(character).then_some(index + character.len_utf8())
+        })
+}
+
+fn insert_synthetic_join_context(
+    text: &mut String,
+    ranges: &mut [(Range<usize>, &ComputedStyle)],
+    synthetic_ranges: &mut Vec<Range<usize>>,
+    index: usize,
+) {
+    let context_len = '\u{0640}'.len_utf8();
+    text.insert(index, '\u{0640}');
+    for (range, _) in ranges.iter_mut() {
+        if range.start >= index {
+            range.start += context_len;
+            range.end += context_len;
+        } else if range.end >= index {
+            range.end += context_len;
+        }
+    }
+    for range in synthetic_ranges.iter_mut() {
+        if range.start >= index {
+            range.start += context_len;
+            range.end += context_len;
+        } else if range.end >= index {
+            range.end += context_len;
+        }
+    }
+    synthetic_ranges.push(index..index + context_len);
+}
+
 /// Remove shaping-only join controls from emitted text content.
 ///
 /// PDF ToUnicode data should reflect the document text, not internal shaping
@@ -1347,12 +1774,8 @@ fn glyphs_without_synthetic_join_controls(
         if synthetic_ranges
             .iter()
             .any(|synthetic| synthetic.contains(&index))
+            || character_is_default_ignorable_code_point(character)
         {
-            if glyph.x_advance != 0.0 {
-                glyph.unicode.clear();
-                output.push(glyph);
-            }
-        } else if character_is_default_ignorable_code_point(character) {
             continue;
         } else {
             glyph.unicode = character.to_string();
@@ -1428,6 +1851,18 @@ fn text_without_variation_selectors(text: &str) -> String {
         .filter(
             |character| !matches!(character, '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}'),
         )
+        .collect()
+}
+
+fn text_without_glyph_output_controls(text: &str) -> String {
+    text.chars()
+        .filter(|character| {
+            !character_is_join_control(*character)
+                && !matches!(
+                    character,
+                    '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}'
+                )
+        })
         .collect()
 }
 
@@ -1527,4 +1962,22 @@ fn cluster_is_default_ignorable_only(raw_text: &str, emitted_text: &str) -> bool
             || emitted_text
                 .chars()
                 .all(character_is_default_ignorable_code_point))
+}
+
+fn default_ignorable_cluster_has_shaping_glyph(
+    face: &ttf_parser::Face<'_>,
+    run_text: &str,
+    emitted_cluster_text: &str,
+    glyphs: &[(u16, f32)],
+) -> bool {
+    run_text
+        .chars()
+        .any(|character| !character_is_default_ignorable_code_point(character))
+        && glyphs.iter().any(|(glyph_id, advance)| {
+            *advance != 0.0
+                && !emitted_cluster_text.chars().any(|character| {
+                    face.glyph_index(character)
+                        .is_some_and(|nominal| nominal.0 == *glyph_id)
+                })
+        })
 }

@@ -23,76 +23,10 @@ pub(crate) fn style_for_element_with_signature(
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
 ) -> ComputedStyle {
-    let mut style = ComputedStyle::initial();
     let inheritance_source = parent.cloned().unwrap_or_else(ComputedStyle::initial);
-    if let Some(parent) = parent {
-        style.custom_properties = parent.custom_properties.clone();
-        style.color = parent.color;
-        style.text_align = parent.text_align;
-        style.text_align_last = parent.text_align_last;
-        style.text_justify = parent.text_justify;
-        style.direction = parent.direction;
-        style.writing_mode = parent.writing_mode;
-        style.text_indent = parent.text_indent;
-        style.hanging_punctuation = parent.hanging_punctuation;
-        style.text_autospace = parent.text_autospace;
-        style.font_style = parent.font_style;
-        style.font_width = parent.font_width;
-        style.font_family = parent.font_family.clone();
-        style.font_feature_settings = parent.font_feature_settings.clone();
-        style.font_kerning = parent.font_kerning;
-        style.font_variant_ligatures = parent.font_variant_ligatures;
-        style.font_variant_position = parent.font_variant_position;
-        style.font_variant_caps = parent.font_variant_caps;
-        style.font_variant_numeric = parent.font_variant_numeric.clone();
-        style.font_variant_alternates = parent.font_variant_alternates.clone();
-        style.font_variant_east_asian = parent.font_variant_east_asian.clone();
-        style.font_variant_emoji = parent.font_variant_emoji;
-        style.language = parent.language.clone();
-        style.line_height_value = parent.line_height_value;
-        style.line_height_multiplier = parent.line_height_multiplier;
-        style.line_height_is_normal = parent.line_height_is_normal;
-        style.word_spacing = parent.word_spacing;
-        style.text_transform = parent.text_transform;
-        style.tab_size = parent.tab_size;
-        style.text_decoration_layers = parent.text_decoration_layers.clone();
-        style.text_decoration.skip_ink = parent.text_decoration.skip_ink;
-        style.text_decoration.skip_self = parent.text_decoration.skip_self;
-        style.text_decoration.skip_box = parent.text_decoration.skip_box;
-        style.text_decoration.skip_spaces = parent.text_decoration.skip_spaces;
-        style.text_decoration.underline_offset = parent.text_decoration.underline_offset;
-        style.text_decoration.underline_position = parent.text_decoration.underline_position;
-        style.text_shadow = parent.text_shadow.clone();
-        style.text_emphasis_style = parent.text_emphasis_style.clone();
-        style.text_emphasis_color = parent.text_emphasis_color;
-        style.text_emphasis_position = parent.text_emphasis_position;
-        style.text_emphasis_skip = parent.text_emphasis_skip;
-        style.white_space = parent.white_space;
-        style.word_break = parent.word_break;
-        style.overflow_wrap = parent.overflow_wrap;
-        style.line_break = parent.line_break;
-        style.hyphens = parent.hyphens;
-        style.hyphenate_limit_chars = parent.hyphenate_limit_chars;
-        style.visibility = parent.visibility;
-        style.orphans = parent.orphans;
-        style.widows = parent.widows;
-        style.list_style_type = parent.list_style_type.clone();
-        style.list_style_position = parent.list_style_position;
-        style.list_style_image = parent.list_style_image.clone();
-        style.list_style_image_base_url = parent.list_style_image_base_url.clone();
-        style.list_style_image_root_url = parent.list_style_image_root_url.clone();
-        style.marker_side = parent.marker_side;
-        style.quotes = parent.quotes.inherited();
-        style.font_size = parent.font_size;
-        style.font_size_adjust = parent.font_size_adjust;
-        style.line_height = parent.line_height;
-        style.font_weight = parent.font_weight;
-        style.border_collapse = parent.border_collapse;
-        style.caption_side = parent.caption_side;
-        style.empty_cells = parent.empty_cells;
-        style.border_spacing = parent.border_spacing;
-        style.border_spacing_explicit = parent.border_spacing_explicit;
-    }
+    let mut style = parent
+        .map(inherited_base_style)
+        .unwrap_or_else(ComputedStyle::initial);
     let resolved_language = current
         .attrs
         .get("lang")
@@ -109,12 +43,16 @@ pub(crate) fn style_for_element_with_signature(
 
     let mut matching_rules = Vec::new();
     let layer_order = global_layer_order(stylesheets);
+    let mut presentational_hints_stylesheet_index = None;
     for (stylesheet_index, stylesheet) in stylesheets.iter().enumerate() {
+        if stylesheet.html_presentational_hints {
+            presentational_hints_stylesheet_index = Some(stylesheet_index);
+        }
         for rule in &stylesheet.rules {
             if let Some(scope_proximity) = selector_matches_with_scope_proximity(
                 &rule.selector,
                 &rule.scopes,
-                current.clone(),
+                &current,
                 ancestors,
             ) {
                 matching_rules.push(MatchedRule {
@@ -136,6 +74,13 @@ pub(crate) fn style_for_element_with_signature(
             &mut cascaded_declarations,
             &matched.rule.declarations,
             RuleCascadeMeta::from_matched(matched, &layer_order),
+        );
+    }
+    if let Some(stylesheet_index) = presentational_hints_stylesheet_index {
+        push_dynamic_html_presentational_hint_declarations(
+            &mut cascaded_declarations,
+            &current,
+            stylesheet_index,
         );
     }
     if let Some(inline_declarations) = &inline_declarations {
@@ -163,11 +108,199 @@ pub(crate) fn style_for_element_with_signature(
         style.abspos_static_source_was_inline_level = style.display.is_inline_level();
     }
     resolve_ua_relative_margins(&mut style);
-    apply_marker_rules(&mut style, current.clone(), stylesheets, ancestors);
-    apply_generated_pseudo_rules(&mut style, current.clone(), stylesheets, ancestors);
-    apply_typographic_pseudo_rules(&mut style, current, stylesheets, ancestors);
+    apply_marker_rules(&mut style, &current, stylesheets, ancestors);
+    apply_generated_pseudo_rules(&mut style, &current, stylesheets, ancestors);
+    apply_typographic_pseudo_rules(&mut style, &current, stylesheets, ancestors);
     finalize_text_decoration_layers(&mut style);
     style
+}
+
+/// Add value-dependent HTML presentational hints for the current element.
+///
+/// Static presentational hints live in `html5_ph.css`. Legacy attributes whose
+/// declarations depend on parsed attribute values are injected here with the
+/// same author-origin, zero-specificity cascade priority:
+/// <https://html.spec.whatwg.org/multipage/rendering.html#presentational-hints>.
+fn push_dynamic_html_presentational_hint_declarations(
+    output: &mut Vec<CascadedDeclaration<'_>>,
+    element: &ElementSignature,
+    stylesheet_index: usize,
+) {
+    if element.tag != "hr" {
+        return;
+    }
+    let mut declaration_order = 0usize;
+    if let Some(width) = element
+        .attrs
+        .get("width")
+        .and_then(|value| html_dimension_property_value(value))
+    {
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            &mut declaration_order,
+            "width",
+            width,
+        );
+    }
+
+    let size = element
+        .attrs
+        .get("size")
+        .and_then(|value| parse_html_non_negative_integer(value));
+    if let Some(size) = size {
+        let shaded_solid =
+            element.attrs.contains_key("color") || element.attrs.contains_key("noshade");
+        if shaded_solid {
+            if size >= 1 {
+                push_dynamic_html_presentational_hint_declaration(
+                    output,
+                    stylesheet_index,
+                    &mut declaration_order,
+                    "border-width",
+                    format!("{}px", format_html_number(size as f32 / 2.0)),
+                );
+            }
+        } else if size == 1 {
+            push_dynamic_html_presentational_hint_declaration(
+                output,
+                stylesheet_index,
+                &mut declaration_order,
+                "border-bottom-width",
+                "0".to_string(),
+            );
+        } else if size > 1 {
+            push_dynamic_html_presentational_hint_declaration(
+                output,
+                stylesheet_index,
+                &mut declaration_order,
+                "height",
+                format!("{}px", size - 2),
+            );
+        }
+    }
+
+    if let Some(color) = element
+        .attrs
+        .get("color")
+        .and_then(|value| html_legacy_color_hint_value(value))
+    {
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            &mut declaration_order,
+            "border-color",
+            color.clone(),
+        );
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            &mut declaration_order,
+            "color",
+            color,
+        );
+    }
+}
+
+fn push_dynamic_html_presentational_hint_declaration(
+    output: &mut Vec<CascadedDeclaration<'_>>,
+    stylesheet_index: usize,
+    declaration_order: &mut usize,
+    name: &'static str,
+    value: String,
+) {
+    output.push(CascadedDeclaration {
+        name: std::borrow::Cow::Borrowed(name),
+        value: std::borrow::Cow::Owned(value),
+        origin: StylesheetOrigin::Author,
+        base_url: None,
+        root_url: None,
+        important: false,
+        layer_order: None,
+        specificity: 0,
+        scope_proximity: usize::MAX,
+        stylesheet_index,
+        rule_order: usize::MAX,
+        declaration_order: *declaration_order,
+    });
+    *declaration_order += 1;
+}
+
+fn html_dimension_property_value(value: &str) -> Option<String> {
+    let value = value.trim_start_matches(is_html_space);
+    let mut end = 0usize;
+    let mut saw_digit = false;
+    let mut saw_dot = false;
+    for (index, character) in value.char_indices() {
+        if character.is_ascii_digit() {
+            saw_digit = true;
+            end = index + character.len_utf8();
+        } else if character == '.' && !saw_dot {
+            saw_dot = true;
+            end = index + character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if !saw_digit {
+        return None;
+    }
+    if value[..end].parse::<f32>().ok()? < 0.0 {
+        return None;
+    }
+    if value[end..].starts_with('%') {
+        Some(format!("{}%", &value[..end]))
+    } else {
+        Some(format!("{}px", &value[..end]))
+    }
+}
+
+fn parse_html_non_negative_integer(value: &str) -> Option<i32> {
+    let value = value.trim_start_matches(is_html_space);
+    let (sign, rest) = match value.as_bytes().first().copied() {
+        Some(b'+') => (1, &value[1..]),
+        Some(b'-') => (-1, &value[1..]),
+        _ => (1, value),
+    };
+    let digit_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_len == 0 {
+        return None;
+    }
+    let integer = rest[..digit_len].parse::<i32>().ok()? * sign;
+    (integer >= 0).then_some(integer)
+}
+
+fn html_legacy_color_hint_value(value: &str) -> Option<String> {
+    let trimmed = value.trim_matches(is_html_space);
+    if trimmed.eq_ignore_ascii_case("transparent") || trimmed.eq_ignore_ascii_case("currentcolor") {
+        return None;
+    }
+    let color = parse_color(trimmed)?;
+    if color.a < 0.999 {
+        return None;
+    }
+    Some(format!(
+        "#{:02x}{:02x}{:02x}",
+        css_color_channel(color.r),
+        css_color_channel(color.g),
+        css_color_channel(color.b)
+    ))
+}
+
+fn css_color_channel(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn format_html_number(value: f32) -> String {
+    if value.fract().abs() < 0.000001 {
+        format!("{}", value as i32)
+    } else {
+        format!("{value}")
+    }
+}
+
+fn is_html_space(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\n' | '\u{0c}' | '\r')
 }
 
 /// Derive the active decoration chain for this element.
@@ -279,7 +412,7 @@ pub(super) fn resolve_ua_relative_margins(style: &mut ComputedStyle) {
 
 pub(super) fn apply_marker_rules(
     style: &mut ComputedStyle,
-    current: ElementSignature,
+    current: &ElementSignature,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
 ) {
@@ -290,7 +423,7 @@ pub(super) fn apply_marker_rules(
             if let Some(scope_proximity) = selector_matches_with_scope_proximity(
                 &rule.selector,
                 &rule.scopes,
-                current.clone(),
+                current,
                 ancestors,
             ) {
                 matching_rules.push(MatchedRule {
@@ -314,8 +447,8 @@ pub(super) fn apply_marker_rules(
     // cascade onto that pseudo-element style.
     // https://www.w3.org/TR/css-pseudo-4/#marker-pseudo
     // https://www.w3.org/TR/css-lists-3/#marker-properties
-    let mut marker_style = style.clone();
     let inheritance_source = style.clone();
+    let mut marker_style = pseudo_inherited_base_style(style);
     marker_style.marker_style = None;
     marker_style.before_style = None;
     marker_style.after_style = None;
@@ -347,13 +480,13 @@ pub(super) fn apply_marker_rules(
 
 pub(super) fn apply_generated_pseudo_rules(
     style: &mut ComputedStyle,
-    current: ElementSignature,
+    current: &ElementSignature,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
 ) {
     style.before_style = generated_pseudo_style(
         style,
-        current.clone(),
+        current,
         stylesheets,
         ancestors,
         |stylesheet| &stylesheet.before_rules,
@@ -368,7 +501,7 @@ pub(super) fn apply_generated_pseudo_rules(
 
 pub(super) fn generated_pseudo_style(
     originating_style: &ComputedStyle,
-    current: ElementSignature,
+    current: &ElementSignature,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
     rule_set: fn(&Stylesheet) -> &[StyleRule],
@@ -380,7 +513,7 @@ pub(super) fn generated_pseudo_style(
             if let Some(scope_proximity) = selector_matches_with_scope_proximity(
                 &rule.selector,
                 &rule.scopes,
-                current.clone(),
+                current,
                 ancestors,
             ) {
                 matching_rules.push(MatchedRule {
@@ -401,9 +534,10 @@ pub(super) fn generated_pseudo_style(
     // CSS Pseudo-Elements 4: `::before`/`::after` are generated boxes whose
     // styles inherit from their originating element, then cascade pseudo rules.
     // https://www.w3.org/TR/css-pseudo-4/#generated-content
-    let mut pseudo_style = originating_style.clone();
     let inheritance_source = originating_style.clone();
+    let mut pseudo_style = pseudo_inherited_base_style(originating_style);
     pseudo_style.content = Content::None;
+    pseudo_style.display = Display::INLINE;
     pseudo_style.before_style = None;
     pseudo_style.after_style = None;
     pseudo_style.marker_style = None;
@@ -434,13 +568,13 @@ pub(super) fn generated_pseudo_style(
 
 pub(super) fn apply_typographic_pseudo_rules(
     style: &mut ComputedStyle,
-    current: ElementSignature,
+    current: &ElementSignature,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
 ) {
     style.first_line_style = typographic_pseudo_style(
         style,
-        current.clone(),
+        current,
         stylesheets,
         ancestors,
         |stylesheet| &stylesheet.first_line_rules,
@@ -460,7 +594,7 @@ pub(super) fn apply_typographic_pseudo_rules(
 
 pub(super) fn typographic_pseudo_style(
     originating_style: &ComputedStyle,
-    current: ElementSignature,
+    current: &ElementSignature,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
     rule_set: fn(&Stylesheet) -> &[StyleRule],
@@ -473,7 +607,7 @@ pub(super) fn typographic_pseudo_style(
             if let Some(scope_proximity) = selector_matches_with_scope_proximity(
                 &rule.selector,
                 &rule.scopes,
-                current.clone(),
+                current,
                 ancestors,
             ) {
                 matching_rules.push(MatchedRule {
@@ -496,8 +630,8 @@ pub(super) fn typographic_pseudo_style(
     // originating element before pseudo-element rules cascade.
     // https://www.w3.org/TR/css-pseudo-4/#first-line-pseudo
     // https://www.w3.org/TR/css-pseudo-4/#first-letter-pseudo
-    let mut pseudo_style = originating_style.clone();
     let inheritance_source = originating_style.clone();
+    let mut pseudo_style = pseudo_inherited_base_style(originating_style);
     pseudo_style.before_style = None;
     pseudo_style.after_style = None;
     pseudo_style.marker_style = None;

@@ -52,27 +52,37 @@ enum PageContentPart {
 ///
 /// CSS Paged Media creates page-margin boxes from the `content` property, and
 /// CSS GCPM adds page-local functions such as `string()` and `element()`.
-/// Resolving those page-only functions before layout keeps the remaining items
-/// as CSS Content primitives, including images and leader/quote tokens:
+/// Resolving those page-only functions before layout keeps inline content as
+/// CSS Content primitives while preserving `element()` as an embedded
+/// running-element item:
 /// <https://www.w3.org/TR/css-page-3/#margin-boxes> and
 /// <https://www.w3.org/TR/css-gcpm-3/#content-list>.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum PageMarginContentItem {
+    Inline(GeneratedContentPart),
+    EmbeddedRunningElement(Box<RunningElementCapture>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct ResolvedPageContent {
-    pub(super) parts: Vec<GeneratedContentPart>,
+    pub(super) items: Vec<PageMarginContentItem>,
 }
 
 impl ResolvedPageContent {
     pub(super) fn is_empty(&self) -> bool {
-        self.parts.iter().all(|part| match part {
-            GeneratedContentPart::Text(text) | GeneratedContentPart::Leader(text) => {
-                trim_css_collapsible_whitespace(text).is_empty()
-            }
-            GeneratedContentPart::Quote(_) => true,
-            GeneratedContentPart::Contents
-            | GeneratedContentPart::Attr { .. }
-            | GeneratedContentPart::Counter { .. }
-            | GeneratedContentPart::Counters { .. }
-            | GeneratedContentPart::Image { .. } => false,
+        self.items.iter().all(|item| match item {
+            PageMarginContentItem::Inline(part) => match part {
+                GeneratedContentPart::Text(text) | GeneratedContentPart::Leader(text) => {
+                    trim_css_collapsible_whitespace(text).is_empty()
+                }
+                GeneratedContentPart::Quote(_) => true,
+                GeneratedContentPart::Contents
+                | GeneratedContentPart::Attr { .. }
+                | GeneratedContentPart::Counter { .. }
+                | GeneratedContentPart::Counters { .. }
+                | GeneratedContentPart::Image { .. } => false,
+            },
+            PageMarginContentItem::EmbeddedRunningElement(_) => false,
         })
     }
 }
@@ -138,13 +148,19 @@ pub(super) fn resolve_page_content_parts(
                     push_resolved_text(&mut output, &fallback);
                 }
             }
-            PageContentPart::Image { url } => output.push(GeneratedContentPart::Image {
-                url,
-                base_url: context.base_url.map(Path::to_path_buf),
-                root_url: context.root_url.map(Path::to_path_buf),
-            }),
-            PageContentPart::Quote(quote) => output.push(GeneratedContentPart::Quote(quote)),
-            PageContentPart::Leader(text) => output.push(GeneratedContentPart::Leader(text)),
+            PageContentPart::Image { url } => {
+                output.push(PageMarginContentItem::Inline(GeneratedContentPart::Image {
+                    url,
+                    base_url: context.base_url.map(Path::to_path_buf),
+                    root_url: context.root_url.map(Path::to_path_buf),
+                }))
+            }
+            PageContentPart::Quote(quote) => output.push(PageMarginContentItem::Inline(
+                GeneratedContentPart::Quote(quote),
+            )),
+            PageContentPart::Leader(text) => output.push(PageMarginContentItem::Inline(
+                GeneratedContentPart::Leader(text),
+            )),
             PageContentPart::PageCounter { style } => {
                 push_resolved_text(
                     &mut output,
@@ -201,38 +217,69 @@ pub(super) fn resolve_page_content_parts(
                 }
             }
             PageContentPart::NamedString { name, keyword } => {
-                if let Some(value) = resolve_page_assignment(
+                if let Some(assignment) = resolve_page_assignment(
                     &name,
                     &keyword,
                     context.page_index,
                     context.page_named_strings,
                 ) {
-                    push_resolved_text(&mut output, value);
+                    append_assignment_generated_content(&mut output, assignment);
                 }
             }
             PageContentPart::RunningElement { name, keyword } => {
-                if let Some(value) = resolve_page_assignment(
+                if let Some(assignment) = resolve_page_assignment(
                     &name,
                     &keyword,
                     context.page_index,
                     context.page_running_elements,
                 ) {
-                    push_resolved_text(&mut output, value);
+                    append_assignment_generated_content(&mut output, assignment);
                 }
             }
         }
     }
-    Some(ResolvedPageContent { parts: output })
+    Some(ResolvedPageContent { items: output })
 }
 
-fn push_resolved_text(output: &mut Vec<GeneratedContentPart>, value: &str) {
+fn append_assignment_generated_content(
+    output: &mut Vec<PageMarginContentItem>,
+    assignment: &NamedStringAssignment,
+) {
+    match &assignment.value {
+        PageAssignmentValue::GeneratedContent(parts) => {
+            append_resolved_items(output, parts);
+        }
+        PageAssignmentValue::RunningElement(capture) => {
+            output.push(PageMarginContentItem::EmbeddedRunningElement(
+                capture.clone(),
+            ));
+        }
+    }
+}
+
+fn append_resolved_items(output: &mut Vec<PageMarginContentItem>, items: &[PageMarginContentItem]) {
+    for item in items {
+        match item {
+            PageMarginContentItem::Inline(GeneratedContentPart::Text(text)) => {
+                push_resolved_text(output, text)
+            }
+            _ => output.push(item.clone()),
+        }
+    }
+}
+
+fn push_resolved_text(output: &mut Vec<PageMarginContentItem>, value: &str) {
     let text = decode_css_escapes(&dom::decode_entities_public(value));
     if text.is_empty() {
         return;
     }
     match output.last_mut() {
-        Some(GeneratedContentPart::Text(previous)) => previous.push_str(&text),
-        _ => output.push(GeneratedContentPart::Text(text)),
+        Some(PageMarginContentItem::Inline(GeneratedContentPart::Text(previous))) => {
+            previous.push_str(&text)
+        }
+        _ => output.push(PageMarginContentItem::Inline(GeneratedContentPart::Text(
+            text,
+        ))),
     }
 }
 
@@ -611,28 +658,24 @@ fn resolve_page_assignment<'a>(
     keyword: &str,
     page_index: usize,
     page_assignments: &'a [HashMap<String, Vec<NamedStringAssignment>>],
-) -> Option<&'a str> {
+) -> Option<&'a NamedStringAssignment> {
     if let Some(assignments) = page_assignments
         .get(page_index)
         .and_then(|strings| strings.get(name))
         .filter(|assignments| !assignments.is_empty())
     {
         return match keyword.to_ascii_lowercase().as_str() {
-            "first" => assignments
-                .first()
-                .map(|assignment| assignment.value.as_str()),
-            "last" => assignments
-                .last()
-                .map(|assignment| assignment.value.as_str()),
+            "first" => assignments.first(),
+            "last" => assignments.last(),
             "start" => assignments
                 .first()
-                .filter(|assignment| assignment.at_page_start)
-                .map(|assignment| assignment.value.as_str())
+                .filter(|assignment| {
+                    assignment.placement.page_index == page_index
+                        && assignment_starts_page_fragment(assignment)
+                })
                 .or_else(|| previous_page_assignment(name, page_index, page_assignments)),
             "first-except" => None,
-            _ => assignments
-                .first()
-                .map(|assignment| assignment.value.as_str()),
+            _ => assignments.first(),
         };
     }
     previous_page_assignment(name, page_index, page_assignments)
@@ -642,17 +685,16 @@ fn previous_page_assignment<'a>(
     name: &str,
     page_index: usize,
     page_assignments: &'a [HashMap<String, Vec<NamedStringAssignment>>],
-) -> Option<&'a str> {
+) -> Option<&'a NamedStringAssignment> {
     page_assignments
         .iter()
         .take(page_index)
         .rev()
-        .find_map(|strings| {
-            strings
-                .get(name)
-                .and_then(|assignments| assignments.last())
-                .map(|assignment| assignment.value.as_str())
-        })
+        .find_map(|strings| strings.get(name).and_then(|assignments| assignments.last()))
+}
+
+fn assignment_starts_page_fragment(assignment: &NamedStringAssignment) -> bool {
+    assignment.placement.starts_page_fragment && assignment.placement.border_box.is_some()
 }
 
 fn strip_ascii_function<'a>(value: &'a str, name: &str) -> Option<&'a str> {

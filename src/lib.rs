@@ -18,9 +18,10 @@ mod timing;
 pub use css::{Color, Css};
 pub use document::{
     Bookmark, BookmarkState, Document, DocumentFont, DocumentMetadata, Page, PaintOperation,
-    RenderedCornerRadius, RenderedGlyph, RenderedImage, RenderedLine, RenderedLink, RenderedPath,
-    RenderedPathCommand, RenderedPathFillRule, RenderedRect, RenderedRoundedRect,
-    RenderedRoundedRectRadii, RenderedStroke, RenderedTextRun,
+    PaintPoint, PaintRect, PaintSize, PdfVariant, RenderedCornerRadius, RenderedGlyph,
+    RenderedImage, RenderedLine, RenderedLink, RenderedPath, RenderedPathCommand,
+    RenderedPathFillRule, RenderedRect, RenderedRoundedRect, RenderedRoundedRectRadii,
+    RenderedStroke, RenderedTextMatrix, RenderedTextRun,
 };
 pub use error::{Error, Result};
 pub use html::Html;

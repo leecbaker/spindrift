@@ -223,6 +223,9 @@ pub(super) fn page_value_sources_from_style_and_children(
         .map(|name| (name, true))
         .unwrap_or((None, false));
     let mut end = own.map(|name| (name, true)).unwrap_or((None, false));
+    if style.display.is_flex() {
+        return (start, end);
+    }
     let normal_flow_children = child_boxes
         .iter()
         .filter(|child| formatting_box_is_in_normal_flow(child))
@@ -697,7 +700,7 @@ pub(super) fn relative_position_offset(
     style: &ComputedStyle,
     containing_block: ContainingBlock,
 ) -> RelativeOffset {
-    if style.position != Position::Relative {
+    if !matches!(style.position, Position::Relative | Position::Sticky) {
         return RelativeOffset { x: 0.0, y: 0.0 };
     }
     let left = used_inset_left(style, containing_block);

@@ -41,6 +41,30 @@ pub(super) struct UsedBoxEdges {
     pub(super) padding: UsedEdges,
 }
 
+/// Used physical box metrics after margin and padding percentages are resolved.
+///
+/// CSS Box Model lays out content, padding, border, and margin as nested
+/// physical edges; CSS 2.2 resolves margin and padding percentages against the
+/// containing block width before used geometry is computed:
+/// <https://www.w3.org/TR/css-box-3/#box-model> and
+/// <https://www.w3.org/TR/CSS22/box.html#box-dimensions>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct UsedBoxMetrics {
+    pub(super) margin: css::Edges,
+    pub(super) padding: css::Edges,
+    pub(super) border: css::Edges,
+}
+
+impl UsedBoxMetrics {
+    pub(super) fn horizontal_non_content(self) -> f32 {
+        self.border.left + self.border.right + self.padding.left + self.padding.right
+    }
+
+    pub(super) fn vertical_non_content(self) -> f32 {
+        self.border.top + self.border.bottom + self.padding.top + self.padding.bottom
+    }
+}
+
 /// Resolves a computed `<length-percentage>` against a used percentage basis.
 ///
 /// CSS Values and Units Level 4 defines computed `<length-percentage>` values
@@ -236,6 +260,81 @@ pub(super) fn used_box_edges(style: &ComputedStyle, inline_basis: f32) -> UsedBo
     UsedBoxEdges {
         margin: used_margin_edges(style, inline_basis),
         padding: used_padding_edges(style, inline_basis),
+    }
+}
+
+/// Return used box metrics without mutating the caller's style.
+///
+/// This is useful for intrinsic sizing paths that need resolved non-content
+/// edges but must not overwrite the computed style carried by a formatting box.
+/// CSS separates computed and used values:
+/// <https://www.w3.org/TR/css-cascade-5/#value-stages>.
+pub(super) fn used_box_metrics(style: &ComputedStyle, inline_basis: f32) -> UsedBoxMetrics {
+    let used_edges = used_box_edges(style, inline_basis);
+    UsedBoxMetrics {
+        margin: used_edges.margin.to_css_edges(),
+        padding: used_edges.padding.to_css_edges(),
+        border: used_border_widths(style),
+    }
+}
+
+/// Resolve a temporary layout style's margin and padding and return box metrics.
+///
+/// Layout code often needs both the mutated style, so later code can consume
+/// used edge values, and the derived non-content sizes. Keeping those steps
+/// together avoids call sites accidentally mixing computed and used edges:
+/// <https://www.w3.org/TR/css-cascade-5/#used>.
+pub(super) fn apply_used_box_metrics(
+    style: &mut ComputedStyle,
+    inline_basis: f32,
+) -> UsedBoxMetrics {
+    let metrics = used_box_metrics(style, inline_basis);
+    style.margin = metrics.margin;
+    style.padding = metrics.padding;
+    metrics
+}
+
+/// Resolve horizontal `auto` margins for a normal-flow block with a used width.
+///
+/// CSS 2.2 defines the block width equation over horizontal margins, borders,
+/// padding, and width. Once the used border-box width is known, auto horizontal
+/// margins absorb remaining inline space; when no horizontal margin is auto,
+/// the over-constrained side is handled during positioning:
+/// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth>.
+pub(super) fn resolve_normal_flow_block_auto_margins(
+    style: &mut ComputedStyle,
+    containing_inline_size: f32,
+    border_box_width: f32,
+    containing_direction: Direction,
+) {
+    let left_auto = style.box_values.margin.left.is_auto();
+    let right_auto = style.box_values.margin.right.is_auto();
+    if has_auto_width(style) || (!left_auto && !right_auto) {
+        return;
+    }
+
+    let free_space =
+        containing_inline_size - style.margin.left - border_box_width - style.margin.right;
+    if left_auto && right_auto {
+        if free_space >= 0.0 {
+            style.margin.left = free_space / 2.0;
+            style.margin.right = free_space / 2.0;
+        } else {
+            match containing_direction {
+                Direction::Ltr => {
+                    style.margin.left = 0.0;
+                    style.margin.right = free_space;
+                }
+                Direction::Rtl => {
+                    style.margin.left = free_space;
+                    style.margin.right = 0.0;
+                }
+            }
+        }
+    } else if left_auto {
+        style.margin.left = free_space.max(0.0);
+    } else if right_auto {
+        style.margin.right = free_space.max(0.0);
     }
 }
 
@@ -484,7 +583,7 @@ pub(super) fn used_inset_left(
     style: &ComputedStyle,
     containing_block: ContainingBlock,
 ) -> Option<f32> {
-    used_length_percentage_or_auto(style.box_values.inset_left, containing_block.width)
+    used_length_percentage_or_auto(style.box_values.inset_left, containing_block.width())
 }
 
 /// Resolves the physical `right` inset for positioned layout.
@@ -495,7 +594,7 @@ pub(super) fn used_inset_right(
     style: &ComputedStyle,
     containing_block: ContainingBlock,
 ) -> Option<f32> {
-    used_length_percentage_or_auto(style.box_values.inset_right, containing_block.width)
+    used_length_percentage_or_auto(style.box_values.inset_right, containing_block.width())
 }
 
 /// Resolves the physical `top` inset for positioned layout.
@@ -506,7 +605,7 @@ pub(super) fn used_inset_top(
     style: &ComputedStyle,
     containing_block: ContainingBlock,
 ) -> Option<f32> {
-    used_length_percentage_or_auto(style.box_values.inset_top, containing_block.height)
+    used_length_percentage_or_auto(style.box_values.inset_top, containing_block.height())
 }
 
 /// Resolves the physical `bottom` inset for positioned layout.
@@ -517,7 +616,7 @@ pub(super) fn used_inset_bottom(
     style: &ComputedStyle,
     containing_block: ContainingBlock,
 ) -> Option<f32> {
-    used_length_percentage_or_auto(style.box_values.inset_bottom, containing_block.height)
+    used_length_percentage_or_auto(style.box_values.inset_bottom, containing_block.height())
 }
 
 /// Replaces computed width with a definite used width for a temporary layout style.

@@ -1,12 +1,11 @@
 use super::*;
 use crate::text::{
-    character_is_css_word_separator, is_css_preserved_document_space,
-    line_end_letter_spacing_width, trim_css_collapsible_whitespace,
-    trim_end_css_collapsible_whitespace, trim_start_css_collapsible_whitespace,
-    trim_trailing_css_hanging_space_separators,
+    character_is_css_word_separator, inter_character_gap_allowed_between_text,
+    is_css_preserved_document_space, line_end_letter_spacing_width,
+    trim_css_collapsible_whitespace, trim_end_css_collapsible_whitespace,
+    trim_start_css_collapsible_whitespace, trim_trailing_css_hanging_space_separators,
+    typographic_unit_count, typographic_unit_ranges,
 };
-
-const INLINE_LINE_WIDTH_EPSILON: f32 = 0.5;
 
 pub(super) fn char_boundary_slice(text: &str, range: std::ops::Range<usize>) -> Option<String> {
     if text.is_empty() {
@@ -62,11 +61,6 @@ pub(super) fn inline_line_item_is_collapsible_space(item: &InlineLineItem) -> bo
     )
 }
 
-fn inline_fragment_is_collapsible_space(fragment: &InlineFragment) -> bool {
-    fragment.style.white_space.collapses_spaces()
-        && fragment.text.chars().all(is_css_collapsible_whitespace)
-}
-
 /// Return whether a line item is a `pre-wrap` space run that can hang.
 ///
 /// CSS Text phase II makes preserved spaces at the end of a soft-wrapped
@@ -91,106 +85,6 @@ pub(super) fn inline_line_item_is_pre_wrap_hanging_space(item: &InlineLineItem) 
 pub(super) fn inline_fragment_is_pre_wrap_hanging_space(fragment: &InlineFragment) -> bool {
     fragment.style.white_space == WhiteSpace::PreWrap
         && fragment.text.chars().all(is_css_preserved_document_space)
-}
-
-pub(super) fn trim_trailing_inline_line_spaces(
-    line: &mut Vec<InlineLineItem>,
-    font_system: &mut FontSystem,
-) -> f32 {
-    let mut trimmed_width = 0.0;
-    while let Some(InlineLineItem::Fragment(fragment)) = line.last()
-        && fragment.style.white_space.collapses_spaces()
-        && fragment.text.chars().all(is_css_collapsible_whitespace)
-    {
-        trimmed_width += font_system.measure_text(&fragment.text, &fragment.style);
-        line.pop();
-    }
-    trimmed_width
-}
-
-/// Remove `pre-wrap` spaces that hang at a soft line boundary.
-///
-/// The CSS Text white-space phase II rules consume these preserved spaces as
-/// line-break opportunities without letting their advances affect line
-/// measurement or painting:
-/// <https://www.w3.org/TR/css-text-3/#white-space-phase-2>.
-pub(super) fn trim_trailing_pre_wrap_hanging_inline_line_spaces(
-    line: &mut Vec<InlineLineItem>,
-    font_system: &mut FontSystem,
-) -> f32 {
-    let mut trimmed_width = 0.0;
-    while let Some(item) = line.last()
-        && inline_line_item_is_pre_wrap_hanging_space(item)
-    {
-        if let InlineLineItem::Fragment(fragment) = item {
-            trimmed_width += font_system.measure_text(&fragment.text, &fragment.style);
-        }
-        line.pop();
-    }
-    trimmed_width
-}
-
-/// Return the advance excluded by CSS Text trailing space-separator hanging.
-///
-/// CSS Text phase II keeps trailing "other space separators" in the formatted
-/// line for painting, but excludes their advance from line measurement for
-/// `white-space: normal`, `nowrap`, and `pre-line`:
-/// <https://www.w3.org/TR/css-text-3/#white-space-phase-2>.
-pub(super) fn trailing_hanging_space_separator_width_for_fragments(
-    fragments: &[InlineFragment],
-    font_system: &mut FontSystem,
-) -> f32 {
-    let mut width = 0.0;
-    for fragment in fragments.iter().rev() {
-        if fragment.text.is_empty() {
-            continue;
-        }
-        let measured = trim_trailing_css_hanging_space_separators(&fragment.text, &fragment.style);
-        if measured.len() == fragment.text.len() {
-            break;
-        }
-        width += font_system.measure_text(&fragment.text[measured.len()..], &fragment.style);
-        if !measured.is_empty() {
-            break;
-        }
-    }
-    width
-}
-
-/// Return the inline-end `letter-spacing` advance excluded from line measure.
-///
-/// CSS Text applies tracking between typographic character units and excludes
-/// it at line edges. Fragment-based inline layout sums raw fragment advances,
-/// then subtracts only the final text fragment's trailing tracking:
-/// <https://www.w3.org/TR/css-text-3/#letter-spacing-property>.
-pub(super) fn trailing_letter_spacing_width_for_fragments(fragments: &[InlineFragment]) -> f32 {
-    fragments
-        .iter()
-        .rev()
-        .find(|fragment| !fragment.text.is_empty())
-        .map(|fragment| line_end_letter_spacing_width(&fragment.text, &fragment.style))
-        .unwrap_or(0.0)
-}
-
-/// Measure the CSS line width of visible inline text fragments.
-///
-/// CSS Text trims collapsible line-edge spaces before alignment and
-/// justification, while hanging space separators and line-edge tracking are
-/// excluded from line measurement but can still paint:
-/// <https://www.w3.org/TR/css-text-3/#white-space-phase-2> and
-/// <https://www.w3.org/TR/css-text-3/#text-align-property>.
-pub(super) fn inline_fragment_line_width(
-    fragments: &[InlineFragment],
-    font_system: &mut FontSystem,
-) -> f32 {
-    let width = fragments
-        .iter()
-        .map(|fragment| font_system.measure_text(&fragment.text, &fragment.style))
-        .sum::<f32>();
-    (width
-        - trailing_hanging_space_separator_width_for_fragments(fragments, font_system)
-        - trailing_letter_spacing_width_for_fragments(fragments))
-    .max(0.0)
 }
 
 /// Return the inline-end `letter-spacing` advance excluded from mixed lines.
@@ -235,26 +129,148 @@ pub(super) fn trailing_hanging_space_separator_width_for_line_items(
     width
 }
 
-/// Return whether an inline item fits on the current line.
+/// Return an atomic inline's logical inline-size in the containing line.
 ///
-/// CSS Inline line breaking places the next inline item in the current line
-/// when its used inline-size fits the available measure. PDF/font/layout
-/// calculations pass through separate floating-point paths, so exact
-/// max-content fits get a sub-device-pixel tolerance rather than forcing a
-/// spurious soft wrap:
-/// <https://www.w3.org/TR/css-inline-3/#line-layout>.
-pub(super) fn inline_items_fit_line(
-    line_width: f32,
-    item_width: f32,
-    available_width: f32,
-) -> bool {
-    line_width + item_width <= available_width + INLINE_LINE_WIDTH_EPSILON
+/// CSS Writing Modes maps inline-level layout to logical axes before painting
+/// physical boxes. Atomic inline boxes keep physical dimensions internally,
+/// so line measurement must remap them through the parent writing mode:
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box> and
+/// <https://www.w3.org/TR/css-inline-3/#atomic-inline>.
+pub(super) fn inline_atom_logical_inline_size(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+) -> f32 {
+    match containing_style.writing_mode {
+        WritingMode::HorizontalTb => atom.width,
+        WritingMode::VerticalRl | WritingMode::VerticalLr => atom.height,
+    }
 }
 
-pub(super) fn inline_line_item_height(item: &InlineLineItem) -> f32 {
+/// Return an atomic inline's logical block-size in the containing line.
+///
+/// Atomic inline boxes are stored as physical margin boxes, but line box
+/// ascent/descent calculations use the logical block axis selected by the
+/// parent inline formatting context:
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box> and
+/// <https://www.w3.org/TR/css-inline-3/#line-box>.
+pub(super) fn inline_atom_logical_block_size(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+) -> f32 {
+    match containing_style.writing_mode {
+        WritingMode::HorizontalTb => atom.height,
+        WritingMode::VerticalRl | WritingMode::VerticalLr => atom.width,
+    }
+}
+
+pub(super) fn inline_atom_logical_inline_start_margin(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+) -> f32 {
+    inline_atom_margin_for_side(
+        atom,
+        inline_start_side(containing_style.writing_mode, containing_style.direction),
+    )
+}
+
+pub(super) fn inline_atom_logical_inline_end_margin(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+) -> f32 {
+    inline_atom_margin_for_side(
+        atom,
+        inline_end_side(containing_style.writing_mode, containing_style.direction),
+    )
+}
+
+pub(super) fn inline_atom_logical_block_start_margin(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+) -> f32 {
+    inline_atom_margin_for_side(atom, block_start_side(containing_style.writing_mode))
+}
+
+pub(super) fn inline_atom_logical_block_end_margin(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+) -> f32 {
+    inline_atom_margin_for_side(atom, block_end_side(containing_style.writing_mode))
+}
+
+pub(super) fn inline_atom_logical_border_inline_size(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+) -> f32 {
+    (inline_atom_logical_inline_size(atom, containing_style)
+        - inline_atom_logical_inline_start_margin(atom, containing_style)
+        - inline_atom_logical_inline_end_margin(atom, containing_style))
+    .max(0.0)
+}
+
+pub(super) fn inline_atom_logical_border_block_size(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+) -> f32 {
+    (inline_atom_logical_block_size(atom, containing_style)
+        - inline_atom_logical_block_start_margin(atom, containing_style)
+        - inline_atom_logical_block_end_margin(atom, containing_style))
+    .max(0.0)
+}
+
+/// Return a line item's logical block-size in its containing line.
+///
+/// Text fragments expose `line-height` in the line block axis. Atomic inline
+/// boxes expose their physical margin boxes, which must be converted to the
+/// parent logical block axis before line metrics are resolved:
+/// <https://www.w3.org/TR/css-inline-3/#line-box>.
+pub(super) fn inline_line_item_logical_block_size(
+    item: &InlineLineItem,
+    containing_style: &ComputedStyle,
+) -> f32 {
     match item {
         InlineLineItem::Fragment(fragment) => fragment.style.line_height,
-        InlineLineItem::Atom(atom) => atom.height,
+        InlineLineItem::Atom(atom)
+            if matches!(
+                atom.content,
+                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge)
+            ) =>
+        {
+            atom.style.line_height
+        }
+        InlineLineItem::Atom(atom) => inline_atom_logical_block_size(atom, containing_style),
+        InlineLineItem::Float(_) => 0.0,
+    }
+}
+
+/// Return an atomic inline baseline offset in the containing line block axis.
+///
+/// Horizontal atomic baselines are stored as physical top-to-baseline offsets.
+/// Vertical inline formatting contexts need a baseline in the horizontal
+/// logical block axis; until atoms carry explicit vertical baseline sets, use
+/// the CSS Align synthesized baseline from the atom's border box:
+/// <https://drafts.csswg.org/css-align-3/#generate-baselines>.
+pub(super) fn inline_atom_logical_baseline_offset(
+    atom: &InlineAtom,
+    containing_style: &ComputedStyle,
+) -> f32 {
+    match containing_style.writing_mode {
+        WritingMode::HorizontalTb => {
+            atom.style.margin.top + atom.baseline_offset - atom.baseline_shift
+        }
+        WritingMode::VerticalRl | WritingMode::VerticalLr => {
+            inline_atom_logical_block_start_margin(atom, containing_style)
+                + inline_atom_logical_border_block_size(atom, containing_style)
+                - atom.baseline_shift
+        }
+    }
+}
+
+fn inline_atom_margin_for_side(atom: &InlineAtom, side: PhysicalSide) -> f32 {
+    match side {
+        PhysicalSide::Top => atom.style.margin.top,
+        PhysicalSide::Right => atom.style.margin.right,
+        PhysicalSide::Bottom => atom.style.margin.bottom,
+        PhysicalSide::Left => atom.style.margin.left,
     }
 }
 
@@ -310,15 +326,14 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 box_tree::FormattingBox::AtomicInline(box_) => {
                     if let Some(fragment) = box_.table_fragment.as_ref() {
-                        let (_, max_content) = self.table_intrinsic_widths_from_fragment(
+                        let (_, max_content) = self.table_outer_intrinsic_widths_from_fragment(
                             box_.element,
                             &box_.style,
                             stylesheets,
                             fragment,
                             available_width,
                         );
-                        return width
-                            .max(max_content + box_.style.margin.left + box_.style.margin.right);
+                        return width.max(max_content);
                     }
                     let child_width = self
                         .inline_boxes_max_content_width(
@@ -368,14 +383,14 @@ impl<'a> LayoutBuilder<'a> {
                         + box_.style.margin.right
                 }
                 box_tree::FormattingBox::Table(box_) => {
-                    let (_, max_content) = self.table_intrinsic_widths_from_fragment(
+                    let (_, max_content) = self.table_outer_intrinsic_widths_from_fragment(
                         box_.element,
                         &box_.style,
                         stylesheets,
                         &box_.fragment,
                         available_width,
                     );
-                    max_content + box_.style.margin.left + box_.style.margin.right
+                    max_content
                 }
                 box_tree::FormattingBox::Flex(box_) => box_
                     .style
@@ -416,6 +431,7 @@ pub(super) fn can_paint_inline_fragments_together(
 ) -> bool {
     left.mergeable
         && right.mergeable
+        && left.source == right.source
         && (left.baseline_shift - right.baseline_shift).abs() < 0.01
         && left.link_target == right.link_target
         && (left.style.font_size - right.style.font_size).abs() < 0.01
@@ -438,9 +454,18 @@ pub(super) fn can_queue_inline_fragments_for_shaping(
     left: &InlineFragment,
     right: &InlineFragment,
 ) -> bool {
+    if left.source != right.source {
+        return false;
+    }
     can_paint_inline_fragments_together(left, right)
         || ((inline_fragment_is_join_control_only(left)
             || inline_fragment_is_join_control_only(right))
+            && can_shape_inline_fragments_together(left, right))
+        || ((inline_fragment_is_arabic_tatweel_only(left)
+            || inline_fragment_is_arabic_tatweel_only(right))
+            && can_shape_inline_fragments_together(left, right))
+        || ((inline_fragment_contains_joining_context(left)
+            || inline_fragment_contains_joining_context(right))
             && can_shape_inline_fragments_together(left, right))
 }
 
@@ -464,8 +489,7 @@ pub(super) fn can_shape_inline_fragments_together(
         return !inline_box_edge_breaks_shaping(&left.style)
             && !inline_box_bidi_isolation_breaks_shaping(&left.style);
     }
-    (left.baseline_shift - right.baseline_shift).abs() < 0.01
-        && left.style.vertical_align == right.style.vertical_align
+    left.style.vertical_align == right.style.vertical_align
         && left.style.writing_mode == right.style.writing_mode
         && left.style.language == right.style.language
         && !inline_box_edge_breaks_shaping(&left.style)
@@ -476,6 +500,16 @@ pub(super) fn can_shape_inline_fragments_together(
 
 pub(super) fn inline_fragment_is_join_control_only(fragment: &InlineFragment) -> bool {
     !fragment.text.is_empty() && fragment.text.chars().all(character_is_join_control)
+}
+
+pub(super) fn inline_fragment_is_arabic_tatweel_only(fragment: &InlineFragment) -> bool {
+    !fragment.text.is_empty() && fragment.text.chars().all(character_is_arabic_tatweel)
+}
+
+fn inline_fragment_contains_joining_context(fragment: &InlineFragment) -> bool {
+    fragment.text.chars().any(|character| {
+        character_is_join_control(character) || character_is_arabic_tatweel(character)
+    })
 }
 
 /// Return whether a style's bidi scope should affect inline line ordering.
@@ -529,43 +563,6 @@ pub(super) fn hanging_punctuation_widths(
             is_last_line,
             line_overflows,
         ),
-    }
-}
-
-/// Return the physical x offset for line-start hanging punctuation.
-///
-/// CSS Text defines `first` at the inline-start edge. Line alignment already
-/// excludes the hanging advance from measurement. In horizontal LTR text, the
-/// glyph is then painted before the measured content with a negative x offset.
-/// In horizontal RTL text, the measurement exclusion moves the line's physical
-/// origin toward the inline-start edge, so applying a second positive paint
-/// offset would double-count the hang:
-/// <https://www.w3.org/TR/css-text-3/#hanging-punctuation-property>.
-pub(super) fn line_start_hanging_punctuation_paint_offset(
-    style: &ComputedStyle,
-    hanging_width: f32,
-) -> f32 {
-    match style.direction {
-        Direction::Ltr => -hanging_width,
-        Direction::Rtl => 0.0,
-    }
-}
-
-/// Return the physical x offset for line-end hanging punctuation.
-///
-/// CSS Text excludes inline-end hanging punctuation from the measured line
-/// width. In horizontal LTR text, that leaves the line origin unchanged and the
-/// glyph paints beyond the physical right edge. In horizontal RTL text, the
-/// inline-end edge is physical left, so the painted line origin must move left
-/// by the hanging advance:
-/// <https://www.w3.org/TR/css-text-3/#hanging-punctuation-property>.
-pub(super) fn line_end_hanging_punctuation_paint_offset(
-    style: &ComputedStyle,
-    hanging_width: f32,
-) -> f32 {
-    match style.direction {
-        Direction::Ltr => 0.0,
-        Direction::Rtl => -hanging_width,
     }
 }
 
@@ -664,7 +661,7 @@ pub(super) fn end_hanging_punctuation_width_for_line_items(
         {
             Some(fragment)
         }
-        InlineLineItem::Fragment(_) | InlineLineItem::Atom(_) => None,
+        InlineLineItem::Fragment(_) | InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
     }) else {
         return 0.0;
     };
@@ -689,7 +686,7 @@ pub(super) fn hanging_punctuation_widths_for_line_items(
         .iter()
         .filter_map(|item| match item {
             InlineLineItem::Fragment(fragment) => Some(fragment.clone()),
-            InlineLineItem::Atom(_) => None,
+            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
         })
         .collect::<Vec<_>>();
     hanging_punctuation_widths(
@@ -700,304 +697,6 @@ pub(super) fn hanging_punctuation_widths_for_line_items(
         is_last_line,
         line_overflows,
     )
-}
-
-/// Return first-line start hanging width for a candidate inline line.
-///
-/// CSS Text excludes `hanging-punctuation: first` from line measurement, so
-/// line breaking must use the same reduced measure as painting and alignment;
-/// otherwise a first line can wrap too early before the punctuation is hung:
-/// <https://www.w3.org/TR/css-text-3/#hanging-punctuation-property>.
-pub(super) fn start_hanging_punctuation_width_for_candidate_line(
-    font_system: &mut FontSystem,
-    line: &[InlineLineItem],
-    item: &InlineLineItem,
-    block_style: &ComputedStyle,
-    is_first_line: bool,
-) -> f32 {
-    if !block_style.hanging_punctuation.first || !is_first_line {
-        return 0.0;
-    }
-    let mut candidate = line.to_vec();
-    candidate.push(item.clone());
-    hanging_punctuation_widths_for_line_items(
-        font_system,
-        &candidate,
-        block_style,
-        true,
-        false,
-        false,
-    )
-    .start
-}
-
-/// Return inline-end hanging width for a candidate inline line.
-///
-/// CSS Text evaluates `last`, `force-end`, and `allow-end` at the formatted
-/// line's inline-end edge. Inline layout therefore has to inspect the
-/// candidate line after appending the next item, not only the item being
-/// appended, so empty and zero-width inline boxes after punctuation do not
-/// suppress allowed hanging:
-/// <https://www.w3.org/TR/css-text-3/#hanging-punctuation-property>.
-pub(super) fn end_hanging_punctuation_width_for_candidate_line(
-    font_system: &mut FontSystem,
-    line: &[InlineLineItem],
-    item: &InlineLineItem,
-    block_style: &ComputedStyle,
-    is_last_line: bool,
-    line_overflows: bool,
-) -> f32 {
-    if !(block_style.hanging_punctuation.last
-        || block_style.hanging_punctuation.force_end
-        || block_style.hanging_punctuation.allow_end)
-    {
-        return 0.0;
-    }
-    let mut candidate = line.to_vec();
-    candidate.push(item.clone());
-    end_hanging_punctuation_width_for_line_items(
-        font_system,
-        &candidate,
-        block_style,
-        is_last_line,
-        line_overflows,
-    )
-}
-
-/// Make a soft hyphen visible when it is the chosen soft-wrap boundary.
-///
-/// CSS Text renders U+00AD SOFT HYPHEN only when the line breaks at that
-/// opportunity; otherwise it remains a shaping/line-breaking control:
-/// <https://www.w3.org/TR/css-text-3/#hyphenation>.
-pub(super) fn show_trailing_soft_hyphen_for_line(line: &mut [InlineLineItem]) {
-    let Some(InlineLineItem::Fragment(fragment)) = line.iter_mut().rev().find(|item| match item {
-        InlineLineItem::Fragment(fragment) => !fragment.text.is_empty(),
-        InlineLineItem::Atom(_) => true,
-    }) else {
-        return;
-    };
-    if fragment.text.ends_with('\u{00ad}') {
-        fragment.text.pop();
-        fragment.text.push('-');
-    }
-}
-
-/// Remove U+200B after it has contributed its CSS Text break opportunity.
-///
-/// HTML's UA stylesheet represents `wbr` as generated U+200B. That character
-/// must influence line breaking, but it must not paint or appear in rendered
-/// line summaries once the selected line has been materialized:
-/// <https://html.spec.whatwg.org/multipage/rendering.html#phrasing-content-3>
-/// and <https://www.w3.org/TR/css-text-3/#line-breaking>.
-pub(super) fn strip_zero_width_space_from_line_items(line: &mut Vec<InlineLineItem>) {
-    const ZERO_WIDTH_SPACE: char = '\u{200b}';
-    let mut index = 0;
-    while index < line.len() {
-        let remove = match &mut line[index] {
-            InlineLineItem::Fragment(fragment) => {
-                if fragment.text.contains(ZERO_WIDTH_SPACE) {
-                    fragment.text = fragment.text.replace(ZERO_WIDTH_SPACE, "");
-                }
-                fragment.text.is_empty()
-            }
-            InlineLineItem::Atom(_) => false,
-        };
-        if remove {
-            line.remove(index);
-        } else {
-            index += 1;
-        }
-    }
-}
-
-/// Select formatted CSS text lines from one paragraph of inline items.
-///
-/// Normal inline layout, generated/page-margin text, and text-only atomic
-/// inline boxes all need the same CSS Text processing order: white-space and
-/// transform normalization feed the inline opportunity graph, then selected
-/// graph ranges are trimmed, hung, soft-hyphen materialized, and shaped into
-/// durable line records:
-/// <https://www.w3.org/TR/css-text-3/#text-processing-order> and
-/// <https://www.w3.org/TR/css-text-3/#line-breaking>.
-pub(super) fn graph_text_lines_for_paragraph(
-    font_system: &mut FontSystem,
-    paragraph: &mut Vec<InlineItem>,
-    style: &ComputedStyle,
-    available_width: f32,
-) -> Vec<TextLine> {
-    trim_inline_item_edges(paragraph);
-    if paragraph.is_empty() {
-        return Vec::new();
-    }
-    let graph = inline_layout::build_inline_opportunity_graph(font_system, paragraph);
-    paragraph.clear();
-    if graph.is_empty() {
-        return Vec::new();
-    }
-
-    let mut lines = Vec::new();
-    let mut start = 0;
-    while start < graph.runs.len() {
-        while start < graph.runs.len()
-            && inline_line_item_is_collapsible_space(&graph.runs[start].item)
-        {
-            start += 1;
-        }
-        if start >= graph.runs.len() {
-            break;
-        }
-        let end = select_graph_text_line_end(
-            &graph,
-            start,
-            lines.len(),
-            font_system,
-            style,
-            available_width,
-        )
-        .max(start + 1)
-        .min(graph.runs.len());
-        let is_soft_break = end < graph.runs.len();
-        if let Some(line) =
-            materialize_graph_text_line(&graph, start..end, style, font_system, is_soft_break)
-        {
-            lines.push(line);
-        }
-        start = end;
-    }
-    lines
-}
-
-fn select_graph_text_line_end(
-    graph: &inline_layout::InlineOpportunityGraph,
-    start: usize,
-    line_index: usize,
-    font_system: &mut FontSystem,
-    style: &ComputedStyle,
-    available_width: f32,
-) -> usize {
-    let mut end = start;
-    let mut line_width = 0.0_f32;
-    let line_available_width = available_width.max(1.0);
-    while end < graph.runs.len() {
-        let run = &graph.runs[end];
-        let line = graph.line_items(start..end);
-        let first_hanging_punctuation_width = start_hanging_punctuation_width_for_candidate_line(
-            font_system,
-            &line,
-            &run.item,
-            style,
-            line_index == 0,
-        );
-        let remaining_allows_last = graph.runs[end + 1..].iter().all(|run| {
-            inline_line_item_is_collapsible_space(&run.item)
-                || inline_line_item_is_pre_wrap_hanging_space(&run.item)
-        });
-        let final_hanging_punctuation_width = end_hanging_punctuation_width_for_candidate_line(
-            font_system,
-            &line,
-            &run.item,
-            style,
-            remaining_allows_last,
-            true,
-        );
-        let candidate_fits = inline_items_fit_line(
-            line_width,
-            run.width,
-            line_available_width
-                + first_hanging_punctuation_width
-                + final_hanging_punctuation_width,
-        );
-        let final_preserved_space =
-            end + 1 == graph.runs.len() && inline_line_item_is_pre_wrap_hanging_space(&run.item);
-        if style.white_space.allows_soft_wrap()
-            && end > start
-            && !final_preserved_space
-            && !candidate_fits
-            && let Some(boundary) = best_graph_text_break_before(graph, start, end)
-        {
-            return boundary;
-        }
-        line_width += run.width;
-        end += 1;
-    }
-    end
-}
-
-fn best_graph_text_break_before(
-    graph: &inline_layout::InlineOpportunityGraph,
-    start: usize,
-    before_run: usize,
-) -> Option<usize> {
-    if let Some(boundary) = (start + 1..=before_run).rev().find(|boundary| {
-        matches!(
-            &graph.runs[*boundary].item,
-            InlineLineItem::Fragment(fragment)
-                if fragment.style.white_space == WhiteSpace::BreakSpaces
-                    && fragment.text.chars().all(is_css_collapsible_whitespace)
-        )
-    }) {
-        return Some(boundary);
-    }
-    (start + 1..=before_run)
-        .rev()
-        .find(|boundary| graph.break_opportunity_before(*boundary).is_some())
-}
-
-fn materialize_graph_text_line(
-    graph: &inline_layout::InlineOpportunityGraph,
-    range: std::ops::Range<usize>,
-    style: &ComputedStyle,
-    font_system: &mut FontSystem,
-    is_soft_break: bool,
-) -> Option<TextLine> {
-    let mut items = graph.line_items(range.clone());
-    let mut width = graph.line_width(range);
-    width -= trim_trailing_inline_line_spaces(&mut items, font_system);
-    if is_soft_break {
-        width -= trim_trailing_pre_wrap_hanging_inline_line_spaces(&mut items, font_system);
-        show_trailing_soft_hyphen_for_line(&mut items);
-    }
-    strip_zero_width_space_from_line_items(&mut items);
-    width -= trailing_hanging_space_separator_width_for_line_items(&items, font_system);
-    width -= trailing_letter_spacing_width_for_line_items(&items);
-    let width = width.max(0.0);
-    let text = graph_text_line_text(&items);
-    if text.is_empty() && width <= 0.0 {
-        return None;
-    }
-    let text = graph_text_line_visual_text(font_system, &text, style);
-    let shaped = font_system.shape_unwrapped_line(&text, style, style.line_height);
-    Some(TextLine::new(text, width, style.line_height).with_shaped(shaped))
-}
-
-fn graph_text_line_text(items: &[InlineLineItem]) -> String {
-    items
-        .iter()
-        .filter_map(|item| match item {
-            InlineLineItem::Fragment(fragment) => Some(fragment.text.as_str()),
-            InlineLineItem::Atom(_) => None,
-        })
-        .collect()
-}
-
-fn graph_text_line_visual_text(
-    font_system: &mut FontSystem,
-    text: &str,
-    style: &ComputedStyle,
-) -> String {
-    const ZERO_WIDTH_SPACE: char = '\u{200b}';
-    let ranges = font_system.visual_ranges_for_unwrapped_text(text, style);
-    if ranges.is_empty() {
-        return text_without_bidi_format_controls(text).replace(ZERO_WIDTH_SPACE, "");
-    }
-    let mut output = String::new();
-    for range in ranges {
-        let Some(text) = char_boundary_slice(text, range) else {
-            continue;
-        };
-        output.push_str(&text);
-    }
-    text_without_bidi_format_controls(&output).replace(ZERO_WIDTH_SPACE, "")
 }
 
 pub(super) fn last_hanging_punctuation_width_for_inline_items(
@@ -1027,6 +726,8 @@ pub(super) fn last_hanging_punctuation_width_for_inline_items(
             baseline_shift: word.baseline_shift,
             link_target: word.link_target.clone(),
             mergeable: word.mergeable,
+            source: word.source,
+            generated_leader: false,
             hanging_edges: word.hanging_edges,
         }),
         block_style,
@@ -1047,7 +748,7 @@ pub(super) fn line_box_uses_hanging_punctuation_alignment(style: &ComputedStyle)
 
 pub(super) fn anonymous_inline_content_needs_normalized_style(style: &ComputedStyle) -> bool {
     (style.display.is_block_level() && style.unicode_bidi == UnicodeBidi::Isolate)
-        || (!style.display.is_inline_level() && style.vertical_align != VerticalAlign::Baseline)
+        || (!style.display.is_inline_level() && style.vertical_align != VerticalAlign::BASELINE)
 }
 
 /// Return the style used by anonymous inline text inside a block container.
@@ -1070,7 +771,7 @@ pub(super) fn normalized_anonymous_inline_content_style(style: &ComputedStyle) -
         style.clone()
     };
     if !style.display.is_inline_level() {
-        style.vertical_align = VerticalAlign::Baseline;
+        style.vertical_align = VerticalAlign::BASELINE;
     }
     style
 }
@@ -1118,7 +819,7 @@ fn inline_box_bidi_isolation_breaks_shaping(style: &ComputedStyle) -> bool {
 /// <https://www.w3.org/TR/css-text-3/#text-justify-property> and
 /// <https://www.w3.org/TR/css-text-3/#word-separator>.
 pub(super) fn inline_fragment_is_inter_word_justification_space(fragment: &InlineFragment) -> bool {
-    fragment.text.chars().all(character_is_css_word_separator)
+    !fragment.generated_leader && fragment.text.chars().all(character_is_css_word_separator)
 }
 
 /// Return whether an inline fragment needs glyph or decoration paint.
@@ -1151,60 +852,6 @@ pub(super) fn justifiable_fragment_space_count(fragments: &[InlineFragment]) -> 
         .sum()
 }
 
-pub(super) fn justifiable_mixed_space_count(items: &[InlineLineItem]) -> usize {
-    let mut end = items.len();
-    while end > 0 && inline_line_item_is_pre_wrap_hanging_space(&items[end - 1]) {
-        end -= 1;
-    }
-    items[..end]
-        .iter()
-        .filter_map(|item| match item {
-            InlineLineItem::Fragment(fragment)
-                if inline_fragment_is_inter_word_justification_space(fragment) =>
-            {
-                Some(fragment.text.chars().count())
-            }
-            InlineLineItem::Fragment(_) | InlineLineItem::Atom(_) => None,
-        })
-        .sum()
-}
-
-pub(super) fn inter_character_fragment_gap_count(fragments: &[InlineFragment]) -> usize {
-    fragments
-        .iter()
-        .map(|fragment| typographic_unit_count(&fragment.text))
-        .sum::<usize>()
-        .saturating_sub(1)
-}
-
-pub(super) fn inter_character_mixed_gap_count(items: &[InlineLineItem]) -> usize {
-    let mut units = 0usize;
-    let mut in_atom_run = false;
-    for item in items {
-        match item {
-            InlineLineItem::Fragment(fragment) => {
-                in_atom_run = false;
-                units += typographic_unit_count(&fragment.text);
-            }
-            InlineLineItem::Atom(_) if !in_atom_run => {
-                in_atom_run = true;
-                units += 1;
-            }
-            InlineLineItem::Atom(_) => {}
-        }
-    }
-    units.saturating_sub(1)
-}
-
-pub(super) fn split_fragments_into_inter_character_units(
-    fragments: &[InlineFragment],
-) -> Vec<InlineFragment> {
-    fragments
-        .iter()
-        .flat_map(split_fragment_into_inter_character_units)
-        .collect()
-}
-
 pub(super) fn split_mixed_line_into_inter_character_units(
     items: &[InlineLineItem],
 ) -> Vec<InlineLineItem> {
@@ -1218,96 +865,332 @@ pub(super) fn split_mixed_line_into_inter_character_units(
                     .collect()
             }
             InlineLineItem::Atom(atom) => vec![InlineLineItem::Atom(atom.clone())],
+            InlineLineItem::Float(_) => Vec::new(),
         })
         .collect()
 }
 
-pub(super) fn inter_character_gap_after_mixed_item(items: &[InlineLineItem], index: usize) -> bool {
-    let Some(item) = items.get(index) else {
-        return false;
-    };
-    if matches!(item, InlineLineItem::Atom(_))
-        && items
-            .get(index + 1)
-            .is_some_and(|next| matches!(next, InlineLineItem::Atom(_)))
-    {
-        return false;
-    }
-    items[index + 1..].iter().any(|item| match item {
-        InlineLineItem::Fragment(fragment) => typographic_unit_count(&fragment.text) > 0,
-        InlineLineItem::Atom(_) => true,
-    })
-}
-
 fn split_fragment_into_inter_character_units(fragment: &InlineFragment) -> Vec<InlineFragment> {
-    let boundaries = GraphemeClusterSegmenter::new()
-        .segment_str(&fragment.text)
-        .collect::<Vec<_>>();
-    if boundaries.len() <= 2 {
+    if fragment.generated_leader {
         return vec![fragment.clone()];
     }
-    boundaries
-        .windows(2)
-        .filter_map(|window| {
-            let text = &fragment.text[window[0]..window[1]];
+    let ranges = typographic_unit_ranges(&fragment.text);
+    if ranges.len() <= 1 {
+        return vec![fragment.clone()];
+    }
+    ranges
+        .into_iter()
+        .filter_map(|range| {
+            let text = &fragment.text[range];
             (!text.is_empty()).then(|| InlineFragment {
                 text: text.to_string(),
                 style: fragment.style.clone(),
                 baseline_shift: fragment.baseline_shift,
                 link_target: fragment.link_target.clone(),
                 mergeable: false,
+                source: fragment.source,
+                generated_leader: fragment.generated_leader,
                 hanging_edges: fragment.hanging_edges,
             })
         })
         .collect()
 }
 
-fn typographic_unit_count(text: &str) -> usize {
-    GraphemeClusterSegmenter::new()
-        .segment_str(text)
-        .collect::<Vec<_>>()
-        .len()
-        .saturating_sub(1)
+/// CSS Text justification policy selected for one materialized inline line.
+///
+/// CSS Text defines justification in terms of text-justification opportunities
+/// after white-space processing and line breaking. Keeping those opportunities
+/// in a line-level plan lets mixed, generated, page-margin, and fragmented
+/// painting share the same expansion decisions:
+/// <https://www.w3.org/TR/css-text-3/#text-justify-property>.
+#[derive(Debug, Clone)]
+pub(super) struct InlineJustificationPlan {
+    mode: InlineJustificationMode,
+    opportunities: Vec<JustificationOpportunity>,
+    item_expansion_counts: Vec<usize>,
 }
 
-pub(super) fn trim_inline_fragment_edges(fragments: &mut Vec<InlineFragment>) {
-    while fragments
-        .first()
-        .is_some_and(inline_fragment_is_collapsible_space)
-    {
-        fragments.remove(0);
-    }
-    while fragments
-        .last()
-        .is_some_and(inline_fragment_is_collapsible_space)
-    {
-        fragments.pop();
-    }
-    if let Some(first) = fragments.first_mut()
-        && first.mergeable
-        && first.style.white_space.collapses_spaces()
-    {
-        first.text = trim_start_css_collapsible_whitespace(&first.text).to_string();
-    }
-    if let Some(last) = fragments.last_mut()
-        && last.mergeable
-        && last.style.white_space.collapses_spaces()
-    {
-        last.text = trim_end_css_collapsible_whitespace(&last.text).to_string();
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineJustificationMode {
+    None,
+    InterWord,
+    InterCharacter,
 }
 
-pub(super) fn apply_first_line_pseudos_to_fragments(
-    fragments: &mut Vec<InlineFragment>,
-    block_style: &ComputedStyle,
-) {
-    if let Some(first_line_style) = block_style.first_line_style.as_deref() {
-        for fragment in fragments.iter_mut() {
-            fragment.style = first_line_style.clone();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct JustificationOpportunity {
+    pub(super) after_item_index: usize,
+    pub(super) kind: JustificationOpportunityKind,
+}
+
+/// CSS Text justification opportunity kind recorded for diagnostics/tests.
+///
+/// Suppressed and blocking entries are retained so tests can prove that
+/// cursive/control gaps and opaque atom boundaries were considered by policy
+/// rather than silently omitted by the painter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JustificationOpportunityKind {
+    WordSeparator,
+    TypographicUnitGap,
+    SuppressedScriptOrControlGap,
+    OpaqueAtomBoundary,
+}
+
+impl InlineJustificationPlan {
+    pub(super) fn for_line(
+        items: &[InlineLineItem],
+        text_justify: TextJustify,
+        should_justify: bool,
+    ) -> Self {
+        let mode = match (should_justify, text_justify) {
+            (false, _) | (_, TextJustify::None) => InlineJustificationMode::None,
+            (true, TextJustify::InterCharacter) => InlineJustificationMode::InterCharacter,
+            (true, TextJustify::Auto | TextJustify::InterWord) => {
+                InlineJustificationMode::InterWord
+            }
+        };
+        let mut plan = Self {
+            mode,
+            opportunities: Vec::new(),
+            item_expansion_counts: vec![0; items.len()],
+        };
+        match mode {
+            InlineJustificationMode::None => {}
+            InlineJustificationMode::InterWord => plan.collect_inter_word_opportunities(items),
+            InlineJustificationMode::InterCharacter => {
+                plan.collect_inter_character_opportunities(items)
+            }
+        }
+        plan
+    }
+
+    pub(super) fn justifies_inter_word(&self) -> bool {
+        self.mode == InlineJustificationMode::InterWord
+    }
+
+    pub(super) fn justifies_inter_character(&self) -> bool {
+        self.mode == InlineJustificationMode::InterCharacter
+    }
+
+    pub(super) fn expansion_opportunity_count(&self) -> usize {
+        self.item_expansion_counts.iter().sum()
+    }
+
+    pub(super) fn extra_space_width(&self, line_width: f32, available_width: f32) -> f32 {
+        let gaps = self.expansion_opportunity_count();
+        if gaps > 0 && line_width < available_width {
+            (available_width - line_width) / gaps as f32
+        } else {
+            0.0
         }
     }
-    if let Some(first_letter_style) = block_style.first_letter_style.as_deref() {
-        apply_first_letter_pseudo_to_fragments(fragments, first_letter_style);
+
+    pub(super) fn expansion_count_after_item(&self, item_index: usize) -> usize {
+        self.item_expansion_counts
+            .get(item_index)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn opportunities(&self) -> &[JustificationOpportunity] {
+        &self.opportunities
+    }
+
+    fn collect_inter_word_opportunities(&mut self, items: &[InlineLineItem]) {
+        let mut end = items.len();
+        while end > 0 && inline_line_item_is_pre_wrap_hanging_space(&items[end - 1]) {
+            end -= 1;
+        }
+        for (index, item) in items[..end].iter().enumerate() {
+            let InlineLineItem::Fragment(fragment) = item else {
+                continue;
+            };
+            if !inline_fragment_is_inter_word_justification_space(fragment) {
+                continue;
+            }
+            let count = fragment.text.chars().count();
+            self.item_expansion_counts[index] = count;
+            self.opportunities
+                .extend((0..count).map(|_| JustificationOpportunity {
+                    after_item_index: index,
+                    kind: JustificationOpportunityKind::WordSeparator,
+                }));
+        }
+    }
+
+    fn collect_inter_character_opportunities(&mut self, items: &[InlineLineItem]) {
+        for index in 0..items.len().saturating_sub(1) {
+            let item = &items[index];
+            let next = &items[index + 1];
+            if matches!(item, InlineLineItem::Float(_)) || matches!(next, InlineLineItem::Float(_))
+            {
+                continue;
+            }
+            if matches!(item, InlineLineItem::Atom(_)) || matches!(next, InlineLineItem::Atom(_)) {
+                self.opportunities.push(JustificationOpportunity {
+                    after_item_index: index,
+                    kind: JustificationOpportunityKind::OpaqueAtomBoundary,
+                });
+                continue;
+            }
+            let (InlineLineItem::Fragment(fragment), InlineLineItem::Fragment(next_fragment)) =
+                (item, next)
+            else {
+                continue;
+            };
+            if !inline_fragment_is_inter_character_unit(fragment)
+                || !inline_fragment_is_inter_character_unit(next_fragment)
+            {
+                continue;
+            }
+            let allowed =
+                inter_character_gap_allowed_between_text(&fragment.text, &next_fragment.text);
+            self.opportunities.push(JustificationOpportunity {
+                after_item_index: index,
+                kind: if allowed {
+                    JustificationOpportunityKind::TypographicUnitGap
+                } else {
+                    JustificationOpportunityKind::SuppressedScriptOrControlGap
+                },
+            });
+            if allowed {
+                self.item_expansion_counts[index] = 1;
+            }
+        }
+    }
+}
+
+fn inline_fragment_is_inter_character_unit(fragment: &InlineFragment) -> bool {
+    !fragment.generated_leader && typographic_unit_count(&fragment.text) > 0
+}
+
+#[cfg(test)]
+mod justification_tests {
+    use super::*;
+
+    fn test_fragment(text: &str) -> InlineLineItem {
+        InlineLineItem::Fragment(InlineFragment {
+            text: text.to_string(),
+            style: ComputedStyle::initial(),
+            baseline_shift: 0.0,
+            link_target: None,
+            mergeable: true,
+            source: InlineTextSource::Normal,
+            generated_leader: false,
+            hanging_edges: InlineHangingEdges::default(),
+        })
+    }
+
+    fn generated_leader_fragment(text: &str) -> InlineLineItem {
+        let InlineLineItem::Fragment(mut fragment) = test_fragment(text) else {
+            unreachable!();
+        };
+        fragment.generated_leader = true;
+        fragment.mergeable = false;
+        InlineLineItem::Fragment(fragment)
+    }
+
+    fn test_atom() -> InlineLineItem {
+        InlineLineItem::Atom(InlineAtom {
+            content: InlineAtomContent::Canvas,
+            style: ComputedStyle::initial(),
+            escaped_positioned_layers: None,
+            width: 10.0,
+            height: 10.0,
+            baseline_offset: 8.0,
+            baseline_shift: 0.0,
+            link_target: None,
+            alt_text: None,
+        })
+    }
+
+    #[test]
+    fn justification_plan_inter_word_ignores_generated_leaders() {
+        let items = vec![
+            test_fragment("A"),
+            test_fragment(" "),
+            generated_leader_fragment(" "),
+        ];
+        let plan = InlineJustificationPlan::for_line(&items, TextJustify::InterWord, true);
+
+        assert!(plan.justifies_inter_word());
+        assert_eq!(plan.expansion_opportunity_count(), 1);
+        assert_eq!(plan.expansion_count_after_item(1), 1);
+        assert_eq!(
+            plan.opportunities()
+                .iter()
+                .map(|opportunity| opportunity.kind)
+                .collect::<Vec<_>>(),
+            vec![JustificationOpportunityKind::WordSeparator]
+        );
+    }
+
+    #[test]
+    fn justification_plan_inter_character_keeps_grapheme_units() {
+        let split = split_mixed_line_into_inter_character_units(&[test_fragment("e\u{301}x中")]);
+        let texts = split
+            .iter()
+            .filter_map(|item| match item {
+                InlineLineItem::Fragment(fragment) => Some(fragment.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["e\u{301}", "x", "中"]);
+
+        let plan = InlineJustificationPlan::for_line(&split, TextJustify::InterCharacter, true);
+        assert!(plan.justifies_inter_character());
+        assert_eq!(plan.expansion_opportunity_count(), 2);
+        assert_eq!(
+            plan.opportunities()
+                .iter()
+                .map(|opportunity| opportunity.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                JustificationOpportunityKind::TypographicUnitGap,
+                JustificationOpportunityKind::TypographicUnitGap
+            ]
+        );
+    }
+
+    #[test]
+    fn justification_plan_records_suppressed_control_gaps() {
+        let items = vec![
+            test_fragment("A"),
+            test_fragment("\u{200d}"),
+            test_fragment("B"),
+        ];
+        let plan = InlineJustificationPlan::for_line(&items, TextJustify::InterCharacter, true);
+
+        assert_eq!(plan.expansion_opportunity_count(), 0);
+        assert_eq!(
+            plan.opportunities()
+                .iter()
+                .map(|opportunity| opportunity.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                JustificationOpportunityKind::SuppressedScriptOrControlGap,
+                JustificationOpportunityKind::SuppressedScriptOrControlGap
+            ]
+        );
+    }
+
+    #[test]
+    fn justification_plan_treats_atoms_as_inter_character_blockers() {
+        let items = vec![test_fragment("A"), test_atom(), test_fragment("B")];
+        let plan = InlineJustificationPlan::for_line(&items, TextJustify::InterCharacter, true);
+
+        assert_eq!(plan.expansion_opportunity_count(), 0);
+        assert_eq!(
+            plan.opportunities()
+                .iter()
+                .map(|opportunity| opportunity.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                JustificationOpportunityKind::OpaqueAtomBoundary,
+                JustificationOpportunityKind::OpaqueAtomBoundary
+            ]
+        );
     }
 }
 
@@ -1343,20 +1226,6 @@ fn apply_first_letter_pseudo_to_line_items(
             .map(InlineLineItem::Fragment)
             .collect::<Vec<_>>();
         items.splice(index..=index, pieces);
-        break;
-    }
-}
-
-fn apply_first_letter_pseudo_to_fragments(
-    fragments: &mut Vec<InlineFragment>,
-    first_letter_style: &ComputedStyle,
-) {
-    for index in 0..fragments.len() {
-        let Some(range) = first_letter_byte_range(&fragments[index].text) else {
-            continue;
-        };
-        let pieces = split_fragment_for_first_letter(&fragments[index], range, first_letter_style);
-        fragments.splice(index..=index, pieces);
         break;
     }
 }
@@ -1419,4 +1288,3 @@ fn first_letter_byte_range(text: &str) -> Option<std::ops::Range<usize>> {
     }
     saw_letter.then(|| start.unwrap_or(0)..end.unwrap_or(0))
 }
-use icu_segmenter::GraphemeClusterSegmenter;

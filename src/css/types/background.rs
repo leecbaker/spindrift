@@ -213,6 +213,61 @@ pub(crate) enum BackgroundImage {
     LinearGradient(LinearGradient),
 }
 
+/// Computed values for one CSS background layer.
+///
+/// CSS Backgrounds and Borders defines every `background-*` longhand except
+/// `background-color` as a comma-separated layer list. Shorter lists repeat to
+/// match the image layer count:
+/// <https://www.w3.org/TR/css-backgrounds-3/#layering>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BackgroundLayer {
+    pub image: Option<BackgroundImage>,
+    pub position: BackgroundPosition,
+    pub size: BackgroundSize,
+    pub repeat: BackgroundRepeat,
+    pub origin: BackgroundBox,
+    pub clip: BackgroundBox,
+}
+
+impl BackgroundLayer {
+    pub(crate) const fn initial() -> Self {
+        Self {
+            image: None,
+            position: BackgroundPosition::INITIAL,
+            size: BackgroundSize::AUTO,
+            repeat: BackgroundRepeat::Repeat,
+            origin: BackgroundBox::Padding,
+            clip: BackgroundBox::Border,
+        }
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.size.resolve_font_metric_lengths(ch_advance);
+        self.position.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.size.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.position.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+    }
+}
+
 /// Computed `linear-gradient()` image for the supported axis-aligned subset.
 ///
 /// CSS Images Level 3 defines gradient lines and color stops. This stores stop

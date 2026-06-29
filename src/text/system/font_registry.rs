@@ -42,7 +42,33 @@ impl DocumentFontRegistry {
 
     pub(super) fn font_has_character(&self, font_id: usize, character: char) -> bool {
         self.get(font_id)
-            .is_some_and(|font| font_has_character(font, character))
+            .is_some_and(|font| self.font_allows_character(font, character))
+    }
+
+    pub(super) fn font_has_unicode_range(&self, font_id: usize) -> bool {
+        self.get(font_id)
+            .and_then(|font| self.metadata_for_document_font(font))
+            .is_some_and(|metadata| metadata.unicode_range.is_some())
+    }
+
+    pub(super) fn font_allows_character(&self, font: &DocumentFont, character: char) -> bool {
+        font_has_character(font, character) && self.font_face_allows_character(font, character)
+    }
+
+    fn font_face_allows_character(&self, font: &DocumentFont, character: char) -> bool {
+        self.metadata_for_document_font(font)
+            .and_then(|metadata| metadata.unicode_range.as_deref())
+            .is_none_or(|ranges| ranges.iter().any(|range| range.contains(character)))
+    }
+
+    fn metadata_for_document_font(
+        &self,
+        font: &DocumentFont,
+    ) -> Option<&RegisteredFontFaceMetadata> {
+        self.registered_font_faces.get(&FontBlobFaceKey {
+            blob_id: font.data.blob_id(),
+            face_index: font.face_index,
+        })
     }
 
     pub(super) fn font_query_has_character(font: &FontiqueQueryFont, character: char) -> bool {

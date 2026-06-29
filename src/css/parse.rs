@@ -3,7 +3,7 @@ use super::types::{
     CounterStyleRange, CounterStyleRangeInterval, CounterStyleRule, CounterStyleSystem, Css,
     CssFontFace, Declarations, Direction, Display, FontFaceSource, FontStyle, FontWeight,
     FontWidth, PagePseudo, PageRule, PageSelector, PageSpecificity, ScopeRule, StyleRule,
-    Stylesheet, StylesheetOrigin,
+    Stylesheet, StylesheetOrigin, UnicodeRange,
 };
 use super::values::{
     parse_color, parse_css_string_token, parse_display, parse_font_family_names, parse_font_style,
@@ -128,6 +128,7 @@ pub(crate) fn parse_stylesheet(css: &Css) -> Stylesheet {
 
     Stylesheet {
         origin: css.origin(),
+        html_presentational_hints: false,
         specificity_override: css.specificity_override(),
         layer_names,
         rules,

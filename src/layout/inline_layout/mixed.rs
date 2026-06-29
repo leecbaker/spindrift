@@ -1,11 +1,103 @@
 use super::super::*;
 use super::graph::*;
-use crate::text::measured_break_opportunities;
+use super::{InlineLineRecord, InlineLineSequence};
 
 #[derive(Debug, Clone, Copy)]
 struct InlineFloatBand {
-    left_offset: f32,
-    width: f32,
+    span: LogicalInlineSpan,
+}
+
+impl InlineFloatBand {
+    fn new(left_offset: f32, width: f32) -> Self {
+        Self {
+            span: LogicalInlineSpan::new(left_offset, width.max(1.0)),
+        }
+    }
+
+    fn left_offset(self) -> f32 {
+        self.span.start()
+    }
+
+    fn width(self) -> f32 {
+        self.span.size()
+    }
+
+    fn end(self) -> f32 {
+        self.span.end()
+    }
+}
+
+const INLINE_FLOAT_EPSILON: f32 = 0.01;
+
+#[derive(Debug, Clone, Copy)]
+struct SelectedInlineLineEnd {
+    position: InlineGraphPosition,
+    break_opportunity: Option<InlineBreakOpportunity>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InlineFloatPlacement {
+    /// Physical horizontal line-box band that accepted the inline float.
+    ///
+    /// CSS 2.2 floats shorten line boxes in the current block formatting
+    /// context. This span is page-local physical `x` after writing-mode and
+    /// `direction` have already been resolved for the horizontal line:
+    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+    line_span: PageInlineSpan,
+    /// Inline advance consumed by text before the same-line float.
+    ///
+    /// The same-line optimization only runs for horizontal LTR suffix layout,
+    /// so this is a physical advance from the line span's left edge in the
+    /// already-resolved line-box coordinate system:
+    /// <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>.
+    prefix_width: f32,
+    /// Physical margin-box span of the placed inline float.
+    ///
+    /// The span comes from the durable float exclusion shape and is used to
+    /// split the remaining line into the gap before/after the float.
+    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+    float_span: PageInlineSpan,
+    side: UsedFloatSide,
+}
+
+impl InlineFloatPlacement {
+    fn new(
+        line_left: f32,
+        line_right: f32,
+        prefix_width: f32,
+        float_left: f32,
+        float_right: f32,
+        side: UsedFloatSide,
+    ) -> Self {
+        Self {
+            line_span: PageInlineSpan::from_edges(line_left, line_right),
+            prefix_width: prefix_width.max(0.0),
+            float_span: PageInlineSpan::from_edges(float_left, float_right),
+            side,
+        }
+    }
+
+    fn line_right(self) -> f32 {
+        self.line_span.right_x()
+    }
+
+    fn prefix_right(self) -> f32 {
+        self.line_span.left_x() + self.prefix_width
+    }
+
+    fn float_left(self) -> f32 {
+        self.float_span.left_x()
+    }
+
+    fn float_right(self) -> f32 {
+        self.float_span.right_x()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CombinedInlineFloatLine {
+    end: InlineGraphPosition,
+    fragment: InlineLineFragment,
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -16,14 +108,22 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         padding_left: f32,
     ) -> InlineFloatBand {
+        if block_style.writing_mode != WritingMode::HorizontalTb {
+            let band = self.current_logical_float_band(
+                block_style.writing_mode,
+                block_style.direction,
+                self.content_left + padding_left,
+                block_style.line_height,
+                self.cursor_y,
+                available_width,
+            );
+            return InlineFloatBand::new(band.inline_start(), band.available_inline_size());
+        }
         let line_top = self.cursor_y - block_style.line_height * line_index as f32;
         let band = self.current_float_band(line_top, block_style.line_height);
-        let left_offset = (band.left - self.content_left - padding_left).max(0.0);
-        let right_offset = (self.content_right - band.right).max(0.0);
-        InlineFloatBand {
-            left_offset,
-            width: (available_width - left_offset - right_offset).max(1.0),
-        }
+        let left_offset = (band.left() - self.content_left - padding_left).max(0.0);
+        let right_offset = (self.content_right - band.right()).max(0.0);
+        InlineFloatBand::new(left_offset, available_width - left_offset - right_offset)
     }
 
     pub(in crate::layout) fn layout_mixed_inline_paragraph(
@@ -35,9 +135,8 @@ impl<'a> LayoutBuilder<'a> {
         plaintext_direction_state: &mut Option<Direction>,
     ) -> usize {
         let block_style = context.block_style;
-        let padding_left = context.padding_left;
         let paragraph_start_line_index = line_index;
-        let graph = self.build_inline_opportunity_graph(items);
+        let graph = self.build_inline_opportunity_graph(items, block_style);
         let (line_boxes, next_line_index) = self.select_inline_lines_from_graph(
             &graph,
             context,
@@ -56,93 +155,41 @@ impl<'a> LayoutBuilder<'a> {
                 )
             })
             .unwrap_or(0.0);
-        let mut painted = 0;
-        while painted < line_count {
-            let fragment_count =
-                self.fragment_line_count(line_count, painted, block_style, |index| {
-                    line_boxes[index]
-                        .metrics
-                        .height
-                        .max(block_style.line_height)
-                });
-            if fragment_count == 0 {
-                self.push_page();
-                continue;
-            }
-            for (offset, line_box) in line_boxes[painted..painted + fragment_count]
-                .iter()
-                .enumerate()
-            {
-                let line_box_index = painted + offset;
-                let is_first_formatted_line = paragraph_start_line_index + line_box_index == 0;
-                let is_last_line = line_box_index + 1 == line_count;
-                let line_text = line_box.text.clone();
-                let text_align = text_align_for_inline_line_text_with_state(
-                    block_style,
-                    is_last_line,
-                    &line_text,
-                    plaintext_direction_state,
-                );
-                let mut metrics = line_box.metrics;
-                let line_available_width = (line_box.available_width - line_box.indent).max(1.0);
-                let hanging_widths = hanging_punctuation_widths_for_line_items(
-                    &mut self.font_system,
-                    &measured_inline_items(&line_box.items),
-                    block_style,
-                    is_first_formatted_line,
-                    is_last_line,
-                    line_box.metrics.width > line_available_width,
-                );
-                if line_box_uses_hanging_punctuation_alignment(block_style) {
-                    let own_hanging_width = hanging_widths.end;
-                    let reserve_width = if text_align == TextAlign::Right {
-                        context.hanging_punctuation_reserve
-                    } else {
-                        0.0
-                    };
-                    let end_width = if is_last_line {
-                        own_hanging_width.max(reserve_width)
-                    } else if text_align == TextAlign::Right {
-                        own_hanging_width.max(
-                            paragraph_last_hanging_width.max(context.hanging_punctuation_reserve),
-                        )
-                    } else {
-                        own_hanging_width
-                    };
-                    metrics.width = (metrics.width - hanging_widths.start - end_width).max(0.0);
-                } else if !is_last_line && text_align == TextAlign::Right {
-                    metrics.width = (metrics.width
-                        - paragraph_last_hanging_width.max(context.hanging_punctuation_reserve))
-                    .max(0.0);
+        let records = line_boxes
+            .into_iter()
+            .enumerate()
+            .map(|(offset, line_box)| {
+                let block_line_index = paragraph_start_line_index + offset;
+                let line_height = line_box.metrics.height.max(block_style.line_height);
+                let used_indent = line_box.indent;
+                let available_width = line_box.available_width;
+                InlineLineRecord {
+                    paragraph_index: 0,
+                    block_line_index,
+                    paragraph_line_index: offset,
+                    fragment: Some(line_box),
+                    is_first_formatted_line: block_line_index == 0,
+                    is_last_line_in_paragraph: offset + 1 == line_count,
+                    is_forced_empty: false,
+                    paragraph_last_hanging_width,
+                    used_indent,
+                    available_width,
+                    line_height,
                 }
-                let line_items =
-                    self.visual_ordered_mixed_inline_line_items(&line_box.items, block_style);
-                let paint_fragment = InlineLineFragment {
-                    items: line_items,
-                    metrics,
-                    hanging_widths,
-                    indent: line_box.indent,
-                    available_width: line_box.available_width,
-                    text: line_text,
-                };
-                self.paint_mixed_inline_line(
-                    &paint_fragment,
-                    InlinePaintContext {
-                        block_style,
-                        available_width: line_box.available_width,
-                        padding_left,
-                        line_indent: line_box.indent,
-                        text_align,
-                        is_first_line: is_first_formatted_line,
-                        is_last_line,
-                    },
-                );
-            }
-            painted += fragment_count;
-            if painted < line_count {
-                self.push_page();
-            }
-        }
+            })
+            .collect();
+        let sequence = InlineLineSequence {
+            records,
+            available_width: context.available_width,
+            padding_left: context.padding_left,
+            hanging_indent: context.hanging_indent,
+            hanging_punctuation_reserve: context.hanging_punctuation_reserve,
+        };
+        self.paint_inline_line_sequence_with_state(
+            &sequence,
+            block_style,
+            plaintext_direction_state,
+        );
         line_index
     }
 
@@ -168,46 +215,149 @@ impl<'a> LayoutBuilder<'a> {
         }
         let paragraph_start_line_index = line_index;
         let mut fragments = Vec::new();
-        let mut start = 0usize;
-        while start < graph.runs.len() {
-            while start < graph.runs.len()
-                && inline_line_item_is_collapsible_space(&graph.runs[start].item)
+        let mut start = graph.start_position();
+        let graph_end = graph.end_position();
+        while start < graph_end {
+            while start.byte_offset == 0
+                && start.run_index < graph.runs.len()
+                && inline_line_item_is_collapsible_space(&graph.runs[start.run_index].item)
             {
-                start += 1;
+                start.run_index += 1;
             }
-            if start >= graph.runs.len() {
+            if start >= graph_end {
                 break;
+            }
+            if let Some(float) = graph.float_at_position(start).cloned() {
+                self.place_inline_waiting_float(&float, context, line_index);
+                start.run_index += 1;
+                start.byte_offset = 0;
+                continue;
             }
             let line_starts_after_forced_break =
                 starts_after_forced_break && line_index == paragraph_start_line_index;
-            if let Some((split_fragments, consumed_runs)) = self.split_oversized_graph_text_run(
-                graph,
-                start,
-                context,
-                line_index,
-                line_starts_after_forced_break,
-            ) {
-                line_index += split_fragments.len();
-                fragments.extend(split_fragments);
-                start += consumed_runs;
-                continue;
-            }
-            let end = self.select_inline_line_end(
+            let selected_end = self.select_inline_line_end(
                 graph,
                 start,
                 context,
                 line_index,
                 line_starts_after_forced_break,
             );
-            let end = end.max(start + 1).min(graph.runs.len());
-            let is_soft_break = end < graph.runs.len();
+            let end = if selected_end.position <= start {
+                graph_end
+            } else {
+                selected_end.position.min(graph_end)
+            };
+            let selected_range = InlineGraphRange { start, end };
+            if !context.block_style.white_space.allows_soft_wrap()
+                && let Some(fragment) = self.try_select_unbreakable_line_with_inline_floats(
+                    graph,
+                    selected_range,
+                    selected_end,
+                    context,
+                    line_index,
+                    line_starts_after_forced_break,
+                )
+            {
+                fragments.push(fragment);
+                line_index += 1;
+                start = end;
+                continue;
+            }
+            if let Some(float_position) = graph.first_float_position_in_range(selected_range) {
+                if float_position <= start {
+                    if let Some(float) = graph.float_at_position(float_position).cloned() {
+                        self.place_inline_waiting_float(&float, context, line_index);
+                    }
+                    start = InlineGraphPosition::at_run_start(float_position.run_index + 1);
+                    continue;
+                }
+                let break_opportunity = Some(InlineBreakOpportunity {
+                    position: float_position,
+                    kind: InlineBreakKind::AtomicBoundary,
+                    priority: 110,
+                    trims: false,
+                    hangs: false,
+                    soft_hyphen: false,
+                    emergency: false,
+                    min_content: true,
+                });
+                let mut prefix = self.materialize_inline_line_fragment(
+                    graph,
+                    InlineGraphRange {
+                        start,
+                        end: float_position,
+                    },
+                    context,
+                    line_index,
+                    line_starts_after_forced_break,
+                    break_opportunity,
+                );
+                if let Some(placement) = self.try_place_inline_float_on_current_line(
+                    graph,
+                    float_position,
+                    prefix.metrics.width,
+                    context,
+                    line_index,
+                    line_starts_after_forced_break,
+                ) {
+                    prefix.suppress_float_adjust = true;
+                    let suffix_start =
+                        InlineGraphPosition::at_run_start(float_position.run_index + 1);
+                    if let Some(combined) = self.try_select_inline_float_same_line_suffix(
+                        graph,
+                        prefix.clone(),
+                        float_position,
+                        suffix_start,
+                        placement,
+                        context,
+                        line_index,
+                    ) {
+                        let end = combined.end;
+                        fragments.push(combined.fragment);
+                        line_index += 1;
+                        start = end;
+                        continue;
+                    }
+                    fragments.push(prefix);
+                    line_index += 1;
+                    start = suffix_start;
+                    continue;
+                }
+                let break_opportunity = Some(InlineBreakOpportunity {
+                    position: float_position,
+                    kind: InlineBreakKind::AtomicBoundary,
+                    priority: 110,
+                    trims: false,
+                    hangs: false,
+                    soft_hyphen: false,
+                    emergency: false,
+                    min_content: true,
+                });
+                fragments.push(self.materialize_inline_line_fragment(
+                    graph,
+                    InlineGraphRange {
+                        start,
+                        end: float_position,
+                    },
+                    context,
+                    line_index,
+                    line_starts_after_forced_break,
+                    break_opportunity,
+                ));
+                line_index += 1;
+                start = float_position;
+                continue;
+            }
+            let break_opportunity = selected_end
+                .break_opportunity
+                .filter(|opportunity| opportunity.position == end && end < graph_end);
             fragments.push(self.materialize_inline_line_fragment(
                 graph,
-                start..end,
+                selected_range,
                 context,
                 line_index,
                 line_starts_after_forced_break,
-                is_soft_break,
+                break_opportunity,
             ));
             line_index += 1;
             start = end;
@@ -215,31 +365,95 @@ impl<'a> LayoutBuilder<'a> {
         (fragments, line_index)
     }
 
-    fn split_oversized_graph_text_run(
+    /// Place inline floats without making them break opportunities in an
+    /// unbreakable line.
+    ///
+    /// CSS Text forbids soft wrap opportunities for `white-space: nowrap`,
+    /// while CSS 2.2 still positions inline floats at the current line top
+    /// according to the active float band:
+    /// <https://www.w3.org/TR/css-text-3/#white-space-property> and
+    /// <https://www.w3.org/TR/CSS22/visuren.html#float-position>.
+    fn try_select_unbreakable_line_with_inline_floats(
         &mut self,
         graph: &InlineOpportunityGraph,
-        start: usize,
+        range: InlineGraphRange,
+        selected_end: SelectedInlineLineEnd,
         context: InlineParagraphContext<'_>,
         line_index: usize,
         starts_after_forced_break: bool,
-    ) -> Option<(Vec<InlineLineFragment>, usize)> {
-        let block_style = context.block_style;
-        if !block_style.white_space.allows_soft_wrap() {
-            return None;
+    ) -> Option<InlineLineFragment> {
+        graph.first_float_position_in_range(range)?;
+        let break_opportunity = selected_end.break_opportunity.filter(|opportunity| {
+            opportunity.position == range.end && range.end < graph.end_position()
+        });
+        let mut fragment = self.materialize_inline_line_fragment(
+            graph,
+            range,
+            context,
+            line_index,
+            starts_after_forced_break,
+            break_opportunity,
+        );
+        let snapshot = self.snapshot();
+        let mut search_start = range.start;
+        while let Some(float_position) = graph.first_float_position_in_range(InlineGraphRange {
+            start: search_start,
+            end: range.end,
+        }) {
+            if !self.try_place_unbreakable_inline_float(
+                graph,
+                float_position,
+                context,
+                line_index,
+                starts_after_forced_break,
+            ) {
+                self.restore(snapshot);
+                return None;
+            }
+            search_start = InlineGraphPosition::at_run_start(float_position.run_index + 1);
+            if search_start >= range.end {
+                break;
+            }
         }
-        let mut text_index = start;
-        while matches!(
-            graph.runs.get(text_index).map(|run| &run.item),
-            Some(InlineLineItem::Atom(atom)) if matches!(atom.content, InlineAtomContent::InlineEdge)
-        ) {
-            text_index += 1;
+        fragment.suppress_float_adjust = true;
+        Some(fragment)
+    }
+
+    fn place_inline_waiting_float(
+        &mut self,
+        float: &InlineFloat,
+        context: InlineParagraphContext<'_>,
+        line_index: usize,
+    ) {
+        let saved_cursor_y = self.cursor_y;
+        self.cursor_y -= context.block_style.line_height * line_index as f32;
+        let mut run = self.float_run_state();
+        self.layout_floating_child(
+            &float.element,
+            float.signature.clone(),
+            &float.style,
+            None,
+            context.stylesheets,
+            &mut run,
+        );
+        self.cursor_y = saved_cursor_y;
+    }
+
+    fn try_place_unbreakable_inline_float(
+        &mut self,
+        graph: &InlineOpportunityGraph,
+        float_position: InlineGraphPosition,
+        context: InlineParagraphContext<'_>,
+        line_index: usize,
+        starts_after_forced_break: bool,
+    ) -> bool {
+        if context.block_style.writing_mode != WritingMode::HorizontalTb {
+            return false;
         }
-        let InlineLineItem::Fragment(fragment) = &graph.runs.get(text_index)?.item else {
-            return None;
+        let Some(float) = graph.float_at_position(float_position).cloned() else {
+            return false;
         };
-        let prefix_items = graph.line_items(start..text_index);
-        let prefix_measured_items = graph.line_measured_items(start..text_index);
-        let prefix_width = graph.line_width(start..text_index);
+        let block_style = context.block_style;
         let band = self.inline_float_band_for_line(
             line_index,
             block_style,
@@ -251,170 +465,245 @@ impl<'a> LayoutBuilder<'a> {
             starts_after_forced_break,
             context.hanging_indent,
             block_style,
-            band.width,
+            band.width(),
         );
-        let line_available_width = (band.width - line_indent).max(1.0);
-        let first_hanging_punctuation_width = start_hanging_punctuation_width_for_candidate_line(
-            &mut self.font_system,
-            &prefix_items,
-            &graph.runs[text_index].item,
-            block_style,
-            line_index == 0,
+        let line_left = self.content_left + context.padding_left + band.left_offset() + line_indent;
+        let line_right =
+            self.content_left + context.padding_left + band.left_offset() + band.width();
+        if line_right - line_left <= INLINE_FLOAT_EPSILON {
+            return false;
+        }
+
+        let snapshot = self.snapshot();
+        let saved_content_left = self.content_left;
+        let saved_content_right = self.content_right;
+        let saved_cursor_y = self.cursor_y;
+        let saved_direction = self.containing_block_direction;
+        let target_top = self.cursor_y - block_style.line_height * line_index as f32;
+
+        self.content_left = line_left;
+        self.content_right = line_right;
+        self.cursor_y = target_top;
+        self.containing_block_direction = block_style.direction;
+        let mut run = self.float_run_state();
+        let placed = self.layout_floating_child(
+            &float.element,
+            float.signature.clone(),
+            &float.style,
+            None,
+            context.stylesheets,
+            &mut run,
         );
-        let first_line_available_width =
-            (line_available_width + first_hanging_punctuation_width - prefix_width).max(1.0);
-        let lines = self
-            .font_system
-            .break_text(&fragment.text, &fragment.style, first_line_available_width)
-            .into_iter()
-            .filter(|line| !line.text.is_empty())
-            .collect::<Vec<_>>();
-        let lines = if lines.len() <= 1
-            && !(fragment.style.hyphens == Hyphens::None && fragment.text.contains('\u{00ad}'))
-        {
-            self.break_graph_fragment_at_measured_opportunities(
-                fragment,
-                first_line_available_width,
-            )
+        let accepted = if placed && self.pages.len() == snapshot.pages.len() {
+            self.float_contexts
+                .last()
+                .and_then(|context| context.shapes.last())
+                .is_some_and(|shape| {
+                    let float_width = shape.right() - shape.left();
+                    let band_width = line_right - line_left;
+                    shape.page_index == self.pages.len()
+                        && (shape.top() - target_top).abs() <= INLINE_FLOAT_EPSILON
+                        && ((shape.left() + INLINE_FLOAT_EPSILON >= line_left
+                            && shape.right() <= line_right + INLINE_FLOAT_EPSILON)
+                            || float_width > band_width + INLINE_FLOAT_EPSILON)
+                })
         } else {
-            lines
+            false
         };
-        if lines.len() <= 1 {
-            return None;
+        if accepted {
+            self.content_left = saved_content_left;
+            self.content_right = saved_content_right;
+            self.cursor_y = saved_cursor_y;
+            self.containing_block_direction = saved_direction;
+            true
+        } else {
+            self.restore(snapshot);
+            false
         }
-        let split_count = lines.len();
-        let mut output = Vec::with_capacity(split_count);
-        for (split_index, split_line) in lines.into_iter().enumerate() {
-            let mut items = if split_index == 0 {
-                prefix_items.clone()
-            } else {
-                Vec::new()
-            };
-            items.push(InlineLineItem::Fragment(InlineFragment {
-                text: split_line.text,
-                style: fragment.style.clone(),
-                baseline_shift: fragment.baseline_shift,
-                link_target: fragment.link_target.clone(),
-                mergeable: false,
-                hanging_edges: InlineHangingEdges {
-                    blocks_start: fragment.hanging_edges.blocks_start && split_index == 0,
-                    blocks_end: fragment.hanging_edges.blocks_end && split_index + 1 == split_count,
-                },
-            }));
-            let mut measured_items = if split_index == 0 {
-                prefix_measured_items.clone()
-            } else {
-                Vec::new()
-            };
-            measured_items.push(MeasuredInlineItem {
-                item: items.last().cloned().expect("split fragment item"),
-                width: split_line.width,
-                shaped: split_line.shaped.clone(),
-            });
-            let mut width = split_line.width + if split_index == 0 { prefix_width } else { 0.0 };
-            width -= trim_trailing_inline_line_spaces(&mut items, &mut self.font_system);
-            if split_index + 1 < split_count {
-                width -= trim_trailing_pre_wrap_hanging_inline_line_spaces(
-                    &mut items,
-                    &mut self.font_system,
-                );
-            }
-            width -= trailing_hanging_space_separator_width_for_line_items(
-                &items,
-                &mut self.font_system,
-            );
-            width -= trailing_letter_spacing_width_for_line_items(&items);
-            width = width.max(0.0);
-            if split_index + 1 < split_count {
-                show_trailing_soft_hyphen_for_line(&mut items);
-            }
-            let line_number = line_index + split_index;
-            let split_band = self.inline_float_band_for_line(
-                line_number,
-                block_style,
-                context.available_width,
-                context.padding_left,
-            );
-            let split_indent = used_line_indent(
-                line_number,
-                (starts_after_forced_break && split_index == 0)
-                    || split_line.starts_after_forced_break,
-                context.hanging_indent,
-                block_style,
-                split_band.width,
-            );
-            let split_metrics = self.mixed_inline_line_metrics(&items, block_style, width);
-            output.push(InlineLineFragment {
-                text: graph.runs[start].break_text.clone(),
-                items: measured_items,
-                metrics: InlineLineMetrics {
-                    width,
-                    offset: 0.0,
-                    aligned_by_parley: false,
-                    height: split_line.line_height,
-                    baseline_offset: split_metrics.baseline_offset,
-                },
-                hanging_widths: HangingPunctuationWidths::default(),
-                indent: split_band.left_offset + split_indent,
-                available_width: split_band.left_offset + split_band.width,
-            });
-        }
-        Some((output, text_index + 1 - start))
     }
 
-    fn break_graph_fragment_at_measured_opportunities(
+    fn try_place_inline_float_on_current_line(
         &mut self,
-        fragment: &InlineFragment,
-        available_width: f32,
-    ) -> Vec<TextLine> {
-        let mut opportunities = measured_break_opportunities(&fragment.text, &fragment.style);
-        opportunities.retain(|opportunity| {
-            *opportunity > 0
-                && *opportunity <= fragment.text.len()
-                && fragment.text.is_char_boundary(*opportunity)
+        graph: &InlineOpportunityGraph,
+        float_position: InlineGraphPosition,
+        prefix_width: f32,
+        context: InlineParagraphContext<'_>,
+        line_index: usize,
+        starts_after_forced_break: bool,
+    ) -> Option<InlineFloatPlacement> {
+        if context.block_style.writing_mode != WritingMode::HorizontalTb {
+            return None;
+        }
+        let float = graph.float_at_position(float_position).cloned()?;
+        let block_style = context.block_style;
+        let band = self.inline_float_band_for_line(
+            line_index,
+            block_style,
+            context.available_width,
+            context.padding_left,
+        );
+        let line_indent = used_line_indent(
+            line_index,
+            starts_after_forced_break,
+            context.hanging_indent,
+            block_style,
+            band.width(),
+        );
+        let line_left = self.content_left + context.padding_left + band.left_offset() + line_indent;
+        let line_right =
+            self.content_left + context.padding_left + band.left_offset() + band.width();
+        let (remaining_left, remaining_right) = match block_style.direction {
+            Direction::Ltr => ((line_left + prefix_width).min(line_right), line_right),
+            Direction::Rtl => (line_left, (line_right - prefix_width).max(line_left)),
+        };
+        if remaining_right - remaining_left <= INLINE_FLOAT_EPSILON {
+            return None;
+        }
+
+        let snapshot = self.snapshot();
+        let saved_content_left = self.content_left;
+        let saved_content_right = self.content_right;
+        let saved_cursor_y = self.cursor_y;
+        let saved_direction = self.containing_block_direction;
+        let target_top = self.cursor_y - block_style.line_height * line_index as f32;
+
+        self.content_left = remaining_left;
+        self.content_right = remaining_right;
+        self.cursor_y = target_top;
+        self.containing_block_direction = block_style.direction;
+        let mut run = self.float_run_state();
+        let placed = self.layout_floating_child(
+            &float.element,
+            float.signature.clone(),
+            &float.style,
+            None,
+            context.stylesheets,
+            &mut run,
+        );
+        let accepted_shape = if placed && self.pages.len() == snapshot.pages.len() {
+            self.float_contexts.last().and_then(|context| {
+                context.shapes.last().and_then(|shape| {
+                    (shape.page_index == self.pages.len()
+                        && (shape.top() - target_top).abs() <= INLINE_FLOAT_EPSILON
+                        && shape.left() + INLINE_FLOAT_EPSILON >= remaining_left
+                        && shape.right() <= remaining_right + INLINE_FLOAT_EPSILON)
+                        .then_some(InlineFloatPlacement::new(
+                            line_left,
+                            line_right,
+                            prefix_width,
+                            shape.left(),
+                            shape.right(),
+                            shape.side,
+                        ))
+                })
+            })
+        } else {
+            None
+        };
+        if let Some(placement) = accepted_shape {
+            self.content_left = saved_content_left;
+            self.content_right = saved_content_right;
+            self.cursor_y = saved_cursor_y;
+            self.containing_block_direction = saved_direction;
+            Some(placement)
+        } else {
+            self.restore(snapshot);
+            None
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_select_inline_float_same_line_suffix(
+        &mut self,
+        graph: &InlineOpportunityGraph,
+        prefix: InlineLineFragment,
+        float_position: InlineGraphPosition,
+        suffix_start: InlineGraphPosition,
+        placement: InlineFloatPlacement,
+        context: InlineParagraphContext<'_>,
+        line_index: usize,
+    ) -> Option<CombinedInlineFloatLine> {
+        if context.block_style.direction != Direction::Ltr || suffix_start >= graph.end_position() {
+            return None;
+        }
+        let prefix_right = placement.prefix_right();
+        let (float_gap, suffix_available_width) = match placement.side {
+            UsedFloatSide::Left | UsedFloatSide::Top => (
+                (placement.float_right() - prefix_right).max(0.0),
+                (placement.line_right() - placement.float_right()).max(0.0),
+            ),
+            UsedFloatSide::Right | UsedFloatSide::Bottom => {
+                (0.0, (placement.float_left() - prefix_right).max(0.0))
+            }
+        };
+        if suffix_available_width <= INLINE_FLOAT_EPSILON {
+            return None;
+        }
+        let selected_end = self.select_inline_line_end_for_width(
+            graph,
+            suffix_start,
+            context.block_style,
+            suffix_available_width,
+            line_index,
+        );
+        let end = selected_end.position.min(graph.end_position());
+        if end <= suffix_start {
+            return None;
+        }
+        let suffix = graph.materialize_line(
+            InlineGraphRange {
+                start: suffix_start,
+                end,
+            },
+            selected_end
+                .break_opportunity
+                .filter(|opportunity| opportunity.position == end && end < graph.end_position()),
+            &mut self.font_system,
+            context.block_style,
+        );
+        if suffix.items.is_empty() {
+            return None;
+        }
+
+        let float = graph.float_at_position(float_position).cloned()?;
+        let mut combined_items = prefix.items.clone();
+        combined_items.push(MeasuredInlineItem {
+            item: InlineLineItem::Float(float),
+            width: float_gap,
+            shaped: None,
         });
-        opportunities.sort_unstable();
-        opportunities.dedup();
-        if opportunities.last().copied() != Some(fragment.text.len()) {
-            opportunities.push(fragment.text.len());
+        combined_items.extend(suffix.items);
+        let combined_line_items = measured_inline_items(&combined_items);
+        let width = combined_items.iter().map(|item| item.width).sum::<f32>();
+        let metrics =
+            self.mixed_inline_line_metrics(&combined_line_items, context.block_style, width);
+        if (metrics.height - prefix.metrics.height).abs() > INLINE_FLOAT_EPSILON {
+            return None;
         }
-        let mut lines = Vec::new();
-        let mut line_start = 0usize;
-        let mut segment_start = 0usize;
-        let mut line_width = 0.0f32;
-        for opportunity in opportunities {
-            if opportunity <= segment_start {
-                continue;
-            }
-            let segment = &fragment.text[segment_start..opportunity];
-            let segment_width = self.font_system.measure_text(segment, &fragment.style);
-            if !inline_items_fit_line(line_width, segment_width, available_width)
-                && segment_start > line_start
-            {
-                let text = fragment.text[line_start..segment_start].to_string();
-                let width = line_width;
-                lines.push(TextLine::new(text, width, fragment.style.line_height));
-                line_start = segment_start;
-                line_width = 0.0;
-            }
-            line_width += segment_width;
-            segment_start = opportunity;
-        }
-        if line_start < fragment.text.len() {
-            let text = fragment.text[line_start..].to_string();
-            lines.push(TextLine::new(text, line_width, fragment.style.line_height));
-        }
-        lines
+        let mut text = prefix.text;
+        text.push_str(&suffix.text);
+        Some(CombinedInlineFloatLine {
+            end,
+            fragment: InlineLineFragment {
+                items: combined_items,
+                metrics,
+                hanging_widths: prefix.hanging_widths,
+                indent: prefix.indent,
+                available_width: prefix.available_width,
+                suppress_float_adjust: true,
+                text,
+            },
+        })
     }
 
     fn select_inline_line_end(
         &mut self,
         graph: &InlineOpportunityGraph,
-        start: usize,
+        start: InlineGraphPosition,
         context: InlineParagraphContext<'_>,
         line_index: usize,
         starts_after_forced_break: bool,
-    ) -> usize {
+    ) -> SelectedInlineLineEnd {
         let block_style = context.block_style;
         let band = self.inline_float_band_for_line(
             line_index,
@@ -427,108 +716,140 @@ impl<'a> LayoutBuilder<'a> {
             starts_after_forced_break,
             context.hanging_indent,
             block_style,
-            band.width,
+            band.width(),
         );
-        let line_available_width = (band.width - line_indent).max(1.0);
-        let mut end = start;
-        let mut line_width = 0.0f32;
-        while end < graph.runs.len() {
-            let run = &graph.runs[end];
-            let line = graph.line_items(start..end);
-            let first_hanging_punctuation_width =
-                start_hanging_punctuation_width_for_candidate_line(
-                    &mut self.font_system,
-                    &line,
-                    &run.item,
-                    block_style,
-                    line_index == 0,
-                );
-            let remaining_allows_last = graph.runs[end + 1..].iter().all(|run| {
-                inline_line_item_is_collapsible_space(&run.item)
-                    || inline_line_item_is_pre_wrap_hanging_space(&run.item)
-            });
-            let final_hanging_punctuation_width = end_hanging_punctuation_width_for_candidate_line(
+        let line_available_width = (band.width() - line_indent).max(1.0);
+        self.select_inline_line_end_for_width(
+            graph,
+            start,
+            block_style,
+            line_available_width,
+            line_index,
+        )
+    }
+
+    fn select_inline_line_end_for_width(
+        &mut self,
+        graph: &InlineOpportunityGraph,
+        start: InlineGraphPosition,
+        block_style: &ComputedStyle,
+        line_available_width: f32,
+        line_index: usize,
+    ) -> SelectedInlineLineEnd {
+        let mut regular_fit = None::<SelectedInlineLineEnd>;
+        let mut emergency_fit = None::<SelectedInlineLineEnd>;
+        let opportunities = graph.break_opportunities_after(start).collect::<Vec<_>>();
+        for opportunity in opportunities {
+            if !block_style.white_space.allows_soft_wrap()
+                && !matches!(opportunity.kind, InlineBreakKind::Forced)
+            {
+                continue;
+            }
+            if !self.mixed_graph_opportunity_allowed(graph, opportunity) {
+                continue;
+            }
+            let range = InlineGraphRange {
+                start,
+                end: opportunity.position,
+            };
+            let materialized = graph.materialize_line(
+                range,
+                (opportunity.position < graph.end_position()).then_some(opportunity),
                 &mut self.font_system,
-                &line,
-                &run.item,
                 block_style,
+            );
+            if materialized.items.is_empty() {
+                continue;
+            }
+            let line_items = measured_inline_items(&materialized.items);
+            let remaining_allows_last =
+                graph_remaining_allows_last_hanging_punctuation(graph, opportunity.position);
+            let hanging_widths = hanging_punctuation_widths_for_line_items(
+                &mut self.font_system,
+                &line_items,
+                block_style,
+                line_index == 0,
                 remaining_allows_last,
                 true,
             );
-            let following_edge_width = graph.runs[end + 1..]
-                .iter()
-                .map_while(|run| match &run.item {
-                    InlineLineItem::Atom(atom)
-                        if matches!(atom.content, InlineAtomContent::InlineEdge) =>
-                    {
-                        Some(run.width)
+            let fit_width =
+                (materialized.content_width - hanging_widths.start - hanging_widths.end).max(0.0);
+            if fit_width <= line_available_width + 0.5 {
+                let selected = SelectedInlineLineEnd {
+                    position: opportunity.position,
+                    break_opportunity: (opportunity.position < graph.end_position())
+                        .then_some(opportunity),
+                };
+                if opportunity.emergency {
+                    if regular_fit.is_none() {
+                        emergency_fit = Some(selected);
                     }
-                    _ => None,
-                })
-                .sum::<f32>();
-            let candidate_fits = inline_items_fit_line(
-                line_width,
-                run.width + following_edge_width,
-                line_available_width
-                    + first_hanging_punctuation_width
-                    + final_hanging_punctuation_width,
-            );
-            let final_preserved_space = end + 1 == graph.runs.len()
-                && inline_line_item_is_pre_wrap_hanging_space(&run.item);
-            if block_style.white_space.allows_soft_wrap()
-                && end > start
-                && !final_preserved_space
-                && !candidate_fits
-                && let Some(boundary) =
-                    self.best_inline_graph_break_before(graph, start, end, block_style)
-            {
-                return boundary;
+                } else {
+                    regular_fit = Some(selected);
+                }
+                if matches!(opportunity.kind, InlineBreakKind::Forced) {
+                    return selected;
+                }
+            } else if let Some(position) = regular_fit.or(emergency_fit) {
+                return position;
+            } else {
+                return SelectedInlineLineEnd {
+                    position: opportunity.position,
+                    break_opportunity: (opportunity.position < graph.end_position())
+                        .then_some(opportunity),
+                };
             }
-            line_width += run.width;
-            end += 1;
         }
-        end
+        regular_fit
+            .or(emergency_fit)
+            .unwrap_or_else(|| SelectedInlineLineEnd {
+                position: graph.end_position(),
+                break_opportunity: None,
+            })
     }
 
-    fn best_inline_graph_break_before(
+    fn mixed_graph_opportunity_allowed(
         &mut self,
         graph: &InlineOpportunityGraph,
-        start: usize,
-        before_run: usize,
-        block_style: &ComputedStyle,
-    ) -> Option<usize> {
-        if let Some(boundary) = (start + 1..=before_run).rev().find(|boundary| {
-            matches!(
-                &graph.runs[*boundary].item,
-                InlineLineItem::Fragment(fragment)
-                    if fragment.style.white_space == WhiteSpace::BreakSpaces
-                        && fragment.text.chars().all(is_css_collapsible_whitespace)
+        opportunity: InlineBreakOpportunity,
+    ) -> bool {
+        if opportunity.position.byte_offset > 0
+            || opportunity.emergency
+            || matches!(
+                opportunity.kind,
+                InlineBreakKind::Forced
+                    | InlineBreakKind::PreservedSpace
+                    | InlineBreakKind::BreakSpaces
+                    | InlineBreakKind::Hyphenation
             )
-        }) {
-            return Some(boundary);
+        {
+            return true;
         }
-        (start + 1..=before_run).rev().find(|boundary| {
-            let Some(opportunity) = graph.break_opportunity_before(*boundary) else {
-                return false;
-            };
-            if opportunity.emergency {
-                return true;
-            }
-            let line = graph.line_items(start..*boundary);
-            let item = &graph.runs[*boundary].item;
-            !mixed_inline_item_starts_with_suppressed_line_start_punctuation(item)
-                && mixed_inline_soft_wrap_allowed_before_item(&line, item, block_style)
-        })
+        let Some(item) = graph
+            .runs
+            .iter()
+            .skip(opportunity.position.run_index)
+            .find(|run| {
+                !matches!(
+                    &run.item,
+                    InlineLineItem::Atom(atom) if atom.content.is_box_edge()
+                )
+            })
+            .map(|run| &run.item)
+        else {
+            return true;
+        };
+        !mixed_inline_item_starts_with_suppressed_line_start_punctuation(item)
     }
 
     fn materialize_inline_line_fragment(
         &mut self,
         graph: &InlineOpportunityGraph,
-        range: std::ops::Range<usize>,
+        range: InlineGraphRange,
         context: InlineParagraphContext<'_>,
         line_index: usize,
         starts_after_forced_break: bool,
-        is_soft_break: bool,
+        break_opportunity: Option<InlineBreakOpportunity>,
     ) -> InlineLineFragment {
         let block_style = context.block_style;
         let band = self.inline_float_band_for_line(
@@ -542,46 +863,27 @@ impl<'a> LayoutBuilder<'a> {
             starts_after_forced_break,
             context.hanging_indent,
             block_style,
-            band.width,
+            band.width(),
         );
-        let mut measured_items = graph.line_measured_items(range.clone());
-        let mut items = measured_inline_items(&measured_items);
-        let mut width = graph.line_width(range.clone());
-        width -= trim_trailing_inline_line_spaces(&mut items, &mut self.font_system);
-        measured_items.truncate(items.len());
-        if is_soft_break {
-            width -= trim_trailing_pre_wrap_hanging_inline_line_spaces(
-                &mut items,
-                &mut self.font_system,
-            );
-            measured_items.truncate(items.len());
-        }
-        width -=
-            trailing_hanging_space_separator_width_for_line_items(&items, &mut self.font_system);
-        width -= trailing_letter_spacing_width_for_line_items(&items);
-        width = width.max(0.0);
-        if is_soft_break {
-            show_trailing_soft_hyphen_for_line(&mut items);
-            measured_items = measured_items
-                .into_iter()
-                .zip(items.iter().cloned())
-                .map(|(mut measured, item)| {
-                    measured.item = item;
-                    measured
-                })
-                .collect();
-        }
-        measured_items = strip_zero_width_space_from_measured_items(measured_items);
-        items = measured_inline_items(&measured_items);
-        let metrics = self.mixed_inline_line_metrics(&items, block_style, width);
-        let text = graph.text(range);
+        let mut materialized =
+            graph.materialize_line(range, break_opportunity, &mut self.font_system, block_style);
+        let line_available_width = (band.width() - line_indent).max(1.0);
+        resolve_materialized_line_leaders(
+            &mut materialized,
+            &mut self.font_system,
+            line_available_width,
+        );
+        let items = measured_inline_items(&materialized.items);
+        let metrics =
+            self.mixed_inline_line_metrics(&items, block_style, materialized.content_width);
         InlineLineFragment {
-            items: measured_items,
+            items: materialized.items,
             metrics,
             hanging_widths: HangingPunctuationWidths::default(),
-            indent: band.left_offset + line_indent,
-            available_width: band.left_offset + band.width,
-            text,
+            indent: band.left_offset() + line_indent,
+            available_width: band.end(),
+            suppress_float_adjust: false,
+            text: materialized.text,
         }
     }
 
@@ -598,6 +900,31 @@ impl<'a> LayoutBuilder<'a> {
         items: &[InlineLineItem],
         block_style: &ComputedStyle,
     ) -> Vec<InlineLineItem> {
+        if items
+            .iter()
+            .all(|item| matches!(item, InlineLineItem::Fragment(_)))
+            && items.iter().any(|item| match item {
+                InlineLineItem::Fragment(fragment) => fragment.text.chars().any(|character| {
+                    character_is_join_control(character) || character_is_arabic_tatweel(character)
+                }),
+                InlineLineItem::Atom(_) | InlineLineItem::Float(_) => false,
+            })
+        {
+            return items
+                .iter()
+                .filter_map(|item| match item {
+                    InlineLineItem::Fragment(fragment) => {
+                        let text = text_without_bidi_format_controls(&fragment.text).into_owned();
+                        (!text.is_empty()).then(|| {
+                            let mut fragment = fragment.clone();
+                            fragment.text = text;
+                            InlineLineItem::Fragment(fragment)
+                        })
+                    }
+                    InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
+                })
+                .collect();
+        }
         if !mixed_inline_line_needs_bidi_ordering(items, block_style) {
             return items.to_vec();
         }
@@ -630,6 +957,7 @@ impl<'a> LayoutBuilder<'a> {
                         }
                     }
                     InlineLineItem::Atom(atom) => output.push(InlineLineItem::Atom(atom.clone())),
+                    InlineLineItem::Float(_) => {}
                 }
             }
         }
@@ -646,6 +974,7 @@ impl<'a> LayoutBuilder<'a> {
                         })
                     }
                     InlineLineItem::Atom(atom) => Some(InlineLineItem::Atom(atom.clone())),
+                    InlineLineItem::Float(_) => None,
                 })
                 .collect()
         } else {
@@ -675,7 +1004,10 @@ impl<'a> LayoutBuilder<'a> {
                         )
                         .map(|line| line.advance_width())
                         .unwrap_or(0.0),
-                    InlineLineItem::Atom(atom) => atom.width,
+                    InlineLineItem::Atom(atom) => {
+                        inline_atom_logical_inline_size(atom, block_style)
+                    }
+                    InlineLineItem::Float(_) => 0.0,
                 };
                 MeasuredInlineItem {
                     item,
@@ -692,17 +1024,20 @@ impl<'a> LayoutBuilder<'a> {
     /// line box. Text baselines come from the selected font metrics, while
     /// atomic inline boxes expose their own atomic baseline:
     /// <https://www.w3.org/TR/css-inline-3/#line-box>.
-    fn inline_line_item_baseline_offset(&mut self, item: &InlineLineItem) -> f32 {
+    fn inline_line_item_baseline_offset(
+        &mut self,
+        item: &InlineLineItem,
+        block_style: &ComputedStyle,
+    ) -> f32 {
         match item {
             InlineLineItem::Fragment(fragment) => {
-                if matches!(fragment.style.vertical_align, VerticalAlign::Top) {
+                if fragment.style.vertical_align.aligns_to_line_box_edge() {
                     return 0.0;
                 }
                 self.inline_style_baseline_offset(&fragment.style, fragment.baseline_shift)
             }
-            InlineLineItem::Atom(atom) => {
-                atom.style.margin.top + atom.baseline_offset - atom.baseline_shift
-            }
+            InlineLineItem::Atom(atom) => inline_atom_logical_baseline_offset(atom, block_style),
+            InlineLineItem::Float(_) => 0.0,
         }
     }
 
@@ -715,13 +1050,41 @@ impl<'a> LayoutBuilder<'a> {
     /// can overflow without increasing the line box:
     /// <https://www.w3.org/TR/css-inline-3/#line-box> and
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>.
-    fn inline_line_item_baseline_extents(&mut self, item: &InlineLineItem) -> (f32, f32) {
-        let baseline = self.inline_line_item_baseline_offset(item).max(0.0);
+    fn inline_line_item_baseline_extents(
+        &mut self,
+        item: &InlineLineItem,
+        block_style: &ComputedStyle,
+    ) -> (f32, f32) {
+        let baseline = self
+            .inline_line_item_baseline_offset(item, block_style)
+            .max(0.0);
         let descent = match item {
-            InlineLineItem::Fragment(_) => inline_line_item_height(item) - baseline,
-            InlineLineItem::Atom(_) => (inline_line_item_height(item) - baseline).max(0.0),
+            InlineLineItem::Fragment(_) => {
+                inline_line_item_logical_block_size(item, block_style) - baseline
+            }
+            InlineLineItem::Atom(_) => {
+                (inline_line_item_logical_block_size(item, block_style) - baseline).max(0.0)
+            }
+            InlineLineItem::Float(_) => 0.0,
         };
         (baseline, descent)
+    }
+
+    /// Return whether the item aligns to the line box edge instead of the
+    /// shared baseline.
+    ///
+    /// CSS 2.2 defines `vertical-align: top` and `bottom` as alignment of the
+    /// box's margin edge with the line box edge. Those boxes still contribute
+    /// to the line box block-size, but they must not add their ascent/descent
+    /// to the baseline-aligned strut:
+    /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>.
+    fn inline_line_item_aligns_to_line_box_edge(item: &InlineLineItem) -> bool {
+        let vertical_align = match item {
+            InlineLineItem::Fragment(fragment) => fragment.style.vertical_align,
+            InlineLineItem::Atom(atom) => atom.style.vertical_align,
+            InlineLineItem::Float(_) => VerticalAlign::BASELINE,
+        };
+        vertical_align.aligns_to_line_box_edge()
     }
 
     /// Return the parent line strut ascent/descent pair around its baseline.
@@ -770,6 +1133,7 @@ impl<'a> LayoutBuilder<'a> {
     ) -> InlineLineMetrics {
         let (baseline_offset, descent) =
             self.mixed_inline_line_baseline_extents(items, block_style);
+        let edge_aligned_height = self.mixed_inline_line_edge_aligned_height(items, block_style);
         let text_only_height = items
             .iter()
             .all(|item| matches!(item, InlineLineItem::Fragment(_)))
@@ -778,15 +1142,15 @@ impl<'a> LayoutBuilder<'a> {
                     .iter()
                     .filter_map(|item| match item {
                         InlineLineItem::Fragment(fragment) => Some(fragment.style.line_height),
-                        InlineLineItem::Atom(_) => None,
+                        InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
                     })
                     .fold(block_style.line_height, f32::max)
             });
         InlineLineMetrics {
             width,
-            offset: 0.0,
-            aligned_by_parley: false,
-            height: text_only_height.unwrap_or(baseline_offset + descent),
+            height: text_only_height
+                .unwrap_or(baseline_offset + descent)
+                .max(edge_aligned_height),
             baseline_offset,
         }
     }
@@ -798,11 +1162,29 @@ impl<'a> LayoutBuilder<'a> {
     ) -> (f32, f32) {
         let (mut baseline_offset, mut descent) = self.inline_style_line_extents(block_style, 0.0);
         for item in items {
-            let (item_baseline_offset, item_descent) = self.inline_line_item_baseline_extents(item);
+            if Self::inline_line_item_aligns_to_line_box_edge(item) {
+                continue;
+            }
+            let (item_baseline_offset, item_descent) =
+                self.inline_line_item_baseline_extents(item, block_style);
             baseline_offset = baseline_offset.max(item_baseline_offset);
             descent = descent.max(item_descent);
         }
         (baseline_offset, descent)
+    }
+
+    fn mixed_inline_line_edge_aligned_height(
+        &mut self,
+        items: &[InlineLineItem],
+        block_style: &ComputedStyle,
+    ) -> f32 {
+        let mut height: f32 = 0.0;
+        for item in items {
+            if Self::inline_line_item_aligns_to_line_box_edge(item) {
+                height = height.max(inline_line_item_logical_block_size(item, block_style));
+            }
+        }
+        height
     }
 }
 
@@ -827,27 +1209,38 @@ fn mixed_inline_line_needs_bidi_ordering(
                 atom.style.direction != block_style.direction
                     || inline_bidi_scope_affects_line_ordering(&atom.style)
             }
+            InlineLineItem::Float(_) => false,
         })
 }
 
-fn strip_zero_width_space_from_measured_items(
-    items: Vec<MeasuredInlineItem>,
-) -> Vec<MeasuredInlineItem> {
-    const ZERO_WIDTH_SPACE: char = '\u{200b}';
-    items
-        .into_iter()
-        .filter_map(|mut measured| {
-            if let InlineLineItem::Fragment(fragment) = &mut measured.item
-                && fragment.text.contains(ZERO_WIDTH_SPACE)
-            {
-                fragment.text = fragment.text.replace(ZERO_WIDTH_SPACE, "");
-                if fragment.text.is_empty() {
-                    return None;
-                }
+fn graph_remaining_allows_last_hanging_punctuation(
+    graph: &InlineOpportunityGraph,
+    position: InlineGraphPosition,
+) -> bool {
+    let Some(run_range) = graph.run_indices_for_graph_range(InlineGraphRange {
+        start: position,
+        end: graph.end_position(),
+    }) else {
+        return true;
+    };
+    run_range.into_iter().all(|run_index| {
+        let run = &graph.runs[run_index];
+        match &run.item {
+            InlineLineItem::Fragment(fragment) => {
+                let start = if run_index == position.run_index {
+                    position.byte_offset.min(fragment.text.len())
+                } else {
+                    0
+                };
+                fragment
+                    .text
+                    .get(start..)
+                    .is_none_or(|text| text.chars().all(is_css_collapsible_whitespace))
             }
-            Some(measured)
-        })
-        .collect()
+            InlineLineItem::Atom(atom) => atom.content.is_box_edge(),
+            InlineLineItem::Float(_) => false,
+        }
+    })
 }
 
 fn mixed_inline_line_bidi_text(
@@ -864,6 +1257,7 @@ fn mixed_inline_line_bidi_text(
                     text.push(OBJECT_REPLACEMENT_CHARACTER);
                 }
             }
+            InlineLineItem::Float(_) => {}
         }
         let end = text.len();
         ranged.push(RangedMixedInlineLineItem {
@@ -872,68 +1266,6 @@ fn mixed_inline_line_bidi_text(
         });
     }
     (text, ranged)
-}
-
-/// Return whether CSS Text permits a soft wrap before one mixed inline item.
-///
-/// CSS Text applies Unicode line breaking across text and atomic inline
-/// boundaries by representing atomic inline boxes as U+FFFC. The mixed inline
-/// line builder must therefore ask the line breaker about the actual boundary
-/// instead of treating every fragment/atom item boundary as breakable:
-/// <https://www.w3.org/TR/css-text-3/#line-break-details>.
-fn mixed_inline_soft_wrap_allowed_before_item(
-    line: &[InlineLineItem],
-    item: &InlineLineItem,
-    block_style: &ComputedStyle,
-) -> bool {
-    if inline_line_item_is_collapsible_space(item)
-        || inline_line_item_is_pre_wrap_hanging_space(item)
-    {
-        return true;
-    }
-    if tracked_text_boundary_allows_soft_wrap(line, item) {
-        return true;
-    }
-    let before = mixed_inline_line_break_text(line);
-    let after = mixed_inline_item_break_text(item);
-    inline_atomic_boundary_allows_soft_wrap(&before, &after, block_style)
-}
-
-/// Return whether a nonzero `letter-spacing` text boundary is soft-wrappable.
-///
-/// CSS Text models tracking as spacing between typographic character units.
-/// A boundary split by text-empty inline boxes still has that inter-character
-/// spacing and must be available to line fitting, which is observable in
-/// intrinsic-size WPTs using `width: max-content`:
-/// <https://www.w3.org/TR/css-text-3/#letter-spacing-property>.
-fn tracked_text_boundary_allows_soft_wrap(line: &[InlineLineItem], item: &InlineLineItem) -> bool {
-    let InlineLineItem::Fragment(current) = item else {
-        return false;
-    };
-    if current.text.is_empty() {
-        return false;
-    }
-    for previous in line.iter().rev() {
-        match previous {
-            InlineLineItem::Fragment(previous) => {
-                return !previous.text.is_empty()
-                    && (previous.style.used_letter_spacing() != 0.0
-                        || current.style.used_letter_spacing() != 0.0);
-            }
-            InlineLineItem::Atom(atom) if matches!(atom.content, InlineAtomContent::InlineEdge) => {
-            }
-            InlineLineItem::Atom(_) => return false,
-        }
-    }
-    false
-}
-
-fn mixed_inline_line_break_text(items: &[InlineLineItem]) -> String {
-    let mut text = String::new();
-    for item in items {
-        text.push_str(&mixed_inline_item_break_text(item));
-    }
-    text
 }
 
 /// Return whether an item starts with punctuation that CSS Text keeps off line start.
@@ -957,14 +1289,4 @@ fn mixed_inline_item_starts_with_suppressed_line_start_punctuation(item: &Inline
     };
     character_is_hangable_stop_or_comma(character)
         || character_is_last_hangable_punctuation(character)
-}
-
-fn mixed_inline_item_break_text(item: &InlineLineItem) -> String {
-    match item {
-        InlineLineItem::Fragment(fragment) => fragment.text.clone(),
-        InlineLineItem::Atom(atom) => match atom.content {
-            InlineAtomContent::InlineEdge | InlineAtomContent::Leader(_) => String::new(),
-            _ => OBJECT_REPLACEMENT_CHARACTER.to_string(),
-        },
-    }
 }

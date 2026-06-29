@@ -118,14 +118,14 @@ pub(crate) fn build_element_box<'a>(
     let content_replacement = matches!(style.content, Content::Replacement { .. });
     let mut child_ancestors = ancestors.to_vec();
     child_ancestors.push(signature.clone());
-    let children = if content_replacement {
+    let children = if content_replacement || is_horizontal_rule_element(element) {
         Vec::new()
     } else {
         build_child_boxes(element, stylesheets, &style, &child_ancestors)
     };
     let marker = marker_box(&style);
 
-    if content_replacement || is_replaced_or_thematic_break(element) {
+    if content_replacement || is_replaced_element(element) {
         let mut style = style;
         style.display = if style.display.is_block_level() {
             Display::BLOCK_REPLACED.with_list_item(style.display.is_list_item())
@@ -210,6 +210,7 @@ pub(crate) fn build_element_box<'a>(
             signature,
             marker,
             style,
+            fragment_edges: InlineBoxFragmentEdges::ALL,
             children,
         }))
     }
@@ -309,7 +310,7 @@ fn collect_table_fragment_columns<'a>(
                 signature: signature.clone(),
                 style: Some(style.clone()),
                 group: None,
-                span: table_span(element),
+                span: html_table_column_span(element),
             });
             continue;
         }
@@ -332,7 +333,7 @@ fn collect_table_fragment_column_group<'a>(
         element: group_element,
         signature: group_signature.clone(),
         style: Some(group_style.clone()),
-        span: table_span(group_element),
+        span: html_table_column_span(group_element),
     };
     let mut saw_column = false;
     for child in children {
@@ -346,7 +347,7 @@ fn collect_table_fragment_column_group<'a>(
                 signature: signature.clone(),
                 style: Some(style.clone()),
                 group: Some(group.clone()),
-                span: table_span(element),
+                span: html_table_column_span(element),
             });
         }
     }
@@ -368,34 +369,32 @@ fn collect_table_fragment_rows<'a>(
     row_groups: &[TableFragmentRowGroup<'a>],
 ) {
     let mut anonymous_cells = Vec::new();
-    for child in children {
+    let mut anonymous_cell_children = Vec::new();
+    for (index, child) in children.iter().enumerate() {
         let Some((element, signature, style, descendants)) = child.element_parts() else {
-            if let FormattingBox::Text(text_box) = child
-                && !formatting_box_is_collapsible_space(child)
+            if matches!(child, FormattingBox::Text(_))
+                && !table_fragment_whitespace_is_ignorable(children, index)
             {
-                anonymous_cells.push(anonymous_text_table_fragment_cell(text_box));
+                anonymous_cell_children.push(child.clone());
             }
             continue;
         };
         if is_table_row_box(element, style) {
+            flush_anonymous_table_fragment_cell(&mut anonymous_cells, &mut anonymous_cell_children);
             flush_anonymous_table_fragment_row(rows, &mut anonymous_cells, ancestors, row_groups);
-            let cells = descendants
-                .iter()
-                .filter_map(table_fragment_row_child_cell)
-                .collect::<Vec<_>>();
-            if !cells.is_empty() {
-                rows.push(TableFragmentRow {
-                    element: Some(element),
-                    signature: signature.clone(),
-                    ancestors: ancestors.to_vec(),
-                    row_groups: row_groups.to_vec(),
-                    style: Some(style.clone()),
-                    cells,
-                });
-            }
+            let cells = table_fragment_row_child_cells(descendants);
+            rows.push(TableFragmentRow {
+                element: Some(element),
+                signature: signature.clone(),
+                ancestors: ancestors.to_vec(),
+                row_groups: row_groups.to_vec(),
+                style: Some(style.clone()),
+                cells,
+            });
             continue;
         }
         if is_table_cell_box(element, style) {
+            flush_anonymous_table_fragment_cell(&mut anonymous_cells, &mut anonymous_cell_children);
             anonymous_cells.push(TableFragmentCell {
                 element: Some(element),
                 signature: signature.clone(),
@@ -411,6 +410,7 @@ fn collect_table_fragment_rows<'a>(
             continue;
         }
         if is_table_row_group_box(element, style) {
+            flush_anonymous_table_fragment_cell(&mut anonymous_cells, &mut anonymous_cell_children);
             flush_anonymous_table_fragment_row(rows, &mut anonymous_cells, ancestors, row_groups);
             let mut child_ancestors = ancestors.to_vec();
             child_ancestors.push(signature.clone());
@@ -423,72 +423,99 @@ fn collect_table_fragment_rows<'a>(
             collect_table_fragment_rows(descendants, rows, &child_ancestors, &child_row_groups);
             continue;
         }
-        anonymous_cells.push(anonymous_table_fragment_cell(
-            element,
-            signature,
-            descendants,
-        ));
+        anonymous_cell_children.push(child.clone());
     }
+    flush_anonymous_table_fragment_cell(&mut anonymous_cells, &mut anonymous_cell_children);
     flush_anonymous_table_fragment_row(rows, &mut anonymous_cells, ancestors, row_groups);
 }
 
-fn table_fragment_row_child_cell<'a>(child: &FormattingBox<'a>) -> Option<TableFragmentCell<'a>> {
-    let Some((element, signature, style, descendants)) = child.element_parts() else {
-        if let FormattingBox::Text(text_box) = child {
-            return (!formatting_box_is_collapsible_space(child))
-                .then(|| anonymous_text_table_fragment_cell(text_box));
+fn table_fragment_row_child_cells<'a>(
+    children: &[FormattingBox<'a>],
+) -> Vec<TableFragmentCell<'a>> {
+    let mut cells = Vec::new();
+    let mut anonymous_cell_children = Vec::new();
+    for (index, child) in children.iter().enumerate() {
+        let Some((element, signature, style, descendants)) = child.element_parts() else {
+            if matches!(child, FormattingBox::Text(_))
+                && !table_fragment_whitespace_is_ignorable(children, index)
+            {
+                anonymous_cell_children.push(child.clone());
+            }
+            continue;
+        };
+        if is_table_cell_box(element, style) {
+            flush_anonymous_table_fragment_cell(&mut cells, &mut anonymous_cell_children);
+            cells.push(TableFragmentCell {
+                element: Some(element),
+                signature: signature.clone(),
+                children: descendants.to_vec(),
+                anonymous: false,
+            });
+            continue;
         }
-        return None;
-    };
-    if is_table_cell_box(element, style) {
-        return Some(TableFragmentCell {
-            element: Some(element),
-            signature: signature.clone(),
-            children: descendants.to_vec(),
-            anonymous: false,
-        });
+        if is_table_column_box(element, style)
+            || is_table_column_group_box(element, style)
+            || is_table_caption_box(element, style)
+            || is_table_row_group_box(element, style)
+            || is_table_row_box(element, style)
+        {
+            continue;
+        }
+        anonymous_cell_children.push(child.clone());
     }
-    if is_table_column_box(element, style)
+    flush_anonymous_table_fragment_cell(&mut cells, &mut anonymous_cell_children);
+    cells
+}
+
+/// Return whether whitespace is ignored while fixing up table-internal boxes.
+///
+/// CSS Tables ignores whitespace-only anonymous inline boxes that touch
+/// table-internal boxes, but the consecutive-box rules keep whitespace between
+/// non-internal siblings so it can participate in the generated anonymous cell:
+/// <https://drafts.csswg.org/css-tables/#consecutive-boxes>.
+fn table_fragment_whitespace_is_ignorable(children: &[FormattingBox<'_>], index: usize) -> bool {
+    children
+        .get(index)
+        .is_some_and(formatting_box_is_collapsible_space)
+        && (index == 0
+            || index + 1 == children.len()
+            || table_fragment_box_is_internal_or_caption(&children[index - 1])
+            || table_fragment_box_is_internal_or_caption(&children[index + 1]))
+}
+
+fn table_fragment_box_is_internal_or_caption(box_: &FormattingBox<'_>) -> bool {
+    let Some((element, _, style, _)) = box_.element_parts() else {
+        return false;
+    };
+    is_table_caption_box(element, style)
         || is_table_column_group_box(element, style)
-        || is_table_caption_box(element, style)
+        || is_table_column_box(element, style)
         || is_table_row_group_box(element, style)
         || is_table_row_box(element, style)
-    {
-        return None;
-    }
-    Some(anonymous_table_fragment_cell(
-        element,
-        signature,
-        descendants,
-    ))
+        || is_table_cell_box(element, style)
 }
 
-fn anonymous_table_fragment_cell<'a>(
-    element: &'a Element,
-    signature: &ElementSignature,
-    children: &[FormattingBox<'a>],
-) -> TableFragmentCell<'a> {
-    TableFragmentCell {
-        element: Some(element),
-        signature: signature.clone(),
-        children: children.to_vec(),
-        anonymous: true,
-    }
-}
-
-/// Build an anonymous table cell around text that appears where CSS expects
-/// table-internal boxes.
+/// Flush consecutive improper table children into one anonymous table cell.
 ///
-/// CSS 2.2 requires missing table rows and cells to be generated around
-/// misparented inline content in the table model:
+/// CSS Tables treats consecutive non-table-cell boxes as one run when
+/// generating missing cells, and only ignores whitespace for table-internal
+/// adjacency. Whitespace between improper children therefore remains inline
+/// content inside the generated cell:
+/// <https://drafts.csswg.org/css-tables/#consecutive-boxes> and
 /// <https://www.w3.org/TR/CSS22/tables.html#anonymous-boxes>.
-fn anonymous_text_table_fragment_cell<'a>(text_box: &TextBox) -> TableFragmentCell<'a> {
-    TableFragmentCell {
+fn flush_anonymous_table_fragment_cell<'a>(
+    cells: &mut Vec<TableFragmentCell<'a>>,
+    children: &mut Vec<FormattingBox<'a>>,
+) {
+    if children.is_empty() {
+        return;
+    }
+    cells.push(TableFragmentCell {
         element: None,
         signature: ElementSignature::new("td", HashMap::new()),
-        children: vec![FormattingBox::Text(text_box.clone())],
+        children: std::mem::take(children),
         anonymous: true,
-    }
+    });
 }
 
 fn flush_anonymous_table_fragment_row<'a>(
@@ -524,10 +551,10 @@ fn table_fragment_grid(rows: &[TableFragmentRow<'_>]) -> TableFragmentGrid {
                 column += 1;
             }
 
-            let colspan = cell.element.map(table_cell_colspan).unwrap_or(1);
+            let colspan = cell.element.map(html_table_colspan).unwrap_or(1);
             let rowspan = cell
                 .element
-                .map(|element| table_cell_rowspan(element, row_index, row_group_ends[row_index]))
+                .map(|element| html_table_rowspan(element, row_index, row_group_ends[row_index]))
                 .unwrap_or(1);
             let end = column + colspan;
             if active_rowspans.len() < end {
@@ -608,51 +635,6 @@ fn is_table_row_box(element: &Element, style: &ComputedStyle) -> bool {
 
 fn is_table_cell_box(element: &Element, style: &ComputedStyle) -> bool {
     is_html_table_cell_element(element) || style.display.is_table_cell()
-}
-
-fn table_cell_colspan(cell: &Element) -> usize {
-    cell.attrs
-        .get("colspan")
-        .and_then(|value| parse_html_positive_integer(value))
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
-}
-
-fn table_cell_rowspan(cell: &Element, row_index: usize, row_group_end: usize) -> usize {
-    let remaining_rows = row_group_end.saturating_sub(row_index).max(1);
-    match cell
-        .attrs
-        .get("rowspan")
-        .and_then(|value| parse_html_non_negative_integer(value))
-    {
-        Some(0) => remaining_rows,
-        Some(value) => value.max(1).min(remaining_rows),
-        None => 1,
-    }
-}
-
-fn table_span(element: &Element) -> usize {
-    element
-        .attrs
-        .get("span")
-        .and_then(|value| parse_html_positive_integer(value))
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
-}
-
-fn parse_html_positive_integer(value: &str) -> Option<usize> {
-    parse_html_non_negative_integer(value).filter(|value| *value > 0)
-}
-
-fn parse_html_non_negative_integer(value: &str) -> Option<usize> {
-    let digits = value
-        .trim_start()
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    (!digits.is_empty())
-        .then(|| digits.parse::<usize>().ok())
-        .flatten()
 }
 
 pub(crate) fn marker_box(style: &ComputedStyle) -> Option<MarkerBox> {

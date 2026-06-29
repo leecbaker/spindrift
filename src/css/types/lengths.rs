@@ -361,10 +361,6 @@ pub(crate) enum ComputedFlexBasis {
 impl ComputedFlexBasis {
     pub(crate) const AUTO: Self = Self::Auto;
 
-    pub(crate) fn is_auto(self) -> bool {
-        matches!(self, Self::Auto)
-    }
-
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
         match self {
             Self::FitContent(Some(value)) | Self::LengthPercentage(value) => {

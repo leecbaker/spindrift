@@ -1,4 +1,6 @@
 use super::*;
+use crate::document::RenderedPathCommandPoints;
+use pdf_writer::{Content, Name, Str};
 
 pub(super) fn page_content_render(
     page: &crate::Page,
@@ -6,17 +8,17 @@ pub(super) fn page_content_render(
     embedded_fonts: &EmbeddedFontPlans<'_>,
     next_object_id: &mut usize,
 ) -> PageContentRender {
-    let mut stream = Vec::new();
+    let mut content = Content::new();
     let mut forms = Vec::new();
     if let Some(tree) = page.paint_tree() {
         let mut state = PaintTreeRenderState {
             next_object_id,
             forms: &mut forms,
-            page_width: page.width,
-            page_height: page.height,
+            page_width: page.width(),
+            page_height: page.height(),
         };
         write_paint_tree(
-            &mut stream,
+            &mut content,
             page,
             tree,
             shaped_lines,
@@ -25,16 +27,22 @@ pub(super) fn page_content_render(
         );
     } else {
         let operations = page.paint_operations();
-        write_page_operations(&mut stream, page, &operations, shaped_lines, embedded_fonts);
+        write_page_operations(
+            &mut content,
+            page,
+            &operations,
+            shaped_lines,
+            embedded_fonts,
+        );
     }
     PageContentRender {
-        stream,
+        stream: content.finish().into_vec(),
         form_xobjects: forms,
     }
 }
 
 fn write_paint_tree(
-    stream: &mut Vec<u8>,
+    content: &mut Content,
     page: &crate::Page,
     tree: &crate::document::PagePaintTree,
     shaped_lines: &[Option<ShapedLine>],
@@ -42,7 +50,7 @@ fn write_paint_tree(
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
     write_stacking_context(
-        stream,
+        content,
         page,
         &tree.root,
         shaped_lines,
@@ -59,51 +67,55 @@ struct PaintTreeRenderState<'a, 'b> {
 }
 
 fn write_stacking_context(
-    stream: &mut Vec<u8>,
+    content: &mut Content,
     page: &crate::Page,
     context: &crate::document::PaintStackingContext,
     shaped_lines: &[Option<ShapedLine>],
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
-    if context.effects.opacity < 1.0 {
-        write_opacity_group(stream, page, context, shaped_lines, embedded_fonts, state);
+    if context.effects.needs_group() {
+        write_effect_group(content, page, context, shaped_lines, embedded_fonts, state);
         return;
     }
-    let scoped = context.effects.transform.is_some()
-        || context.effects.overflow_clip.is_some()
-        || context.effects.absolute_clip.is_some();
+    let effect_steps = context.effects.ordered_steps();
+    let scoped = !effect_steps.is_empty();
     if scoped {
-        stream.extend_from_slice(b"q ");
+        content.save_state();
     }
-    if let Some(clip) = context
-        .effects
-        .absolute_clip
-        .or(context.effects.overflow_clip)
-    {
-        write_rect_clip(stream, clip);
-    }
-    if let Some(transform) = context.effects.transform {
-        stream.extend_from_slice(
-            format!(
-                "{:.6} {:.6} {:.6} {:.6} {:.6} {:.6} cm ",
-                transform.a, transform.b, transform.c, transform.d, transform.e, transform.f
-            )
-            .as_bytes(),
-        );
+    for step in effect_steps {
+        match step {
+            crate::document::PaintEffectStep::Clip(clip) => write_rect_clip(content, clip),
+            crate::document::PaintEffectStep::Transform(transform) => {
+                content.transform([
+                    transform.a,
+                    transform.b,
+                    transform.c,
+                    transform.d,
+                    transform.e,
+                    transform.f,
+                ]);
+            }
+            crate::document::PaintEffectStep::ClipPath(_)
+            | crate::document::PaintEffectStep::Filter(_)
+            | crate::document::PaintEffectStep::Mask(_)
+            | crate::document::PaintEffectStep::Opacity(_)
+            | crate::document::PaintEffectStep::Blend(_)
+            | crate::document::PaintEffectStep::Isolation => {}
+        }
     }
     for band in crate::document::PaintBand::ORDER {
         for item in &context.bands.bands[band.index()] {
-            write_display_item(stream, page, item, shaped_lines, embedded_fonts, state);
+            write_display_item(content, page, item, shaped_lines, embedded_fonts, state);
         }
     }
     if scoped {
-        stream.extend_from_slice(b"Q\n");
+        content.restore_state();
     }
 }
 
-fn write_opacity_group(
-    stream: &mut Vec<u8>,
+fn write_effect_group(
+    content: &mut Content,
     page: &crate::Page,
     context: &crate::document::PaintStackingContext,
     shaped_lines: &[Option<ShapedLine>],
@@ -113,17 +125,17 @@ fn write_opacity_group(
     let id = *state.next_object_id;
     *state.next_object_id += 1;
     let name = format!("Fm{}", state.forms.len() + 1);
-    let bbox = context.bounds.unwrap_or(crate::document::PaintClip {
-        x: 0.0,
-        y: 0.0,
-        width: state.page_width,
-        height: state.page_height,
-    });
-    let mut form_stream = Vec::new();
+    let bbox = context.effect_bounds(crate::document::PaintClip::new(
+        0.0,
+        0.0,
+        state.page_width,
+        state.page_height,
+    ));
+    let mut form_content = Content::new();
     let mut form_context = context.clone();
-    form_context.effects.opacity = 1.0;
+    form_context.effects = form_context.effects.without_group_effects();
     write_stacking_context(
-        &mut form_stream,
+        &mut form_content,
         page,
         &form_context,
         shaped_lines,
@@ -134,23 +146,29 @@ fn write_opacity_group(
         id,
         name: name.clone(),
         bbox,
-        stream: form_stream,
+        stream: form_content.finish().into_vec(),
     });
-    let alpha = crate::Color {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: context.effects.opacity,
-    };
-    stream.extend_from_slice(b"q ");
-    if let Some(resource_name) = paint_alpha_resource_name(alpha) {
-        stream.extend_from_slice(format!("/{resource_name} gs ").as_bytes());
+    content.save_state();
+    if context.effects.opacity < 1.0 {
+        let alpha = crate::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: context.effects.opacity,
+        };
+        if let Some(resource_name) = paint_alpha_resource_name(alpha) {
+            content.set_parameters(pdf_name(&resource_name));
+        }
     }
-    stream.extend_from_slice(format!("/{name} Do Q\n").as_bytes());
+    if let Some(resource_name) = context.effects.blend_mode.resource_name() {
+        content.set_parameters(pdf_name(&resource_name));
+    }
+    content.x_object(pdf_name(&name));
+    content.restore_state();
 }
 
 fn write_display_item(
-    stream: &mut Vec<u8>,
+    content: &mut Content,
     page: &crate::Page,
     item: &crate::document::PaintDisplayItem,
     shaped_lines: &[Option<ShapedLine>],
@@ -159,10 +177,10 @@ fn write_display_item(
 ) {
     match item {
         crate::document::PaintDisplayItem::Operation(operation) => {
-            write_page_operation(stream, page, operation, shaped_lines, embedded_fonts);
+            write_page_operation(content, page, operation, shaped_lines, embedded_fonts);
         }
         crate::document::PaintDisplayItem::StackingContext(context) => {
-            write_stacking_context(stream, page, context, shaped_lines, embedded_fonts, state);
+            write_stacking_context(content, page, context, shaped_lines, embedded_fonts, state);
         }
         crate::document::PaintDisplayItem::Primitive(_)
         | crate::document::PaintDisplayItem::Link(_) => {}
@@ -170,7 +188,7 @@ fn write_display_item(
 }
 
 fn write_page_operation(
-    stream: &mut Vec<u8>,
+    content: &mut Content,
     page: &crate::Page,
     operation: &crate::PaintOperation,
     shaped_lines: &[Option<ShapedLine>],
@@ -179,33 +197,33 @@ fn write_page_operation(
     match operation {
         crate::PaintOperation::Rect(index) => {
             if let Some(rect) = page.rects.get(*index) {
-                write_rect(stream, rect);
+                write_rect(content, rect);
             }
         }
         crate::PaintOperation::RoundedRect(index) => {
             if let Some(rect) = page.rounded_rects.get(*index) {
-                write_rounded_rect(stream, rect);
+                write_rounded_rect(content, rect);
             }
         }
         crate::PaintOperation::Path(index) => {
             if let Some(path) = page.paths.get(*index) {
-                write_path(stream, path);
+                write_path(content, path);
             }
         }
         crate::PaintOperation::Stroke(index) => {
             if let Some(stroke) = page.strokes.get(*index) {
-                write_stroke(stream, stroke);
+                write_stroke(content, stroke);
             }
         }
         crate::PaintOperation::Image(index) => {
             if let Some(image) = page.images.get(*index) {
-                write_image(stream, image, *index);
+                write_image(content, image, *index);
             }
         }
         crate::PaintOperation::Line(index) => {
             if let Some(line) = page.lines.get(*index) {
                 write_line(
-                    stream,
+                    content,
                     line,
                     shaped_lines.get(*index).and_then(Option::as_ref),
                     embedded_fonts,
@@ -215,21 +233,24 @@ fn write_page_operation(
     }
 }
 
-fn write_rect_clip(stream: &mut Vec<u8>, clip: crate::document::PaintClip) {
-    if clip.width <= 0.0 || clip.height <= 0.0 {
+fn write_rect_clip(content: &mut Content, clip: crate::document::PaintClip) {
+    if clip.width() <= 0.0 || clip.height() <= 0.0 {
         return;
     }
-    stream.extend_from_slice(
-        format!(
-            "{:.6} {:.6} {:.6} {:.6} re W n ",
-            clip.x, clip.y, clip.width, clip.height
+    let rect = crate::document::paint_rect_to_pdf(clip.paint_rect());
+    content
+        .rect(
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
         )
-        .as_bytes(),
-    );
+        .clip_nonzero()
+        .end_path();
 }
 
 pub(super) fn write_page_operations(
-    stream: &mut Vec<u8>,
+    content: &mut Content,
     page: &crate::Page,
     operations: &[crate::PaintOperation],
     shaped_lines: &[Option<ShapedLine>],
@@ -253,43 +274,43 @@ pub(super) fn write_page_operations(
                     {
                         continue;
                     }
-                    flush_pending_rect(stream, &mut pending_rect);
+                    flush_pending_rect(content, &mut pending_rect);
                     if is_mergeable_fill_rect(rect) {
                         pending_rect = Some(rect.clone());
                     } else {
-                        write_rect(stream, rect);
+                        write_rect(content, rect);
                     }
                 }
             }
             crate::PaintOperation::RoundedRect(index) => {
-                flush_pending_rect(stream, &mut pending_rect);
+                flush_pending_rect(content, &mut pending_rect);
                 if let Some(rect) = page.rounded_rects.get(*index) {
-                    write_rounded_rect(stream, rect);
+                    write_rounded_rect(content, rect);
                 }
             }
             crate::PaintOperation::Path(index) => {
-                flush_pending_rect(stream, &mut pending_rect);
+                flush_pending_rect(content, &mut pending_rect);
                 if let Some(path) = page.paths.get(*index) {
-                    write_path(stream, path);
+                    write_path(content, path);
                 }
             }
             crate::PaintOperation::Stroke(index) => {
-                flush_pending_rect(stream, &mut pending_rect);
+                flush_pending_rect(content, &mut pending_rect);
                 if let Some(stroke) = page.strokes.get(*index) {
-                    write_stroke(stream, stroke);
+                    write_stroke(content, stroke);
                 }
             }
             crate::PaintOperation::Image(index) => {
-                flush_pending_rect(stream, &mut pending_rect);
+                flush_pending_rect(content, &mut pending_rect);
                 if let Some(image) = page.images.get(*index) {
-                    write_image(stream, image, *index);
+                    write_image(content, image, *index);
                 }
             }
             crate::PaintOperation::Line(index) => {
-                flush_pending_rect(stream, &mut pending_rect);
+                flush_pending_rect(content, &mut pending_rect);
                 if let Some(line) = page.lines.get(*index) {
                     write_line(
-                        stream,
+                        content,
                         line,
                         shaped_lines.get(*index).and_then(Option::as_ref),
                         embedded_fonts,
@@ -298,7 +319,7 @@ pub(super) fn write_page_operations(
             }
         }
     }
-    flush_pending_rect(stream, &mut pending_rect);
+    flush_pending_rect(content, &mut pending_rect);
 }
 
 /// Detects a PDF fill that is completely obscured by later opaque fills.
@@ -339,25 +360,35 @@ fn merge_adjacent_fill_rect(left: &mut crate::RenderedRect, right: &crate::Rende
     if !is_mergeable_fill_rect(left) || !is_mergeable_fill_rect(right) || left.fill != right.fill {
         return false;
     }
-    if nearly_equal(left.x, right.x) && nearly_equal(left.width, right.width) {
-        if nearly_equal(left.y + left.height, right.y) {
-            left.height += right.height;
+    if nearly_equal(left.x(), right.x()) && nearly_equal(left.width(), right.width()) {
+        if nearly_equal(left.y() + left.height(), right.y()) {
+            left.set_paint_rect(crate::document::PaintRect::new(
+                crate::document::PaintPoint::new(left.x(), left.y()),
+                crate::document::PaintSize::new(left.width(), left.height() + right.height()),
+            ));
             return true;
         }
-        if nearly_equal(right.y + right.height, left.y) {
-            left.y = right.y;
-            left.height += right.height;
+        if nearly_equal(right.y() + right.height(), left.y()) {
+            left.set_paint_rect(crate::document::PaintRect::new(
+                crate::document::PaintPoint::new(left.x(), right.y()),
+                crate::document::PaintSize::new(left.width(), left.height() + right.height()),
+            ));
             return true;
         }
     }
-    if nearly_equal(left.y, right.y) && nearly_equal(left.height, right.height) {
-        if nearly_equal(left.x + left.width, right.x) {
-            left.width += right.width;
+    if nearly_equal(left.y(), right.y()) && nearly_equal(left.height(), right.height()) {
+        if nearly_equal(left.x() + left.width(), right.x()) {
+            left.set_paint_rect(crate::document::PaintRect::new(
+                crate::document::PaintPoint::new(left.x(), left.y()),
+                crate::document::PaintSize::new(left.width() + right.width(), left.height()),
+            ));
             return true;
         }
-        if nearly_equal(right.x + right.width, left.x) {
-            left.x = right.x;
-            left.width += right.width;
+        if nearly_equal(right.x() + right.width(), left.x()) {
+            left.set_paint_rect(crate::document::PaintRect::new(
+                crate::document::PaintPoint::new(right.x(), left.y()),
+                crate::document::PaintSize::new(left.width() + right.width(), left.height()),
+            ));
             return true;
         }
     }
@@ -372,35 +403,35 @@ fn is_opaque_fill_rect(rect: &crate::RenderedRect) -> bool {
     rect.stroke.is_none() && rect.fill.is_some_and(|fill| fill.a >= 1.0)
 }
 
-fn flush_pending_rect(stream: &mut Vec<u8>, pending_rect: &mut Option<crate::RenderedRect>) {
+fn flush_pending_rect(content: &mut Content, pending_rect: &mut Option<crate::RenderedRect>) {
     if let Some(rect) = pending_rect.take() {
-        write_rect(stream, &rect);
+        write_rect(content, &rect);
     }
 }
 
 fn rects_intersect(left: &crate::RenderedRect, right: &crate::RenderedRect) -> bool {
-    left.x < right.x + right.width
-        && right.x < left.x + left.width
-        && left.y < right.y + right.height
-        && right.y < left.y + left.height
+    left.x() < right.x() + right.width()
+        && right.x() < left.x() + left.width()
+        && left.y() < right.y() + right.height()
+        && right.y() < left.y() + left.height()
 }
 
 fn rect_area_is_covered_by_rects(
     rect: &crate::RenderedRect,
     covers: &[&crate::RenderedRect],
 ) -> bool {
-    if covers.is_empty() || rect.width <= 0.0 || rect.height <= 0.0 {
+    if covers.is_empty() || rect.width() <= 0.0 || rect.height() <= 0.0 {
         return false;
     }
-    let right = rect.x + rect.width;
-    let top = rect.y + rect.height;
-    let mut x_edges = vec![rect.x, right];
-    let mut y_edges = vec![rect.y, top];
+    let right = rect.x() + rect.width();
+    let top = rect.y() + rect.height();
+    let mut x_edges = vec![rect.x(), right];
+    let mut y_edges = vec![rect.y(), top];
     for cover in covers {
-        x_edges.push(cover.x.clamp(rect.x, right));
-        x_edges.push((cover.x + cover.width).clamp(rect.x, right));
-        y_edges.push(cover.y.clamp(rect.y, top));
-        y_edges.push((cover.y + cover.height).clamp(rect.y, top));
+        x_edges.push(cover.x().clamp(rect.x(), right));
+        x_edges.push((cover.x() + cover.width()).clamp(rect.x(), right));
+        y_edges.push(cover.y().clamp(rect.y(), top));
+        y_edges.push((cover.y() + cover.height()).clamp(rect.y(), top));
     }
     sort_unique_edges(&mut x_edges);
     sort_unique_edges(&mut y_edges);
@@ -415,10 +446,10 @@ fn rect_area_is_covered_by_rects(
                 return true;
             }
             covers.iter().any(|cover| {
-                cover.x <= cell_left + 0.001
-                    && cover.x + cover.width >= cell_right - 0.001
-                    && cover.y <= cell_bottom + 0.001
-                    && cover.y + cover.height >= cell_top - 0.001
+                cover.x() <= cell_left + 0.001
+                    && cover.x() + cover.width() >= cell_right - 0.001
+                    && cover.y() <= cell_bottom + 0.001
+                    && cover.y() + cover.height() >= cell_top - 0.001
             })
         })
     })
@@ -433,147 +464,126 @@ fn nearly_equal(left: f32, right: f32) -> bool {
     (left - right).abs() < 0.001
 }
 
-pub(super) fn write_rect(stream: &mut Vec<u8>, rect: &crate::RenderedRect) {
+pub(super) fn write_rect(content: &mut Content, rect: &crate::RenderedRect) {
+    let pdf_rect = crate::document::paint_rect_to_pdf(rect.paint_rect());
     if let Some(fill) = rect.fill
         && fill.is_visible()
     {
-        let scoped_alpha = write_alpha_graphics_state(stream, fill);
-        stream.extend_from_slice(
-            format!(
-                "{:.3} {:.3} {:.3} rg {:.6} {:.6} {:.6} {:.6} re f\n",
-                fill.r, fill.g, fill.b, rect.x, rect.y, rect.width, rect.height
+        let scoped_alpha = write_alpha_graphics_state(content, fill);
+        content
+            .set_fill_rgb(fill.r, fill.g, fill.b)
+            .rect(
+                pdf_rect.origin.x,
+                pdf_rect.origin.y,
+                pdf_rect.size.width,
+                pdf_rect.size.height,
             )
-            .as_bytes(),
-        );
-        close_alpha_graphics_state(stream, scoped_alpha);
+            .fill_nonzero();
+        close_alpha_graphics_state(content, scoped_alpha);
     }
     if let Some(stroke) = rect.stroke
         && stroke.is_visible()
     {
-        let scoped_alpha = write_alpha_graphics_state(stream, stroke);
-        stream.extend_from_slice(
-            format!(
-                "{:.3} w {:.3} {:.3} {:.3} RG {:.6} {:.6} {:.6} {:.6} re S\n",
-                rect.stroke_width,
-                stroke.r,
-                stroke.g,
-                stroke.b,
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height
+        let scoped_alpha = write_alpha_graphics_state(content, stroke);
+        content
+            .set_line_width(rect.stroke_width)
+            .set_stroke_rgb(stroke.r, stroke.g, stroke.b)
+            .rect(
+                pdf_rect.origin.x,
+                pdf_rect.origin.y,
+                pdf_rect.size.width,
+                pdf_rect.size.height,
             )
-            .as_bytes(),
-        );
-        close_alpha_graphics_state(stream, scoped_alpha);
+            .stroke();
+        close_alpha_graphics_state(content, scoped_alpha);
     }
 }
 
-pub(super) fn write_rounded_rect(stream: &mut Vec<u8>, rect: &RenderedRoundedRect) {
+pub(super) fn write_rounded_rect(content: &mut Content, rect: &RenderedRoundedRect) {
     if let Some(fill) = rect.fill
         && fill.is_visible()
     {
-        let scoped_alpha = write_alpha_graphics_state(stream, fill);
-        stream
-            .extend_from_slice(format!("{:.3} {:.3} {:.3} rg ", fill.r, fill.g, fill.b).as_bytes());
-        write_rounded_rect_path(stream, rect);
-        stream.extend_from_slice(b" f\n");
-        close_alpha_graphics_state(stream, scoped_alpha);
+        let scoped_alpha = write_alpha_graphics_state(content, fill);
+        content.set_fill_rgb(fill.r, fill.g, fill.b);
+        write_rounded_rect_path(content, rect);
+        content.fill_nonzero();
+        close_alpha_graphics_state(content, scoped_alpha);
     }
     if let Some(stroke) = rect.stroke
         && stroke.is_visible()
     {
-        let scoped_alpha = write_alpha_graphics_state(stream, stroke);
-        stream.extend_from_slice(
-            format!(
-                "{:.3} w {:.3} {:.3} {:.3} RG ",
-                rect.stroke_width, stroke.r, stroke.g, stroke.b
-            )
-            .as_bytes(),
-        );
-        write_rounded_rect_path(stream, rect);
-        stream.extend_from_slice(b" S\n");
-        close_alpha_graphics_state(stream, scoped_alpha);
+        let scoped_alpha = write_alpha_graphics_state(content, stroke);
+        content
+            .set_line_width(rect.stroke_width)
+            .set_stroke_rgb(stroke.r, stroke.g, stroke.b);
+        write_rounded_rect_path(content, rect);
+        content.stroke();
+        close_alpha_graphics_state(content, scoped_alpha);
     }
 }
 
-pub(super) fn write_rounded_rect_path(stream: &mut Vec<u8>, rect: &RenderedRoundedRect) {
+pub(super) fn write_rounded_rect_path(content: &mut Content, rect: &RenderedRoundedRect) {
     // PDF paths use cubic Beziers for arcs. The kappa constant approximates a
     // quarter ellipse, matching the CSS border-radius curve shape closely
     // enough for filled/stroked page graphics.
     const KAPPA: f32 = 0.552_284_8;
 
-    let x0 = rect.x;
-    let y0 = rect.y;
-    let x1 = rect.x + rect.width;
-    let y1 = rect.y + rect.height;
+    let pdf_rect = crate::document::paint_rect_to_pdf(rect.paint_rect());
+    let x0 = pdf_rect.origin.x;
+    let y0 = pdf_rect.origin.y;
+    let x1 = pdf_rect.origin.x + pdf_rect.size.width;
+    let y1 = pdf_rect.origin.y + pdf_rect.size.height;
     let tl = rect.radii.top_left;
     let tr = rect.radii.top_right;
     let br = rect.radii.bottom_right;
     let bl = rect.radii.bottom_left;
 
-    stream.extend_from_slice(format!("{:.3} {:.3} m ", x0 + bl.x, y0).as_bytes());
-    stream.extend_from_slice(format!("{:.3} {:.3} l ", x1 - br.x, y0).as_bytes());
-    if br.x > 0.0 || br.y > 0.0 {
-        stream.extend_from_slice(
-            format!(
-                "{:.3} {:.3} {:.3} {:.3} {:.3} {:.3} c ",
-                x1 - br.x + br.x * KAPPA,
-                y0,
-                x1,
-                y0 + br.y - br.y * KAPPA,
-                x1,
-                y0 + br.y
-            )
-            .as_bytes(),
+    content.move_to(x0 + bl.x(), y0);
+    content.line_to(x1 - br.x(), y0);
+    if br.x() > 0.0 || br.y() > 0.0 {
+        content.cubic_to(
+            x1 - br.x() + br.x() * KAPPA,
+            y0,
+            x1,
+            y0 + br.y() - br.y() * KAPPA,
+            x1,
+            y0 + br.y(),
         );
     }
-    stream.extend_from_slice(format!("{:.3} {:.3} l ", x1, y1 - tr.y).as_bytes());
-    if tr.x > 0.0 || tr.y > 0.0 {
-        stream.extend_from_slice(
-            format!(
-                "{:.3} {:.3} {:.3} {:.3} {:.3} {:.3} c ",
-                x1,
-                y1 - tr.y + tr.y * KAPPA,
-                x1 - tr.x + tr.x * KAPPA,
-                y1,
-                x1 - tr.x,
-                y1
-            )
-            .as_bytes(),
+    content.line_to(x1, y1 - tr.y());
+    if tr.x() > 0.0 || tr.y() > 0.0 {
+        content.cubic_to(
+            x1,
+            y1 - tr.y() + tr.y() * KAPPA,
+            x1 - tr.x() + tr.x() * KAPPA,
+            y1,
+            x1 - tr.x(),
+            y1,
         );
     }
-    stream.extend_from_slice(format!("{:.3} {:.3} l ", x0 + tl.x, y1).as_bytes());
-    if tl.x > 0.0 || tl.y > 0.0 {
-        stream.extend_from_slice(
-            format!(
-                "{:.3} {:.3} {:.3} {:.3} {:.3} {:.3} c ",
-                x0 + tl.x - tl.x * KAPPA,
-                y1,
-                x0,
-                y1 - tl.y + tl.y * KAPPA,
-                x0,
-                y1 - tl.y
-            )
-            .as_bytes(),
+    content.line_to(x0 + tl.x(), y1);
+    if tl.x() > 0.0 || tl.y() > 0.0 {
+        content.cubic_to(
+            x0 + tl.x() - tl.x() * KAPPA,
+            y1,
+            x0,
+            y1 - tl.y() + tl.y() * KAPPA,
+            x0,
+            y1 - tl.y(),
         );
     }
-    stream.extend_from_slice(format!("{:.3} {:.3} l ", x0, y0 + bl.y).as_bytes());
-    if bl.x > 0.0 || bl.y > 0.0 {
-        stream.extend_from_slice(
-            format!(
-                "{:.3} {:.3} {:.3} {:.3} {:.3} {:.3} c ",
-                x0,
-                y0 + bl.y - bl.y * KAPPA,
-                x0 + bl.x - bl.x * KAPPA,
-                y0,
-                x0 + bl.x,
-                y0
-            )
-            .as_bytes(),
+    content.line_to(x0, y0 + bl.y());
+    if bl.x() > 0.0 || bl.y() > 0.0 {
+        content.cubic_to(
+            x0,
+            y0 + bl.y() - bl.y() * KAPPA,
+            x0 + bl.x() - bl.x() * KAPPA,
+            y0,
+            x0 + bl.x(),
+            y0,
         );
     }
-    stream.extend_from_slice(b"h");
+    content.close_path();
 }
 
 /// Serialize a generic vector path into a PDF content stream.
@@ -581,7 +591,7 @@ pub(super) fn write_rounded_rect_path(stream: &mut Vec<u8>, rect: &RenderedRound
 /// PDF path construction and painting operators are defined in ISO
 /// 32000-1:2008, 8.5.2 and 8.5.3. CSS border rings use `f*` when their inner
 /// padding-edge subpath must cut out the content area using even-odd filling.
-pub(super) fn write_path(stream: &mut Vec<u8>, path: &RenderedPath) {
+pub(super) fn write_path(content: &mut Content, path: &RenderedPath) {
     if path.commands.is_empty() {
         return;
     }
@@ -590,135 +600,150 @@ pub(super) fn write_path(stream: &mut Vec<u8>, path: &RenderedPath) {
         .as_ref()
         .is_some_and(|clip| !clip.commands.is_empty());
     if clipped {
-        stream.extend_from_slice(b"q ");
+        content.save_state();
         let clip = path.clip.as_ref().unwrap();
-        write_clip_path(stream, &clip.commands, clip.fill_rule);
+        write_clip_path(content, &clip.commands, clip.fill_rule);
         for additional_clip in &clip.additional_clips {
-            write_clip_path(stream, &additional_clip.commands, additional_clip.fill_rule);
+            write_clip_path(
+                content,
+                &additional_clip.commands,
+                additional_clip.fill_rule,
+            );
         }
     }
     if let Some(fill) = path.fill
         && fill.is_visible()
     {
-        let scoped_alpha = write_alpha_graphics_state(stream, fill);
-        stream
-            .extend_from_slice(format!("{:.3} {:.3} {:.3} rg ", fill.r, fill.g, fill.b).as_bytes());
-        write_path_commands(stream, &path.commands);
+        let scoped_alpha = write_alpha_graphics_state(content, fill);
+        content.set_fill_rgb(fill.r, fill.g, fill.b);
+        write_path_commands(content, &path.commands);
         match path.fill_rule {
-            RenderedPathFillRule::NonZero => stream.extend_from_slice(b" f\n"),
-            RenderedPathFillRule::EvenOdd => stream.extend_from_slice(b" f*\n"),
+            RenderedPathFillRule::NonZero => {
+                content.fill_nonzero();
+            }
+            RenderedPathFillRule::EvenOdd => {
+                content.fill_even_odd();
+            }
         }
-        close_alpha_graphics_state(stream, scoped_alpha);
+        close_alpha_graphics_state(content, scoped_alpha);
     }
     if let Some(stroke) = path.stroke
         && stroke.is_visible()
     {
-        let scoped_alpha = write_alpha_graphics_state(stream, stroke);
-        stream.extend_from_slice(
-            format!(
-                "{:.3} w {:.3} {:.3} {:.3} RG ",
-                path.stroke_width, stroke.r, stroke.g, stroke.b
-            )
-            .as_bytes(),
-        );
-        write_path_commands(stream, &path.commands);
-        stream.extend_from_slice(b" S\n");
-        close_alpha_graphics_state(stream, scoped_alpha);
+        let scoped_alpha = write_alpha_graphics_state(content, stroke);
+        content
+            .set_line_width(path.stroke_width)
+            .set_stroke_rgb(stroke.r, stroke.g, stroke.b);
+        write_path_commands(content, &path.commands);
+        content.stroke();
+        close_alpha_graphics_state(content, scoped_alpha);
     }
     if clipped {
-        stream.extend_from_slice(b"Q\n");
+        content.restore_state();
     }
 }
 
 fn write_clip_path(
-    stream: &mut Vec<u8>,
+    content: &mut Content,
     commands: &[RenderedPathCommand],
     fill_rule: RenderedPathFillRule,
 ) {
-    write_path_commands(stream, commands);
+    write_path_commands(content, commands);
     match fill_rule {
-        RenderedPathFillRule::NonZero => stream.extend_from_slice(b"W n "),
-        RenderedPathFillRule::EvenOdd => stream.extend_from_slice(b"W* n "),
+        RenderedPathFillRule::NonZero => {
+            content.clip_nonzero();
+        }
+        RenderedPathFillRule::EvenOdd => {
+            content.clip_even_odd();
+        }
     }
+    content.end_path();
 }
 
-fn write_path_commands(stream: &mut Vec<u8>, commands: &[RenderedPathCommand]) {
+fn write_path_commands(content: &mut Content, commands: &[RenderedPathCommand]) {
     for command in commands {
-        match *command {
-            RenderedPathCommand::MoveTo(x, y) => {
-                stream.extend_from_slice(format!("{x:.3} {y:.3} m ").as_bytes());
+        match command.typed_points() {
+            RenderedPathCommandPoints::MoveTo(point) => {
+                let point = crate::document::paint_point_to_pdf(point);
+                content.move_to(point.x, point.y);
             }
-            RenderedPathCommand::LineTo(x, y) => {
-                stream.extend_from_slice(format!("{x:.3} {y:.3} l ").as_bytes());
+            RenderedPathCommandPoints::LineTo(point) => {
+                let point = crate::document::paint_point_to_pdf(point);
+                content.line_to(point.x, point.y);
             }
-            RenderedPathCommand::CurveTo {
-                x1,
-                y1,
-                x2,
-                y2,
-                x3,
-                y3,
+            RenderedPathCommandPoints::CurveTo {
+                control_1,
+                control_2,
+                end,
             } => {
-                stream.extend_from_slice(
-                    format!("{x1:.3} {y1:.3} {x2:.3} {y2:.3} {x3:.3} {y3:.3} c ").as_bytes(),
+                let control_1 = crate::document::paint_point_to_pdf(control_1);
+                let control_2 = crate::document::paint_point_to_pdf(control_2);
+                let end = crate::document::paint_point_to_pdf(end);
+                content.cubic_to(
+                    control_1.x,
+                    control_1.y,
+                    control_2.x,
+                    control_2.y,
+                    end.x,
+                    end.y,
                 );
             }
-            RenderedPathCommand::Close => stream.extend_from_slice(b"h "),
+            RenderedPathCommandPoints::Close => {
+                content.close_path();
+            }
         }
     }
 }
 
-pub(super) fn write_stroke(stream: &mut Vec<u8>, stroke: &crate::RenderedStroke) {
+pub(super) fn write_stroke(content: &mut Content, stroke: &crate::RenderedStroke) {
     if !stroke.color.is_visible() {
         return;
     }
-    stream.extend_from_slice(b"q ");
+    content.save_state();
     if let Some(resource_name) = paint_alpha_resource_name(stroke.color) {
-        stream.extend_from_slice(format!("/{resource_name} gs ").as_bytes());
+        content.set_parameters(pdf_name(&resource_name));
     }
     if let Some((dash, gap)) = stroke.dash {
-        stream.extend_from_slice(format!("[{dash:.3} {gap:.3}] 0 d ").as_bytes());
+        content.set_dash_pattern([dash, gap], 0.0);
     } else {
-        stream.extend_from_slice(b"[] 0 d ");
+        content.set_dash_pattern([], 0.0);
     }
-    stream.extend_from_slice(
-        format!(
-            "{:.3} w {:.3} {:.3} {:.3} RG {:.3} {:.3} m {:.3} {:.3} l S Q\n",
-            stroke.width,
-            stroke.color.r,
-            stroke.color.g,
-            stroke.color.b,
-            stroke.x1,
-            stroke.y1,
-            stroke.x2,
-            stroke.y2
-        )
-        .as_bytes(),
-    );
+    let (start, end) = stroke.paint_points();
+    let start = crate::document::paint_point_to_pdf(start);
+    let end = crate::document::paint_point_to_pdf(end);
+    content
+        .set_line_width(stroke.width)
+        .set_stroke_rgb(stroke.color.r, stroke.color.g, stroke.color.b)
+        .move_to(start.x, start.y)
+        .line_to(end.x, end.y)
+        .stroke()
+        .restore_state();
 }
 
-pub(super) fn write_image(stream: &mut Vec<u8>, image: &crate::RenderedImage, index: usize) {
-    stream.extend_from_slice(
-        format!(
-            "q {:.3} 0 0 {:.3} {:.3} {:.3} cm /Im{} Do Q\n",
-            image.width,
-            image.height,
-            image.x,
-            image.y,
-            index + 1
-        )
-        .as_bytes(),
-    );
+pub(super) fn write_image(content: &mut Content, image: &crate::RenderedImage, index: usize) {
+    let rect = crate::document::paint_rect_to_pdf(image.paint_rect());
+    content
+        .save_state()
+        .transform([
+            rect.size.width,
+            0.0,
+            0.0,
+            rect.size.height,
+            rect.origin.x,
+            rect.origin.y,
+        ])
+        .x_object(pdf_name(&format!("Im{}", index + 1)))
+        .restore_state();
 }
 
 pub(super) fn write_line(
-    stream: &mut Vec<u8>,
+    content: &mut Content,
     line: &crate::RenderedLine,
     shaped_line: Option<&ShapedLine>,
     embedded_fonts: &EmbeddedFontPlans<'_>,
 ) {
     if let Some(shaped_line) = shaped_line {
-        write_shaped_line(stream, line, shaped_line, embedded_fonts);
+        write_shaped_line(content, line, shaped_line, embedded_fonts);
     } else if !line.text.is_empty() {
         log::warn!(
             "skipping unshaped text line without a resolved embedded font: {:?}",
@@ -728,7 +753,7 @@ pub(super) fn write_line(
 }
 
 pub(super) fn write_shaped_line(
-    stream: &mut Vec<u8>,
+    content: &mut Content,
     line: &crate::RenderedLine,
     shaped_line: &ShapedLine,
     embedded_fonts: &EmbeddedFontPlans<'_>,
@@ -744,14 +769,11 @@ pub(super) fn write_shaped_line(
     // CSS inline layout stores shaped runs at visual offsets inside one line
     // box, so reset the text matrix for each run instead of assuming all
     // fallback/style runs are contiguous after the previous text operator.
-    let scoped_alpha = write_alpha_graphics_state(stream, line.color);
-    stream.extend_from_slice(
-        format!(
-            "{:.3} {:.3} {:.3} rg BT ",
-            line.color.r, line.color.g, line.color.b
-        )
-        .as_bytes(),
-    );
+    let scoped_alpha = write_alpha_graphics_state(content, line.color);
+    content
+        .set_fill_rgb(line.color.r, line.color.g, line.color.b)
+        .begin_text();
+    let line_origin = crate::document::paint_point_to_pdf(line.origin());
     for run in &shaped_line.runs {
         if run.glyphs.is_empty() {
             continue;
@@ -768,22 +790,22 @@ pub(super) fn write_shaped_line(
             );
             continue;
         };
-        let text_operator = shaped_text_operator(run.font_size, &run.glyphs);
         let pdf_font_size = quantized_pdf_font_size(run.font_size);
-        stream.extend_from_slice(
-            format!(
-                "1 0 0 1 {:.6} {:.6} Tm /{} {:.6} Tf {} ",
-                line.x + run.x_offset,
-                line.y,
-                font.resource_name,
-                pdf_font_size,
-                text_operator
-            )
-            .as_bytes(),
-        );
+        let matrix = run.text_matrix;
+        content
+            .set_text_matrix([
+                matrix.a,
+                matrix.b,
+                matrix.c,
+                matrix.d,
+                line_origin.x + run.x_offset,
+                line_origin.y + run.y_offset,
+            ])
+            .set_font(pdf_name(&font.resource_name), pdf_font_size);
+        write_shaped_glyphs(content, run.font_size, &run.glyphs);
     }
-    stream.extend_from_slice(b"ET\n");
-    close_alpha_graphics_state(stream, scoped_alpha);
+    content.end_text();
+    close_alpha_graphics_state(content, scoped_alpha);
 }
 
 /// Activate a PDF ExtGState for semi-transparent paint.
@@ -792,18 +814,20 @@ pub(super) fn write_shaped_line(
 /// including stroking and nonstroking alpha constants:
 /// ISO 32000-1:2008, 8.4.4 "Graphics State Operators" and 11.7.4.3
 /// "Constant Shape and Opacity".
-fn write_alpha_graphics_state(stream: &mut Vec<u8>, color: Color) -> bool {
+fn write_alpha_graphics_state(content: &mut Content, color: Color) -> bool {
     if let Some(resource_name) = paint_alpha_resource_name(color) {
-        stream.extend_from_slice(format!("q /{resource_name} gs ").as_bytes());
+        content
+            .save_state()
+            .set_parameters(pdf_name(&resource_name));
         true
     } else {
         false
     }
 }
 
-fn close_alpha_graphics_state(stream: &mut Vec<u8>, scoped_alpha: bool) {
+fn close_alpha_graphics_state(content: &mut Content, scoped_alpha: bool) {
     if scoped_alpha {
-        stream.extend_from_slice(b"Q\n");
+        content.restore_state();
     }
 }
 
@@ -816,23 +840,26 @@ pub(super) fn quantized_pdf_font_size(font_size: f32) -> f32 {
     (css_px * 1024.0).floor() / 1024.0 * crate::css::CSS_PX_TO_PT
 }
 
-pub(super) fn shaped_text_operator(font_size: f32, glyphs: &[ShapedGlyph]) -> String {
+fn write_shaped_glyphs(content: &mut Content, font_size: f32, glyphs: &[ShapedGlyph]) {
     if !needs_positioned_glyphs(glyphs) {
-        return format!("{} Tj", glyph_string(glyphs));
+        let glyph_bytes = glyph_bytes(glyphs);
+        content.show(Str(&glyph_bytes));
+        return;
     }
 
-    let mut parts = Vec::new();
+    let mut positioned = content.show_positioned();
+    let mut items = positioned.items();
     for (index, glyph) in glyphs.iter().enumerate() {
-        parts.push(format!("<{:04X}>", glyph.id));
+        let glyph_bytes = glyph_id_bytes(glyph.id);
+        items.show(Str(&glyph_bytes));
         if index + 1 < glyphs.len() {
             let adjustment =
                 ((glyph.nominal_x_advance - glyph.x_advance) * 1000.0) / font_size.max(0.001);
             if adjustment.abs() > 0.01 {
-                parts.push(format!("{adjustment:.3}"));
+                items.adjust(adjustment);
             }
         }
     }
-    format!("[{}] TJ", parts.join(" "))
 }
 
 pub(super) fn needs_positioned_glyphs(glyphs: &[ShapedGlyph]) -> bool {
@@ -843,73 +870,17 @@ pub(super) fn needs_positioned_glyphs(glyphs: &[ShapedGlyph]) -> bool {
     })
 }
 
-pub(super) fn glyph_string(glyphs: &[ShapedGlyph]) -> String {
-    format!(
-        "<{}>",
-        glyphs
-            .iter()
-            .map(|glyph| format!("{:04X}", glyph.id))
-            .collect::<String>()
-    )
-}
-
-pub(super) fn escape_pdf_string(text: &str) -> String {
-    escape_pdf_bytes(&encode_winansi_bytes(text))
-}
-
-pub(super) fn encode_winansi_bytes(text: &str) -> Vec<u8> {
-    text.chars()
-        .map(|character| winansi_byte(character).unwrap_or(b'?'))
+fn glyph_bytes(glyphs: &[ShapedGlyph]) -> Vec<u8> {
+    glyphs
+        .iter()
+        .flat_map(|glyph| glyph_id_bytes(glyph.id))
         .collect()
 }
 
-pub(super) fn winansi_byte(character: char) -> Option<u8> {
-    match character {
-        '\n' | '\r' | '\t' => Some(b' '),
-        '\u{00a0}' => Some(0xa0),
-        character if ('\u{20}'..='\u{7e}').contains(&character) => Some(character as u8),
-        '€' => Some(0x80),
-        '‚' => Some(0x82),
-        'ƒ' => Some(0x83),
-        '„' => Some(0x84),
-        '…' => Some(0x85),
-        '†' => Some(0x86),
-        '‡' => Some(0x87),
-        'ˆ' => Some(0x88),
-        '‰' => Some(0x89),
-        'Š' => Some(0x8a),
-        '‹' => Some(0x8b),
-        'Œ' => Some(0x8c),
-        'Ž' => Some(0x8e),
-        '‘' => Some(0x91),
-        '’' => Some(0x92),
-        '“' => Some(0x93),
-        '”' => Some(0x94),
-        '•' => Some(0x95),
-        '–' => Some(0x96),
-        '—' => Some(0x97),
-        '˜' => Some(0x98),
-        '™' => Some(0x99),
-        'š' => Some(0x9a),
-        '›' => Some(0x9b),
-        'œ' => Some(0x9c),
-        'ž' => Some(0x9e),
-        'Ÿ' => Some(0x9f),
-        character if ('\u{00a1}'..='\u{00ff}').contains(&character) => Some(character as u8),
-        _ => None,
-    }
+fn glyph_id_bytes(glyph_id: u16) -> [u8; 2] {
+    glyph_id.to_be_bytes()
 }
 
-pub(super) fn escape_pdf_bytes(bytes: &[u8]) -> String {
-    let mut output = String::new();
-    for byte in bytes {
-        match byte {
-            b'(' => output.push_str("\\("),
-            b')' => output.push_str("\\)"),
-            b'\\' => output.push_str("\\\\"),
-            0x20..=0x7e => output.push(*byte as char),
-            _ => output.push_str(&format!("\\{byte:03o}")),
-        }
-    }
-    output
+fn pdf_name(name: &str) -> Name<'_> {
+    Name(name.as_bytes())
 }

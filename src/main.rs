@@ -1,8 +1,8 @@
 use clap::{CommandFactory, Parser, ValueHint};
 use clap_complete::{Shell, generate};
-use quire::{Css, Html, RenderOptions, file_url_to_path};
+use quire::{Css, Html, PdfVariant, RenderOptions, file_url_to_path};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Debug, Parser)]
@@ -38,6 +38,16 @@ struct Cli {
     )]
     base_url: Option<String>,
 
+    /// PDF variant to generate.
+    #[arg(
+        long = "pdf-variant",
+        alias = "pdf-type",
+        value_name = "VARIANT",
+        default_value_t = PdfVariant::default(),
+        value_parser = clap::value_parser!(PdfVariant)
+    )]
+    pdf_variant: PdfVariant,
+
     /// Generate a shell completion script to standard output.
     #[arg(long = "generate-completion", value_name = "SHELL")]
     generate_completion: Option<Shell>,
@@ -54,9 +64,10 @@ struct Cli {
     #[arg(
         value_name = "OUTPUT",
         required_unless_present = "generate_completion",
-        value_hint = ValueHint::FilePath
+        value_hint = ValueHint::FilePath,
+        value_parser = canonicalize_output_path
     )]
-    output: Option<String>,
+    output: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -122,11 +133,12 @@ async fn run() -> quire::Result<()> {
         html = html.with_stylesheet(stylesheet);
     }
 
-    log::info!("writing PDF to {output}");
+    log::info!("writing PDF to {}", output.display());
     let started = Instant::now();
     let options = RenderOptions {
         presentational_hints: args.presentational_hints,
         target_fragment: args.target_fragment,
+        pdf_variant: args.pdf_variant,
         ..RenderOptions::default()
     };
     html.write_pdf_async(output, &options).await?;
@@ -136,4 +148,103 @@ async fn run() -> quire::Result<()> {
 
 fn looks_like_html(input: &str) -> bool {
     input.contains('<') && input.contains('>')
+}
+
+fn canonicalize_output_path(value: &str) -> Result<PathBuf, String> {
+    let path = file_url_to_path(value).unwrap_or_else(|| PathBuf::from(value));
+    if path.as_os_str().is_empty() {
+        return Err("output path must not be empty".to_string());
+    }
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "output path must include a file name".to_string())?;
+    if path.exists() {
+        return path
+            .canonicalize()
+            .map_err(|error| format!("failed to canonicalize output path {value}: {error}"));
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = parent
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize output directory {parent:?}: {error}"))?;
+    Ok(parent.join(file_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_defaults_to_pdfa_2b() {
+        let cli = Cli::try_parse_from(["quire", "input.html", "output.pdf"]).unwrap();
+
+        assert_eq!(cli.pdf_variant, PdfVariant::PdfA2B);
+        assert_eq!(
+            cli.output.as_deref().and_then(Path::file_name),
+            Some("output.pdf".as_ref())
+        );
+    }
+
+    #[test]
+    fn cli_accepts_pdf_variant() {
+        let cli = Cli::try_parse_from([
+            "quire",
+            "--pdf-variant",
+            "pdf/a-2u",
+            "input.html",
+            "output.pdf",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.pdf_variant, PdfVariant::PdfA2U);
+    }
+
+    #[test]
+    fn cli_accepts_pdf_type_alias() {
+        let cli = Cli::try_parse_from(["quire", "--pdf-type", "pdf", "input.html", "output.pdf"])
+            .unwrap();
+
+        assert_eq!(cli.pdf_variant, PdfVariant::Pdf);
+    }
+
+    #[test]
+    fn cli_rejects_invalid_pdf_variant() {
+        let error = Cli::try_parse_from([
+            "quire",
+            "--pdf-variant",
+            "pdf/a-4f",
+            "input.html",
+            "output.pdf",
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unsupported PDF variant"));
+    }
+
+    #[test]
+    fn cli_canonicalizes_output_path() {
+        let cli = Cli::try_parse_from(["quire", "input.html", "output.pdf"]).unwrap();
+        let output = cli.output.unwrap();
+
+        assert!(output.is_absolute());
+        assert_eq!(output.file_name(), Some("output.pdf".as_ref()));
+    }
+
+    #[test]
+    fn cli_rejects_output_with_missing_parent() {
+        let missing_parent = format!("quire-missing-output-parent-{}", std::process::id());
+        let output = format!("{missing_parent}/output.pdf");
+        let error = Cli::try_parse_from(["quire", "input.html", output.as_str()]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to canonicalize output directory")
+        );
+    }
 }

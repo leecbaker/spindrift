@@ -1,32 +1,6 @@
-use crate::css::{ComputedStyle, LineBreak, OverflowWrap, WordBreak};
-use crate::text::{FontSystem, is_css_collapsible_whitespace, measured_break_opportunities};
-use icu_segmenter::GraphemeClusterSegmenter;
-
-pub(super) fn guarded_max_content_width(width: f32, style: &ComputedStyle) -> f32 {
-    width + intrinsic_text_width_epsilon(style)
-}
-
-/// Rounds intrinsic text widths up enough to survive line-breaker metric drift.
-///
-/// CSS Sizing defines max-content as the inline size with no soft wraps:
-/// <https://www.w3.org/TR/css-sizing-3/#max-content>. The PDF text emitter and
-/// line breaker use shaped font metrics through different APIs, so intrinsic
-/// widths keep a sub-glyph guard band to avoid wrapping at their own measured
-/// max-content boundary.
-fn intrinsic_text_width_epsilon(style: &ComputedStyle) -> f32 {
-    (style.font_size * 0.05).clamp(0.25, 1.5)
-}
-
-pub(super) fn transformed_min_content_segment_widths(
-    font_system: &mut FontSystem,
-    text: &str,
-    style: &ComputedStyle,
-) -> Vec<f32> {
-    transformed_min_content_segments(text, style)
-        .into_iter()
-        .map(|segment| font_system.measure_line_text(segment, style))
-        .collect()
-}
+use crate::css::{self, ComputedStyle};
+use crate::layout::used_values::{used_content_width, used_length_percentage};
+use crate::text::FontSystem;
 
 /// Return the advance of one punctuation glyph that CSS Text has made hangable.
 ///
@@ -42,66 +16,82 @@ pub(super) fn hanging_punctuation_character_width(
     font_system.measure_text(&character.to_string(), style)
 }
 
-fn transformed_min_content_segments<'a>(
-    transformed: &'a str,
-    style: &ComputedStyle,
-) -> Vec<&'a str> {
-    if transformed.is_empty() {
-        return Vec::new();
-    }
-    if matches!(style.overflow_wrap, OverflowWrap::Anywhere)
-        || matches!(style.word_break, WordBreak::BreakAll)
-        || matches!(style.line_break, LineBreak::Anywhere)
-    {
-        let boundaries = GraphemeClusterSegmenter::new()
-            .segment_str(transformed)
-            .collect::<Vec<_>>();
-        return boundaries
-            .windows(2)
-            .filter_map(|window| {
-                let segment = &transformed[window[0]..window[1]];
-                (!segment.is_empty()).then_some(segment)
-            })
-            .collect();
-    }
-    let breaks = measured_break_opportunities(transformed, style);
-    let mut start = 0usize;
-    let mut segments = Vec::new();
-    for end in breaks {
-        if end <= start || end > transformed.len() {
-            continue;
-        }
-        let segment = trim_css_intrinsic_segment(&transformed[start..end], style);
-        if !segment.is_empty() {
-            segments.push(segment);
-        }
-        start = end;
-    }
-    if start < transformed.len() {
-        let segment = trim_css_intrinsic_segment(&transformed[start..], style);
-        if !segment.is_empty() {
-            segments.push(segment);
-        }
-    }
-    segments
-}
-
-/// Trim segment-edge document whitespace for intrinsic text measurement.
-///
-/// CSS Text excludes collapsible document white space at soft wrap boundaries
-/// from the measured line box, while preserved white-space modes keep their
-/// authored spacing:
-/// <https://www.w3.org/TR/css-text-3/#white-space-processing> and
-/// <https://www.w3.org/TR/css-sizing-3/#min-content>.
-fn trim_css_intrinsic_segment<'a>(segment: &'a str, style: &ComputedStyle) -> &'a str {
-    if style.white_space.preserves_space_edges() {
-        segment
-    } else {
-        segment.trim_matches(is_css_collapsible_whitespace)
-    }
-}
-
 // CSS 2.2 shrink-to-fit width: min(max(preferred-min, available), preferred).
 pub(super) fn shrink_to_fit_width(preferred_min: f32, preferred: f32, available: f32) -> f32 {
     preferred_min.max(available).min(preferred)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum IntrinsicAutoWidth {
+    FillAvailable,
+    ShrinkToFit,
+}
+
+/// Resolve an intrinsic `width` keyword from known content-box contributions.
+///
+/// CSS Sizing defines `min-content`, `max-content`, and `fit-content()` as
+/// sizing keywords that consume a box's intrinsic min/max-content
+/// contributions. Returning `None` for ordinary widths lets formatting
+/// contexts keep their existing length/percentage and `auto` behavior:
+/// <https://www.w3.org/TR/css-sizing-3/#sizing-values> and
+/// <https://www.w3.org/TR/css-sizing-3/#fit-content-size>.
+pub(super) fn intrinsic_width_keyword(
+    value: css::ComputedLengthPercentageOrAuto,
+    min_content: f32,
+    max_content: f32,
+    available_outer_width: f32,
+    horizontal_non_content: f32,
+) -> Option<f32> {
+    let min_content = min_content.max(0.0);
+    let max_content = max_content.max(min_content).max(0.0);
+    match value {
+        css::ComputedLengthPercentageOrAuto::MinContent => Some(min_content),
+        css::ComputedLengthPercentageOrAuto::MaxContent => Some(max_content),
+        css::ComputedLengthPercentageOrAuto::FitContent(limit) => {
+            let stretch = (available_outer_width - horizontal_non_content).max(0.0);
+            let limit = limit
+                .map(|limit| used_length_percentage(limit, available_outer_width).max(0.0))
+                .unwrap_or(stretch);
+            Some(max_content.min(min_content.max(limit)))
+        }
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::LengthPercentage(_) => None,
+    }
+}
+
+/// Resolve a content-box width from intrinsic contributions and auto behavior.
+///
+/// CSS Sizing defines intrinsic width keywords, while CSS 2.2 gives different
+/// `auto` width behavior to normal block boxes and shrink-to-fit formatting
+/// contexts such as floats and atomic inline boxes:
+/// <https://www.w3.org/TR/css-sizing-3/#sizing-values> and
+/// <https://www.w3.org/TR/CSS22/visudet.html#float-width>.
+pub(super) fn content_width_from_intrinsic(
+    style: &ComputedStyle,
+    available_outer_width: f32,
+    horizontal_non_content: f32,
+    min_content: f32,
+    max_content: f32,
+    auto_width: IntrinsicAutoWidth,
+) -> f32 {
+    if let Some(width) = intrinsic_width_keyword(
+        style.box_values.width,
+        min_content,
+        max_content,
+        available_outer_width,
+        horizontal_non_content,
+    ) {
+        return width;
+    }
+
+    match (style.box_values.width, auto_width) {
+        (css::ComputedLengthPercentageOrAuto::Auto, IntrinsicAutoWidth::ShrinkToFit) => {
+            shrink_to_fit_width(
+                min_content.max(0.0),
+                max_content.max(min_content).max(0.0),
+                (available_outer_width - horizontal_non_content).max(0.0),
+            )
+        }
+        _ => used_content_width(style, available_outer_width, horizontal_non_content),
+    }
 }

@@ -1,5 +1,4 @@
 use super::*;
-use crate::layout::assets::paint_effects_for_box;
 
 impl<'a> LayoutBuilder<'a> {
     /// Replace current-page paint emitted since `checkpoint` with one scoped
@@ -51,12 +50,13 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         child_contexts: Vec<PaintStackingContext>,
     ) -> bool {
+        let policy = StackingContextPolicy::for_atomic(style, band, bounds);
         self.scope_current_page_paint_since(
             checkpoint,
-            band,
+            policy.parent_band,
             bounds,
             child_contexts,
-            paint_effects_for_box(style, bounds),
+            policy.effects,
         )
     }
 
@@ -137,6 +137,7 @@ impl<'a> LayoutBuilder<'a> {
         let mut outline_style = style.clone();
         outline_style.background_color = None;
         outline_style.background_image = None;
+        outline_style.background_layers.clear();
         outline_style.border_image = css::BorderImage::initial();
         outline_style.border_width = style.outline_width;
         outline_style.border_widths = css::Edges {
@@ -215,7 +216,7 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     pub(super) fn push_overflow_clip(&mut self, clip: OverflowClip) {
-        if clip.width > 0.0 && clip.height > 0.0 {
+        if clip.width() > 0.0 && clip.height() > 0.0 {
             self.overflow_clips.push(clip);
         }
     }
@@ -239,12 +240,12 @@ impl<'a> LayoutBuilder<'a> {
             return false;
         }
         let clip_height = content_height + style.padding.top + style.padding.bottom;
-        self.push_overflow_clip(OverflowClip {
-            x: outer_x + border_widths.left,
-            y: block_top - border_widths.top - clip_height,
-            width: content_width + style.padding.left + style.padding.right,
-            height: clip_height,
-        });
+        self.push_overflow_clip(OverflowClip::from_page_top_rect(PageTopRect::new(
+            outer_x + border_widths.left,
+            block_top - border_widths.top,
+            content_width + style.padding.left + style.padding.right,
+            clip_height,
+        )));
         true
     }
 
@@ -262,17 +263,15 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://www.w3.org/TR/css-overflow-3/#overflow-clip-edge>.
     fn clip_rendered_rect(&self, mut rect: RenderedRect) -> Option<RenderedRect> {
         for clip in &self.overflow_clips {
-            let left = rect.x.max(clip.x);
-            let right = (rect.x + rect.width).min(clip.x + clip.width);
-            let bottom = rect.y.max(clip.y);
-            let top = (rect.y + rect.height).min(clip.y + clip.height);
+            let clip_rect = clip.paint_rect();
+            let left = rect.x().max(clip_rect.origin.x);
+            let right = (rect.x() + rect.width()).min(clip_rect.origin.x + clip_rect.size.width);
+            let bottom = rect.y().max(clip_rect.origin.y);
+            let top = (rect.y() + rect.height()).min(clip_rect.origin.y + clip_rect.size.height);
             if right <= left || top <= bottom {
                 return None;
             }
-            rect.x = left;
-            rect.y = bottom;
-            rect.width = right - left;
-            rect.height = top - bottom;
+            rect.set_paint_rect(paint_space_rect(left, bottom, right - left, top - bottom));
         }
         Some(rect)
     }
@@ -290,27 +289,31 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         let width = rendered_line_width(line);
-        let left = line.x;
-        let right = line.x + width;
-        let bottom = line.y - line.font_size;
-        let top = line.y + line.font_size * 0.35;
+        let left = line.x();
+        let right = line.x() + width;
+        let bottom = line.y() - line.font_size;
+        let top = line.y() + line.font_size * 0.35;
 
         self.overflow_clips.iter().all(|clip| {
-            right > clip.x
-                && left < clip.x + clip.width
-                && top > clip.y
-                && bottom < clip.y + clip.height
+            let clip_rect = clip.paint_rect();
+            right > clip_rect.origin.x
+                && left < clip_rect.origin.x + clip_rect.size.width
+                && top > clip_rect.origin.y
+                && bottom < clip_rect.origin.y + clip_rect.size.height
         })
     }
 }
 
 fn rendered_line_width(line: &RenderedLine) -> f32 {
     line.runs.iter().fold(0.0_f32, |width, run| {
-        let run_width = run
-            .glyphs
-            .as_ref()
-            .map(|glyphs| glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>())
-            .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.5);
+        let run_width = if run.text_matrix.is_identity() {
+            run.glyphs
+                .as_ref()
+                .map(|glyphs| glyphs.iter().map(|glyph| glyph.x_advance).sum::<f32>())
+                .unwrap_or_else(|| run.text.chars().count() as f32 * run.font_size * 0.5)
+        } else {
+            run.font_size
+        };
         width.max(run.x_offset + run_width)
     })
 }

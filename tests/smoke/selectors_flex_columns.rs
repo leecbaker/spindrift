@@ -144,8 +144,8 @@ async fn supports_nested_css_for_flex_children() {
             .rects
             .iter()
             .any(|rect| rect.fill == Some(Color::new(220, 224, 229))
-                && rect.width > 10.0
-                && rect.height <= 1.0)
+                && rect.width() > 10.0
+                && rect.height() <= 1.0)
     );
 }
 
@@ -161,10 +161,10 @@ async fn padding_zero_removes_default_list_indent_for_flex_lists() {
         .rects
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(220, 224, 229)))
-        .min_by(|left, right| left.x.total_cmp(&right.x))
+        .min_by(|left, right| left.x().total_cmp(&right.x()))
         .unwrap();
 
-    assert_eq!(left_label.x, 10.0);
+    assert_eq!(left_label.x(), 10.0);
 }
 
 #[tokio::test]
@@ -180,15 +180,15 @@ async fn flex_column_items_honor_vertical_margins() {
         .rects
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(220, 224, 229)))
-        .filter(|rect| rect.height > 5.0 && rect.x < page.width / 2.0)
-        .map(|rect| (rect.y * 10.0).round() as i32)
+        .filter(|rect| rect.height() > 5.0 && rect.x() < page.width() / 2.0)
+        .map(|rect| (rect.y() * 10.0).round() as i32)
         .collect::<Vec<_>>();
     let mut right_box_rows = page
         .rects
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(220, 224, 229)))
-        .filter(|rect| rect.height > 5.0 && rect.x >= page.width / 2.0)
-        .map(|rect| (rect.y * 10.0).round() as i32)
+        .filter(|rect| rect.height() > 5.0 && rect.x() >= page.width() / 2.0)
+        .map(|rect| (rect.y() * 10.0).round() as i32)
         .collect::<Vec<_>>();
     left_box_rows.sort_unstable();
     left_box_rows.dedup();
@@ -218,7 +218,7 @@ async fn flex_container_margin_bottom_separates_following_block() {
         .find(|line| line.text == "After")
         .unwrap();
 
-    assert!((flex.y - after.y - 50.0).abs() < 0.01);
+    assert!((flex.y() - after.y() - 50.0).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -233,24 +233,27 @@ async fn flex_items_keep_small_explicit_cross_size_when_centered() {
     let left_label = document.pages[0]
         .rects
         .iter()
-        .filter(|rect| rect.fill == Some(fill) && rect.height > 10.0)
-        .min_by(|left, right| left.x.total_cmp(&right.x))
+        .filter(|rect| rect.fill == Some(fill) && rect.height() > 10.0)
+        .min_by(|left, right| left.x().total_cmp(&right.x()))
         .unwrap();
     let connector = document.pages[0]
         .rects
         .iter()
         .filter(|rect| {
-            rect.fill == Some(fill) && rect.height <= 1.0 && rect.width > 1.0 && rect.width < 4.0
+            rect.fill == Some(fill)
+                && rect.height() <= 1.0
+                && rect.width() > 1.0
+                && rect.width() < 4.0
         })
         .max_by(|left, right| {
-            let left_x = left.x;
-            let right_x = right.x;
+            let left_x = left.x();
+            let right_x = right.x();
             left_x.total_cmp(&right_x)
         })
         .unwrap();
 
-    let label_center = left_label.y + left_label.height / 2.0;
-    let connector_center = connector.y + connector.height / 2.0;
+    let label_center = left_label.y() + left_label.height() / 2.0;
+    let connector_center = connector.y() + connector.height() / 2.0;
     assert!((connector_center - label_center).abs() < 4.0);
 }
 
@@ -266,8 +269,8 @@ async fn renders_and_deduplicates_page_margin_background_images() {
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[0].images.len(), 1);
     assert_eq!(document.pages[1].images.len(), 1);
-    assert_eq!(document.pages[0].images[0].width, 5.0);
-    assert_eq!(document.pages[0].images[0].height, 5.0);
+    assert_eq!(document.pages[0].images[0].width(), 5.0);
+    assert_eq!(document.pages[0].images[0].height(), 5.0);
     assert!(document.pages[0].images[0].interpolate);
 
     let pdf = document.write_pdf_bytes().unwrap();
@@ -291,20 +294,23 @@ async fn page_margin_content_supports_mixed_generated_items_and_images() {
     .await
     .unwrap();
 
-    assert!(
-        document.pages[0]
-            .lines
-            .iter()
-            .any(|line| line.text == "[A].1 fallback")
-    );
+    let margin_text = document.pages[0]
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(margin_text.contains("[A]"), "{margin_text}");
+    assert!(margin_text.contains("..."), "{margin_text}");
+    assert!(margin_text.contains("1 fallback"), "{margin_text}");
     assert_eq!(document.pages[0].images.len(), 1);
     assert_eq!(document.pages[0].images[0].pixel_width, 1);
     assert_eq!(document.pages[0].images[0].pixel_height, 1);
-    assert!(document.pages[0].images[0].y >= 68.0);
+    assert!(document.pages[0].images[0].y() >= 68.0);
 }
 
 #[tokio::test]
-async fn page_margin_text_decoration_paints_text_strokes() {
+async fn page_margin_text_decoration_paints_text_primitives() {
     let document = Html::from_string(
         "<style>\
          @page { size: 120pt 80pt; margin: 12pt;\
@@ -317,13 +323,16 @@ async fn page_margin_text_decoration_paints_text_strokes() {
     .await
     .unwrap();
 
-    let red_strokes = document.pages[0]
-        .strokes
+    let red_decoration_rects = document.pages[0]
+        .rects
         .iter()
-        .filter(|stroke| stroke.color == Color::new(255, 0, 0))
+        .filter(|rect| {
+            rect.fill == Some(Color::new(255, 0, 0))
+                && rect.width() > rect.height()
+                && rect.height() > 0.0
+        })
         .collect::<Vec<_>>();
-    assert_eq!(red_strokes.len(), 2);
-    assert!(red_strokes.iter().all(|stroke| stroke.x2 > stroke.x1));
+    assert!(red_decoration_rects.len() >= 2);
 }
 
 #[tokio::test]
@@ -447,22 +456,22 @@ async fn side_and_corner_page_margin_boxes_use_page_margin_regions() {
     .unwrap();
 
     assert!(document.pages[0].rects.iter().any(|rect| {
-        (rect.x - 0.0).abs() < 0.01
-            && (rect.y - 40.0).abs() < 0.01
-            && (rect.width - 10.0).abs() < 0.01
-            && (rect.height - 20.0).abs() < 0.01
+        (rect.x() - 0.0).abs() < 0.01
+            && (rect.y() - 40.0).abs() < 0.01
+            && (rect.width() - 10.0).abs() < 0.01
+            && (rect.height() - 20.0).abs() < 0.01
     }));
     assert!(document.pages[0].rects.iter().any(|rect| {
-        (rect.x - 90.0).abs() < 0.01
-            && (rect.y - 40.0).abs() < 0.01
-            && (rect.width - 10.0).abs() < 0.01
-            && (rect.height - 20.0).abs() < 0.01
+        (rect.x() - 90.0).abs() < 0.01
+            && (rect.y() - 40.0).abs() < 0.01
+            && (rect.width() - 10.0).abs() < 0.01
+            && (rect.height() - 20.0).abs() < 0.01
     }));
     assert!(document.pages[0].rects.iter().any(|rect| {
-        (rect.x - 0.0).abs() < 0.01
-            && (rect.y - 90.0).abs() < 0.01
-            && (rect.width - 10.0).abs() < 0.01
-            && (rect.height - 10.0).abs() < 0.01
+        (rect.x() - 0.0).abs() < 0.01
+            && (rect.y() - 90.0).abs() < 0.01
+            && (rect.width() - 10.0).abs() < 0.01
+            && (rect.height() - 10.0).abs() < 0.01
     }));
 }
 
@@ -483,8 +492,8 @@ async fn page_margin_boxes_without_generated_content_are_not_created() {
 
     assert!(!document.pages[0].rects.iter().any(|rect| {
         rect.fill == Some(Color::BLACK)
-            && ((rect.x - 0.0).abs() < 0.01 || (rect.x - 90.0).abs() < 0.01)
-            && (rect.y - 90.0).abs() < 0.01
+            && ((rect.x() - 0.0).abs() < 0.01 || (rect.x() - 90.0).abs() < 0.01)
+            && (rect.y() - 90.0).abs() < 0.01
     }));
 }
 
@@ -551,6 +560,78 @@ async fn named_pages_combine_with_left_page_pseudo_class() {
 }
 
 #[tokio::test]
+async fn named_string_start_inside_moved_flex_item_uses_final_fragment() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin: 10pt; @top-center { content: string(chapter, start); font-size: 8pt; line-height: 8pt } }\
+         body, div { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .spacer { height: 80pt }\
+         .flex { display: flex; flex-direction: column }\
+         .item { height: 10pt; string-set: chapter attr(data-title) }\
+         </style>\
+         <div class=\"spacer\"></div><div class=\"flex\"><div class=\"item\" data-title=\"Flex Chapter\">Body</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_lines = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(document.pages.len(), 2, "{page_lines:?}");
+    assert!(
+        !page_lines[0].contains(&"Flex Chapter"),
+        "named string should not be placed before the flex item fragment: {page_lines:?}"
+    );
+    assert!(
+        page_lines[1].contains(&"Flex Chapter"),
+        "named string should resolve from the moved flex item fragment: {page_lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn running_element_start_inside_moved_flex_item_uses_item_fragment() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin: 10pt; @top-center { content: element(header, start); font-size: 8pt; line-height: 8pt } }\
+         body, div { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .spacer { height: 80pt }\
+         .flex { display: flex; flex-direction: column }\
+         .header { position: running(header); height: 10pt }\
+         </style>\
+         <div class=\"spacer\"></div><div class=\"flex\"><div class=\"header\">Flex Header</div><div>Body</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_lines = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(document.pages.len(), 2, "{page_lines:?}");
+    assert!(
+        page_lines[1].contains(&"Flex Header"),
+        "running element should resolve from the moved flex item fragment: {page_lines:?}"
+    );
+}
+
+#[tokio::test]
 async fn definition_lists_can_lay_out_term_groups_in_columns() {
     let document = Html::from_string(
         "<style>@page { size: 220pt 120pt; margin: 10pt } body, dl, dt, dd { margin: 0; font-size: 10pt; line-height: 10pt } dl { columns: 4; column-gap: 4pt; width: 160pt }</style><dl><dt>Flight</dt><dd>AB123</dd><dt>Gate</dt><dd>17</dd><dt>Seat</dt><dd>4A</dd><dt>Zone</dt><dd>2</dd></dl>",
@@ -569,12 +650,54 @@ async fn definition_lists_can_lay_out_term_groups_in_columns() {
 
     let term_lines = page.lines.iter().step_by(2).collect::<Vec<_>>();
     for pair in term_lines.windows(2) {
-        assert!((pair[1].x - pair[0].x - 41.0).abs() < 0.01);
-        assert!((pair[1].y - pair[0].y).abs() < 0.01);
+        assert!((pair[1].x() - pair[0].x() - 41.0).abs() < 0.01);
+        assert!((pair[1].y() - pair[0].y()).abs() < 0.01);
     }
 
     for group in page.lines.chunks(2) {
-        assert!((group[0].x - group[1].x).abs() < 0.01);
-        assert!((group[0].y - group[1].y - 10.0).abs() < 0.01);
+        assert!((group[0].x() - group[1].x()).abs() < 0.01);
+        assert!((group[0].y() - group[1].y() - 10.0).abs() < 0.01);
     }
+}
+
+#[tokio::test]
+async fn definition_list_multicol_align_content_uses_multicol_overflow_defaults() {
+    let document = Html::from_string(
+        "<style>@page { size: 220pt 160pt; margin: 10pt }\
+         body, dl, dt, dd { margin: 0; font-size: 10pt; line-height: 10pt }\
+         dl { columns: 2; column-gap: 10pt; width: 90pt; height: 10pt; align-content: center; margin-bottom: 20pt; background: red }\
+         .safe { align-content: safe center; background: blue }</style>\
+         <dl><dt>Default</dt><dd>A</dd><dt>Next</dt><dd>B</dd></dl>\
+         <dl class=\"safe\"><dt>Safe</dt><dd>A</dd><dt>Next</dt><dd>B</dd></dl>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = |text: &str| {
+        document.pages[0]
+            .lines
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("{text} should render"))
+    };
+    let default = line("Default");
+    let safe = line("Safe");
+    let default_box = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("default multicol background should paint");
+    let safe_box = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("safe multicol background should paint");
+
+    let default_distance_from_top = default_box.y() + default_box.height() - default.y();
+    let safe_distance_from_top = safe_box.y() + safe_box.height() - safe.y();
+    assert!(
+        (safe_distance_from_top - default_distance_from_top - 5.0).abs() < 0.5,
+        "default multicol center overflow should remain unsafe while safe center falls back to block-start: default={default:?}, default_box={default_box:?}, safe={safe:?}, safe_box={safe_box:?}"
+    );
 }

@@ -1,5 +1,4 @@
 use super::*;
-use crate::layout::assets::paint_effects_for_box;
 
 /// Used geometry for painting a CSS table wrapper box.
 ///
@@ -31,6 +30,7 @@ struct TableFragmentPlan {
     body_rows: Vec<TableRowPiecePlan>,
     repeated_footer_rows: Vec<usize>,
     break_reason: TableFragmentBreakReason,
+    metadata: FragmentPageMetadata,
 }
 
 impl TableFragmentPlan {
@@ -42,10 +42,28 @@ impl TableFragmentPlan {
             body_rows: Vec::new(),
             repeated_footer_rows: Vec::new(),
             break_reason,
+            metadata: FragmentPageMetadata::new(
+                page_index,
+                None,
+                break_reason == TableFragmentBreakReason::TableStart,
+            ),
         }
     }
 
     fn push_body_row(&mut self, row: TableRowPiecePlan) {
+        if self.metadata.source_border_box.is_none() {
+            self.metadata.source_border_box = row.metadata.source_border_box;
+        }
+        if self.body_rows.is_empty() {
+            self.metadata.starts_page_fragment = row.metadata.starts_page_fragment;
+            self.metadata.first_page_value = row.metadata.first_page_value.clone();
+        }
+        self.metadata.continues_from_previous_page |= row.metadata.continues_from_previous_page;
+        self.metadata.continues_to_next_page |= row.metadata.continues_to_next_page;
+        self.metadata.last_page_value = row.metadata.last_page_value.clone();
+        self.metadata
+            .assignment_ids
+            .extend(row.metadata.assignment_ids.iter().copied());
         self.body_rows.push(row);
     }
 
@@ -68,7 +86,7 @@ enum TableFragmentBreakReason {
 }
 
 /// One visible source-row slice inside a table page fragment.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TableRowPiecePlan {
     row_index: usize,
     row_top: f32,
@@ -77,6 +95,7 @@ struct TableRowPiecePlan {
     original_row_height: f32,
     collapsed: bool,
     artificial_split: bool,
+    metadata: FragmentPageMetadata,
 }
 
 impl TableRowPiecePlan {
@@ -88,17 +107,45 @@ impl TableRowPiecePlan {
 /// Cell-level geometry consumed while painting a planned row piece.
 #[derive(Debug, Clone)]
 struct TableCellFragmentPlan {
-    x: f32,
-    width: f32,
-    height: f32,
-    content_top: f32,
+    border_box: TableCellBorderBox,
+    placement: TableGridPlacement,
     content_offset: f32,
+    content_x_offset: f32,
     content_clip: Option<OverflowClip>,
-    row_index: usize,
-    column: usize,
-    colspan: usize,
-    rowspan: usize,
+    area: TableGridArea,
     content: TableCellContentPlan,
+}
+
+impl TableCellFragmentPlan {
+    fn x(&self) -> f32 {
+        self.border_box.x(self.placement)
+    }
+
+    fn top_y(&self) -> f32 {
+        self.border_box.top_y(self.placement)
+    }
+
+    fn width(&self) -> f32 {
+        self.border_box.width()
+    }
+
+    fn height(&self) -> f32 {
+        self.border_box.height()
+    }
+
+    fn content_box(
+        &self,
+        cell_style: &ComputedStyle,
+        cell_borders: css::Edges,
+    ) -> TableCellContentBox {
+        self.border_box.content_box(
+            self.placement,
+            cell_style.padding,
+            cell_borders,
+            self.content_offset,
+            self.content_x_offset,
+        )
+    }
 }
 
 /// Planned table-cell content for one page-local row piece.
@@ -110,17 +157,17 @@ struct TableCellFragmentPlan {
 /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
 #[derive(Debug, Clone)]
 struct TableCellContentPlan {
-    inline_plan: Option<inline_layout::InlineFragmentationPlan>,
+    inline_sequence: Option<inline_layout::InlineLineSequence>,
     child_fragments: Vec<TableCellChildFragmentPlan>,
-    children_painted_by_inline_plan: bool,
+    children_painted_by_inline_sequence: bool,
 }
 
 impl TableCellContentPlan {
     fn empty() -> Self {
         Self {
-            inline_plan: None,
+            inline_sequence: None,
             child_fragments: Vec::new(),
-            children_painted_by_inline_plan: false,
+            children_painted_by_inline_sequence: false,
         }
     }
 }
@@ -134,7 +181,22 @@ struct TableCellChildFragmentPlan {
     slice_top: f32,
     slice_bottom: f32,
     kind: TableCellChildFragmentKind,
+    inline_sequence: Option<TableCellNestedInlineSequencePlan>,
     nested_fragment: Option<TableCellNestedFragmentPlan>,
+    metadata: FragmentPageMetadata,
+}
+
+/// Sequence-backed inline content for a nested table-cell slice.
+///
+/// CSS Text line selection and CSS Fragmentation slicing should consume the
+/// same graph-selected line records even when inline content is nested under
+/// table-cell split-row replay:
+/// <https://www.w3.org/TR/css-text-3/#line-breaking> and
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
+#[derive(Debug, Clone)]
+struct TableCellNestedInlineSequencePlan {
+    sequence: inline_layout::InlineLineSequence,
+    style: ComputedStyle,
 }
 
 /// Pre-rendered table-cell nested formatting context for split row replay.
@@ -143,6 +205,7 @@ struct TableCellNestedFragmentPlan {
     fragment: PaintFragment,
     width: f32,
     height: f32,
+    metadata: FragmentPageMetadata,
 }
 
 /// Coarse child kind used to route planned table-cell fragment painting.
@@ -162,6 +225,7 @@ struct TableBreakCandidate {
     snapshot: LayoutSnapshot,
     row_index: usize,
     table_body_fragment: Option<TableBodyPaintFragment>,
+    repeat_policy: TableFragmentRepeatPolicy,
     height: f32,
 }
 
@@ -171,6 +235,100 @@ impl TableBreakCandidate {
         candidate.height = height;
         candidate
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TableFragmentRepeatPolicy {
+    repeat_header: bool,
+    repeat_footer: bool,
+}
+
+const TABLE_AVOID_UNFRAGMENTED_OVERFLOW_TOLERANCE: f32 = 2.0;
+
+impl TableFragmentRepeatPolicy {
+    fn header_rows<'a>(&self, rows: &'a [usize]) -> &'a [usize] {
+        if self.repeat_header { rows } else { &[] }
+    }
+
+    fn footer_rows<'a>(&self, rows: &'a [usize]) -> &'a [usize] {
+        if self.repeat_footer { rows } else { &[] }
+    }
+
+    fn reserved_footer_height(&self, footer_height: f32) -> f32 {
+        if self.repeat_footer {
+            footer_height
+        } else {
+            0.0
+        }
+    }
+
+    fn body_capacity(&self, page_area_height: f32, header_height: f32, footer_height: f32) -> f32 {
+        let repeated_height = if self.repeat_header {
+            header_height
+        } else {
+            0.0
+        } + if self.repeat_footer {
+            footer_height
+        } else {
+            0.0
+        };
+        (page_area_height - repeated_height).max(0.0)
+    }
+}
+
+/// Choose optional repeated table rows for a page fragment with required body space.
+///
+/// CSS 2.2 permits print user agents to repeat table header and footer groups
+/// on each page, but CSS Fragmentation still requires progress and treats
+/// `break-inside: avoid` as a constraint to honor when possible. Prefer
+/// preserving both repeated groups, then the header, then the footer, and
+/// finally suppress optional repeats before creating a fragment with no usable
+/// body area.
+/// <https://www.w3.org/TR/CSS22/tables.html#value-def-table-header-group>
+/// <https://www.w3.org/TR/CSS22/tables.html#value-def-table-footer-group>
+/// <https://www.w3.org/TR/css-break-3/#break-within>
+fn table_fragment_repeat_policy(
+    required_body_height: f32,
+    page_area_height: f32,
+    header_height: f32,
+    footer_height: f32,
+    allow_header: bool,
+    allow_footer: bool,
+) -> TableFragmentRepeatPolicy {
+    let candidates = [
+        TableFragmentRepeatPolicy {
+            repeat_header: allow_header,
+            repeat_footer: allow_footer,
+        },
+        TableFragmentRepeatPolicy {
+            repeat_header: allow_header,
+            repeat_footer: false,
+        },
+        TableFragmentRepeatPolicy {
+            repeat_header: false,
+            repeat_footer: allow_footer,
+        },
+        TableFragmentRepeatPolicy {
+            repeat_header: false,
+            repeat_footer: false,
+        },
+    ];
+
+    let required_body_height = required_body_height.max(0.0);
+    for policy in candidates {
+        let body_capacity = policy.body_capacity(page_area_height, header_height, footer_height);
+        if body_capacity > 0.01 && required_body_height <= body_capacity + 0.01 {
+            return policy;
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|policy| policy.body_capacity(page_area_height, header_height, footer_height) > 0.01)
+        .unwrap_or(TableFragmentRepeatPolicy {
+            repeat_header: false,
+            repeat_footer: false,
+        })
 }
 
 /// Page-local body-row paint capture for one fragmented table piece.
@@ -192,6 +350,53 @@ struct TableCellLayoutMetrics {
     content_height: f32,
     border_box_height: f32,
     baseline_offset: f32,
+}
+
+struct PreparedTableCell {
+    style: ComputedStyle,
+    area: TableGridArea,
+    inline_bounds: TableInlineBounds,
+    borders: css::Edges,
+    metrics: TableCellLayoutMetrics,
+    text: String,
+}
+
+impl PreparedTableCell {
+    fn width(&self) -> f32 {
+        self.inline_bounds.size
+    }
+}
+
+struct TableGridLayoutContext<'table, 'ctx> {
+    rows: &'ctx [TableRow<'table>],
+    grid: &'ctx TableGrid,
+    table_style: &'ctx ComputedStyle,
+    stylesheets: &'ctx [Stylesheet],
+    table_cellpadding: Option<f32>,
+    column_plan: &'ctx TableColumnPlan,
+    table_metrics: TableMetrics,
+    collapsed_geometry: Option<&'ctx CollapsedTableGeometry>,
+}
+
+struct TableCellBaselineAlignmentContext<'a> {
+    row_index: usize,
+    row_style: &'a ComputedStyle,
+    table_style: &'a ComputedStyle,
+    rows: &'a [TableRow<'a>],
+    grid: &'a TableGrid,
+    stylesheets: &'a [Stylesheet],
+    table_cellpadding: Option<f32>,
+    column_plan: &'a TableColumnPlan,
+    planned_row_heights: &'a [f32],
+    table_metrics: TableMetrics,
+    collapsed_geometry: Option<&'a CollapsedTableGeometry>,
+    row_baseline_offset: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableCellBaselineSet {
+    First,
+    Last,
 }
 
 /// CSS Tables 3 row-height plan for first-pass minimums, reference sizes, and
@@ -228,6 +433,49 @@ pub(super) struct CollapsedTableGeometry {
     outer_insets: css::Edges,
 }
 
+impl CollapsedTableGeometry {
+    fn cell_insets(&self, placement: &TableCellPlacement, row_index: usize) -> css::Edges {
+        self.grid.cell_insets(
+            row_index,
+            placement.column,
+            placement.colspan,
+            placement.rowspan,
+        )
+    }
+}
+
+fn table_cell_border_insets(
+    cell_style: &ComputedStyle,
+    placement: &TableCellPlacement,
+    row_index: usize,
+    table_metrics: TableMetrics,
+    collapsed_geometry: Option<&CollapsedTableGeometry>,
+) -> css::Edges {
+    if table_metrics.border_collapse == css::BorderCollapse::Collapse {
+        return collapsed_geometry
+            .map(|geometry| geometry.cell_insets(placement, row_index))
+            .unwrap_or(css::Edges::ZERO);
+    }
+    used_border_widths(cell_style)
+}
+
+fn table_cell_border_box_height_with_insets(
+    style: &ComputedStyle,
+    content_height: f32,
+    border_insets: css::Edges,
+) -> f32 {
+    constrain_height(
+        style,
+        used_length_percentage_or_auto(style.box_values.height, content_height)
+            .unwrap_or(0.0)
+            .max(content_height),
+        content_height,
+    ) + style.padding.top
+        + style.padding.bottom
+        + border_insets.top
+        + border_insets.bottom
+}
+
 impl TableBodyPaintFragment {
     fn new(
         checkpoint: PaintCheckpoint,
@@ -251,6 +499,14 @@ impl TableBodyPaintFragment {
         row_offset: f32,
         original_row_height: f32,
     ) {
+        let mut metadata = FragmentPageMetadata::new(
+            self.plan.page_index,
+            Some(PageTopRect::new(0.0, row_top, 0.0, row_height).paint_clip()),
+            self.plan.break_reason != TableFragmentBreakReason::Overflow
+                && self.plan.body_rows.is_empty(),
+        );
+        metadata.continues_from_previous_page = row_offset > 0.0;
+        metadata.continues_to_next_page = row_offset + row_height + 0.01 < original_row_height;
         self.plan.push_body_row(TableRowPiecePlan {
             row_index,
             row_top,
@@ -259,6 +515,7 @@ impl TableBodyPaintFragment {
             original_row_height,
             collapsed: row_height <= 0.01 && original_row_height <= 0.01,
             artificial_split: row_offset > 0.0 || row_height + 0.01 < original_row_height,
+            metadata,
         });
     }
 
@@ -349,6 +606,59 @@ fn table_wrapper_border_box_height(content_height: f32, table_width: UsedTableWi
         + table_width.border_widths.bottom
 }
 
+fn table_horizontal_non_content_width(style: &ComputedStyle, table_width: UsedTableWidth) -> f32 {
+    let border_width = if style.border_collapse == css::BorderCollapse::Collapse {
+        0.0
+    } else {
+        table_width.border_widths.left + table_width.border_widths.right
+    };
+    border_width + table_width.padding.left + table_width.padding.right
+}
+
+fn table_content_width_clamped_to_min_content(
+    style: &ComputedStyle,
+    content_width: f32,
+    min_content: f32,
+) -> f32 {
+    if style.table_layout == TableLayout::Auto {
+        content_width.max(min_content)
+    } else {
+        content_width
+    }
+}
+
+fn table_displayed_horizontal_spacing(visible_columns: usize, table_metrics: TableMetrics) -> f32 {
+    if visible_columns == 0 {
+        0.0
+    } else {
+        table_metrics.spacing.horizontal * (visible_columns + 1) as f32
+    }
+}
+
+/// Return separated-border gutters inside a logical column span.
+///
+/// CSS 2.2 places horizontal `border-spacing` between adjacent column cells.
+/// A cell spanning multiple visible columns includes those internal gutters in
+/// its border box, so column width constraints derived from that cell must
+/// remove them before distributing the remaining width to tracks:
+/// <https://www.w3.org/TR/CSS22/tables.html#separated-borders>.
+fn table_internal_horizontal_spacing(
+    start_column: usize,
+    end_column: usize,
+    collapsed_columns: &[bool],
+    table_metrics: TableMetrics,
+) -> f32 {
+    let end_column = end_column.min(collapsed_columns.len());
+    if start_column >= end_column {
+        return 0.0;
+    }
+    let visible_columns = collapsed_columns[start_column..end_column]
+        .iter()
+        .filter(|collapsed| !**collapsed)
+        .count();
+    table_metrics.spacing.horizontal * visible_columns.saturating_sub(1) as f32
+}
+
 fn table_column_background_rect(
     table_x: f32,
     grid_top: f32,
@@ -363,18 +673,29 @@ fn table_column_background_rect(
         return None;
     }
     let clamped_end = end_column.min(column_plan.column_count());
-    let x = table_x + column_plan.offset_for_column(start_column);
-    let width =
-        column_plan.boundary_offset(clamped_end) - column_plan.offset_for_column(start_column);
-    Some(RenderedRect {
-        x,
-        y: grid_top - grid_height,
-        width,
-        height: grid_height,
-        fill: Some(fill),
-        stroke: None,
-        stroke_width: 0.0,
-    })
+    let inline_bounds =
+        column_plan.inline_bounds_for_span(start_column, clamped_end - start_column);
+    let rect = TableGridRect::new(
+        TableGridPoint::new(inline_bounds.start, 0.0),
+        TableGridSize::new(inline_bounds.size, grid_height),
+    );
+    let placement = TableGridPlacement::new(PageTopPoint::new(table_x, grid_top));
+    let clip = placement.overflow_clip_for(rect);
+    Some(RenderedRect::from_paint_rect(clip.paint_rect(), Some(fill)))
+}
+
+fn visible_column_span(
+    start_column: usize,
+    end_column: usize,
+    collapsed_columns: &[bool],
+) -> Option<(usize, usize)> {
+    let clamped_end = end_column.min(collapsed_columns.len());
+    let visible_start = (start_column..clamped_end).find(|index| !collapsed_columns[*index])?;
+    let visible_end = (visible_start + 1..clamped_end)
+        .rfind(|index| !collapsed_columns[*index])
+        .map(|index| index + 1)
+        .unwrap_or(visible_start + 1);
+    Some((visible_start, visible_end))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -388,21 +709,32 @@ fn push_table_fragment_row_span_background(
     end: usize,
     fill: Color,
 ) {
+    if let Some(bounds) =
+        table_fragment_row_span_bounds(table_x, used_table_width, row_tops, row_heights, start, end)
+    {
+        primitives.push(PaintPrimitive::Rect(RenderedRect::from_paint_rect(
+            bounds.paint_rect(),
+            Some(fill),
+        )));
+    }
+}
+
+fn table_fragment_row_span_bounds(
+    table_x: f32,
+    used_table_width: f32,
+    row_tops: &[f32],
+    row_heights: &[f32],
+    start: usize,
+    end: usize,
+) -> Option<PaintClip> {
     if start >= end || end > row_tops.len() || end > row_heights.len() {
-        return;
+        return None;
     }
     let top = row_tops[start];
     let last = end - 1;
     let bottom = row_tops[last] - row_heights[last];
-    primitives.push(PaintPrimitive::Rect(RenderedRect {
-        x: table_x,
-        y: bottom,
-        width: used_table_width,
-        height: (top - bottom).max(0.0),
-        fill: Some(fill),
-        stroke: None,
-        stroke_width: 0.0,
-    }));
+    let height = (top - bottom).max(0.0);
+    (height > 0.0).then_some(PageTopRect::new(table_x, top, used_table_width, height).paint_clip())
 }
 
 fn table_wrapper_collision_height(
@@ -768,14 +1100,22 @@ impl<'a> LayoutBuilder<'a> {
         (min_content, max_content)
     }
 
-    pub(in crate::layout) fn table_shrink_to_fit_width_from_fragment(
+    /// Return parent-facing content-box intrinsic widths for a table fragment.
+    ///
+    /// CSS Tables computes grid min/max-content widths from column measures,
+    /// but CSS Sizing intrinsic contributions also honor a non-auto preferred
+    /// size. For auto-layout tables, the used table content box is clamped so
+    /// it is not smaller than the grid min-content width:
+    /// <https://drafts.csswg.org/css-tables-3/#computing-the-table-width> and
+    /// <https://www.w3.org/TR/css-sizing-3/#intrinsic-contribution>.
+    pub(in crate::layout) fn table_parent_intrinsic_content_widths_from_fragment(
         &mut self,
         element: &Element,
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         fragment: &box_tree::TableFragment<'_>,
         available_outer_width: f32,
-    ) -> f32 {
+    ) -> (f32, f32) {
         let (min_content, max_content) = self.table_intrinsic_widths_from_fragment(
             element,
             style,
@@ -783,8 +1123,64 @@ impl<'a> LayoutBuilder<'a> {
             fragment,
             available_outer_width,
         );
-        intrinsic::shrink_to_fit_width(min_content, max_content, available_outer_width)
-            .max(style.font_size)
+        let available_table_width =
+            (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
+        let table_width = used_table_width(style, available_table_width);
+        let horizontal_non_content = table_horizontal_non_content_width(style, table_width);
+        let resolved_width =
+            used_content_width_or_auto(style, available_table_width, horizontal_non_content)
+                .or_else(|| {
+                    intrinsic::intrinsic_width_keyword(
+                        style.box_values.width,
+                        min_content,
+                        max_content,
+                        available_table_width,
+                        horizontal_non_content,
+                    )
+                })
+                .map(|width| {
+                    constrain_width(style, width, available_table_width).max(style.font_size)
+                });
+
+        if let Some(width) = resolved_width {
+            let width = table_content_width_clamped_to_min_content(style, width, min_content);
+            (width, width)
+        } else {
+            (min_content, max_content)
+        }
+    }
+
+    /// Return parent-facing margin-box intrinsic widths for a table fragment.
+    ///
+    /// Table parents consume the table wrapper/margin box, while table layout
+    /// itself consumes the grid/content width. Keep this conversion separate so
+    /// grid sizing remains available for column layout:
+    /// <https://www.w3.org/TR/css-sizing-3/#intrinsic-contribution>.
+    pub(in crate::layout) fn table_outer_intrinsic_widths_from_fragment(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        fragment: &box_tree::TableFragment<'_>,
+        available_outer_width: f32,
+    ) -> (f32, f32) {
+        let (min_content, max_content) = self.table_parent_intrinsic_content_widths_from_fragment(
+            element,
+            style,
+            stylesheets,
+            fragment,
+            available_outer_width,
+        );
+        let available_table_width =
+            (available_outer_width - style.margin.left - style.margin.right).max(style.font_size);
+        let table_width = used_table_width(style, available_table_width);
+        let horizontal_extras = table_horizontal_non_content_width(style, table_width)
+            + style.margin.left
+            + style.margin.right;
+        (
+            min_content + horizontal_extras,
+            max_content + horizontal_extras,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -809,12 +1205,23 @@ impl<'a> LayoutBuilder<'a> {
         let available_width =
             (self.content_right - self.content_left - style.margin.left - style.margin.right)
                 .max(style.font_size);
-        let table_width = used_table_width(style, available_width);
+        let mut table_width = used_table_width(style, available_width);
         let table_cellpadding = element
             .attrs
             .get("cellpadding")
             .and_then(|value| parse_html_length(value));
         let table_metrics = table_metrics(element, style);
+        self.resolve_table_used_content_width(
+            rows,
+            &grid,
+            style,
+            stylesheets,
+            &input.columns,
+            available_width,
+            table_cellpadding,
+            table_metrics,
+            &mut table_width,
+        );
         let column_plan = self.table_column_plan(
             rows,
             &grid,
@@ -830,16 +1237,29 @@ impl<'a> LayoutBuilder<'a> {
             .total_width()
             .min(available_width)
             .max(style.font_size);
+        let collapsed_geometry = (table_metrics.border_collapse == css::BorderCollapse::Collapse)
+            .then(|| {
+                self.collapsed_table_geometry(
+                    rows,
+                    &grid,
+                    style,
+                    stylesheets,
+                    &input.columns,
+                    column_plan.column_count(),
+                )
+            });
         let top = 10_000.0;
-        let planned_row_heights = self.measure_table_row_heights(
+        let table_context = TableGridLayoutContext {
             rows,
-            &grid,
-            style,
+            grid: &grid,
+            table_style: style,
             stylesheets,
             table_cellpadding,
-            &column_plan,
+            column_plan: &column_plan,
             table_metrics,
-        );
+            collapsed_geometry: collapsed_geometry.as_ref(),
+        };
+        let planned_row_heights = self.measure_table_row_heights(&table_context);
         let top_caption_height = self.estimate_table_captions_height(
             &input.captions,
             style,
@@ -892,7 +1312,7 @@ impl<'a> LayoutBuilder<'a> {
         let fragment = self
             .current_page
             .paint_fragment()
-            .translated(0.0, -fragment_bottom);
+            .translated(PaintVector::new(0.0, -fragment_bottom));
         self.restore(snapshot);
 
         let mut atom_style = style.clone();
@@ -905,6 +1325,7 @@ impl<'a> LayoutBuilder<'a> {
         Some(InlineAtom {
             content: InlineAtomContent::InlineFragment(fragment),
             style: atom_style,
+            escaped_positioned_layers: None,
             width: content_width + style.margin.left + style.margin.right,
             height: content_height,
             baseline_offset,
@@ -983,6 +1404,17 @@ impl<'a> LayoutBuilder<'a> {
             table_cellpadding,
             table_metrics,
         );
+        let collapsed_geometry = (table_metrics.border_collapse == css::BorderCollapse::Collapse)
+            .then(|| {
+                self.collapsed_table_geometry(
+                    rows,
+                    &grid,
+                    style,
+                    stylesheets,
+                    columns,
+                    column_plan.column_count(),
+                )
+            });
 
         let mut total = style.margin.top;
         total += self.estimate_table_captions_height(
@@ -992,15 +1424,17 @@ impl<'a> LayoutBuilder<'a> {
             table_width.content_width,
             CaptionSide::Top,
         );
-        let row_heights = self.measure_table_row_heights(
+        let table_context = TableGridLayoutContext {
             rows,
-            &grid,
-            style,
+            grid: &grid,
+            table_style: style,
             stylesheets,
             table_cellpadding,
-            &column_plan,
+            column_plan: &column_plan,
             table_metrics,
-        );
+            collapsed_geometry: collapsed_geometry.as_ref(),
+        };
+        let row_heights = self.measure_table_row_heights(&table_context);
         total += table_vertical_edge_spacing(&row_heights, table_metrics);
         for (row_index, row_height) in row_heights.iter().copied().enumerate() {
             total += row_height;
@@ -1042,7 +1476,7 @@ impl<'a> LayoutBuilder<'a> {
         let input = TableLayoutInput::from_fragment(fragment);
         let rows = input.rows.as_slice();
         let relative_offset = relative_position_offset(style, self.current_containing_block());
-        if style.position == Position::Relative {
+        if matches!(style.position, Position::Relative | Position::Sticky) {
             self.cursor_y += relative_offset.y;
         }
         let captions = input.captions.as_slice();
@@ -1069,6 +1503,17 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         let grid = table_grid(rows);
+        self.resolve_table_used_content_width(
+            rows,
+            &grid,
+            style,
+            stylesheets,
+            columns,
+            available_table_width,
+            table_cellpadding,
+            table_metrics,
+            &mut table_width,
+        );
         let column_plan = self.table_column_plan(
             rows,
             &grid,
@@ -1098,18 +1543,21 @@ impl<'a> LayoutBuilder<'a> {
         let repeating_header_rows = table_repeating_header_row_indices(rows);
         let repeating_footer_rows = table_repeating_footer_row_indices(rows);
 
-        let planned_row_heights = self.measure_table_row_heights(
+        let table_context = TableGridLayoutContext {
             rows,
-            &grid,
-            style,
+            grid: &grid,
+            table_style: style,
             stylesheets,
             table_cellpadding,
-            &column_plan,
+            column_plan: &column_plan,
             table_metrics,
-        );
+            collapsed_geometry: collapsed_geometry.as_ref(),
+        };
+        let planned_row_heights = self.measure_table_row_heights(&table_context);
+        let repeating_header_height =
+            repeated_table_rows_height(&repeating_header_rows, &planned_row_heights, table_metrics);
         let repeating_footer_height =
             repeated_table_rows_height(&repeating_footer_rows, &planned_row_heights, table_metrics);
-        let repeating_footer_fits_page = repeating_footer_height <= self.page_area_height() + 0.01;
         let row_group_spans = table_row_group_spans(rows);
         let avoid_break_row_groups = row_group_spans
             .iter()
@@ -1161,6 +1609,8 @@ impl<'a> LayoutBuilder<'a> {
             style.margin.left + table_border_box_width + style.margin.right,
             table_collision_height,
             style.clear,
+            style.writing_mode,
+            style.direction,
             self.containing_block_direction,
         );
         self.cursor_y = avoided_top;
@@ -1170,6 +1620,25 @@ impl<'a> LayoutBuilder<'a> {
         let table_x = table_width.content_x(table_outer_x);
 
         self.push_float_context();
+        let table_wrapper_top = self.cursor_y;
+        let establishes_positioning_containing_block =
+            matches!(style.position, Position::Relative | Position::Sticky)
+                || !style.transform.is_empty();
+        if establishes_positioning_containing_block {
+            self.containing_blocks
+                .push(ContainingBlock::from_page_top_rect(PageTopRect::new(
+                    table_x,
+                    table_wrapper_top,
+                    used_table_width,
+                    top_caption_height
+                        + table_width.border_widths.top
+                        + table_width.padding.top
+                        + table_content_height
+                        + table_width.padding.bottom
+                        + table_width.border_widths.bottom
+                        + bottom_caption_height,
+                )));
+        }
         self.layout_table_captions(
             captions,
             style,
@@ -1182,22 +1651,6 @@ impl<'a> LayoutBuilder<'a> {
         self.cursor_y -= table_width.border_widths.top + table_width.padding.top;
         let table_edge_spacing = table_vertical_edge_spacing(&planned_row_heights, table_metrics);
         self.cursor_y -= table_edge_spacing;
-        let establishes_positioning_containing_block =
-            style.position == Position::Relative || !style.transform.is_empty();
-        if establishes_positioning_containing_block {
-            self.containing_blocks.push(ContainingBlock {
-                x: table_x,
-                top_y: table_box_top,
-                width: used_table_width,
-                height: top_caption_height
-                    + table_width.border_widths.top
-                    + table_width.padding.top
-                    + table_content_height
-                    + table_width.padding.bottom
-                    + table_width.border_widths.bottom
-                    + bottom_caption_height,
-            });
-        }
 
         let table_structure_paint_checkpoint = self.current_page.paint_checkpoint();
         let table_structure_paint_page_index = self.pages.len();
@@ -1218,44 +1671,70 @@ impl<'a> LayoutBuilder<'a> {
             self.scope_current_page_atomic_paint_since(
                 &table_structure_paint_checkpoint,
                 PaintBand::InFlowBlock,
-                PaintClip {
-                    x: table_x - table_width.padding.left - table_width.border_widths.left,
-                    y: table_box_top - table_border_box_height,
-                    width: table_border_box_width,
-                    height: table_border_box_height,
-                },
+                PageTopRect::new(
+                    table_x - table_width.padding.left - table_width.border_widths.left,
+                    table_box_top,
+                    table_border_box_width,
+                    table_border_box_height,
+                )
+                .paint_clip(),
                 style,
                 Vec::new(),
             );
         }
 
+        // Table row-grid fragments split independently of the source row's
+        // previous block position. Recording the grid's fragment offset lets
+        // `push_page` continue table rows at the page-start position of the
+        // surrounding formatting context, instead of at the consumed position
+        // of the row that triggered the break.
+        // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+        self.fragment_top_offsets
+            .push(self.current_page_context.top() - self.cursor_y);
         let mut table_body_fragment: Option<TableBodyPaintFragment> = None;
         let mut pending_table_fragment_break_reason = TableFragmentBreakReason::TableStart;
         let mut pending_repeated_header_rows = Vec::new();
+        let mut current_fragment_repeat_policy = table_fragment_repeat_policy(
+            0.01,
+            self.page_area_height(),
+            0.0,
+            repeating_footer_height,
+            false,
+            true,
+        );
         let mut page_break_before_next_row = PageBreak::Auto;
         let mut forced_break_after_table_rows = PageBreak::Auto;
         let mut avoid_break_candidate: Option<TableBreakCandidate> = None;
         let mut previous_row_candidate: Option<TableBreakCandidate> = None;
         let mut previous_break_after_avoid = false;
+        let mut unfragmented_avoid_row_group_end: Option<usize> = None;
         let mut row_index = 0usize;
         while row_index < rows.len() {
             let row = &rows[row_index];
             let row_style = self.style_for_table_row(row, style, stylesheets);
             let row_is_repeating_header = repeating_header_rows.contains(&row_index);
             let row_is_repeating_footer = repeating_footer_rows.contains(&row_index);
+            let row_height = planned_row_heights[row_index];
+            let row_collapsed = table_row_is_collapsed(&row_style);
+            let row_fragment_required_height = if row_height > self.page_area_height() + 0.01 {
+                0.01
+            } else {
+                row_height
+            };
             let mut broke_before_row = page_break_before_next_row.is_forced();
             let pending_avoid_before_row = page_break_before_next_row.avoids_page();
             let row_start_candidate = TableBreakCandidate {
                 snapshot: self.snapshot(),
                 row_index,
                 table_body_fragment: table_body_fragment.clone(),
+                repeat_policy: current_fragment_repeat_policy,
                 height: 0.0,
             };
             if page_break_before_next_row.is_forced() {
                 if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
                     self.mark_table_body_fragment_repeated_footers(
                         &mut table_body_fragment,
-                        &repeating_footer_rows,
+                        current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                         &planned_row_heights,
                         table_metrics,
                     );
@@ -1280,7 +1759,7 @@ impl<'a> LayoutBuilder<'a> {
                         rows,
                         &grid,
                         columns,
-                        &repeating_footer_rows,
+                        current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                         style,
                         stylesheets,
                         table_x,
@@ -1294,6 +1773,14 @@ impl<'a> LayoutBuilder<'a> {
                     );
                 }
                 self.apply_forced_break(page_break_before_next_row);
+                current_fragment_repeat_policy = table_fragment_repeat_policy(
+                    row_fragment_required_height,
+                    self.page_area_height(),
+                    repeating_header_height,
+                    repeating_footer_height,
+                    !row_is_repeating_header,
+                    !row_is_repeating_footer,
+                );
                 pending_table_fragment_break_reason = TableFragmentBreakReason::Forced;
             }
             page_break_before_next_row = PageBreak::Auto;
@@ -1309,7 +1796,7 @@ impl<'a> LayoutBuilder<'a> {
                 if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
                     self.mark_table_body_fragment_repeated_footers(
                         &mut table_body_fragment,
-                        &repeating_footer_rows,
+                        current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                         &planned_row_heights,
                         table_metrics,
                     );
@@ -1334,7 +1821,7 @@ impl<'a> LayoutBuilder<'a> {
                         rows,
                         &grid,
                         columns,
-                        &repeating_footer_rows,
+                        current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                         style,
                         stylesheets,
                         table_x,
@@ -1348,6 +1835,14 @@ impl<'a> LayoutBuilder<'a> {
                     );
                 }
                 self.apply_forced_break(break_before);
+                current_fragment_repeat_policy = table_fragment_repeat_policy(
+                    row_fragment_required_height,
+                    self.page_area_height(),
+                    repeating_header_height,
+                    repeating_footer_height,
+                    !row_is_repeating_header,
+                    !row_is_repeating_footer,
+                );
                 pending_table_fragment_break_reason = TableFragmentBreakReason::Forced;
                 broke_before_row = true;
             }
@@ -1368,14 +1863,43 @@ impl<'a> LayoutBuilder<'a> {
                 // so rows are moved as a unit when the group fits on a fresh
                 // page but not in the current remaining fragmentainer.
                 // https://www.w3.org/TR/css-break-3/#break-within
-                if group_height <= self.page_area_height() + 0.01
+                let mut next_fragment_repeat_policy = table_fragment_repeat_policy(
+                    group_height,
+                    self.page_area_height(),
+                    repeating_header_height,
+                    repeating_footer_height,
+                    !row_is_repeating_header,
+                    !row_is_repeating_footer,
+                );
+                let next_fragment_body_capacity = next_fragment_repeat_policy.body_capacity(
+                    self.page_area_height(),
+                    repeating_header_height,
+                    repeating_footer_height,
+                );
+                let group_fits_next_fragment = group_height <= next_fragment_body_capacity + 0.01;
+                let no_repeat_policy = TableFragmentRepeatPolicy {
+                    repeat_header: false,
+                    repeat_footer: false,
+                };
+                let no_repeat_body_capacity = no_repeat_policy.body_capacity(
+                    self.page_area_height(),
+                    repeating_header_height,
+                    repeating_footer_height,
+                );
+                let group_can_overflow_next_fragment = !group_fits_next_fragment
+                    && group_height
+                        <= no_repeat_body_capacity + TABLE_AVOID_UNFRAGMENTED_OVERFLOW_TOLERANCE;
+                if group_can_overflow_next_fragment {
+                    next_fragment_repeat_policy = no_repeat_policy;
+                }
+                if (group_fits_next_fragment || group_can_overflow_next_fragment)
                     && group_height > remaining_height + 0.01
                     && !self.cursor_is_at_page_top()
                 {
                     if !row_is_repeating_footer {
                         self.mark_table_body_fragment_repeated_footers(
                             &mut table_body_fragment,
-                            &repeating_footer_rows,
+                            current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                             &planned_row_heights,
                             table_metrics,
                         );
@@ -1400,7 +1924,7 @@ impl<'a> LayoutBuilder<'a> {
                             rows,
                             &grid,
                             columns,
-                            &repeating_footer_rows,
+                            current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                             style,
                             stylesheets,
                             table_x,
@@ -1414,16 +1938,19 @@ impl<'a> LayoutBuilder<'a> {
                         );
                     }
                     self.push_page();
+                    self.cursor_y = self.page_top();
+                    current_fragment_repeat_policy = next_fragment_repeat_policy;
+                    if group_can_overflow_next_fragment {
+                        unfragmented_avoid_row_group_end = Some(*end);
+                    }
                     pending_table_fragment_break_reason = TableFragmentBreakReason::AvoidedOverflow;
                     broke_before_row = true;
                 }
             }
-            let row_height = planned_row_heights[row_index];
-            let row_collapsed = table_row_is_collapsed(&row_style);
-            let reserved_footer_height = if row_is_repeating_footer || !repeating_footer_fits_page {
+            let reserved_footer_height = if row_is_repeating_footer {
                 0.0
             } else {
-                repeating_footer_height
+                current_fragment_repeat_policy.reserved_footer_height(repeating_footer_height)
             };
             let avoid_boundary = pending_avoid_before_row
                 || previous_break_after_avoid
@@ -1439,90 +1966,125 @@ impl<'a> LayoutBuilder<'a> {
                 && let Some(candidate) = avoid_candidate
                 && !self.cursor_is_at_page_top()
                 && row_height > self.cursor_y - self.page_bottom() + 0.01
-                && candidate.height + row_height + reserved_footer_height
-                    <= self.page_area_height() + 0.01
             {
-                self.restore(candidate.snapshot);
-                table_body_fragment = candidate.table_body_fragment;
-                if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
-                    self.mark_table_body_fragment_repeated_footers(
-                        &mut table_body_fragment,
-                        &repeating_footer_rows,
-                        &planned_row_heights,
-                        table_metrics,
-                    );
-                }
-                self.finalize_table_body_paint_fragment(
-                    &mut table_body_fragment,
-                    rows,
-                    &grid,
-                    columns,
-                    style,
-                    stylesheets,
-                    table_x,
-                    used_table_width,
-                    table_cellpadding,
-                    &column_plan,
-                    table_width,
-                    table_metrics,
-                    collapsed_geometry.as_ref(),
+                let avoid_run_height = candidate.height + row_height;
+                let next_fragment_repeat_policy = table_fragment_repeat_policy(
+                    avoid_run_height,
+                    self.page_area_height(),
+                    repeating_header_height,
+                    repeating_footer_height,
+                    !row_is_repeating_header,
+                    !row_is_repeating_footer,
                 );
-                if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
-                    self.layout_repeated_table_footer_rows_at_page_bottom(
+                if avoid_run_height
+                    > next_fragment_repeat_policy.body_capacity(
+                        self.page_area_height(),
+                        repeating_header_height,
+                        repeating_footer_height,
+                    ) + 0.01
+                {
+                    // The run cannot be kept together on the next fragment;
+                    // fall through to the ordinary row break rules.
+                } else {
+                    self.restore(candidate.snapshot);
+                    table_body_fragment = candidate.table_body_fragment;
+                    current_fragment_repeat_policy = candidate.repeat_policy;
+                    if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
+                        self.mark_table_body_fragment_repeated_footers(
+                            &mut table_body_fragment,
+                            current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
+                            &planned_row_heights,
+                            table_metrics,
+                        );
+                    }
+                    self.finalize_table_body_paint_fragment(
+                        &mut table_body_fragment,
                         rows,
                         &grid,
                         columns,
-                        &repeating_footer_rows,
                         style,
                         stylesheets,
                         table_x,
                         used_table_width,
                         table_cellpadding,
                         &column_plan,
-                        &planned_row_heights,
                         table_width,
                         table_metrics,
                         collapsed_geometry.as_ref(),
                     );
+                    if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
+                        self.layout_repeated_table_footer_rows_at_page_bottom(
+                            rows,
+                            &grid,
+                            columns,
+                            current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
+                            style,
+                            stylesheets,
+                            table_x,
+                            used_table_width,
+                            table_cellpadding,
+                            &column_plan,
+                            &planned_row_heights,
+                            table_width,
+                            table_metrics,
+                            collapsed_geometry.as_ref(),
+                        );
+                    }
+                    self.push_page();
+                    self.cursor_y = self.page_top();
+                    current_fragment_repeat_policy = next_fragment_repeat_policy;
+                    pending_table_fragment_break_reason = TableFragmentBreakReason::AvoidedOverflow;
+                    if !row_is_repeating_header {
+                        self.layout_repeated_table_rows(
+                            rows,
+                            &grid,
+                            columns,
+                            current_fragment_repeat_policy.header_rows(&repeating_header_rows),
+                            style,
+                            stylesheets,
+                            table_x,
+                            used_table_width,
+                            table_cellpadding,
+                            &column_plan,
+                            &planned_row_heights,
+                            table_width,
+                            table_metrics,
+                            collapsed_geometry.as_ref(),
+                        );
+                        pending_repeated_header_rows = current_fragment_repeat_policy
+                            .header_rows(&repeating_header_rows)
+                            .to_vec();
+                    }
+                    row_index = candidate.row_index;
+                    page_break_before_next_row = PageBreak::Auto;
+                    avoid_break_candidate = None;
+                    previous_row_candidate = None;
+                    previous_break_after_avoid = false;
+                    continue;
                 }
-                self.push_page();
-                pending_table_fragment_break_reason = TableFragmentBreakReason::AvoidedOverflow;
-                if !row_is_repeating_header {
-                    self.layout_repeated_table_rows(
-                        rows,
-                        &grid,
-                        columns,
-                        &repeating_header_rows,
-                        style,
-                        stylesheets,
-                        table_x,
-                        used_table_width,
-                        table_cellpadding,
-                        &column_plan,
-                        &planned_row_heights,
-                        table_width,
-                        table_metrics,
-                        collapsed_geometry.as_ref(),
-                    );
-                    pending_repeated_header_rows = repeating_header_rows.clone();
-                }
-                row_index = candidate.row_index;
-                page_break_before_next_row = PageBreak::Auto;
-                avoid_break_candidate = None;
-                previous_row_candidate = None;
-                previous_break_after_avoid = false;
-                continue;
             }
-            let row_overflows_page = self.cursor_y - row_height < self.page_bottom();
-            let row_overflows_reserved_footer =
-                self.cursor_y - row_height - reserved_footer_height < self.page_bottom();
+            let row_requires_split = row_height > self.page_area_height() + 0.01;
+            let row_kept_by_avoid_group =
+                unfragmented_avoid_row_group_end.is_some_and(|end| row_index < end);
+            let available_height = self.cursor_y - self.page_bottom();
+            let row_overflows_page = if row_requires_split {
+                !row_kept_by_avoid_group && available_height <= 0.01
+            } else {
+                self.cursor_y - row_height < self.page_bottom()
+            };
+            let row_overflows_reserved_footer = if row_requires_split {
+                !row_kept_by_avoid_group && available_height - reserved_footer_height <= 0.01
+            } else {
+                self.cursor_y - row_height - reserved_footer_height < self.page_bottom()
+            };
             if (row_overflows_page || row_overflows_reserved_footer)
                 && !self.cursor_is_at_page_top()
+                && self.out_of_flow_prebreak_suppression_depth == 0
             {
                 if !row_is_repeating_footer {
                     self.mark_table_body_fragment_repeated_footers(
                         &mut table_body_fragment,
-                        &repeating_footer_rows,
+                        current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                         &planned_row_heights,
                         table_metrics,
                     );
@@ -1547,7 +2109,7 @@ impl<'a> LayoutBuilder<'a> {
                         rows,
                         &grid,
                         columns,
-                        &repeating_footer_rows,
+                        current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                         style,
                         stylesheets,
                         table_x,
@@ -1561,6 +2123,15 @@ impl<'a> LayoutBuilder<'a> {
                     );
                 }
                 self.push_page();
+                self.cursor_y = self.page_top();
+                current_fragment_repeat_policy = table_fragment_repeat_policy(
+                    row_fragment_required_height,
+                    self.page_area_height(),
+                    repeating_header_height,
+                    repeating_footer_height,
+                    !row_is_repeating_header,
+                    !row_is_repeating_footer,
+                );
                 pending_table_fragment_break_reason = TableFragmentBreakReason::Overflow;
                 broke_before_row = true;
             }
@@ -1569,7 +2140,7 @@ impl<'a> LayoutBuilder<'a> {
                     rows,
                     &grid,
                     columns,
-                    &repeating_header_rows,
+                    current_fragment_repeat_policy.header_rows(&repeating_header_rows),
                     style,
                     stylesheets,
                     table_x,
@@ -1581,13 +2152,28 @@ impl<'a> LayoutBuilder<'a> {
                     table_metrics,
                     collapsed_geometry.as_ref(),
                 );
-                pending_repeated_header_rows = repeating_header_rows.clone();
-                if self.cursor_y - row_height < self.page_bottom() && !self.cursor_is_at_page_top()
-                {
+                pending_repeated_header_rows = current_fragment_repeat_policy
+                    .header_rows(&repeating_header_rows)
+                    .to_vec();
+                let reserved_footer_height_after_header = if row_is_repeating_footer {
+                    0.0
+                } else {
+                    current_fragment_repeat_policy.reserved_footer_height(repeating_footer_height)
+                };
+                let available_height_after_header = self.cursor_y - self.page_bottom();
+                let row_still_overflows_after_header = if row_requires_split {
+                    !row_kept_by_avoid_group
+                        && available_height_after_header - reserved_footer_height_after_header
+                            <= 0.01
+                } else {
+                    self.cursor_y - row_height - reserved_footer_height_after_header
+                        < self.page_bottom()
+                };
+                if row_still_overflows_after_header && !self.cursor_is_at_page_top() {
                     if !row_is_repeating_footer {
                         self.mark_table_body_fragment_repeated_footers(
                             &mut table_body_fragment,
-                            &repeating_footer_rows,
+                            current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                             &planned_row_heights,
                             table_metrics,
                         );
@@ -1612,7 +2198,7 @@ impl<'a> LayoutBuilder<'a> {
                             rows,
                             &grid,
                             columns,
-                            &repeating_footer_rows,
+                            current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                             style,
                             stylesheets,
                             table_x,
@@ -1626,12 +2212,21 @@ impl<'a> LayoutBuilder<'a> {
                         );
                     }
                     self.push_page();
+                    self.cursor_y = self.page_top();
+                    current_fragment_repeat_policy = table_fragment_repeat_policy(
+                        row_fragment_required_height,
+                        self.page_area_height(),
+                        repeating_header_height,
+                        repeating_footer_height,
+                        false,
+                        !row_is_repeating_footer,
+                    );
                     pending_table_fragment_break_reason = TableFragmentBreakReason::Overflow;
                     self.layout_repeated_table_rows(
                         rows,
                         &grid,
                         columns,
-                        &repeating_header_rows,
+                        current_fragment_repeat_policy.header_rows(&repeating_header_rows),
                         style,
                         stylesheets,
                         table_x,
@@ -1643,7 +2238,9 @@ impl<'a> LayoutBuilder<'a> {
                         table_metrics,
                         collapsed_geometry.as_ref(),
                     );
-                    pending_repeated_header_rows = repeating_header_rows.clone();
+                    pending_repeated_header_rows = current_fragment_repeat_policy
+                        .header_rows(&repeating_header_rows)
+                        .to_vec();
                 }
             }
 
@@ -1668,24 +2265,33 @@ impl<'a> LayoutBuilder<'a> {
                 continue;
             }
             let row_baseline_offset = self.table_row_baseline_offset(
+                row_index,
                 row,
                 &grid.rows[row_index],
                 &row_style,
                 stylesheets,
                 table_cellpadding,
                 &column_plan,
+                table_metrics,
+                collapsed_geometry.as_ref(),
             );
-            if row_height > self.page_area_height() + 0.01 {
+            if row_height > self.page_area_height() + 0.01 && !row_kept_by_avoid_group {
                 let mut remaining = row_height;
                 let mut piece_offset = 0.0;
                 while remaining > 0.01 {
+                    let reserved_footer_height = if row_is_repeating_footer {
+                        0.0
+                    } else {
+                        current_fragment_repeat_policy
+                            .reserved_footer_height(repeating_footer_height)
+                    };
                     let available_height =
                         (self.cursor_y - self.page_bottom() - reserved_footer_height).max(0.0);
                     if available_height <= 0.01 {
                         if !row_is_repeating_footer {
                             self.mark_table_body_fragment_repeated_footers(
                                 &mut table_body_fragment,
-                                &repeating_footer_rows,
+                                current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                                 &planned_row_heights,
                                 table_metrics,
                             );
@@ -1710,7 +2316,7 @@ impl<'a> LayoutBuilder<'a> {
                                 rows,
                                 &grid,
                                 columns,
-                                &repeating_footer_rows,
+                                current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                                 style,
                                 stylesheets,
                                 table_x,
@@ -1724,6 +2330,15 @@ impl<'a> LayoutBuilder<'a> {
                             );
                         }
                         self.push_page();
+                        self.cursor_y = self.page_top();
+                        current_fragment_repeat_policy = table_fragment_repeat_policy(
+                            row_fragment_required_height,
+                            self.page_area_height(),
+                            repeating_header_height,
+                            repeating_footer_height,
+                            !row_is_repeating_header,
+                            !row_is_repeating_footer,
+                        );
                         pending_table_fragment_break_reason =
                             TableFragmentBreakReason::OversizedRowSlice;
                         if !row_is_repeating_header {
@@ -1731,7 +2346,7 @@ impl<'a> LayoutBuilder<'a> {
                                 rows,
                                 &grid,
                                 columns,
-                                &repeating_header_rows,
+                                current_fragment_repeat_policy.header_rows(&repeating_header_rows),
                                 style,
                                 stylesheets,
                                 table_x,
@@ -1743,7 +2358,9 @@ impl<'a> LayoutBuilder<'a> {
                                 table_metrics,
                                 collapsed_geometry.as_ref(),
                             );
-                            pending_repeated_header_rows = repeating_header_rows.clone();
+                            pending_repeated_header_rows = current_fragment_repeat_policy
+                                .header_rows(&repeating_header_rows)
+                                .to_vec();
                         }
                         if self.ensure_table_body_paint_fragment(
                             &mut table_body_fragment,
@@ -1787,6 +2404,7 @@ impl<'a> LayoutBuilder<'a> {
                         row_height,
                         piece_height,
                         piece_offset,
+                        collapsed_geometry.as_ref(),
                         row_baseline_offset,
                     );
                     if let Some(fragment) = &mut table_body_fragment {
@@ -1806,7 +2424,7 @@ impl<'a> LayoutBuilder<'a> {
                         if !row_is_repeating_footer {
                             self.mark_table_body_fragment_repeated_footers(
                                 &mut table_body_fragment,
-                                &repeating_footer_rows,
+                                current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                                 &planned_row_heights,
                                 table_metrics,
                             );
@@ -1831,7 +2449,7 @@ impl<'a> LayoutBuilder<'a> {
                                 rows,
                                 &grid,
                                 columns,
-                                &repeating_footer_rows,
+                                current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
                                 style,
                                 stylesheets,
                                 table_x,
@@ -1845,6 +2463,15 @@ impl<'a> LayoutBuilder<'a> {
                             );
                         }
                         self.push_page();
+                        self.cursor_y = self.page_top();
+                        current_fragment_repeat_policy = table_fragment_repeat_policy(
+                            row_fragment_required_height,
+                            self.page_area_height(),
+                            repeating_header_height,
+                            repeating_footer_height,
+                            !row_is_repeating_header,
+                            !row_is_repeating_footer,
+                        );
                         pending_table_fragment_break_reason =
                             TableFragmentBreakReason::OversizedRowSlice;
                         if !row_is_repeating_header {
@@ -1852,7 +2479,7 @@ impl<'a> LayoutBuilder<'a> {
                                 rows,
                                 &grid,
                                 columns,
-                                &repeating_header_rows,
+                                current_fragment_repeat_policy.header_rows(&repeating_header_rows),
                                 style,
                                 stylesheets,
                                 table_x,
@@ -1864,7 +2491,9 @@ impl<'a> LayoutBuilder<'a> {
                                 table_metrics,
                                 collapsed_geometry.as_ref(),
                             );
-                            pending_repeated_header_rows = repeating_header_rows.clone();
+                            pending_repeated_header_rows = current_fragment_repeat_policy
+                                .header_rows(&repeating_header_rows)
+                                .to_vec();
                         }
                         if self.ensure_table_body_paint_fragment(
                             &mut table_body_fragment,
@@ -1897,6 +2526,7 @@ impl<'a> LayoutBuilder<'a> {
                     row_height,
                     row_height,
                     0.0,
+                    collapsed_geometry.as_ref(),
                     row_baseline_offset,
                 );
                 if let Some(fragment) = &mut table_body_fragment {
@@ -1951,11 +2581,14 @@ impl<'a> LayoutBuilder<'a> {
             }
             previous_break_after_avoid = break_after.avoids_page();
             row_index += 1;
+            if unfragmented_avoid_row_group_end.is_some_and(|end| row_index >= end) {
+                unfragmented_avoid_row_group_end = None;
+            }
         }
 
         self.mark_table_body_fragment_repeated_footers(
             &mut table_body_fragment,
-            &repeating_footer_rows,
+            current_fragment_repeat_policy.footer_rows(&repeating_footer_rows),
             &planned_row_heights,
             table_metrics,
         );
@@ -1974,6 +2607,7 @@ impl<'a> LayoutBuilder<'a> {
             table_metrics,
             collapsed_geometry.as_ref(),
         );
+        self.fragment_top_offsets.pop();
         self.cursor_y -= table_edge_spacing;
 
         self.cursor_y -= table_width.padding.bottom + table_width.border_widths.bottom;
@@ -1991,7 +2625,7 @@ impl<'a> LayoutBuilder<'a> {
         }
         self.pop_float_context();
         self.cursor_y -= style.margin.bottom;
-        if style.position == Position::Relative {
+        if matches!(style.position, Position::Relative | Position::Sticky) {
             self.cursor_y -= relative_offset.y;
         }
         self.apply_forced_break(if style.break_after.is_forced() {
@@ -2016,12 +2650,8 @@ impl<'a> LayoutBuilder<'a> {
         table_width: UsedTableWidth,
     ) -> f32 {
         let content_width = used_empty_table_grid_width(style, available_table_width, table_width);
-        let content_height = used_empty_table_grid_height(
-            style,
-            self.page_area_height(),
-            content_width,
-            table_width,
-        );
+        let content_height =
+            used_empty_table_grid_height(style, self.page_area_height(), table_width);
         style.margin.top
             + self.estimate_table_captions_height(
                 captions,
@@ -2055,12 +2685,8 @@ impl<'a> LayoutBuilder<'a> {
         relative_offset: RelativeOffset,
     ) -> (f32, f32, f32, f32) {
         let content_width = used_empty_table_grid_width(style, available_table_width, table_width);
-        let content_height = used_empty_table_grid_height(
-            style,
-            self.page_area_height(),
-            content_width,
-            table_width,
-        );
+        let content_height =
+            used_empty_table_grid_height(style, self.page_area_height(), table_width);
         let top_caption_height = self.estimate_table_captions_height(
             captions,
             style,
@@ -2091,6 +2717,8 @@ impl<'a> LayoutBuilder<'a> {
             style.margin.left + border_box_width + style.margin.right,
             collision_height,
             style.clear,
+            style.writing_mode,
+            style.direction,
             self.containing_block_direction,
         );
         self.cursor_y = avoided_top;
@@ -2133,6 +2761,34 @@ impl<'a> LayoutBuilder<'a> {
         let table_x = table_width.content_x(table_outer_x);
 
         self.push_float_context();
+        let table_wrapper_top = self.cursor_y;
+        let border_box_x = table_x - table_width.padding.left - table_width.border_widths.left;
+        let establishes_positioning_containing_block =
+            matches!(style.position, Position::Relative | Position::Sticky)
+                || !style.transform.is_empty();
+        if establishes_positioning_containing_block {
+            let top_caption_height = self.estimate_table_captions_height(
+                captions,
+                style,
+                stylesheets,
+                content_width,
+                CaptionSide::Top,
+            );
+            let bottom_caption_height = self.estimate_table_captions_height(
+                captions,
+                style,
+                stylesheets,
+                content_width,
+                CaptionSide::Bottom,
+            );
+            self.containing_blocks
+                .push(ContainingBlock::from_page_top_rect(PageTopRect::new(
+                    table_x,
+                    table_wrapper_top,
+                    content_width,
+                    top_caption_height + border_box_height + bottom_caption_height,
+                )));
+        }
         self.layout_table_captions(
             captions,
             style,
@@ -2143,32 +2799,19 @@ impl<'a> LayoutBuilder<'a> {
         );
 
         let table_box_top = self.cursor_y;
-        let border_box_x = table_x - table_width.padding.left - table_width.border_widths.left;
-        let establishes_positioning_containing_block =
-            style.position == Position::Relative || !style.transform.is_empty();
-        if establishes_positioning_containing_block {
-            self.containing_blocks.push(ContainingBlock {
-                x: table_x,
-                top_y: table_box_top,
-                width: content_width,
-                height: border_box_height,
-            });
-        }
 
         let table_structure_paint_checkpoint = self.current_page.paint_checkpoint();
         let table_structure_paint_page_index = self.pages.len();
         if let Some(fill) = style.background_color {
             self.push_rect_in_band(
                 PaintBand::InFlowBlock,
-                RenderedRect {
-                    x: border_box_x,
-                    y: table_box_top - border_box_height,
-                    width: border_box_width,
-                    height: border_box_height,
-                    fill: Some(fill),
-                    stroke: None,
-                    stroke_width: 0.0,
-                },
+                PageTopRect::new(
+                    border_box_x,
+                    table_box_top,
+                    border_box_width,
+                    border_box_height,
+                )
+                .rendered_rect(Some(fill)),
             );
         }
         self.paint_separated_table_wrapper_border(
@@ -2186,12 +2829,13 @@ impl<'a> LayoutBuilder<'a> {
             self.scope_current_page_atomic_paint_since(
                 &table_structure_paint_checkpoint,
                 PaintBand::InFlowBlock,
-                PaintClip {
-                    x: border_box_x,
-                    y: table_box_top - border_box_height,
-                    width: border_box_width,
-                    height: border_box_height,
-                },
+                PageTopRect::new(
+                    border_box_x,
+                    table_box_top,
+                    border_box_width,
+                    border_box_height,
+                )
+                .paint_clip(),
                 style,
                 Vec::new(),
             );
@@ -2211,7 +2855,7 @@ impl<'a> LayoutBuilder<'a> {
         }
         self.pop_float_context();
         self.cursor_y -= style.margin.bottom;
-        if style.position == Position::Relative {
+        if matches!(style.position, Position::Relative | Position::Sticky) {
             self.cursor_y -= relative_offset.y;
         }
         self.apply_forced_break(style.break_after);
@@ -2354,7 +2998,12 @@ impl<'a> LayoutBuilder<'a> {
         let paint_page_index = self.pages.len();
         let positioned_layer_start = self.positioned_layers.len();
         let fragment_top = self.cursor_y;
-        self.paint_repeated_table_fragment_structural_backgrounds(
+        let occupied_inline_bounds = column_plan
+            .occupied_inline_bounds()
+            .unwrap_or_else(|| TableInlineBounds::new(0.0, used_table_width));
+        let occupied_x = table_x + occupied_inline_bounds.start;
+        let occupied_width = occupied_inline_bounds.size;
+        self.paint_repeated_table_fragment_structural_layers(
             rows,
             repeated_rows,
             columns,
@@ -2385,12 +3034,15 @@ impl<'a> LayoutBuilder<'a> {
             }
 
             let row_baseline_offset = self.table_row_baseline_offset(
+                row_index,
                 row,
                 &grid.rows[row_index],
                 &row_style,
                 stylesheets,
                 table_cellpadding,
                 column_plan,
+                table_metrics,
+                collapsed_geometry,
             );
             // CSS Tables allow repeated table-header-group and
             // table-footer-group boxes on fragmented tables. This replays the
@@ -2401,31 +3053,30 @@ impl<'a> LayoutBuilder<'a> {
             if row_style.background_color.is_some() {
                 self.push_rect_in_band(
                     PaintBand::InFlowBlock,
-                    RenderedRect {
-                        x: table_x,
-                        y: row_top - row_height,
-                        width: used_table_width,
-                        height: row_height,
-                        fill: row_style.background_color,
-                        stroke: None,
-                        stroke_width: 0.0,
-                    },
+                    PageTopRect::new(occupied_x, row_top, occupied_width, row_height)
+                        .rendered_rect(row_style.background_color),
                 );
             }
             for placement in &grid.rows[row_index] {
                 let cell = &row.cells[placement.cell];
-                let mut cell_style = self.style_for_table_cell(cell, row, &row_style, stylesheets);
-                let cell_x = table_x + column_plan.offset_for_column(placement.column);
-                let cell_width = column_plan.width_for_span(placement.column, placement.colspan);
-                if cell_width <= 0.0 {
+                let Some(prepared) = self.prepare_table_cell(
+                    cell,
+                    row,
+                    &row_style,
+                    placement,
+                    row_index,
+                    table_x,
+                    stylesheets,
+                    table_cellpadding,
+                    column_plan,
+                    table_metrics,
+                    collapsed_geometry,
+                ) else {
                     continue;
-                }
-                apply_table_cell_used_padding(&mut cell_style, table_cellpadding, cell_width);
-                let text = table_cell_inline_text(cell);
-                let non_text_height = table_cell_non_text_content_height(cell);
-                let cell_is_empty = text.is_empty() && non_text_height <= 0.0;
-                let metrics =
-                    self.table_cell_layout_metrics(cell, &cell_style, stylesheets, cell_width);
+                };
+                let cell_style = &prepared.style;
+                let cell_borders = prepared.borders;
+                let metrics = prepared.metrics;
                 let cell_height = table_row_span_height(
                     planned_row_heights,
                     row_index,
@@ -2433,12 +3084,45 @@ impl<'a> LayoutBuilder<'a> {
                     table_metrics,
                 )
                 .max(metrics.border_box_height);
+                let cell_placement = TableGridPlacement::new(PageTopPoint::new(table_x, row_top));
+                let cell_border_box = column_plan
+                    .cell_border_box(prepared.area, TableRowBounds::new(0.0, cell_height));
+                let cell_x = cell_border_box.x(cell_placement);
+                let cell_width = cell_border_box.width();
+                let text = prepared.text;
+                let cell_is_empty = text.is_empty() && metrics.content_height <= 0.0;
+                let baseline_context = TableCellBaselineAlignmentContext {
+                    row_index,
+                    row_style: &row_style,
+                    table_style,
+                    rows,
+                    grid,
+                    stylesheets,
+                    table_cellpadding,
+                    column_plan,
+                    planned_row_heights,
+                    table_metrics,
+                    collapsed_geometry,
+                    row_baseline_offset,
+                };
+                let cell_row_baseline_offset = self.table_cell_row_baseline_offset_for_alignment(
+                    &baseline_context,
+                    placement,
+                    cell_style,
+                );
                 let content_offset = table_cell_content_offset(
-                    &cell_style,
+                    cell_style,
                     metrics.content_height,
                     cell_height,
-                    row_baseline_offset,
+                    cell_row_baseline_offset,
                     metrics.baseline_offset,
+                );
+                let content_x_offset = self.table_cell_content_x_offset(
+                    cell,
+                    cell_style,
+                    stylesheets,
+                    cell_width,
+                    cell_borders,
                 );
                 let content_clip = self.collapsed_rowspan_cell_content_clip(
                     row_index,
@@ -2448,9 +3132,8 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     planned_row_heights,
                     table_metrics,
-                    cell_x,
-                    cell_width,
-                    row_top,
+                    cell_border_box,
+                    cell_placement,
                 );
                 let paint_empty_cell = table_metrics.border_collapse
                     == css::BorderCollapse::Collapse
@@ -2460,15 +3143,7 @@ impl<'a> LayoutBuilder<'a> {
                 if paint_empty_cell && cell_style.background_color.is_some() {
                     self.push_rect_in_band(
                         PaintBand::InFlowBlock,
-                        RenderedRect {
-                            x: cell_x,
-                            y: row_top - cell_height,
-                            width: cell_width,
-                            height: cell_height,
-                            fill: cell_style.background_color,
-                            stroke: None,
-                            stroke_width: 0.0,
-                        },
+                        cell_border_box.rendered_rect(cell_placement, cell_style.background_color),
                     );
                 }
                 if table_metrics.border_collapse != css::BorderCollapse::Collapse
@@ -2483,7 +3158,7 @@ impl<'a> LayoutBuilder<'a> {
                         row_top,
                         cell_width,
                         cell_height,
-                        &cell_style,
+                        cell_style,
                     );
                     for rect in border_rects {
                         self.push_rect_in_band(PaintBand::InFlowBlock, rect);
@@ -2504,24 +3179,28 @@ impl<'a> LayoutBuilder<'a> {
                     let previous_left = self.content_left;
                     let previous_right = self.content_right;
                     let previous_cursor_y = self.cursor_y;
-                    let cell_borders = used_border_widths(&cell_style);
-                    self.content_left = cell_x + cell_borders.left + cell_style.padding.left;
-                    self.content_right =
-                        cell_x + cell_width - cell_borders.right - cell_style.padding.right;
-                    self.cursor_y =
-                        row_top - cell_borders.top - cell_style.padding.top - content_offset;
+                    let content_box = cell_border_box.content_box(
+                        cell_placement,
+                        cell_style.padding,
+                        cell_borders,
+                        content_offset,
+                        content_x_offset,
+                    );
+                    self.content_left = content_box.left();
+                    self.content_right = content_box.right();
+                    self.cursor_y = content_box.top_y();
                     self.push_float_context();
                     if let Some(element) = cell.element {
                         self.layout_inline_items_block(
                             element,
-                            &cell_style,
+                            cell_style,
                             stylesheets,
                             (0.0, 0.0),
                             table_cell_href(cell),
                             None,
                         );
                     } else {
-                        self.layout_text_block(&text, &cell_style, 0.0, 0.0, table_cell_href(cell));
+                        self.layout_text_block(&text, cell_style, 0.0, 0.0, table_cell_href(cell));
                     }
                     self.pop_float_context();
                     self.content_left = previous_left;
@@ -2530,31 +3209,29 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 self.layout_table_cell_replaced_children(
                     cell,
-                    &cell_style,
-                    cell_x,
-                    row_top,
+                    cell_style,
+                    cell_border_box,
+                    cell_placement,
                     content_offset,
+                    content_x_offset,
                 );
                 self.layout_table_cell_flow_children(
                     cell,
                     row,
-                    &cell_style,
+                    cell_style,
                     stylesheets,
-                    cell_x,
-                    row_top,
-                    cell_width,
-                    cell_height,
+                    cell_border_box,
+                    cell_placement,
                     content_offset,
+                    content_x_offset,
                 );
                 self.layout_table_cell_positioned_children(
                     cell,
                     row,
-                    &cell_style,
+                    cell_style,
                     stylesheets,
-                    cell_x,
-                    row_top,
-                    cell_width,
-                    cell_height,
+                    cell_border_box,
+                    cell_placement,
                 );
                 self.pop_overflow_clip(clip_active);
             }
@@ -2565,9 +3242,9 @@ impl<'a> LayoutBuilder<'a> {
                 paint_table_border_edges(
                     &mut border_rects,
                     &mut border_paths,
-                    table_x,
+                    occupied_x,
                     row_top,
-                    used_table_width,
+                    occupied_width,
                     row_height,
                     &row_style,
                 );
@@ -2590,8 +3267,9 @@ impl<'a> LayoutBuilder<'a> {
                 .iter()
                 .map(|row| planned_row_heights[*row])
                 .collect::<Vec<_>>();
+            let placement = TableGridPlacement::new(PageTopPoint::new(table_x, 0.0));
             let (rects, paths) = geometry.grid.paint_fragment_rows(
-                table_x,
+                placement,
                 column_plan,
                 repeated_rows,
                 &repeated_row_tops,
@@ -2607,7 +3285,26 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
         if self.pages.len() == paint_page_index {
-            let child_contexts = if positioned_layer_start < self.positioned_layers.len() {
+            let bounds = PageTopRect::new(
+                table_x - table_width.padding.left - table_width.border_widths.left,
+                fragment_top + table_width.padding.top + table_width.border_widths.top,
+                used_table_width
+                    + table_width.padding.left
+                    + table_width.padding.right
+                    + table_width.border_widths.left
+                    + table_width.border_widths.right,
+                fragment_top + table_width.padding.top + table_width.border_widths.top
+                    - self.cursor_y
+                    + table_width.padding.bottom
+                    + table_width.border_widths.bottom,
+            )
+            .paint_clip();
+            let captures_positioned_descendants =
+                StackingContextPolicy::for_atomic(table_style, PaintBand::InFlowBlock, bounds)
+                    .captures_positioned_descendants;
+            let child_contexts = if captures_positioned_descendants
+                && positioned_layer_start < self.positioned_layers.len()
+            {
                 self.positioned_layers
                     .split_off(positioned_layer_start)
                     .into_iter()
@@ -2620,38 +3317,23 @@ impl<'a> LayoutBuilder<'a> {
             self.scope_current_page_atomic_paint_since(
                 &paint_checkpoint,
                 PaintBand::InFlowBlock,
-                PaintClip {
-                    x: table_x - table_width.padding.left - table_width.border_widths.left,
-                    y: self.cursor_y
-                        - table_width.padding.bottom
-                        - table_width.border_widths.bottom,
-                    width: used_table_width
-                        + table_width.padding.left
-                        + table_width.padding.right
-                        + table_width.border_widths.left
-                        + table_width.border_widths.right,
-                    height: (fragment_top
-                        + table_width.padding.top
-                        + table_width.border_widths.top
-                        - self.cursor_y
-                        + table_width.padding.bottom
-                        + table_width.border_widths.bottom)
-                        .max(0.0),
-                },
+                bounds,
                 table_style,
                 child_contexts,
             );
         }
     }
 
-    /// Paint table and column background layers for one repeated table fragment.
+    /// Paint table and column structural layers for one repeated table fragment.
     ///
     /// CSS 2.2 table painting orders structural backgrounds below row, cell,
-    /// and border paint. Repeated header/footer fragments therefore need their
-    /// own page-local table and column layers before row replay:
-    /// <https://www.w3.org/TR/CSS22/tables.html#table-layers>.
+    /// and border paint, while outlines paint in the final outline band.
+    /// Repeated header/footer fragments therefore need their own page-local
+    /// table, column, and row-group layers around row replay:
+    /// <https://www.w3.org/TR/CSS22/tables.html#table-layers> and
+    /// <https://drafts.csswg.org/css-tables-3/#rendering>.
     #[allow(clippy::too_many_arguments)]
-    fn paint_repeated_table_fragment_structural_backgrounds(
+    fn paint_repeated_table_fragment_structural_layers(
         &mut self,
         rows: &[TableRow<'_>],
         repeated_rows: &[usize],
@@ -2676,19 +3358,17 @@ impl<'a> LayoutBuilder<'a> {
                 - table_width.border_widths.bottom;
             self.push_rect_in_band(
                 PaintBand::InFlowBlock,
-                RenderedRect {
-                    x: table_x - table_width.padding.left - table_width.border_widths.left,
-                    y: background_bottom,
-                    width: used_table_width
+                PageTopRect::new(
+                    table_x - table_width.padding.left - table_width.border_widths.left,
+                    background_top,
+                    used_table_width
                         + table_width.padding.left
                         + table_width.padding.right
                         + table_width.border_widths.left
                         + table_width.border_widths.right,
-                    height: (background_top - background_bottom).max(0.0),
-                    fill: Some(fill),
-                    stroke: None,
-                    stroke_width: 0.0,
-                },
+                    background_top - background_bottom,
+                )
+                .rendered_rect(Some(fill)),
             );
         }
         for (start_column, end_column, column_group) in
@@ -2729,10 +3409,18 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         let mut local_row_tops = Vec::with_capacity(repeated_rows.len());
+        let mut local_row_heights = Vec::with_capacity(repeated_rows.len());
         let mut cursor_y = fragment_top;
+        let occupied_inline_bounds = column_plan
+            .occupied_inline_bounds()
+            .unwrap_or_else(|| TableInlineBounds::new(0.0, used_table_width));
+        let occupied_x = table_x + occupied_inline_bounds.start;
+        let occupied_width = occupied_inline_bounds.size;
         for (position, row_index) in repeated_rows.iter().copied().enumerate() {
             local_row_tops.push(cursor_y);
-            cursor_y -= planned_row_heights[row_index];
+            let row_height = planned_row_heights[row_index];
+            local_row_heights.push(row_height);
+            cursor_y -= row_height;
             if position + 1 < repeated_rows.len() {
                 cursor_y -= table_metrics.spacing.vertical;
             }
@@ -2740,42 +3428,51 @@ impl<'a> LayoutBuilder<'a> {
         for (start_row, end_row, row_group) in table_row_group_spans(rows) {
             let row_group_style =
                 self.style_for_table_row_group(&row_group, table_style, stylesheets);
-            let Some(fill) = row_group_style.background_color else {
-                continue;
-            };
-            let mut segment_start = None;
-            let mut previous_local = None;
-            for (local_row, original_row) in repeated_rows.iter().copied().enumerate() {
-                if original_row >= start_row && original_row < end_row {
-                    if segment_start.is_none() {
-                        segment_start = Some(local_row);
+            if let Some(fill) = row_group_style.background_color {
+                let mut segment_start = None;
+                let mut previous_local = None;
+                for (local_row, original_row) in repeated_rows.iter().copied().enumerate() {
+                    if original_row >= start_row && original_row < end_row {
+                        if segment_start.is_none() {
+                            segment_start = Some(local_row);
+                        }
+                        previous_local = Some(local_row + 1);
+                    } else if let (Some(start), Some(end)) =
+                        (segment_start.take(), previous_local.take())
+                    {
+                        self.paint_repeated_table_row_group_background(
+                            occupied_x,
+                            occupied_width,
+                            &local_row_tops,
+                            &local_row_heights,
+                            start,
+                            end,
+                            fill,
+                        );
                     }
-                    previous_local = Some(local_row + 1);
-                } else if let (Some(start), Some(end)) =
-                    (segment_start.take(), previous_local.take())
-                {
+                }
+                if let (Some(start), Some(end)) = (segment_start, previous_local) {
                     self.paint_repeated_table_row_group_background(
-                        table_x,
-                        used_table_width,
+                        occupied_x,
+                        occupied_width,
                         &local_row_tops,
-                        repeated_rows,
-                        planned_row_heights,
+                        &local_row_heights,
                         start,
                         end,
                         fill,
                     );
                 }
             }
-            if let (Some(start), Some(end)) = (segment_start, previous_local) {
-                self.paint_repeated_table_row_group_background(
-                    table_x,
-                    used_table_width,
+            if row_group_style.visibility == Visibility::Visible {
+                self.paint_repeated_table_row_group_outline(
+                    occupied_x,
+                    occupied_width,
                     &local_row_tops,
+                    &local_row_heights,
                     repeated_rows,
-                    planned_row_heights,
-                    start,
-                    end,
-                    fill,
+                    start_row,
+                    end_row,
+                    &row_group_style,
                 );
             }
         }
@@ -2787,30 +3484,101 @@ impl<'a> LayoutBuilder<'a> {
         table_x: f32,
         used_table_width: f32,
         local_row_tops: &[f32],
-        repeated_rows: &[usize],
-        planned_row_heights: &[f32],
+        local_row_heights: &[f32],
         start: usize,
         end: usize,
         fill: Color,
     ) {
-        if start >= end || end > repeated_rows.len() {
-            return;
+        if let Some(bounds) = table_fragment_row_span_bounds(
+            table_x,
+            used_table_width,
+            local_row_tops,
+            local_row_heights,
+            start,
+            end,
+        ) {
+            self.push_rect_in_band(
+                PaintBand::InFlowBlock,
+                RenderedRect::from_paint_rect(bounds.paint_rect(), Some(fill)),
+            );
         }
-        let top = local_row_tops[start];
-        let last = end - 1;
-        let bottom = local_row_tops[last] - planned_row_heights[repeated_rows[last]];
-        self.push_rect_in_band(
-            PaintBand::InFlowBlock,
-            RenderedRect {
-                x: table_x,
-                y: bottom,
-                width: used_table_width,
-                height: (top - bottom).max(0.0),
-                fill: Some(fill),
-                stroke: None,
-                stroke_width: 0.0,
-            },
-        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_repeated_table_row_group_outline(
+        &mut self,
+        table_x: f32,
+        used_table_width: f32,
+        local_row_tops: &[f32],
+        local_row_heights: &[f32],
+        repeated_rows: &[usize],
+        start_row: usize,
+        end_row: usize,
+        row_group_style: &ComputedStyle,
+    ) {
+        let mut segment_start = None;
+        let mut previous_local = None;
+        for (local_row, original_row) in repeated_rows.iter().copied().enumerate() {
+            if original_row >= start_row && original_row < end_row {
+                if segment_start.is_none() {
+                    segment_start = Some(local_row);
+                }
+                previous_local = Some(local_row + 1);
+            } else if let (Some(start), Some(end)) = (segment_start.take(), previous_local.take()) {
+                self.push_repeated_table_row_group_outline(
+                    table_x,
+                    used_table_width,
+                    local_row_tops,
+                    local_row_heights,
+                    start,
+                    end,
+                    row_group_style,
+                );
+            }
+        }
+        if let (Some(start), Some(end)) = (segment_start, previous_local) {
+            self.push_repeated_table_row_group_outline(
+                table_x,
+                used_table_width,
+                local_row_tops,
+                local_row_heights,
+                start,
+                end,
+                row_group_style,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_repeated_table_row_group_outline(
+        &mut self,
+        table_x: f32,
+        used_table_width: f32,
+        local_row_tops: &[f32],
+        local_row_heights: &[f32],
+        start: usize,
+        end: usize,
+        row_group_style: &ComputedStyle,
+    ) {
+        let Some(bounds) = table_fragment_row_span_bounds(
+            table_x,
+            used_table_width,
+            local_row_tops,
+            local_row_heights,
+            start,
+            end,
+        ) else {
+            return;
+        };
+        for primitive in self.box_outline_primitives(
+            bounds.x(),
+            bounds.y(),
+            bounds.width(),
+            bounds.height(),
+            row_group_style,
+        ) {
+            self.push_primitive_in_band(PaintBand::Outline, primitive);
+        }
     }
 
     fn ensure_table_body_paint_fragment(
@@ -2908,22 +3676,28 @@ impl<'a> LayoutBuilder<'a> {
             return;
         };
 
-        let structural = self.table_body_fragment_structural_background_primitives(
-            rows,
-            columns,
-            table_style,
-            stylesheets,
-            table_x,
-            used_table_width,
-            table_width,
-            table_metrics,
-            column_plan,
-            &fragment_state,
-        );
+        let (structural_backgrounds, structural_outlines) = self
+            .table_body_fragment_structural_primitives(
+                rows,
+                columns,
+                table_style,
+                stylesheets,
+                table_x,
+                used_table_width,
+                table_width,
+                table_metrics,
+                column_plan,
+                &fragment_state,
+            );
         self.current_page.prepend_recorded_primitives_to_fragment(
             &mut fragment,
             PaintBand::BackgroundBorder,
-            structural,
+            structural_backgrounds,
+        );
+        self.current_page.append_recorded_primitives_to_fragment(
+            &mut fragment,
+            PaintBand::Outline,
+            structural_outlines,
         );
 
         if table_metrics.border_collapse == css::BorderCollapse::Collapse {
@@ -2944,7 +3718,26 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
 
-        let child_contexts = if fragment_state.positioned_layer_start < self.positioned_layers.len()
+        let bottom = fragment_state.bottom();
+        let bounds_x = table_x - table_width.padding.left - table_width.border_widths.left;
+        let bounds_top = fragment_state.plan.fragment_top
+            + table_width.padding.top
+            + table_width.border_widths.top;
+        let bounds_bottom = bottom - table_width.padding.bottom - table_width.border_widths.bottom;
+        let bounds = PageTopRect::new(
+            bounds_x,
+            bounds_top,
+            used_table_width
+                + table_width.padding.left
+                + table_width.padding.right
+                + table_width.border_widths.left
+                + table_width.border_widths.right,
+            bounds_top - bounds_bottom,
+        )
+        .paint_clip();
+        let policy = StackingContextPolicy::for_atomic(table_style, PaintBand::InFlowBlock, bounds);
+        let child_contexts = if policy.captures_positioned_descendants
+            && fragment_state.positioned_layer_start < self.positioned_layers.len()
         {
             self.positioned_layers
                 .split_off(fragment_state.positioned_layer_start)
@@ -2959,29 +3752,13 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
 
-        let bottom = fragment_state.bottom();
-        let bounds_x = table_x - table_width.padding.left - table_width.border_widths.left;
-        let bounds_top = fragment_state.plan.fragment_top
-            + table_width.padding.top
-            + table_width.border_widths.top;
-        let bounds_bottom = bottom - table_width.padding.bottom - table_width.border_widths.bottom;
-        let bounds = PaintClip {
-            x: bounds_x,
-            y: bounds_bottom,
-            width: used_table_width
-                + table_width.padding.left
-                + table_width.padding.right
-                + table_width.border_widths.left
-                + table_width.border_widths.right,
-            height: (bounds_top - bounds_bottom).max(0.0),
-        };
         let context = PaintStackingContext::from_banded_fragment(fragment, child_contexts)
             .with_source_order(self.next_paint_source_order())
-            .with_effects(paint_effects_for_box(table_style, bounds))
+            .with_effects(policy.effects)
             .with_bounds(bounds);
         self.current_page.replace_paint_tree_since_with_context(
             &fragment_state.checkpoint,
-            PaintBand::InFlowBlock,
+            policy.parent_band,
             context,
         );
     }
@@ -3006,16 +3783,19 @@ impl<'a> LayoutBuilder<'a> {
         row_height: f32,
         piece_height: f32,
         piece_offset: f32,
+        collapsed_geometry: Option<&CollapsedTableGeometry>,
         row_baseline_offset: Option<f32>,
     ) {
         let split_piece = piece_offset > 0.0 || piece_height + 0.01 < row_height;
+        let occupied_inline_bounds = column_plan
+            .occupied_inline_bounds()
+            .unwrap_or_else(|| TableInlineBounds::new(0.0, used_table_width));
+        let occupied_x = table_x + occupied_inline_bounds.start;
+        let occupied_width = occupied_inline_bounds.size;
         let row_piece_clip_active = if split_piece {
-            self.push_overflow_clip(OverflowClip {
-                x: table_x,
-                y: row_top - piece_height,
-                width: used_table_width,
-                height: piece_height,
-            });
+            self.push_overflow_clip(
+                PageTopRect::new(table_x, row_top, used_table_width, piece_height).overflow_clip(),
+            );
             true
         } else {
             false
@@ -3024,18 +3804,24 @@ impl<'a> LayoutBuilder<'a> {
 
         for placement in &grid.rows[row_index] {
             let cell = &row.cells[placement.cell];
-            let mut cell_style = self.style_for_table_cell(cell, row, row_style, stylesheets);
-            let cell_x = table_x + column_plan.offset_for_column(placement.column);
-            let cell_width = column_plan.width_for_span(placement.column, placement.colspan);
-            if cell_width <= 0.0 {
+            let Some(prepared) = self.prepare_table_cell(
+                cell,
+                row,
+                row_style,
+                placement,
+                row_index,
+                table_x,
+                stylesheets,
+                table_cellpadding,
+                column_plan,
+                table_metrics,
+                collapsed_geometry,
+            ) else {
                 continue;
-            }
-            apply_table_cell_used_padding(&mut cell_style, table_cellpadding, cell_width);
-            let text = table_cell_inline_text(cell);
-            let non_text_height = table_cell_non_text_content_height(cell);
-            let cell_is_empty = text.is_empty() && non_text_height <= 0.0;
-            let metrics =
-                self.table_cell_layout_metrics(cell, &cell_style, stylesheets, cell_width);
+            };
+            let cell_style = &prepared.style;
+            let cell_borders = prepared.borders;
+            let metrics = prepared.metrics;
             let cell_height = table_row_span_height(
                 planned_row_heights,
                 row_index,
@@ -3043,12 +3829,45 @@ impl<'a> LayoutBuilder<'a> {
                 table_metrics,
             )
             .max(metrics.border_box_height);
+            let cell_placement =
+                TableGridPlacement::new(PageTopPoint::new(table_x, content_row_top));
+            let cell_border_box =
+                column_plan.cell_border_box(prepared.area, TableRowBounds::new(0.0, cell_height));
+            let cell_width = cell_border_box.width();
+            let text = prepared.text;
+            let cell_is_empty = text.is_empty() && metrics.content_height <= 0.0;
+            let baseline_context = TableCellBaselineAlignmentContext {
+                row_index,
+                row_style,
+                table_style,
+                rows,
+                grid,
+                stylesheets,
+                table_cellpadding,
+                column_plan,
+                planned_row_heights,
+                table_metrics,
+                collapsed_geometry,
+                row_baseline_offset,
+            };
+            let cell_row_baseline_offset = self.table_cell_row_baseline_offset_for_alignment(
+                &baseline_context,
+                placement,
+                cell_style,
+            );
             let content_offset = table_cell_content_offset(
-                &cell_style,
+                cell_style,
                 metrics.content_height,
                 cell_height,
-                row_baseline_offset,
+                cell_row_baseline_offset,
                 metrics.baseline_offset,
+            );
+            let content_x_offset = self.table_cell_content_x_offset(
+                cell,
+                cell_style,
+                stylesheets,
+                cell_width,
+                cell_borders,
             );
             let content_clip = self.collapsed_rowspan_cell_content_clip(
                 row_index,
@@ -3058,28 +3877,22 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 planned_row_heights,
                 table_metrics,
-                cell_x,
-                cell_width,
-                content_row_top,
+                cell_border_box,
+                cell_placement,
             );
-            let cell_borders = used_border_widths(&cell_style);
             let mut cell_fragment_plan = TableCellFragmentPlan {
-                x: cell_x,
-                width: cell_width,
-                height: cell_height,
-                content_top: content_row_top,
+                border_box: cell_border_box,
+                placement: cell_placement,
                 content_offset,
+                content_x_offset,
                 content_clip,
-                row_index,
-                column: placement.column,
-                colspan: placement.colspan,
-                rowspan: placement.rowspan,
+                area: prepared.area,
                 content: TableCellContentPlan::empty(),
             };
             cell_fragment_plan.content = self.plan_table_cell_content(
                 cell,
                 row,
-                &cell_style,
+                cell_style,
                 stylesheets,
                 cell_width,
                 cell_borders,
@@ -3090,46 +3903,36 @@ impl<'a> LayoutBuilder<'a> {
                 piece_height,
                 split_piece,
             );
-            debug_assert_eq!(cell_fragment_plan.row_index, row_index);
-            debug_assert_eq!(cell_fragment_plan.column, placement.column);
-            debug_assert_eq!(cell_fragment_plan.colspan, placement.colspan);
-            debug_assert_eq!(cell_fragment_plan.rowspan, placement.rowspan);
+            debug_assert_eq!(cell_fragment_plan.area.row, row_index);
+            debug_assert_eq!(cell_fragment_plan.area.column, placement.column);
+            debug_assert_eq!(cell_fragment_plan.area.colspan, placement.colspan.max(1));
+            debug_assert_eq!(cell_fragment_plan.area.rowspan, placement.rowspan.max(1));
 
             let paint_empty_cell = table_metrics.border_collapse == css::BorderCollapse::Collapse
                 || cell_style.empty_cells == EmptyCells::Show
                 || !cell_is_empty;
 
-            if paint_empty_cell && cell_style.background_color.is_some() {
-                self.push_rect_in_band(
-                    PaintBand::InFlowBlock,
-                    RenderedRect {
-                        x: cell_fragment_plan.x,
-                        y: cell_fragment_plan.content_top - cell_fragment_plan.height,
-                        width: cell_fragment_plan.width,
-                        height: cell_fragment_plan.height,
-                        fill: cell_style.background_color,
-                        stroke: None,
-                        stroke_width: 0.0,
-                    },
+            if paint_empty_cell {
+                let (rects, rounded_rects, paths, strokes) = block_paint_ops_with_border_insets(
+                    cell_fragment_plan.x(),
+                    cell_fragment_plan.top_y() - cell_fragment_plan.height(),
+                    cell_fragment_plan.width(),
+                    cell_fragment_plan.height(),
+                    cell_style,
+                    cell_borders,
+                    table_metrics.border_collapse != css::BorderCollapse::Collapse,
                 );
-            }
-            if table_metrics.border_collapse != css::BorderCollapse::Collapse && paint_empty_cell {
-                let mut border_rects = Vec::new();
-                let mut border_paths = Vec::new();
-                paint_table_border_edges(
-                    &mut border_rects,
-                    &mut border_paths,
-                    cell_fragment_plan.x,
-                    cell_fragment_plan.content_top,
-                    cell_fragment_plan.width,
-                    cell_fragment_plan.height,
-                    &cell_style,
-                );
-                for rect in border_rects {
+                for rect in rects {
                     self.push_rect_in_band(PaintBand::InFlowBlock, rect);
                 }
-                for path in border_paths {
+                for rounded_rect in rounded_rects {
+                    self.push_rounded_rect_in_band(PaintBand::InFlowBlock, rounded_rect);
+                }
+                for path in paths {
                     self.push_path_in_band(PaintBand::InFlowBlock, path);
+                }
+                for stroke in strokes {
+                    self.push_stroke_in_band(PaintBand::InFlowBlock, stroke);
                 }
             }
 
@@ -3140,41 +3943,37 @@ impl<'a> LayoutBuilder<'a> {
                 false
             };
 
-            let inline_plan_paints_cell_children =
-                cell_fragment_plan.content.children_painted_by_inline_plan;
+            let inline_sequence_paints_cell_children = cell_fragment_plan
+                .content
+                .children_painted_by_inline_sequence;
             if !text.is_empty()
-                && (cell.children.is_none() || cell_fragment_plan.content.inline_plan.is_some())
+                && (cell.children.is_none() || cell_fragment_plan.content.inline_sequence.is_some())
             {
                 let previous_left = self.content_left;
                 let previous_right = self.content_right;
                 let previous_cursor_y = self.cursor_y;
-                self.content_left =
-                    cell_fragment_plan.x + cell_borders.left + cell_style.padding.left;
-                self.content_right = cell_fragment_plan.x + cell_fragment_plan.width
-                    - cell_borders.right
-                    - cell_style.padding.right;
-                self.cursor_y = cell_fragment_plan.content_top
-                    - cell_borders.top
-                    - cell_style.padding.top
-                    - cell_fragment_plan.content_offset;
+                let content_box = cell_fragment_plan.content_box(cell_style, cell_borders);
+                self.content_left = content_box.left();
+                self.content_right = content_box.right();
+                self.cursor_y = content_box.top_y();
                 self.push_float_context();
-                if let Some(plan) = &cell_fragment_plan.content.inline_plan {
+                if let Some(sequence) = &cell_fragment_plan.content.inline_sequence {
                     if split_piece {
-                        self.paint_inline_fragmentation_plan_slice(
-                            plan,
-                            &cell_style,
+                        self.paint_inline_line_sequence_slice(
+                            sequence,
+                            cell_style,
                             self.cursor_y,
                             row_top,
                             row_top - piece_height,
                         );
                     } else {
-                        self.paint_inline_fragmentation_plan(plan, &cell_style);
+                        self.paint_inline_line_sequence(sequence, cell_style);
                     }
                 } else if split_piece {
                     if let Some(element) = cell.element {
                         self.paint_element_inline_block_slice(
                             element,
-                            &cell_style,
+                            cell_style,
                             stylesheets,
                             0.0,
                             0.0,
@@ -3186,7 +3985,7 @@ impl<'a> LayoutBuilder<'a> {
                     } else {
                         self.paint_text_block_slice(
                             &text,
-                            &cell_style,
+                            cell_style,
                             0.0,
                             0.0,
                             table_cell_href(cell),
@@ -3198,65 +3997,63 @@ impl<'a> LayoutBuilder<'a> {
                 } else if let Some(element) = cell.element {
                     self.layout_inline_items_block(
                         element,
-                        &cell_style,
+                        cell_style,
                         stylesheets,
                         (0.0, 0.0),
                         table_cell_href(cell),
                         None,
                     );
                 } else {
-                    self.layout_text_block(&text, &cell_style, 0.0, 0.0, table_cell_href(cell));
+                    self.layout_text_block(&text, cell_style, 0.0, 0.0, table_cell_href(cell));
                 }
                 self.pop_float_context();
                 self.content_left = previous_left;
                 self.content_right = previous_right;
                 self.cursor_y = previous_cursor_y;
             }
-            if !inline_plan_paints_cell_children {
+            if !inline_sequence_paints_cell_children {
                 if split_piece {
                     self.paint_table_cell_planned_child_fragments(
                         cell,
                         row,
-                        &cell_style,
+                        cell_style,
                         stylesheets,
-                        cell_fragment_plan.x,
-                        cell_fragment_plan.content_top,
-                        cell_fragment_plan.width,
+                        cell_fragment_plan.border_box,
+                        cell_fragment_plan.placement,
                         cell_fragment_plan.content_offset,
+                        cell_fragment_plan.content_x_offset,
                         &cell_fragment_plan.content.child_fragments,
                     );
                 } else {
                     self.layout_table_cell_flow_children(
                         cell,
                         row,
-                        &cell_style,
+                        cell_style,
                         stylesheets,
-                        cell_fragment_plan.x,
-                        cell_fragment_plan.content_top,
-                        cell_fragment_plan.width,
-                        cell_fragment_plan.height,
+                        cell_fragment_plan.border_box,
+                        cell_fragment_plan.placement,
                         cell_fragment_plan.content_offset,
+                        cell_fragment_plan.content_x_offset,
                     );
                 }
             }
             if !split_piece {
                 self.layout_table_cell_replaced_children(
                     cell,
-                    &cell_style,
-                    cell_fragment_plan.x,
-                    cell_fragment_plan.content_top,
+                    cell_style,
+                    cell_fragment_plan.border_box,
+                    cell_fragment_plan.placement,
                     cell_fragment_plan.content_offset,
+                    cell_fragment_plan.content_x_offset,
                 );
             }
             self.layout_table_cell_positioned_children(
                 cell,
                 row,
-                &cell_style,
+                cell_style,
                 stylesheets,
-                cell_fragment_plan.x,
-                cell_fragment_plan.content_top,
-                cell_fragment_plan.width,
-                cell_fragment_plan.height,
+                cell_fragment_plan.border_box,
+                cell_fragment_plan.placement,
             );
             self.pop_overflow_clip(clip_active);
         }
@@ -3266,9 +4063,9 @@ impl<'a> LayoutBuilder<'a> {
             paint_table_border_edges(
                 &mut border_rects,
                 &mut border_paths,
-                table_x,
+                occupied_x,
                 content_row_top,
-                used_table_width,
+                occupied_width,
                 row_height,
                 row_style,
             );
@@ -3307,7 +4104,7 @@ impl<'a> LayoutBuilder<'a> {
             .max(1.0);
 
         if let Some(children) = cell.children.as_deref()
-            && table_cell_children_can_use_inline_fragmentation_plan(children)
+            && table_cell_children_can_use_inline_line_sequence(children)
         {
             let mut items = Vec::new();
             let link_target = table_cell_href(cell).map(str::to_string);
@@ -3326,6 +4123,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 link_target.clone(),
                 0.0,
+                cell_style,
                 cell_style.text_decoration,
                 &mut items,
             );
@@ -3340,14 +4138,14 @@ impl<'a> LayoutBuilder<'a> {
                 );
             }
             if !items.is_empty() {
-                plan.inline_plan = Some(self.collect_inline_fragmentation_plan(
+                plan.inline_sequence = Some(self.collect_inline_line_sequence(
                     items,
                     cell_style,
                     available_width,
                     0.0,
                     0.0,
                 ));
-                plan.children_painted_by_inline_plan = true;
+                plan.children_painted_by_inline_sequence = true;
                 return plan;
             }
         }
@@ -3381,7 +4179,7 @@ impl<'a> LayoutBuilder<'a> {
                     &mut items,
                 );
                 if !items.is_empty() {
-                    plan.inline_plan = Some(self.collect_inline_fragmentation_plan(
+                    plan.inline_sequence = Some(self.collect_inline_line_sequence(
                         items,
                         cell_style,
                         available_width,
@@ -3390,7 +4188,7 @@ impl<'a> LayoutBuilder<'a> {
                     ));
                 }
             } else if !text.is_empty() {
-                plan.inline_plan = Some(self.inline_fragmentation_plan_for_text(
+                plan.inline_sequence = Some(self.inline_line_sequence_for_text(
                     text,
                     cell_style,
                     available_width,
@@ -3403,8 +4201,10 @@ impl<'a> LayoutBuilder<'a> {
         if split_piece && let Some(children) = cell.children.as_deref() {
             let child_top =
                 content_row_top - cell_borders.top - cell_style.padding.top - content_offset;
-            plan.child_fragments = table_cell_child_fragment_plans(
+            plan.child_fragments = self.table_cell_child_fragment_plans(
                 children,
+                stylesheets,
+                available_width,
                 child_top,
                 row_top,
                 row_top - piece_height,
@@ -3413,18 +4213,144 @@ impl<'a> LayoutBuilder<'a> {
                 if child_plan.kind == TableCellChildFragmentKind::NestedFormattingContext
                     && let Some(child_box) = children.get(child_plan.source_child_index)
                 {
-                    child_plan.nested_fragment = self.plan_table_cell_nested_child_fragment(
-                        cell,
-                        row,
-                        child_box,
-                        stylesheets,
-                        available_width,
-                    );
+                    child_plan.nested_fragment = self
+                        .plan_table_cell_nested_child_fragment(
+                            cell,
+                            row,
+                            child_box,
+                            stylesheets,
+                            available_width,
+                        )
+                        .map(|mut nested_fragment| {
+                            nested_fragment.metadata = child_plan.metadata.clone();
+                            nested_fragment
+                        });
                 }
             }
         }
 
         plan
+    }
+
+    fn table_cell_nested_inline_sequence_for_child(
+        &mut self,
+        child_box: &box_tree::FormattingBox<'_>,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+    ) -> Option<TableCellNestedInlineSequencePlan> {
+        let style = match child_box {
+            box_tree::FormattingBox::Text(box_) => &box_.style,
+            box_tree::FormattingBox::Line(box_) => box_.children.first().map(|text| &text.style)?,
+            box_tree::FormattingBox::Inline(box_) => &box_.style,
+            box_tree::FormattingBox::AnonymousBlock(box_) => &box_.style,
+            box_tree::FormattingBox::Block(_)
+            | box_tree::FormattingBox::AtomicInline(_)
+            | box_tree::FormattingBox::Table(_)
+            | box_tree::FormattingBox::Flex(_)
+            | box_tree::FormattingBox::Replaced(_) => return None,
+        };
+        self.table_cell_nested_inline_sequence_for_children(
+            style,
+            std::slice::from_ref(child_box),
+            stylesheets,
+            None,
+            available_width,
+        )
+    }
+
+    fn table_cell_nested_inline_sequence_for_children(
+        &mut self,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        inherited_link: Option<String>,
+        available_width: f32,
+    ) -> Option<TableCellNestedInlineSequencePlan> {
+        let mut items = Vec::new();
+        self.collect_inline_box_items(
+            children,
+            stylesheets,
+            inherited_link,
+            0.0,
+            style,
+            style.text_decoration,
+            &mut items,
+        );
+        (!items.is_empty()).then(|| TableCellNestedInlineSequencePlan {
+            sequence: self.collect_inline_line_sequence(
+                items,
+                style,
+                available_width.max(1.0),
+                0.0,
+                0.0,
+            ),
+            style: style.clone(),
+        })
+    }
+
+    fn table_cell_child_fragment_plans(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        mut child_top: f32,
+        slice_top: f32,
+        slice_bottom: f32,
+    ) -> Vec<TableCellChildFragmentPlan> {
+        let mut plans = Vec::new();
+        for (source_child_index, child_box) in children.iter().enumerate() {
+            let inline_sequence = self.table_cell_nested_inline_sequence_for_child(
+                child_box,
+                stylesheets,
+                available_width,
+            );
+            if inline_sequence.is_none() && !table_cell_has_in_flow_layout_child(child_box) {
+                continue;
+            }
+            let child_height = inline_sequence
+                .as_ref()
+                .map(|plan| plan.sequence.total_height())
+                .unwrap_or_else(|| table_cell_formatting_child_slice_height(child_box));
+            if child_height <= 0.0 {
+                continue;
+            }
+            let child_bottom = child_top - child_height;
+            if child_top >= slice_bottom
+                && child_bottom <= slice_top
+                && let Some(kind) = table_cell_child_fragment_kind(child_box)
+            {
+                let visible_top = child_top.min(slice_top);
+                let visible_bottom = child_bottom.max(slice_bottom);
+                let mut metadata = FragmentPageMetadata::new(
+                    self.pages.len(),
+                    Some(
+                        PageTopRect::new(
+                            0.0,
+                            visible_top,
+                            available_width,
+                            visible_top - visible_bottom,
+                        )
+                        .paint_clip(),
+                    ),
+                    (child_top - slice_top).abs() <= 0.01,
+                );
+                metadata.continues_from_previous_page = child_top > slice_top + 0.01;
+                metadata.continues_to_next_page = child_bottom < slice_bottom - 0.01;
+                plans.push(TableCellChildFragmentPlan {
+                    source_child_index,
+                    child_top,
+                    child_height,
+                    slice_top,
+                    slice_bottom,
+                    kind,
+                    inline_sequence,
+                    nested_fragment: None,
+                    metadata,
+                });
+            }
+            child_top = child_bottom;
+        }
+        plans
     }
 
     /// Pre-render a nested table/flex formatting context for split table-cell
@@ -3465,15 +4391,10 @@ impl<'a> LayoutBuilder<'a> {
         self.layout_formatting_box(child_box, stylesheets);
         self.flush_positioned_layers_since(positioned_layer_start);
 
-        let operations = self.current_page.paint_operations().into_owned();
-        let fragment = PaintFragment::from_primitives(
-            self.current_page
-                .paint_primitives_for_operations(&operations)
-                .into_iter()
-                .collect(),
-            self.current_page.links.clone(),
-        )
-        .translated(0.0, -top);
+        let fragment = self
+            .current_page
+            .paint_fragment()
+            .translated(PaintVector::new(0.0, -top));
         let height = (top - self.cursor_y).max(0.0);
         self.restore(snapshot);
 
@@ -3481,6 +4402,7 @@ impl<'a> LayoutBuilder<'a> {
             fragment,
             width,
             height,
+            metadata: FragmentPageMetadata::empty(self.pages.len()),
         })
     }
 
@@ -3491,10 +4413,10 @@ impl<'a> LayoutBuilder<'a> {
         row: &TableRow<'_>,
         cell_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        cell_x: f32,
-        row_top: f32,
-        cell_width: f32,
+        border_box: TableCellBorderBox,
+        placement: TableGridPlacement,
         content_offset: f32,
+        content_x_offset: f32,
         child_fragments: &[TableCellChildFragmentPlan],
     ) {
         let Some(children) = cell.children.as_deref() else {
@@ -3509,9 +4431,16 @@ impl<'a> LayoutBuilder<'a> {
         let previous_cursor_y = self.cursor_y;
         let previous_ancestors = self.ancestors.clone();
         let borders = used_border_widths(cell_style);
-        self.content_left = cell_x + borders.left + cell_style.padding.left;
-        self.content_right = cell_x + cell_width - borders.right - cell_style.padding.right;
-        self.cursor_y = row_top - borders.top - cell_style.padding.top - content_offset;
+        let content_box = border_box.content_box(
+            placement,
+            cell_style.padding,
+            borders,
+            content_offset,
+            content_x_offset,
+        );
+        self.content_left = content_box.left();
+        self.content_right = content_box.right();
+        self.cursor_y = content_box.top_y();
         self.ancestors = self.table_cell_child_ancestors(cell, row);
 
         for child_plan in child_fragments {
@@ -3536,6 +4465,15 @@ impl<'a> LayoutBuilder<'a> {
         let child_height = child_plan.child_height;
         let slice_top = child_plan.slice_top;
         let slice_bottom = child_plan.slice_bottom;
+        if let Some(inline_sequence) = &child_plan.inline_sequence {
+            self.paint_table_cell_nested_inline_sequence_slice(
+                inline_sequence,
+                child_top,
+                slice_top,
+                slice_bottom,
+            );
+            return;
+        }
         match child_plan.kind {
             TableCellChildFragmentKind::Block => {
                 let box_tree::FormattingBox::Block(box_) = child_box else {
@@ -3545,6 +4483,7 @@ impl<'a> LayoutBuilder<'a> {
                     box_.element,
                     &box_.style,
                     &box_.children,
+                    stylesheets,
                     child_top,
                     child_height,
                     slice_top,
@@ -3611,6 +4550,7 @@ impl<'a> LayoutBuilder<'a> {
                         box_.element,
                         &box_.style,
                         &box_.children,
+                        stylesheets,
                         child_top,
                         child_height,
                         slice_top,
@@ -3635,6 +4575,22 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
+    fn paint_table_cell_nested_inline_sequence_slice(
+        &mut self,
+        inline_sequence: &TableCellNestedInlineSequencePlan,
+        child_top: f32,
+        slice_top: f32,
+        slice_bottom: f32,
+    ) {
+        self.paint_inline_line_sequence_slice(
+            &inline_sequence.sequence,
+            &inline_sequence.style,
+            child_top,
+            slice_top,
+            slice_bottom,
+        );
+    }
+
     fn paint_table_cell_nested_child_fragment(&mut self, child_plan: &TableCellChildFragmentPlan) {
         let Some(nested) = &child_plan.nested_fragment else {
             return;
@@ -3645,19 +4601,16 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         let x = self.content_left;
-        let translated = nested.fragment.clone().translated(x, child_plan.child_top);
-        let bounds = PaintClip {
-            x,
-            y: child_plan.child_top - nested.height,
-            width: nested.width,
-            height: nested.height,
-        };
-        let slice_clip = PaintClip {
-            x,
-            y: child_plan.slice_bottom,
-            width: nested.width,
-            height: slice_height,
-        };
+        let translated = nested
+            .fragment
+            .clone()
+            .translated(PaintVector::new(x, child_plan.child_top));
+        let bounds =
+            PageTopRect::new(x, child_plan.child_top, nested.width, nested.height).paint_clip();
+        let slice_clip = PaintClip::from_paint_rect(PaintRect::new(
+            PaintPoint::new(x, child_plan.slice_bottom),
+            PaintSize::new(nested.width, slice_height),
+        ));
         let context = PaintStackingContext::from_banded_fragment(translated, Vec::new())
             .with_source_order(self.next_paint_source_order())
             .with_effects(PaintEffects {
@@ -3668,7 +4621,8 @@ impl<'a> LayoutBuilder<'a> {
             .with_bounds(bounds);
         let fragment =
             PaintFragment::from_stacking_context_in_band(PaintBand::InFlowBlock, context);
-        self.current_page.append_paint_fragment(&fragment, 0.0, 0.0);
+        self.current_page
+            .append_paint_fragment(&fragment, PaintVector::new(0.0, 0.0));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3677,6 +4631,7 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
         child_top: f32,
         child_height: f32,
         slice_top: f32,
@@ -3689,46 +4644,47 @@ impl<'a> LayoutBuilder<'a> {
         let outer_width = (self.content_right - self.content_left).max(0.0);
         let border_box_top = child_top - style.margin.top;
         let border_box_height = (child_height - style.margin.top - style.margin.bottom).max(0.0);
-        let border_box_bottom = border_box_top - border_box_height;
-        let bounds = PaintClip {
-            x: self.content_left + style.margin.left,
-            y: border_box_bottom,
-            width: (outer_width - style.margin.left - style.margin.right).max(0.0),
-            height: border_box_height,
-        };
+        let bounds = PageTopRect::new(
+            self.content_left + style.margin.left,
+            border_box_top,
+            outer_width - style.margin.left - style.margin.right,
+            border_box_height,
+        )
+        .paint_clip();
         if border_box_height > 0.0 && style.visibility == Visibility::Visible {
             for primitive in self.box_background_primitives(
-                bounds.x,
-                bounds.y,
-                bounds.width,
-                bounds.height,
+                bounds.x(),
+                bounds.y(),
+                bounds.width(),
+                bounds.height(),
                 style,
             ) {
                 self.push_primitive_in_band(PaintBand::BackgroundBorder, primitive);
             }
         }
-        let text = table_cell_formatting_box_text(children);
-        if !text.is_empty() {
-            let previous_left = self.content_left;
-            let previous_right = self.content_right;
-            self.content_left +=
-                style.margin.left + used_border_widths(style).left + style.padding.left;
-            self.content_right -=
-                style.margin.right + used_border_widths(style).right + style.padding.right;
-            let text_top = border_box_top - used_border_widths(style).top - style.padding.top;
-            self.paint_text_block_slice(
-                &text,
-                style,
-                0.0,
-                0.0,
-                element.attrs.get("href").map(String::as_str),
+        let previous_left = self.content_left;
+        let previous_right = self.content_right;
+        let borders = used_border_widths(style);
+        self.content_left += style.margin.left + borders.left + style.padding.left;
+        self.content_right -= style.margin.right + borders.right + style.padding.right;
+        let content_width = (self.content_right - self.content_left).max(1.0);
+        if let Some(sequence) = self.table_cell_nested_inline_sequence_for_children(
+            style,
+            children,
+            stylesheets,
+            element.attrs.get("href").cloned(),
+            content_width,
+        ) {
+            let text_top = border_box_top - borders.top - style.padding.top;
+            self.paint_table_cell_nested_inline_sequence_slice(
+                &sequence,
                 text_top,
                 slice_top,
                 slice_bottom,
             );
-            self.content_left = previous_left;
-            self.content_right = previous_right;
         }
+        self.content_left = previous_left;
+        self.content_right = previous_right;
         self.scope_current_page_atomic_paint_since(
             &paint_checkpoint,
             PaintBand::InFlowBlock,
@@ -3754,16 +4710,20 @@ impl<'a> LayoutBuilder<'a> {
         let outer_width = (self.content_right - self.content_left).max(0.0);
         let border_box_top = child_top - style.margin.top;
         let border_box_height = (child_height - style.margin.top - style.margin.bottom).max(0.0);
-        let border_box_bottom = border_box_top - border_box_height;
-        let bounds = PaintClip {
-            x: self.content_left + style.margin.left,
-            y: border_box_bottom,
-            width: (outer_width - style.margin.left - style.margin.right).max(0.0),
-            height: border_box_height,
-        };
-        for primitive in
-            self.box_background_primitives(bounds.x, bounds.y, bounds.width, bounds.height, style)
-        {
+        let bounds = PageTopRect::new(
+            self.content_left + style.margin.left,
+            border_box_top,
+            outer_width - style.margin.left - style.margin.right,
+            border_box_height,
+        )
+        .paint_clip();
+        for primitive in self.box_background_primitives(
+            bounds.x(),
+            bounds.y(),
+            bounds.width(),
+            bounds.height(),
+            style,
+        ) {
             self.push_primitive_in_band(PaintBand::BackgroundBorder, primitive);
         }
 
@@ -3773,15 +4733,7 @@ impl<'a> LayoutBuilder<'a> {
             let y_top = border_box_top - borders.top - style.padding.top;
             self.push_rect_in_band(
                 PaintBand::Inline,
-                RenderedRect {
-                    x,
-                    y: y_top - height,
-                    width,
-                    height,
-                    fill: Some(fill),
-                    stroke: None,
-                    stroke_width: 0.0,
-                },
+                PageTopRect::new(x, y_top, width, height).rendered_rect(Some(fill)),
             );
         }
         self.scope_current_page_atomic_paint_since(
@@ -3802,28 +4754,35 @@ impl<'a> LayoutBuilder<'a> {
         slice_bottom: f32,
         stylesheets: &[Stylesheet],
     ) {
-        let text = table_cell_formatting_box_text(children);
-        if !text.is_empty() {
-            self.paint_text_block_slice(
-                &text,
-                style,
-                0.0,
-                0.0,
-                None,
+        let available_width = (self.content_right - self.content_left).max(1.0);
+        if let Some(sequence) = self.table_cell_nested_inline_sequence_for_children(
+            style,
+            children,
+            stylesheets,
+            None,
+            available_width,
+        ) {
+            self.paint_table_cell_nested_inline_sequence_slice(
+                &sequence,
                 child_top,
                 slice_top,
                 slice_bottom,
             );
         }
-        for child_plan in
-            table_cell_child_fragment_plans(children, child_top, slice_top, slice_bottom)
-        {
+        for child_plan in self.table_cell_child_fragment_plans(
+            children,
+            stylesheets,
+            available_width,
+            child_top,
+            slice_top,
+            slice_bottom,
+        ) {
             let child = &children[child_plan.source_child_index];
             if matches!(
                 child,
-                box_tree::FormattingBox::AtomicInline(_)
-                    | box_tree::FormattingBox::Replaced(_)
-                    | box_tree::FormattingBox::Inline(_)
+                box_tree::FormattingBox::Replaced(_)
+                    | box_tree::FormattingBox::Table(_)
+                    | box_tree::FormattingBox::Flex(_)
             ) {
                 self.paint_table_cell_planned_child_slice(child, stylesheets, &child_plan);
             }
@@ -3831,7 +4790,7 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn table_body_fragment_structural_background_primitives(
+    fn table_body_fragment_structural_primitives(
         &mut self,
         rows: &[TableRow<'_>],
         columns: &[TableColumn<'_>],
@@ -3843,13 +4802,14 @@ impl<'a> LayoutBuilder<'a> {
         table_metrics: TableMetrics,
         column_plan: &TableColumnPlan,
         fragment: &TableBodyPaintFragment,
-    ) -> Vec<PaintPrimitive> {
+    ) -> (Vec<PaintPrimitive>, Vec<PaintPrimitive>) {
         let top = fragment.plan.fragment_top;
         let bottom = fragment.bottom();
         let height = (top - bottom).max(0.0);
-        let mut primitives = Vec::new();
+        let mut backgrounds = Vec::new();
+        let mut outlines = Vec::new();
         if height <= 0.0 {
-            return primitives;
+            return (backgrounds, outlines);
         }
 
         if let Some(fill) = table_style.background_color {
@@ -3862,19 +4822,19 @@ impl<'a> LayoutBuilder<'a> {
                 - vertical_edge_spacing
                 - table_width.padding.bottom
                 - table_width.border_widths.bottom;
-            primitives.push(PaintPrimitive::Rect(RenderedRect {
-                x: table_x - table_width.padding.left - table_width.border_widths.left,
-                y: background_bottom,
-                width: used_table_width
-                    + table_width.padding.left
-                    + table_width.padding.right
-                    + table_width.border_widths.left
-                    + table_width.border_widths.right,
-                height: (background_top - background_bottom).max(0.0),
-                fill: Some(fill),
-                stroke: None,
-                stroke_width: 0.0,
-            }));
+            backgrounds.push(PaintPrimitive::Rect(
+                PageTopRect::new(
+                    table_x - table_width.padding.left - table_width.border_widths.left,
+                    background_top,
+                    used_table_width
+                        + table_width.padding.left
+                        + table_width.padding.right
+                        + table_width.border_widths.left
+                        + table_width.border_widths.right,
+                    background_top - background_bottom,
+                )
+                .rendered_rect(Some(fill)),
+            ));
         }
         for (start_column, end_column, column_group) in
             table_column_group_spans(columns, column_plan.column_count())
@@ -3890,7 +4850,7 @@ impl<'a> LayoutBuilder<'a> {
                 end_column,
                 column_group_style.background_color,
             ) {
-                primitives.push(PaintPrimitive::Rect(rect));
+                backgrounds.push(PaintPrimitive::Rect(rect));
             }
         }
         let mut column_index = 0;
@@ -3912,7 +4872,7 @@ impl<'a> LayoutBuilder<'a> {
                 column_index + span,
                 column_style.background_color,
             ) {
-                primitives.push(PaintPrimitive::Rect(rect));
+                backgrounds.push(PaintPrimitive::Rect(rect));
             }
             column_index += span;
         }
@@ -3920,28 +4880,44 @@ impl<'a> LayoutBuilder<'a> {
         let fragment_rows = fragment.rows();
         let fragment_row_tops = fragment.row_tops();
         let fragment_row_heights = fragment.row_heights();
+        let occupied_inline_bounds = column_plan
+            .occupied_inline_bounds()
+            .unwrap_or_else(|| TableInlineBounds::new(0.0, used_table_width));
+        let occupied_x = table_x + occupied_inline_bounds.start;
+        let occupied_width = occupied_inline_bounds.size;
 
         for (start_row, end_row, row_group) in table_row_group_spans(rows) {
             let row_group_style =
                 self.style_for_table_row_group(&row_group, table_style, stylesheets);
-            let Some(fill) = row_group_style.background_color else {
-                continue;
-            };
-            let mut segment_start = None;
-            let mut previous_local = None;
-            for (local_row, original_row) in fragment_rows.iter().copied().enumerate() {
-                if original_row >= start_row && original_row < end_row {
-                    if segment_start.is_none() {
-                        segment_start = Some(local_row);
+            if let Some(fill) = row_group_style.background_color {
+                let mut segment_start = None;
+                let mut previous_local = None;
+                for (local_row, original_row) in fragment_rows.iter().copied().enumerate() {
+                    if original_row >= start_row && original_row < end_row {
+                        if segment_start.is_none() {
+                            segment_start = Some(local_row);
+                        }
+                        previous_local = Some(local_row + 1);
+                    } else if let (Some(start), Some(end)) =
+                        (segment_start.take(), previous_local.take())
+                    {
+                        push_table_fragment_row_span_background(
+                            &mut backgrounds,
+                            occupied_x,
+                            occupied_width,
+                            &fragment_row_tops,
+                            &fragment_row_heights,
+                            start,
+                            end,
+                            fill,
+                        );
                     }
-                    previous_local = Some(local_row + 1);
-                } else if let (Some(start), Some(end)) =
-                    (segment_start.take(), previous_local.take())
-                {
+                }
+                if let (Some(start), Some(end)) = (segment_start, previous_local) {
                     push_table_fragment_row_span_background(
-                        &mut primitives,
-                        table_x,
-                        used_table_width,
+                        &mut backgrounds,
+                        occupied_x,
+                        occupied_width,
                         &fragment_row_tops,
                         &fragment_row_heights,
                         start,
@@ -3950,16 +4926,17 @@ impl<'a> LayoutBuilder<'a> {
                     );
                 }
             }
-            if let (Some(start), Some(end)) = (segment_start, previous_local) {
-                push_table_fragment_row_span_background(
-                    &mut primitives,
-                    table_x,
-                    used_table_width,
+            if row_group_style.visibility == Visibility::Visible {
+                self.push_table_fragment_row_group_outline_segments(
+                    &mut outlines,
+                    occupied_x,
+                    occupied_width,
                     &fragment_row_tops,
                     &fragment_row_heights,
-                    start,
-                    end,
-                    fill,
+                    &fragment_rows,
+                    start_row,
+                    end_row,
+                    &row_group_style,
                 );
             }
         }
@@ -3968,9 +4945,9 @@ impl<'a> LayoutBuilder<'a> {
             let row_style = self.style_for_table_row(&rows[original_row], table_style, stylesheets);
             if let Some(fill) = row_style.background_color {
                 push_table_fragment_row_span_background(
-                    &mut primitives,
-                    table_x,
-                    used_table_width,
+                    &mut backgrounds,
+                    occupied_x,
+                    occupied_width,
                     &fragment_row_tops,
                     &fragment_row_heights,
                     local_row,
@@ -3979,7 +4956,86 @@ impl<'a> LayoutBuilder<'a> {
                 );
             }
         }
-        primitives
+        (backgrounds, outlines)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_table_fragment_row_group_outline_segments(
+        &self,
+        primitives: &mut Vec<PaintPrimitive>,
+        table_x: f32,
+        used_table_width: f32,
+        row_tops: &[f32],
+        row_heights: &[f32],
+        rows: &[usize],
+        start_row: usize,
+        end_row: usize,
+        row_group_style: &ComputedStyle,
+    ) {
+        let mut segment_start = None;
+        let mut previous_local = None;
+        for (local_row, original_row) in rows.iter().copied().enumerate() {
+            if original_row >= start_row && original_row < end_row {
+                if segment_start.is_none() {
+                    segment_start = Some(local_row);
+                }
+                previous_local = Some(local_row + 1);
+            } else if let (Some(start), Some(end)) = (segment_start.take(), previous_local.take()) {
+                self.push_table_fragment_row_span_outline(
+                    primitives,
+                    table_x,
+                    used_table_width,
+                    row_tops,
+                    row_heights,
+                    start,
+                    end,
+                    row_group_style,
+                );
+            }
+        }
+        if let (Some(start), Some(end)) = (segment_start, previous_local) {
+            self.push_table_fragment_row_span_outline(
+                primitives,
+                table_x,
+                used_table_width,
+                row_tops,
+                row_heights,
+                start,
+                end,
+                row_group_style,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_table_fragment_row_span_outline(
+        &self,
+        primitives: &mut Vec<PaintPrimitive>,
+        table_x: f32,
+        used_table_width: f32,
+        row_tops: &[f32],
+        row_heights: &[f32],
+        start: usize,
+        end: usize,
+        row_group_style: &ComputedStyle,
+    ) {
+        let Some(bounds) = table_fragment_row_span_bounds(
+            table_x,
+            used_table_width,
+            row_tops,
+            row_heights,
+            start,
+            end,
+        ) else {
+            return;
+        };
+        primitives.extend(self.box_outline_primitives(
+            bounds.x(),
+            bounds.y(),
+            bounds.width(),
+            bounds.height(),
+            row_group_style,
+        ));
     }
 
     /// Build collapsed borders for one generated table row fragment.
@@ -4003,8 +5059,9 @@ impl<'a> LayoutBuilder<'a> {
         let row_heights = fragment.row_heights();
         let row_offsets = fragment.row_offsets();
         let original_row_heights = fragment.original_row_heights();
+        let placement = TableGridPlacement::new(PageTopPoint::new(table_x, 0.0));
         let (rects, paths) = geometry.grid.paint_fragment_rows(
-            table_x,
+            placement,
             column_plan,
             &rows,
             &row_tops,
@@ -4019,15 +5076,14 @@ impl<'a> LayoutBuilder<'a> {
             .collect()
     }
 
-    pub(super) fn measure_table_row_height(
+    fn measure_table_row_height(
         &mut self,
-        row: &TableRow<'_>,
-        placements: &[TableCellPlacement],
+        context: &TableGridLayoutContext<'_, '_>,
+        row_index: usize,
         row_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
-        table_cellpadding: Option<f32>,
-        column_plan: &TableColumnPlan,
     ) -> f32 {
+        let row = &context.rows[row_index];
+        let placements = &context.grid.rows[row_index];
         let mut row_height: f32 =
             used_length_percentage_or_auto_with_optional_basis(row_style.box_values.height, None)
                 .unwrap_or(0.0);
@@ -4036,23 +5092,30 @@ impl<'a> LayoutBuilder<'a> {
         let mut has_baseline_cells = false;
         for placement in placements {
             let cell = &row.cells[placement.cell];
-            let mut cell_style = self.style_for_table_cell(cell, row, row_style, stylesheets);
-            let cell_width = column_plan.width_for_span(placement.column, placement.colspan);
-            if cell_width <= 0.0 {
+            let Some(prepared) = self.prepare_table_cell(
+                cell,
+                row,
+                row_style,
+                placement,
+                row_index,
+                0.0,
+                context.stylesheets,
+                context.table_cellpadding,
+                context.column_plan,
+                context.table_metrics,
+                context.collapsed_geometry,
+            ) else {
                 continue;
-            }
-            apply_table_cell_used_padding(&mut cell_style, table_cellpadding, cell_width);
-            let metrics =
-                self.table_cell_layout_metrics(cell, &cell_style, stylesheets, cell_width);
+            };
             if placement.rowspan == 1 {
-                row_height = row_height.max(metrics.border_box_height);
+                row_height = row_height.max(prepared.metrics.border_box_height);
             }
-            if placement.rowspan == 1 && table_cell_participates_in_baseline(&cell_style) {
+            if table_cell_participates_in_row_baseline(&prepared.style, row_style, placement) {
                 has_baseline_cells = true;
-                let baseline = metrics.baseline_offset;
+                let baseline = prepared.metrics.baseline_offset;
                 max_baseline = max_baseline.max(baseline);
-                max_after_baseline =
-                    max_after_baseline.max((metrics.border_box_height - baseline).max(0.0));
+                max_after_baseline = max_after_baseline
+                    .max((prepared.metrics.border_box_height - baseline).max(0.0));
             }
         }
         if has_baseline_cells {
@@ -4061,30 +5124,12 @@ impl<'a> LayoutBuilder<'a> {
         row_height
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn measure_table_row_heights(
-        &mut self,
-        rows: &[TableRow<'_>],
-        grid: &TableGrid,
-        table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
-        table_cellpadding: Option<f32>,
-        column_plan: &TableColumnPlan,
-        table_metrics: TableMetrics,
-    ) -> Vec<f32> {
-        self.table_height_plan(
-            rows,
-            grid,
-            table_style,
-            stylesheets,
-            table_cellpadding,
-            column_plan,
-            table_metrics,
-        )
-        .rows
-        .into_iter()
-        .map(|row| row.final_height)
-        .collect()
+    fn measure_table_row_heights(&mut self, context: &TableGridLayoutContext<'_, '_>) -> Vec<f32> {
+        self.table_height_plan(context)
+            .rows
+            .into_iter()
+            .map(|row| row.final_height)
+            .collect()
     }
 
     /// Build the CSS Tables 3 height distribution plan for a table grid.
@@ -4097,26 +5142,16 @@ impl<'a> LayoutBuilder<'a> {
     /// Spec: <https://drafts.csswg.org/css-tables-3/#row-layout>,
     /// <https://drafts.csswg.org/css-tables-3/#height-distribution-algorithm>,
     /// and <https://drafts.csswg.org/css-tables-3/#table-cell-content-layout-second-pass>.
-    #[allow(clippy::too_many_arguments)]
-    fn table_height_plan(
-        &mut self,
-        rows: &[TableRow<'_>],
-        grid: &TableGrid,
-        table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
-        table_cellpadding: Option<f32>,
-        column_plan: &TableColumnPlan,
-        table_metrics: TableMetrics,
-    ) -> TableHeightPlan {
+    fn table_height_plan(&mut self, context: &TableGridLayoutContext<'_, '_>) -> TableHeightPlan {
         // CSS Tables 3 row layout first computes minimum row sizes, applies
         // spanning-cell minimum constraints, then distributes any definite
         // table height against reference sizes:
         // <https://drafts.csswg.org/css-tables-3/#row-layout> and
         // <https://drafts.csswg.org/css-tables-3/#height-distribution-algorithm>.
-        let mut plan_rows = Vec::with_capacity(rows.len());
+        let mut plan_rows = Vec::with_capacity(context.rows.len());
         let mut spanning_cells = Vec::new();
-        for (row_index, row) in rows.iter().enumerate() {
-            let row_style = self.style_for_table_row(row, table_style, stylesheets);
+        for (row_index, row) in context.rows.iter().enumerate() {
+            let row_style = self.style_for_table_row(row, context.table_style, context.stylesheets);
             if table_row_is_collapsed(&row_style) {
                 plan_rows.push(TableRowHeightPlan {
                     base: 0.0,
@@ -4129,12 +5164,12 @@ impl<'a> LayoutBuilder<'a> {
             }
             if self.table_row_is_hidden_empty(
                 row,
-                &grid.rows[row_index],
+                &context.grid.rows[row_index],
                 &row_style,
-                stylesheets,
-                table_cellpadding,
-                column_plan,
-                table_metrics,
+                context.stylesheets,
+                context.table_cellpadding,
+                context.column_plan,
+                context.table_metrics,
             ) {
                 plan_rows.push(TableRowHeightPlan {
                     base: 0.0,
@@ -4145,14 +5180,7 @@ impl<'a> LayoutBuilder<'a> {
                 });
                 continue;
             }
-            let base = self.measure_table_row_height(
-                row,
-                &grid.rows[row_index],
-                &row_style,
-                stylesheets,
-                table_cellpadding,
-                column_plan,
-            );
+            let base = self.measure_table_row_height(context, row_index, &row_style);
             plan_rows.push(TableRowHeightPlan {
                 base,
                 reference: base,
@@ -4160,20 +5188,29 @@ impl<'a> LayoutBuilder<'a> {
                 auto: row_style.box_values.height.is_auto(),
                 collapsed: false,
             });
-            for placement in &grid.rows[row_index] {
+            for placement in &context.grid.rows[row_index] {
                 if placement.rowspan > 1 {
                     let cell = &row.cells[placement.cell];
-                    let mut cell_style =
-                        self.style_for_table_cell(cell, row, &row_style, stylesheets);
-                    let cell_width =
-                        column_plan.width_for_span(placement.column, placement.colspan);
-                    if cell_width <= 0.0 {
+                    let Some(prepared) = self.prepare_table_cell(
+                        cell,
+                        row,
+                        &row_style,
+                        placement,
+                        row_index,
+                        0.0,
+                        context.stylesheets,
+                        context.table_cellpadding,
+                        context.column_plan,
+                        context.table_metrics,
+                        context.collapsed_geometry,
+                    ) else {
                         continue;
-                    }
-                    apply_table_cell_used_padding(&mut cell_style, table_cellpadding, cell_width);
-                    let metrics =
-                        self.table_cell_layout_metrics(cell, &cell_style, stylesheets, cell_width);
-                    spanning_cells.push((row_index, placement.rowspan, metrics.border_box_height));
+                    };
+                    spanning_cells.push((
+                        row_index,
+                        placement.rowspan,
+                        prepared.metrics.border_box_height,
+                    ));
                 }
             }
         }
@@ -4184,7 +5221,7 @@ impl<'a> LayoutBuilder<'a> {
                 row_index,
                 rowspan,
                 required_height,
-                table_metrics,
+                context.table_metrics,
                 TableHeightTarget::Base,
             );
         }
@@ -4193,100 +5230,93 @@ impl<'a> LayoutBuilder<'a> {
             row.final_height = row.base;
         }
 
-        let target_content_height =
-            self.resolve_table_target_content_height(table_style, column_plan.total_width());
-        self.compute_table_reference_heights(
+        let target_content_height = self.resolve_table_target_content_height(context.table_style);
+        self.compute_table_reference_heights(&mut plan_rows, context, target_content_height);
+        self.distribute_table_height_plan(
             &mut plan_rows,
-            rows,
-            grid,
-            table_style,
-            stylesheets,
-            table_cellpadding,
-            column_plan,
-            table_metrics,
             target_content_height,
+            context.table_metrics,
         );
-        self.distribute_table_height_plan(&mut plan_rows, target_content_height, table_metrics);
 
         TableHeightPlan { rows: plan_rows }
     }
 
-    fn resolve_table_target_content_height(
-        &self,
-        table_style: &ComputedStyle,
-        content_width: f32,
-    ) -> Option<f32> {
-        let border_widths = used_border_widths(table_style);
-        let vertical_non_content = table_style.padding.top
-            + table_style.padding.bottom
-            + border_widths.top
-            + border_widths.bottom;
-        used_content_height_or_auto(table_style, self.page_area_height(), vertical_non_content)
-            .map(|height| constrain_height(table_style, height, content_width).max(0.0))
+    fn resolve_table_target_content_height(&self, table_style: &ComputedStyle) -> Option<f32> {
+        let vertical_non_content = if table_style.border_collapse == css::BorderCollapse::Collapse {
+            0.0
+        } else {
+            let border_widths = used_border_widths(table_style);
+            table_style.padding.top
+                + table_style.padding.bottom
+                + border_widths.top
+                + border_widths.bottom
+        };
+        used_table_target_content_height(table_style, self.page_area_height(), vertical_non_content)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn compute_table_reference_heights(
         &mut self,
         plan_rows: &mut [TableRowHeightPlan],
-        rows: &[TableRow<'_>],
-        grid: &TableGrid,
-        table_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
-        table_cellpadding: Option<f32>,
-        column_plan: &TableColumnPlan,
-        table_metrics: TableMetrics,
+        context: &TableGridLayoutContext<'_, '_>,
         target_content_height: Option<f32>,
     ) {
         if plan_rows.is_empty() {
             return;
         }
 
-        for (row_index, row) in rows.iter().enumerate() {
+        for (row_index, row) in context.rows.iter().enumerate() {
             if plan_rows[row_index].collapsed {
                 continue;
             }
-            let row_style = self.style_for_table_row(row, table_style, stylesheets);
+            let row_style = self.style_for_table_row(row, context.table_style, context.stylesheets);
             if let Some(row_height) = used_length_percentage_or_auto_with_optional_basis(
                 row_style.box_values.height,
                 target_content_height,
             ) {
                 plan_rows[row_index].reference = plan_rows[row_index].reference.max(row_height);
             }
-            for placement in &grid.rows[row_index] {
+            for placement in &context.grid.rows[row_index] {
                 let cell = &row.cells[placement.cell];
-                let mut cell_style = self.style_for_table_cell(cell, row, &row_style, stylesheets);
-                let cell_width = column_plan.width_for_span(placement.column, placement.colspan);
-                if cell_width <= 0.0 {
+                let Some(prepared) = self.prepare_table_cell(
+                    cell,
+                    row,
+                    &row_style,
+                    placement,
+                    row_index,
+                    0.0,
+                    context.stylesheets,
+                    context.table_cellpadding,
+                    context.column_plan,
+                    context.table_metrics,
+                    context.collapsed_geometry,
+                ) else {
                     continue;
-                }
-                apply_table_cell_used_padding(&mut cell_style, table_cellpadding, cell_width);
-                let metrics =
-                    self.table_cell_layout_metrics(cell, &cell_style, stylesheets, cell_width);
+                };
                 let required_height = self.table_cell_border_box_height_with_basis(
-                    &cell_style,
-                    metrics.content_height,
+                    &prepared.style,
+                    prepared.metrics.content_height,
                     target_content_height,
-                    column_plan.total_width(),
+                    context.column_plan.total_width(),
+                    prepared.borders,
                 );
                 distribute_table_span_constraint(
                     plan_rows,
                     row_index,
                     placement.rowspan,
                     required_height,
-                    table_metrics,
+                    context.table_metrics,
                     TableHeightTarget::Reference,
                 );
             }
         }
 
-        let groups = table_height_distribution_groups(rows);
+        let groups = table_height_distribution_groups(context.rows);
         for (start, end) in groups {
-            let Some(row_group) = rows[start].row_groups.last() else {
+            let Some(row_group) = context.rows[start].row_groups.last() else {
                 continue;
             };
             let row_group_style =
-                self.style_for_table_row_group(row_group, table_style, stylesheets);
+                self.style_for_table_row_group(row_group, context.table_style, context.stylesheets);
             let Some(group_height) = used_length_percentage_or_auto_with_optional_basis(
                 row_group_style.box_values.height,
                 target_content_height,
@@ -4298,7 +5328,7 @@ impl<'a> LayoutBuilder<'a> {
                 start,
                 end - start,
                 group_height,
-                table_metrics,
+                context.table_metrics,
                 TableHeightTarget::Reference,
             );
         }
@@ -4310,9 +5340,10 @@ impl<'a> LayoutBuilder<'a> {
         content_height: f32,
         percentage_basis: Option<f32>,
         width_basis: f32,
+        border_insets: css::Edges,
     ) -> f32 {
         let vertical_non_content =
-            style.padding.top + style.padding.bottom + table_vertical_borders(style);
+            style.padding.top + style.padding.bottom + border_insets.top + border_insets.bottom;
         let requested_content = used_content_height_or_auto_with_optional_basis(
             style,
             percentage_basis,
@@ -4407,7 +5438,15 @@ impl<'a> LayoutBuilder<'a> {
             let mut cell_style = self.style_for_table_cell(cell, row, row_style, stylesheets);
             apply_table_cell_used_padding(&mut cell_style, table_cellpadding, cell_width);
             let cell_is_empty = table_cell_inline_text(cell).is_empty()
-                && table_cell_replaced_content_height(cell) <= 0.0;
+                && self.table_cell_non_text_content_height(
+                    cell,
+                    stylesheets,
+                    (cell_width
+                        - cell_style.padding.left
+                        - cell_style.padding.right
+                        - table_horizontal_borders(&cell_style))
+                    .max(0.0),
+                ) <= 0.0;
             if cell_style.empty_cells == EmptyCells::Show || !cell_is_empty {
                 return false;
             }
@@ -4441,14 +5480,18 @@ impl<'a> LayoutBuilder<'a> {
             .sum()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn table_row_baseline_offset(
         &mut self,
+        row_index: usize,
         row: &TableRow<'_>,
         placements: &[TableCellPlacement],
         row_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         table_cellpadding: Option<f32>,
         column_plan: &TableColumnPlan,
+        table_metrics: TableMetrics,
+        collapsed_geometry: Option<&CollapsedTableGeometry>,
     ) -> Option<f32> {
         // CSS 2.2 table height layout aligns cells with `vertical-align:
         // baseline` by the baseline of their first in-flow line box. This
@@ -4458,17 +5501,118 @@ impl<'a> LayoutBuilder<'a> {
             .iter()
             .filter_map(|placement| {
                 let cell = &row.cells[placement.cell];
-                let mut cell_style = self.style_for_table_cell(cell, row, row_style, stylesheets);
-                let cell_width = column_plan.width_for_span(placement.column, placement.colspan);
-                if cell_width <= 0.0 {
+                let prepared = self.prepare_table_cell(
+                    cell,
+                    row,
+                    row_style,
+                    placement,
+                    row_index,
+                    0.0,
+                    stylesheets,
+                    table_cellpadding,
+                    column_plan,
+                    table_metrics,
+                    collapsed_geometry,
+                )?;
+                if !table_cell_participates_in_row_baseline(&prepared.style, row_style, placement) {
                     return None;
                 }
-                apply_table_cell_used_padding(&mut cell_style, table_cellpadding, cell_width);
-                (placement.rowspan == 1 && table_cell_participates_in_baseline(&cell_style)).then(
-                    || {
-                        self.table_cell_layout_metrics(cell, &cell_style, stylesheets, cell_width)
-                            .baseline_offset
-                    },
+                Some(prepared.metrics.baseline_offset)
+            })
+            .reduce(f32::max)
+    }
+
+    fn table_cell_row_baseline_offset_for_alignment(
+        &mut self,
+        context: &TableCellBaselineAlignmentContext<'_>,
+        placement: &TableCellPlacement,
+        cell_style: &ComputedStyle,
+    ) -> Option<f32> {
+        if !table_cell_participates_in_baseline(cell_style, context.row_style) {
+            return None;
+        }
+        if table_cell_alignment_baseline_set(cell_style) == TableCellBaselineSet::First {
+            return context.row_baseline_offset;
+        }
+        let target_row_index = (context.row_index + placement.rowspan.saturating_sub(1))
+            .min(context.rows.len().saturating_sub(1));
+        if target_row_index == context.row_index {
+            return context.row_baseline_offset;
+        }
+        let target_row = context.rows.get(target_row_index)?;
+        let target_row_style =
+            self.style_for_table_row(target_row, context.table_style, context.stylesheets);
+        let target_baseline = self.table_row_baseline_offset(
+            target_row_index,
+            target_row,
+            context.grid.rows.get(target_row_index)?,
+            &target_row_style,
+            context.stylesheets,
+            context.table_cellpadding,
+            context.column_plan,
+            context.table_metrics,
+            context.collapsed_geometry,
+        )?;
+        let origin_top = table_row_top(
+            0.0,
+            context.planned_row_heights,
+            context.table_metrics,
+            context.row_index,
+        );
+        let target_top = table_row_top(
+            0.0,
+            context.planned_row_heights,
+            context.table_metrics,
+            target_row_index,
+        );
+        Some((origin_top - target_top).max(0.0) + target_baseline)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn table_row_baseline_only_offset(
+        &mut self,
+        row_index: usize,
+        row: &TableRow<'_>,
+        placements: &[TableCellPlacement],
+        row_style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        table_cellpadding: Option<f32>,
+        column_plan: &TableColumnPlan,
+        table_metrics: TableMetrics,
+        collapsed_geometry: Option<&CollapsedTableGeometry>,
+    ) -> Option<f32> {
+        placements
+            .iter()
+            .filter_map(|placement| {
+                let cell = &row.cells[placement.cell];
+                let prepared = self.prepare_table_cell(
+                    cell,
+                    row,
+                    row_style,
+                    placement,
+                    row_index,
+                    0.0,
+                    stylesheets,
+                    table_cellpadding,
+                    column_plan,
+                    table_metrics,
+                    collapsed_geometry,
+                )?;
+                if !table_cell_participates_in_row_baseline(&prepared.style, row_style, placement) {
+                    return None;
+                }
+                let available_width = (prepared.width()
+                    - prepared.style.padding.left
+                    - prepared.style.padding.right
+                    - prepared.borders.left
+                    - prepared.borders.right)
+                    .max(0.0);
+                self.table_cell_alignment_baseline_offset(
+                    cell,
+                    &prepared.style,
+                    stylesheets,
+                    available_width,
+                    prepared.borders,
                 )
             })
             .reduce(f32::max)
@@ -4481,24 +5625,81 @@ impl<'a> LayoutBuilder<'a> {
     /// exists, the baseline is the bottom content edge:
     /// <https://www.w3.org/TR/CSS22/tables.html#height-layout> and
     /// <https://drafts.csswg.org/css-tables-3/#row-layout>.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_table_cell(
+        &mut self,
+        cell: &TableCell<'_>,
+        row: &TableRow<'_>,
+        row_style: &ComputedStyle,
+        placement: &TableCellPlacement,
+        row_index: usize,
+        _table_x: f32,
+        stylesheets: &[Stylesheet],
+        table_cellpadding: Option<f32>,
+        column_plan: &TableColumnPlan,
+        table_metrics: TableMetrics,
+        collapsed_geometry: Option<&CollapsedTableGeometry>,
+    ) -> Option<PreparedTableCell> {
+        let mut style = self.style_for_table_cell(cell, row, row_style, stylesheets);
+        let area = TableGridArea::from_placement(row_index, placement);
+        let inline_bounds = column_plan.inline_bounds_for_area(area);
+        let width = inline_bounds.size;
+        if width <= 0.0 {
+            return None;
+        }
+        apply_table_cell_used_padding(&mut style, table_cellpadding, width);
+        let borders = table_cell_border_insets(
+            &style,
+            placement,
+            row_index,
+            table_metrics,
+            collapsed_geometry,
+        );
+        let metrics = self.table_cell_layout_metrics(cell, &style, stylesheets, width, borders);
+        let text = table_cell_inline_text(cell);
+        Some(PreparedTableCell {
+            style,
+            area,
+            inline_bounds,
+            borders,
+            metrics,
+            text,
+        })
+    }
+
     fn table_cell_layout_metrics(
         &mut self,
         cell: &TableCell<'_>,
         cell_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         cell_width: f32,
+        border_insets: css::Edges,
     ) -> TableCellLayoutMetrics {
         let available_width = (cell_width
             - cell_style.padding.left
             - cell_style.padding.right
-            - table_horizontal_borders(cell_style))
-        .max(0.0);
+            - border_insets.left
+            - border_insets.right)
+            .max(0.0);
         let text_height = self.table_cell_text_content_height(cell, cell_style, available_width);
-        let content_height = text_height.max(table_cell_non_text_content_height(cell));
-        let border_box_height = table_cell_border_box_height(cell_style, content_height);
+        let content_height = text_height.max(self.table_cell_non_text_content_height(
+            cell,
+            stylesheets,
+            available_width,
+        ));
+        let border_box_height =
+            table_cell_border_box_height_with_insets(cell_style, content_height, border_insets);
         let baseline_offset = self
-            .table_cell_baseline_offset(cell, cell_style, stylesheets, available_width)
-            .unwrap_or_else(|| self.table_cell_content_bottom_baseline(cell_style, content_height));
+            .table_cell_alignment_baseline_offset(
+                cell,
+                cell_style,
+                stylesheets,
+                available_width,
+                border_insets,
+            )
+            .unwrap_or_else(|| {
+                self.table_cell_content_bottom_baseline(cell_style, content_height, border_insets)
+            });
 
         TableCellLayoutMetrics {
             content_height,
@@ -4507,13 +5708,125 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
+    /// Measure non-text content for table row sizing using durable child boxes.
+    ///
+    /// CSS table row height depends on the minimum height required by cell
+    /// content. Nested table boxes already carry a table fragment with row,
+    /// caption, spacing, and span information, so row sizing must reuse the
+    /// table measurement path instead of approximating from the child list:
+    /// <https://www.w3.org/TR/CSS22/tables.html#height-layout> and
+    /// <https://drafts.csswg.org/css-tables-3/#row-layout>.
+    fn table_cell_non_text_content_height(
+        &mut self,
+        cell: &TableCell<'_>,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+    ) -> f32 {
+        let fallback = table_cell_non_text_content_height(cell);
+        let Some(children) = cell.children.as_deref() else {
+            return fallback;
+        };
+
+        fallback.max(self.table_cell_children_non_text_content_height(
+            children,
+            stylesheets,
+            available_width,
+        ))
+    }
+
+    fn table_cell_children_non_text_content_height(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+    ) -> f32 {
+        let mut height = 0.0_f32;
+        let mut inline_line_height = 0.0_f32;
+
+        for child in children {
+            if let Some(inline_height) = table_cell_measured_inline_outer_height(child) {
+                inline_line_height = inline_line_height.max(inline_height);
+                continue;
+            }
+            if inline_line_height > 0.0 {
+                height += inline_line_height;
+                inline_line_height = 0.0;
+            }
+            height +=
+                self.table_cell_measured_block_child_height(child, stylesheets, available_width);
+        }
+
+        height + inline_line_height
+    }
+
+    fn table_cell_measured_block_child_height(
+        &mut self,
+        child: &box_tree::FormattingBox<'_>,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+    ) -> f32 {
+        match child {
+            box_tree::FormattingBox::Table(box_) => {
+                if matches!(box_.style.position, Position::Absolute | Position::Fixed) {
+                    return 0.0;
+                }
+                self.estimate_table_height(
+                    box_.element,
+                    &box_.style,
+                    stylesheets,
+                    available_width,
+                    &box_.fragment,
+                )
+            }
+            box_tree::FormattingBox::Block(box_) => self.table_cell_measured_element_child_height(
+                box_.element,
+                &box_.style,
+                &box_.children,
+                stylesheets,
+                available_width,
+                child,
+            ),
+            box_tree::FormattingBox::Flex(box_) => self.table_cell_measured_element_child_height(
+                box_.element,
+                &box_.style,
+                &box_.children,
+                stylesheets,
+                available_width,
+                child,
+            ),
+            box_tree::FormattingBox::AnonymousBlock(box_) => self
+                .table_cell_children_non_text_content_height(
+                    &box_.children,
+                    stylesheets,
+                    available_width,
+                ),
+            _ => table_cell_formatting_child_outer_height(child),
+        }
+    }
+
+    fn table_cell_measured_element_child_height(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        fallback_child: &box_tree::FormattingBox<'_>,
+    ) -> f32 {
+        if matches!(style.position, Position::Absolute | Position::Fixed) {
+            return 0.0;
+        }
+        self.estimate_element_height(element, style, stylesheets, available_width, Some(children))
+            .unwrap_or_else(|| table_cell_formatting_child_outer_height(fallback_child))
+    }
+
     fn table_cell_content_bottom_baseline(
         &self,
         cell_style: &ComputedStyle,
         content_height: f32,
+        border_insets: css::Edges,
     ) -> f32 {
-        let borders = used_border_widths(cell_style);
-        borders.top + cell_style.padding.top + content_height
+        border_insets.top + cell_style.padding.top + content_height
     }
 
     fn table_cell_baseline_offset(
@@ -4522,78 +5835,188 @@ impl<'a> LayoutBuilder<'a> {
         cell_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         available_width: f32,
+        border_insets: css::Edges,
     ) -> Option<f32> {
-        let borders = used_border_widths(cell_style);
         if let Some(children) = cell.children.as_deref() {
             return self
-                .table_cell_children_first_baseline_offset(children, stylesheets, available_width)
-                .map(|baseline| borders.top + cell_style.padding.top + baseline);
+                .table_cell_children_first_baseline_offset(
+                    children,
+                    cell_style,
+                    stylesheets,
+                    available_width,
+                )
+                .map(|baseline| border_insets.top + cell_style.padding.top + baseline);
         }
 
         (!table_cell_inline_text(cell).is_empty())
             .then(|| self.table_cell_first_baseline_offset(cell_style))
     }
 
+    fn table_cell_alignment_baseline_offset(
+        &mut self,
+        cell: &TableCell<'_>,
+        cell_style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        border_insets: css::Edges,
+    ) -> Option<f32> {
+        match table_cell_alignment_baseline_set(cell_style) {
+            TableCellBaselineSet::First => self.table_cell_baseline_offset(
+                cell,
+                cell_style,
+                stylesheets,
+                available_width,
+                border_insets,
+            ),
+            TableCellBaselineSet::Last => self.table_cell_last_baseline_offset(
+                cell,
+                cell_style,
+                stylesheets,
+                available_width,
+                border_insets,
+            ),
+        }
+    }
+
+    fn table_cell_last_baseline_offset(
+        &mut self,
+        cell: &TableCell<'_>,
+        cell_style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        border_insets: css::Edges,
+    ) -> Option<f32> {
+        if let Some(children) = cell.children.as_deref() {
+            return self
+                .table_cell_children_baseline_offset(
+                    children,
+                    cell_style,
+                    stylesheets,
+                    available_width,
+                    TableCellBaselineSet::Last,
+                )
+                .map(|baseline| border_insets.top + cell_style.padding.top + baseline);
+        }
+
+        let text = table_cell_inline_text(cell);
+        (!text.is_empty()).then(|| {
+            border_insets.top
+                + cell_style.padding.top
+                + self.table_cell_text_last_baseline_offset(&text, cell_style, available_width)
+        })
+    }
+
     fn table_cell_children_first_baseline_offset(
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
+        containing_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         available_width: f32,
     ) -> Option<f32> {
+        self.table_cell_children_baseline_offset(
+            children,
+            containing_style,
+            stylesheets,
+            available_width,
+            TableCellBaselineSet::First,
+        )
+    }
+
+    fn table_cell_children_baseline_offset(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        containing_style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        baseline_set: TableCellBaselineSet,
+    ) -> Option<f32> {
+        if formatting_boxes_have_textual_baseline(children)
+            && !has_non_inline_formatting_box(children)
+        {
+            return self.table_cell_inline_content_baseline_offset(
+                children,
+                containing_style,
+                stylesheets,
+                available_width,
+                baseline_set,
+            );
+        }
+
         let mut block_offset = 0.0_f32;
+        let mut last_baseline = None;
 
         for child in children {
             if !table_cell_has_in_flow_layout_child(child) {
                 continue;
             }
-            if let Some(baseline) =
-                self.table_cell_child_first_baseline_offset(child, stylesheets, available_width)
-            {
-                return Some(block_offset + baseline);
+            let child_baseline = self.table_cell_child_baseline_offset(
+                child,
+                stylesheets,
+                available_width,
+                baseline_set,
+            );
+            if let Some(baseline) = child_baseline {
+                let baseline = block_offset + baseline;
+                if baseline_set == TableCellBaselineSet::First {
+                    return Some(baseline);
+                }
+                last_baseline = Some(baseline);
             }
             block_offset += table_cell_formatting_child_outer_height(child);
         }
 
-        None
+        last_baseline
     }
 
-    fn table_cell_child_first_baseline_offset(
+    fn table_cell_child_baseline_offset(
         &mut self,
         child: &box_tree::FormattingBox<'_>,
         stylesheets: &[Stylesheet],
         available_width: f32,
+        baseline_set: TableCellBaselineSet,
     ) -> Option<f32> {
         match child {
             box_tree::FormattingBox::Text(box_) => {
                 (!box_tree::formatting_box_is_collapsible_space(child)).then(|| {
-                    self.font_system
-                        .rendered_first_line_baseline_offset(&box_.style)
+                    self.table_cell_text_baseline_offset(
+                        &box_.text,
+                        &box_.style,
+                        available_width,
+                        baseline_set,
+                    )
                 })
             }
             box_tree::FormattingBox::Line(box_) => (!box_.children.is_empty()).then(|| {
-                self.font_system
-                    .rendered_first_line_baseline_offset(&box_.style)
+                self.table_cell_text_baseline_offset("", &box_.style, available_width, baseline_set)
             }),
-            box_tree::FormattingBox::Inline(box_) => {
-                self.inline_children_first_baseline_offset(&box_.children, &box_.style)
-            }
+            box_tree::FormattingBox::Inline(box_) => self.inline_children_baseline_offset(
+                &box_.children,
+                &box_.style,
+                stylesheets,
+                available_width,
+                baseline_set,
+            ),
             box_tree::FormattingBox::AnonymousBlock(box_) => self
-                .table_cell_children_first_baseline_offset(
+                .table_cell_children_baseline_offset(
                     &box_.children,
+                    &box_.style,
                     stylesheets,
                     available_width,
+                    baseline_set,
                 ),
-            box_tree::FormattingBox::Block(box_) => self.block_child_first_baseline_offset(
+            box_tree::FormattingBox::Block(box_) => self.block_child_baseline_offset(
                 &box_.style,
                 &box_.children,
                 stylesheets,
                 available_width,
+                baseline_set,
             ),
-            box_tree::FormattingBox::Flex(box_) => self.block_child_first_baseline_offset(
+            box_tree::FormattingBox::Flex(box_) => self.block_child_baseline_offset(
                 &box_.style,
                 &box_.children,
                 stylesheets,
                 available_width,
+                baseline_set,
             ),
             box_tree::FormattingBox::Table(box_) => self
                 .table_fragment_baseline_offset(
@@ -4608,66 +6031,82 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
-    fn inline_children_first_baseline_offset(
+    fn inline_children_baseline_offset(
         &mut self,
         children: &[box_tree::FormattingBox<'_>],
         inline_style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        baseline_set: TableCellBaselineSet,
     ) -> Option<f32> {
-        let mut baseline = None;
-        for child in children {
-            match child {
-                box_tree::FormattingBox::Text(box_)
-                    if !box_tree::formatting_box_is_collapsible_space(child) =>
-                {
-                    baseline = Some(
-                        baseline.unwrap_or(0.0_f32).max(
-                            self.font_system
-                                .rendered_first_line_baseline_offset(&box_.style),
-                        ),
-                    );
-                }
-                box_tree::FormattingBox::Line(box_) if !box_.children.is_empty() => {
-                    baseline = Some(
-                        baseline.unwrap_or(0.0_f32).max(
-                            self.font_system
-                                .rendered_first_line_baseline_offset(&box_.style),
-                        ),
-                    );
-                }
-                box_tree::FormattingBox::Inline(box_) => {
-                    if let Some(child_baseline) =
-                        self.inline_children_first_baseline_offset(&box_.children, &box_.style)
-                    {
-                        baseline = Some(baseline.unwrap_or(0.0_f32).max(child_baseline));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        baseline.or_else(|| {
-            formatting_box_has_inline_content(children).then(|| {
-                self.font_system
-                    .rendered_first_line_baseline_offset(inline_style)
-            })
-        })
+        self.table_cell_inline_content_baseline_offset(
+            children,
+            inline_style,
+            stylesheets,
+            available_width,
+            baseline_set,
+        )
     }
 
-    fn block_child_first_baseline_offset(
+    fn block_child_baseline_offset(
         &mut self,
         block_style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
         stylesheets: &[Stylesheet],
         available_width: f32,
+        baseline_set: TableCellBaselineSet,
     ) -> Option<f32> {
         if matches!(block_style.position, Position::Absolute | Position::Fixed) {
             return None;
         }
         let borders = used_border_widths(block_style);
-        self.table_cell_children_first_baseline_offset(children, stylesheets, available_width)
-            .map(|baseline| {
-                block_style.margin.top + borders.top + block_style.padding.top + baseline
-            })
+        self.table_cell_children_baseline_offset(
+            children,
+            block_style,
+            stylesheets,
+            available_width,
+            baseline_set,
+        )
+        .map(|baseline| block_style.margin.top + borders.top + block_style.padding.top + baseline)
+    }
+
+    fn table_cell_inline_content_baseline_offset(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        baseline_set: TableCellBaselineSet,
+    ) -> Option<f32> {
+        if !formatting_box_has_inline_content(children) {
+            return None;
+        }
+
+        let measurement = self.intrinsic_inline_measurement_for_boxes(
+            children,
+            style,
+            stylesheets,
+            available_width,
+        );
+        let line_count = measurement.line_count();
+        if line_count == 0 {
+            return None;
+        }
+
+        let first_baseline = self.font_system.rendered_first_line_baseline_offset(style);
+        Some(match baseline_set {
+            TableCellBaselineSet::First => first_baseline,
+            TableCellBaselineSet::Last => {
+                first_baseline
+                    + measurement
+                        .sequence
+                        .records
+                        .iter()
+                        .take(line_count.saturating_sub(1))
+                        .map(|line| line.line_height)
+                        .sum::<f32>()
+            }
+        })
     }
 
     fn table_fragment_baseline_offset(
@@ -4702,20 +6141,17 @@ impl<'a> LayoutBuilder<'a> {
             table_cellpadding,
             table_metrics,
         );
-        let row_heights = self.measure_table_row_heights(
-            rows,
-            &grid,
-            style,
-            stylesheets,
-            table_cellpadding,
-            &column_plan,
-            table_metrics,
-        );
-        let content_height = table_grid_height(&row_heights, table_metrics);
-        if rows.is_empty() {
-            return Some(table_width.border_widths.top + style.padding.top + content_height);
-        }
-
+        let collapsed_geometry = (table_metrics.border_collapse == css::BorderCollapse::Collapse)
+            .then(|| {
+                self.collapsed_table_geometry(
+                    rows,
+                    &grid,
+                    style,
+                    stylesheets,
+                    &input.columns,
+                    column_plan.column_count(),
+                )
+            });
         let top_caption_height = self.estimate_table_captions_height(
             &input.captions,
             style,
@@ -4723,34 +6159,62 @@ impl<'a> LayoutBuilder<'a> {
             column_plan.total_width(),
             CaptionSide::Top,
         );
-        let (row_index, _) = row_heights
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, height)| *height > 0.0)?;
-        let preceding_rows_height = row_heights[..row_index].iter().sum::<f32>();
-        let preceding_spacing = table_internal_vertical_gap_count_before(&row_heights, row_index)
-            as f32
-            * table_metrics.spacing.vertical;
+        let table_context = TableGridLayoutContext {
+            rows,
+            grid: &grid,
+            table_style: style,
+            stylesheets,
+            table_cellpadding,
+            column_plan: &column_plan,
+            table_metrics,
+            collapsed_geometry: collapsed_geometry.as_ref(),
+        };
+
+        let Some(row_index) = rows.iter().enumerate().find_map(|(index, row)| {
+            let row_style = self.style_for_table_row(row, style, stylesheets);
+            if table_row_is_collapsed(&row_style) || grid.rows[index].is_empty() {
+                return None;
+            }
+            if self.table_row_is_hidden_empty(
+                row,
+                &grid.rows[index],
+                &row_style,
+                stylesheets,
+                table_cellpadding,
+                &column_plan,
+                table_metrics,
+            ) {
+                return None;
+            }
+            Some(index)
+        }) else {
+            return Some(
+                table_width.border_widths.top + table_width.padding.top + top_caption_height,
+            );
+        };
+
         let row_style = self.style_for_table_row(&rows[row_index], style, stylesheets);
         let row_baseline = self
-            .table_row_baseline_offset(
+            .table_row_baseline_only_offset(
+                row_index,
                 &rows[row_index],
                 &grid.rows[row_index],
                 &row_style,
                 stylesheets,
                 table_cellpadding,
                 &column_plan,
+                table_metrics,
+                collapsed_geometry.as_ref(),
             )
-            .unwrap_or(row_heights[row_index]);
+            .unwrap_or_else(|| {
+                self.measure_table_row_height(&table_context, row_index, &row_style)
+            });
 
         Some(
             top_caption_height
                 + table_width.border_widths.top
-                + style.padding.top
-                + table_vertical_edge_spacing(&row_heights, table_metrics)
-                + preceding_rows_height
-                + preceding_spacing
+                + table_width.padding.top
+                + table_metrics.spacing.vertical
                 + row_baseline,
         )
     }
@@ -4766,6 +6230,41 @@ impl<'a> LayoutBuilder<'a> {
         borders.top
             + style.padding.top
             + self.font_system.rendered_first_line_baseline_offset(style)
+    }
+
+    fn table_cell_text_baseline_offset(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        available_width: f32,
+        baseline_set: TableCellBaselineSet,
+    ) -> f32 {
+        match baseline_set {
+            TableCellBaselineSet::First => {
+                self.font_system.rendered_first_line_baseline_offset(style)
+            }
+            TableCellBaselineSet::Last => {
+                self.table_cell_text_last_baseline_offset(text, style, available_width)
+            }
+        }
+    }
+
+    fn table_cell_text_last_baseline_offset(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        available_width: f32,
+    ) -> f32 {
+        let line_count = if text.is_empty() {
+            1
+        } else {
+            let line_height = style.line_height.max(0.01);
+            (self.estimate_text_height(text, style, available_width, 0.0, 0.0) / line_height)
+                .ceil()
+                .max(1.0) as usize
+        };
+        self.font_system.rendered_first_line_baseline_offset(style)
+            + line_count.saturating_sub(1) as f32 * style.line_height
     }
 
     /// Measure text content height for a table cell using durable child styles.
@@ -4855,9 +6354,8 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
         row_heights: &[f32],
         table_metrics: TableMetrics,
-        cell_x: f32,
-        cell_width: f32,
-        row_top: f32,
+        border_box: TableCellBorderBox,
+        placement: TableGridPlacement,
     ) -> Option<OverflowClip> {
         if rowspan <= 1 {
             return None;
@@ -4871,16 +6369,11 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         let visible_height = table_row_span_height(row_heights, row_index, rowspan, table_metrics);
-        let clip_x = cell_x;
-        let clip_width = cell_width.max(0.0);
-        let clip_height = visible_height.max(0.0);
-        let clip_top = row_top;
-        Some(OverflowClip {
-            x: clip_x,
-            y: clip_top - clip_height,
-            width: clip_width,
-            height: clip_height,
-        })
+        let rect = TableGridRect::new(
+            border_box.rect().origin,
+            TableGridSize::new(border_box.width(), visible_height.max(0.0)),
+        );
+        Some(placement.overflow_clip_for(rect))
     }
 
     pub(super) fn layout_table_captions(
@@ -4897,13 +6390,27 @@ impl<'a> LayoutBuilder<'a> {
             if caption_style.caption_side != side || caption_style.display.is_none() {
                 continue;
             }
+            let caption_available_width = if has_auto_width(&caption_style) {
+                set_style_used_width(&mut caption_style, table_width);
+                table_width
+            } else {
+                let horizontal_non_content = caption_style.padding.left
+                    + caption_style.padding.right
+                    + horizontal_border_width(&caption_style);
+                let caption_content_width =
+                    used_content_width_or_auto(&caption_style, table_width, horizontal_non_content)
+                        .unwrap_or(table_width);
+                table_width.max(
+                    caption_style.margin.left
+                        + caption_content_width
+                        + horizontal_non_content
+                        + caption_style.margin.right,
+                )
+            };
             let previous_left = self.content_left;
             let previous_right = self.content_right;
             self.content_left = table_x;
-            self.content_right = table_x + table_width;
-            if has_auto_width(&caption_style) {
-                set_style_used_width(&mut caption_style, table_width);
-            }
+            self.content_right = table_x + caption_available_width;
             self.push_float_context();
             if let Some(children) = caption.children.as_deref() {
                 self.layout_element_box(
@@ -4963,7 +6470,10 @@ impl<'a> LayoutBuilder<'a> {
         columns: &[TableColumn<'_>],
         column_count: usize,
     ) -> CollapsedTableGeometry {
-        let mut collapsed_grid = CollapsedBorderGrid::new(rows.len(), column_count);
+        let collapsed_columns =
+            self.collapsed_table_columns(columns, table_style, stylesheets, column_count);
+        let mut collapsed_grid =
+            CollapsedBorderGrid::new(rows.len(), column_count, TableAxes::for_style(table_style));
         collapsed_grid.add_table(table_style, rows.len(), column_count);
         let mut first_displayed_row = None;
         for (row_index, row) in rows.iter().enumerate() {
@@ -4996,11 +6506,16 @@ impl<'a> LayoutBuilder<'a> {
         for (start_column, end_column, column_group) in
             table_column_group_spans(columns, column_count)
         {
+            let Some((visible_start, visible_end)) =
+                visible_column_span(start_column, end_column, &collapsed_columns)
+            else {
+                continue;
+            };
             let column_group_style =
                 self.style_for_table_column_group(&column_group, table_style, stylesheets);
             collapsed_grid.add_column_group(
-                start_column,
-                end_column,
+                visible_start,
+                visible_end,
                 rows.len(),
                 &column_group_style,
             );
@@ -5011,8 +6526,14 @@ impl<'a> LayoutBuilder<'a> {
                 break;
             }
             let span = column.span.min(column_count - column_index).max(1);
+            let start_column = column_index;
+            let end_column = column_index + span;
             let column_style = self.style_for_table_column(column, table_style, stylesheets);
-            collapsed_grid.add_column(column_index, column_index + span, rows.len(), &column_style);
+            if let Some((visible_start, visible_end)) =
+                visible_column_span(start_column, end_column, &collapsed_columns)
+            {
+                collapsed_grid.add_column(visible_start, visible_end, rows.len(), &column_style);
+            }
             column_index += span;
         }
 
@@ -5098,11 +6619,15 @@ impl<'a> LayoutBuilder<'a> {
         table_metrics: TableMetrics,
     ) -> TableColumnMeasures {
         let column_count = grid.column_count;
+        let collapsed_columns =
+            self.collapsed_table_columns(columns, table_style, stylesheets, column_count);
+        let visible_columns = collapsed_columns
+            .iter()
+            .filter(|collapsed| !**collapsed)
+            .count();
         let total_horizontal_spacing =
-            table_metrics.spacing.horizontal * column_count.saturating_sub(1) as f32;
-        let padding_basis = (table_width
-            - table_metrics.spacing.horizontal * column_count.saturating_sub(1) as f32)
-            .max(table_style.font_size);
+            table_displayed_horizontal_spacing(visible_columns, table_metrics);
+        let padding_basis = (table_width - total_horizontal_spacing).max(table_style.font_size);
         let mut measures = TableColumnMeasures {
             min_content_widths: vec![0.0_f32; column_count],
             max_content_widths: vec![0.0_f32; column_count],
@@ -5183,19 +6708,25 @@ impl<'a> LayoutBuilder<'a> {
                         measures.constrained[placement.column] = true;
                     }
                 } else {
+                    let internal_spacing = table_internal_horizontal_spacing(
+                        placement.column,
+                        end,
+                        &collapsed_columns,
+                        table_metrics,
+                    );
                     distribute_spanned_percentage(&mut measures, placement.column, end, percentage);
                     distribute_spanned_measure(
                         &mut measures,
                         placement.column,
                         end,
-                        min_target_width,
+                        (min_target_width - internal_spacing).max(0.0),
                         true,
                     );
                     distribute_spanned_measure(
                         &mut measures,
                         placement.column,
                         end,
-                        max_target_width,
+                        (max_target_width - internal_spacing).max(0.0),
                         false,
                     );
                 }
@@ -5204,6 +6735,61 @@ impl<'a> LayoutBuilder<'a> {
 
         cap_intrinsic_percentages(&mut measures.intrinsic_percentages);
         measures
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Resolve the table wrapper's used grid/content inline size.
+    ///
+    /// CSS Tables 3 computes the table grid minimum before resolving the used
+    /// table width; auto-layout tables cannot use a content-box width smaller
+    /// than that grid min-content contribution:
+    /// <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>.
+    fn resolve_table_used_content_width(
+        &mut self,
+        rows: &[TableRow<'_>],
+        grid: &TableGrid,
+        table_style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        columns: &[TableColumn<'_>],
+        available_outer_width: f32,
+        table_cellpadding: Option<f32>,
+        table_metrics: TableMetrics,
+        table_width: &mut UsedTableWidth,
+    ) {
+        let measures = self.table_column_measures(
+            rows,
+            grid,
+            table_style,
+            stylesheets,
+            columns,
+            table_width.content_width,
+            table_cellpadding,
+            table_metrics,
+        );
+        let min_content = measures.table_min_content_width().max(0.0);
+        let max_content = measures.table_max_content_width().max(min_content);
+        let horizontal_border_non_content =
+            if table_style.border_collapse == css::BorderCollapse::Collapse {
+                0.0
+            } else {
+                table_width.border_widths.left + table_width.border_widths.right
+            };
+        let horizontal_non_content =
+            horizontal_border_non_content + table_width.padding.left + table_width.padding.right;
+        let mut content_width = table_width.content_width;
+        if let Some(width) = intrinsic::intrinsic_width_keyword(
+            table_style.box_values.width,
+            min_content,
+            max_content,
+            available_outer_width,
+            horizontal_non_content,
+        ) {
+            content_width = constrain_width(table_style, width, available_outer_width)
+                .max(table_style.font_size);
+        }
+        content_width =
+            table_content_width_clamped_to_min_content(table_style, content_width, min_content);
+        table_width.content_width = content_width;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5263,7 +6849,12 @@ impl<'a> LayoutBuilder<'a> {
 
         let collapsed_columns =
             self.collapsed_table_columns(columns, table_style, stylesheets, column_count);
-        TableColumnPlan::with_collapsed(widths, table_metrics.spacing.horizontal, collapsed_columns)
+        TableColumnPlan::with_collapsed(
+            widths,
+            table_metrics.spacing.horizontal,
+            collapsed_columns,
+            TableAxes::for_style(table_style),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5282,8 +6873,14 @@ impl<'a> LayoutBuilder<'a> {
     ) -> TableColumnPlan {
         // CSS 2.2 fixed table layout uses column widths from column elements,
         // then first-row cells, then divides remaining space equally.
+        let collapsed_columns =
+            self.collapsed_table_columns(columns, table_style, stylesheets, column_count);
+        let visible_columns = collapsed_columns
+            .iter()
+            .filter(|collapsed| !**collapsed)
+            .count();
         let total_horizontal_spacing =
-            table_metrics.spacing.horizontal * column_count.saturating_sub(1) as f32;
+            table_displayed_horizontal_spacing(visible_columns, table_metrics);
         let content_table_width =
             (table_width - total_horizontal_spacing).max(table_style.font_size);
         let mut widths = vec![0.0_f32; column_count];
@@ -5330,6 +6927,18 @@ impl<'a> LayoutBuilder<'a> {
                         explicit_width,
                         content_table_width,
                     );
+                    let width = if colspan > 1 {
+                        let end = (placement.column + colspan).min(collapsed_columns.len());
+                        let internal_spacing = table_internal_horizontal_spacing(
+                            placement.column,
+                            end,
+                            &collapsed_columns,
+                            table_metrics,
+                        );
+                        (width - internal_spacing).max(0.0)
+                    } else {
+                        width
+                    };
                     distribute_first_row_fixed_width(
                         &mut widths,
                         &mut declared,
@@ -5360,9 +6969,12 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
 
-        let collapsed_columns =
-            self.collapsed_table_columns(columns, table_style, stylesheets, column_count);
-        TableColumnPlan::with_collapsed(widths, table_metrics.spacing.horizontal, collapsed_columns)
+        TableColumnPlan::with_collapsed(
+            widths,
+            table_metrics.spacing.horizontal,
+            collapsed_columns,
+            TableAxes::for_style(table_style),
+        )
     }
 
     /// Compute which table grid columns are suppressed by `visibility: collapse`.
@@ -5562,17 +7174,66 @@ impl<'a> LayoutBuilder<'a> {
         )
     }
 
+    fn table_cell_content_x_offset(
+        &mut self,
+        cell: &TableCell<'_>,
+        cell_style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        cell_width: f32,
+        border_insets: css::Edges,
+    ) -> f32 {
+        if cell_style.writing_mode == WritingMode::HorizontalTb
+            || cell_style.align_content.keyword == ContentAlignmentKeyword::Normal
+        {
+            return 0.0;
+        }
+
+        let content_box_width = (cell_width
+            - border_insets.left
+            - border_insets.right
+            - cell_style.padding.left
+            - cell_style.padding.right)
+            .max(0.0);
+        let subject_width = (table_cell_content_max_width(self, cell, cell_style, stylesheets)
+            - border_insets.left
+            - border_insets.right
+            - cell_style.padding.left
+            - cell_style.padding.right)
+            .max(0.0);
+        let free_space = content_box_width - subject_width;
+        let toward_block_end = content_alignment_offset_toward_end(
+            cell_style.align_content,
+            free_space,
+            block_align_content_defaults_to_safe_overflow(cell_style),
+        );
+
+        match block_start_side(cell_style.writing_mode) {
+            PhysicalSide::Left => toward_block_end,
+            PhysicalSide::Right => free_space - toward_block_end,
+            PhysicalSide::Top | PhysicalSide::Bottom => 0.0,
+        }
+    }
+
     pub(super) fn layout_table_cell_replaced_children(
         &mut self,
         cell: &TableCell<'_>,
         cell_style: &ComputedStyle,
-        cell_x: f32,
-        row_top: f32,
+        border_box: TableCellBorderBox,
+        placement: TableGridPlacement,
         content_offset: f32,
+        content_x_offset: f32,
     ) {
         let borders = used_border_widths(cell_style);
-        let mut x = cell_x + borders.left + cell_style.padding.left;
-        let y_top = row_top - borders.top - cell_style.padding.top - content_offset;
+        let content_box = border_box.content_box(
+            placement,
+            cell_style.padding,
+            borders,
+            content_offset,
+            content_x_offset,
+        );
+        let content_bounds = content_box.page_top_rect();
+        let mut x = content_bounds.x;
+        let y_top = content_bounds.top_y;
         if let Some(children) = cell.children.as_deref() {
             for child_box in children {
                 let Some((child, _, _, _)) = child_box.element_parts() else {
@@ -5582,15 +7243,9 @@ impl<'a> LayoutBuilder<'a> {
                     && let Some((width, height, fill)) = svg_rect(child)
                 {
                     if cell_style.visibility == Visibility::Visible {
-                        self.push_rect(RenderedRect {
-                            x,
-                            y: y_top - height,
-                            width,
-                            height,
-                            fill: Some(fill),
-                            stroke: None,
-                            stroke_width: 0.0,
-                        });
+                        self.push_rect(
+                            PageTopRect::new(x, y_top, width, height).rendered_rect(Some(fill)),
+                        );
                     }
                     x += width;
                 }
@@ -5608,15 +7263,7 @@ impl<'a> LayoutBuilder<'a> {
             if replaced_element_kind(child) == Some(ReplacedElementKind::Svg)
                 && let Some((width, height, fill)) = svg_rect(child)
             {
-                self.push_rect(RenderedRect {
-                    x,
-                    y: y_top - height,
-                    width,
-                    height,
-                    fill: Some(fill),
-                    stroke: None,
-                    stroke_width: 0.0,
-                });
+                self.push_rect(PageTopRect::new(x, y_top, width, height).rendered_rect(Some(fill)));
                 x += width;
             }
         }
@@ -5635,11 +7282,10 @@ impl<'a> LayoutBuilder<'a> {
         row: &TableRow<'_>,
         cell_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        cell_x: f32,
-        row_top: f32,
-        cell_width: f32,
-        cell_height: f32,
+        border_box: TableCellBorderBox,
+        placement: TableGridPlacement,
         content_offset: f32,
+        content_x_offset: f32,
     ) {
         let Some(children) = cell.children.as_deref() else {
             return;
@@ -5653,16 +7299,18 @@ impl<'a> LayoutBuilder<'a> {
         let previous_cursor_y = self.cursor_y;
         let previous_ancestors = self.ancestors.clone();
         let borders = used_border_widths(cell_style);
-        self.content_left = cell_x + borders.left + cell_style.padding.left;
-        self.content_right = cell_x + cell_width - borders.right - cell_style.padding.right;
-        self.cursor_y = row_top - borders.top - cell_style.padding.top - content_offset;
+        let content_box = border_box.content_box(
+            placement,
+            cell_style.padding,
+            borders,
+            content_offset,
+            content_x_offset,
+        );
+        self.content_left = content_box.left();
+        self.content_right = content_box.right();
+        self.cursor_y = content_box.top_y();
         self.ancestors = self.table_cell_child_ancestors(cell, row);
-        let cell_content_height = (cell_height
-            - borders.top
-            - borders.bottom
-            - cell_style.padding.top
-            - cell_style.padding.bottom)
-            .max(0.0);
+        let cell_content_height = content_box.height();
 
         self.push_float_context();
         self.definite_block_size_stack
@@ -5692,23 +7340,16 @@ impl<'a> LayoutBuilder<'a> {
         row: &TableRow<'_>,
         cell_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        cell_x: f32,
-        row_top: f32,
-        cell_width: f32,
-        cell_height: f32,
+        border_box: TableCellBorderBox,
+        placement: TableGridPlacement,
     ) {
         let previous_left = self.content_left;
         let previous_right = self.content_right;
         let previous_cursor_y = self.cursor_y;
         let previous_ancestors = self.ancestors.clone();
         let child_ancestors = self.table_cell_child_ancestors(cell, row);
-        let containing_block_pushed = self.push_table_cell_containing_block_if_positioned(
-            cell_style,
-            cell_x,
-            row_top,
-            cell_width,
-            cell_height,
-        );
+        let containing_block_pushed =
+            self.push_table_cell_containing_block_if_positioned(cell_style, border_box, placement);
 
         self.ancestors = child_ancestors.clone();
         if let Some(children) = cell.children.as_deref() {
@@ -5772,21 +7413,15 @@ impl<'a> LayoutBuilder<'a> {
     pub(super) fn push_table_cell_containing_block_if_positioned(
         &mut self,
         cell_style: &ComputedStyle,
-        cell_x: f32,
-        row_top: f32,
-        cell_width: f32,
-        cell_height: f32,
+        border_box: TableCellBorderBox,
+        placement: TableGridPlacement,
     ) -> bool {
-        if cell_style.position != Position::Relative {
+        if !matches!(cell_style.position, Position::Relative | Position::Sticky) {
             return false;
         }
         let borders = used_border_widths(cell_style);
-        self.containing_blocks.push(ContainingBlock {
-            x: cell_x + borders.left,
-            top_y: row_top - borders.top,
-            width: (cell_width - borders.left - borders.right).max(0.0),
-            height: (cell_height - borders.top - borders.bottom).max(0.0),
-        });
+        self.containing_blocks
+            .push(placement.containing_block_for(border_box, borders));
         true
     }
 
@@ -5803,11 +7438,82 @@ impl<'a> LayoutBuilder<'a> {
     }
 }
 
-fn table_cell_participates_in_baseline(style: &ComputedStyle) -> bool {
-    !matches!(
-        style.vertical_align,
-        VerticalAlign::Top | VerticalAlign::Middle | VerticalAlign::Bottom
+/// Return whether a cell joins its row baseline-sharing group.
+///
+/// CSS Box Alignment only lets first/last baseline-aligned table cells
+/// participate when the cell inline axis is parallel to the table row's inline
+/// axis; orthogonal cells use baseline fallback instead:
+/// <https://www.w3.org/TR/css-align-3/#baseline-align-content>.
+fn table_cell_participates_in_baseline(
+    cell_style: &ComputedStyle,
+    row_style: &ComputedStyle,
+) -> bool {
+    if inline_start_side(cell_style.writing_mode, cell_style.direction).axis()
+        != inline_start_side(row_style.writing_mode, row_style.direction).axis()
+    {
+        return false;
+    }
+
+    if cell_style.align_content.keyword != ContentAlignmentKeyword::Normal {
+        return matches!(
+            cell_style.align_content.keyword,
+            ContentAlignmentKeyword::Baseline | ContentAlignmentKeyword::LastBaseline
+        );
+    }
+
+    matches!(
+        cell_style.vertical_align.table_cell_align,
+        TableCellVerticalAlign::Baseline
     )
+}
+
+fn table_cell_participates_in_row_baseline(
+    cell_style: &ComputedStyle,
+    row_style: &ComputedStyle,
+    placement: &TableCellPlacement,
+) -> bool {
+    if !table_cell_participates_in_baseline(cell_style, row_style) {
+        return false;
+    }
+    // CSS Align assigns row-spanning cells to the start-most row for first
+    // baseline alignment and to the end-most row for last baseline alignment.
+    // TableGrid stores a spanning cell on its start-most row; the end-most row
+    // target for last baseline is resolved later when painting the origin row.
+    // <https://www.w3.org/TR/css-align-3/#baseline-align-content>.
+    placement.rowspan == 1
+        || table_cell_alignment_baseline_set(cell_style) == TableCellBaselineSet::First
+}
+
+fn table_cell_alignment_baseline_set(style: &ComputedStyle) -> TableCellBaselineSet {
+    if style.align_content.keyword == ContentAlignmentKeyword::LastBaseline {
+        TableCellBaselineSet::Last
+    } else {
+        TableCellBaselineSet::First
+    }
+}
+
+/// Return whether inline table-cell contents expose a textual line baseline.
+///
+/// CSS table cells fall back to the bottom content edge when no in-flow line
+/// box baseline is available; atomic inline-only content must therefore not be
+/// mistaken for text-baseline content:
+/// <https://www.w3.org/TR/CSS22/tables.html#height-layout>.
+fn formatting_boxes_have_textual_baseline(children: &[box_tree::FormattingBox<'_>]) -> bool {
+    children.iter().any(|child| match child {
+        box_tree::FormattingBox::Text(_) => !box_tree::formatting_box_is_collapsible_space(child),
+        box_tree::FormattingBox::Line(box_) => !box_.children.is_empty(),
+        box_tree::FormattingBox::Inline(box_) => {
+            formatting_boxes_have_textual_baseline(&box_.children)
+        }
+        box_tree::FormattingBox::AnonymousBlock(box_) => {
+            formatting_boxes_have_textual_baseline(&box_.children)
+        }
+        box_tree::FormattingBox::Block(_)
+        | box_tree::FormattingBox::Table(_)
+        | box_tree::FormattingBox::Flex(_)
+        | box_tree::FormattingBox::AtomicInline(_)
+        | box_tree::FormattingBox::Replaced(_) => false,
+    })
 }
 
 /// Return whether a table-cell child needs a nested formatting-context pass.
@@ -5882,39 +7588,25 @@ fn table_cell_formatting_child_slice_height(child: &box_tree::FormattingBox<'_>)
     outer_height.max(descendant_visual_height)
 }
 
-fn table_cell_child_fragment_plans(
-    children: &[box_tree::FormattingBox<'_>],
-    mut child_top: f32,
-    slice_top: f32,
-    slice_bottom: f32,
-) -> Vec<TableCellChildFragmentPlan> {
-    let mut plans = Vec::new();
-    for (source_child_index, child_box) in children.iter().enumerate() {
-        if !table_cell_has_in_flow_layout_child(child_box) {
-            continue;
+fn table_cell_measured_inline_outer_height(child: &box_tree::FormattingBox<'_>) -> Option<f32> {
+    match child {
+        box_tree::FormattingBox::Inline(box_) => {
+            if matches!(box_.style.position, Position::Absolute | Position::Fixed) {
+                Some(0.0)
+            } else {
+                Some(table_cell_formatting_child_outer_height(child))
+            }
         }
-        let child_height = table_cell_formatting_child_slice_height(child_box);
-        if child_height <= 0.0 {
-            continue;
+        box_tree::FormattingBox::AtomicInline(_) | box_tree::FormattingBox::Replaced(_) => {
+            Some(table_cell_formatting_child_outer_height(child))
         }
-        let child_bottom = child_top - child_height;
-        if child_top >= slice_bottom
-            && child_bottom <= slice_top
-            && let Some(kind) = table_cell_child_fragment_kind(child_box)
-        {
-            plans.push(TableCellChildFragmentPlan {
-                source_child_index,
-                child_top,
-                child_height,
-                slice_top,
-                slice_bottom,
-                kind,
-                nested_fragment: None,
-            });
-        }
-        child_top = child_bottom;
+        box_tree::FormattingBox::AnonymousBlock(_)
+        | box_tree::FormattingBox::Block(_)
+        | box_tree::FormattingBox::Table(_)
+        | box_tree::FormattingBox::Flex(_)
+        | box_tree::FormattingBox::Line(_)
+        | box_tree::FormattingBox::Text(_) => None,
     }
-    plans
 }
 
 fn table_cell_child_fragment_kind(
@@ -5936,35 +7628,7 @@ fn table_cell_child_fragment_kind(
     }
 }
 
-fn table_cell_formatting_box_text(children: &[box_tree::FormattingBox<'_>]) -> String {
-    let mut text = String::new();
-    for child in children {
-        match child {
-            box_tree::FormattingBox::Text(box_) => {
-                text.push_str(&normalized_text_for_style(&box_.text, &box_.style));
-            }
-            box_tree::FormattingBox::Line(box_) => {
-                for text_box in &box_.children {
-                    text.push_str(&normalized_text_for_style(&text_box.text, &text_box.style));
-                }
-            }
-            box_tree::FormattingBox::Inline(box_) => {
-                text.push_str(&table_cell_formatting_box_text(&box_.children));
-            }
-            box_tree::FormattingBox::AnonymousBlock(box_) => {
-                text.push_str(&table_cell_formatting_box_text(&box_.children));
-            }
-            box_tree::FormattingBox::Block(_)
-            | box_tree::FormattingBox::AtomicInline(_)
-            | box_tree::FormattingBox::Table(_)
-            | box_tree::FormattingBox::Flex(_)
-            | box_tree::FormattingBox::Replaced(_) => {}
-        }
-    }
-    text
-}
-
-fn table_cell_children_can_use_inline_fragmentation_plan(
+fn table_cell_children_can_use_inline_line_sequence(
     children: &[box_tree::FormattingBox<'_>],
 ) -> bool {
     children.iter().all(|child| match child {
@@ -5972,10 +7636,10 @@ fn table_cell_children_can_use_inline_fragmentation_plan(
         box_tree::FormattingBox::Inline(box_) => {
             !matches!(box_.style.position, Position::Absolute | Position::Fixed)
                 && box_.style.float == Float::None
-                && table_cell_children_can_use_inline_fragmentation_plan(&box_.children)
+                && table_cell_children_can_use_inline_line_sequence(&box_.children)
         }
         box_tree::FormattingBox::AnonymousBlock(box_) => {
-            table_cell_children_can_use_inline_fragmentation_plan(&box_.children)
+            table_cell_children_can_use_inline_line_sequence(&box_.children)
         }
         box_tree::FormattingBox::AtomicInline(_) => false,
         box_tree::FormattingBox::Block(_)

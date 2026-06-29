@@ -6,52 +6,14 @@ pub(super) fn apply_background_shorthand(
     base_url: Option<&std::path::Path>,
     root_url: Option<&std::path::Path>,
 ) {
-    style.background_origin = BackgroundBox::Padding;
-    style.background_clip = BackgroundBox::Border;
     style.background_color =
         parse_color(value).or_else(|| background_tokens(value).into_iter().find_map(parse_color));
-    style.background_image = parse_background_image(value, base_url, root_url);
-    style.background_repeat = parse_background_repeat(value).unwrap_or(BackgroundRepeat::Repeat);
-    if let Some((position, size)) = split_background_position_size(value) {
-        if !position.trim().is_empty()
-            && let Some(position) = parse_background_position(position.trim(), style.font_size)
-        {
-            style.background_position = position;
-        }
-        if !size.trim().is_empty()
-            && let Some(size) = parse_background_size(size.trim(), style.font_size)
-        {
-            style.background_size = size;
-        }
-    } else if background_tokens(value)
-        .into_iter()
-        .any(|token| token.eq_ignore_ascii_case("center"))
-    {
-        style.background_position = BackgroundPosition {
-            x: BackgroundPositionAxis {
-                origin: BackgroundPositionOrigin::Center,
-                offset: ComputedLengthPercentage::ZERO,
-            },
-            y: BackgroundPositionAxis {
-                origin: BackgroundPositionOrigin::Center,
-                offset: ComputedLengthPercentage::ZERO,
-            },
-        };
-    }
-    let boxes = background_tokens(value)
-        .into_iter()
-        .filter_map(parse_background_box)
-        .collect::<Vec<_>>();
-    match boxes.as_slice() {
-        [box_] => {
-            style.background_origin = *box_;
-            style.background_clip = *box_;
-        }
-        [origin, clip, ..] => {
-            style.background_origin = *origin;
-            style.background_clip = *clip;
-        }
-        [] => {}
+    style.background_layers =
+        parse_background_shorthand_layers(value, style.font_size, base_url, root_url);
+    if style.background_layers.is_empty() {
+        sync_background_layers_from_single_fields(style);
+    } else {
+        sync_background_single_fields_from_layers(style);
     }
 }
 
@@ -99,6 +61,100 @@ pub(super) fn parse_background_repeat(value: &str) -> Option<BackgroundRepeat> {
         ["no-repeat", "repeat"] => Some(BackgroundRepeat::RepeatY),
         _ => None,
     }
+}
+
+pub(super) fn apply_background_image_list(
+    style: &mut ComputedStyle,
+    value: &str,
+    base_url: Option<&std::path::Path>,
+    root_url: Option<&std::path::Path>,
+) {
+    let images = parse_background_image_layers(value, base_url, root_url);
+    if images.is_empty() {
+        style.background_image = None;
+        style.background_layers.clear();
+        return;
+    }
+    ensure_background_layer_count(style, images.len());
+    for (index, layer) in style.background_layers.iter_mut().enumerate() {
+        layer.image = repeated_layer_value(&images, index);
+    }
+    sync_background_single_fields_from_layers(style);
+}
+
+pub(super) fn apply_background_size_list(style: &mut ComputedStyle, value: &str) {
+    let values = split_background_layer_values(value)
+        .into_iter()
+        .filter_map(|part| parse_background_size(part, style.font_size))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    ensure_background_layer_count(style, values.len());
+    for (index, layer) in style.background_layers.iter_mut().enumerate() {
+        layer.size = repeated_layer_value(&values, index);
+    }
+    sync_background_single_fields_from_layers(style);
+}
+
+pub(super) fn apply_background_position_list(style: &mut ComputedStyle, value: &str) {
+    let values = split_background_layer_values(value)
+        .into_iter()
+        .filter_map(|part| parse_background_position(part, style.font_size))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    ensure_background_layer_count(style, values.len());
+    for (index, layer) in style.background_layers.iter_mut().enumerate() {
+        layer.position = repeated_layer_value(&values, index);
+    }
+    sync_background_single_fields_from_layers(style);
+}
+
+pub(super) fn apply_background_repeat_list(style: &mut ComputedStyle, value: &str) {
+    let values = split_background_layer_values(value)
+        .into_iter()
+        .filter_map(parse_background_repeat)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    ensure_background_layer_count(style, values.len());
+    for (index, layer) in style.background_layers.iter_mut().enumerate() {
+        layer.repeat = repeated_layer_value(&values, index);
+    }
+    sync_background_single_fields_from_layers(style);
+}
+
+pub(super) fn apply_background_origin_list(style: &mut ComputedStyle, value: &str) {
+    let values = split_background_layer_values(value)
+        .into_iter()
+        .filter_map(parse_background_box)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    ensure_background_layer_count(style, values.len());
+    for (index, layer) in style.background_layers.iter_mut().enumerate() {
+        layer.origin = repeated_layer_value(&values, index);
+    }
+    sync_background_single_fields_from_layers(style);
+}
+
+pub(super) fn apply_background_clip_list(style: &mut ComputedStyle, value: &str) {
+    let values = split_background_layer_values(value)
+        .into_iter()
+        .filter_map(parse_background_box)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    ensure_background_layer_count(style, values.len());
+    for (index, layer) in style.background_layers.iter_mut().enumerate() {
+        layer.clip = repeated_layer_value(&values, index);
+    }
+    sync_background_single_fields_from_layers(style);
 }
 
 /// Parses `background-size` for a single background layer.
@@ -210,6 +266,177 @@ pub(super) fn parse_background_image(
         base_url: base_url.map(std::path::Path::to_path_buf),
         root_url: root_url.map(std::path::Path::to_path_buf),
     })
+}
+
+pub(super) fn sync_background_layers_from_single_fields(style: &mut ComputedStyle) {
+    style.background_layers = vec![layer_from_single_fields(style)];
+}
+
+pub(super) fn sync_background_single_fields_from_layers(style: &mut ComputedStyle) {
+    let Some(layer) = style.background_layers.first() else {
+        style.background_image = None;
+        style.background_size = BackgroundSize::AUTO;
+        style.background_position = BackgroundPosition::INITIAL;
+        style.background_repeat = BackgroundRepeat::Repeat;
+        style.background_origin = BackgroundBox::Padding;
+        style.background_clip = BackgroundBox::Border;
+        return;
+    };
+    style.background_image = layer.image.clone();
+    style.background_size = layer.size;
+    style.background_position = layer.position;
+    style.background_repeat = layer.repeat;
+    style.background_origin = layer.origin;
+    style.background_clip = layer.clip;
+}
+
+fn layer_from_single_fields(style: &ComputedStyle) -> BackgroundLayer {
+    BackgroundLayer {
+        image: style.background_image.clone(),
+        position: style.background_position,
+        size: style.background_size,
+        repeat: style.background_repeat,
+        origin: style.background_origin,
+        clip: style.background_clip,
+    }
+}
+
+fn ensure_background_layer_count(style: &mut ComputedStyle, count: usize) {
+    if count == 0 {
+        return;
+    }
+    if style.background_layers.is_empty() {
+        style
+            .background_layers
+            .push(layer_from_single_fields(style));
+    }
+    while style.background_layers.len() < count {
+        let layer = style
+            .background_layers
+            .last()
+            .cloned()
+            .unwrap_or_else(BackgroundLayer::initial);
+        style.background_layers.push(layer);
+    }
+}
+
+fn repeated_layer_value<T: Clone>(values: &[T], index: usize) -> T {
+    values[index % values.len()].clone()
+}
+
+fn parse_background_image_layers(
+    value: &str,
+    base_url: Option<&std::path::Path>,
+    root_url: Option<&std::path::Path>,
+) -> Vec<Option<BackgroundImage>> {
+    split_background_layer_values(value)
+        .into_iter()
+        .map(|part| {
+            if trim_css_value(part).eq_ignore_ascii_case("none") {
+                None
+            } else {
+                parse_background_image(part, base_url, root_url)
+            }
+        })
+        .collect()
+}
+
+fn parse_background_shorthand_layers(
+    value: &str,
+    font_size: f32,
+    base_url: Option<&std::path::Path>,
+    root_url: Option<&std::path::Path>,
+) -> Vec<BackgroundLayer> {
+    split_background_layer_values(value)
+        .into_iter()
+        .map(|part| {
+            let mut layer = BackgroundLayer::initial();
+            layer.image = parse_background_image(part, base_url, root_url);
+            layer.repeat = parse_background_repeat(part).unwrap_or(BackgroundRepeat::Repeat);
+            if let Some((position, size)) = split_background_position_size(part) {
+                if !position.trim().is_empty()
+                    && let Some(position) = parse_background_position(position.trim(), font_size)
+                {
+                    layer.position = position;
+                }
+                if !size.trim().is_empty()
+                    && let Some(size) = parse_background_size(size.trim(), font_size)
+                {
+                    layer.size = size;
+                }
+            } else if background_tokens(part)
+                .into_iter()
+                .any(|token| token.eq_ignore_ascii_case("center"))
+            {
+                layer.position = BackgroundPosition {
+                    x: BackgroundPositionAxis {
+                        origin: BackgroundPositionOrigin::Center,
+                        offset: ComputedLengthPercentage::ZERO,
+                    },
+                    y: BackgroundPositionAxis {
+                        origin: BackgroundPositionOrigin::Center,
+                        offset: ComputedLengthPercentage::ZERO,
+                    },
+                };
+            }
+            let boxes = background_tokens(part)
+                .into_iter()
+                .filter_map(parse_background_box)
+                .collect::<Vec<_>>();
+            match boxes.as_slice() {
+                [box_] => {
+                    layer.origin = *box_;
+                    layer.clip = *box_;
+                }
+                [origin, clip, ..] => {
+                    layer.origin = *origin;
+                    layer.clip = *clip;
+                }
+                [] => {}
+            }
+            layer
+        })
+        .collect()
+}
+
+fn split_background_layer_values(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote.is_some() {
+            if character == '\\' {
+                escaped = true;
+            } else if Some(character) == quote {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '"' | '\'' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let part = trim_css_value(&value[start..index]);
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let part = trim_css_value(&value[start..]);
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
 }
 
 /// Parses the supported `linear-gradient()` subset.
