@@ -1,5 +1,5 @@
 use super::super::*;
-use super::graph::{InlineLineFragment, measured_inline_items};
+use super::graph::InlineLineFragment;
 use crate::layout::inline_collect::{
     insert_text_autospace_items, normalize_inline_whitespace_items,
 };
@@ -183,7 +183,7 @@ impl<'a> LayoutBuilder<'a> {
                         cursor.starts_after_forced_break = false;
                     }
                 }
-                _ => paragraph.push(item.clone()),
+                _ => paragraph.push(item),
             }
         }
         let _ = self.collect_inline_paragraph_lines(
@@ -401,7 +401,7 @@ impl<'a> LayoutBuilder<'a> {
 
     fn collect_inline_paragraph_lines(
         &mut self,
-        paragraph: &mut Vec<InlineItem>,
+        paragraph: &mut Vec<&InlineItem>,
         context: InlineParagraphContext<'_>,
         cursor: InlineLineSequenceCursor,
         force_empty_line: bool,
@@ -441,7 +441,8 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         let paragraph_start_line_index = line_index;
-        let graph = self.build_inline_opportunity_graph(paragraph, context.block_style);
+        let graph =
+            self.build_inline_opportunity_graph(paragraph.iter().copied(), context.block_style);
         let (line_boxes, next_line_index) = self.select_inline_lines_from_graph(
             &graph,
             context,
@@ -453,7 +454,7 @@ impl<'a> LayoutBuilder<'a> {
             .map(|line_box| {
                 last_hanging_punctuation_width_for_line_items(
                     &mut self.font_system,
-                    &measured_inline_items(&line_box.items),
+                    &line_box.items,
                     context.block_style,
                 )
             })
@@ -575,7 +576,7 @@ impl<'a> LayoutBuilder<'a> {
         let line_available_width = (line.available_width - line.used_indent).max(1.0);
         let hanging_widths = hanging_punctuation_widths_for_line_items(
             &mut self.font_system,
-            &measured_inline_items(&line_box.items),
+            &line_box.items,
             block_style,
             line.is_first_formatted_line,
             line.is_last_line_in_paragraph,

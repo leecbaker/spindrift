@@ -150,7 +150,7 @@ impl<'a> LayoutBuilder<'a> {
             .map(|line_box| {
                 last_hanging_punctuation_width_for_line_items(
                     &mut self.font_system,
-                    &measured_inline_items(&line_box.items),
+                    &line_box.items,
                     block_style,
                 )
             })
@@ -673,10 +673,8 @@ impl<'a> LayoutBuilder<'a> {
             shaped: None,
         });
         combined_items.extend(suffix.items);
-        let combined_line_items = measured_inline_items(&combined_items);
         let width = combined_items.iter().map(|item| item.width).sum::<f32>();
-        let metrics =
-            self.mixed_inline_line_metrics(&combined_line_items, context.block_style, width);
+        let metrics = self.mixed_inline_line_metrics(&combined_items, context.block_style, width);
         if (metrics.height - prefix.metrics.height).abs() > INLINE_FLOAT_EPSILON {
             return None;
         }
@@ -752,28 +750,49 @@ impl<'a> LayoutBuilder<'a> {
                 start,
                 end: opportunity.position,
             };
-            let materialized = graph.materialize_line(
-                range,
-                (opportunity.position < graph.end_position()).then_some(opportunity),
-                &mut self.font_system,
-                block_style,
-            );
-            if materialized.items.is_empty() {
-                continue;
-            }
-            let line_items = measured_inline_items(&materialized.items);
+            let selected_break =
+                (opportunity.position < graph.end_position()).then_some(opportunity);
             let remaining_allows_last =
                 graph_remaining_allows_last_hanging_punctuation(graph, opportunity.position);
-            let hanging_widths = hanging_punctuation_widths_for_line_items(
-                &mut self.font_system,
-                &line_items,
-                block_style,
-                line_index == 0,
-                remaining_allows_last,
-                true,
-            );
-            let fit_width =
-                (materialized.content_width - hanging_widths.start - hanging_widths.end).max(0.0);
+            let fit_width = if let Some(measurement) = graph
+                .borrowed_line_measurement_for_full_run_range(
+                    range,
+                    selected_break,
+                    &mut self.font_system,
+                ) {
+                let runs = &graph.runs[measurement.run_range];
+                if runs.is_empty() {
+                    continue;
+                }
+                let hanging_widths = hanging_punctuation_widths_for_line_items(
+                    &mut self.font_system,
+                    runs,
+                    block_style,
+                    line_index == 0,
+                    remaining_allows_last,
+                    true,
+                );
+                (measurement.content_width - hanging_widths.start - hanging_widths.end).max(0.0)
+            } else {
+                let materialized = graph.materialize_line(
+                    range,
+                    selected_break,
+                    &mut self.font_system,
+                    block_style,
+                );
+                if materialized.items.is_empty() {
+                    continue;
+                }
+                let hanging_widths = hanging_punctuation_widths_for_line_items(
+                    &mut self.font_system,
+                    &materialized.items,
+                    block_style,
+                    line_index == 0,
+                    remaining_allows_last,
+                    true,
+                );
+                (materialized.content_width - hanging_widths.start - hanging_widths.end).max(0.0)
+            };
             if fit_width <= line_available_width + 0.5 {
                 let selected = SelectedInlineLineEnd {
                     position: opportunity.position,
@@ -873,9 +892,11 @@ impl<'a> LayoutBuilder<'a> {
             &mut self.font_system,
             line_available_width,
         );
-        let items = measured_inline_items(&materialized.items);
-        let metrics =
-            self.mixed_inline_line_metrics(&items, block_style, materialized.content_width);
+        let metrics = self.mixed_inline_line_metrics(
+            &materialized.items,
+            block_style,
+            materialized.content_width,
+        );
         InlineLineFragment {
             items: materialized.items,
             metrics,
@@ -987,10 +1008,10 @@ impl<'a> LayoutBuilder<'a> {
         items: &[MeasuredInlineItem],
         block_style: &ComputedStyle,
     ) -> Vec<MeasuredInlineItem> {
-        let line_items = measured_inline_items(items);
-        if !mixed_inline_line_needs_bidi_ordering(&line_items, block_style) {
+        if !mixed_inline_line_needs_bidi_ordering(items, block_style) {
             return items.to_vec();
         }
+        let line_items = measured_inline_items(items);
         self.visual_ordered_mixed_inline_line(&line_items, block_style)
             .into_iter()
             .map(|item| {
@@ -1125,22 +1146,25 @@ impl<'a> LayoutBuilder<'a> {
     /// calculation:
     /// <https://www.w3.org/TR/css-inline-3/#line-box> and
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>.
-    fn mixed_inline_line_metrics(
+    fn mixed_inline_line_metrics<T>(
         &mut self,
-        items: &[InlineLineItem],
+        items: &[T],
         block_style: &ComputedStyle,
         width: f32,
-    ) -> InlineLineMetrics {
+    ) -> InlineLineMetrics
+    where
+        T: AsRef<InlineLineItem>,
+    {
         let (baseline_offset, descent) =
             self.mixed_inline_line_baseline_extents(items, block_style);
         let edge_aligned_height = self.mixed_inline_line_edge_aligned_height(items, block_style);
         let text_only_height = items
             .iter()
-            .all(|item| matches!(item, InlineLineItem::Fragment(_)))
+            .all(|item| matches!(item.as_ref(), InlineLineItem::Fragment(_)))
             .then(|| {
                 items
                     .iter()
-                    .filter_map(|item| match item {
+                    .filter_map(|item| match item.as_ref() {
                         InlineLineItem::Fragment(fragment) => Some(fragment.style.line_height),
                         InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
                     })
@@ -1155,13 +1179,17 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
-    fn mixed_inline_line_baseline_extents(
+    fn mixed_inline_line_baseline_extents<T>(
         &mut self,
-        items: &[InlineLineItem],
+        items: &[T],
         block_style: &ComputedStyle,
-    ) -> (f32, f32) {
+    ) -> (f32, f32)
+    where
+        T: AsRef<InlineLineItem>,
+    {
         let (mut baseline_offset, mut descent) = self.inline_style_line_extents(block_style, 0.0);
         for item in items {
+            let item = item.as_ref();
             if Self::inline_line_item_aligns_to_line_box_edge(item) {
                 continue;
             }
@@ -1173,13 +1201,17 @@ impl<'a> LayoutBuilder<'a> {
         (baseline_offset, descent)
     }
 
-    fn mixed_inline_line_edge_aligned_height(
+    fn mixed_inline_line_edge_aligned_height<T>(
         &mut self,
-        items: &[InlineLineItem],
+        items: &[T],
         block_style: &ComputedStyle,
-    ) -> f32 {
+    ) -> f32
+    where
+        T: AsRef<InlineLineItem>,
+    {
         let mut height: f32 = 0.0;
         for item in items {
+            let item = item.as_ref();
             if Self::inline_line_item_aligns_to_line_box_edge(item) {
                 height = height.max(inline_line_item_logical_block_size(item, block_style));
             }
@@ -1194,13 +1226,13 @@ struct RangedMixedInlineLineItem {
     range: std::ops::Range<usize>,
 }
 
-fn mixed_inline_line_needs_bidi_ordering(
-    items: &[InlineLineItem],
-    block_style: &ComputedStyle,
-) -> bool {
+fn mixed_inline_line_needs_bidi_ordering<T>(items: &[T], block_style: &ComputedStyle) -> bool
+where
+    T: AsRef<InlineLineItem>,
+{
     block_style.direction == Direction::Rtl
         || inline_bidi_scope_affects_line_ordering(block_style)
-        || items.iter().any(|item| match item {
+        || items.iter().any(|item| match item.as_ref() {
             InlineLineItem::Fragment(fragment) => {
                 contains_bidi_text(&fragment.text)
                     || inline_bidi_scope_affects_line_ordering(&fragment.style)

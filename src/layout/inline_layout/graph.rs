@@ -21,6 +21,12 @@ pub(in crate::layout) struct InlineParagraphRun {
     pub(in crate::layout) shaped: Option<ShapedInlineLine>,
 }
 
+impl AsRef<InlineLineItem> for InlineParagraphRun {
+    fn as_ref(&self) -> &InlineLineItem {
+        &self.item
+    }
+}
+
 /// One selected inline item with the measurement artifact used for line layout.
 ///
 /// CSS Inline lays out a stream of text fragments and atomic inline boxes. Text
@@ -34,6 +40,12 @@ pub(in crate::layout) struct MeasuredInlineItem {
     pub(in crate::layout) item: InlineLineItem,
     pub(in crate::layout) width: f32,
     pub(in crate::layout) shaped: Option<ShapedInlineLine>,
+}
+
+impl AsRef<InlineLineItem> for MeasuredInlineItem {
+    fn as_ref(&self) -> &InlineLineItem {
+        &self.item
+    }
 }
 
 /// A graph-selected line after CSS Text line-edge effects are applied.
@@ -58,10 +70,43 @@ pub(in crate::layout) struct MaterializedInlineGraphLine {
     pub(in crate::layout) trailing_tracking_width: f32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct InlineContentWidth {
+    content_width: f32,
+    trailing_space_width: f32,
+    trailing_tracking_width: f32,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::layout) struct BorrowedInlineLineMeasurement {
+    pub(in crate::layout) run_range: std::ops::Range<usize>,
+    pub(in crate::layout) content_width: f32,
+}
+
 pub(in crate::layout) fn measured_inline_items(
     items: &[MeasuredInlineItem],
 ) -> Vec<InlineLineItem> {
     items.iter().map(|item| item.item.clone()).collect()
+}
+
+fn inline_content_width_for_line_items<T, F>(
+    items: &[T],
+    font_system: &mut FontSystem,
+    mut item_width: F,
+) -> InlineContentWidth
+where
+    T: AsRef<InlineLineItem>,
+    F: FnMut(&T) -> f32,
+{
+    let raw_width = items.iter().map(&mut item_width).sum::<f32>();
+    let trailing_space_width =
+        trailing_hanging_space_separator_width_for_line_items(items, font_system);
+    let trailing_tracking_width = trailing_letter_spacing_width_for_line_items(items);
+    InlineContentWidth {
+        content_width: (raw_width - trailing_space_width - trailing_tracking_width).max(0.0),
+        trailing_space_width,
+        trailing_tracking_width,
+    }
 }
 
 /// Resolve generated `leader()` atoms inside one selected graph line.
@@ -91,9 +136,8 @@ pub(in crate::layout) fn resolve_materialized_line_leaders(
         return;
     }
 
-    let old_items = measured_inline_items(&line.items);
     let old_trailing_space_width =
-        trailing_hanging_space_separator_width_for_line_items(&old_items, font_system);
+        trailing_hanging_space_separator_width_for_line_items(&line.items, font_system);
     let consumed_pre_wrap_width = (line.hanging_space_width - old_trailing_space_width).max(0.0);
     let mut remaining_inline_width = (available_inline_width - line.content_width).max(0.0);
     let mut remaining_leaders = leader_count;
@@ -153,13 +197,10 @@ pub(in crate::layout) fn resolve_materialized_line_leaders(
     }
 
     line.items = resolved_items;
-    let line_items = measured_inline_items(&line.items);
-    let raw_width = line.items.iter().map(|item| item.width).sum::<f32>();
-    let trailing_space_width =
-        trailing_hanging_space_separator_width_for_line_items(&line_items, font_system);
-    line.trailing_tracking_width = trailing_letter_spacing_width_for_line_items(&line_items);
-    line.hanging_space_width = consumed_pre_wrap_width + trailing_space_width;
-    line.content_width = (raw_width - trailing_space_width - line.trailing_tracking_width).max(0.0);
+    let widths = inline_content_width_for_line_items(&line.items, font_system, |item| item.width);
+    line.trailing_tracking_width = widths.trailing_tracking_width;
+    line.hanging_space_width = consumed_pre_wrap_width + widths.trailing_space_width;
+    line.content_width = widths.content_width;
     line.text = text_for_measured_items(&line.items);
 }
 
@@ -334,24 +375,32 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://www.w3.org/TR/css-text-3/#text-transform-property>,
     /// <https://www.w3.org/TR/css-text-3/#line-breaking>, and
     /// <https://www.w3.org/TR/css-inline-3/#atomic-inline>.
-    pub(in crate::layout) fn build_inline_opportunity_graph(
+    pub(in crate::layout) fn build_inline_opportunity_graph<I>(
         &mut self,
-        items: &[InlineItem],
+        items: I,
         block_style: &ComputedStyle,
-    ) -> InlineOpportunityGraph {
+    ) -> InlineOpportunityGraph
+    where
+        I: IntoIterator,
+        I::Item: AsRef<InlineItem>,
+    {
         build_inline_opportunity_graph(&mut self.font_system, items, block_style)
     }
 }
 
-pub(in crate::layout) fn build_inline_opportunity_graph(
+pub(in crate::layout) fn build_inline_opportunity_graph<I>(
     font_system: &mut FontSystem,
-    items: &[InlineItem],
+    items: I,
     block_style: &ComputedStyle,
-) -> InlineOpportunityGraph {
+) -> InlineOpportunityGraph
+where
+    I: IntoIterator,
+    I::Item: AsRef<InlineItem>,
+{
     let mut runs = Vec::new();
     let mut transform_state = TextTransformState::default();
     for item in items {
-        match item {
+        match item.as_ref() {
             InlineItem::Word(word) => {
                 let text = transform_text_with_state(&word.text, &word.style, &mut transform_state);
                 push_text_graph_runs(font_system, &mut runs, word, &text);
@@ -451,20 +500,6 @@ impl InlineOpportunityGraph {
         InlineGraphPosition::at_run_start(self.runs.len())
     }
 
-    pub(in crate::layout) fn line_items(
-        &self,
-        range: std::ops::Range<usize>,
-    ) -> Vec<InlineLineItem> {
-        self.runs[range]
-            .iter()
-            .map(|run| run.item.clone())
-            .collect()
-    }
-
-    pub(in crate::layout) fn line_width(&self, range: std::ops::Range<usize>) -> f32 {
-        self.runs[range].iter().map(|run| run.width).sum()
-    }
-
     pub(in crate::layout) fn float_at_position(
         &self,
         position: InlineGraphPosition,
@@ -534,21 +569,16 @@ impl InlineOpportunityGraph {
             selected_break.is_some_and(|opportunity| opportunity.soft_hyphen),
             font_system,
         );
-        let line_items = measured_inline_items(&items);
-        let raw_width = items.iter().map(|item| item.width).sum::<f32>();
-        let trailing_space_width =
-            trailing_hanging_space_separator_width_for_line_items(&line_items, font_system);
-        let trailing_tracking_width = trailing_letter_spacing_width_for_line_items(&line_items);
-        let hanging_space_width = consumed_pre_wrap_width + trailing_space_width;
-        let content_width = (raw_width - trailing_space_width - trailing_tracking_width).max(0.0);
+        let widths = inline_content_width_for_line_items(&items, font_system, |item| item.width);
+        let hanging_space_width = consumed_pre_wrap_width + widths.trailing_space_width;
         let text = text_for_measured_items(&items);
         MaterializedInlineGraphLine {
             items,
             text,
-            content_width,
+            content_width: widths.content_width,
             trimmed_width,
             hanging_space_width,
-            trailing_tracking_width,
+            trailing_tracking_width: widths.trailing_tracking_width,
         }
     }
 
@@ -576,6 +606,47 @@ impl InlineOpportunityGraph {
         }
         .min(self.runs.len());
         (range.start.run_index < end_run).then_some(range.start.run_index..end_run)
+    }
+
+    pub(in crate::layout) fn borrowed_line_measurement_for_full_run_range(
+        &self,
+        range: InlineGraphRange,
+        selected_break: Option<InlineBreakOpportunity>,
+        font_system: &mut FontSystem,
+    ) -> Option<BorrowedInlineLineMeasurement> {
+        if range.start.byte_offset != 0 || range.end.byte_offset != 0 {
+            return None;
+        }
+        let mut run_range = self.run_indices_for_graph_range(range)?;
+        while run_range.end > run_range.start
+            && inline_line_item_is_collapsible_space(&self.runs[run_range.end - 1].item)
+        {
+            run_range.end -= 1;
+        }
+        if selected_break
+            .is_some_and(|opportunity| opportunity.hangs || opportunity_is_soft_wrap(opportunity))
+        {
+            while run_range.end > run_range.start
+                && inline_line_item_is_pre_wrap_hanging_space(&self.runs[run_range.end - 1].item)
+            {
+                run_range.end -= 1;
+            }
+        }
+        let runs = &self.runs[run_range.clone()];
+        if runs.iter().any(|run| match &run.item {
+            InlineLineItem::Fragment(fragment) => fragment_text_needs_materialized_normalization(
+                &fragment.text,
+                selected_break.is_some_and(|opportunity| opportunity.soft_hyphen),
+            ),
+            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => false,
+        }) {
+            return None;
+        }
+        let widths = inline_content_width_for_line_items(runs, font_system, |run| run.width);
+        Some(BorrowedInlineLineMeasurement {
+            run_range,
+            content_width: widths.content_width,
+        })
     }
 
     fn measured_run_slice_for_graph_range(
@@ -652,21 +723,17 @@ impl InlineOpportunityGraph {
         if self.runs.is_empty() {
             return InlineIntrinsicContribution::default();
         }
-        let line_items = self.line_items(0..self.runs.len());
+        let widths = inline_content_width_for_line_items(&self.runs, font_system, |run| run.width);
         let hanging_widths = hanging_punctuation_widths_for_line_items(
             font_system,
-            &line_items,
+            &self.runs,
             block_style,
             true,
             true,
             false,
         );
-        let max_content = (self.line_width(0..self.runs.len())
-            - trailing_hanging_space_separator_width_for_line_items(&line_items, font_system)
-            - trailing_letter_spacing_width_for_line_items(&line_items)
-            - hanging_widths.start
-            - hanging_widths.end)
-            .max(0.0);
+        let max_content =
+            (widths.content_width - hanging_widths.start - hanging_widths.end).max(0.0);
 
         let mut min_content = 0.0_f32;
         let mut segment_start = self.start_position();
@@ -708,6 +775,11 @@ impl InlineOpportunityGraph {
         font_system: &mut FontSystem,
         block_style: &ComputedStyle,
     ) -> f32 {
+        if let Some(measurement) =
+            self.borrowed_line_measurement_for_full_run_range(range, None, font_system)
+        {
+            return measurement.content_width;
+        }
         let materialized = self.materialize_line(range, None, font_system, block_style);
         if materialized.items.is_empty() {
             return 0.0;
@@ -762,12 +834,13 @@ fn normalize_materialized_control_characters(
     let mut index = 0;
     while index < items.len() {
         let mut remove = false;
-        if let InlineLineItem::Fragment(fragment) = &mut items[index].item {
-            let original = fragment.text.clone();
-            fragment.text = normalize_materialized_fragment_text(
-                original,
+        if let InlineLineItem::Fragment(fragment) = &mut items[index].item
+            && let Some(text) = normalize_materialized_fragment_text(
+                &fragment.text,
                 Some(index) == trailing_soft_hyphen_index,
-            );
+            )
+        {
+            fragment.text = text;
             remove = fragment.text.is_empty();
             if !remove {
                 remeasure_materialized_item(&mut items[index], font_system);
@@ -781,25 +854,43 @@ fn normalize_materialized_control_characters(
     }
 }
 
-fn normalize_materialized_fragment_text(
-    mut text: String,
+fn fragment_text_needs_materialized_normalization(
+    text: &str,
     visible_trailing_soft_hyphen: bool,
-) -> String {
+) -> bool {
     const SOFT_HYPHEN: char = '\u{00ad}';
     const ZERO_WIDTH_SPACE: char = '\u{200b}';
-    if text.contains(ZERO_WIDTH_SPACE) {
-        text = text.replace(ZERO_WIDTH_SPACE, "");
+    text.contains(ZERO_WIDTH_SPACE)
+        || text.contains(SOFT_HYPHEN)
+        || (visible_trailing_soft_hyphen && text.ends_with(SOFT_HYPHEN))
+}
+
+fn normalize_materialized_fragment_text(
+    text: &str,
+    visible_trailing_soft_hyphen: bool,
+) -> Option<String> {
+    const SOFT_HYPHEN: char = '\u{00ad}';
+    const ZERO_WIDTH_SPACE: char = '\u{200b}';
+    let has_zero_width_space = text.contains(ZERO_WIDTH_SPACE);
+    let has_soft_hyphen = text.contains(SOFT_HYPHEN);
+    if !has_zero_width_space && !has_soft_hyphen {
+        return None;
     }
-    if !text.contains(SOFT_HYPHEN) {
-        return text;
-    }
-    if visible_trailing_soft_hyphen && text.ends_with(SOFT_HYPHEN) {
-        text.pop();
-        text = text.replace(SOFT_HYPHEN, "");
-        text.push('-');
-        text
+    let mut normalized = if has_zero_width_space {
+        text.replace(ZERO_WIDTH_SPACE, "")
     } else {
-        text.replace(SOFT_HYPHEN, "")
+        text.to_string()
+    };
+    if !has_soft_hyphen {
+        return Some(normalized);
+    }
+    if visible_trailing_soft_hyphen && normalized.ends_with(SOFT_HYPHEN) {
+        normalized.pop();
+        normalized = normalized.replace(SOFT_HYPHEN, "");
+        normalized.push('-');
+        Some(normalized)
+    } else {
+        Some(normalized.replace(SOFT_HYPHEN, ""))
     }
 }
 

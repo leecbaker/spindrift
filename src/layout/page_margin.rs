@@ -2151,7 +2151,7 @@ fn accumulate_page_margin_intrinsic_paragraph(
     if paragraph.is_empty() {
         return;
     }
-    let graph = inline_layout::build_inline_opportunity_graph(font_system, paragraph, style);
+    let graph = inline_layout::build_inline_opportunity_graph(font_system, paragraph.iter(), style);
     let contribution = graph.intrinsic_contribution(font_system, style);
     *min_content = (*min_content).max(contribution.min_content);
     *max_content = (*max_content).max(contribution.max_content);

@@ -639,7 +639,7 @@ impl<'a> LayoutBuilder<'a> {
         }
         let paragraph_index = output.paragraphs.len();
         let paragraph_start_line_index = output.sequence.records.len();
-        let graph = self.build_inline_opportunity_graph(paragraph, context.block_style);
+        let graph = self.build_inline_opportunity_graph(paragraph.iter(), context.block_style);
         let contribution = graph.intrinsic_contribution(&mut self.font_system, context.block_style);
         let (lines, next_line_count) = self.select_inline_lines_from_graph(
             &graph,
@@ -660,7 +660,7 @@ impl<'a> LayoutBuilder<'a> {
             .map(|line| {
                 last_hanging_punctuation_width_for_line_items(
                     &mut self.font_system,
-                    &inline_layout::measured_inline_items(&line.items),
+                    &line.items,
                     context.block_style,
                 )
             })

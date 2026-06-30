@@ -1058,6 +1058,46 @@ async fn block_in_inline_zero_height_margins_collapse_to_larger_gap() {
 }
 
 #[tokio::test]
+async fn block_in_inline_only_child_self_collapsing_margins_collapse_through_parent() {
+    let style = "<style>@page { size: 200px 200px; margin: 0 } body { margin: 0 } p { display: none } .prior { width: 100px; height: 20px; background: green } .parent { width: 100px; font: 20px/1 serif } .empty { width: 100px; height: 0; margin-top: 30px; margin-bottom: 40px; background: red } .next { width: 100px; height: 20px; background: green } .gap { width: 100px; height: 40px }</style>";
+    let wrapped = Html::from_string(format!(
+        "{style}<p>Two green squares with a 40px gap; no red.</p><div class=\"prior\"></div><div class=\"parent\"><span><div class=\"empty\"></div></span></div><div class=\"next\"></div>"
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+    let direct = Html::from_string(format!(
+        "{style}<p>Two green squares with a 40px gap; no red.</p><div class=\"prior\"></div><div class=\"parent\"><div class=\"empty\"></div></div><div class=\"next\"></div>"
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+    let reference = Html::from_string(format!(
+        "{style}<p>Two green squares with a 40px gap; no red.</p><div class=\"prior\"></div><div class=\"gap\"></div><div class=\"next\"></div>"
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_no_red_or_hotpink_rects(&wrapped);
+    assert_eq!(wrapped.pages[0].rects, direct.pages[0].rects);
+    assert_eq!(wrapped.pages[0].rects, reference.pages[0].rects);
+
+    let green = Color::new(0, 128, 0);
+    let green_rects = wrapped.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(green))
+        .collect::<Vec<_>>();
+    assert_eq!(green_rects.len(), 2);
+    let gap = green_rects[0].y() - (green_rects[1].y() + green_rects[1].height());
+    assert!(
+        (gap - 30.0).abs() < 0.01,
+        "40px collapsed margin should create a 30pt gap, got {gap}"
+    );
+}
+
+#[tokio::test]
 async fn block_in_inline_text_align_does_not_move_split_block_child() {
     let base_style = "@page { size: 220pt 220pt; margin: 10pt } body { margin: 0 } section { width: 20ch; font-size: 10pt; line-height: 10pt } .left { text-align: left } .right { text-align: right }";
     let target = Html::from_string(format!(

@@ -2066,12 +2066,24 @@ enum InlineItem {
     PageScopeEnd,
 }
 
+impl AsRef<InlineItem> for InlineItem {
+    fn as_ref(&self) -> &InlineItem {
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 enum InlineLineItem {
     Fragment(InlineFragment),
     Atom(InlineAtom),
     Float(InlineFloat),
+}
+
+impl AsRef<InlineLineItem> for InlineLineItem {
+    fn as_ref(&self) -> &InlineLineItem {
+        self
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -30,23 +30,42 @@ pub(super) fn next_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-pub(super) fn inline_item_is_collapsible_space(item: &InlineItem) -> bool {
+pub(super) fn inline_item_is_collapsible_space<T>(item: &T) -> bool
+where
+    T: AsRef<InlineItem> + ?Sized,
+{
     matches!(
-        item,
+        item.as_ref(),
         InlineItem::Word(word)
             if word.style.white_space.collapses_spaces()
                 && word.text.chars().all(is_css_collapsible_whitespace)
     )
 }
 
-pub(super) fn trim_inline_item_edges(items: &mut Vec<InlineItem>) {
-    while items.first().is_some_and(inline_item_is_collapsible_space) {
-        items.remove(0);
+pub(super) fn trim_inline_item_edges<T>(items: &mut Vec<T>)
+where
+    T: AsRef<InlineItem>,
+{
+    let first_kept = items
+        .iter()
+        .position(|item| !inline_item_is_collapsible_space(item));
+    match first_kept {
+        Some(0) => {}
+        Some(index) => {
+            items.drain(..index);
+        }
+        None => {
+            items.clear();
+            return;
+        }
     }
     trim_trailing_inline_spaces(items);
 }
 
-pub(super) fn trim_trailing_inline_spaces(items: &mut Vec<InlineItem>) {
+pub(super) fn trim_trailing_inline_spaces<T>(items: &mut Vec<T>)
+where
+    T: AsRef<InlineItem>,
+{
     while items.last().is_some_and(inline_item_is_collapsible_space) {
         items.pop();
     }
@@ -92,10 +111,13 @@ pub(super) fn inline_fragment_is_pre_wrap_hanging_space(fragment: &InlineFragmen
 /// CSS Text line-edge tracking is excluded only for the final text fragment;
 /// atomic inline boxes do not generate character tracking:
 /// <https://www.w3.org/TR/css-text-3/#letter-spacing-property>.
-pub(super) fn trailing_letter_spacing_width_for_line_items(line: &[InlineLineItem]) -> f32 {
+pub(super) fn trailing_letter_spacing_width_for_line_items<T>(line: &[T]) -> f32
+where
+    T: AsRef<InlineLineItem>,
+{
     line.iter()
         .rev()
-        .find_map(|item| match item {
+        .find_map(|item| match item.as_ref() {
             InlineLineItem::Fragment(fragment) if !fragment.text.is_empty() => Some(
                 line_end_letter_spacing_width(&fragment.text, &fragment.style),
             ),
@@ -105,13 +127,16 @@ pub(super) fn trailing_letter_spacing_width_for_line_items(line: &[InlineLineIte
         .unwrap_or(0.0)
 }
 
-pub(super) fn trailing_hanging_space_separator_width_for_line_items(
-    line: &[InlineLineItem],
+pub(super) fn trailing_hanging_space_separator_width_for_line_items<T>(
+    line: &[T],
     font_system: &mut FontSystem,
-) -> f32 {
+) -> f32
+where
+    T: AsRef<InlineLineItem>,
+{
     let mut width = 0.0;
     for item in line.iter().rev() {
-        let InlineLineItem::Fragment(fragment) = item else {
+        let InlineLineItem::Fragment(fragment) = item.as_ref() else {
             break;
         };
         if fragment.text.is_empty() {
@@ -572,13 +597,22 @@ fn first_hanging_punctuation_width(
     block_style: &ComputedStyle,
     is_first_line: bool,
 ) -> f32 {
+    let fragment = fragments
+        .iter()
+        .find(|fragment| !trim_css_collapsible_whitespace(&fragment.text).is_empty());
+    first_hanging_punctuation_width_for_fragment(font_system, fragment, block_style, is_first_line)
+}
+
+fn first_hanging_punctuation_width_for_fragment(
+    font_system: &mut FontSystem,
+    fragment: Option<&InlineFragment>,
+    block_style: &ComputedStyle,
+    is_first_line: bool,
+) -> f32 {
     if !block_style.hanging_punctuation.first || !is_first_line {
         return 0.0;
     }
-    let Some(fragment) = fragments
-        .iter()
-        .find(|fragment| !trim_css_collapsible_whitespace(&fragment.text).is_empty())
-    else {
+    let Some(fragment) = fragment else {
         return 0.0;
     };
     let Some(character) = trim_start_css_collapsible_whitespace(&fragment.text)
@@ -603,11 +637,27 @@ fn end_hanging_punctuation_width(
     is_last_line: bool,
     line_overflows: bool,
 ) -> f32 {
-    let Some(fragment) = fragments
+    let fragment = fragments
         .iter()
         .rev()
-        .find(|fragment| !trim_css_collapsible_whitespace(&fragment.text).is_empty())
-    else {
+        .find(|fragment| !trim_css_collapsible_whitespace(&fragment.text).is_empty());
+    end_hanging_punctuation_width_for_fragment(
+        font_system,
+        fragment,
+        block_style,
+        is_last_line,
+        line_overflows,
+    )
+}
+
+fn end_hanging_punctuation_width_for_fragment(
+    font_system: &mut FontSystem,
+    fragment: Option<&InlineFragment>,
+    block_style: &ComputedStyle,
+    is_last_line: bool,
+    line_overflows: bool,
+) -> f32 {
+    let Some(fragment) = fragment else {
         return 0.0;
     };
     let Some(character) = trim_end_css_collapsible_whitespace(&fragment.text)
@@ -634,11 +684,14 @@ fn end_hanging_punctuation_width(
     intrinsic::hanging_punctuation_character_width(font_system, character, &fragment.style)
 }
 
-pub(super) fn last_hanging_punctuation_width_for_line_items(
+pub(super) fn last_hanging_punctuation_width_for_line_items<T>(
     font_system: &mut FontSystem,
-    items: &[InlineLineItem],
+    items: &[T],
     block_style: &ComputedStyle,
-) -> f32 {
+) -> f32
+where
+    T: AsRef<InlineLineItem>,
+{
     end_hanging_punctuation_width_for_line_items(font_system, items, block_style, true, false)
 }
 
@@ -648,55 +701,75 @@ pub(super) fn last_hanging_punctuation_width_for_line_items(
 /// even when that text is split across inline boxes and atomic inline items:
 /// <https://www.w3.org/TR/css-text-3/#hanging-punctuation-property> and
 /// <https://www.w3.org/TR/css-inline-3/#line-box>.
-pub(super) fn end_hanging_punctuation_width_for_line_items(
+pub(super) fn end_hanging_punctuation_width_for_line_items<T>(
     font_system: &mut FontSystem,
-    items: &[InlineLineItem],
+    items: &[T],
     block_style: &ComputedStyle,
     is_last_line: bool,
     line_overflows: bool,
-) -> f32 {
-    let Some(fragment) = items.iter().rev().find_map(|item| match item {
+) -> f32
+where
+    T: AsRef<InlineLineItem>,
+{
+    let fragment = items.iter().rev().find_map(|item| match item.as_ref() {
         InlineLineItem::Fragment(fragment)
             if !trim_css_collapsible_whitespace(&fragment.text).is_empty() =>
         {
             Some(fragment)
         }
         InlineLineItem::Fragment(_) | InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
-    }) else {
-        return 0.0;
-    };
-    end_hanging_punctuation_width(
+    });
+    end_hanging_punctuation_width_for_fragment(
         font_system,
-        std::slice::from_ref(fragment),
+        fragment,
         block_style,
         is_last_line,
         line_overflows,
     )
 }
 
-pub(super) fn hanging_punctuation_widths_for_line_items(
+pub(super) fn hanging_punctuation_widths_for_line_items<T>(
     font_system: &mut FontSystem,
-    items: &[InlineLineItem],
+    items: &[T],
     block_style: &ComputedStyle,
     is_first_line: bool,
     is_last_line: bool,
     line_overflows: bool,
-) -> HangingPunctuationWidths {
-    let fragments = items
-        .iter()
-        .filter_map(|item| match item {
-            InlineLineItem::Fragment(fragment) => Some(fragment.clone()),
-            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
-        })
-        .collect::<Vec<_>>();
-    hanging_punctuation_widths(
-        font_system,
-        &fragments,
-        block_style,
-        is_first_line,
-        is_last_line,
-        line_overflows,
-    )
+) -> HangingPunctuationWidths
+where
+    T: AsRef<InlineLineItem>,
+{
+    let first_fragment = items.iter().find_map(|item| match item.as_ref() {
+        InlineLineItem::Fragment(fragment)
+            if !trim_css_collapsible_whitespace(&fragment.text).is_empty() =>
+        {
+            Some(fragment)
+        }
+        InlineLineItem::Fragment(_) | InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
+    });
+    let last_fragment = items.iter().rev().find_map(|item| match item.as_ref() {
+        InlineLineItem::Fragment(fragment)
+            if !trim_css_collapsible_whitespace(&fragment.text).is_empty() =>
+        {
+            Some(fragment)
+        }
+        InlineLineItem::Fragment(_) | InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
+    });
+    HangingPunctuationWidths {
+        start: first_hanging_punctuation_width_for_fragment(
+            font_system,
+            first_fragment,
+            block_style,
+            is_first_line,
+        ),
+        end: end_hanging_punctuation_width_for_fragment(
+            font_system,
+            last_fragment,
+            block_style,
+            is_last_line,
+            line_overflows,
+        ),
+    }
 }
 
 pub(super) fn last_hanging_punctuation_width_for_inline_items(

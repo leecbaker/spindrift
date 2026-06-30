@@ -1005,7 +1005,12 @@ pub(super) fn collapsible_start_margin_for_box(
     ) && let Some(descendant_margin) =
         collapsible_first_child_start_margin_from_boxes(child_boxes, element, style)
     {
+        if is_self_collapsing_block_box(element, style, child_boxes) {
+            return self_collapsing_block_margin_set_for_box(style, Some(descendant_margin));
+        }
         collapse_margins(style.margin.top, descendant_margin)
+    } else if is_self_collapsing_block_box(element, style, child_boxes) {
+        self_collapsing_block_margin_set_for_box(style, None)
     } else {
         style.margin.top
     }
@@ -1124,7 +1129,12 @@ pub(super) fn collapsible_start_margin_dom(
     ) && let Some(descendant_margin) =
         collapsible_first_child_start_margin_dom(element, style, stylesheets, ancestors)
     {
+        if is_self_collapsing_block_dom(element, style, stylesheets, ancestors) {
+            return self_collapsing_block_margin_set_for_box(style, Some(descendant_margin));
+        }
         collapse_margins(style.margin.top, descendant_margin)
+    } else if is_self_collapsing_block_dom(element, style, stylesheets, ancestors) {
+        self_collapsing_block_margin_set_for_box(style, None)
     } else {
         style.margin.top
     }

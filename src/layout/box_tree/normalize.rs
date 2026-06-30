@@ -380,6 +380,7 @@ fn trim_formatting_box_start_collapsible_whitespace(box_: &mut FormattingBox<'_>
         FormattingBox::Inline(box_) => {
             trim_split_inline_run_start(&mut box_.children);
             box_.children.is_empty()
+                && split_trim_empty_inline_box_is_discardable(box_, InlineBoxEdge::Start)
         }
         _ => false,
     }
@@ -394,9 +395,47 @@ fn trim_formatting_box_end_collapsible_whitespace(box_: &mut FormattingBox<'_>) 
         FormattingBox::Inline(box_) => {
             trim_split_inline_run_end(&mut box_.children);
             box_.children.is_empty()
+                && split_trim_empty_inline_box_is_discardable(box_, InlineBoxEdge::End)
         }
         _ => false,
     }
+}
+
+/// Return whether an empty inline box at a split boundary can be discarded.
+///
+/// CSS 2.2 block-in-inline splitting exposes new anonymous block boundaries,
+/// where CSS Text trimming can remove collapsible whitespace. Empty inline
+/// boxes are only ignorable if they have no owned edge decoration and cannot
+/// produce generated content. This preserves HTML `br` rendering through the
+/// UA `br::before` generated newline while still allowing author
+/// `br::before { content: none }` to suppress the break:
+/// <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>,
+/// <https://www.w3.org/TR/css-content-3/#content-property>, and
+/// <https://html.spec.whatwg.org/multipage/text-level-semantics.html#the-br-element>.
+fn split_trim_empty_inline_box_is_discardable(box_: &InlineBox<'_>, edge: InlineBoxEdge) -> bool {
+    !inline_box_fragment_owns_nonzero_edge(&box_.style, box_.fragment_edges, edge)
+        && !box_.style.content.is_generated()
+        && !pseudo_style_has_generated_content(box_.style.before_style.as_deref())
+        && !pseudo_style_has_generated_content(box_.style.after_style.as_deref())
+}
+
+fn inline_box_fragment_owns_nonzero_edge(
+    style: &ComputedStyle,
+    fragment_edges: InlineBoxFragmentEdges,
+    edge: InlineBoxEdge,
+) -> bool {
+    match edge {
+        InlineBoxEdge::Start => {
+            fragment_edges.owns_start && inline_box_edge_has_nonzero_component(style, edge)
+        }
+        InlineBoxEdge::End => {
+            fragment_edges.owns_end && inline_box_edge_has_nonzero_component(style, edge)
+        }
+    }
+}
+
+fn pseudo_style_has_generated_content(style: Option<&ComputedStyle>) -> bool {
+    style.is_some_and(|style| style.content.is_generated())
 }
 
 fn formatting_box_is_empty_text(box_: &FormattingBox<'_>) -> bool {
