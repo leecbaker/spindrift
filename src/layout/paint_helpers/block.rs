@@ -61,14 +61,27 @@ pub(crate) fn block_paint_ops_with_border_insets(
     if let Some(fill) = style.background_color
         && fill.is_visible()
     {
-        if style.border_radius.is_zero() {
+        let area = background_rect_area_for_box(
+            x,
+            y,
+            width,
+            height,
+            style,
+            border_insets,
+            style.background_clip,
+        );
+        if area.width <= 0.0 || area.height <= 0.0 {
+            // Nothing to paint for the solid color layer after clipping.
+        } else if style.background_clip != css::BackgroundBox::Border
+            || style.border_radius.is_zero()
+        {
             rects.push(RenderedRect::from_paint_rect(
-                paint_space_rect(x, y, width, height),
+                paint_space_rect(area.x, area.y, area.width, area.height),
                 Some(fill),
             ));
         } else if style.corner_shapes.all_round() {
             rounded_rects.push(RenderedRoundedRect::from_paint_rect(
-                paint_space_rect(x, y, width, height),
+                paint_space_rect(area.x, area.y, area.width, area.height),
                 used_rounded_rect_radii(style.border_radius, width, height),
                 Some(fill),
                 None,
@@ -77,10 +90,10 @@ pub(crate) fn block_paint_ops_with_border_insets(
         } else {
             paths.push(RenderedPath::new(
                 shaped_rect_path_commands(
-                    x,
-                    y,
-                    width,
-                    height,
+                    area.x,
+                    area.y,
+                    area.width,
+                    area.height,
                     used_rounded_rect_radii(style.border_radius, width, height),
                     style.corner_shapes,
                 ),
@@ -148,6 +161,7 @@ fn linear_gradient_rects(
 
         let before = rects.len();
         let first = gradient.stops[0];
+        let first_position = gradient_stop_position(first, axis_length);
         push_gradient_band(
             &mut rects,
             gradient.direction,
@@ -156,10 +170,12 @@ fn linear_gradient_rects(
             area.width,
             area.height,
             0.0,
-            first.position,
+            first_position,
             first.color,
         );
         for pair in gradient.stops.windows(2) {
+            let start = gradient_stop_position(pair[0], axis_length);
+            let end = gradient_stop_position(pair[1], axis_length);
             push_gradient_band(
                 &mut rects,
                 gradient.direction,
@@ -167,12 +183,13 @@ fn linear_gradient_rects(
                 area.y,
                 area.width,
                 area.height,
-                pair[0].position,
-                pair[1].position,
+                start,
+                end,
                 pair[0].color,
             );
         }
         let last = *gradient.stops.last().expect("checked length above");
+        let last_position = gradient_stop_position(last, axis_length);
         push_gradient_band(
             &mut rects,
             gradient.direction,
@@ -180,7 +197,7 @@ fn linear_gradient_rects(
             area.y,
             area.width,
             area.height,
-            last.position,
+            last_position,
             axis_length,
             last.color,
         );
@@ -190,6 +207,12 @@ fn linear_gradient_rects(
     }
     rects.retain(|rect| rect.width() > 0.0 && rect.height() > 0.0);
     rects
+}
+
+fn gradient_stop_position(stop: css::GradientColorStop, axis_length: f32) -> f32 {
+    stop.position
+        .used_length_with_percentage_basis(axis_length)
+        .unwrap_or(stop.position.length + stop.position.percent * axis_length)
 }
 
 fn background_layers_for_gradient_paint(style: &ComputedStyle) -> Vec<css::BackgroundLayer> {
@@ -269,7 +292,8 @@ fn paint_box_shadows(
         .filter(|shadow| shadow.inset == inset)
     {
         let color = shadow.color.resolve(style.color);
-        if !color.is_visible() || shadow.blur_radius > 0.0 || !style.border_radius.is_zero() {
+        if !color.is_visible() || shadow.blur_radius.length > 0.0 || !style.border_radius.is_zero()
+        {
             continue;
         }
         if shadow.inset {
@@ -286,10 +310,13 @@ fn paint_outer_box_shadow(
     shadow: css::BoxShadow,
     color: Color,
 ) {
-    let shadow_x = geometry.x + shadow.offset_x - shadow.spread;
-    let shadow_y = geometry.y - shadow.offset_y - shadow.spread;
-    let shadow_width = geometry.width + shadow.spread * 2.0;
-    let shadow_height = geometry.height + shadow.spread * 2.0;
+    let offset_x = shadow.offset_x.length;
+    let offset_y = shadow.offset_y.length;
+    let spread = shadow.spread.length;
+    let shadow_x = geometry.x + offset_x - spread;
+    let shadow_y = geometry.y - offset_y - spread;
+    let shadow_width = geometry.width + spread * 2.0;
+    let shadow_height = geometry.height + spread * 2.0;
     if shadow_width <= 0.0 || shadow_height <= 0.0 {
         return;
     }
@@ -329,11 +356,13 @@ fn paint_inset_box_shadow(
         return;
     }
 
-    let spread = shadow.spread.max(0.0);
-    let left = inset_shadow_edge_width(shadow.offset_x, spread, true).min(padding.width);
-    let right = inset_shadow_edge_width(shadow.offset_x, spread, false).min(padding.width);
-    let top = inset_shadow_edge_width(shadow.offset_y, spread, true).min(padding.height);
-    let bottom = inset_shadow_edge_width(shadow.offset_y, spread, false).min(padding.height);
+    let spread = shadow.spread.length.max(0.0);
+    let offset_x = shadow.offset_x.length;
+    let offset_y = shadow.offset_y.length;
+    let left = inset_shadow_edge_width(offset_x, spread, true).min(padding.width);
+    let right = inset_shadow_edge_width(offset_x, spread, false).min(padding.width);
+    let top = inset_shadow_edge_width(offset_y, spread, true).min(padding.height);
+    let bottom = inset_shadow_edge_width(offset_y, spread, false).min(padding.height);
 
     push_shadow_rect(rects, padding.x, padding.y, left, padding.height, color);
     push_shadow_rect(

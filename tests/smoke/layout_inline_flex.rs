@@ -72,6 +72,48 @@ async fn split_inline_after_block_omits_inline_start_border_for_wpt_case() {
 }
 
 #[tokio::test]
+async fn split_inline_empty_end_edge_paints_border_despite_negative_margin() {
+    let document = Html::from_string(
+        r#"<!DOCTYPE html>
+<style>
+@page { size: 240pt 240pt; margin: 0 }
+body { margin: 0 }
+p { display: none }
+</style>
+<p>Test passes if there is a filled green square and no red.</p>
+<div style="width: 200px; height: 200px; background: red">
+  <span style="font: 200px/1 sans-serif; border-right: 200px solid green; margin-right: -200px"><div></div></span>
+</div>"#,
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green_index = page
+        .rects
+        .iter()
+        .position(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("split inline end border should paint green");
+    let green = &page.rects[green_index];
+
+    assert!(
+        !page
+            .rects
+            .iter()
+            .any(|rect| rect.fill == Some(Color::new(255, 0, 0))),
+        "split inline end border should leave no visible red paint: {:?}",
+        page.rects
+    );
+    assert!(
+        green.x().abs() < 0.01
+            && (green.width() - 150.0).abs() < 0.01
+            && (green.height() - 150.0).abs() < 0.01,
+        "200px split inline border should cover the 200px square in PDF points: {green:?}"
+    );
+}
+
+#[tokio::test]
 async fn supports_explicit_block_dimensions() {
     let document = Html::from_string(
         "<div style=\"margin: 0; width: 50pt; height: 20pt; padding: 2pt; border: 1pt solid black; background: red\"></div>",
@@ -121,6 +163,1688 @@ async fn supports_flex_row_space_between() {
     assert_eq!(document.pages[0].lines[1].text, "B");
     assert_eq!(document.pages[0].lines[0].x(), 10.0);
     assert!(document.pages[0].lines[1].x() >= 100.0);
+}
+
+#[tokio::test]
+async fn grid_places_children_in_explicit_columns() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: 40pt 50pt; grid-template-rows: 12pt; column-gap: 5pt; width: 100pt }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first grid item background should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second grid item background should paint");
+
+    assert!((red.x() - 10.0).abs() < 0.01, "red item: {red:?}");
+    assert!((red.width() - 40.0).abs() < 0.01, "red item: {red:?}");
+    assert!((blue.x() - 55.0).abs() < 0.01, "blue item: {blue:?}");
+    assert!((blue.width() - 50.0).abs() < 0.01, "blue item: {blue:?}");
+}
+
+#[tokio::test]
+async fn grid_template_areas_place_named_items() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-areas: \"left right\"; grid-template-columns: 30pt 20pt; grid-template-rows: 10pt; width: 50pt }\
+         .left { grid-area: left; background: red }\
+         .right { grid-area: right; background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"right\"></div><div class=\"left\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("left named grid area background should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("right named grid area background should paint");
+
+    assert!((red.x() - 10.0).abs() < 0.01, "left item: {red:?}");
+    assert!((red.width() - 30.0).abs() < 0.01, "left item: {red:?}");
+    assert!((blue.x() - 40.0).abs() < 0.01, "right item: {blue:?}");
+    assert!((blue.width() - 20.0).abs() < 0.01, "right item: {blue:?}");
+}
+
+#[tokio::test]
+async fn grid_template_area_generates_named_start_and_end_lines() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-areas: \"left right\"; grid-template-columns: 30pt 20pt; grid-template-rows: 10pt; width: 50pt }\
+         .hit { grid-column: right-start / right-end; background: red }\
+         </style>\
+         <div class=\"grid\"><div class=\"hit\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let rect = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("template-area generated-line grid item should paint");
+
+    assert!(
+        (rect.x() - 40.0).abs() < 0.01,
+        "generated right-start line should begin at the second area: {rect:?}"
+    );
+    assert!(
+        (rect.width() - 20.0).abs() < 0.01,
+        "generated right-end line should end at the second area: {rect:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_named_line_occurrence_places_item() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: [main] 30pt [main] 20pt; grid-template-rows: 10pt; width: 50pt }\
+         .hit { grid-column: main 2 / span 1; background: red }\
+         </style>\
+         <div class=\"grid\"><div class=\"hit\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let rect = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("named-line occurrence grid item background should paint");
+
+    assert!((rect.x() - 40.0).abs() < 0.01, "item: {rect:?}");
+    assert!((rect.width() - 20.0).abs() < 0.01, "item: {rect:?}");
+}
+
+#[tokio::test]
+async fn grid_spanning_item_includes_track_gaps() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: 20pt 20pt 20pt; grid-template-rows: 10pt 10pt; column-gap: 5pt; row-gap: 4pt; width: 70pt }\
+         .span { grid-column: 1 / span 2; grid-row: 1 / span 2; background: red }\
+         .cell { grid-column: 3; grid-row: 2; background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"span\"></div><div class=\"cell\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("spanning grid item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("single-cell grid item should paint");
+
+    assert!((red.x() - 10.0).abs() < 0.01, "spanning item: {red:?}");
+    assert!(
+        (red.width() - 45.0).abs() < 0.01,
+        "spanning item should include the column gap: {red:?}"
+    );
+    assert!(
+        (red.height() - 24.0).abs() < 0.01,
+        "spanning item should include the row gap: {red:?}"
+    );
+    assert!((blue.x() - 60.0).abs() < 0.01, "single cell: {blue:?}");
+    assert!((blue.width() - 20.0).abs() < 0.01, "single cell: {blue:?}");
+}
+
+#[tokio::test]
+async fn grid_flexible_tracks_distribute_remaining_width() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: 1fr 2fr; grid-template-rows: 10pt; width: 90pt }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first flexible-track grid item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second flexible-track grid item should paint");
+
+    assert!((red.x() - 10.0).abs() < 0.01, "first item: {red:?}");
+    assert!(
+        (red.width() - 30.0).abs() < 0.01,
+        "1fr track should receive one third of the free width: {red:?}"
+    );
+    assert!((blue.x() - 40.0).abs() < 0.01, "second item: {blue:?}");
+    assert!(
+        (blue.width() - 60.0).abs() < 0.01,
+        "2fr track should receive two thirds of the free width: {blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_auto_fill_repeats_fixed_tracks_to_fill_definite_width() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: repeat(auto-fill, 20pt); grid-template-rows: 10pt; column-gap: 5pt; width: 70pt }\
+         .a { background: red }\
+         .b { background: green }\
+         .c { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div><div class=\"c\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color| {
+        page.rects
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects))
+    };
+    let red = rect(Color::new(255, 0, 0));
+    let green = rect(Color::new(0, 128, 0));
+    let blue = rect(Color::new(0, 0, 255));
+
+    assert!((red.x() - 10.0).abs() < 0.01, "first track: {red:?}");
+    assert!((red.width() - 20.0).abs() < 0.01, "first track: {red:?}");
+    assert!(
+        (green.x() - 35.0).abs() < 0.01,
+        "second auto-filled track should include the column gap: {green:?}"
+    );
+    assert!(
+        (blue.x() - 60.0).abs() < 0.01,
+        "third auto-filled track should fit in the definite grid width: {blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_auto_fit_collapses_empty_fixed_repeat_tracks() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: repeat(auto-fit, 20pt); grid-template-rows: 10pt; column-gap: 5pt; justify-content: end; width: 70pt }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first auto-fit grid item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second auto-fit grid item should paint");
+
+    assert!(
+        (red.x() - 35.0).abs() < 0.01,
+        "auto-fit should collapse the empty third 20pt track before end-aligning the occupied tracks: {red:?}"
+    );
+    assert!((red.width() - 20.0).abs() < 0.01, "first item: {red:?}");
+    assert!(
+        (blue.x() - 60.0).abs() < 0.01,
+        "occupied auto-fit tracks should keep their column gap: {blue:?}"
+    );
+    assert!((blue.width() - 20.0).abs() < 0.01, "second item: {blue:?}");
+}
+
+#[tokio::test]
+async fn grid_auto_template_rows_and_columns_size_to_items() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 160pt 120pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: auto auto; grid-template-rows: auto auto; width: 40pt; height: 30pt }\
+         .a { grid-column: 1; grid-row: 1; width: 15pt; height: 10pt; background: red }\
+         .b { grid-column: 2; grid-row: 1; width: 25pt; height: 10pt; background: blue }\
+         .c { grid-column: 1; grid-row: 2; width: 15pt; height: 20pt; background: green }\
+         .d { grid-column: 2; grid-row: 2; width: 25pt; height: 20pt; background: yellow }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div><div class=\"c\"></div><div class=\"d\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first auto-track grid item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second auto-track grid item should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("third auto-track grid item should paint");
+    let yellow = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .expect("fourth auto-track grid item should paint");
+
+    assert!((red.x() - 10.0).abs() < 0.01, "first column: {red:?}");
+    assert!((red.width() - 15.0).abs() < 0.01, "first column: {red:?}");
+    assert!(
+        (blue.x() - 25.0).abs() < 0.01,
+        "second auto column should start after the 15pt first column: {blue:?}"
+    );
+    assert!(
+        (blue.width() - 25.0).abs() < 0.01,
+        "second column: {blue:?}"
+    );
+    assert!(
+        (green.y() - 80.0).abs() < 0.01,
+        "second auto row should start after the 10pt first row in paint space: {green:?}"
+    );
+    assert!(
+        (green.height() - 20.0).abs() < 0.01,
+        "second row: {green:?}"
+    );
+    assert!(
+        (yellow.x() - 25.0).abs() < 0.01,
+        "second column: {yellow:?}"
+    );
+    assert!((yellow.y() - 80.0).abs() < 0.01, "second row: {yellow:?}");
+}
+
+#[tokio::test]
+async fn grid_justify_content_space_evenly_distributes_column_tracks() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: 10pt 10pt; grid-template-rows: 10pt; width: 80pt; justify-content: space-evenly }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first space-evenly grid item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second space-evenly grid item should paint");
+
+    assert!(
+        (red.x() - 30.0).abs() < 0.01,
+        "space-evenly should place the first 10pt track after one 20pt interval: {red:?}"
+    );
+    assert!((red.width() - 10.0).abs() < 0.01, "first item: {red:?}");
+    assert!(
+        (blue.x() - 60.0).abs() < 0.01,
+        "space-evenly should leave equal intervals between and around tracks: {blue:?}"
+    );
+    assert!((blue.width() - 10.0).abs() < 0.01, "second item: {blue:?}");
+}
+
+#[tokio::test]
+async fn grid_align_content_space_evenly_distributes_row_tracks() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 120pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: 10pt; grid-template-rows: 10pt 10pt; width: 10pt; height: 80pt; align-content: space-evenly }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first space-evenly row item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second space-evenly row item should paint");
+
+    assert!(
+        (red.y() - 80.0).abs() < 0.01,
+        "space-evenly should place the first 10pt row after one 20pt interval: {red:?}"
+    );
+    assert!((red.height() - 10.0).abs() < 0.01, "first item: {red:?}");
+    assert!(
+        (blue.y() - 50.0).abs() < 0.01,
+        "space-evenly should leave equal intervals between and around rows: {blue:?}"
+    );
+    assert!((blue.height() - 10.0).abs() < 0.01, "second item: {blue:?}");
+}
+
+#[tokio::test]
+async fn rtl_grid_auto_placement_starts_at_inline_start_column() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; direction: rtl; grid-template-columns: 20pt 20pt 20pt; grid-template-rows: 10pt; width: 60pt }\
+         .a { background: red }\
+         .b { background: green }\
+         .c { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div><div class=\"c\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color| {
+        page.rects
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects))
+    };
+    let red = rect(Color::new(255, 0, 0));
+    let green = rect(Color::new(0, 128, 0));
+    let blue = rect(Color::new(0, 0, 255));
+
+    assert!(
+        (red.x() - 50.0).abs() < 0.01,
+        "RTL grid auto-placement should start at the rightmost column: {red:?}"
+    );
+    assert!(
+        (green.x() - 30.0).abs() < 0.01,
+        "second RTL auto-placed item should move leftward: {green:?}"
+    );
+    assert!(
+        (blue.x() - 10.0).abs() < 0.01,
+        "third RTL auto-placed item should occupy the leftmost track: {blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_auto_flow_column_places_items_down_rows() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-auto-flow: column; grid-template-rows: 10pt 10pt; grid-auto-columns: 15pt; width: 45pt }\
+         .a { background: red }\
+         .b { background: green }\
+         .c { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div><div class=\"c\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color| {
+        page.rects
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects))
+    };
+    let red = rect(Color::new(255, 0, 0));
+    let green = rect(Color::new(0, 128, 0));
+    let blue = rect(Color::new(0, 0, 255));
+
+    assert!((red.x() - 10.0).abs() < 0.01, "first item: {red:?}");
+    assert!(
+        (green.x() - red.x()).abs() < 0.01,
+        "column auto-flow should place the second item in the next row: red={red:?}, green={green:?}"
+    );
+    assert!(
+        (blue.x() - 25.0).abs() < 0.01,
+        "column auto-flow should create the next implicit column: {blue:?}"
+    );
+    assert!(
+        (blue.y() - red.y()).abs() < 0.01,
+        "third item should return to the first row of the next column: red={red:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_auto_rows_size_implicit_row_tracks() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: 20pt 20pt; grid-template-rows: 10pt; grid-auto-rows: 14pt; row-gap: 3pt; width: 40pt }\
+         .a { background: red }\
+         .b { background: green }\
+         .c { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div><div class=\"c\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color| {
+        page.rects
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects))
+    };
+    let red = rect(Color::new(255, 0, 0));
+    let green = rect(Color::new(0, 128, 0));
+    let blue = rect(Color::new(0, 0, 255));
+
+    assert!(
+        (red.y() - green.y()).abs() < 0.01,
+        "first two items should share the explicit row: red={red:?}, green={green:?}"
+    );
+    assert!(
+        (red.height() - 10.0).abs() < 0.01,
+        "explicit row should be 10pt tall: {red:?}"
+    );
+    assert!(
+        (blue.height() - 14.0).abs() < 0.01,
+        "implicit row should use grid-auto-rows: {blue:?}"
+    );
+    assert!(
+        (blue.y() + blue.height() + 3.0 - red.y()).abs() < 0.01,
+        "implicit row should be separated from the explicit row by row-gap: red={red:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_auto_rows_cycles_implicit_track_list() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 140pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: 20pt 20pt; grid-template-rows: 10pt; grid-auto-rows: 12pt 18pt; width: 40pt }\
+         .a { background: red }\
+         .b { background: green }\
+         .c { background: blue }\
+         .d { background: yellow }\
+         .e { background: magenta }\
+         .f { background: cyan }\
+         .g { background: black }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div><div class=\"c\"></div><div class=\"d\"></div><div class=\"e\"></div><div class=\"f\"></div><div class=\"g\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color| {
+        page.rects
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects))
+    };
+    let red = rect(Color::new(255, 0, 0));
+    let blue = rect(Color::new(0, 0, 255));
+    let magenta = rect(Color::new(255, 0, 255));
+    let black = rect(Color::new(0, 0, 0));
+
+    assert!(
+        (red.height() - 10.0).abs() < 0.01,
+        "explicit row should be 10pt tall: {red:?}"
+    );
+    assert!(
+        (blue.height() - 12.0).abs() < 0.01,
+        "first implicit row should use the first grid-auto-rows track: {blue:?}"
+    );
+    assert!(
+        (magenta.height() - 18.0).abs() < 0.01,
+        "second implicit row should use the second grid-auto-rows track: {magenta:?}"
+    );
+    assert!(
+        (black.height() - 12.0).abs() < 0.01,
+        "third implicit row should cycle back to the first grid-auto-rows track: {black:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_auto_columns_cycles_implicit_track_list() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 140pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-auto-flow: column; grid-template-rows: 10pt 10pt; grid-auto-columns: 12pt 18pt; width: 80pt }\
+         .a { background: red }\
+         .b { background: green }\
+         .c { background: blue }\
+         .d { background: yellow }\
+         .e { background: magenta }\
+         .f { background: cyan }\
+         .g { background: black }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div><div class=\"c\"></div><div class=\"d\"></div><div class=\"e\"></div><div class=\"f\"></div><div class=\"g\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color| {
+        page.rects
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects))
+    };
+    let red = rect(Color::new(255, 0, 0));
+    let blue = rect(Color::new(0, 0, 255));
+    let magenta = rect(Color::new(255, 0, 255));
+    let black = rect(Color::new(0, 0, 0));
+
+    assert!(
+        (red.width() - 12.0).abs() < 0.01,
+        "first implicit column should use the first grid-auto-columns track: {red:?}"
+    );
+    assert!(
+        (blue.width() - 18.0).abs() < 0.01,
+        "second implicit column should use the second grid-auto-columns track: {blue:?}"
+    );
+    assert!(
+        (magenta.width() - 12.0).abs() < 0.01,
+        "third implicit column should cycle back to the first grid-auto-columns track: {magenta:?}"
+    );
+    assert!(
+        (black.width() - 18.0).abs() < 0.01,
+        "fourth implicit column should cycle back to the second grid-auto-columns track: {black:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_auto_flow_dense_backfills_earlier_row_holes() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-auto-flow: row dense; grid-template-columns: 20pt 20pt 20pt; grid-auto-rows: 10pt; width: 60pt }\
+         .wide { grid-column: span 2; background: red }\
+         .wide2 { grid-column: span 2; background: green }\
+         .single { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"wide\"></div><div class=\"wide2\"></div><div class=\"single\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color| {
+        page.rects
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects))
+    };
+    let red = rect(Color::new(255, 0, 0));
+    let green = rect(Color::new(0, 128, 0));
+    let blue = rect(Color::new(0, 0, 255));
+
+    assert!((red.x() - 10.0).abs() < 0.01, "first wide item: {red:?}");
+    assert!(
+        (green.y() + 10.0 - red.y()).abs() < 0.01,
+        "second wide item should move to the next row: red={red:?}, green={green:?}"
+    );
+    assert!(
+        (blue.x() - 50.0).abs() < 0.01,
+        "dense auto-placement should backfill the first-row hole: {blue:?}"
+    );
+    assert!(
+        (blue.y() - red.y()).abs() < 0.01,
+        "dense item should share the first row with the first wide item: red={red:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_creates_anonymous_items_for_non_whitespace_text_runs() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .grid { display: grid; grid-template-columns: 20pt 20pt; grid-template-rows: 10pt; width: 40pt }\
+         .item { background: red }\
+         </style>\
+         <div class=\"grid\">A<div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let line = page
+        .lines
+        .iter()
+        .find(|line| line.text.trim() == "A")
+        .expect("anonymous grid text should render");
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("grid item after anonymous text should paint");
+
+    assert!(
+        (first_visible_glyph_x(line) - 10.0).abs() < 0.01,
+        "anonymous text should occupy the first grid cell: {line:?}"
+    );
+    assert!(
+        (red.x() - 30.0).abs() < 0.01,
+        "following grid item should occupy the second grid cell: {red:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_ignores_whitespace_only_anonymous_text_runs() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: 20pt 20pt; grid-template-rows: 10pt; width: 40pt }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\">   <div class=\"a\"></div>   <div class=\"b\"></div>   </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first non-whitespace grid item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second non-whitespace grid item should paint");
+
+    assert!(
+        (red.x() - 10.0).abs() < 0.01,
+        "collapsible whitespace should not consume the first grid cell: {red:?}"
+    );
+    assert!(
+        (blue.x() - 30.0).abs() < 0.01,
+        "second item should occupy the second grid cell: {blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_display_contents_children_participate_as_grid_items() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: 20pt 20pt; grid-template-rows: 10pt; width: 40pt }\
+         .contents { display: contents }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"contents\"><div class=\"a\"></div><div class=\"b\"></div></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first display: contents child should paint as a grid item");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second display: contents child should paint as a grid item");
+
+    assert!((red.x() - 10.0).abs() < 0.01, "first child: {red:?}");
+    assert!((blue.x() - 30.0).abs() < 0.01, "second child: {blue:?}");
+}
+
+#[tokio::test]
+async fn generated_after_pseudo_participates_as_grid_item() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .grid { display: grid; grid-template-columns: 20pt 20pt; grid-template-rows: 10pt; width: 40pt }\
+         .grid::after { content: 'B'; display: block; background: blue; width: 20pt; height: 10pt }\
+         .item { background: red; width: 20pt; height: 10pt }\
+         </style>\
+         <div class=\"grid\"><div class=\"item\">A</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("real grid child should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("generated ::after grid item should paint");
+
+    assert!((red.x() - 10.0).abs() < 0.01, "real item: {red:?}");
+    assert!(
+        (blue.x() - 30.0).abs() < 0.01,
+        "generated ::after should occupy the next grid cell: {blue:?}"
+    );
+    assert!(
+        page.lines.iter().any(|line| line.text.trim() == "B"),
+        "generated ::after text should render as grid item content: {:?}",
+        page.lines
+    );
+}
+
+#[tokio::test]
+async fn generated_pseudo_grid_items_participate_in_order_sorting() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .grid { display: grid; grid-template-columns: 20pt 20pt 20pt; grid-template-rows: 10pt; width: 60pt }\
+         .grid::before, .grid::after, span { display: block; width: 20pt; height: 10pt }\
+         .grid::before { content: 'A'; order: 3 }\
+         span { order: 2 }\
+         .grid::after { content: 'C'; order: 1 }\
+         </style>\
+         <div class=\"grid\"><span>B</span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let mut line_text_by_x = document.pages[0]
+        .lines
+        .iter()
+        .map(|line| (line.x(), line.text.trim()))
+        .collect::<Vec<_>>();
+    line_text_by_x.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let text = line_text_by_x
+        .iter()
+        .map(|(_, text)| *text)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        text,
+        vec!["C", "B", "A"],
+        "pseudo and element grid items should share order-modified document order: {:?}",
+        document.pages[0].lines
+    );
+}
+
+#[tokio::test]
+async fn grid_min_content_track_uses_item_intrinsic_width() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: min-content 20pt; grid-template-rows: 10pt; width: 100pt; font-size: 10pt }\
+         .a { background: red; white-space: nowrap }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\">MMMMMMMM</div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("min-content grid item background should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second grid item background should paint");
+
+    assert!(red.width() > 40.0, "min-content item: {red:?}");
+    assert!(
+        blue.x() >= red.x() + red.width() - 0.01,
+        "tracks should not overlap: red={red:?}, blue={blue:?}"
+    );
+    assert!((blue.width() - 20.0).abs() < 0.01, "fixed item: {blue:?}");
+}
+
+#[tokio::test]
+async fn grid_fit_content_track_clamps_between_min_and_max_content() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 140pt; margin: 10pt }\
+         body { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .grid { display: grid; width: 100pt; grid-template-rows: 10pt; margin-bottom: 2pt }\
+         .min { grid-template-columns: min-content }\
+         .fit { grid-template-columns: fit-content(30pt) }\
+         .max { grid-template-columns: max-content }\
+         .min > div { background: red }\
+         .fit > div { background: green }\
+         .max > div { background: blue }\
+         </style>\
+         <div class=\"grid min\"><div>Hi there friend</div></div>\
+         <div class=\"grid fit\"><div>Hi there friend</div></div>\
+         <div class=\"grid max\"><div>Hi there friend</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color| {
+        page.rects
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects))
+    };
+    let min = rect(Color::new(255, 0, 0));
+    let fit = rect(Color::new(0, 128, 0));
+    let max = rect(Color::new(0, 0, 255));
+
+    assert!(
+        min.width() < fit.width(),
+        "fit-content track should be wider than min-content: min={min:?}, fit={fit:?}"
+    );
+    assert!(
+        fit.width() < max.width(),
+        "fit-content track should be narrower than max-content: fit={fit:?}, max={max:?}"
+    );
+    assert!(
+        (fit.width() - 30.0).abs() < 0.5,
+        "fit-content(30pt) should use the argument between intrinsic bounds: {fit:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_container_min_content_width_uses_tracks() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; width: min-content; grid-template-columns: min-content 20pt; grid-template-rows: 10pt; font-size: 10pt; background: yellow }\
+         .a { background: red; white-space: nowrap }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\">MMMMMMMM</div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let grid = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .expect("min-content grid background should paint");
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first grid item background should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second grid item background should paint");
+
+    assert!(
+        grid.width() < 100.0,
+        "grid should shrink-wrap tracks: {grid:?}"
+    );
+    assert!(
+        grid.width() >= red.width() + blue.width() - 0.01,
+        "grid should contain tracks: grid={grid:?}, red={red:?}, blue={blue:?}"
+    );
+    assert!((blue.width() - 20.0).abs() < 0.01, "fixed item: {blue:?}");
+}
+
+#[tokio::test]
+async fn grid_container_min_content_width_uses_per_track_item_contributions() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 260pt 120pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; width: min-content; grid-template-columns: min-content min-content; grid-template-rows: 10pt; column-gap: 5pt; font-size: 10pt; background: yellow }\
+         .a { grid-column: 1; background: red; white-space: nowrap }\
+         .b { grid-column: 2; background: blue; white-space: nowrap }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\">MMMMMMMM</div><div class=\"b\">i</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let grid = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .expect("min-content grid background should paint");
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first intrinsic grid item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second intrinsic grid item should paint");
+
+    assert!(
+        red.width() > blue.width() * 4.0,
+        "test fixture should have meaningfully different item contributions: red={red:?}, blue={blue:?}"
+    );
+    assert!(
+        grid.width() < red.width() * 1.5,
+        "grid min-content width should not apply the first column contribution to every intrinsic track: grid={grid:?}, red={red:?}, blue={blue:?}"
+    );
+    assert!(
+        (blue.x() - (red.x() + red.width() + 5.0)).abs() < 0.01,
+        "second track should start after the first track's own contribution and the gap: red={red:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_container_min_content_width_uses_named_line_item_contributions() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 260pt 120pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; width: min-content; grid-template-columns: [main] min-content [main] min-content [main]; grid-template-rows: 10pt; column-gap: 5pt; font-size: 10pt; background: yellow }\
+         .a { grid-column: main 1; background: red; white-space: nowrap }\
+         .b { grid-column: main 2; background: blue; white-space: nowrap }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\">i</div><div class=\"b\">MMMMMMMM</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let grid = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .expect("min-content named-line grid background should paint");
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first named-line intrinsic grid item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second named-line intrinsic grid item should paint");
+
+    assert!(
+        blue.width() > red.width() * 4.0,
+        "test fixture should have meaningfully different named-line contributions: red={red:?}, blue={blue:?}"
+    );
+    assert!(
+        grid.width() < blue.width() * 1.5,
+        "named-line contribution assignment should not apply the second column contribution to every intrinsic track: grid={grid:?}, blue={blue:?}"
+    );
+    assert!(
+        (blue.x() - (red.x() + red.width() + 5.0)).abs() < 0.01,
+        "second named line track should start after the first track's contribution and gap: red={red:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_container_min_content_width_uses_negative_line_item_contributions() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 260pt 120pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; width: min-content; grid-template-columns: min-content min-content; grid-template-rows: 10pt; column-gap: 5pt; font-size: 10pt; background: yellow }\
+         .a { grid-column: 1; background: red; white-space: nowrap }\
+         .b { grid-column: -2; background: blue; white-space: nowrap }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\">i</div><div class=\"b\">MMMMMMMM</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let grid = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .expect("min-content negative-line grid background should paint");
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first negative-line intrinsic grid item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second negative-line intrinsic grid item should paint");
+
+    assert!(
+        blue.width() > red.width() * 4.0,
+        "test fixture should have meaningfully different negative-line contributions: red={red:?}, blue={blue:?}"
+    );
+    assert!(
+        grid.width() < blue.width() * 1.5,
+        "negative numeric line contribution assignment should not apply the second column contribution to every intrinsic track: grid={grid:?}, blue={blue:?}"
+    );
+    assert!(
+        (blue.x() - (red.x() + red.width() + 5.0)).abs() < 0.01,
+        "negative numeric line should resolve to the second intrinsic track: red={red:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_container_min_content_width_uses_negative_named_line_item_contributions() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 260pt 120pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; width: min-content; grid-template-columns: [main] min-content [main] min-content [main]; grid-template-rows: 10pt; column-gap: 5pt; font-size: 10pt; background: yellow }\
+         .a { grid-column: main 1; background: red; white-space: nowrap }\
+         .b { grid-column: main -2; background: blue; white-space: nowrap }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\">i</div><div class=\"b\">MMMMMMMM</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let grid = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .expect("min-content negative named-line grid background should paint");
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first negative named-line intrinsic grid item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second negative named-line intrinsic grid item should paint");
+
+    assert!(
+        blue.width() > red.width() * 4.0,
+        "test fixture should have meaningfully different negative named-line contributions: red={red:?}, blue={blue:?}"
+    );
+    assert!(
+        grid.width() < blue.width() * 1.5,
+        "negative named-line contribution assignment should not apply the second column contribution to every intrinsic track: grid={grid:?}, blue={blue:?}"
+    );
+    assert!(
+        (blue.x() - (red.x() + red.width() + 5.0)).abs() < 0.01,
+        "negative named line should resolve to the second intrinsic track: red={red:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_container_min_content_width_distributes_simple_spanning_contribution() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 260pt 120pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; width: min-content; grid-template-columns: min-content min-content; grid-template-rows: 10pt; column-gap: 5pt; font-size: 10pt; background: yellow }\
+         .span { grid-column: 1 / span 2; background: red; white-space: nowrap }\
+         </style>\
+         <div class=\"grid\"><div class=\"span\">MMMMMMMM</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let grid = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .expect("min-content grid background should paint");
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("spanning intrinsic grid item should paint");
+
+    assert!(
+        red.width() > 40.0,
+        "test fixture should have a meaningful spanning contribution: {red:?}"
+    );
+    assert!(
+        grid.width() < 100.0,
+        "spanning contribution should be distributed across the two intrinsic tracks, not applied in full to each track: grid={grid:?}, red={red:?}"
+    );
+    assert!(
+        (red.width() - grid.width()).abs() < 0.01,
+        "spanning item should cover the shrink-wrapped grid columns: grid={grid:?}, red={red:?}"
+    );
+}
+
+#[tokio::test]
+async fn grid_container_min_content_width_uses_one_fixed_auto_fill_repetition() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; width: min-content; grid-template-columns: repeat(auto-fill, 20pt); grid-template-rows: 10pt; column-gap: 5pt; background: yellow }\
+         .a { background: red }\
+         .b { background: green }\
+         .c { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"a\"></div><div class=\"b\"></div><div class=\"c\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let grid = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .unwrap_or_else(|| {
+            panic!(
+                "min-content auto-fill grid background should paint: {:?}",
+                page.rects
+            )
+        });
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first auto-fill grid item should paint");
+
+    assert!(
+        (grid.width() - 20.0).abs() < 0.01,
+        "indefinite min-content sizing should use one fixed auto-fill repetition: {grid:?}"
+    );
+    assert!(
+        (red.x() - grid.x()).abs() < 0.01,
+        "first item should occupy the single intrinsic auto-fill track: red={red:?}, grid={grid:?}"
+    );
+}
+
+#[tokio::test]
+async fn inline_grid_paints_atomically_and_exports_item_baseline() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0; font-size: 10pt; line-height: 20pt }\
+         .grid { display: inline-grid; grid-template-columns: 24pt; grid-template-rows: 20pt; background: yellow }\
+         .item { font-size: 20pt; line-height: 20pt; background: red }\
+         </style>\
+         a <span class=\"grid\"><span class=\"item\">b</span></span> c",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let line = |text: &str| {
+        page.lines
+            .iter()
+            .find(|line| line.text.trim() == text)
+            .unwrap_or_else(|| panic!("{text} should render: {:?}", page.lines))
+    };
+    let a = line("a");
+    let b = line("b");
+    let yellow = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .expect("inline-grid background should paint");
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("inline-grid item background should paint");
+
+    assert!(
+        yellow.x() > first_visible_glyph_x(a),
+        "inline-grid should participate at an inline position: a={a:?}, grid={yellow:?}"
+    );
+    assert!(
+        (red.x() - yellow.x()).abs() < 0.01,
+        "grid item should paint inside the inline-grid atom: grid={yellow:?}, item={red:?}"
+    );
+    assert!(
+        (b.y() - a.y()).abs() < 0.01,
+        "inline-grid should export the grid item baseline: a={}, b={}",
+        a.y(),
+        b.y()
+    );
+}
+
+#[tokio::test]
+async fn grid_justify_items_aligns_item_inside_grid_area() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; grid-template-columns: 40pt; grid-template-rows: 10pt; width: 40pt; justify-items: end }\
+         .item { width: 10pt; height: 10pt; background: red }\
+         </style>\
+         <div class=\"grid\"><div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let rect = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("aligned grid item background should paint");
+
+    assert!((rect.x() - 40.0).abs() < 0.01, "item: {rect:?}");
+    assert!((rect.width() - 10.0).abs() < 0.01, "item: {rect:?}");
+}
+
+#[tokio::test]
+async fn absolute_grid_child_uses_grid_static_position_without_participating() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; position: relative; margin-left: 15pt; grid-template-columns: 20pt 20pt; grid-template-rows: 10pt; column-gap: 5pt; width: 45pt }\
+         .abs { position: absolute; grid-column: 2; width: 8pt; height: 8pt; background: green }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"abs\"></div><div class=\"a\"></div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("absolutely positioned grid child should paint");
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("first normal grid item should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second normal grid item should paint");
+
+    assert!((red.x() - 25.0).abs() < 0.01, "red item: {red:?}");
+    assert!((blue.x() - 50.0).abs() < 0.01, "blue item: {blue:?}");
+    assert!((green.x() - 50.0).abs() < 0.01, "abspos item: {green:?}");
+    assert!((green.width() - 8.0).abs() < 0.01, "abspos item: {green:?}");
+}
+
+#[tokio::test]
+async fn absolute_grid_child_static_position_uses_auto_fill_track() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; position: relative; margin-left: 15pt; grid-template-columns: repeat(auto-fill, 20pt); grid-template-rows: 10pt; column-gap: 5pt; width: 70pt }\
+         .abs { position: absolute; grid-column: 3; width: 8pt; height: 8pt; background: green }\
+         .a { background: red }\
+         .b { background: yellow }\
+         .c { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"abs\"></div><div class=\"a\"></div><div class=\"b\"></div><div class=\"c\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("absolutely positioned auto-fill grid child should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("third normal auto-fill grid item should paint");
+
+    assert!(
+        (blue.x() - 75.0).abs() < 0.01,
+        "third auto-fill track should start after two fixed tracks and gaps: {blue:?}"
+    );
+    assert!(
+        (green.x() - blue.x()).abs() < 0.01,
+        "abspos item should use the third auto-filled track start: green={green:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn absolute_grid_child_static_position_uses_named_line() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; position: relative; margin-left: 15pt; grid-template-columns: [main] 20pt [main] 20pt; grid-template-rows: 10pt; column-gap: 5pt; width: 45pt }\
+         .abs { position: absolute; grid-column: main 2; width: 8pt; height: 8pt; background: green }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"abs\"></div><div class=\"a\"></div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("absolutely positioned named-line grid child should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second normal grid item should paint");
+
+    assert!((blue.x() - 50.0).abs() < 0.01, "blue item: {blue:?}");
+    assert!(
+        (green.x() - blue.x()).abs() < 0.01,
+        "abspos item should use second named line: green={green:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn absolute_grid_child_static_position_uses_negative_line() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; position: relative; margin-left: 15pt; grid-template-columns: 20pt 20pt; grid-template-rows: 10pt; column-gap: 5pt; width: 45pt }\
+         .abs { position: absolute; grid-column: -1; width: 8pt; height: 8pt; background: green }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"abs\"></div><div class=\"a\"></div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("absolutely positioned negative-line grid child should paint");
+
+    assert!(
+        (green.x() - 70.0).abs() < 0.01,
+        "abspos item should use the explicit grid end line: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn absolute_grid_child_static_position_uses_negative_named_line() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; position: relative; margin-left: 15pt; grid-template-columns: [main] 20pt [main] 20pt [main]; grid-template-rows: 10pt; column-gap: 5pt; width: 45pt }\
+         .abs { position: absolute; grid-column: main -1; width: 8pt; height: 8pt; background: green }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"abs\"></div><div class=\"a\"></div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("absolutely positioned negative named-line grid child should paint");
+
+    assert!(
+        (green.x() - 70.0).abs() < 0.01,
+        "abspos item should use the last named explicit grid line: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn absolute_grid_child_static_position_uses_template_area() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; position: relative; margin-left: 15pt; grid-template-areas: \"left right\"; grid-template-columns: 20pt 20pt; grid-template-rows: 10pt; column-gap: 5pt; width: 45pt }\
+         .abs { position: absolute; grid-area: right; width: 8pt; height: 8pt; background: green }\
+         .left { grid-area: left; background: red }\
+         .right { grid-area: right; background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"abs\"></div><div class=\"left\"></div><div class=\"right\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("absolutely positioned template-area grid child should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("normal grid area child should paint");
+
+    assert!(
+        (green.x() - blue.x()).abs() < 0.01,
+        "abspos item should use the named template area's column start: green={green:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn absolute_grid_child_static_position_uses_template_area_generated_line() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; position: relative; margin-left: 15pt; grid-template-areas: \"left right\"; grid-template-columns: 20pt 20pt; grid-template-rows: 10pt; column-gap: 5pt; width: 45pt }\
+         .abs { position: absolute; grid-column: right-start; width: 8pt; height: 8pt; background: green }\
+         .left { grid-area: left; background: red }\
+         .right { grid-area: right; background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"abs\"></div><div class=\"left\"></div><div class=\"right\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("absolutely positioned generated-line grid child should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("normal grid area child should paint");
+
+    assert!(
+        (green.x() - blue.x()).abs() < 0.01,
+        "abspos item should use the generated template-area line: green={green:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn absolute_grid_child_static_position_uses_flexible_tracks() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         .grid { display: grid; position: relative; margin-left: 15pt; grid-template-columns: 1fr 1fr; grid-template-rows: 10pt; width: 100pt }\
+         .abs { position: absolute; grid-column: 2; width: 8pt; height: 8pt; background: green }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"abs\"></div><div class=\"a\"></div><div class=\"b\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("absolutely positioned flexible-track grid child should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second normal grid item should paint");
+
+    assert!(
+        (green.x() - blue.x()).abs() < 0.01,
+        "abspos item should use the second flexible track start: green={green:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn absolute_grid_child_static_position_uses_intrinsic_tracks() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 240pt 120pt; margin: 10pt }\
+         body { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .grid { display: grid; position: relative; margin-left: 15pt; grid-template-columns: max-content max-content; grid-template-rows: 10pt; column-gap: 5pt; width: 120pt }\
+         .abs { position: absolute; grid-column: 2; width: 8pt; height: 8pt; background: green }\
+         .a { background: red }\
+         .b { background: blue }\
+         </style>\
+         <div class=\"grid\"><div class=\"abs\"></div><div class=\"a\">wide text</div><div class=\"b\">xx</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("absolutely positioned intrinsic-track grid child should paint");
+    let blue = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("second normal grid item should paint");
+
+    assert!(
+        (green.x() - blue.x()).abs() < 0.01,
+        "abspos item should use the second intrinsic track start: green={green:?}, blue={blue:?}"
+    );
 }
 
 #[tokio::test]
@@ -2825,6 +4549,48 @@ async fn column_flex_replaced_item_auto_min_height_uses_transferred_size() {
 }
 
 #[tokio::test]
+async fn nested_abspos_flex_image_uses_stretched_cross_size_as_flex_basis() {
+    let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let document = Html::from_string(format!(
+        "<!DOCTYPE html><style>@page {{ size: 240pt 240pt; margin: 0 }} body {{ margin:0 }}\
+         .outer-flex {{ display:flex; height:200px }} .flex-item {{ width:100% }}\
+         .intermediate {{ position:relative; height:100% }}\
+         .inner-flex {{ display:flex; position:absolute; top:0; bottom:0 }}\
+         img {{ display:block }}\
+         </style><div class=\"outer-flex\"><div class=\"flex-item\"><div class=\"intermediate\"><div class=\"inner-flex\"><img src=\"{image}\"></div></div></div></div>",
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages[0].images.len(), 1);
+    let image = &document.pages[0].images[0];
+    assert!((image.width() - 150.0).abs() < 0.01, "image={image:?}");
+    assert!((image.height() - 150.0).abs() < 0.01, "image={image:?}");
+}
+
+#[tokio::test]
+async fn non_stretched_nested_abspos_flex_image_keeps_intrinsic_flex_basis() {
+    let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let document = Html::from_string(format!(
+        "<!DOCTYPE html><style>@page {{ size: 240pt 240pt; margin: 0 }} body {{ margin:0 }}\
+         .outer-flex {{ display:flex; height:200px }} .flex-item {{ width:100% }}\
+         .intermediate {{ position:relative; height:100% }}\
+         .inner-flex {{ display:flex; align-items:flex-start; position:absolute; top:0; bottom:0 }}\
+         img {{ display:block }}\
+         </style><div class=\"outer-flex\"><div class=\"flex-item\"><div class=\"intermediate\"><div class=\"inner-flex\"><img src=\"{image}\"></div></div></div></div>",
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages[0].images.len(), 1);
+    let image = &document.pages[0].images[0];
+    assert!((image.width() - 1.0).abs() < 0.01, "image={image:?}");
+    assert!((image.height() - 1.0).abs() < 0.01, "image={image:?}");
+}
+
+#[tokio::test]
 async fn collapsed_flex_item_before_replaced_item_keeps_source_indexed_auto_minimum() {
     let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
     let document = Html::from_string(format!(
@@ -3829,6 +5595,73 @@ async fn absolute_flex_children_use_flex_static_position_and_ignore_justify_self
 }
 
 #[tokio::test]
+async fn absolute_flex_children_ignore_flex_basis_for_auto_width() {
+    let document = Html::from_string(
+        r#"<style>
+         @page { size: 80pt 180pt; margin: 0 }
+         body { margin: 0 }
+         .flex {
+           display: flex;
+           height: 10px;
+           width: 10px;
+           background: purple;
+           margin-bottom: 5px;
+           position: relative;
+         }
+         .flex > * {
+           position: absolute;
+           background: teal;
+           height: 10px;
+         }
+         .sized { width: 10px }
+         .implied { left: 0; right: 0 }
+         </style>
+         <div class="flex"><div style="flex-basis: 2px"></div></div>
+         <div class="flex"><div style="flex-basis: 100px"></div></div>
+         <div class="flex"><div style="flex-basis: 80%"></div></div>
+         <div class="flex"><div style="flex-basis: content"></div></div>
+         <div class="flex"><div class="sized" style="flex-basis: 2px"></div></div>
+         <div class="flex"><div class="sized" style="flex-basis: 100px"></div></div>
+         <div class="flex"><div class="sized" style="flex-basis: 80%"></div></div>
+         <div class="flex"><div class="sized" style="flex-basis: content"></div></div>
+         <div class="flex"><div class="implied" style="flex-basis: 2px"></div></div>
+         <div class="flex"><div class="implied" style="flex-basis: 100px"></div></div>
+         <div class="flex"><div class="implied" style="flex-basis: 80%"></div></div>
+         <div class="flex"><div class="implied" style="flex-basis: content"></div></div>"#,
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let visible_rects = document.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| rect.width() > 0.01 && rect.height() > 0.01)
+        .collect::<Vec<_>>();
+    let purple_rects = visible_rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(128, 0, 128)))
+        .collect::<Vec<_>>();
+    let teal_rects = visible_rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 128, 128)))
+        .collect::<Vec<_>>();
+
+    assert_eq!(purple_rects.len(), 12);
+    assert_eq!(
+        teal_rects.len(),
+        8,
+        "auto-width abspos flex children should shrink-wrap to zero and leave the first four containers purple: {teal_rects:?}"
+    );
+    for child in teal_rects {
+        assert!(
+            (child.width() - 7.5).abs() < 0.01,
+            "explicit and inset-constrained abspos flex children should stay 10 CSS px wide: {child:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn flex_root_honors_align_items_and_percent_height() {
     let document = Html::from_string(
         "<style>@page { size: 100pt 100pt; margin: 10pt } html { display: flex; height: 100%; align-items: center; justify-content: center } body { margin: 0; width: 20pt; height: 20pt; font-size: 10pt; line-height: 10pt }</style><body>X</body>",
@@ -4588,11 +6421,19 @@ async fn shrink_to_fit_inline_block_uses_exact_graph_max_content_width() {
         .await
         .unwrap();
 
+    let destination_start = document.pages[0]
+        .lines
+        .iter()
+        .find(|line| line.text == "CDG " && line.font_size == 25.0)
+        .unwrap();
+    let destination_y = destination_start.y();
+
     assert!(
-        document.pages[0]
-            .lines
-            .iter()
-            .any(|line| line.text == "CDG ✈ LFLL" && line.font_size == 25.0)
+        document.pages[0].lines.iter().any(|line| {
+            line.text == "✈" && line.font_size == 25.0 && (line.y() - destination_y).abs() < 0.01
+        }) && document.pages[0].lines.iter().any(|line| {
+            line.text == "LFLL" && line.font_size == 25.0 && (line.y() - destination_y).abs() < 0.01
+        })
     );
 }
 
@@ -4630,8 +6471,14 @@ async fn inline_origin_abspos_uses_inline_static_position() {
     let destination = document.pages[0]
         .lines
         .iter()
-        .find(|line| line.text == "CDG ✈ LFLL" && line.font_size == 25.0)
+        .find(|line| line.text == "CDG " && line.font_size == 25.0)
         .unwrap();
+    assert!(document.pages[0].lines.iter().any(|line| {
+        line.text == "✈" && line.font_size == 25.0 && (line.y() - destination.y()).abs() < 0.01
+    }));
+    assert!(document.pages[0].lines.iter().any(|line| {
+        line.text == "LFLL" && line.font_size == 25.0 && (line.y() - destination.y()).abs() < 0.01
+    }));
 
     assert!(
         (name.y() - destination.y()).abs() < 0.01,
@@ -4682,6 +6529,78 @@ async fn inline_block_content_participates_in_parent_inline_line() {
     assert!(before.x() < boxed.x());
     assert!(boxed.x() < after.x());
     assert!((before.y() - after.y()).abs() < 0.1);
+}
+
+#[tokio::test]
+async fn inline_block_block_child_paints_above_atom_background() {
+    let document = Html::from_string(
+        "<style>@page { size: 320px 140px; margin: 0 } body { margin: 0; font-size: 0; line-height: 0 } .empty, .box { display: inline-block; vertical-align: top; width: 100px; height: 100px } .box { background: red } .box > div { width: 100px; height: 100px; background: green }</style><div class=\"empty\"></div><div class=\"box\"><div></div></div><div class=\"empty\"></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("inline-block background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("block child background should paint");
+    let red_index = first_rect_paint_operation_index(page, Color::new(255, 0, 0));
+    let green_index = first_rect_paint_operation_index(page, Color::new(0, 128, 0));
+
+    assert!(
+        red_index < green_index,
+        "inline-block background must paint before its in-flow block child"
+    );
+    assert_eq!(
+        final_rect_fill_at(
+            page,
+            red.x() + red.width() / 2.0,
+            red.y() + red.height() / 2.0
+        ),
+        Some(Color::new(0, 128, 0)),
+    );
+    assert!((green.x() - red.x()).abs() < 0.01);
+    assert!((green.y() - red.y()).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn inline_block_absolute_child_escapes_pseudo_context_at_static_position() {
+    let document = Html::from_string(
+        "<style>@page { size: 320px 140px; margin: 0 } body { margin: 0; font-size: 0; line-height: 0 } .empty, .box { display: inline-block; vertical-align: top; width: 100px; height: 100px } .box { background: red } .box > div { position: absolute; width: 100px; height: 100px; background: green }</style><div class=\"empty\"></div><div class=\"box\"><div></div></div><div class=\"empty\"></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("inline-block background should paint");
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("absolute child background should paint");
+
+    assert_eq!(
+        final_rect_fill_at(
+            page,
+            red.x() + red.width() / 2.0,
+            red.y() + red.height() / 2.0
+        ),
+        Some(Color::new(0, 128, 0)),
+    );
+    assert!((green.x() - red.x()).abs() < 0.01);
+    assert!((green.y() - red.y()).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -4778,6 +6697,61 @@ async fn inline_block_explicit_height_is_not_expanded_by_line_height() {
         .unwrap();
 
     assert!((background.height() - 30.0).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn inline_block_middle_alignment_does_not_inflate_wrapped_rows() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 180pt; margin: 0 } body { margin: 0 }\
+         .wrapper { width:90pt; height:90pt; background:red; direction:ltr; writing-mode:horizontal-tb }\
+         .wrapper div { display:inline-block; width:28.5pt; height:28.5pt; border:0.75pt solid #32cd32;\
+             background:green; color:white; font-size:12pt; line-height:30pt; text-align:center; vertical-align:middle }\
+         </style><div class=\"wrapper\"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div><div>6</div><div>7</div><div>8</div><div>9</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let wrapper = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("wrapper background should paint");
+    let mut green_rects = page
+        .rects
+        .iter()
+        .filter(|rect| {
+            rect.fill == Some(Color::new(0, 128, 0))
+                && (rect.width() - 30.0).abs() < 0.01
+                && (rect.height() - 30.0).abs() < 0.01
+        })
+        .collect::<Vec<_>>();
+    green_rects.sort_by(|left, right| {
+        left.y()
+            .total_cmp(&right.y())
+            .then_with(|| left.x().total_cmp(&right.x()))
+    });
+    assert_eq!(
+        green_rects.len(),
+        9,
+        "expected nine 30pt green backgrounds: {green_rects:?}"
+    );
+
+    let mut row_bottoms = green_rects.iter().map(|rect| rect.y()).collect::<Vec<_>>();
+    row_bottoms.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    assert_eq!(row_bottoms.len(), 3, "expected three rows: {row_bottoms:?}");
+    assert!(
+        row_bottoms
+            .windows(2)
+            .all(|pair| (pair[1] - pair[0] - 30.0).abs() < 0.01),
+        "inline-block rows should advance by exactly 30pt: {row_bottoms:?}"
+    );
+    assert!(
+        (row_bottoms[0] - wrapper.y()).abs() < 0.01
+            && (row_bottoms[2] + 30.0 - (wrapper.y() + wrapper.height())).abs() < 0.01,
+        "green rows should cover the 90pt wrapper with no exposed red: wrapper={wrapper:?}, rows={row_bottoms:?}"
+    );
 }
 
 #[tokio::test]
@@ -5065,6 +7039,51 @@ async fn inline_block_outline_paints_after_atomic_content() {
     assert!(
         outline_operation > child_operation,
         "inline-block outline should paint after atomic descendant content"
+    );
+}
+
+#[tokio::test]
+async fn zero_font_separators_still_create_atomic_inline_break_opportunities() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>@page { size: 200px 260px; margin: 0 } body { margin: 0 }\
+         div { width: 100px; background: blue }\
+         inline-block { display: inline-block; width: 80px; height: 1em; background: rgb(255 165 0) }\
+         sep { font-size: 0 }</style>\
+         <div>\
+           <inline-block></inline-block><sep> </sep>\
+           <inline-block></inline-block><sep>, </sep>\
+           <inline-block></inline-block><sep>) (</sep>\
+           <inline-block></inline-block><sep>a</sep>\
+           <inline-block></inline-block>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let mut orange_rects = document.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(255, 165, 0)))
+        .collect::<Vec<_>>();
+    orange_rects.sort_by(|left, right| right.y().total_cmp(&left.y()));
+
+    assert_eq!(
+        orange_rects.len(),
+        5,
+        "expected five inline-block backgrounds: {orange_rects:?}"
+    );
+    assert!(
+        orange_rects
+            .iter()
+            .all(|rect| (rect.width() - 60.0).abs() < 0.01),
+        "each 80px inline-block should be 60pt wide: {orange_rects:?}"
+    );
+    assert!(
+        orange_rects
+            .windows(2)
+            .all(|pair| (pair[0].y() - pair[1].y()).abs() > 0.5),
+        "inline-blocks should occupy five distinct visual lines: {orange_rects:?}"
     );
 }
 

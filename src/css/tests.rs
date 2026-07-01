@@ -16,6 +16,30 @@ async fn applies_page_options() {
 }
 
 #[tokio::test]
+async fn stylesheet_options_do_not_flatten_ch_font_metrics_before_fonts_load() {
+    let css = Css::from_string(
+        "p { font-size: 2ch; line-height: 3ch } body { font-size: calc(1ch + 10pt) }",
+    );
+    let mut options = RenderOptions::default();
+
+    apply_stylesheet_options(&css, &mut options);
+
+    assert_eq!(options.font_size, 12.0);
+    assert!((options.line_height - 14.4).abs() < 0.001);
+}
+
+#[tokio::test]
+async fn stylesheet_options_keep_metric_independent_font_defaults() {
+    let css = Css::from_string("p { font-size: 20px; line-height: 24px }");
+    let mut options = RenderOptions::default();
+
+    apply_stylesheet_options(&css, &mut options);
+
+    assert_eq!(options.font_size, 15.0);
+    assert_eq!(options.line_height, 18.0);
+}
+
+#[tokio::test]
 async fn page_size_one_length_creates_square_page() {
     let css = Css::from_string("@page { size: 5in }");
     let mut options = RenderOptions::default();
@@ -45,6 +69,33 @@ async fn page_width_height_descriptors_derive_sheet_size_when_size_is_omitted() 
 
     assert_eq!(size.width, 384.0);
     assert_eq!(size.height, 324.0);
+}
+
+#[tokio::test]
+async fn page_context_ch_lengths_use_page_font_metric_fallback() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@page { font-size: 20pt; size: 10ch 20ch; margin: 2ch; padding: 1ch }",
+    ));
+    let size = page_size_from(&stylesheet.page_declarations, PageSize::A4_POINTS);
+    let margins =
+        page_margins_from_for_size(&stylesheet.page_declarations, PageMargins::all(0.0), size);
+    let padding = page_padding_from_for_size(&stylesheet.page_declarations, size);
+
+    assert_eq!(size.width, 100.0);
+    assert_eq!(size.height, 200.0);
+    assert_eq!(margins, PageMargins::all(20.0));
+    assert_eq!(padding, edge_all(10.0));
+}
+
+#[tokio::test]
+async fn page_width_height_ch_descriptors_include_fixed_ch_margins() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@page { font-size: 20pt; width: 10ch; height: 5ch; margin: 1ch }",
+    ));
+    let size = page_size_from(&stylesheet.page_declarations, PageSize::A4_POINTS);
+
+    assert_eq!(size.width, 120.0);
+    assert_eq!(size.height, 70.0);
 }
 
 #[tokio::test]
@@ -1740,11 +1791,74 @@ async fn parses_axis_aligned_linear_gradient_background_image() {
     assert_eq!(gradient.direction, LinearGradientDirection::Bottom);
     assert_eq!(gradient.stops.len(), 4);
     assert_eq!(gradient.stops[0].color, Color::new(255, 0, 0));
-    assert_eq!(gradient.stops[0].position, 0.0);
-    assert_eq!(gradient.stops[1].position, 37.5);
+    assert_eq!(gradient.stops[0].position.length, 0.0);
+    assert_eq!(gradient.stops[1].position.length, 37.5);
     assert_eq!(gradient.stops[2].color, Color::new(0, 128, 0));
-    assert_eq!(gradient.stops[2].position, 37.5);
-    assert_eq!(gradient.stops[3].position, 75.0);
+    assert_eq!(gradient.stops[2].position.length, 37.5);
+    assert_eq!(gradient.stops[3].position.length, 75.0);
+}
+
+#[tokio::test]
+async fn parses_linear_gradient_percentage_color_stops() {
+    let declarations =
+        parse_declarations("background: linear-gradient(to bottom, red 50%, green 50%)");
+    let mut style = default_style_for_tag("div");
+
+    apply_declarations(&mut style, &declarations);
+
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image else {
+        panic!("expected linear gradient background image");
+    };
+    assert_eq!(gradient.stops.len(), 2);
+    assert_eq!(gradient.stops[0].color, Color::new(255, 0, 0));
+    assert_eq!(gradient.stops[0].position.percent, 0.5);
+    assert_eq!(gradient.stops[1].color, Color::new(0, 128, 0));
+    assert_eq!(gradient.stops[1].position.percent, 0.5);
+}
+
+#[tokio::test]
+async fn ch_linear_gradient_color_stops_resolve_before_paint() {
+    let declarations =
+        parse_declarations("background: linear-gradient(to right, red 2ch, blue 10vw)");
+    let mut style = default_style_for_tag("div");
+
+    apply_declarations(&mut style, &declarations);
+
+    let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_image else {
+        panic!("expected linear gradient background image");
+    };
+    assert_eq!(
+        gradient.stops[0].position,
+        ComputedLengthPercentage::from_ch(2.0)
+    );
+
+    style.resolve_font_metric_lengths(6.0);
+
+    let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_image else {
+        panic!("expected linear gradient background image");
+    };
+    assert_eq!(
+        gradient.stops[0].position,
+        ComputedLengthPercentage::from_length(12.0)
+    );
+    let Some(BackgroundImage::LinearGradient(layer_gradient)) = &style.background_layers[0].image
+    else {
+        panic!("expected linear gradient background layer");
+    };
+    assert_eq!(
+        layer_gradient.stops[0].position,
+        ComputedLengthPercentage::from_length(12.0)
+    );
+
+    style.resolve_viewport_lengths(200.0, 100.0);
+
+    let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_image else {
+        panic!("expected linear gradient background image");
+    };
+    assert_eq!(
+        gradient.stops[1].position,
+        ComputedLengthPercentage::from_length(20.0)
+    );
 }
 
 #[tokio::test]
@@ -2828,6 +2942,41 @@ async fn parses_inline_vertical_align_subset() {
 }
 
 #[tokio::test]
+async fn ch_baseline_shift_resolves_before_inline_layout() {
+    let declarations = parse_declarations("vertical-align: 2ch");
+    let mut style = default_style_for_tag("span");
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.vertical_align.baseline_shift,
+        BaselineShift::LengthPercentage(ComputedLengthPercentage::from_ch(2.0))
+    );
+
+    style.resolve_font_metric_lengths(6.0);
+
+    assert_eq!(
+        style.vertical_align.baseline_shift,
+        BaselineShift::LengthPercentage(ComputedLengthPercentage::from_length(12.0))
+    );
+
+    let declarations = parse_declarations("baseline-shift: 3ch");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.vertical_align.baseline_shift,
+        BaselineShift::LengthPercentage(ComputedLengthPercentage::from_ch(3.0))
+    );
+
+    style.resolve_font_metric_lengths(5.0);
+
+    assert_eq!(
+        style.vertical_align.baseline_shift,
+        BaselineShift::LengthPercentage(ComputedLengthPercentage::from_length(15.0))
+    );
+}
+
+#[tokio::test]
 async fn parses_css_bookmark_properties() {
     let declarations = parse_declarations(
         r#"bookmark-level: 3; bookmark-label: "Appendix: " attr(data-title) " - " content(text); bookmark-state: closed"#,
@@ -2912,7 +3061,10 @@ async fn parses_multicolumn_declarations() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(style.column_count, Some(4));
-    assert_eq!(style.column_width, ComputedColumnWidth::Length(24.0));
+    assert_eq!(
+        style.column_width,
+        ComputedColumnWidth::Length(ComputedLengthPercentage::from_length(24.0))
+    );
     assert_eq!(style.column_gap, ComputedGap::Normal);
     assert_eq!(style.row_gap, ComputedGap::Normal);
 }
@@ -2923,7 +3075,29 @@ async fn parses_column_width_longhand() {
     let mut style = default_style_for_tag("dl");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.column_width, ComputedColumnWidth::Length(12.0));
+    assert_eq!(
+        style.column_width,
+        ComputedColumnWidth::Length(ComputedLengthPercentage::from_length(12.0))
+    );
+}
+
+#[tokio::test]
+async fn ch_column_width_preserves_font_metric_component_until_used_resolution() {
+    let declarations = parse_declarations("column-width: 5ch");
+    let mut style = default_style_for_tag("dl");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.column_width,
+        ComputedColumnWidth::Length(ComputedLengthPercentage::from_ch(5.0))
+    );
+
+    style.resolve_font_metric_lengths(7.0);
+
+    assert_eq!(
+        style.column_width,
+        ComputedColumnWidth::Length(ComputedLengthPercentage::from_length(35.0))
+    );
 }
 
 #[tokio::test]
@@ -3149,6 +3323,15 @@ async fn parses_display_outer_inner_model() {
         ("inline-block", Display::INLINE_BLOCK, false),
         ("flex", Display::FLEX, false),
         ("inline-flex", Display::INLINE_FLEX, false),
+        ("grid", Display::GRID, false),
+        ("inline-grid", Display::INLINE_GRID, false),
+        ("inline grid", Display::INLINE_GRID, false),
+        ("block grid", Display::GRID, false),
+        (
+            "run-in grid",
+            Display::new(DisplayOuter::RunIn, DisplayInner::Grid),
+            false,
+        ),
         ("table", Display::TABLE, false),
         ("inline-table", Display::INLINE_TABLE, false),
         ("inline table", Display::INLINE_TABLE, false),
@@ -3198,6 +3381,8 @@ async fn rejects_invalid_display_outer_inner_grammar() {
         "flow flow-root",
         "flex list-item",
         "inline flex list-item",
+        "grid list-item",
+        "inline grid list-item",
         "table list-item",
         "run-in table list-item",
         "inline-block flow",
@@ -3693,8 +3878,845 @@ async fn classifies_atomic_inline_displays() {
     assert!(Display::INLINE_BLOCK.is_atomic_inline());
     assert!(Display::INLINE_FLEX.is_inline_level());
     assert!(Display::INLINE_FLEX.is_atomic_inline());
+    assert!(Display::INLINE_GRID.is_inline_level());
+    assert!(Display::INLINE_GRID.is_atomic_inline());
     assert!(!Display::INLINE.is_atomic_inline());
     assert!(Display::FLEX.establishes_block_formatting_context());
+    assert!(Display::GRID.establishes_block_formatting_context());
+}
+
+#[tokio::test]
+async fn parses_grid_display_and_core_longhands() {
+    let declarations = parse_declarations(
+        "display: grid;\
+         grid-template-columns: [start] 10pt 1fr minmax(20pt, 2fr) fit-content(30pt) repeat(2, 5pt);\
+         grid-template-rows: none;\
+         grid-template-areas: \"head head\" \"side main\";\
+         grid-auto-rows: minmax(8pt, auto) 1fr;\
+         grid-auto-columns: 12pt;\
+         grid-auto-flow: column dense;\
+         grid-row-start: 2;\
+         grid-row-end: span footer 3;\
+         grid-column-start: main;\
+         grid-column-end: span 2",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.display, Display::GRID);
+    let GridTrackList::Tracks {
+        components: columns,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("grid-template-columns should parse");
+    };
+    assert_eq!(columns.len(), 5);
+    match &columns[0] {
+        GridTrackListComponent::Track(names, size) => {
+            assert_eq!(names, &["start".to_string()]);
+            assert_eq!(
+                size.min,
+                GridMinTrackBreadth::LengthPercentage(ComputedLengthPercentage::from_length(10.0))
+            );
+        }
+        other => panic!("expected first explicit track, got {other:?}"),
+    }
+    assert!(matches!(
+        columns[1],
+        GridTrackListComponent::Track(
+            _,
+            GridTrackSize {
+                min: GridMinTrackBreadth::Auto,
+                max: GridMaxTrackBreadth::Flex(1.0)
+            }
+        )
+    ));
+    assert!(matches!(columns[4], GridTrackListComponent::Repeat(_, _)));
+    assert_eq!(style.grid_template_rows, GridTrackList::None);
+    let GridTemplateAreas::Areas(rows) = &style.grid_template_areas else {
+        panic!("grid-template-areas should parse");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].cells,
+        [Some("head".to_string()), Some("head".to_string())]
+    );
+    assert_eq!(style.grid_auto_flow, GridAutoFlow::ColumnDense);
+    assert_eq!(
+        style.grid_row_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: None,
+            index: Some(2)
+        })
+    );
+    assert_eq!(
+        style.grid_row_end,
+        GridPlacement::Span(GridSpanPlacement {
+            name: Some("footer".to_string()),
+            span: Some(3)
+        })
+    );
+    assert_eq!(
+        style.grid_column_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("main".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        style.grid_column_end,
+        GridPlacement::Span(GridSpanPlacement {
+            name: None,
+            span: Some(2)
+        })
+    );
+}
+
+#[tokio::test]
+async fn invalid_grid_longhands_do_not_partially_apply() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-columns: 10pt;\
+             grid-template-areas: \"head head\" \"side main\";\
+             grid-auto-flow: row",
+        ),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-columns: minmax(1fr, 10pt);\
+             grid-template-areas: \"bad bad\" \"bad main\";\
+             grid-auto-flow: row column",
+        ),
+    );
+
+    let GridTrackList::Tracks {
+        components: columns,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("valid initial grid-template-columns should remain");
+    };
+    assert_eq!(columns.len(), 1);
+    let GridTemplateAreas::Areas(rows) = &style.grid_template_areas else {
+        panic!("valid initial grid-template-areas should remain");
+    };
+    assert_eq!(
+        rows[0].cells,
+        [Some("head".to_string()), Some("head".to_string())]
+    );
+    assert_eq!(style.grid_auto_flow, GridAutoFlow::Row);
+}
+
+#[tokio::test]
+async fn parses_grid_auto_repeat_track_lists() {
+    let declarations = parse_declarations(
+        "grid-template-columns: [outer] repeat(auto-fit, [card] minmax(12pt, 1fr) [end]);\
+         grid-template-rows: repeat(auto-fill, minmax(auto, 20pt));",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let GridTrackList::Tracks {
+        components: columns,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("grid-template-columns should parse auto-fit");
+    };
+    let GridTrackListComponent::Repeat(names, repeat) = &columns[0] else {
+        panic!("expected auto-fit repeat");
+    };
+    assert_eq!(names, &["outer".to_string()]);
+    assert_eq!(repeat.count, GridRepeatCount::AutoFit);
+    assert_eq!(repeat.trailing_names, ["end".to_string()]);
+    assert_eq!(repeat.tracks.len(), 1);
+
+    let GridTrackList::Tracks {
+        components: rows, ..
+    } = &style.grid_template_rows
+    else {
+        panic!("grid-template-rows should parse auto-fill");
+    };
+    let GridTrackListComponent::Repeat(_, repeat) = &rows[0] else {
+        panic!("expected auto-fill repeat");
+    };
+    assert_eq!(repeat.count, GridRepeatCount::AutoFill);
+}
+
+#[tokio::test]
+async fn invalid_grid_auto_repeat_forms_do_not_apply() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-columns: repeat(auto-fill, 20pt);\
+             grid-template-rows: 10pt",
+        ),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-columns: repeat(auto-fit, 1fr);\
+             grid-template-rows: repeat(2, repeat(2, 10pt))",
+        ),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-columns: repeat(auto-fill, 10pt) repeat(auto-fit, 20pt)",
+        ),
+    );
+
+    let GridTrackList::Tracks {
+        components: columns,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("valid initial grid-template-columns should remain");
+    };
+    let GridTrackListComponent::Repeat(_, repeat) = &columns[0] else {
+        panic!("valid initial auto-fill repeat should remain");
+    };
+    assert_eq!(repeat.count, GridRepeatCount::AutoFill);
+
+    let GridTrackList::Tracks {
+        components: rows, ..
+    } = &style.grid_template_rows
+    else {
+        panic!("valid initial grid-template-rows should remain");
+    };
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0], GridTrackListComponent::Track(_, _)));
+}
+
+#[tokio::test]
+async fn invalid_grid_track_line_names_do_not_apply() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-columns: [main edge] 10pt;\
+             grid-template-rows: [row-start] 12pt",
+        ),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-columns: [span] 20pt;\
+             grid-template-rows: [main()] 30pt",
+        ),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations("grid-template-columns: [initial] 40pt"),
+    );
+
+    let GridTrackList::Tracks {
+        components: columns,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("valid initial grid-template-columns should remain");
+    };
+    let GridTrackListComponent::Track(names, _) = &columns[0] else {
+        panic!("valid initial column track should remain");
+    };
+    assert_eq!(names, &["main".to_string(), "edge".to_string()]);
+
+    let GridTrackList::Tracks {
+        components: rows, ..
+    } = &style.grid_template_rows
+    else {
+        panic!("valid initial grid-template-rows should remain");
+    };
+    let GridTrackListComponent::Track(names, _) = &rows[0] else {
+        panic!("valid initial row track should remain");
+    };
+    assert_eq!(names, &["row-start".to_string()]);
+}
+
+#[tokio::test]
+async fn invalid_grid_template_area_rows_do_not_apply() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations("grid-template-areas: \"a a\" \"b c\""),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations("grid-template-areas: \"a @\" \"b c\""),
+    );
+    let GridTemplateAreas::Areas(rows) = &style.grid_template_areas else {
+        panic!("valid initial grid-template-areas should remain");
+    };
+    assert_eq!(
+        rows[0].cells,
+        [Some("a".to_string()), Some("a".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn parses_grid_row_and_column_shorthands() {
+    let declarations = parse_declarations("grid-row: header / span 2; grid-column: 2 / main");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.grid_row_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("header".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        style.grid_row_end,
+        GridPlacement::Span(GridSpanPlacement {
+            name: None,
+            span: Some(2)
+        })
+    );
+    assert_eq!(
+        style.grid_column_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: None,
+            index: Some(2)
+        })
+    );
+    assert_eq!(
+        style.grid_column_end,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("main".to_string()),
+            index: None
+        })
+    );
+
+    let declarations = parse_declarations("grid-row-start: auto; grid-column: 2");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.grid_row_start, GridPlacement::Auto);
+    assert_eq!(
+        style.grid_column_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: None,
+            index: Some(2)
+        })
+    );
+    assert_eq!(style.grid_column_end, GridPlacement::Auto);
+}
+
+#[tokio::test]
+async fn parses_grid_area_shorthand() {
+    let declarations = parse_declarations("grid-area: main");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let expected = GridPlacement::Line(GridLinePlacement {
+        name: Some("main".to_string()),
+        index: None,
+    });
+    assert_eq!(style.grid_row_start, expected.clone());
+    assert_eq!(style.grid_column_start, expected.clone());
+    assert_eq!(style.grid_row_end, expected.clone());
+    assert_eq!(style.grid_column_end, expected);
+
+    let declarations = parse_declarations("grid-area: 2 / side / span 3 / 4");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(
+        style.grid_row_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: None,
+            index: Some(2)
+        })
+    );
+    assert_eq!(
+        style.grid_column_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("side".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        style.grid_row_end,
+        GridPlacement::Span(GridSpanPlacement {
+            name: None,
+            span: Some(3)
+        })
+    );
+    assert_eq!(
+        style.grid_column_end,
+        GridPlacement::Line(GridLinePlacement {
+            name: None,
+            index: Some(4)
+        })
+    );
+}
+
+#[tokio::test]
+async fn parses_grid_area_shorthand_omitted_values() {
+    let declarations = parse_declarations("grid-area: header / main");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let header = GridPlacement::Line(GridLinePlacement {
+        name: Some("header".to_string()),
+        index: None,
+    });
+    let main = GridPlacement::Line(GridLinePlacement {
+        name: Some("main".to_string()),
+        index: None,
+    });
+    assert_eq!(style.grid_row_start, header.clone());
+    assert_eq!(style.grid_column_start, main.clone());
+    assert_eq!(style.grid_row_end, header);
+    assert_eq!(style.grid_column_end, main);
+
+    let declarations = parse_declarations("grid-area: 2 / main / 4");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(
+        style.grid_row_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: None,
+            index: Some(2)
+        })
+    );
+    assert_eq!(
+        style.grid_column_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("main".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        style.grid_row_end,
+        GridPlacement::Line(GridLinePlacement {
+            name: None,
+            index: Some(4)
+        })
+    );
+    assert_eq!(
+        style.grid_column_end,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("main".to_string()),
+            index: None
+        })
+    );
+}
+
+#[tokio::test]
+async fn invalid_grid_area_shorthand_does_not_partially_apply() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &parse_declarations("grid-area: header / main"));
+    apply_declarations(
+        &mut style,
+        &parse_declarations("grid-area: 1 / 2 / 3 / 4 / 5"),
+    );
+
+    assert_eq!(
+        style.grid_row_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("header".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        style.grid_column_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("main".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        style.grid_row_end,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("header".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        style.grid_column_end,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("main".to_string()),
+            index: None
+        })
+    );
+}
+
+#[tokio::test]
+async fn parses_grid_named_line_occurrences() {
+    let declarations = parse_declarations(
+        "grid-row-start: header 2;\
+         grid-row-end: 3 footer;\
+         grid-column-start: span main 2;\
+         grid-column-end: 2 span main",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.grid_row_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("header".to_string()),
+            index: Some(2)
+        })
+    );
+    assert_eq!(
+        style.grid_row_end,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("footer".to_string()),
+            index: Some(3)
+        })
+    );
+    let expected_span = GridPlacement::Span(GridSpanPlacement {
+        name: Some("main".to_string()),
+        span: Some(2),
+    });
+    assert_eq!(style.grid_column_start, expected_span.clone());
+    assert_eq!(style.grid_column_end, expected_span);
+}
+
+#[tokio::test]
+async fn invalid_grid_placement_custom_idents_do_not_apply() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-row-start: header;\
+             grid-column-start: main;\
+             grid-column-end: span rail 2",
+        ),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-row-start: \"bad\";\
+             grid-column-start: main();\
+             grid-column-end: span initial 2",
+        ),
+    );
+
+    assert_eq!(
+        style.grid_row_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("header".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        style.grid_column_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("main".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        style.grid_column_end,
+        GridPlacement::Span(GridSpanPlacement {
+            name: Some("rail".to_string()),
+            span: Some(2)
+        })
+    );
+}
+
+#[tokio::test]
+async fn invalid_grid_placement_shorthand_custom_idents_do_not_apply() {
+    let mut row_style = default_style_for_tag("div");
+    apply_declarations(
+        &mut row_style,
+        &parse_declarations("grid-row: header / footer"),
+    );
+    apply_declarations(
+        &mut row_style,
+        &parse_declarations("grid-row: initial / main"),
+    );
+
+    assert_eq!(
+        row_style.grid_row_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("header".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        row_style.grid_row_end,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("footer".to_string()),
+            index: None
+        })
+    );
+
+    let mut area_style = default_style_for_tag("div");
+    apply_declarations(
+        &mut area_style,
+        &parse_declarations("grid-area: card / main"),
+    );
+    apply_declarations(
+        &mut area_style,
+        &parse_declarations("grid-area: card() / main"),
+    );
+
+    assert_eq!(
+        area_style.grid_row_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("card".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        area_style.grid_row_end,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("card".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        area_style.grid_column_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("main".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        area_style.grid_column_end,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("main".to_string()),
+            index: None
+        })
+    );
+}
+
+#[tokio::test]
+async fn parses_grid_template_shorthand() {
+    let declarations = parse_declarations(
+        "grid-template: [top] \"head head\" 12pt [middle] \"side main\" minmax(20pt, auto) [bottom] / [left] 30pt [split] 1fr [right]",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let GridTemplateAreas::Areas(rows) = &style.grid_template_areas else {
+        panic!("grid-template should set areas");
+    };
+    assert_eq!(
+        rows[0].cells,
+        [Some("head".to_string()), Some("head".to_string())]
+    );
+    assert_eq!(
+        rows[1].cells,
+        [Some("side".to_string()), Some("main".to_string())]
+    );
+
+    let GridTrackList::Tracks {
+        components: row_tracks,
+        trailing_names: row_trailing_names,
+    } = &style.grid_template_rows
+    else {
+        panic!("grid-template should set row tracks");
+    };
+    assert_eq!(row_tracks.len(), 2);
+    assert_eq!(row_trailing_names, &["bottom".to_string()]);
+    match &row_tracks[0] {
+        GridTrackListComponent::Track(names, size) => {
+            assert_eq!(names, &["top".to_string()]);
+            assert_eq!(
+                size.min,
+                GridMinTrackBreadth::LengthPercentage(ComputedLengthPercentage::from_length(12.0))
+            );
+        }
+        other => panic!("expected first row track, got {other:?}"),
+    }
+    match &row_tracks[1] {
+        GridTrackListComponent::Track(names, _) => {
+            assert_eq!(names, &["middle".to_string()]);
+        }
+        other => panic!("expected second row track, got {other:?}"),
+    }
+
+    let GridTrackList::Tracks {
+        components: column_tracks,
+        trailing_names: column_trailing_names,
+    } = &style.grid_template_columns
+    else {
+        panic!("grid-template should set column tracks");
+    };
+    assert_eq!(column_tracks.len(), 2);
+    assert_eq!(column_trailing_names, &["right".to_string()]);
+    match &column_tracks[0] {
+        GridTrackListComponent::Track(names, _) => assert_eq!(names, &["left".to_string()]),
+        other => panic!("expected first column track, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn parses_grid_template_track_shorthand_and_none() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations("grid-template: 10pt 1fr / 20pt 2fr"),
+    );
+    let GridTrackList::Tracks {
+        components: row_tracks,
+        ..
+    } = &style.grid_template_rows
+    else {
+        panic!("grid-template should set rows");
+    };
+    let GridTrackList::Tracks {
+        components: column_tracks,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("grid-template should set columns");
+    };
+    assert_eq!(row_tracks.len(), 2);
+    assert_eq!(column_tracks.len(), 2);
+    assert_eq!(style.grid_template_areas, GridTemplateAreas::None);
+
+    apply_declarations(&mut style, &parse_declarations("grid-template: none"));
+    assert_eq!(style.grid_template_rows, GridTrackList::None);
+    assert_eq!(style.grid_template_columns, GridTrackList::None);
+    assert_eq!(style.grid_template_areas, GridTemplateAreas::None);
+}
+
+#[tokio::test]
+async fn invalid_grid_template_shorthand_does_not_partially_apply() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations("grid-template: \"a a\" 10pt / 20pt 1fr"),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations("grid-template: \"bad bad\" \"bad main\" / 1fr 1fr"),
+    );
+
+    let GridTemplateAreas::Areas(rows) = &style.grid_template_areas else {
+        panic!("valid initial grid-template areas should remain");
+    };
+    assert_eq!(
+        rows[0].cells,
+        [Some("a".to_string()), Some("a".to_string())]
+    );
+    let GridTrackList::Tracks {
+        components: row_tracks,
+        ..
+    } = &style.grid_template_rows
+    else {
+        panic!("valid initial grid-template rows should remain");
+    };
+    let GridTrackList::Tracks {
+        components: column_tracks,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("valid initial grid-template columns should remain");
+    };
+    assert_eq!(row_tracks.len(), 1);
+    assert_eq!(column_tracks.len(), 2);
+}
+
+#[tokio::test]
+async fn parses_grid_shorthand_template_form_and_resets_implicit_grid() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-auto-flow: column dense; grid-auto-rows: 5pt; grid-auto-columns: 6pt",
+        ),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations("grid: \"a a\" 10pt / 20pt 1fr"),
+    );
+
+    let GridTemplateAreas::Areas(rows) = &style.grid_template_areas else {
+        panic!("grid shorthand should set template areas");
+    };
+    assert_eq!(
+        rows[0].cells,
+        [Some("a".to_string()), Some("a".to_string())]
+    );
+    let GridTrackList::Tracks {
+        components: row_tracks,
+        ..
+    } = &style.grid_template_rows
+    else {
+        panic!("grid shorthand should set template rows");
+    };
+    let GridTrackList::Tracks {
+        components: column_tracks,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("grid shorthand should set template columns");
+    };
+    assert_eq!(row_tracks.len(), 1);
+    assert_eq!(column_tracks.len(), 2);
+    assert_eq!(style.grid_auto_flow, GridAutoFlow::Row);
+    assert_eq!(style.grid_auto_rows.tracks, [GridTrackSize::AUTO]);
+    assert_eq!(style.grid_auto_columns.tracks, [GridTrackSize::AUTO]);
+}
+
+#[tokio::test]
+async fn parses_grid_shorthand_auto_flow_forms() {
+    let declarations = parse_declarations("grid: auto-flow dense 7pt 8pt / [main] 1fr");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(style.grid_template_rows, GridTrackList::None);
+    assert_eq!(style.grid_auto_flow, GridAutoFlow::RowDense);
+    assert_eq!(style.grid_auto_rows.tracks.len(), 2);
+    assert_eq!(style.grid_auto_columns.tracks, [GridTrackSize::AUTO]);
+    let GridTrackList::Tracks {
+        components: columns,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("row auto-flow grid shorthand should set columns");
+    };
+    assert_eq!(columns.len(), 1);
+
+    let declarations = parse_declarations("grid: [row] 10pt / dense auto-flow 9pt");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(style.grid_template_columns, GridTrackList::None);
+    assert_eq!(style.grid_auto_flow, GridAutoFlow::ColumnDense);
+    assert_eq!(style.grid_auto_rows.tracks, [GridTrackSize::AUTO]);
+    assert_eq!(style.grid_auto_columns.tracks.len(), 1);
+    let GridTrackList::Tracks {
+        components: rows, ..
+    } = &style.grid_template_rows
+    else {
+        panic!("column auto-flow grid shorthand should set rows");
+    };
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
+async fn invalid_grid_shorthand_does_not_partially_apply() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &parse_declarations("grid: 10pt / 20pt"));
+    apply_declarations(&mut style, &parse_declarations("grid: 10pt 20pt"));
+
+    let GridTrackList::Tracks {
+        components: rows, ..
+    } = &style.grid_template_rows
+    else {
+        panic!("valid initial grid rows should remain");
+    };
+    let GridTrackList::Tracks {
+        components: columns,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("valid initial grid columns should remain");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(columns.len(), 1);
 }
 
 #[tokio::test]
@@ -4846,6 +5868,35 @@ async fn parses_side_specific_border_widths() {
 }
 
 #[tokio::test]
+async fn ch_border_width_preserves_font_metric_component_until_used_resolution() {
+    let declarations =
+        parse_declarations("border-width: 2ch 1pt; border-style: solid; border-color: green");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.border_width_values.top,
+        ComputedLengthPercentage::from_ch(2.0)
+    );
+    assert_eq!(
+        style.border_width_values.right,
+        ComputedLengthPercentage::from_length(1.0)
+    );
+    assert_eq!(style.border_widths.top, 0.0);
+    assert_eq!(style.border_widths.right, 1.0);
+
+    style.resolve_font_metric_lengths(5.0);
+
+    assert_eq!(
+        style.border_width_values.top,
+        ComputedLengthPercentage::from_length(10.0)
+    );
+    assert_eq!(style.border_widths.top, 10.0);
+    assert_eq!(style.border_widths.right, 1.0);
+    assert_eq!(style.border_width, 10.0);
+}
+
+#[tokio::test]
 async fn parses_side_specific_dotted_border_shorthand() {
     let declarations = parse_declarations("border-top: 2pt dotted blue");
     let mut style = default_style_for_tag("div");
@@ -5042,14 +6093,14 @@ async fn maps_logical_corner_radii_to_initial_physical_corners() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_radius.top_left.x.length, 1.0);
-    assert_eq!(style.border_radius.top_left.y.length, 2.0);
-    assert_eq!(style.border_radius.top_right.x.length, 3.0);
-    assert_eq!(style.border_radius.top_right.y.length, 3.0);
-    assert_eq!(style.border_radius.bottom_left.x.length, 4.0);
-    assert_eq!(style.border_radius.bottom_left.y.length, 5.0);
-    assert_eq!(style.border_radius.bottom_right.x.length, 6.0);
-    assert_eq!(style.border_radius.bottom_right.y.length, 6.0);
+    assert_eq!(style.border_radius.top_left.x.value.length, 1.0);
+    assert_eq!(style.border_radius.top_left.y.value.length, 2.0);
+    assert_eq!(style.border_radius.top_right.x.value.length, 3.0);
+    assert_eq!(style.border_radius.top_right.y.value.length, 3.0);
+    assert_eq!(style.border_radius.bottom_left.x.value.length, 4.0);
+    assert_eq!(style.border_radius.bottom_left.y.value.length, 5.0);
+    assert_eq!(style.border_radius.bottom_right.x.value.length, 6.0);
+    assert_eq!(style.border_radius.bottom_right.y.value.length, 6.0);
 }
 
 #[tokio::test]
@@ -5064,14 +6115,14 @@ async fn maps_logical_corner_radii_through_vertical_writing_mode() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_radius.top_right.x.length, 1.0);
-    assert_eq!(style.border_radius.top_right.y.length, 2.0);
-    assert_eq!(style.border_radius.bottom_right.x.length, 3.0);
-    assert_eq!(style.border_radius.bottom_right.y.length, 3.0);
-    assert_eq!(style.border_radius.top_left.x.length, 4.0);
-    assert_eq!(style.border_radius.top_left.y.length, 5.0);
-    assert_eq!(style.border_radius.bottom_left.x.length, 6.0);
-    assert_eq!(style.border_radius.bottom_left.y.length, 6.0);
+    assert_eq!(style.border_radius.top_right.x.value.length, 1.0);
+    assert_eq!(style.border_radius.top_right.y.value.length, 2.0);
+    assert_eq!(style.border_radius.bottom_right.x.value.length, 3.0);
+    assert_eq!(style.border_radius.bottom_right.y.value.length, 3.0);
+    assert_eq!(style.border_radius.top_left.x.value.length, 4.0);
+    assert_eq!(style.border_radius.top_left.y.value.length, 5.0);
+    assert_eq!(style.border_radius.bottom_left.x.value.length, 6.0);
+    assert_eq!(style.border_radius.bottom_left.y.value.length, 6.0);
 }
 
 #[tokio::test]
@@ -5089,8 +6140,8 @@ async fn logical_corner_radius_revert_layer_rolls_back_physical_corner() {
         &[],
     );
 
-    assert_eq!(style.border_radius.top_left.x.length, 7.0);
-    assert_eq!(style.border_radius.top_left.y.length, 8.0);
+    assert_eq!(style.border_radius.top_left.x.value.length, 7.0);
+    assert_eq!(style.border_radius.top_left.y.value.length, 8.0);
 }
 
 #[tokio::test]
@@ -5133,7 +6184,7 @@ async fn parses_border_image_longhands() {
     );
     assert_eq!(
         style.border_image.outset.right,
-        BorderImageOutsetValue::Length(2.0)
+        BorderImageOutsetValue::Length(ComputedLengthPercentage::from_length(2.0))
     );
     assert_eq!(
         style.border_image.repeat.horizontal,
@@ -5173,7 +6224,7 @@ async fn parses_border_image_shorthand_and_resets_omitted_longhands() {
     );
     assert_eq!(
         style.border_image.outset.right,
-        BorderImageOutsetValue::Length(2.0)
+        BorderImageOutsetValue::Length(ComputedLengthPercentage::from_length(2.0))
     );
     assert_eq!(
         style.border_image.repeat.horizontal,
@@ -5194,6 +6245,33 @@ async fn parses_border_image_shorthand_and_resets_omitted_longhands() {
     assert_eq!(
         reset_style.border_image.slice.offsets.top,
         BorderImageSliceValue::Percent(1.0)
+    );
+}
+
+#[tokio::test]
+async fn ch_border_image_outset_preserves_font_metric_component_until_used_resolution() {
+    let declarations = parse_declarations("border-image-outset: 2ch 1pt");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.border_image.outset.top,
+        BorderImageOutsetValue::Length(ComputedLengthPercentage::from_ch(2.0))
+    );
+    assert_eq!(
+        style.border_image.outset.right,
+        BorderImageOutsetValue::Length(ComputedLengthPercentage::from_length(1.0))
+    );
+
+    style.resolve_font_metric_lengths(5.0);
+
+    assert_eq!(
+        style.border_image.outset.top,
+        BorderImageOutsetValue::Length(ComputedLengthPercentage::from_length(10.0))
+    );
+    assert_eq!(
+        style.border_image.outset.right,
+        BorderImageOutsetValue::Length(ComputedLengthPercentage::from_length(1.0))
     );
 }
 
@@ -5224,14 +6302,38 @@ async fn parses_border_radius_shorthand_lengths_and_percentages() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_radius.top_left.x.length, 4.0);
-    assert_eq!(style.border_radius.top_right.x.length, 8.0);
-    assert_eq!(style.border_radius.bottom_right.x.length, 4.0);
-    assert_eq!(style.border_radius.bottom_left.x.length, 8.0);
-    assert_eq!(style.border_radius.top_left.y.percent, 0.1);
-    assert_eq!(style.border_radius.top_right.y.percent, 0.2);
-    assert_eq!(style.border_radius.bottom_right.y.percent, 0.1);
-    assert_eq!(style.border_radius.bottom_left.y.percent, 0.2);
+    assert_eq!(style.border_radius.top_left.x.value.length, 4.0);
+    assert_eq!(style.border_radius.top_right.x.value.length, 8.0);
+    assert_eq!(style.border_radius.bottom_right.x.value.length, 4.0);
+    assert_eq!(style.border_radius.bottom_left.x.value.length, 8.0);
+    assert_eq!(style.border_radius.top_left.y.value.percent, 0.1);
+    assert_eq!(style.border_radius.top_right.y.value.percent, 0.2);
+    assert_eq!(style.border_radius.bottom_right.y.value.percent, 0.1);
+    assert_eq!(style.border_radius.bottom_left.y.value.percent, 0.2);
+}
+
+#[tokio::test]
+async fn ch_border_radius_preserves_font_metric_component_until_used_resolution() {
+    let declarations = parse_declarations("border-radius: 2ch 1pt");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.border_radius.top_left.x.value,
+        ComputedLengthPercentage::from_ch(2.0)
+    );
+    assert_eq!(
+        style.border_radius.top_right.x.value,
+        ComputedLengthPercentage::from_length(1.0)
+    );
+
+    style.resolve_font_metric_lengths(6.0);
+
+    assert_eq!(
+        style.border_radius.top_left.x.value,
+        ComputedLengthPercentage::from_length(12.0)
+    );
+    assert_eq!(style.border_radius.top_left.x.resolve(100.0), 12.0);
 }
 
 #[tokio::test]
@@ -5241,10 +6343,10 @@ async fn parses_border_radius_corner_longhands() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_radius.top_left.x.length, 4.0);
-    assert_eq!(style.border_radius.top_left.y.percent, 0.1);
-    assert_eq!(style.border_radius.bottom_right.x.length, 8.0);
-    assert_eq!(style.border_radius.bottom_right.y.length, 12.0);
+    assert_eq!(style.border_radius.top_left.x.value.length, 4.0);
+    assert_eq!(style.border_radius.top_left.y.value.percent, 0.1);
+    assert_eq!(style.border_radius.bottom_right.x.value.length, 8.0);
+    assert_eq!(style.border_radius.bottom_right.y.value.length, 12.0);
 }
 
 #[tokio::test]
@@ -5254,14 +6356,20 @@ async fn parses_corner_shape_and_corner_shorthand() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_radius.top_left.x.length, 36.0 * CSS_PX_TO_PT);
-    assert_eq!(style.border_radius.top_right.x.length, 18.0 * CSS_PX_TO_PT);
     assert_eq!(
-        style.border_radius.bottom_right.x.length,
+        style.border_radius.top_left.x.value.length,
+        36.0 * CSS_PX_TO_PT
+    );
+    assert_eq!(
+        style.border_radius.top_right.x.value.length,
+        18.0 * CSS_PX_TO_PT
+    );
+    assert_eq!(
+        style.border_radius.bottom_right.x.value.length,
         28.0 * CSS_PX_TO_PT
     );
     assert_eq!(
-        style.border_radius.bottom_left.x.length,
+        style.border_radius.bottom_left.x.value.length,
         20.0 * CSS_PX_TO_PT
     );
     assert_eq!(style.corner_shapes.top_left, CornerShape::Round);
@@ -5285,14 +6393,14 @@ async fn revert_layer_border_radius_longhand_preserves_unaffected_shorthand_corn
         &[],
     );
 
-    assert_eq!(style.border_radius.top_left.x.length, 3.0);
-    assert_eq!(style.border_radius.top_left.y.length, 3.0);
-    assert_eq!(style.border_radius.top_right.x.length, 10.0);
-    assert_eq!(style.border_radius.top_right.y.length, 20.0);
-    assert_eq!(style.border_radius.bottom_right.x.length, 10.0);
-    assert_eq!(style.border_radius.bottom_right.y.length, 20.0);
-    assert_eq!(style.border_radius.bottom_left.x.length, 10.0);
-    assert_eq!(style.border_radius.bottom_left.y.length, 20.0);
+    assert_eq!(style.border_radius.top_left.x.value.length, 3.0);
+    assert_eq!(style.border_radius.top_left.y.value.length, 3.0);
+    assert_eq!(style.border_radius.top_right.x.value.length, 10.0);
+    assert_eq!(style.border_radius.top_right.y.value.length, 20.0);
+    assert_eq!(style.border_radius.bottom_right.x.value.length, 10.0);
+    assert_eq!(style.border_radius.bottom_right.y.value.length, 20.0);
+    assert_eq!(style.border_radius.bottom_left.x.value.length, 10.0);
+    assert_eq!(style.border_radius.bottom_left.y.value.length, 20.0);
 }
 
 #[tokio::test]
@@ -5308,20 +6416,47 @@ async fn parses_table_border_model_properties() {
     assert_eq!(style.table_layout, TableLayout::Fixed);
     assert_eq!(style.empty_cells, EmptyCells::Show);
     assert_eq!(style.visibility, Visibility::Collapse);
-    assert_eq!(style.border_spacing.horizontal, 4.0);
-    assert_eq!(style.border_spacing.vertical, 4.5);
+    assert_eq!(style.border_spacing.horizontal.length, 4.0);
+    assert_eq!(style.border_spacing.vertical.length, 4.5);
     assert!(style.border_spacing_explicit);
+}
+
+#[tokio::test]
+async fn ch_border_spacing_preserves_font_metric_component_until_used_resolution() {
+    let declarations = parse_declarations("border-spacing: 2ch 1pt");
+    let mut style = default_style_for_tag("table");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.border_spacing.horizontal,
+        ComputedLengthPercentage::from_ch(2.0)
+    );
+    assert_eq!(
+        style.border_spacing.vertical,
+        ComputedLengthPercentage::from_length(1.0)
+    );
+
+    style.resolve_font_metric_lengths(5.0);
+
+    assert_eq!(
+        style.border_spacing.horizontal,
+        ComputedLengthPercentage::from_length(10.0)
+    );
+    assert_eq!(
+        style.border_spacing.vertical,
+        ComputedLengthPercentage::from_length(1.0)
+    );
 }
 
 #[tokio::test]
 async fn border_spacing_initial_value_is_zero_but_html_tables_get_ua_spacing() {
     let initial = ComputedStyle::initial();
-    assert_eq!(initial.border_spacing.horizontal, 0.0);
-    assert_eq!(initial.border_spacing.vertical, 0.0);
+    assert_eq!(initial.border_spacing.horizontal.length, 0.0);
+    assert_eq!(initial.border_spacing.vertical.length, 0.0);
 
     let table = default_style_for_tag("table");
-    assert_eq!(table.border_spacing.horizontal, 1.5);
-    assert_eq!(table.border_spacing.vertical, 1.5);
+    assert_eq!(table.border_spacing.horizontal.length, 1.5);
+    assert_eq!(table.border_spacing.vertical.length, 1.5);
     assert!(!table.border_spacing_explicit);
 }
 
@@ -5385,7 +6520,10 @@ async fn parses_css_text_decoration_level_four_properties() {
     assert!(matches!(
         style.text_decoration.inset,
         TextDecorationInset::Lengths { start, end }
-            if (start - 1.5).abs() < 0.01 && (end + 0.75).abs() < 0.01
+            if (start.length - 1.5).abs() < 0.01
+                && start.percent == 0.0
+                && (end.length + 0.75).abs() < 0.01
+                && end.percent == 0.0
     ));
     assert!(matches!(
         style.text_decoration.skip_self,
@@ -5398,10 +6536,10 @@ async fn parses_css_text_decoration_level_four_properties() {
             if (value.length - 3.75).abs() < 0.01
     ));
     assert_eq!(style.text_shadow.len(), 2);
-    assert!((style.text_shadow[0].offset_x - 0.75).abs() < 0.01);
-    assert!((style.text_shadow[0].offset_y - 1.5).abs() < 0.01);
-    assert!((style.text_shadow[0].blur_radius - 2.25).abs() < 0.01);
-    assert!((style.text_shadow[0].spread - 3.0).abs() < 0.01);
+    assert!((style.text_shadow[0].offset_x.length - 0.75).abs() < 0.01);
+    assert!((style.text_shadow[0].offset_y.length - 1.5).abs() < 0.01);
+    assert!((style.text_shadow[0].blur_radius.length - 2.25).abs() < 0.01);
+    assert!((style.text_shadow[0].spread.length - 3.0).abs() < 0.01);
     assert_eq!(
         style.text_shadow[0].color,
         TextShadowColor::Color(Color::new(255, 0, 0))
@@ -5410,16 +6548,16 @@ async fn parses_css_text_decoration_level_four_properties() {
     assert!(style.text_shadow[1].inset);
     assert_eq!(style.box_shadow.len(), 2);
     assert!(style.box_shadow[0].inset);
-    assert!((style.box_shadow[0].offset_x - 45.0).abs() < 0.01);
-    assert!((style.box_shadow[0].offset_y - 0.0).abs() < 0.01);
+    assert!((style.box_shadow[0].offset_x.length - 45.0).abs() < 0.01);
+    assert!((style.box_shadow[0].offset_y.length - 0.0).abs() < 0.01);
     assert_eq!(
         style.box_shadow[0].color,
         BoxShadowColor::Color(Color::new(0, 128, 0))
     );
     assert_eq!(style.box_shadow[1].color, BoxShadowColor::CurrentColor);
-    assert!((style.box_shadow[1].offset_x + 1.5).abs() < 0.01);
-    assert!((style.box_shadow[1].offset_y - 2.25).abs() < 0.01);
-    assert!((style.box_shadow[1].spread + 0.75).abs() < 0.01);
+    assert!((style.box_shadow[1].offset_x.length + 1.5).abs() < 0.01);
+    assert!((style.box_shadow[1].offset_y.length - 2.25).abs() < 0.01);
+    assert!((style.box_shadow[1].spread.length + 0.75).abs() < 0.01);
     assert_eq!(style.text_emphasis_color, Some(Color::new(0, 128, 0)));
     assert_eq!(
         style
@@ -5436,6 +6574,29 @@ async fn parses_css_text_decoration_level_four_properties() {
 }
 
 #[tokio::test]
+async fn ch_text_decoration_inset_preserves_font_metric_component_until_used_resolution() {
+    let declarations = parse_declarations("text-decoration-inset: 2ch 1pt");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert!(matches!(
+        style.text_decoration.inset,
+        TextDecorationInset::Lengths { start, end }
+            if start == ComputedLengthPercentage::from_ch(2.0)
+                && end == ComputedLengthPercentage::from_length(1.0)
+    ));
+
+    style.resolve_font_metric_lengths(6.0);
+
+    assert!(matches!(
+        style.text_decoration.inset,
+        TextDecorationInset::Lengths { start, end }
+            if start == ComputedLengthPercentage::from_length(12.0)
+                && end == ComputedLengthPercentage::from_length(1.0)
+    ));
+}
+
+#[tokio::test]
 async fn parses_box_shadow_none_and_rejects_negative_blur() {
     let mut style = default_style_for_tag("div");
     apply_declarations(
@@ -5449,6 +6610,41 @@ async fn parses_box_shadow_none_and_rejects_negative_blur() {
         &parse_declarations("box-shadow: 1px 2px -3px green"),
     );
     assert!(style.box_shadow.is_empty());
+}
+
+#[tokio::test]
+async fn ch_shadow_lengths_preserve_font_metric_component_until_used_resolution() {
+    let declarations = parse_declarations("text-shadow: 2ch 1pt; box-shadow: 1pt 3ch 0 2ch");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.text_shadow[0].offset_x,
+        ComputedLengthPercentage::from_ch(2.0)
+    );
+    assert_eq!(
+        style.box_shadow[0].offset_y,
+        ComputedLengthPercentage::from_ch(3.0)
+    );
+    assert_eq!(
+        style.box_shadow[0].spread,
+        ComputedLengthPercentage::from_ch(2.0)
+    );
+
+    style.resolve_font_metric_lengths(5.0);
+
+    assert_eq!(
+        style.text_shadow[0].offset_x,
+        ComputedLengthPercentage::from_length(10.0)
+    );
+    assert_eq!(
+        style.box_shadow[0].offset_y,
+        ComputedLengthPercentage::from_length(15.0)
+    );
+    assert_eq!(
+        style.box_shadow[0].spread,
+        ComputedLengthPercentage::from_length(10.0)
+    );
 }
 
 #[tokio::test]
@@ -5973,8 +7169,8 @@ async fn parses_css_math_length_percentage_values() {
 }
 
 #[tokio::test]
-async fn rejects_incomparable_css_math_min_max_values() {
-    let declarations = parse_declarations("width: 20pt; width: min(10pt, 50%)");
+async fn rejects_incomparable_css_math_number_length_values() {
+    let declarations = parse_declarations("width: 20pt; width: min(10pt, 2)");
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
@@ -5987,6 +7183,245 @@ async fn rejects_incomparable_css_math_min_max_values() {
             ..ComputedLengthPercentage::ZERO
         })
     );
+}
+
+#[tokio::test]
+async fn css_math_defers_ch_comparisons_until_font_metric_resolution() {
+    let declarations = parse_declarations(
+        "width: calc(min(10pt, 2ch) + 1pt); height: calc(max(10pt, 2ch) - 1pt); min-width: clamp(10pt, 2ch, 20pt); max-height: min(20pt, 2ch, 10pt); line-height: min(10pt, calc(2ch + 1pt))",
+    );
+    let mut small_ch = default_style_for_tag("div");
+    apply_declarations(&mut small_ch, &declarations);
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = small_ch.box_values.width else {
+        panic!("expected deferred width");
+    };
+    assert!(width.length_if_no_percent().is_none());
+
+    let mut large_ch = small_ch.clone();
+
+    small_ch.resolve_font_metric_lengths(4.0);
+    large_ch.resolve_font_metric_lengths(6.0);
+
+    assert_eq!(
+        small_ch.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            9.0
+        ))
+    );
+    assert_eq!(
+        small_ch.box_values.height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            9.0
+        ))
+    );
+    assert_eq!(
+        small_ch.box_values.min_width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            10.0
+        ))
+    );
+    assert_eq!(
+        small_ch.box_values.max_height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            8.0
+        ))
+    );
+    assert_eq!(small_ch.line_height, 9.0);
+
+    assert_eq!(
+        large_ch.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            11.0
+        ))
+    );
+    assert_eq!(
+        large_ch.box_values.height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            11.0
+        ))
+    );
+    assert_eq!(
+        large_ch.box_values.min_width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            12.0
+        ))
+    );
+    assert_eq!(
+        large_ch.box_values.max_height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            10.0
+        ))
+    );
+    assert_eq!(large_ch.line_height, 10.0);
+}
+
+#[tokio::test]
+async fn css_math_defers_length_percentage_comparisons_until_used_basis_resolution() {
+    let declarations = parse_declarations(
+        "width: min(10pt, 50%); height: max(10pt, 50%); min-width: calc(min(10ch, 50%) + 1pt); max-width: clamp(10pt, 50%, 80pt)",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
+        panic!("expected deferred width");
+    };
+    assert!(width.length_if_no_percent().is_none());
+    assert_eq!(width.used_length_with_percentage_basis(12.0), Some(6.0));
+    assert_eq!(width.used_length_with_percentage_basis(40.0), Some(10.0));
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(height) = style.box_values.height else {
+        panic!("expected deferred height");
+    };
+    assert_eq!(height.used_length_with_percentage_basis(12.0), Some(10.0));
+    assert_eq!(height.used_length_with_percentage_basis(40.0), Some(20.0));
+
+    style.resolve_font_metric_lengths(4.0);
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(min_width) = style.box_values.min_width
+    else {
+        panic!("expected deferred min-width");
+    };
+    assert_eq!(
+        min_width.used_length_with_percentage_basis(100.0),
+        Some(41.0)
+    );
+    assert_eq!(
+        min_width.used_length_with_percentage_basis(60.0),
+        Some(31.0)
+    );
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(max_width) = style.box_values.max_width
+    else {
+        panic!("expected deferred max-width");
+    };
+    assert_eq!(
+        max_width.used_length_with_percentage_basis(12.0),
+        Some(10.0)
+    );
+    assert_eq!(
+        max_width.used_length_with_percentage_basis(100.0),
+        Some(50.0)
+    );
+    assert_eq!(
+        max_width.used_length_with_percentage_basis(200.0),
+        Some(80.0)
+    );
+}
+
+#[tokio::test]
+async fn css_math_same_unit_ch_values_preserve_font_metric_component() {
+    let declarations = parse_declarations(
+        "width: min(3ch, 2ch); height: max(1ch, 4ch); min-width: clamp(1ch, 3ch, 2ch); line-height: min(4ch, 2ch)",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_ch(2.0))
+    );
+    assert_eq!(
+        style.box_values.height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_ch(4.0))
+    );
+    assert_eq!(
+        style.box_values.min_width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_ch(2.0))
+    );
+    assert_eq!(
+        style.line_height_value,
+        ComputedLineHeight::Length(ComputedLengthPercentage::from_ch(2.0))
+    );
+
+    style.resolve_font_metric_lengths(5.0);
+
+    assert_eq!(
+        style.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            10.0
+        ))
+    );
+    assert_eq!(
+        style.box_values.height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            20.0
+        ))
+    );
+    assert_eq!(
+        style.box_values.min_width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            10.0
+        ))
+    );
+    assert_eq!(style.line_height, 10.0);
+}
+
+#[tokio::test]
+async fn css_math_affine_ch_values_reduce_when_unknown_components_cancel() {
+    let declarations = parse_declarations(
+        "width: min(calc(3ch + 1pt), calc(2ch + 1pt)); height: max(calc(2ch + 3pt), calc(2ch + 5pt)); min-width: min(calc(1ch + 10%), calc(3ch + 10%)); line-height: max(calc(2ch + 1pt), calc(2ch + 3pt))",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
+            length: 1.0,
+            ch: 2.0,
+            ..ComputedLengthPercentage::ZERO
+        })
+    );
+    assert_eq!(
+        style.box_values.height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
+            length: 5.0,
+            ch: 2.0,
+            ..ComputedLengthPercentage::ZERO
+        })
+    );
+    assert_eq!(
+        style.box_values.min_width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
+            percent: 0.1,
+            ch: 1.0,
+            ..ComputedLengthPercentage::ZERO
+        })
+    );
+    assert_eq!(
+        style.line_height_value,
+        ComputedLineHeight::Length(ComputedLengthPercentage {
+            length: 3.0,
+            ch: 2.0,
+            ..ComputedLengthPercentage::ZERO
+        })
+    );
+
+    style.resolve_font_metric_lengths(5.0);
+
+    assert_eq!(
+        style.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            11.0
+        ))
+    );
+    assert_eq!(
+        style.box_values.height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            15.0
+        ))
+    );
+    assert_eq!(
+        style.box_values.min_width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
+            length: 5.0,
+            percent: 0.1,
+            ..ComputedLengthPercentage::ZERO
+        })
+    );
+    assert_eq!(style.line_height, 13.0);
 }
 
 #[tokio::test]
@@ -6190,7 +7625,10 @@ async fn absolute_line_height_is_not_scaled_by_later_font_size() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(style.line_height, 15.0);
-    assert_eq!(style.line_height_value, ComputedLineHeight::Length(15.0));
+    assert_eq!(
+        style.line_height_value,
+        ComputedLineHeight::from_length(15.0)
+    );
     assert_eq!(style.line_height_multiplier, None);
 
     let declarations = parse_declarations("font-size: 2em");
@@ -6198,6 +7636,106 @@ async fn absolute_line_height_is_not_scaled_by_later_font_size() {
 
     assert_eq!(style.font_size, 15.0);
     assert_eq!(style.line_height, 15.0);
+}
+
+#[tokio::test]
+async fn ch_font_size_uses_parent_metric_fallback() {
+    let mut parent = default_style_for_tag("div");
+    parent.font_size = 20.0;
+
+    let child = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        Some("font-size: 2ch"),
+        &[],
+        Some(&parent),
+        &[ElementSignature::new("div", HashMap::new())],
+    );
+
+    assert_eq!(child.font_size, 20.0);
+    assert_eq!(child.line_height, 24.0);
+}
+
+#[tokio::test]
+async fn ch_font_size_uses_vertical_upright_parent_fallback() {
+    let mut parent = default_style_for_tag("div");
+    parent.font_size = 20.0;
+    parent.writing_mode = WritingMode::VerticalRl;
+    parent.text_orientation = TextOrientation::Upright;
+
+    let child = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        Some("font-size: 2ch"),
+        &[],
+        Some(&parent),
+        &[ElementSignature::new("div", HashMap::new())],
+    );
+
+    assert_eq!(child.font_size, 40.0);
+    assert_eq!(child.line_height, 48.0);
+}
+
+#[tokio::test]
+async fn ch_line_height_preserves_font_metric_component_until_used_resolution() {
+    let declarations = parse_declarations("font-size: 20px; line-height: 5ch");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.font_size, 15.0);
+    assert_eq!(style.line_height, 75.0);
+    assert_eq!(
+        style.line_height_value,
+        ComputedLineHeight::Length(ComputedLengthPercentage::from_ch(5.0))
+    );
+
+    style.resolve_font_metric_lengths(8.0);
+
+    assert_eq!(style.line_height, 40.0);
+    assert_eq!(
+        style.line_height_value,
+        ComputedLineHeight::Length(ComputedLengthPercentage::from_length(40.0))
+    );
+}
+
+#[tokio::test]
+async fn inherited_ch_line_height_keeps_metric_component() {
+    let mut parent = default_style_for_tag("div");
+    apply_declarations(&mut parent, &parse_declarations("line-height: 5ch"));
+
+    let child = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        None,
+        &[],
+        Some(&parent),
+        &[ElementSignature::new("div", HashMap::new())],
+    );
+
+    assert_eq!(
+        child.line_height_value,
+        ComputedLineHeight::Length(ComputedLengthPercentage::from_ch(5.0))
+    );
+}
+
+#[tokio::test]
+async fn font_shorthand_ch_size_uses_parent_metric_fallback() {
+    let mut parent = default_style_for_tag("div");
+    parent.font_size = 20.0;
+
+    let child = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        Some("font: 2ch/1 Ahem; width: 1em"),
+        &[],
+        Some(&parent),
+        &[ElementSignature::new("div", HashMap::new())],
+    );
+
+    assert_eq!(child.font_size, 20.0);
+    assert_eq!(child.line_height, 20.0);
+    assert_eq!(
+        child.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_length(
+            20.0
+        ))
+    );
 }
 
 #[tokio::test]
@@ -6219,7 +7757,10 @@ async fn font_shorthand_em_line_height_uses_winning_computed_font_size() {
 
     assert_eq!(style.font_size, 30.0);
     assert_eq!(style.line_height, 30.0);
-    assert_eq!(style.line_height_value, ComputedLineHeight::Length(30.0));
+    assert_eq!(
+        style.line_height_value,
+        ComputedLineHeight::from_length(30.0)
+    );
     assert_eq!(style.line_height_multiplier, None);
 }
 
@@ -6666,7 +8207,10 @@ async fn supports_rule_applies_supported_declaration_conditions() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "@supports (display: flex) { p { color: blue } }\
          @supports (float: inline-start) { p { background-color: red } }\
-         @supports (clear: inline-end) { p { border-top-color: green } }",
+         @supports (clear: inline-end) { p { border-top-color: green } }\
+         @supports (border-spacing: 1ch 2ch) { p { border-spacing: 1ch 2ch } }\
+         @supports (border-width: 1ch 2ch) { p { border-width: 1ch 2ch } }\
+         @supports (outline-width: 3ch) { p { outline-width: 3ch } }",
     ));
     let style = style_for_element_with_signature(
         ElementSignature::new("p", HashMap::new()),
@@ -6679,6 +8223,26 @@ async fn supports_rule_applies_supported_declaration_conditions() {
     assert_eq!(style.color, Color::new(0, 0, 255));
     assert_eq!(style.background_color, Some(Color::new(255, 0, 0)));
     assert_eq!(style.border_colors.top, Color::new(0, 128, 0));
+    assert_eq!(
+        style.border_spacing.horizontal,
+        ComputedLengthPercentage::from_ch(1.0)
+    );
+    assert_eq!(
+        style.border_spacing.vertical,
+        ComputedLengthPercentage::from_ch(2.0)
+    );
+    assert_eq!(
+        style.border_width_values.top,
+        ComputedLengthPercentage::from_ch(1.0)
+    );
+    assert_eq!(
+        style.border_width_values.right,
+        ComputedLengthPercentage::from_ch(2.0)
+    );
+    assert_eq!(
+        style.outline_width_value,
+        ComputedLengthPercentage::from_ch(3.0)
+    );
 }
 
 #[tokio::test]
@@ -7979,6 +9543,46 @@ async fn parses_transform_functions_and_origin() {
 }
 
 #[tokio::test]
+async fn ch_transform_lengths_preserve_font_metric_component_until_used_resolution() {
+    let declarations =
+        parse_declarations("transform: translate(2ch, 25%); transform-origin: 3ch 4ch");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.transform,
+        vec![TransformFunction::Translate(
+            ComputedLengthPercentage::from_ch(2.0),
+            ComputedLengthPercentage::from_percent(0.25),
+        )]
+    );
+    assert_eq!(
+        style.transform_origin,
+        TransformOrigin {
+            x: ComputedLengthPercentage::from_ch(3.0),
+            y: ComputedLengthPercentage::from_ch(4.0),
+        }
+    );
+
+    style.resolve_font_metric_lengths(5.0);
+
+    assert_eq!(
+        style.transform,
+        vec![TransformFunction::Translate(
+            ComputedLengthPercentage::from_length(10.0),
+            ComputedLengthPercentage::from_percent(0.25),
+        )]
+    );
+    assert_eq!(
+        style.transform_origin,
+        TransformOrigin {
+            x: ComputedLengthPercentage::from_length(15.0),
+            y: ComputedLengthPercentage::from_length(20.0),
+        }
+    );
+}
+
+#[tokio::test]
 async fn parses_outline_properties() {
     let declarations = parse_declarations(
         "color: #123456; outline: thick dashed currentColor; outline-offset: 2pt",
@@ -7989,5 +9593,45 @@ async fn parses_outline_properties() {
     assert_eq!(style.outline_width, 5.0 * CSS_PX_TO_PT);
     assert_eq!(style.outline_style, BorderStyle::Dashed);
     assert_eq!(style.outline_color, Color::new(0x12, 0x34, 0x56));
-    assert_eq!(style.outline_offset, 2.0);
+    assert_eq!(
+        style.outline_offset,
+        ComputedLengthPercentage::from_length(2.0)
+    );
+}
+
+#[tokio::test]
+async fn ch_outline_offset_preserves_font_metric_component_until_used_resolution() {
+    let declarations = parse_declarations("outline-offset: 2ch");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.outline_offset, ComputedLengthPercentage::from_ch(2.0));
+
+    style.resolve_font_metric_lengths(4.0);
+
+    assert_eq!(
+        style.outline_offset,
+        ComputedLengthPercentage::from_length(8.0)
+    );
+}
+
+#[tokio::test]
+async fn ch_outline_width_preserves_font_metric_component_until_used_resolution() {
+    let declarations = parse_declarations("outline-width: 2ch; outline-style: solid");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.outline_width_value,
+        ComputedLengthPercentage::from_ch(2.0)
+    );
+    assert_eq!(style.outline_width, 0.0);
+
+    style.resolve_font_metric_lengths(4.0);
+
+    assert_eq!(
+        style.outline_width_value,
+        ComputedLengthPercentage::from_length(8.0)
+    );
+    assert_eq!(style.outline_width, 8.0);
 }

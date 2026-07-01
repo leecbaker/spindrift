@@ -257,7 +257,7 @@ pub(super) fn inline_line_item_logical_block_size(
         InlineLineItem::Atom(atom)
             if matches!(
                 atom.content,
-                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge)
+                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
             ) =>
         {
             atom.style.line_height
@@ -379,6 +379,8 @@ impl<'a> LayoutBuilder<'a> {
                         + horizontal_border_width(&box_.style)
                 }
                 box_tree::FormattingBox::AnonymousBlock(box_) => self
+                    .inline_boxes_max_content_width(&box_.children, stylesheets, available_width),
+                box_tree::FormattingBox::InlineSplitBlockContext(box_) => self
                     .inline_boxes_max_content_width(&box_.children, stylesheets, available_width),
                 box_tree::FormattingBox::Line(box_) => box_
                     .children

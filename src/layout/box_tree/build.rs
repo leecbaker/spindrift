@@ -1,12 +1,33 @@
 use super::*;
 
+#[cfg(test)]
 pub(crate) fn build_page_box<'a>(
     root: &'a Node,
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
 ) -> PageBox<'a> {
+    build_page_box_inner(root, stylesheets, parent_style, None)
+}
+
+pub(crate) fn build_page_box_with_font_metrics<'a>(
+    root: &'a Node,
+    stylesheets: &[Stylesheet],
+    parent_style: &ComputedStyle,
+    font_system: &mut FontSystem,
+) -> PageBox<'a> {
+    build_page_box_inner(root, stylesheets, parent_style, Some(font_system))
+}
+
+fn build_page_box_inner<'a>(
+    root: &'a Node,
+    stylesheets: &[Stylesheet],
+    parent_style: &ComputedStyle,
+    font_system: Option<&mut FontSystem>,
+) -> PageBox<'a> {
     let children = match &root.kind {
-        NodeKind::Element(element) => build_child_boxes(element, stylesheets, parent_style, &[]),
+        NodeKind::Element(element) => {
+            build_child_boxes_inner(element, stylesheets, parent_style, &[], true, font_system)
+        }
         NodeKind::Text(text) => {
             if text.is_empty() {
                 Vec::new()
@@ -21,13 +42,21 @@ pub(crate) fn build_page_box<'a>(
     PageBox { children }
 }
 
-pub(crate) fn build_child_boxes<'a>(
+pub(crate) fn build_child_boxes_with_font_metrics<'a>(
     element: &'a Element,
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
     ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
 ) -> Vec<FormattingBox<'a>> {
-    build_child_boxes_inner(element, stylesheets, parent_style, ancestors, true)
+    build_child_boxes_inner(
+        element,
+        stylesheets,
+        parent_style,
+        ancestors,
+        true,
+        Some(font_system),
+    )
 }
 
 fn build_child_boxes_inner<'a>(
@@ -36,10 +65,17 @@ fn build_child_boxes_inner<'a>(
     parent_style: &ComputedStyle,
     ancestors: &[ElementSignature],
     normalize_for_parent: bool,
+    mut font_system: Option<&mut FontSystem>,
 ) -> Vec<FormattingBox<'a>> {
     let sibling_tags = element_sibling_tags(element);
     let mut element_index = 0usize;
     let mut raw = Vec::new();
+    push_generated_pseudo_box(
+        &mut raw,
+        element,
+        parent_style.before_style.as_deref(),
+        GeneratedPseudoKind::Before,
+    );
     for child in &element.children {
         match &child.kind {
             NodeKind::Text(text) => {
@@ -58,13 +94,40 @@ fn build_child_boxes_inner<'a>(
                     sibling_tags.clone(),
                 );
                 element_index += 1;
-                let style = style_for_layout_element(
-                    child_element,
-                    signature.clone(),
-                    stylesheets,
-                    Some(parent_style),
-                    ancestors,
-                );
+                let style = match font_system.as_deref_mut() {
+                    Some(font_system) => {
+                        let parent_ch_advance = font_system.ch_advance(parent_style);
+                        let mut style = style_for_layout_element_with_parent_ch_advance(
+                            child_element,
+                            signature.clone(),
+                            stylesheets,
+                            Some(parent_style),
+                            ancestors,
+                            parent_ch_advance,
+                        );
+                        let pseudo_parent_ch_advance = font_system.ch_advance(&style);
+                        let pseudo_signature = layout_element_signature(
+                            child_element,
+                            signature.clone(),
+                            Some(parent_style),
+                        );
+                        css::apply_pseudo_rules_with_parent_ch_advance(
+                            &mut style,
+                            &pseudo_signature,
+                            stylesheets,
+                            ancestors,
+                            pseudo_parent_ch_advance,
+                        );
+                        style
+                    }
+                    None => style_for_layout_element(
+                        child_element,
+                        signature.clone(),
+                        stylesheets,
+                        Some(parent_style),
+                        ancestors,
+                    ),
+                };
                 let style = if ancestors.is_empty() {
                     root_display_fixed_style(style)
                 } else {
@@ -84,15 +147,27 @@ fn build_child_boxes_inner<'a>(
                         &style,
                         &child_ancestors,
                         false,
+                        font_system.as_deref_mut(),
                     ));
-                } else if let Some(box_) =
-                    build_element_box(child_element, signature, style, stylesheets, ancestors)
-                {
+                } else if let Some(box_) = build_element_box(
+                    child_element,
+                    signature,
+                    style,
+                    stylesheets,
+                    ancestors,
+                    font_system.as_deref_mut(),
+                ) {
                     raw.push(box_);
                 }
             }
         }
     }
+    push_generated_pseudo_box(
+        &mut raw,
+        element,
+        parent_style.after_style.as_deref(),
+        GeneratedPseudoKind::After,
+    );
     if normalize_for_parent {
         normalize_block_container_children(raw, parent_style)
     } else {
@@ -106,6 +181,7 @@ pub(crate) fn build_element_box<'a>(
     mut style: ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    font_system: Option<&mut FontSystem>,
 ) -> Option<FormattingBox<'a>> {
     if style.display.is_none() {
         return None;
@@ -121,9 +197,17 @@ pub(crate) fn build_element_box<'a>(
     let children = if content_replacement || is_horizontal_rule_element(element) {
         Vec::new()
     } else {
-        build_child_boxes(element, stylesheets, &style, &child_ancestors)
+        build_child_boxes_inner(
+            element,
+            stylesheets,
+            &style,
+            &child_ancestors,
+            true,
+            font_system,
+        )
     };
     let marker = marker_box(&style);
+    let source = BoxSource::Principal;
 
     if content_replacement || is_replaced_element(element) {
         let mut style = style;
@@ -138,6 +222,7 @@ pub(crate) fn build_element_box<'a>(
             Some(FormattingBox::AtomicInline(AtomicInlineBox {
                 element,
                 signature,
+                source,
                 marker,
                 style,
                 children,
@@ -147,6 +232,7 @@ pub(crate) fn build_element_box<'a>(
             Some(FormattingBox::Replaced(ReplacedBox {
                 element,
                 signature,
+                source,
                 marker,
                 style,
                 children,
@@ -159,6 +245,7 @@ pub(crate) fn build_element_box<'a>(
         Some(FormattingBox::AtomicInline(AtomicInlineBox {
             element,
             signature,
+            source,
             marker,
             style,
             children,
@@ -171,6 +258,7 @@ pub(crate) fn build_element_box<'a>(
         Some(FormattingBox::Table(TableBox {
             element,
             signature,
+            source,
             marker,
             style,
             children,
@@ -180,6 +268,7 @@ pub(crate) fn build_element_box<'a>(
         Some(FormattingBox::Flex(FlexBox {
             element,
             signature,
+            source,
             marker,
             style,
             children,
@@ -190,6 +279,7 @@ pub(crate) fn build_element_box<'a>(
         Some(FormattingBox::AtomicInline(AtomicInlineBox {
             element,
             signature,
+            source,
             marker,
             style,
             children,
@@ -199,6 +289,7 @@ pub(crate) fn build_element_box<'a>(
         Some(FormattingBox::Block(BlockBox {
             element,
             signature,
+            source,
             marker,
             style,
             run_in_children: Vec::new(),
@@ -208,6 +299,120 @@ pub(crate) fn build_element_box<'a>(
         Some(FormattingBox::Inline(InlineBox {
             element,
             signature,
+            source,
+            marker,
+            style,
+            fragment_edges: InlineBoxFragmentEdges::ALL,
+            children,
+        }))
+    }
+}
+
+fn push_generated_pseudo_box<'a>(
+    output: &mut Vec<FormattingBox<'a>>,
+    originating_element: &'a Element,
+    pseudo_style: Option<&ComputedStyle>,
+    kind: GeneratedPseudoKind,
+) {
+    let Some(pseudo_style) = pseudo_style else {
+        return;
+    };
+    if pseudo_style.display.is_none() || !pseudo_style.content.is_generated() {
+        return;
+    }
+    let originating_signature = ElementSignature::new(
+        originating_element.tag.clone(),
+        originating_element.attrs.clone(),
+    );
+    let mut style = pseudo_style.clone();
+    if matches!(style.position, Position::Absolute | Position::Fixed) {
+        style.abspos_static_source_was_inline_level = style.display.is_inline_level();
+        style.display = style.display.blockified();
+    }
+    if let Some(box_) =
+        build_generated_pseudo_box(originating_element, originating_signature, style, kind)
+    {
+        output.push(box_);
+    }
+}
+
+fn build_generated_pseudo_box<'a>(
+    originating_element: &'a Element,
+    originating_signature: ElementSignature,
+    style: ComputedStyle,
+    kind: GeneratedPseudoKind,
+) -> Option<FormattingBox<'a>> {
+    if style.display.is_none() {
+        return None;
+    }
+    let source = BoxSource::GeneratedPseudo(Box::new(GeneratedPseudoBox {
+        originating_element,
+        originating_signature: originating_signature.clone(),
+        kind,
+    }));
+    let marker = marker_box(&style);
+    let children = Vec::new();
+
+    if style.display.is_table() && style.display.is_inline_or_run_in_level() {
+        let fragment = build_table_fragment(originating_element, &originating_signature, &children);
+        Some(FormattingBox::AtomicInline(AtomicInlineBox {
+            element: originating_element,
+            signature: originating_signature,
+            source,
+            marker,
+            style,
+            children,
+            table_fragment: Some(fragment),
+        }))
+    } else if style.display.is_table()
+        || (style.display.is_block_level() && is_html_table_element(originating_element))
+    {
+        let fragment = build_table_fragment(originating_element, &originating_signature, &children);
+        Some(FormattingBox::Table(TableBox {
+            element: originating_element,
+            signature: originating_signature,
+            source,
+            marker,
+            style,
+            children,
+            fragment,
+        }))
+    } else if style.display.is_flex() && style.display.is_block_level() {
+        Some(FormattingBox::Flex(FlexBox {
+            element: originating_element,
+            signature: originating_signature,
+            source,
+            marker,
+            style,
+            children,
+        }))
+    } else if style.display.is_atomic_inline()
+        || (style.display.is_run_in() && !style.display.is_flow())
+    {
+        Some(FormattingBox::AtomicInline(AtomicInlineBox {
+            element: originating_element,
+            signature: originating_signature,
+            source,
+            marker,
+            style,
+            children,
+            table_fragment: None,
+        }))
+    } else if style.display.is_block_level() {
+        Some(FormattingBox::Block(BlockBox {
+            element: originating_element,
+            signature: originating_signature,
+            source,
+            marker,
+            style,
+            run_in_children: Vec::new(),
+            children,
+        }))
+    } else {
+        Some(FormattingBox::Inline(InlineBox {
+            element: originating_element,
+            signature: originating_signature,
+            source,
             marker,
             style,
             fragment_edges: InlineBoxFragmentEdges::ALL,
@@ -398,6 +603,7 @@ fn collect_table_fragment_rows<'a>(
             anonymous_cells.push(TableFragmentCell {
                 element: Some(element),
                 signature: signature.clone(),
+                style: Some(style.clone()),
                 children: descendants.to_vec(),
                 anonymous: false,
             });
@@ -448,6 +654,7 @@ fn table_fragment_row_child_cells<'a>(
             cells.push(TableFragmentCell {
                 element: Some(element),
                 signature: signature.clone(),
+                style: Some(style.clone()),
                 children: descendants.to_vec(),
                 anonymous: false,
             });
@@ -513,6 +720,7 @@ fn flush_anonymous_table_fragment_cell<'a>(
     cells.push(TableFragmentCell {
         element: None,
         signature: ElementSignature::new("td", HashMap::new()),
+        style: None,
         children: std::mem::take(children),
         anonymous: true,
     });

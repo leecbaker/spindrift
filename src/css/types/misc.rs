@@ -435,6 +435,38 @@ pub(crate) enum TransformFunction {
     Skew(f32, f32),
 }
 
+impl TransformFunction {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        if let Self::Translate(x, y) = self {
+            x.resolve_font_metric_lengths(ch_advance);
+            y.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        if let Self::Translate(x, y) = self {
+            x.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+            y.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
+    }
+}
+
 pub(crate) type TransformList = Vec<TransformFunction>;
 
 /// Computed `transform-origin` for the supported 2D transform model.
@@ -460,6 +492,7 @@ impl TransformOrigin {
             vmax: 0.0,
             vi: 0.0,
             vb: 0.0,
+            math: None,
         },
         y: ComputedLengthPercentage {
             length: 0.0,
@@ -471,8 +504,35 @@ impl TransformOrigin {
             vmax: 0.0,
             vi: 0.0,
             vb: 0.0,
+            math: None,
         },
     };
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.x.resolve_font_metric_lengths(ch_advance);
+        self.y.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.x.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.y.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+    }
 }
 
 /// Computed `float` value.
@@ -1018,30 +1078,58 @@ impl TextDecorationThickness {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum TextDecorationInset {
     Auto,
-    Lengths { start: f32, end: f32 },
+    Lengths {
+        start: ComputedLengthPercentage,
+        end: ComputedLengthPercentage,
+    },
 }
 
 impl TextDecorationInset {
     pub(crate) const ZERO: Self = Self::Lengths {
-        start: 0.0,
-        end: 0.0,
+        start: ComputedLengthPercentage::ZERO,
+        end: ComputedLengthPercentage::ZERO,
     };
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, _ch_advance: f32) {}
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        if let Self::Lengths { start, end } = self {
+            start.resolve_font_metric_lengths(ch_advance);
+            end.resolve_font_metric_lengths(ch_advance);
+        }
+    }
 
     pub(crate) fn resolve_viewport_lengths(
         &mut self,
-        _viewport_width: f32,
-        _viewport_height: f32,
-        _viewport_inline: f32,
-        _viewport_block: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
     ) {
+        if let Self::Lengths { start, end } = self {
+            start.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+            end.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
     }
 
     pub(crate) fn used(self, font_size: f32) -> (f32, f32) {
         match self {
             Self::Auto => (font_size * 0.125, font_size * 0.125),
-            Self::Lengths { start, end } => (start, end),
+            Self::Lengths { start, end } => (
+                start
+                    .used_length_with_percentage_basis(font_size)
+                    .unwrap_or(start.length + start.percent * font_size),
+                end.used_length_with_percentage_basis(font_size)
+                    .unwrap_or(end.length + end.percent * font_size),
+            ),
         }
     }
 }
@@ -1240,11 +1328,53 @@ impl Default for TextEmphasisSkip {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct BoxShadow {
     pub(crate) color: BoxShadowColor,
-    pub(crate) offset_x: f32,
-    pub(crate) offset_y: f32,
-    pub(crate) blur_radius: f32,
-    pub(crate) spread: f32,
+    pub(crate) offset_x: ComputedLengthPercentage,
+    pub(crate) offset_y: ComputedLengthPercentage,
+    pub(crate) blur_radius: ComputedLengthPercentage,
+    pub(crate) spread: ComputedLengthPercentage,
     pub(crate) inset: bool,
+}
+
+impl BoxShadow {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.offset_x.resolve_font_metric_lengths(ch_advance);
+        self.offset_y.resolve_font_metric_lengths(ch_advance);
+        self.blur_radius.resolve_font_metric_lengths(ch_advance);
+        self.spread.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.offset_x.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.offset_y.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.blur_radius.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.spread.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+    }
 }
 
 /// Color component of a computed CSS `box-shadow`.
@@ -1276,11 +1406,53 @@ impl BoxShadowColor {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct TextShadow {
     pub(crate) color: TextShadowColor,
-    pub(crate) offset_x: f32,
-    pub(crate) offset_y: f32,
-    pub(crate) blur_radius: f32,
-    pub(crate) spread: f32,
+    pub(crate) offset_x: ComputedLengthPercentage,
+    pub(crate) offset_y: ComputedLengthPercentage,
+    pub(crate) blur_radius: ComputedLengthPercentage,
+    pub(crate) spread: ComputedLengthPercentage,
     pub(crate) inset: bool,
+}
+
+impl TextShadow {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.offset_x.resolve_font_metric_lengths(ch_advance);
+        self.offset_y.resolve_font_metric_lengths(ch_advance);
+        self.blur_radius.resolve_font_metric_lengths(ch_advance);
+        self.spread.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.offset_x.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.offset_y.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.blur_radius.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.spread.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+    }
 }
 
 /// Color component of a computed CSS `text-shadow`.

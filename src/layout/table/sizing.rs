@@ -167,7 +167,9 @@ pub(super) fn declared_table_cell_width(
     match style.box_values.width {
         css::ComputedLengthPercentageOrAuto::Auto => html_width_for_table_cell(cell),
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            if value.percent != 0.0 && value.length == 0.0 {
+            if value.math.is_some() {
+                Some(DeclaredTableWidth::LengthPercentage(value))
+            } else if value.percent != 0.0 && value.length == 0.0 {
                 Some(DeclaredTableWidth::Percent(value.percent))
             } else if value.percent != 0.0 {
                 Some(DeclaredTableWidth::LengthPercentage(value))
@@ -191,7 +193,9 @@ fn declared_table_width_from_computed(
     match value {
         css::ComputedLengthPercentageOrAuto::Auto => None,
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            if value.percent != 0.0 && value.length == 0.0 {
+            if value.math.is_some() {
+                Some(DeclaredTableWidth::LengthPercentage(value))
+            } else if value.percent != 0.0 && value.length == 0.0 {
                 Some(DeclaredTableWidth::Percent(value.percent))
             } else if value.percent != 0.0 {
                 Some(DeclaredTableWidth::LengthPercentage(value))
@@ -322,7 +326,10 @@ pub(super) fn intrinsic_percentage_contribution(style: &ComputedStyle) -> f32 {
 
 fn length_percentage_percent(value: css::ComputedLengthPercentageOrAuto) -> Option<f32> {
     match value {
-        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => Some(value.percent),
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) if value.math.is_none() => {
+            Some(value.percent)
+        }
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(_) => None,
         css::ComputedLengthPercentageOrAuto::Auto
         | css::ComputedLengthPercentageOrAuto::MinContent
         | css::ComputedLengthPercentageOrAuto::MaxContent
@@ -342,9 +349,10 @@ pub(super) fn constrain_table_intrinsic_width_with_floor(
 
 fn intrinsic_length_constraint(value: css::ComputedLengthPercentageOrAuto) -> Option<f32> {
     match value {
-        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) if value.math.is_none() => {
             (value.length != 0.0 || value.percent == 0.0).then_some(value.length.max(0.0))
         }
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(_) => None,
         css::ComputedLengthPercentageOrAuto::Auto
         | css::ComputedLengthPercentageOrAuto::MinContent
         | css::ComputedLengthPercentageOrAuto::MaxContent
@@ -568,14 +576,23 @@ fn table_cell_inline_intrinsic_contribution(
     style: &ComputedStyle,
     stylesheets: &[Stylesheet],
 ) -> inline_layout::InlineIntrinsicContribution {
-    if let Some(children) = cell.children.as_deref() {
-        return layout.intrinsic_inline_contribution_for_boxes(children, style, stylesheets);
+    let measurement = if let Some(children) = cell.children.as_deref() {
+        layout.intrinsic_inline_measurement_for_boxes(children, style, stylesheets, f32::MAX)
+    } else if let Some(element) = cell.element {
+        layout.intrinsic_inline_measurement_for_element(element, style, stylesheets, None, f32::MAX)
+    } else {
+        return inline_layout::InlineIntrinsicContribution::default();
+    };
+
+    if style.writing_mode == WritingMode::HorizontalTb {
+        return measurement.contribution;
     }
-    cell.element
-        .map(|element| {
-            layout.intrinsic_inline_contribution_for_element(element, style, stylesheets, None)
-        })
-        .unwrap_or_default()
+
+    let physical_width = measurement.physical_width(style);
+    inline_layout::InlineIntrinsicContribution {
+        min_content: physical_width,
+        max_content: physical_width,
+    }
 }
 
 /// Return min/max-content width contributions from block-level cell children.

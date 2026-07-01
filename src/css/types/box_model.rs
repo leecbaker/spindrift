@@ -204,8 +204,48 @@ pub(crate) enum TextOrientation {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct BorderSpacing {
-    pub horizontal: f32,
-    pub vertical: f32,
+    pub horizontal: ComputedLengthPercentage,
+    pub vertical: ComputedLengthPercentage,
+}
+
+impl BorderSpacing {
+    pub(crate) const ZERO: Self = Self {
+        horizontal: ComputedLengthPercentage::ZERO,
+        vertical: ComputedLengthPercentage::ZERO,
+    };
+
+    pub(crate) fn from_lengths(horizontal: f32, vertical: f32) -> Self {
+        Self {
+            horizontal: ComputedLengthPercentage::from_length(horizontal),
+            vertical: ComputedLengthPercentage::from_length(vertical),
+        }
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.horizontal.resolve_font_metric_lengths(ch_advance);
+        self.vertical.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.horizontal.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.vertical.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -229,6 +269,46 @@ impl BorderRadius {
             && self.top_right.is_zero()
             && self.bottom_right.is_zero()
             && self.bottom_left.is_zero()
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.top_left.resolve_font_metric_lengths(ch_advance);
+        self.top_right.resolve_font_metric_lengths(ch_advance);
+        self.bottom_right.resolve_font_metric_lengths(ch_advance);
+        self.bottom_left.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.top_left.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.top_right.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.bottom_right.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.bottom_left.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
     }
 }
 
@@ -290,26 +370,72 @@ impl CornerRadius {
     pub(crate) fn is_zero(self) -> bool {
         self.x.is_zero() && self.y.is_zero()
     }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.x.resolve_font_metric_lengths(ch_advance);
+        self.y.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.x.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.y.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct CssRadius {
-    pub length: f32,
-    pub percent: f32,
+    pub value: ComputedLengthPercentage,
 }
 
 impl CssRadius {
     pub const ZERO: Self = Self {
-        length: 0.0,
-        percent: 0.0,
+        value: ComputedLengthPercentage::ZERO,
     };
 
     pub(crate) fn is_zero(self) -> bool {
-        self.length == 0.0 && self.percent == 0.0
+        self.value == ComputedLengthPercentage::ZERO
     }
 
     pub(crate) fn resolve(self, basis: f32) -> f32 {
-        (self.length + basis * self.percent).max(0.0)
+        self.value
+            .used_length_with_percentage_basis(basis)
+            .unwrap_or(self.value.length + basis * self.value.percent)
+            .max(0.0)
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.value.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.value.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
     }
 }
 
@@ -800,6 +926,29 @@ pub(crate) enum BaselineShift {
 impl BaselineShift {
     pub(crate) const ZERO: Self = Self::LengthPercentage(ComputedLengthPercentage::ZERO);
 
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
+    }
+
     /// Resolve `<length-percentage>` against the element's own line-height.
     ///
     /// CSS Inline Layout Level 3 defines percentages on `baseline-shift` as
@@ -807,7 +956,9 @@ impl BaselineShift {
     /// <https://drafts.csswg.org/css-inline-3/#baseline-shift-property>.
     pub(crate) fn length_percentage_shift(self, line_height: f32) -> f32 {
         match self {
-            Self::LengthPercentage(value) => value.length + value.percent * line_height,
+            Self::LengthPercentage(value) => value
+                .used_length_with_percentage_basis(line_height)
+                .unwrap_or(value.length + value.percent * line_height),
             _ => 0.0,
         }
     }
@@ -860,6 +1011,25 @@ impl VerticalAlign {
     ) -> Self {
         self.table_cell_align = table_cell_align;
         self
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.baseline_shift.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.baseline_shift.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
     }
 
     pub(crate) fn aligns_to_line_box_edge(self) -> bool {

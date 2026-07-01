@@ -146,6 +146,9 @@ impl<'a> LayoutBuilder<'a> {
             bottom: style.outline_width,
             left: style.outline_width,
         };
+        outline_style.border_width_values = css::CssEdges::all(
+            css::ComputedLengthPercentage::from_length(style.outline_width),
+        );
         outline_style.border_color = style.outline_color;
         outline_style.border_colors = css::BorderColors {
             top: style.outline_color,
@@ -160,7 +163,7 @@ impl<'a> LayoutBuilder<'a> {
             left: style.outline_style,
         };
 
-        let outset = style.outline_offset + style.outline_width;
+        let outset = style.outline_offset.length + style.outline_width;
         let (rects, rounded_rects, paths, strokes) = block_paint_ops(
             outer_x - outset,
             block_bottom - outset,

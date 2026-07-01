@@ -1,6 +1,7 @@
 use super::*;
 use crate::css::values::{
-    parse_alignment_baseline, parse_baseline_shift, parse_baseline_source, parse_dominant_baseline,
+    parse_alignment_baseline, parse_baseline_shift, parse_baseline_source, parse_border_spacing,
+    parse_computed_border_width, parse_computed_length_percentage, parse_dominant_baseline,
     parse_font_feature_settings, parse_font_kerning, parse_font_shorthand, parse_font_size_adjust,
     parse_font_variant, parse_font_variant_alternates, parse_font_variant_caps,
     parse_font_variant_east_asian, parse_font_variant_emoji, parse_font_variant_ligatures,
@@ -679,7 +680,8 @@ fn supports_declaration_condition(condition: &str) -> bool {
         ),
         "text-decoration-skip-spaces" => supports_text_decoration_skip_spaces_value(value),
         "text-underline-offset" => {
-            value.eq_ignore_ascii_case("auto") || parse_length(value).is_some()
+            value.eq_ignore_ascii_case("auto")
+                || parse_computed_length_percentage(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
         }
         "text-underline-position" => supports_text_underline_position_value(value),
         "text-emphasis-style" => supports_text_emphasis_style_value(value),
@@ -689,6 +691,7 @@ fn supports_declaration_condition(condition: &str) -> bool {
         "text-emphasis-skip" => supports_text_emphasis_skip_value(value),
         "text-shadow" => supports_text_shadow_value(value),
         "box-shadow" => supports_box_shadow_value(value),
+        "border-spacing" => parse_border_spacing(value, crate::css::ROOT_FONT_SIZE_PT).is_some(),
         "letter-spacing" => {
             value.eq_ignore_ascii_case("normal") || parse_letter_spacing(value, 12.0).is_some()
         }
@@ -765,21 +768,24 @@ fn supports_declaration_condition(condition: &str) -> bool {
         | "padding-block-start"
         | "padding-block-end"
         | "padding-inline-start"
-        | "padding-inline-end"
-        | "border-width"
-        | "border-top-width"
+        | "padding-inline-end" => {
+            parse_computed_length_percentage(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
+        }
+        "border-width" => supports_border_width_list(value, 4),
+        "border-block-width" | "border-inline-width" => supports_border_width_list(value, 2),
+        "outline-width" => supports_border_width_value(value),
+        "border-top-width"
         | "border-right-width"
         | "border-bottom-width"
         | "border-left-width"
-        | "border-block-width"
         | "border-block-start-width"
         | "border-block-end-width"
-        | "border-inline-width"
         | "border-inline-start-width"
-        | "border-inline-end-width"
-        | "gap"
-        | "row-gap"
-        | "column-gap" => value.eq_ignore_ascii_case("auto") || parse_length(value).is_some(),
+        | "border-inline-end-width" => supports_border_width_value(value),
+        "gap" | "row-gap" | "column-gap" => {
+            value.eq_ignore_ascii_case("auto")
+                || parse_computed_length_percentage(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
+        }
         "position" => matches!(
             value.to_ascii_lowercase().as_str(),
             "static" | "relative" | "absolute" | "fixed" | "sticky"
@@ -852,6 +858,17 @@ fn supports_text_transform_value(value: &str) -> bool {
         }
     }
     saw_case || saw_full_width || saw_full_size_kana
+}
+
+fn supports_border_width_value(value: &str) -> bool {
+    parse_computed_border_width(trim_css_value(value), crate::css::ROOT_FONT_SIZE_PT).is_some()
+}
+
+fn supports_border_width_list(value: &str, max_count: usize) -> bool {
+    let parts = split_css_component_values(trim_css_value(value));
+    !parts.is_empty()
+        && parts.len() <= max_count
+        && parts.iter().all(|part| supports_border_width_value(part))
 }
 
 fn supports_display_value(value: &str) -> bool {
@@ -1191,7 +1208,7 @@ fn supports_text_decoration_thickness_value(value: &str) -> bool {
     matches!(
         trim_css_value(value).to_ascii_lowercase().as_str(),
         "auto" | "from-font" | "thin" | "medium" | "thick"
-    ) || parse_length(value).is_some()
+    ) || parse_computed_length_percentage(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
 }
 
 fn supports_text_decoration_inset_value(value: &str) -> bool {
@@ -1200,7 +1217,10 @@ fn supports_text_decoration_inset_value(value: &str) -> bool {
         return true;
     }
     let parts = split_css_component_values(value);
-    matches!(parts.len(), 1 | 2) && parts.iter().all(|part| parse_length(part).is_some())
+    matches!(parts.len(), 1 | 2)
+        && parts.iter().all(|part| {
+            parse_computed_length_percentage(part, crate::css::ROOT_FONT_SIZE_PT).is_some()
+        })
 }
 
 fn supports_text_decoration_skip_self_value(value: &str) -> bool {
@@ -1457,7 +1477,7 @@ fn supports_text_shadow_layer_value(value: &str) -> bool {
             color = true;
             continue;
         }
-        if parse_length(part).is_some() {
+        if supports_shadow_length(part) {
             lengths += 1;
             continue;
         }
@@ -1489,13 +1509,41 @@ fn supports_box_shadow_layer_value(value: &str) -> bool {
             color = true;
             continue;
         }
-        if let Some(length) = parse_length(part) {
+        if let Some(length) = parse_shadow_support_length(part) {
             lengths.push(length);
             continue;
         }
         return false;
     }
-    (2..=4).contains(&lengths.len()) && !lengths.get(2).is_some_and(|blur| *blur < 0.0)
+    (2..=4).contains(&lengths.len())
+        && !lengths
+            .get(2)
+            .is_some_and(|blur| length_percentage_is_definitely_negative(*blur))
+}
+
+fn supports_shadow_length(value: &str) -> bool {
+    parse_shadow_support_length(value).is_some()
+}
+
+fn parse_shadow_support_length(value: &str) -> Option<crate::css::ComputedLengthPercentage> {
+    let length = parse_computed_length_percentage(value, crate::css::ROOT_FONT_SIZE_PT)?;
+    (length.percent == 0.0).then_some(length)
+}
+
+fn length_percentage_is_definitely_negative(value: crate::css::ComputedLengthPercentage) -> bool {
+    let components = [
+        value.length,
+        value.percent,
+        value.ch,
+        value.vw,
+        value.vh,
+        value.vmin,
+        value.vmax,
+        value.vi,
+        value.vb,
+    ];
+    components.iter().any(|component| *component < 0.0)
+        && components.iter().all(|component| *component <= 0.0)
 }
 
 /// Returns whether a logical margin/padding axis value has valid arity.
@@ -1508,7 +1556,8 @@ fn supports_box_edge_axis_value(value: &str, allow_auto: bool) -> bool {
     let parts = split_css_component_values(trim_css_value(value));
     matches!(parts.len(), 1 | 2)
         && parts.iter().all(|part| {
-            (allow_auto && part.eq_ignore_ascii_case("auto")) || parse_length(part).is_some()
+            (allow_auto && part.eq_ignore_ascii_case("auto"))
+                || parse_computed_length_percentage(part, crate::css::ROOT_FONT_SIZE_PT).is_some()
         })
 }
 

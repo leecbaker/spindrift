@@ -259,9 +259,24 @@ pub(crate) fn parse_font_shorthand(
     inherited_font_size: f32,
     inherited_font_weight: FontWeight,
 ) -> Option<ParsedFontShorthand> {
+    parse_font_shorthand_with_parent_ch_advance(
+        value,
+        inherited_font_size,
+        inherited_font_size * 0.5,
+        inherited_font_weight,
+    )
+}
+
+pub(crate) fn parse_font_shorthand_with_parent_ch_advance(
+    value: &str,
+    inherited_font_size: f32,
+    inherited_ch_advance: f32,
+    inherited_font_weight: FontWeight,
+) -> Option<ParsedFontShorthand> {
     parse_font_shorthand_with_line_height_font_size(
         value,
         inherited_font_size,
+        inherited_ch_advance,
         inherited_font_weight,
         None,
     )
@@ -279,13 +294,14 @@ pub(crate) fn parse_font_shorthand(
 pub(crate) fn parse_font_shorthand_with_line_height_font_size(
     value: &str,
     inherited_font_size: f32,
+    inherited_ch_advance: f32,
     inherited_font_weight: FontWeight,
     line_height_font_size: Option<f32>,
 ) -> Option<ParsedFontShorthand> {
     let tokens = split_css_component_values(value);
-    let size_index = tokens
-        .iter()
-        .position(|token| split_font_size_and_line_height(token, inherited_font_size).is_some())?;
+    let size_index = tokens.iter().position(|token| {
+        split_font_size_and_line_height(token, inherited_font_size, inherited_ch_advance).is_some()
+    })?;
     let mut style = FontStyle::Normal;
     let mut weight = FontWeight::NORMAL;
     let mut width = FontWidth::NORMAL;
@@ -312,6 +328,7 @@ pub(crate) fn parse_font_shorthand_with_line_height_font_size(
     let (size, mut line_height) = split_font_size_and_line_height_with_line_height_font_size(
         tokens[size_index],
         inherited_font_size,
+        inherited_ch_advance,
         line_height_font_size,
     )?;
     let mut family_start = size_index + 1;
@@ -340,25 +357,38 @@ pub(crate) fn parse_font_shorthand_with_line_height_font_size(
 fn split_font_size_and_line_height(
     token: &str,
     inherited_font_size: f32,
+    inherited_ch_advance: f32,
 ) -> Option<(f32, Option<ComputedLineHeight>)> {
-    split_font_size_and_line_height_with_line_height_font_size(token, inherited_font_size, None)
+    split_font_size_and_line_height_with_line_height_font_size(
+        token,
+        inherited_font_size,
+        inherited_ch_advance,
+        None,
+    )
 }
 
 fn split_font_size_and_line_height_with_line_height_font_size(
     token: &str,
     inherited_font_size: f32,
+    inherited_ch_advance: f32,
     line_height_font_size: Option<f32>,
 ) -> Option<(f32, Option<ComputedLineHeight>)> {
     let Some((size, line_height)) = split_font_token_on_slash(token) else {
         if is_unitless_nonzero_number(token) {
             return None;
         }
-        return parse_font_size(token, inherited_font_size).map(|size| (size, None));
+        return parse_font_size_with_parent_ch_advance(
+            token,
+            inherited_font_size,
+            inherited_ch_advance,
+        )
+        .map(|size| (size, None));
     };
     if is_unitless_nonzero_number(size) {
         return None;
     }
-    let size = parse_font_size(size, inherited_font_size)?;
+    let size =
+        parse_font_size_with_parent_ch_advance(size, inherited_font_size, inherited_ch_advance)?;
     let line_height =
         parse_computed_line_height(line_height, line_height_font_size.unwrap_or(size))?;
     Some((size, Some(line_height)))

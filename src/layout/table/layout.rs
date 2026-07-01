@@ -229,14 +229,6 @@ struct TableBreakCandidate {
     height: f32,
 }
 
-impl TableBreakCandidate {
-    fn with_height(&self, height: f32) -> Self {
-        let mut candidate = self.clone();
-        candidate.height = height;
-        candidate
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TableFragmentRepeatPolicy {
     repeat_header: bool,
@@ -354,6 +346,7 @@ struct TableCellLayoutMetrics {
 
 struct PreparedTableCell {
     style: ComputedStyle,
+    row_sizing_style: ComputedStyle,
     area: TableGridArea,
     inline_bounds: TableInlineBounds,
     borders: css::Edges,
@@ -421,6 +414,19 @@ struct TableRowHeightPlan {
     final_height: f32,
     auto: bool,
     collapsed: bool,
+}
+
+/// Table-cell content sizing mode for CSS Tables row layout.
+///
+/// CSS Tables 3 first measures row minimum heights with cell-percentage
+/// dependent descendants treated as `auto`, then relays out cell content
+/// against the final cell content box height:
+/// <https://drafts.csswg.org/css-tables-3/#row-layout> and
+/// <https://drafts.csswg.org/css-tables-3/#table-cell-content-relayout>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableCellContentSizingPolicy {
+    RowMinimum,
+    FinalRelayout,
 }
 
 /// Shared CSS 2.2 collapsed-border geometry for one laid-out table.
@@ -631,7 +637,7 @@ fn table_displayed_horizontal_spacing(visible_columns: usize, table_metrics: Tab
     if visible_columns == 0 {
         0.0
     } else {
-        table_metrics.spacing.horizontal * (visible_columns + 1) as f32
+        table_metrics.spacing.horizontal.length * (visible_columns + 1) as f32
     }
 }
 
@@ -656,7 +662,7 @@ fn table_internal_horizontal_spacing(
         .iter()
         .filter(|collapsed| !**collapsed)
         .count();
-    table_metrics.spacing.horizontal * visible_columns.saturating_sub(1) as f32
+    table_metrics.spacing.horizontal.length * visible_columns.saturating_sub(1) as f32
 }
 
 fn table_column_background_rect(
@@ -1319,6 +1325,7 @@ impl<'a> LayoutBuilder<'a> {
         atom_style.background_color = None;
         atom_style.border_width = 0.0;
         atom_style.border_widths = css::Edges::ZERO;
+        atom_style.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
         atom_style.border_styles = css::BorderStyles::NONE;
         atom_style.padding = css::Edges::ZERO;
 
@@ -1450,7 +1457,7 @@ impl<'a> LayoutBuilder<'a> {
             ) && row_index + 1 < rows.len()
                 && has_following_uncollapsed_row(&rows[row_index + 1..], style, stylesheets, self)
             {
-                total += table_metrics.spacing.vertical;
+                total += table_metrics.spacing.vertical.length;
             }
         }
         total += table_vertical_edge_spacing(&row_heights, table_metrics);
@@ -1540,6 +1547,15 @@ impl<'a> LayoutBuilder<'a> {
             table_width.border_widths = geometry.outer_insets;
         }
         let used_table_width = column_plan.total_width();
+        let table_border_box_width = table_wrapper_border_box_width(used_table_width, table_width);
+        let mut used_style = style.clone();
+        resolve_normal_flow_auto_margins_for_known_width(
+            &mut used_style,
+            (self.content_right - self.content_left).max(0.0),
+            table_border_box_width,
+            self.containing_block_direction,
+        );
+        let style = &used_style;
         let repeating_header_rows = table_repeating_header_row_indices(rows);
         let repeating_footer_rows = table_repeating_footer_row_indices(rows);
 
@@ -1594,7 +1610,6 @@ impl<'a> LayoutBuilder<'a> {
             CaptionSide::Bottom,
         );
         let table_content_height = table_content_height(&planned_row_heights, table_metrics);
-        let table_border_box_width = table_wrapper_border_box_width(used_table_width, table_width);
         let table_collision_height = table_wrapper_collision_height(
             style,
             table_width,
@@ -2258,7 +2273,13 @@ impl<'a> LayoutBuilder<'a> {
                 if let Some(fragment) = &mut table_body_fragment {
                     fragment.push_row(row_index, row_top, 0.0, 0.0, 0.0);
                 }
-                previous_row_candidate = Some(row_start_candidate.with_height(0.0));
+                previous_row_candidate = Some({
+                    let this = &row_start_candidate;
+                    TableBreakCandidate {
+                        height: 0.0,
+                        ..this.clone()
+                    }
+                });
                 avoid_break_candidate = None;
                 previous_break_after_avoid = false;
                 row_index += 1;
@@ -2545,7 +2566,7 @@ impl<'a> LayoutBuilder<'a> {
             ) && row_index + 1 < rows.len()
                 && has_following_uncollapsed_row(&rows[row_index + 1..], style, stylesheets, self)
             {
-                self.cursor_y -= table_metrics.spacing.vertical;
+                self.cursor_y -= table_metrics.spacing.vertical.length;
             }
             let break_after = if row_style.break_after != PageBreak::Auto {
                 row_style.break_after
@@ -2560,18 +2581,28 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
             let row_candidate = if previous_break_after_avoid {
-                avoid_break_candidate
-                    .clone()
-                    .unwrap_or_else(|| row_start_candidate.clone())
-                    .with_height(
-                        avoid_break_candidate
-                            .as_ref()
-                            .map(|candidate| candidate.height)
-                            .unwrap_or(0.0)
-                            + row_height,
-                    )
+                {
+                    let this = &avoid_break_candidate
+                        .clone()
+                        .unwrap_or_else(|| row_start_candidate.clone());
+                    let height = avoid_break_candidate
+                        .as_ref()
+                        .map(|candidate| candidate.height)
+                        .unwrap_or(0.0)
+                        + row_height;
+                    TableBreakCandidate {
+                        height,
+                        ..this.clone()
+                    }
+                }
             } else {
-                row_start_candidate.with_height(row_height)
+                {
+                    let this = &row_start_candidate;
+                    TableBreakCandidate {
+                        height: row_height,
+                        ..this.clone()
+                    }
+                }
             };
             previous_row_candidate = Some(row_candidate.clone());
             if break_after.avoids_page() {
@@ -2687,6 +2718,15 @@ impl<'a> LayoutBuilder<'a> {
         let content_width = used_empty_table_grid_width(style, available_table_width, table_width);
         let content_height =
             used_empty_table_grid_height(style, self.page_area_height(), table_width);
+        let border_box_width = table_wrapper_border_box_width(content_width, table_width);
+        let mut used_style = style.clone();
+        resolve_normal_flow_auto_margins_for_known_width(
+            &mut used_style,
+            (self.content_right - self.content_left).max(0.0),
+            border_box_width,
+            self.containing_block_direction,
+        );
+        let style = &used_style;
         let top_caption_height = self.estimate_table_captions_height(
             captions,
             style,
@@ -2701,7 +2741,6 @@ impl<'a> LayoutBuilder<'a> {
             content_width,
             CaptionSide::Bottom,
         );
-        let border_box_width = table_wrapper_border_box_width(content_width, table_width);
         let collision_height = table_wrapper_collision_height(
             style,
             table_width,
@@ -3140,11 +3179,28 @@ impl<'a> LayoutBuilder<'a> {
                     || cell_style.empty_cells == EmptyCells::Show
                     || !cell_is_empty;
 
-                if paint_empty_cell && cell_style.background_color.is_some() {
-                    self.push_rect_in_band(
-                        PaintBand::InFlowBlock,
-                        cell_border_box.rendered_rect(cell_placement, cell_style.background_color),
+                if paint_empty_cell {
+                    let (rects, rounded_rects, paths, strokes) = block_paint_ops_with_border_insets(
+                        cell_x,
+                        row_top - cell_height,
+                        cell_width,
+                        cell_height,
+                        cell_style,
+                        cell_borders,
+                        false,
                     );
+                    for rect in rects {
+                        self.push_rect_in_band(PaintBand::InFlowBlock, rect);
+                    }
+                    for rounded_rect in rounded_rects {
+                        self.push_rounded_rect_in_band(PaintBand::InFlowBlock, rounded_rect);
+                    }
+                    for path in paths {
+                        self.push_path_in_band(PaintBand::InFlowBlock, path);
+                    }
+                    for stroke in strokes {
+                        self.push_stroke_in_band(PaintBand::InFlowBlock, stroke);
+                    }
                 }
                 if table_metrics.border_collapse != css::BorderCollapse::Collapse
                     && paint_empty_cell
@@ -3219,6 +3275,8 @@ impl<'a> LayoutBuilder<'a> {
                     cell,
                     row,
                     cell_style,
+                    &prepared.row_sizing_style,
+                    table_style,
                     stylesheets,
                     cell_border_box,
                     cell_placement,
@@ -3258,7 +3316,7 @@ impl<'a> LayoutBuilder<'a> {
 
             self.cursor_y -= row_height;
             if position + 1 < repeated_rows.len() {
-                self.cursor_y -= table_metrics.spacing.vertical;
+                self.cursor_y -= table_metrics.spacing.vertical.length;
             }
         }
         if let Some(geometry) = collapsed_geometry {
@@ -3422,7 +3480,7 @@ impl<'a> LayoutBuilder<'a> {
             local_row_heights.push(row_height);
             cursor_y -= row_height;
             if position + 1 < repeated_rows.len() {
-                cursor_y -= table_metrics.spacing.vertical;
+                cursor_y -= table_metrics.spacing.vertical.length;
             }
         }
         for (start_row, end_row, row_group) in table_row_group_spans(rows) {
@@ -4029,6 +4087,8 @@ impl<'a> LayoutBuilder<'a> {
                         cell,
                         row,
                         cell_style,
+                        &prepared.row_sizing_style,
+                        table_style,
                         stylesheets,
                         cell_fragment_plan.border_box,
                         cell_fragment_plan.placement,
@@ -4244,6 +4304,7 @@ impl<'a> LayoutBuilder<'a> {
             box_tree::FormattingBox::Inline(box_) => &box_.style,
             box_tree::FormattingBox::AnonymousBlock(box_) => &box_.style,
             box_tree::FormattingBox::Block(_)
+            | box_tree::FormattingBox::InlineSplitBlockContext(_)
             | box_tree::FormattingBox::AtomicInline(_)
             | box_tree::FormattingBox::Table(_)
             | box_tree::FormattingBox::Flex(_)
@@ -4813,7 +4874,7 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         if let Some(fill) = table_style.background_color {
-            let vertical_edge_spacing = table_metrics.spacing.vertical;
+            let vertical_edge_spacing = table_metrics.spacing.vertical.length;
             let background_top = top
                 + vertical_edge_spacing
                 + table_width.padding.top
@@ -5110,7 +5171,11 @@ impl<'a> LayoutBuilder<'a> {
             if placement.rowspan == 1 {
                 row_height = row_height.max(prepared.metrics.border_box_height);
             }
-            if table_cell_participates_in_row_baseline(&prepared.style, row_style, placement) {
+            if table_cell_participates_in_physical_y_row_baseline(
+                &prepared.style,
+                row_style,
+                placement,
+            ) {
                 has_baseline_cells = true;
                 let baseline = prepared.metrics.baseline_offset;
                 max_baseline = max_baseline.max(baseline);
@@ -5237,7 +5302,6 @@ impl<'a> LayoutBuilder<'a> {
             target_content_height,
             context.table_metrics,
         );
-
         TableHeightPlan { rows: plan_rows }
     }
 
@@ -5293,7 +5357,7 @@ impl<'a> LayoutBuilder<'a> {
                     continue;
                 };
                 let required_height = self.table_cell_border_box_height_with_basis(
-                    &prepared.style,
+                    &prepared.row_sizing_style,
                     prepared.metrics.content_height,
                     target_content_height,
                     context.column_plan.total_width(),
@@ -5514,7 +5578,11 @@ impl<'a> LayoutBuilder<'a> {
                     table_metrics,
                     collapsed_geometry,
                 )?;
-                if !table_cell_participates_in_row_baseline(&prepared.style, row_style, placement) {
+                if !table_cell_participates_in_physical_y_row_baseline(
+                    &prepared.style,
+                    row_style,
+                    placement,
+                ) {
                     return None;
                 }
                 Some(prepared.metrics.baseline_offset)
@@ -5528,7 +5596,11 @@ impl<'a> LayoutBuilder<'a> {
         placement: &TableCellPlacement,
         cell_style: &ComputedStyle,
     ) -> Option<f32> {
-        if !table_cell_participates_in_baseline(cell_style, context.row_style) {
+        if !table_cell_participates_in_physical_y_row_baseline(
+            cell_style,
+            context.row_style,
+            placement,
+        ) {
             return None;
         }
         if table_cell_alignment_baseline_set(cell_style) == TableCellBaselineSet::First {
@@ -5598,7 +5670,11 @@ impl<'a> LayoutBuilder<'a> {
                     table_metrics,
                     collapsed_geometry,
                 )?;
-                if !table_cell_participates_in_row_baseline(&prepared.style, row_style, placement) {
+                if !table_cell_participates_in_physical_y_row_baseline(
+                    &prepared.style,
+                    row_style,
+                    placement,
+                ) {
                     return None;
                 }
                 let available_width = (prepared.width()
@@ -5655,10 +5731,19 @@ impl<'a> LayoutBuilder<'a> {
             table_metrics,
             collapsed_geometry,
         );
-        let metrics = self.table_cell_layout_metrics(cell, &style, stylesheets, width, borders);
+        let row_sizing_style = self.table_cell_row_sizing_style(&style, row_style);
+        let metrics = self.table_cell_layout_metrics(
+            cell,
+            &style,
+            &row_sizing_style,
+            stylesheets,
+            width,
+            borders,
+        );
         let text = table_cell_inline_text(cell);
         Some(PreparedTableCell {
             style,
+            row_sizing_style,
             area,
             inline_bounds,
             borders,
@@ -5671,6 +5756,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         cell: &TableCell<'_>,
         cell_style: &ComputedStyle,
+        row_sizing_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         cell_width: f32,
         border_insets: css::Edges,
@@ -5687,8 +5773,11 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             available_width,
         ));
-        let border_box_height =
-            table_cell_border_box_height_with_insets(cell_style, content_height, border_insets);
+        let border_box_height = table_cell_border_box_height_with_insets(
+            row_sizing_style,
+            content_height,
+            border_insets,
+        );
         let baseline_offset = self
             .table_cell_alignment_baseline_offset(
                 cell,
@@ -5708,6 +5797,36 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
+    /// Resolve table-cell physical row-size constraints in the row axis.
+    ///
+    /// CSS Tables consumes `height`/`min-height`/`max-height` on cells as row
+    /// sizing constraints. Those constraints use the cell's selected font, but
+    /// their font-relative units must follow the row/table axis instead of an
+    /// orthogonal cell content writing mode.
+    fn table_cell_row_sizing_style(
+        &mut self,
+        cell_style: &ComputedStyle,
+        row_style: &ComputedStyle,
+    ) -> ComputedStyle {
+        let mut style = cell_style.clone();
+        style.writing_mode = row_style.writing_mode;
+        style.text_orientation = row_style.text_orientation;
+        let ch_advance = self.font_system.ch_advance(&style);
+        style
+            .box_values
+            .height
+            .resolve_font_metric_lengths(ch_advance);
+        style
+            .box_values
+            .min_height
+            .resolve_font_metric_lengths(ch_advance);
+        style
+            .box_values
+            .max_height
+            .resolve_font_metric_lengths(ch_advance);
+        style
+    }
+
     /// Measure non-text content for table row sizing using durable child boxes.
     ///
     /// CSS table row height depends on the minimum height required by cell
@@ -5722,16 +5841,17 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
         available_width: f32,
     ) -> f32 {
-        let fallback = table_cell_non_text_content_height(cell);
         let Some(children) = cell.children.as_deref() else {
-            return fallback;
+            return table_cell_non_text_content_height(cell);
         };
 
-        fallback.max(self.table_cell_children_non_text_content_height(
-            children,
-            stylesheets,
-            available_width,
-        ))
+        table_cell_replaced_content_height(cell).max(
+            self.table_cell_children_non_text_content_height(
+                children,
+                stylesheets,
+                available_width,
+            ),
+        )
     }
 
     fn table_cell_children_non_text_content_height(
@@ -5744,7 +5864,9 @@ impl<'a> LayoutBuilder<'a> {
         let mut inline_line_height = 0.0_f32;
 
         for child in children {
-            if let Some(inline_height) = table_cell_measured_inline_outer_height(child) {
+            if let Some(inline_height) =
+                self.table_cell_measured_inline_outer_height(child, stylesheets, available_width)
+            {
                 inline_line_height = inline_line_height.max(inline_height);
                 continue;
             }
@@ -5765,14 +5887,29 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
         available_width: f32,
     ) -> f32 {
+        let has_parent_percentage =
+            table_cell_formatting_child_has_parent_percentage_block_size(child);
         match child {
             box_tree::FormattingBox::Table(box_) => {
                 if matches!(box_.style.position, Position::Absolute | Position::Fixed) {
                     return 0.0;
                 }
+                if !has_parent_percentage {
+                    return self.estimate_table_height(
+                        box_.element,
+                        &box_.style,
+                        stylesheets,
+                        available_width,
+                        &box_.fragment,
+                    );
+                }
+                let style = self.table_cell_content_sizing_style(
+                    &box_.style,
+                    TableCellContentSizingPolicy::RowMinimum,
+                );
                 self.estimate_table_height(
                     box_.element,
-                    &box_.style,
+                    &style,
                     stylesheets,
                     available_width,
                     &box_.fragment,
@@ -5800,6 +5937,12 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     available_width,
                 ),
+            box_tree::FormattingBox::InlineSplitBlockContext(box_) => self
+                .table_cell_children_non_text_content_height(
+                    &box_.children,
+                    stylesheets,
+                    available_width,
+                ),
             _ => table_cell_formatting_child_outer_height(child),
         }
     }
@@ -5816,8 +5959,347 @@ impl<'a> LayoutBuilder<'a> {
         if matches!(style.position, Position::Absolute | Position::Fixed) {
             return 0.0;
         }
-        self.estimate_element_height(element, style, stylesheets, available_width, Some(children))
-            .unwrap_or_else(|| table_cell_formatting_child_outer_height(fallback_child))
+        if is_document_canvas_element(element) {
+            return self.table_cell_measured_document_canvas_child_height(
+                style,
+                children,
+                stylesheets,
+                available_width,
+            );
+        }
+        if !table_cell_formatting_child_has_parent_percentage_block_size(fallback_child) {
+            return self
+                .estimate_element_height(
+                    element,
+                    style,
+                    stylesheets,
+                    available_width,
+                    Some(children),
+                )
+                .unwrap_or_else(|| table_cell_formatting_child_outer_height(fallback_child));
+        }
+        self.table_cell_row_minimum_element_outer_height(
+            element,
+            style,
+            children,
+            stylesheets,
+            available_width,
+            fallback_child,
+        )
+    }
+
+    /// Measure a table-cell descendant for first-pass row minimum sizing.
+    ///
+    /// CSS Tables 3 excludes heights that depend on the final parent cell
+    /// block-size from the first pass. This estimator mirrors normal block-like
+    /// height estimation, but applies the table row-minimum sizing policy
+    /// recursively so nested percentage heights do not accidentally become
+    /// definite by using their own intrinsic content as a percentage basis:
+    /// <https://drafts.csswg.org/css-tables-3/#row-layout>.
+    fn table_cell_row_minimum_element_outer_height(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        fallback_child: &box_tree::FormattingBox<'_>,
+    ) -> f32 {
+        if matches!(style.position, Position::Absolute | Position::Fixed) {
+            return 0.0;
+        }
+
+        let style =
+            self.table_cell_content_sizing_style(style, TableCellContentSizingPolicy::RowMinimum);
+        match replaced_element_kind(element) {
+            Some(ReplacedElementKind::Canvas) => {
+                table_cell_canvas_first_pass_outer_height(element, &style, available_width)
+            }
+            Some(ReplacedElementKind::Image) => {
+                self.estimate_image_height(element, &style, available_width)
+            }
+            Some(ReplacedElementKind::Svg) => estimate_svg_height(element, &style),
+            None if style.display.is_table() || is_html_table_element(element) => self
+                .estimate_element_height(
+                    element,
+                    &style,
+                    stylesheets,
+                    available_width,
+                    Some(children),
+                )
+                .unwrap_or_else(|| table_cell_formatting_child_outer_height(fallback_child)),
+            None => self.table_cell_row_minimum_block_like_outer_height(
+                element,
+                &style,
+                children,
+                stylesheets,
+                available_width,
+            ),
+        }
+    }
+
+    fn table_cell_row_minimum_block_like_outer_height(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        available_outer_width: f32,
+    ) -> f32 {
+        let mut used_style = style.clone();
+        let box_metrics = apply_used_box_metrics(&mut used_style, available_outer_width.max(0.0));
+        let style = &used_style;
+        let horizontal_extras = box_metrics.horizontal_non_content();
+        let requested_content_width = if matches!(
+            style.box_values.width,
+            css::ComputedLengthPercentageOrAuto::MinContent
+                | css::ComputedLengthPercentageOrAuto::MaxContent
+                | css::ComputedLengthPercentageOrAuto::FitContent(_)
+        ) {
+            let (min_content, max_content) = self.block_intrinsic_content_widths(
+                element,
+                style,
+                stylesheets,
+                Some(children),
+                available_outer_width,
+            );
+            intrinsic::content_width_from_intrinsic(
+                style,
+                available_outer_width,
+                horizontal_extras,
+                min_content,
+                max_content,
+                intrinsic::IntrinsicAutoWidth::FillAvailable,
+            )
+        } else {
+            used_content_width(style, available_outer_width, horizontal_extras)
+        };
+        let content_width = constrain_width(style, requested_content_width, available_outer_width)
+            .max(style.font_size);
+
+        let mut content_height = 0.0;
+        if !has_non_inline_formatting_box(children)
+            && (has_direct_inline_content_box(children)
+                || has_atomic_inline_formatting_box(children))
+        {
+            let text = inline_text_from_formatting_boxes(children);
+            if !text.is_empty() {
+                content_height += self.estimate_text_physical_height(
+                    &text,
+                    style,
+                    content_width,
+                    style.padding.left,
+                    style.padding.right,
+                );
+            } else if has_atomic_inline_formatting_box(children) {
+                content_height += style.line_height;
+            }
+        }
+
+        for child_box in children {
+            if let box_tree::FormattingBox::AnonymousBlock(box_) = child_box {
+                let text = inline_text_from_formatting_boxes(&box_.children);
+                if !text.is_empty() || has_atomic_inline_formatting_box(&box_.children) {
+                    content_height += self
+                        .estimate_text_physical_height(
+                            &text,
+                            &box_.style,
+                            content_width,
+                            box_.style.padding.left,
+                            box_.style.padding.right,
+                        )
+                        .max(box_.style.line_height);
+                }
+                continue;
+            }
+            let Some((child_element, _, child_style, child_children)) = child_box.element_parts()
+            else {
+                continue;
+            };
+            if child_style.display.is_block_level()
+                || is_document_canvas_element(element)
+                || is_replaced_element(child_element)
+            {
+                content_height += self.table_cell_row_minimum_element_outer_height(
+                    child_element,
+                    child_style,
+                    child_children,
+                    stylesheets,
+                    content_width,
+                    child_box,
+                );
+            }
+        }
+
+        if !has_auto_height(style)
+            || used_min_height(style, content_width).is_some()
+            || used_max_height(style, content_width).is_some()
+        {
+            let vertical_extras = box_metrics.vertical_non_content();
+            let requested_content_height =
+                used_content_height_or_auto(style, content_height, vertical_extras)
+                    .unwrap_or(content_height);
+            content_height = constrain_height(style, requested_content_height, content_width);
+        }
+
+        style.margin.top
+            + used_border_width(style)
+            + style.padding.top
+            + content_height
+            + style.padding.bottom
+            + used_border_width(style)
+            + style.margin.bottom
+    }
+
+    fn table_cell_measured_inline_outer_height(
+        &mut self,
+        child: &box_tree::FormattingBox<'_>,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+    ) -> Option<f32> {
+        if !table_cell_formatting_child_has_parent_percentage_block_size(child) {
+            return table_cell_measured_inline_outer_height_without_policy(child, available_width);
+        }
+        match child {
+            box_tree::FormattingBox::Inline(box_) => {
+                if matches!(box_.style.position, Position::Absolute | Position::Fixed) {
+                    Some(0.0)
+                } else {
+                    Some(table_cell_formatting_child_outer_height(child))
+                }
+            }
+            box_tree::FormattingBox::AtomicInline(box_)
+                if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Canvas) =>
+            {
+                let style = self.table_cell_content_sizing_style(
+                    &box_.style,
+                    TableCellContentSizingPolicy::RowMinimum,
+                );
+                Some(table_cell_canvas_first_pass_outer_height(
+                    box_.element,
+                    &style,
+                    available_width,
+                ))
+            }
+            box_tree::FormattingBox::Replaced(box_)
+                if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Canvas) =>
+            {
+                let style = self.table_cell_content_sizing_style(
+                    &box_.style,
+                    TableCellContentSizingPolicy::RowMinimum,
+                );
+                Some(table_cell_canvas_first_pass_outer_height(
+                    box_.element,
+                    &style,
+                    available_width,
+                ))
+            }
+            box_tree::FormattingBox::AtomicInline(box_) => {
+                Some(self.table_cell_row_minimum_atomic_inline_outer_height(
+                    &box_.style,
+                    &box_.children,
+                    stylesheets,
+                    available_width,
+                ))
+            }
+            box_tree::FormattingBox::Replaced(box_) => {
+                Some(self.table_cell_row_minimum_atomic_inline_outer_height(
+                    &box_.style,
+                    &box_.children,
+                    stylesheets,
+                    available_width,
+                ))
+            }
+            box_tree::FormattingBox::AnonymousBlock(_)
+            | box_tree::FormattingBox::InlineSplitBlockContext(_)
+            | box_tree::FormattingBox::Block(_)
+            | box_tree::FormattingBox::Table(_)
+            | box_tree::FormattingBox::Flex(_)
+            | box_tree::FormattingBox::Line(_)
+            | box_tree::FormattingBox::Text(_) => None,
+        }
+    }
+
+    fn table_cell_row_minimum_atomic_inline_outer_height(
+        &mut self,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+    ) -> f32 {
+        if matches!(style.position, Position::Absolute | Position::Fixed) {
+            return 0.0;
+        }
+        let style =
+            self.table_cell_content_sizing_style(style, TableCellContentSizingPolicy::RowMinimum);
+        let nested_height = self.table_cell_children_non_text_content_height(
+            children,
+            stylesheets,
+            available_width,
+        );
+        let vertical_non_content =
+            style.padding.top + style.padding.bottom + table_vertical_borders(&style);
+        let preferred_content_height = nested_height.max(style.line_height);
+        let content_height =
+            used_content_height_or_auto(&style, preferred_content_height, vertical_non_content)
+                .unwrap_or(preferred_content_height)
+                .max(nested_height);
+        (content_height + vertical_non_content + style.margin.top + style.margin.bottom).max(0.0)
+    }
+
+    fn table_cell_content_sizing_style(
+        &self,
+        style: &ComputedStyle,
+        policy: TableCellContentSizingPolicy,
+    ) -> ComputedStyle {
+        let mut style = self.style_with_current_viewport_lengths(style);
+        apply_table_cell_content_sizing_policy(&mut style, policy);
+        style
+    }
+
+    /// Measure a document-canvas element when it appears as table-cell content.
+    ///
+    /// HTML's root/body canvas rules propagate backgrounds and root block
+    /// sizing to the page canvas, but a `body` box inside an authored
+    /// `html { display: table }` anonymous cell remains ordinary table-cell
+    /// content for row sizing:
+    /// <https://html.spec.whatwg.org/multipage/rendering.html#the-page>
+    /// and <https://www.w3.org/TR/css-overflow-3/#scrollable>.
+    fn table_cell_measured_document_canvas_child_height(
+        &mut self,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+    ) -> f32 {
+        let mut measured_style = style.clone();
+        set_style_auto_height(&mut measured_style);
+        measured_style.box_values.min_height = css::ComputedLengthPercentageOrAuto::Auto;
+        measured_style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
+
+        let structural_content_height = self.table_cell_children_non_text_content_height(
+            children,
+            stylesheets,
+            available_width,
+        );
+        let text = inline_text_from_formatting_boxes(children);
+        let text_height = if text.is_empty() {
+            0.0
+        } else {
+            self.estimate_text_physical_height(
+                &text,
+                &measured_style,
+                available_width,
+                measured_style.padding.left,
+                measured_style.padding.right,
+            )
+        };
+        structural_content_height.max(text_height)
+            + measured_style.padding.top
+            + measured_style.padding.bottom
+            + table_vertical_borders(&measured_style)
+            + measured_style.margin.top
+            + measured_style.margin.bottom
     }
 
     fn table_cell_content_bottom_baseline(
@@ -5997,6 +6479,14 @@ impl<'a> LayoutBuilder<'a> {
                 baseline_set,
             ),
             box_tree::FormattingBox::AnonymousBlock(box_) => self
+                .table_cell_children_baseline_offset(
+                    &box_.children,
+                    &box_.style,
+                    stylesheets,
+                    available_width,
+                    baseline_set,
+                ),
+            box_tree::FormattingBox::InlineSplitBlockContext(box_) => self
                 .table_cell_children_baseline_offset(
                     &box_.children,
                     &box_.style,
@@ -6214,7 +6704,7 @@ impl<'a> LayoutBuilder<'a> {
             top_caption_height
                 + table_width.border_widths.top
                 + table_width.padding.top
-                + table_metrics.spacing.vertical
+                + table_metrics.spacing.vertical.length
                 + row_baseline,
         )
     }
@@ -6288,7 +6778,7 @@ impl<'a> LayoutBuilder<'a> {
         if text.is_empty() {
             0.0
         } else {
-            self.estimate_text_height(&text, cell_style, available_width, 0.0, 0.0)
+            self.estimate_text_physical_height(&text, cell_style, available_width, 0.0, 0.0)
         }
     }
 
@@ -6303,13 +6793,14 @@ impl<'a> LayoutBuilder<'a> {
         for child in children {
             match child {
                 box_tree::FormattingBox::Text(box_) => {
-                    inline_line_height = inline_line_height.max(self.estimate_text_height(
-                        &box_.text,
-                        &box_.style,
-                        available_width,
-                        0.0,
-                        0.0,
-                    ));
+                    inline_line_height =
+                        inline_line_height.max(self.estimate_text_physical_height(
+                            &box_.text,
+                            &box_.style,
+                            available_width,
+                            0.0,
+                            0.0,
+                        ));
                 }
                 box_tree::FormattingBox::Inline(box_) => {
                     inline_line_height =
@@ -6346,7 +6837,7 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://drafts.csswg.org/css-tables-3/#visibility-collapse-cell-rendering>.
     #[allow(clippy::too_many_arguments)]
     fn collapsed_rowspan_cell_content_clip(
-        &self,
+        &mut self,
         row_index: usize,
         rowspan: usize,
         rows: &[TableRow<'_>],
@@ -6418,6 +6909,7 @@ impl<'a> LayoutBuilder<'a> {
                     &caption_style,
                     stylesheets,
                     caption.signature.clone(),
+                    &box_tree::BoxSource::Principal,
                     &[],
                     children,
                 );
@@ -6851,7 +7343,7 @@ impl<'a> LayoutBuilder<'a> {
             self.collapsed_table_columns(columns, table_style, stylesheets, column_count);
         TableColumnPlan::with_collapsed(
             widths,
-            table_metrics.spacing.horizontal,
+            table_metrics.spacing.horizontal.length,
             collapsed_columns,
             TableAxes::for_style(table_style),
         )
@@ -6971,7 +7463,7 @@ impl<'a> LayoutBuilder<'a> {
 
         TableColumnPlan::with_collapsed(
             widths,
-            table_metrics.spacing.horizontal,
+            table_metrics.spacing.horizontal.length,
             collapsed_columns,
             TableAxes::for_style(table_style),
         )
@@ -6984,7 +7476,7 @@ impl<'a> LayoutBuilder<'a> {
     /// without recomputing the table's column constraints.
     /// https://www.w3.org/TR/CSS22/tables.html#dynamic-effects
     pub(super) fn collapsed_table_columns(
-        &self,
+        &mut self,
         columns: &[TableColumn<'_>],
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
@@ -7014,7 +7506,7 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     pub(super) fn style_for_table_row(
-        &self,
+        &mut self,
         row: &TableRow<'_>,
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
@@ -7030,7 +7522,7 @@ impl<'a> LayoutBuilder<'a> {
             .map(|group| self.style_for_table_row_group(group, table_style, stylesheets))
             .unwrap_or_else(|| table_style.clone());
         if let Some(element) = row.element {
-            style_for_layout_element(
+            self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
                 element,
                 row.signature.clone(),
                 stylesheets,
@@ -7038,7 +7530,7 @@ impl<'a> LayoutBuilder<'a> {
                 &ancestors,
             )
         } else {
-            css::style_for_element_with_signature(
+            self.style_for_signature_with_parent_font_metrics(
                 row.signature.clone(),
                 None,
                 stylesheets,
@@ -7049,7 +7541,7 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     pub(super) fn style_for_table_row_group(
-        &self,
+        &mut self,
         row_group: &TableRowGroup<'_>,
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
@@ -7057,17 +7549,18 @@ impl<'a> LayoutBuilder<'a> {
         if let Some(style) = &row_group.style {
             return style.clone();
         }
-        style_for_layout_element(
+        let ancestors = self.ancestors.clone();
+        self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
             row_group.element,
             row_group.signature.clone(),
             stylesheets,
             Some(table_style),
-            &self.ancestors,
+            &ancestors,
         )
     }
 
     pub(super) fn style_for_table_column(
-        &self,
+        &mut self,
         column: &TableColumn<'_>,
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
@@ -7083,7 +7576,7 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             table_style.clone()
         };
-        style_for_layout_element(
+        self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
             column.element,
             column.signature.clone(),
             stylesheets,
@@ -7093,7 +7586,7 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     pub(super) fn style_for_table_column_group(
-        &self,
+        &mut self,
         group: &TableColumnGroup<'_>,
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
@@ -7101,17 +7594,18 @@ impl<'a> LayoutBuilder<'a> {
         if let Some(style) = &group.style {
             return style.clone();
         }
-        style_for_layout_element(
+        let ancestors = self.ancestors.clone();
+        self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
             group.element,
             group.signature.clone(),
             stylesheets,
             Some(table_style),
-            &self.ancestors,
+            &ancestors,
         )
     }
 
     pub(super) fn style_for_table_cell(
-        &self,
+        &mut self,
         cell: &TableCell<'_>,
         row: &TableRow<'_>,
         row_style: &ComputedStyle,
@@ -7124,6 +7618,7 @@ impl<'a> LayoutBuilder<'a> {
             style.padding = css::Edges::ZERO;
             style.border_width = 0.0;
             style.border_widths = css::Edges::ZERO;
+            style.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
             style.border_styles = css::BorderStyles::NONE;
             style.background_color = None;
             set_style_auto_width(&mut style);
@@ -7134,11 +7629,14 @@ impl<'a> LayoutBuilder<'a> {
             style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
             return style;
         }
+        if let Some(style) = &cell.style {
+            return style.clone();
+        }
         let mut ancestors = self.ancestors.clone();
         ancestors.extend(row.ancestors.iter().cloned());
         ancestors.push(row.signature.clone());
         if let Some(element) = cell.element {
-            style_for_layout_element(
+            self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
                 element,
                 cell.signature.clone(),
                 stylesheets,
@@ -7146,7 +7644,7 @@ impl<'a> LayoutBuilder<'a> {
                 &ancestors,
             )
         } else {
-            css::style_for_element_with_signature(
+            self.style_for_signature_with_parent_font_metrics(
                 cell.signature.clone(),
                 None,
                 stylesheets,
@@ -7157,7 +7655,7 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     pub(super) fn style_for_table_caption(
-        &self,
+        &mut self,
         caption: &TableCaption<'_>,
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
@@ -7165,12 +7663,13 @@ impl<'a> LayoutBuilder<'a> {
         if let Some(style) = &caption.style {
             return style.clone();
         }
-        style_for_layout_element(
+        let ancestors = self.ancestors.clone();
+        self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
             caption.element,
             caption.signature.clone(),
             stylesheets,
             Some(table_style),
-            &self.ancestors,
+            &ancestors,
         )
     }
 
@@ -7281,6 +7780,8 @@ impl<'a> LayoutBuilder<'a> {
         cell: &TableCell<'_>,
         row: &TableRow<'_>,
         cell_style: &ComputedStyle,
+        row_sizing_style: &ComputedStyle,
+        table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         border_box: TableCellBorderBox,
         placement: TableGridPlacement,
@@ -7311,10 +7812,11 @@ impl<'a> LayoutBuilder<'a> {
         self.cursor_y = content_box.top_y();
         self.ancestors = self.table_cell_child_ancestors(cell, row);
         let cell_content_height = content_box.height();
+        let percentage_height_basis =
+            table_cell_percentage_height_basis(row_sizing_style, table_style, cell_content_height);
 
         self.push_float_context();
-        self.definite_block_size_stack
-            .push(Some(cell_content_height));
+        self.definite_block_size_stack.push(percentage_height_basis);
         if formatting_box_has_inline_content(children) && !has_non_inline_formatting_box(children) {
             self.layout_anonymous_block(cell_style, children, stylesheets, None);
         } else {
@@ -7385,13 +7887,14 @@ impl<'a> LayoutBuilder<'a> {
                     sibling_tags.clone(),
                 );
                 element_index += 1;
-                let child_style = style_for_layout_element(
-                    child_element,
-                    child_signature.clone(),
-                    stylesheets,
-                    Some(cell_style),
-                    &child_ancestors,
-                );
+                let child_style = self
+                    .style_for_layout_element_with_parent_font_metrics_and_ancestors(
+                        child_element,
+                        child_signature.clone(),
+                        stylesheets,
+                        Some(cell_style),
+                        &child_ancestors,
+                    );
                 if !matches!(child_style.position, Position::Absolute | Position::Fixed) {
                     continue;
                 }
@@ -7435,6 +7938,148 @@ impl<'a> LayoutBuilder<'a> {
         ancestors.push(row.signature.clone());
         ancestors.push(cell.signature.clone());
         ancestors
+    }
+}
+
+/// Return the block-size basis used by CSS Tables 3 table-cell content relayout.
+///
+/// Percentage heights on table-cell descendants are resolved during the second
+/// content layout pass only when the cell itself has an explicit length height,
+/// or when its table root has a length or percentage height:
+/// <https://drafts.csswg.org/css-tables-3/#table-cell-content-relayout>.
+fn table_cell_percentage_height_basis(
+    cell_style: &ComputedStyle,
+    table_style: &ComputedStyle,
+    final_content_height: f32,
+) -> Option<f32> {
+    if table_cell_content_relayout_policy(cell_style, table_style)
+        != TableCellContentSizingPolicy::FinalRelayout
+    {
+        return None;
+    }
+    Some(final_content_height)
+}
+
+fn table_cell_content_relayout_policy(
+    cell_style: &ComputedStyle,
+    table_style: &ComputedStyle,
+) -> TableCellContentSizingPolicy {
+    if cell_style
+        .box_values
+        .height
+        .length_if_no_percent()
+        .is_some()
+    {
+        return TableCellContentSizingPolicy::FinalRelayout;
+    }
+    if matches!(
+        table_style.box_values.height,
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+    ) || matches!(
+        table_style.box_values.min_height,
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+    ) {
+        return TableCellContentSizingPolicy::FinalRelayout;
+    }
+    TableCellContentSizingPolicy::RowMinimum
+}
+
+fn apply_table_cell_content_sizing_policy(
+    style: &mut ComputedStyle,
+    policy: TableCellContentSizingPolicy,
+) {
+    if policy != TableCellContentSizingPolicy::RowMinimum {
+        return;
+    }
+    if table_cell_block_size_depends_on_parent_percentage(style.box_values.height) {
+        set_style_auto_height(style);
+    }
+    if table_cell_block_size_depends_on_parent_percentage(style.box_values.min_height) {
+        style.box_values.min_height = css::ComputedLengthPercentageOrAuto::Auto;
+    }
+    if table_cell_block_size_depends_on_parent_percentage(style.box_values.max_height) {
+        style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
+    }
+}
+
+fn table_cell_block_size_depends_on_parent_percentage(
+    value: css::ComputedLengthPercentageOrAuto,
+) -> bool {
+    match value {
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value)
+        | css::ComputedLengthPercentageOrAuto::FitContent(Some(value)) => value.percent != 0.0,
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::MinContent
+        | css::ComputedLengthPercentageOrAuto::MaxContent
+        | css::ComputedLengthPercentageOrAuto::FitContent(None) => false,
+    }
+}
+
+fn table_cell_style_has_parent_percentage_block_size(style: &ComputedStyle) -> bool {
+    table_cell_block_size_depends_on_parent_percentage(style.box_values.height)
+        || table_cell_block_size_depends_on_parent_percentage(style.box_values.min_height)
+        || table_cell_block_size_depends_on_parent_percentage(style.box_values.max_height)
+}
+
+fn table_cell_formatting_child_has_parent_percentage_block_size(
+    child: &box_tree::FormattingBox<'_>,
+) -> bool {
+    match child {
+        box_tree::FormattingBox::Block(box_) => {
+            table_cell_style_has_parent_percentage_block_size(&box_.style)
+                || box_
+                    .children
+                    .iter()
+                    .any(table_cell_formatting_child_has_parent_percentage_block_size)
+        }
+        box_tree::FormattingBox::Table(box_) => {
+            table_cell_style_has_parent_percentage_block_size(&box_.style)
+                || box_
+                    .fragment
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.cells.iter())
+                    .flat_map(|cell| cell.children.iter())
+                    .any(table_cell_formatting_child_has_parent_percentage_block_size)
+        }
+        box_tree::FormattingBox::Flex(box_) => {
+            table_cell_style_has_parent_percentage_block_size(&box_.style)
+                || box_
+                    .children
+                    .iter()
+                    .any(table_cell_formatting_child_has_parent_percentage_block_size)
+        }
+        box_tree::FormattingBox::Inline(box_) => {
+            table_cell_style_has_parent_percentage_block_size(&box_.style)
+                || box_
+                    .children
+                    .iter()
+                    .any(table_cell_formatting_child_has_parent_percentage_block_size)
+        }
+        box_tree::FormattingBox::AtomicInline(box_) => {
+            table_cell_style_has_parent_percentage_block_size(&box_.style)
+                || box_
+                    .children
+                    .iter()
+                    .any(table_cell_formatting_child_has_parent_percentage_block_size)
+        }
+        box_tree::FormattingBox::Replaced(box_) => {
+            table_cell_style_has_parent_percentage_block_size(&box_.style)
+                || box_
+                    .children
+                    .iter()
+                    .any(table_cell_formatting_child_has_parent_percentage_block_size)
+        }
+        box_tree::FormattingBox::AnonymousBlock(box_) => box_
+            .children
+            .iter()
+            .any(table_cell_formatting_child_has_parent_percentage_block_size),
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
+            .children
+            .iter()
+            .any(table_cell_formatting_child_has_parent_percentage_block_size),
+        box_tree::FormattingBox::Line(_) => false,
+        box_tree::FormattingBox::Text(_) => false,
     }
 }
 
@@ -7484,6 +8129,28 @@ fn table_cell_participates_in_row_baseline(
         || table_cell_alignment_baseline_set(cell_style) == TableCellBaselineSet::First
 }
 
+/// Return whether a row baseline can be consumed as a physical Y offset.
+///
+/// CSS Tables aligns table-cell baselines along the row's baseline-sharing
+/// axis, while CSS Writing Modes maps a vertical-writing cell baseline onto
+/// the horizontal block axis. Quire's current row-height and `content_offset`
+/// paths store only physical Y offsets, so horizontal-axis baselines must not
+/// inflate row heights or move content vertically:
+/// <https://drafts.csswg.org/css-tables-3/#table-cell-baseline> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+fn table_cell_participates_in_physical_y_row_baseline(
+    cell_style: &ComputedStyle,
+    row_style: &ComputedStyle,
+    placement: &TableCellPlacement,
+) -> bool {
+    table_cell_participates_in_row_baseline(cell_style, row_style, placement)
+        && table_cell_baseline_offset_axis(cell_style) == PhysicalAxis::Vertical
+}
+
+fn table_cell_baseline_offset_axis(cell_style: &ComputedStyle) -> PhysicalAxis {
+    block_start_side(cell_style.writing_mode).axis()
+}
+
 fn table_cell_alignment_baseline_set(style: &ComputedStyle) -> TableCellBaselineSet {
     if style.align_content.keyword == ContentAlignmentKeyword::LastBaseline {
         TableCellBaselineSet::Last
@@ -7506,6 +8173,9 @@ fn formatting_boxes_have_textual_baseline(children: &[box_tree::FormattingBox<'_
             formatting_boxes_have_textual_baseline(&box_.children)
         }
         box_tree::FormattingBox::AnonymousBlock(box_) => {
+            formatting_boxes_have_textual_baseline(&box_.children)
+        }
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
             formatting_boxes_have_textual_baseline(&box_.children)
         }
         box_tree::FormattingBox::Block(_)
@@ -7536,6 +8206,10 @@ fn table_cell_has_in_flow_layout_child(child_box: &box_tree::FormattingBox<'_>) 
             !matches!(box_.style.position, Position::Absolute | Position::Fixed)
         }
         box_tree::FormattingBox::AnonymousBlock(box_) => box_
+            .children
+            .iter()
+            .any(table_cell_has_in_flow_layout_child),
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
             .children
             .iter()
             .any(table_cell_has_in_flow_layout_child),
@@ -7583,12 +8257,20 @@ fn table_cell_formatting_child_slice_height(child: &box_tree::FormattingBox<'_>)
             .iter()
             .map(table_cell_formatting_child_slice_height)
             .fold(0.0_f32, f32::max),
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
+            .children
+            .iter()
+            .map(table_cell_formatting_child_slice_height)
+            .fold(0.0_f32, f32::max),
         _ => 0.0,
     };
     outer_height.max(descendant_visual_height)
 }
 
-fn table_cell_measured_inline_outer_height(child: &box_tree::FormattingBox<'_>) -> Option<f32> {
+fn table_cell_measured_inline_outer_height_without_policy(
+    child: &box_tree::FormattingBox<'_>,
+    available_width: f32,
+) -> Option<f32> {
     match child {
         box_tree::FormattingBox::Inline(box_) => {
             if matches!(box_.style.position, Position::Absolute | Position::Fixed) {
@@ -7597,10 +8279,29 @@ fn table_cell_measured_inline_outer_height(child: &box_tree::FormattingBox<'_>) 
                 Some(table_cell_formatting_child_outer_height(child))
             }
         }
+        box_tree::FormattingBox::AtomicInline(box_)
+            if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Canvas) =>
+        {
+            Some(table_cell_canvas_first_pass_outer_height(
+                box_.element,
+                &box_.style,
+                available_width,
+            ))
+        }
+        box_tree::FormattingBox::Replaced(box_)
+            if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Canvas) =>
+        {
+            Some(table_cell_canvas_first_pass_outer_height(
+                box_.element,
+                &box_.style,
+                available_width,
+            ))
+        }
         box_tree::FormattingBox::AtomicInline(_) | box_tree::FormattingBox::Replaced(_) => {
             Some(table_cell_formatting_child_outer_height(child))
         }
         box_tree::FormattingBox::AnonymousBlock(_)
+        | box_tree::FormattingBox::InlineSplitBlockContext(_)
         | box_tree::FormattingBox::Block(_)
         | box_tree::FormattingBox::Table(_)
         | box_tree::FormattingBox::Flex(_)
@@ -7609,11 +8310,30 @@ fn table_cell_measured_inline_outer_height(child: &box_tree::FormattingBox<'_>) 
     }
 }
 
+/// Measure a canvas replaced element for first-pass table row layout.
+///
+/// CSS Tables 3 says table-cell descendants whose height depends on
+/// percentages of the parent cell are treated as auto during first-pass row
+/// layout; the real percentage is handled in table-cell content relayout.
+/// <https://drafts.csswg.org/css-tables-3/#row-layout>.
+fn table_cell_canvas_first_pass_outer_height(
+    element: &Element,
+    style: &ComputedStyle,
+    available_width: f32,
+) -> f32 {
+    let (_width, height) =
+        used_canvas_size_with_height_basis(element, style, available_width, None);
+    height + style.margin.top + style.margin.bottom
+}
+
 fn table_cell_child_fragment_kind(
     child_box: &box_tree::FormattingBox<'_>,
 ) -> Option<TableCellChildFragmentKind> {
     match child_box {
         box_tree::FormattingBox::Block(_) => Some(TableCellChildFragmentKind::Block),
+        box_tree::FormattingBox::InlineSplitBlockContext(_) => {
+            Some(TableCellChildFragmentKind::Block)
+        }
         box_tree::FormattingBox::AnonymousBlock(_) => {
             Some(TableCellChildFragmentKind::AnonymousBlock)
         }
@@ -7641,10 +8361,88 @@ fn table_cell_children_can_use_inline_line_sequence(
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             table_cell_children_can_use_inline_line_sequence(&box_.children)
         }
+        box_tree::FormattingBox::InlineSplitBlockContext(_) => false,
         box_tree::FormattingBox::AtomicInline(_) => false,
         box_tree::FormattingBox::Block(_)
         | box_tree::FormattingBox::Table(_)
         | box_tree::FormattingBox::Flex(_)
         | box_tree::FormattingBox::Replaced(_) => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_element_by_tag<'a>(node: &'a Node, tag: &str) -> Option<&'a Element> {
+        match &node.kind {
+            NodeKind::Text(_) => None,
+            NodeKind::Element(element) => {
+                if element.tag == tag {
+                    return Some(element);
+                }
+                element
+                    .children
+                    .iter()
+                    .find_map(|child| first_element_by_tag(child, tag))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn table_row_style_reconstruction_uses_measured_parent_ch_for_font_size() {
+        let root = dom::parse("<html><body><table><tr><td>Cell</td></tr></table></body></html>");
+        let row_element = first_element_by_tag(&root, "tr").expect("expected table row");
+        let stylesheet = css::parse_stylesheet(
+            &css::Css::from_string(
+                r#"@font-face {
+                    font-family: MetricProbe;
+                    src: url("tests/resources/fonts/noto-sans-v8-latin-regular.woff");
+                }
+                tr { font-size: 2ch }"#,
+            )
+            .with_base_url(Some(std::path::PathBuf::from("."))),
+        );
+        let font_system = FontSystem::start_loading()
+            .load_stylesheet_fonts(std::slice::from_ref(&stylesheet))
+            .finish()
+            .await;
+        let options = RenderOptions::default();
+        let stylesheets = vec![stylesheet];
+        let resource_cache = ResourceCache::default();
+        let mut builder = LayoutBuilder::new(LayoutBuilderConfig {
+            options: &options,
+            stylesheets: &stylesheets,
+            base_url: None,
+            root_url: None,
+            resource_cache: &resource_cache,
+            page_progression_direction: Direction::Ltr,
+            page_counter_initial_values: HashMap::new(),
+            font_system,
+        });
+        let mut table_style = ComputedStyle {
+            font_family: css::FontFamily::Names(vec!["MetricProbe".to_string()]),
+            font_size: 40.0,
+            line_height: 40.0,
+            ..ComputedStyle::initial()
+        };
+        table_style.line_height_value = css::ComputedLineHeight::from_length(40.0);
+        let parent_ch_advance = builder.font_system.ch_advance(&table_style);
+        assert!(
+            (parent_ch_advance - table_style.font_size * 0.5).abs() > 0.01,
+            "fixture must differ from the generic 0.5em ch fallback"
+        );
+        let row = TableRow {
+            element: Some(row_element),
+            signature: ElementSignature::new("tr", row_element.attrs.clone()),
+            ancestors: Vec::new(),
+            row_groups: Vec::new(),
+            style: None,
+            cells: Vec::new(),
+        };
+
+        let row_style = builder.style_for_table_row(&row, &table_style, &stylesheets);
+
+        assert!((row_style.font_size - parent_ch_advance * 2.0).abs() < 0.01);
+    }
 }

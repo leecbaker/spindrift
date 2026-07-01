@@ -47,11 +47,69 @@ pub(super) fn element_selector_signature(element: &Element) -> ElementSiblingSig
     signature
 }
 
-pub(super) fn definition_list_column_groups<'a>(
+struct DomStyleResolver<'a> {
+    font_system: &'a mut FontSystem,
+}
+
+impl<'a> DomStyleResolver<'a> {
+    fn with_font_system(font_system: &'a mut FontSystem) -> Self {
+        Self { font_system }
+    }
+
+    fn style_for_element(
+        &mut self,
+        element: &Element,
+        signature: ElementSignature,
+        stylesheets: &[Stylesheet],
+        parent: Option<&ComputedStyle>,
+        ancestors: &[ElementSignature],
+    ) -> ComputedStyle {
+        let inheritance_source = parent.cloned().unwrap_or_else(ComputedStyle::initial);
+        let parent_ch_advance = self.font_system.ch_advance(&inheritance_source);
+        let mut style = style_for_layout_element_with_parent_ch_advance(
+            element,
+            signature.clone(),
+            stylesheets,
+            parent,
+            ancestors,
+            parent_ch_advance,
+        );
+        let pseudo_parent_ch_advance = self.font_system.ch_advance(&style);
+        let signature = layout_element_signature(element, signature, parent);
+        css::apply_pseudo_rules_with_parent_ch_advance(
+            &mut style,
+            &signature,
+            stylesheets,
+            ancestors,
+            pseudo_parent_ch_advance,
+        );
+        style
+    }
+}
+
+pub(super) fn definition_list_column_groups_with_font_metrics<'a>(
     element: &'a Element,
     parent_style: &ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> Vec<Vec<DefinitionListColumnItem<'a>>> {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    definition_list_column_groups_with_resolver(
+        element,
+        parent_style,
+        stylesheets,
+        ancestors,
+        &mut resolver,
+    )
+}
+
+fn definition_list_column_groups_with_resolver<'a>(
+    element: &'a Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &[Stylesheet],
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
 ) -> Vec<Vec<DefinitionListColumnItem<'a>>> {
     let sibling_tags = element_sibling_tags(element);
     let mut element_index = 0usize;
@@ -69,7 +127,7 @@ pub(super) fn definition_list_column_groups<'a>(
             sibling_tags.clone(),
         );
         element_index += 1;
-        let style = style_for_layout_element(
+        let style = resolver.style_for_element(
             child_element,
             signature.clone(),
             stylesheets,
@@ -175,6 +233,9 @@ pub(super) fn has_table_or_replaced_descendant_box(
         box_tree::FormattingBox::Inline(box_) => {
             has_table_or_replaced_descendant_box(&box_.children)
         }
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+            has_table_or_replaced_descendant_box(&box_.children)
+        }
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             has_table_or_replaced_descendant_box(&box_.children)
         }
@@ -276,6 +337,9 @@ pub(super) fn formatting_box_page_value_sources(
         box_tree::FormattingBox::Inline(box_) => {
             page_value_sources_from_style_and_children(&box_.style, &box_.children)
         }
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+            page_value_sources_from_style_and_children(&box_.style, &box_.children)
+        }
         box_tree::FormattingBox::AtomicInline(box_) => {
             if box_.style.display.is_replaced() {
                 return ((None, false), (None, false));
@@ -349,6 +413,9 @@ pub(super) fn formatting_box_is_in_normal_flow(box_: &box_tree::FormattingBox<'_
     match box_ {
         box_tree::FormattingBox::Block(box_) => style_is_in_normal_flow(&box_.style),
         box_tree::FormattingBox::Inline(box_) => style_is_in_normal_flow(&box_.style),
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+            style_is_in_normal_flow(&box_.style)
+        }
         box_tree::FormattingBox::AtomicInline(box_) => style_is_in_normal_flow(&box_.style),
         box_tree::FormattingBox::Flex(box_) => style_is_in_normal_flow(&box_.style),
         box_tree::FormattingBox::Table(box_) => style_is_in_normal_flow(&box_.style),
@@ -430,6 +497,7 @@ pub(super) fn formatting_box_has_inline_content(
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             formatting_box_has_inline_content(&box_.children)
         }
+        box_tree::FormattingBox::InlineSplitBlockContext(_) => false,
         box_tree::FormattingBox::AtomicInline(_) | box_tree::FormattingBox::Replaced(_) => true,
         box_tree::FormattingBox::Block(_)
         | box_tree::FormattingBox::Table(_)
@@ -452,6 +520,9 @@ pub(super) fn collect_inline_text_from_formatting_boxes(
             box_tree::FormattingBox::Inline(box_) => {
                 collect_inline_text_from_formatting_boxes(&box_.children, output);
             }
+            box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+                collect_inline_text_from_formatting_boxes(&box_.children, output);
+            }
             box_tree::FormattingBox::AnonymousBlock(box_) => {
                 collect_inline_text_from_formatting_boxes(&box_.children, output);
             }
@@ -466,11 +537,29 @@ pub(super) fn collect_inline_text_from_formatting_boxes(
     }
 }
 
-pub(super) fn has_styled_inline_descendant(
+pub(super) fn has_styled_inline_descendant_with_font_metrics(
     element: &Element,
     parent_style: &ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> bool {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    has_styled_inline_descendant_with_resolver(
+        element,
+        parent_style,
+        stylesheets,
+        ancestors,
+        &mut resolver,
+    )
+}
+
+fn has_styled_inline_descendant_with_resolver(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &[Stylesheet],
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
     let sibling_tags = element_sibling_tags(element);
     let mut element_index = 0usize;
@@ -485,7 +574,7 @@ pub(super) fn has_styled_inline_descendant(
             sibling_tags.clone(),
         );
         element_index += 1;
-        let child_style = style_for_layout_element(
+        let child_style = resolver.style_for_element(
             child_element,
             signature.clone(),
             stylesheets,
@@ -498,7 +587,13 @@ pub(super) fn has_styled_inline_descendant(
         inline_style_affects_line(parent_style, &child_style) || {
             let mut child_ancestors = ancestors.to_vec();
             child_ancestors.push(signature);
-            has_styled_inline_descendant(child_element, &child_style, stylesheets, &child_ancestors)
+            has_styled_inline_descendant_with_resolver(
+                child_element,
+                &child_style,
+                stylesheets,
+                &child_ancestors,
+                resolver,
+            )
         }
     })
 }
@@ -526,10 +621,21 @@ pub(super) fn has_direct_inline_replaced_child(element: &Element) -> bool {
     })
 }
 
-pub(super) fn has_direct_flow_child(
+pub(super) fn has_direct_flow_child_with_font_metrics(
     element: &Element,
     parent_style: &ComputedStyle,
     stylesheets: &[Stylesheet],
+    font_system: &mut FontSystem,
+) -> bool {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    has_direct_flow_child_with_resolver(element, parent_style, stylesheets, &mut resolver)
+}
+
+fn has_direct_flow_child_with_resolver(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &[Stylesheet],
+    resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
     let sibling_tags = element_sibling_tags(element);
     let mut element_index = 0usize;
@@ -544,7 +650,7 @@ pub(super) fn has_direct_flow_child(
             sibling_tags.clone(),
         );
         element_index += 1;
-        let style = style_for_layout_element(
+        let style = resolver.style_for_element(
             child_element,
             signature,
             stylesheets,
@@ -558,11 +664,29 @@ pub(super) fn has_direct_flow_child(
     })
 }
 
-pub(super) fn has_ordered_mixed_flow_content(
+pub(super) fn has_ordered_mixed_flow_content_with_font_metrics(
     element: &Element,
     parent_style: &ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> bool {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    has_ordered_mixed_flow_content_with_resolver(
+        element,
+        parent_style,
+        stylesheets,
+        ancestors,
+        &mut resolver,
+    )
+}
+
+fn has_ordered_mixed_flow_content_with_resolver(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &[Stylesheet],
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
     if suppresses_ordered_mixed_flow_detection(element) {
         return false;
@@ -588,7 +712,7 @@ pub(super) fn has_ordered_mixed_flow_content(
                     sibling_tags.clone(),
                 );
                 element_index += 1;
-                let child_style = style_for_layout_element(
+                let child_style = resolver.style_for_element(
                     child_element,
                     signature,
                     stylesheets,
@@ -617,12 +741,14 @@ pub(super) fn has_ordered_mixed_flow_content(
 
 /// Returns whether a block container's start edge can adjoin child margins.
 ///
-/// CSS 2.2 allows parent/child vertical margin collapse only through ordinary
-/// flow block boxes without border, padding, inline content, fixed height, or
-/// min-height. Boxes that establish an independent formatting context, such as
-/// `display: flow-root`, do not collapse with in-flow descendants.
+/// CSS 2.2 allows parent/child vertical margin collapse through ordinary flow
+/// block boxes without border, padding, inline content, or fixed height. A
+/// non-auto `min-height` only prevents a last child's bottom margin from
+/// collapsing through when that margin also adjoins the parent's top edge; the
+/// final used min/max-height constraint is applied after child layout.
 ///
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+/// <https://www.w3.org/TR/CSS22/visudet.html#min-max-heights>
 /// <https://www.w3.org/TR/css-display-3/#valdef-display-flow-root>
 pub(super) fn can_collapse_block_start_margin(
     style: &ComputedStyle,
@@ -634,15 +760,16 @@ pub(super) fn can_collapse_block_start_margin(
         && style.padding.top == 0.0
         && border_widths.top == 0.0
         && has_auto_height(style)
-        && style.box_values.min_height.is_auto()
 }
 
 /// Returns whether a block container's end edge can adjoin child margins.
 ///
-/// This is the block-end counterpart to `can_collapse_block_start_margin` and
-/// follows the same CSS 2.2 parent/child margin-collapse restrictions.
+/// This is the block-end counterpart to `can_collapse_block_start_margin`. The
+/// block layout pass later decides whether the final min-height-constrained
+/// content height actually keeps this adjoining margin inside the parent.
 ///
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+/// <https://www.w3.org/TR/CSS22/visudet.html#min-max-heights>
 /// <https://www.w3.org/TR/css-display-3/#valdef-display-flow-root>
 pub(super) fn can_collapse_block_end_margin(
     style: &ComputedStyle,
@@ -654,7 +781,6 @@ pub(super) fn can_collapse_block_end_margin(
         && style.padding.bottom == 0.0
         && border_widths.bottom == 0.0
         && has_auto_height(style)
-        && style.box_values.min_height.is_auto()
 }
 
 /// Returns whether a child participates in normal block flow for margin collapse.
@@ -716,13 +842,35 @@ pub(super) fn relative_position_offset(
     RelativeOffset { x, y }
 }
 
-pub(super) fn has_later_normal_block_flow_child(
+pub(super) fn has_later_normal_block_flow_child_with_font_metrics(
     element: &Element,
     start_element_index: usize,
     sibling_tags: &[ElementSiblingSignature],
     parent_style: &ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> bool {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    has_later_normal_block_flow_child_with_resolver(
+        element,
+        start_element_index,
+        sibling_tags,
+        parent_style,
+        stylesheets,
+        ancestors,
+        &mut resolver,
+    )
+}
+
+fn has_later_normal_block_flow_child_with_resolver(
+    element: &Element,
+    start_element_index: usize,
+    sibling_tags: &[ElementSiblingSignature],
+    parent_style: &ComputedStyle,
+    stylesheets: &[Stylesheet],
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
     let mut element_index = 0usize;
     for child in &element.children {
@@ -740,7 +888,7 @@ pub(super) fn has_later_normal_block_flow_child(
             current_index,
             sibling_tags.to_vec(),
         );
-        let style = style_for_layout_element(
+        let style = resolver.style_for_element(
             child_element,
             signature,
             stylesheets,
@@ -807,6 +955,7 @@ pub(super) fn collapse_margins(first: f32, second: f32) -> f32 {
 /// when a set contains more than two mixed-sign margins.
 ///
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+/// <https://www.w3.org/TR/CSS22/visudet.html#min-max-heights>
 pub(super) fn collapse_margin_set(margins: impl IntoIterator<Item = f32>) -> f32 {
     let mut max_positive = 0.0f32;
     let mut min_negative = 0.0f32;
@@ -1035,6 +1184,7 @@ pub(super) fn has_non_inline_formatting_box(child_boxes: &[box_tree::FormattingB
         matches!(
             child,
             box_tree::FormattingBox::AnonymousBlock(_)
+                | box_tree::FormattingBox::InlineSplitBlockContext(_)
                 | box_tree::FormattingBox::Block(_)
                 | box_tree::FormattingBox::Table(_)
                 | box_tree::FormattingBox::Flex(_)
@@ -1051,6 +1201,9 @@ pub(super) fn has_atomic_inline_formatting_box(
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             has_atomic_inline_formatting_box(&box_.children)
         }
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+            has_atomic_inline_formatting_box(&box_.children)
+        }
         box_tree::FormattingBox::Inline(box_) => has_atomic_inline_formatting_box(&box_.children),
         box_tree::FormattingBox::Block(_)
         | box_tree::FormattingBox::Line(_)
@@ -1061,11 +1214,29 @@ pub(super) fn has_atomic_inline_formatting_box(
     })
 }
 
-pub(super) fn collapsible_first_child_start_margin_dom(
+pub(super) fn collapsible_first_child_start_margin_dom_with_font_metrics(
     element: &Element,
     parent_style: &ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> Option<f32> {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    collapsible_first_child_start_margin_dom_with_resolver(
+        element,
+        parent_style,
+        stylesheets,
+        ancestors,
+        &mut resolver,
+    )
+}
+
+fn collapsible_first_child_start_margin_dom_with_resolver(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &[Stylesheet],
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
 ) -> Option<f32> {
     let sibling_tags = element_sibling_tags(element);
     let mut element_index = 0usize;
@@ -1085,7 +1256,7 @@ pub(super) fn collapsible_first_child_start_margin_dom(
             sibling_tags.clone(),
         );
         element_index += 1;
-        let child_style = style_for_layout_element(
+        let child_style = resolver.style_for_element(
             child_element,
             signature.clone(),
             stylesheets,
@@ -1106,34 +1277,58 @@ pub(super) fn collapsible_first_child_start_margin_dom(
         }
         let mut child_ancestors = ancestors.to_vec();
         child_ancestors.push(signature);
-        return Some(collapsible_start_margin_dom(
+        return Some(collapsible_start_margin_dom_with_resolver(
             child_element,
             &child_style,
             stylesheets,
             &child_ancestors,
+            resolver,
         ));
     }
     None
 }
 
-pub(super) fn collapsible_start_margin_dom(
+fn collapsible_start_margin_dom_with_resolver(
     element: &Element,
     style: &ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
 ) -> f32 {
     if can_collapse_block_start_margin(
         style,
         used_border_widths(style),
-        has_direct_inline_content_dom(element, style, stylesheets, ancestors),
-    ) && let Some(descendant_margin) =
-        collapsible_first_child_start_margin_dom(element, style, stylesheets, ancestors)
-    {
-        if is_self_collapsing_block_dom(element, style, stylesheets, ancestors) {
+        has_direct_inline_content_dom_with_resolver(
+            element,
+            style,
+            stylesheets,
+            ancestors,
+            resolver,
+        ),
+    ) && let Some(descendant_margin) = collapsible_first_child_start_margin_dom_with_resolver(
+        element,
+        style,
+        stylesheets,
+        ancestors,
+        resolver,
+    ) {
+        if is_self_collapsing_block_dom_with_resolver(
+            element,
+            style,
+            stylesheets,
+            ancestors,
+            resolver,
+        ) {
             return self_collapsing_block_margin_set_for_box(style, Some(descendant_margin));
         }
         collapse_margins(style.margin.top, descendant_margin)
-    } else if is_self_collapsing_block_dom(element, style, stylesheets, ancestors) {
+    } else if is_self_collapsing_block_dom_with_resolver(
+        element,
+        style,
+        stylesheets,
+        ancestors,
+        resolver,
+    ) {
         self_collapsing_block_margin_set_for_box(style, None)
     } else {
         style.margin.top
@@ -1149,21 +1344,50 @@ pub(super) fn collapsible_start_margin_dom(
 ///
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
 /// <https://drafts.csswg.org/css-box-4/#margin-trim>
-pub(super) fn is_self_collapsing_block_dom(
+pub(super) fn is_self_collapsing_block_dom_with_font_metrics(
     element: &Element,
     style: &ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
 ) -> bool {
-    let has_direct_inline_content =
-        has_direct_inline_content_dom(element, style, stylesheets, ancestors);
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    is_self_collapsing_block_dom_with_resolver(
+        element,
+        style,
+        stylesheets,
+        ancestors,
+        &mut resolver,
+    )
+}
+
+fn is_self_collapsing_block_dom_with_resolver(
+    element: &Element,
+    style: &ComputedStyle,
+    stylesheets: &[Stylesheet],
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
+) -> bool {
+    let has_direct_inline_content = has_direct_inline_content_dom_with_resolver(
+        element,
+        style,
+        stylesheets,
+        ancestors,
+        resolver,
+    );
     is_collapsible_block_child(element, style)
         && can_collapse_own_block_margins(
             style,
             used_border_widths(style),
             has_direct_inline_content,
         )
-        && dom_children_keep_self_collapsing_parent(element, style, stylesheets, ancestors)
+        && dom_children_keep_self_collapsing_parent(
+            element,
+            style,
+            stylesheets,
+            ancestors,
+            resolver,
+        )
 }
 
 fn dom_children_keep_self_collapsing_parent(
@@ -1171,6 +1395,7 @@ fn dom_children_keep_self_collapsing_parent(
     parent_style: &ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
     let sibling_tags = element_sibling_tags(element);
     let mut element_index = 0usize;
@@ -1184,7 +1409,7 @@ fn dom_children_keep_self_collapsing_parent(
                 sibling_tags.clone(),
             );
             element_index += 1;
-            let child_style = style_for_layout_element(
+            let child_style = resolver.style_for_element(
                 child,
                 signature.clone(),
                 stylesheets,
@@ -1199,16 +1424,40 @@ fn dom_children_keep_self_collapsing_parent(
             let mut child_ancestors = ancestors.to_vec();
             child_ancestors.push(signature);
             is_normal_block_flow_child(child, &child_style)
-                && is_self_collapsing_block_dom(child, &child_style, stylesheets, &child_ancestors)
+                && is_self_collapsing_block_dom_with_resolver(
+                    child,
+                    &child_style,
+                    stylesheets,
+                    &child_ancestors,
+                    resolver,
+                )
         }
     })
 }
 
-pub(super) fn has_direct_inline_content_dom(
+pub(super) fn has_direct_inline_content_dom_with_font_metrics(
     element: &Element,
     parent_style: &ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    font_system: &mut FontSystem,
+) -> bool {
+    let mut resolver = DomStyleResolver::with_font_system(font_system);
+    has_direct_inline_content_dom_with_resolver(
+        element,
+        parent_style,
+        stylesheets,
+        ancestors,
+        &mut resolver,
+    )
+}
+
+fn has_direct_inline_content_dom_with_resolver(
+    element: &Element,
+    parent_style: &ComputedStyle,
+    stylesheets: &[Stylesheet],
+    ancestors: &[ElementSignature],
+    resolver: &mut DomStyleResolver<'_>,
 ) -> bool {
     let sibling_tags = element_sibling_tags(element);
     let mut element_index = 0usize;
@@ -1222,7 +1471,7 @@ pub(super) fn has_direct_inline_content_dom(
                 sibling_tags.clone(),
             );
             element_index += 1;
-            let child_style = style_for_layout_element(
+            let child_style = resolver.style_for_element(
                 child,
                 signature,
                 stylesheets,
@@ -1239,6 +1488,7 @@ pub(super) fn has_direct_inline_content_dom(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn test_parent_style() -> ComputedStyle {
         ComputedStyle {
@@ -1246,6 +1496,21 @@ mod tests {
             line_height: 14.4,
             color: Color::BLACK,
             ..ComputedStyle::initial()
+        }
+    }
+
+    fn first_element_by_tag<'a>(node: &'a Node, tag: &str) -> Option<&'a Element> {
+        match &node.kind {
+            NodeKind::Text(_) => None,
+            NodeKind::Element(element) => {
+                if element.tag == tag {
+                    return Some(element);
+                }
+                element
+                    .children
+                    .iter()
+                    .find_map(|child| first_element_by_tag(child, tag))
+            }
         }
     }
 
@@ -1273,5 +1538,49 @@ mod tests {
             formatting_box_page_values(&body.children()[1]),
             (Some("c".to_string()), Some("c".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn definition_list_dom_grouping_uses_measured_parent_ch_for_child_font_size() {
+        let root =
+            dom::parse("<html><body><dl><dt style=\"font-size: 2ch\">Term</dt></dl></body></html>");
+        let dl = first_element_by_tag(&root, "dl").expect("expected dl element");
+        let stylesheet = css::parse_stylesheet(
+            &css::Css::from_string(
+                r#"@font-face {
+                    font-family: MetricProbe;
+                    src: url("tests/resources/fonts/noto-sans-v8-latin-regular.woff");
+                }"#,
+            )
+            .with_base_url(Some(PathBuf::from("."))),
+        );
+        let stylesheets = vec![css::html5_user_agent_stylesheet(), stylesheet];
+        let mut parent_style = ComputedStyle {
+            font_family: css::FontFamily::Names(vec!["MetricProbe".to_string()]),
+            font_size: 40.0,
+            line_height: 40.0,
+            ..ComputedStyle::initial()
+        };
+        parent_style.line_height_value = css::ComputedLineHeight::from_length(40.0);
+        let mut font_system = FontSystem::start_loading()
+            .load_stylesheet_fonts(&stylesheets)
+            .finish()
+            .await;
+        let parent_ch_advance = font_system.ch_advance(&parent_style);
+        assert!(
+            (parent_ch_advance - parent_style.font_size * 0.5).abs() > 0.01,
+            "fixture must differ from the generic 0.5em ch fallback"
+        );
+
+        let groups = definition_list_column_groups_with_font_metrics(
+            dl,
+            &parent_style,
+            &stylesheets,
+            &[],
+            &mut font_system,
+        );
+
+        assert_eq!(groups.len(), 1);
+        assert!((groups[0][0].style.font_size - parent_ch_advance * 2.0).abs() < 0.01);
     }
 }

@@ -266,6 +266,13 @@ fn expand_simple_modeled_shorthand(
         "gap" => expand_gap_shorthand(value),
         "flex-flow" => expand_flex_flow_shorthand(value),
         "flex" => expand_flex_shorthand(value),
+        "grid-row" => expand_grid_placement_shorthand(value, "grid-row-start", "grid-row-end"),
+        "grid-column" => {
+            expand_grid_placement_shorthand(value, "grid-column-start", "grid-column-end")
+        }
+        "grid" => expand_grid_shorthand(value),
+        "grid-template" => expand_grid_template_shorthand(value),
+        "grid-area" => expand_grid_area_shorthand(value),
         "place-content" | "place-items" | "place-self" => {
             expand_alignment_place_shorthand(name, value)
         }
@@ -563,7 +570,7 @@ fn border_shorthand_components(value: &str) -> Option<BorderShorthandComponents>
     let mut color = None;
     for part in split_css_component_values(value) {
         let mut recognized = false;
-        if width.is_none() && parse_border_width(part).is_some() {
+        if width.is_none() && parse_computed_border_width(part, ROOT_FONT_SIZE_PT).is_some() {
             width = Some(part.to_string());
             recognized = true;
         }
@@ -964,6 +971,722 @@ fn parse_gap_shorthand_components(
     }
 }
 
+fn parse_grid_track_list(value: &str, font_size: f32) -> Option<GridTrackList> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("none") {
+        return Some(GridTrackList::None);
+    }
+    let (components, trailing_names) = parse_grid_track_list_components(value, font_size)?;
+    (!components.is_empty()).then_some(GridTrackList::Tracks {
+        components,
+        trailing_names,
+    })
+}
+
+fn expand_grid_template_shorthand(value: &str) -> Option<Vec<(&'static str, String)>> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("none") {
+        return Some(vec![
+            ("grid-template-rows", "none".to_string()),
+            ("grid-template-columns", "none".to_string()),
+            ("grid-template-areas", "none".to_string()),
+        ]);
+    }
+
+    let (rows, columns, has_slash) = split_top_level_once(value, '/')
+        .map(|(rows, columns)| (trim_css_value(rows), trim_css_value(columns), true))
+        .unwrap_or((value, "none", false));
+    if rows.is_empty() || columns.is_empty() {
+        return None;
+    }
+    let rows_have_areas = split_css_component_values(rows)
+        .iter()
+        .any(|token| css_string_token_contents(token).is_some());
+    if !rows_have_areas {
+        if !has_slash {
+            return None;
+        }
+        parse_grid_track_list(rows, ROOT_FONT_SIZE_PT)?;
+        parse_grid_track_list(columns, ROOT_FONT_SIZE_PT)?;
+        return Some(vec![
+            ("grid-template-rows", rows.to_string()),
+            ("grid-template-columns", columns.to_string()),
+            ("grid-template-areas", "none".to_string()),
+        ]);
+    }
+
+    let (row_tracks, areas) = parse_grid_template_ascii_rows(rows)?;
+    parse_grid_track_list(&row_tracks, ROOT_FONT_SIZE_PT)?;
+    parse_grid_template_areas(&areas)?;
+    parse_grid_track_list(columns, ROOT_FONT_SIZE_PT)?;
+    Some(vec![
+        ("grid-template-rows", row_tracks),
+        ("grid-template-columns", columns.to_string()),
+        ("grid-template-areas", areas),
+    ])
+}
+
+fn expand_grid_shorthand(value: &str) -> Option<Vec<(&'static str, String)>> {
+    let value = trim_css_value(value);
+    let (left, right) = split_top_level_once(value, '/')
+        .map(|(left, right)| (trim_css_value(left), trim_css_value(right)))
+        .unwrap_or((value, ""));
+    if left.is_empty() || right.is_empty() {
+        let mut expanded = expand_grid_template_shorthand(value)?;
+        expanded.extend(grid_implicit_initial_longhands());
+        return Some(expanded);
+    }
+    if let Some((dense, auto_tracks)) = parse_grid_auto_flow_shorthand_side(left) {
+        parse_grid_track_list(right, ROOT_FONT_SIZE_PT)?;
+        return Some(vec![
+            ("grid-template-rows", "none".to_string()),
+            ("grid-template-columns", right.to_string()),
+            ("grid-template-areas", "none".to_string()),
+            (
+                "grid-auto-flow",
+                if dense { "row dense" } else { "row" }.to_string(),
+            ),
+            ("grid-auto-rows", auto_tracks),
+            ("grid-auto-columns", "auto".to_string()),
+        ]);
+    }
+    if let Some((dense, auto_tracks)) = parse_grid_auto_flow_shorthand_side(right) {
+        parse_grid_track_list(left, ROOT_FONT_SIZE_PT)?;
+        return Some(vec![
+            ("grid-template-rows", left.to_string()),
+            ("grid-template-columns", "none".to_string()),
+            ("grid-template-areas", "none".to_string()),
+            (
+                "grid-auto-flow",
+                if dense { "column dense" } else { "column" }.to_string(),
+            ),
+            ("grid-auto-rows", "auto".to_string()),
+            ("grid-auto-columns", auto_tracks),
+        ]);
+    }
+    let mut expanded = expand_grid_template_shorthand(value)?;
+    expanded.extend(grid_implicit_initial_longhands());
+    Some(expanded)
+}
+
+fn grid_implicit_initial_longhands() -> Vec<(&'static str, String)> {
+    vec![
+        ("grid-auto-flow", "row".to_string()),
+        ("grid-auto-rows", "auto".to_string()),
+        ("grid-auto-columns", "auto".to_string()),
+    ]
+}
+
+fn parse_grid_auto_flow_shorthand_side(value: &str) -> Option<(bool, String)> {
+    let tokens = split_css_component_values(value);
+    let auto_flow_index = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("auto-flow"))?;
+    let mut dense = false;
+    for token in &tokens[..auto_flow_index] {
+        if token.eq_ignore_ascii_case("dense") && !dense {
+            dense = true;
+        } else {
+            return None;
+        }
+    }
+    let mut track_start = auto_flow_index + 1;
+    if tokens
+        .get(track_start)
+        .is_some_and(|token| token.eq_ignore_ascii_case("dense"))
+    {
+        dense = true;
+        track_start += 1;
+    }
+    if tokens[track_start..]
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("dense") || token.eq_ignore_ascii_case("auto-flow"))
+    {
+        return None;
+    }
+    let auto_tracks = if track_start == tokens.len() {
+        "auto".to_string()
+    } else {
+        let auto_tracks = tokens[track_start..].join(" ");
+        parse_grid_auto_track_list(&auto_tracks, ROOT_FONT_SIZE_PT)?;
+        auto_tracks
+    };
+    Some((dense, auto_tracks))
+}
+
+fn parse_grid_template_ascii_rows(value: &str) -> Option<(String, String)> {
+    let tokens = split_css_component_values(value);
+    let mut index = 0usize;
+    let mut row_track_tokens = Vec::new();
+    let mut area_tokens = Vec::new();
+
+    while index < tokens.len() {
+        while index < tokens.len() && parse_grid_line_names(tokens[index]).is_some() {
+            row_track_tokens.push(tokens[index].to_string());
+            index += 1;
+        }
+
+        let area = tokens
+            .get(index)
+            .and_then(|token| css_string_token_contents(token))?;
+        area_tokens.push(css_quote_string(area));
+        index += 1;
+
+        if index < tokens.len()
+            && css_string_token_contents(tokens[index]).is_none()
+            && parse_grid_line_names(tokens[index]).is_none()
+        {
+            parse_grid_track_size(tokens[index], ROOT_FONT_SIZE_PT)?;
+            row_track_tokens.push(tokens[index].to_string());
+            index += 1;
+        } else {
+            row_track_tokens.push("auto".to_string());
+        }
+
+        while index < tokens.len() && parse_grid_line_names(tokens[index]).is_some() {
+            row_track_tokens.push(tokens[index].to_string());
+            index += 1;
+        }
+    }
+
+    (!area_tokens.is_empty()).then(|| (row_track_tokens.join(" "), area_tokens.join(" ")))
+}
+
+fn css_string_token_contents(token: &str) -> Option<&str> {
+    let token = trim_css_value(token);
+    token
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            token
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+}
+
+fn css_quote_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn parse_grid_track_list_components(
+    value: &str,
+    font_size: f32,
+) -> Option<(Vec<GridTrackListComponent>, GridLineNames)> {
+    parse_grid_track_list_components_with_options(value, font_size, true)
+}
+
+fn parse_grid_track_list_components_with_options(
+    value: &str,
+    font_size: f32,
+    allow_repeat: bool,
+) -> Option<(Vec<GridTrackListComponent>, GridLineNames)> {
+    let mut components = Vec::new();
+    let mut pending_names = Vec::new();
+    let mut saw_auto_repeat = false;
+    for token in split_css_component_values(value) {
+        if let Some(names) = parse_grid_line_names(token) {
+            pending_names.extend(names);
+            continue;
+        }
+        if allow_repeat && let Some(repeat) = parse_grid_repeat(token, font_size) {
+            if matches!(
+                repeat.count,
+                GridRepeatCount::AutoFill | GridRepeatCount::AutoFit
+            ) {
+                if saw_auto_repeat {
+                    return None;
+                }
+                saw_auto_repeat = true;
+            }
+            components.push(GridTrackListComponent::Repeat(
+                std::mem::take(&mut pending_names),
+                repeat,
+            ));
+            continue;
+        }
+        if let Some(size) = parse_grid_track_size(token, font_size) {
+            components.push(GridTrackListComponent::Track(
+                std::mem::take(&mut pending_names),
+                size,
+            ));
+            continue;
+        }
+        return None;
+    }
+    if !pending_names.is_empty() && components.is_empty() {
+        return None;
+    }
+    Some((components, pending_names))
+}
+
+fn parse_grid_line_names(token: &str) -> Option<Vec<String>> {
+    let token = trim_css_value(token);
+    let inner = token.strip_prefix('[')?.strip_suffix(']')?;
+    let mut names = Vec::new();
+    for name in inner.split_whitespace() {
+        if !grid_placement_name_is_custom_ident(name) {
+            return None;
+        }
+        names.push(name.to_string());
+    }
+    Some(names)
+}
+
+fn parse_grid_repeat(token: &str, font_size: f32) -> Option<GridRepeat> {
+    let inner = grid_function_body(trim_css_value(token), "repeat")?;
+    let (count, tracks) = split_top_level_once(inner, ',')?;
+    let count = match trim_css_value(count).to_ascii_lowercase().as_str() {
+        "auto-fill" => GridRepeatCount::AutoFill,
+        "auto-fit" => GridRepeatCount::AutoFit,
+        value => GridRepeatCount::Number(value.parse::<u16>().ok().filter(|count| *count > 0)?),
+    };
+    let (tracks, trailing_names) =
+        parse_grid_track_list_components_with_options(tracks, font_size, false)?;
+    if tracks.is_empty() || !grid_repeat_tracks_are_valid(count, &tracks) {
+        return None;
+    }
+    Some(GridRepeat {
+        count,
+        tracks,
+        trailing_names,
+    })
+}
+
+/// Validate the CSS Grid `repeat()` grammar after parsing its track fragment.
+///
+/// CSS Grid forbids nested `repeat()` fragments, and `auto-fill`/`auto-fit`
+/// use the stricter `<fixed-size>` grammar because auto-repeat counts are
+/// derived from definite track breadths:
+/// <https://www.w3.org/TR/css-grid-1/#repeat-notation>.
+fn grid_repeat_tracks_are_valid(count: GridRepeatCount, tracks: &[GridTrackListComponent]) -> bool {
+    tracks.iter().all(|component| match component {
+        GridTrackListComponent::Track(_, size) => {
+            !matches!(count, GridRepeatCount::AutoFill | GridRepeatCount::AutoFit)
+                || grid_track_size_is_fixed_for_auto_repeat(*size)
+        }
+        GridTrackListComponent::Repeat(_, _) => false,
+    })
+}
+
+fn grid_track_size_is_fixed_for_auto_repeat(size: GridTrackSize) -> bool {
+    grid_min_track_breadth_is_fixed(size.min)
+        || (grid_min_track_breadth_is_inflexible(size.min)
+            && grid_max_track_breadth_is_fixed(size.max))
+}
+
+fn grid_min_track_breadth_is_fixed(value: GridMinTrackBreadth) -> bool {
+    matches!(value, GridMinTrackBreadth::LengthPercentage(_))
+}
+
+fn grid_min_track_breadth_is_inflexible(value: GridMinTrackBreadth) -> bool {
+    matches!(
+        value,
+        GridMinTrackBreadth::Auto
+            | GridMinTrackBreadth::MinContent
+            | GridMinTrackBreadth::MaxContent
+            | GridMinTrackBreadth::LengthPercentage(_)
+    )
+}
+
+fn grid_max_track_breadth_is_fixed(value: GridMaxTrackBreadth) -> bool {
+    matches!(value, GridMaxTrackBreadth::LengthPercentage(_))
+}
+
+fn parse_grid_auto_track_list(value: &str, font_size: f32) -> Option<GridAutoTrackList> {
+    let tracks = split_css_component_values(value)
+        .into_iter()
+        .map(|part| parse_grid_track_size(part, font_size))
+        .collect::<Option<Vec<_>>>()?;
+    (!tracks.is_empty()).then_some(GridAutoTrackList { tracks })
+}
+
+fn parse_grid_track_size(value: &str, font_size: f32) -> Option<GridTrackSize> {
+    let value = trim_css_value(value);
+    let lower = value.to_ascii_lowercase();
+    if let Some(inner) = grid_function_body(value, "minmax") {
+        let (min, max) = split_top_level_once(inner, ',')?;
+        return Some(GridTrackSize {
+            min: parse_grid_min_track_breadth(min, font_size)?,
+            max: parse_grid_max_track_breadth(max, font_size)?,
+        });
+    }
+    if let Some(inner) = grid_function_body(value, "fit-content") {
+        return Some(GridTrackSize {
+            min: GridMinTrackBreadth::Auto,
+            max: GridMaxTrackBreadth::FitContent(parse_computed_length_percentage(
+                inner, font_size,
+            )?),
+        });
+    }
+    if let Some(flex) = parse_grid_flex(&lower) {
+        return Some(GridTrackSize {
+            min: GridMinTrackBreadth::Auto,
+            max: GridMaxTrackBreadth::Flex(flex),
+        });
+    }
+    match lower.as_str() {
+        "auto" => Some(GridTrackSize::AUTO),
+        "min-content" => Some(GridTrackSize {
+            min: GridMinTrackBreadth::MinContent,
+            max: GridMaxTrackBreadth::MinContent,
+        }),
+        "max-content" => Some(GridTrackSize {
+            min: GridMinTrackBreadth::MaxContent,
+            max: GridMaxTrackBreadth::MaxContent,
+        }),
+        _ => {
+            let length = parse_computed_length_percentage(value, font_size)?;
+            Some(GridTrackSize {
+                min: GridMinTrackBreadth::LengthPercentage(length),
+                max: GridMaxTrackBreadth::LengthPercentage(length),
+            })
+        }
+    }
+}
+
+fn parse_grid_min_track_breadth(value: &str, font_size: f32) -> Option<GridMinTrackBreadth> {
+    let value = trim_css_value(value);
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => Some(GridMinTrackBreadth::Auto),
+        "min-content" => Some(GridMinTrackBreadth::MinContent),
+        "max-content" => Some(GridMinTrackBreadth::MaxContent),
+        _ => parse_computed_length_percentage(value, font_size)
+            .map(GridMinTrackBreadth::LengthPercentage),
+    }
+}
+
+fn parse_grid_max_track_breadth(value: &str, font_size: f32) -> Option<GridMaxTrackBreadth> {
+    let value = trim_css_value(value);
+    let lower = value.to_ascii_lowercase();
+    if let Some(flex) = parse_grid_flex(&lower) {
+        return Some(GridMaxTrackBreadth::Flex(flex));
+    }
+    if let Some(inner) = grid_function_body(value, "fit-content") {
+        return parse_computed_length_percentage(inner, font_size)
+            .map(GridMaxTrackBreadth::FitContent);
+    }
+    match lower.as_str() {
+        "auto" => Some(GridMaxTrackBreadth::Auto),
+        "min-content" => Some(GridMaxTrackBreadth::MinContent),
+        "max-content" => Some(GridMaxTrackBreadth::MaxContent),
+        _ => parse_computed_length_percentage(value, font_size)
+            .map(GridMaxTrackBreadth::LengthPercentage),
+    }
+}
+
+fn parse_grid_flex(lower: &str) -> Option<f32> {
+    let value = lower.strip_suffix("fr")?;
+    value.parse::<f32>().ok().filter(|value| *value >= 0.0)
+}
+
+fn grid_function_body<'a>(value: &'a str, name: &str) -> Option<&'a str> {
+    let value = trim_css_value(value);
+    let prefix_len = name.len();
+    let prefix = value.get(..prefix_len)?;
+    if !prefix.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    value[prefix_len..]
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')
+}
+
+fn parse_grid_template_areas(value: &str) -> Option<GridTemplateAreas> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("none") {
+        return Some(GridTemplateAreas::None);
+    }
+    let mut rows = Vec::new();
+    for token in split_css_component_values(value) {
+        let token = trim_css_value(token);
+        let row = token
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                token
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })?;
+        let cells = parse_grid_template_area_row(row)?;
+        if cells.is_empty() {
+            return None;
+        }
+        rows.push(GridTemplateAreaRow { cells });
+    }
+    let width = rows.first()?.cells.len();
+    (rows.iter().all(|row| row.cells.len() == width) && grid_template_areas_are_rectangular(&rows))
+        .then_some(GridTemplateAreas::Areas(rows))
+}
+
+/// Parses one `grid-template-areas` string token into named and null cells.
+///
+/// CSS Grid parses each string as a whitespace-separated row of named cell
+/// tokens or null cell tokens. Any unrecognized sequence is invalid:
+/// <https://www.w3.org/TR/css-grid-1/#typedef-grid-template-areas-string>.
+fn parse_grid_template_area_row(row: &str) -> Option<Vec<Option<String>>> {
+    let mut cells = Vec::new();
+    let mut chars = row.chars().peekable();
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if ch == '.' {
+            while matches!(chars.peek(), Some('.')) {
+                chars.next();
+            }
+            cells.push(None);
+            continue;
+        }
+        if grid_template_area_name_code_point(ch) {
+            let mut name = String::new();
+            while let Some(ch) = chars.peek().copied() {
+                if !grid_template_area_name_code_point(ch) {
+                    break;
+                }
+                name.push(ch);
+                chars.next();
+            }
+            cells.push(Some(name));
+            continue;
+        }
+        return None;
+    }
+    Some(cells)
+}
+
+fn grid_template_area_name_code_point(ch: char) -> bool {
+    ch == '-' || ch == '_' || ch.is_ascii_alphanumeric() || !ch.is_ascii()
+}
+
+/// Validates the CSS Grid requirement that named area cells form rectangles.
+///
+/// If any named grid area spans multiple cells, those cells must define a
+/// single filled-in rectangle and no disconnected fragments:
+/// <https://www.w3.org/TR/css-grid-1/#grid-template-areas-property>.
+fn grid_template_areas_are_rectangular(rows: &[GridTemplateAreaRow]) -> bool {
+    let mut areas: Vec<GridTemplateAreaParseBounds> = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        for (column_index, cell) in row.cells.iter().enumerate() {
+            let Some(name) = cell else {
+                continue;
+            };
+            if let Some(area) = areas.iter_mut().find(|area| area.name == *name) {
+                area.row_start = area.row_start.min(row_index);
+                area.row_end = area.row_end.max(row_index);
+                area.column_start = area.column_start.min(column_index);
+                area.column_end = area.column_end.max(column_index);
+            } else {
+                areas.push(GridTemplateAreaParseBounds {
+                    name: name.clone(),
+                    row_start: row_index,
+                    row_end: row_index,
+                    column_start: column_index,
+                    column_end: column_index,
+                });
+            }
+        }
+    }
+    areas.into_iter().all(|area| {
+        (area.row_start..=area.row_end).all(|row_index| {
+            (area.column_start..=area.column_end).all(|column_index| {
+                rows.get(row_index)
+                    .and_then(|row| row.cells.get(column_index))
+                    .is_some_and(|cell| cell.as_ref() == Some(&area.name))
+            })
+        })
+    })
+}
+
+#[derive(Debug, Clone)]
+struct GridTemplateAreaParseBounds {
+    name: String,
+    row_start: usize,
+    row_end: usize,
+    column_start: usize,
+    column_end: usize,
+}
+
+fn parse_grid_auto_flow(value: &str) -> Option<GridAutoFlow> {
+    let mut axis = None;
+    let mut dense = false;
+    for token in split_css_component_values(value) {
+        match token.to_ascii_lowercase().as_str() {
+            "row" if axis.replace("row").is_none() => {}
+            "column" if axis.replace("column").is_none() => {}
+            "dense" if !dense => dense = true,
+            _ => return None,
+        }
+    }
+    match (axis, dense) {
+        (None, false) => None,
+        (Some("row") | None, true) => Some(GridAutoFlow::RowDense),
+        (Some("row"), false) => Some(GridAutoFlow::Row),
+        (Some("column"), false) => Some(GridAutoFlow::Column),
+        (Some("column"), true) => Some(GridAutoFlow::ColumnDense),
+        _ => None,
+    }
+}
+
+fn parse_grid_placement(value: &str) -> Option<GridPlacement> {
+    let parts = split_css_component_values(value);
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.len() == 1 && parts[0].eq_ignore_ascii_case("auto") {
+        return Some(GridPlacement::Auto);
+    }
+    if parts.iter().any(|part| part.eq_ignore_ascii_case("span")) {
+        parse_grid_span_placement(&parts).map(GridPlacement::Span)
+    } else {
+        parse_grid_line_placement(&parts).map(GridPlacement::Line)
+    }
+}
+
+fn expand_grid_placement_shorthand(
+    value: &str,
+    start_name: &'static str,
+    end_name: &'static str,
+) -> Option<Vec<(&'static str, String)>> {
+    let (start, end) = split_top_level_once(value, '/')
+        .map(|(start, end)| (trim_css_value(start), trim_css_value(end).to_string()))
+        .unwrap_or_else(|| {
+            let start = trim_css_value(value);
+            let end = if grid_placement_is_custom_ident(start) {
+                start.to_string()
+            } else {
+                "auto".to_string()
+            };
+            (start, end)
+        });
+    if start.is_empty()
+        || end.is_empty()
+        || parse_grid_placement(start).is_none()
+        || parse_grid_placement(&end).is_none()
+    {
+        return None;
+    }
+    Some(vec![(start_name, start.to_string()), (end_name, end)])
+}
+
+fn expand_grid_area_shorthand(value: &str) -> Option<Vec<(&'static str, String)>> {
+    let parts = split_css_top_level_slashes(value);
+    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    if parts
+        .iter()
+        .any(|part| parse_grid_placement(part).is_none())
+    {
+        return None;
+    }
+    let row_start = parts[0];
+    let column_start = parts.get(1).copied().unwrap_or_else(|| {
+        if grid_placement_is_custom_ident(row_start) {
+            row_start
+        } else {
+            "auto"
+        }
+    });
+    let row_end = parts.get(2).copied().unwrap_or_else(|| {
+        if grid_placement_is_custom_ident(row_start) {
+            row_start
+        } else {
+            "auto"
+        }
+    });
+    let column_end = parts.get(3).copied().unwrap_or_else(|| {
+        if grid_placement_is_custom_ident(column_start) {
+            column_start
+        } else {
+            "auto"
+        }
+    });
+    Some(vec![
+        ("grid-row-start", row_start.to_string()),
+        ("grid-column-start", column_start.to_string()),
+        ("grid-row-end", row_end.to_string()),
+        ("grid-column-end", column_end.to_string()),
+    ])
+}
+
+fn grid_placement_is_custom_ident(value: &str) -> bool {
+    matches!(
+        parse_grid_placement(value),
+        Some(GridPlacement::Line(GridLinePlacement {
+            name: Some(_),
+            index: None
+        }))
+    )
+}
+
+fn grid_placement_name_is_custom_ident(value: &str) -> bool {
+    is_css_identifier(value)
+        && !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "auto" | "span" | "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+        )
+}
+
+fn parse_grid_line_placement(parts: &[&str]) -> Option<GridLinePlacement> {
+    let mut name = None;
+    let mut index = None;
+    for part in parts {
+        if part.eq_ignore_ascii_case("auto") || part.eq_ignore_ascii_case("span") {
+            return None;
+        }
+        if let Ok(value) = part.parse::<i32>() {
+            if value == 0 || index.replace(value).is_some() {
+                return None;
+            }
+            continue;
+        }
+        if !grid_placement_name_is_custom_ident(part) {
+            return None;
+        }
+        if name.replace((*part).to_string()).is_some() {
+            return None;
+        }
+    }
+    (name.is_some() || index.is_some()).then_some(GridLinePlacement { name, index })
+}
+
+fn parse_grid_span_placement(parts: &[&str]) -> Option<GridSpanPlacement> {
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let mut saw_span = false;
+    let mut name = None;
+    let mut span = None;
+    for part in parts {
+        if part.eq_ignore_ascii_case("span") {
+            if saw_span {
+                return None;
+            }
+            saw_span = true;
+            continue;
+        }
+        if part.eq_ignore_ascii_case("auto") {
+            return None;
+        }
+        if let Ok(value) = part.parse::<u16>() {
+            if value == 0 || span.replace(value).is_some() {
+                return None;
+            }
+            continue;
+        }
+        if !grid_placement_name_is_custom_ident(part) {
+            return None;
+        }
+        if name.replace((*part).to_string()).is_some() {
+            return None;
+        }
+    }
+    (saw_span && (name.is_some() || span.is_some())).then_some(GridSpanPlacement { name, span })
+}
+
 fn expand_flex_flow_shorthand(value: &str) -> Option<Vec<(&'static str, String)>> {
     let mut direction = "row";
     let mut wrap = "nowrap";
@@ -1344,7 +2067,9 @@ fn expand_columns_shorthand(value: &str) -> Option<Vec<(&'static str, String)>> 
         {
             count = part.to_string();
             saw_component = true;
-        } else if parse_length(part).is_some() {
+        } else if parse_computed_length_percentage(part, ROOT_FONT_SIZE_PT)
+            .is_some_and(|length| length.percent == 0.0)
+        {
             width = part.to_string();
             saw_component = true;
         } else {
@@ -2031,11 +2756,31 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source(
     declarations: &[CascadedDeclaration<'_>],
     inheritance_source: &ComputedStyle,
 ) {
+    let parent_ch_advance = fallback_ch_advance_for_style(inheritance_source);
+    apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance(
+        style,
+        declarations,
+        inheritance_source,
+        parent_ch_advance,
+    );
+}
+
+pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance(
+    style: &mut ComputedStyle,
+    declarations: &[CascadedDeclaration<'_>],
+    inheritance_source: &ComputedStyle,
+    parent_ch_advance: f32,
+) {
     let (direction, writing_mode) =
         logical_mapping_context(style, declarations, inheritance_source);
     let declarations = declarations_after_css_wide_rollbacks(declarations, direction, writing_mode);
     apply_cascaded_custom_property_declarations(style, &declarations);
-    apply_cascaded_font_size_declarations(style, &declarations, inheritance_source);
+    apply_cascaded_font_size_declarations_with_parent_ch_advance(
+        style,
+        &declarations,
+        inheritance_source,
+        parent_ch_advance,
+    );
     apply_cascaded_color_declarations(style, &declarations, inheritance_source);
 
     for (index, declaration) in declarations.iter().enumerate() {
@@ -2196,6 +2941,56 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source(
                     style.column_gap = gap;
                 }
             }
+            "grid-template-rows" => {
+                if let Some(tracks) = parse_grid_track_list(value, style.font_size) {
+                    style.grid_template_rows = tracks;
+                }
+            }
+            "grid-template-columns" => {
+                if let Some(tracks) = parse_grid_track_list(value, style.font_size) {
+                    style.grid_template_columns = tracks;
+                }
+            }
+            "grid-template-areas" => {
+                if let Some(areas) = parse_grid_template_areas(value) {
+                    style.grid_template_areas = areas;
+                }
+            }
+            "grid-auto-rows" => {
+                if let Some(tracks) = parse_grid_auto_track_list(value, style.font_size) {
+                    style.grid_auto_rows = tracks;
+                }
+            }
+            "grid-auto-columns" => {
+                if let Some(tracks) = parse_grid_auto_track_list(value, style.font_size) {
+                    style.grid_auto_columns = tracks;
+                }
+            }
+            "grid-auto-flow" => {
+                if let Some(flow) = parse_grid_auto_flow(value) {
+                    style.grid_auto_flow = flow;
+                }
+            }
+            "grid-row-start" => {
+                if let Some(placement) = parse_grid_placement(value) {
+                    style.grid_row_start = placement;
+                }
+            }
+            "grid-row-end" => {
+                if let Some(placement) = parse_grid_placement(value) {
+                    style.grid_row_end = placement;
+                }
+            }
+            "grid-column-start" => {
+                if let Some(placement) = parse_grid_placement(value) {
+                    style.grid_column_start = placement;
+                }
+            }
+            "grid-column-end" => {
+                if let Some(placement) = parse_grid_placement(value) {
+                    style.grid_column_end = placement;
+                }
+            }
             "columns" => apply_columns(value, style),
             "margin-trim" => {
                 if let Some(margin_trim) = parse_margin_trim(value) {
@@ -2306,9 +3101,24 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source(
             | "border-inline-start"
             | "border-inline-end" => apply_logical_border(value, style, name),
             "border-width" => {
-                if let Some(edges) = parse_edges_with_font_size(value, style.font_size) {
-                    style.border_widths = edges;
-                    style.border_width = max_edge(edges);
+                if let Some(edges) = parse_border_width_edges(value, style.font_size) {
+                    style.border_width_values = edges;
+                    style.border_widths = Edges {
+                        top: edges.top.length_if_no_percent().unwrap_or(edges.top.length),
+                        right: edges
+                            .right
+                            .length_if_no_percent()
+                            .unwrap_or(edges.right.length),
+                        bottom: edges
+                            .bottom
+                            .length_if_no_percent()
+                            .unwrap_or(edges.bottom.length),
+                        left: edges
+                            .left
+                            .length_if_no_percent()
+                            .unwrap_or(edges.left.length),
+                    };
+                    style.border_width = max_edge(style.border_widths);
                 }
             }
             "border-block-width" => {
@@ -2330,22 +3140,22 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source(
                 }
             }
             "border-top-width" => {
-                if let Some(length) = parse_border_width_with_font_size(value, style.font_size) {
+                if let Some(length) = parse_computed_border_width(value, style.font_size) {
                     set_border_side_width(style, BorderSide::Top, length);
                 }
             }
             "border-right-width" => {
-                if let Some(length) = parse_border_width_with_font_size(value, style.font_size) {
+                if let Some(length) = parse_computed_border_width(value, style.font_size) {
                     set_border_side_width(style, BorderSide::Right, length);
                 }
             }
             "border-bottom-width" => {
-                if let Some(length) = parse_border_width_with_font_size(value, style.font_size) {
+                if let Some(length) = parse_computed_border_width(value, style.font_size) {
                     set_border_side_width(style, BorderSide::Bottom, length);
                 }
             }
             "border-left-width" => {
-                if let Some(length) = parse_border_width_with_font_size(value, style.font_size) {
+                if let Some(length) = parse_computed_border_width(value, style.font_size) {
                     set_border_side_width(style, BorderSide::Left, length);
                 }
             }
@@ -2354,7 +3164,7 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source(
             | "border-inline-start-width"
             | "border-inline-end-width" => {
                 if let Some(side) = logical_border_side(name, style.direction, style.writing_mode)
-                    && let Some(length) = parse_border_width_with_font_size(value, style.font_size)
+                    && let Some(length) = parse_computed_border_width(value, style.font_size)
                 {
                     set_border_side_width(style, side, length);
                 }
@@ -2423,8 +3233,9 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source(
                 }
             }
             "outline-width" => {
-                if let Some(length) = parse_border_width_with_font_size(value, style.font_size) {
-                    style.outline_width = length;
+                if let Some(length) = parse_computed_border_width(value, style.font_size) {
+                    style.outline_width_value = length;
+                    style.outline_width = length.length_if_no_percent().unwrap_or(length.length);
                 }
             }
             "outline-style" => {
@@ -2438,7 +3249,9 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source(
                 }
             }
             "outline-offset" => {
-                if let Some(length) = parse_length(value) {
+                if let Some(length) = parse_computed_length_percentage(value, style.font_size)
+                    && length.percent == 0.0
+                {
                     style.outline_offset = length;
                 }
             }
@@ -2574,7 +3387,7 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source(
                 };
             }
             "border-spacing" => {
-                if let Some(spacing) = parse_border_spacing(value) {
+                if let Some(spacing) = parse_border_spacing(value, style.font_size) {
                     style.border_spacing = spacing;
                     style.border_spacing_explicit = declaration.origin == StylesheetOrigin::Author;
                 }
@@ -2669,6 +3482,7 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source(
                 if let Some(font) = parse_font_shorthand_with_line_height_font_size(
                     value,
                     inheritance_source.font_size,
+                    parent_ch_advance,
                     style.font_weight,
                     Some(style.font_size),
                 ) {
@@ -4498,15 +5312,15 @@ fn parse_text_decoration_inset(value: &str, font_size: f32) -> Option<TextDecora
     let parts = split_css_component_values(value);
     match parts.as_slice() {
         [single] => {
-            let length = parse_length_with_font_size(single, font_size)?;
+            let length = parse_computed_length_percentage(single, font_size)?;
             Some(TextDecorationInset::Lengths {
                 start: length,
                 end: length,
             })
         }
         [start, end] => Some(TextDecorationInset::Lengths {
-            start: parse_length_with_font_size(start, font_size)?,
-            end: parse_length_with_font_size(end, font_size)?,
+            start: parse_computed_length_percentage(start, font_size)?,
+            end: parse_computed_length_percentage(end, font_size)?,
         }),
         _ => None,
     }
@@ -4827,7 +5641,7 @@ fn parse_text_shadow_layer(value: &str, font_size: f32) -> Option<TextShadow> {
             color = Some(TextShadowColor::Color(parsed_color));
             continue;
         }
-        if let Some(length) = parse_length_with_font_size(part, font_size) {
+        if let Some(length) = parse_shadow_length(part, font_size) {
             lengths.push(length);
             continue;
         }
@@ -4836,15 +5650,22 @@ fn parse_text_shadow_layer(value: &str, font_size: f32) -> Option<TextShadow> {
     if !(2..=4).contains(&lengths.len()) {
         return None;
     }
-    let spread = lengths.get(3).copied().unwrap_or(0.0);
-    if spread < 0.0 {
+    let spread = lengths
+        .get(3)
+        .copied()
+        .unwrap_or(ComputedLengthPercentage::ZERO);
+    if length_percentage_is_definitely_negative(spread) {
         return None;
     }
     Some(TextShadow {
         color: color.unwrap_or(TextShadowColor::CurrentColor),
         offset_x: lengths[0],
         offset_y: lengths[1],
-        blur_radius: lengths.get(2).copied().unwrap_or(0.0).max(0.0),
+        blur_radius: lengths
+            .get(2)
+            .copied()
+            .filter(|length| !length_percentage_is_definitely_negative(*length))
+            .unwrap_or(ComputedLengthPercentage::ZERO),
         spread,
         inset,
     })
@@ -4881,23 +5702,54 @@ fn parse_box_shadow_layer(value: &str, font_size: f32) -> Option<BoxShadow> {
             color = Some(BoxShadowColor::Color(parsed_color));
             continue;
         }
-        if let Some(length) = parse_length_with_font_size(part, font_size) {
+        if let Some(length) = parse_shadow_length(part, font_size) {
             lengths.push(length);
             continue;
         }
         return None;
     }
-    if !(2..=4).contains(&lengths.len()) || lengths.get(2).is_some_and(|blur| *blur < 0.0) {
+    if !(2..=4).contains(&lengths.len())
+        || lengths
+            .get(2)
+            .is_some_and(|blur| length_percentage_is_definitely_negative(*blur))
+    {
         return None;
     }
     Some(BoxShadow {
         color: color.unwrap_or(BoxShadowColor::CurrentColor),
         offset_x: lengths[0],
         offset_y: lengths[1],
-        blur_radius: lengths.get(2).copied().unwrap_or(0.0),
-        spread: lengths.get(3).copied().unwrap_or(0.0),
+        blur_radius: lengths
+            .get(2)
+            .copied()
+            .unwrap_or(ComputedLengthPercentage::ZERO),
+        spread: lengths
+            .get(3)
+            .copied()
+            .unwrap_or(ComputedLengthPercentage::ZERO),
         inset,
     })
+}
+
+fn parse_shadow_length(value: &str, font_size: f32) -> Option<ComputedLengthPercentage> {
+    let length = parse_computed_length_percentage(value, font_size)?;
+    (length.percent == 0.0).then_some(length)
+}
+
+fn length_percentage_is_definitely_negative(value: ComputedLengthPercentage) -> bool {
+    let components = [
+        value.length,
+        value.percent,
+        value.ch,
+        value.vw,
+        value.vh,
+        value.vmin,
+        value.vmax,
+        value.vi,
+        value.vb,
+    ];
+    components.iter().any(|component| *component < 0.0)
+        && components.iter().all(|component| *component <= 0.0)
 }
 
 /// Parses the CSS `text-decoration` shorthand.
@@ -4974,16 +5826,22 @@ fn parse_text_decoration_shorthand(
     Some(decoration)
 }
 
-pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source(
+pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_parent_ch_advance(
     style: &mut ComputedStyle,
     declarations: &[CascadedDeclaration<'_>],
     inheritance_source: &ComputedStyle,
+    parent_ch_advance: f32,
 ) {
     let (direction, writing_mode) =
         logical_mapping_context(style, declarations, inheritance_source);
     let declarations = declarations_after_css_wide_rollbacks(declarations, direction, writing_mode);
     apply_cascaded_custom_property_declarations(style, &declarations);
-    apply_cascaded_font_size_declarations(style, &declarations, inheritance_source);
+    apply_cascaded_font_size_declarations_with_parent_ch_advance(
+        style,
+        &declarations,
+        inheritance_source,
+        parent_ch_advance,
+    );
     apply_cascaded_color_declarations(style, &declarations, inheritance_source);
 
     for (index, declaration) in declarations.iter().enumerate() {

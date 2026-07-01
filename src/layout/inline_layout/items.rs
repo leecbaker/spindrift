@@ -750,7 +750,10 @@ impl InlineLineStackCursor {
 }
 
 impl InlineLineSequence {
-    fn context<'a>(&self, block_style: &'a ComputedStyle) -> InlineParagraphContext<'a> {
+    pub(in crate::layout) fn context<'a>(
+        &self,
+        block_style: &'a ComputedStyle,
+    ) -> InlineParagraphContext<'a> {
         InlineParagraphContext {
             block_style,
             stylesheets: &[],

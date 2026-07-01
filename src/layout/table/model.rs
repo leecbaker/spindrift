@@ -28,6 +28,7 @@ pub(super) struct TableRowGroup<'a> {
 pub(super) struct TableCell<'a> {
     pub(super) element: Option<&'a Element>,
     pub(super) signature: ElementSignature,
+    pub(super) style: Option<ComputedStyle>,
     pub(super) children: Option<Vec<box_tree::FormattingBox<'a>>>,
     pub(super) anonymous: bool,
 }

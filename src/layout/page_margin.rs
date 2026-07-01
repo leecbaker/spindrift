@@ -116,14 +116,23 @@ impl<'a> LayoutBuilder<'a> {
                 page_declarations: &page_declarations,
                 base_page_style: &base_page_style,
             });
-            let page_size = css::page_size_from(&page_declarations, base_page_context.size);
-            let page_edges =
-                super::builder::page_box_edges_from_declarations(&page_declarations, page_size);
-            let page_margins = css::page_margins_from_for_size_and_edges(
+            let page_ch_advance = self.page_ch_advance_for_declarations(&page_declarations);
+            let page_size = css::page_size_from_with_ch_advance(
+                &page_declarations,
+                base_page_context.size,
+                page_ch_advance,
+            );
+            let page_edges = super::builder::page_box_edges_from_declarations_with_ch_advance(
+                &page_declarations,
+                page_size,
+                page_ch_advance,
+            );
+            let page_margins = css::page_margins_from_for_size_and_edges_with_ch_advance(
                 &page_declarations,
                 base_page_context.margins,
                 page_size,
                 page_edges.total(),
+                page_ch_advance,
             );
             let page_counters = page_counter_values
                 .get(index)
@@ -314,7 +323,7 @@ impl<'a> LayoutBuilder<'a> {
                 top: 0.0,
             },
         );
-        self.inline_static_baseline_y = None;
+        self.inline_static_position = None;
         self.block_static_position_y_offset = None;
         self.fragment_top_offsets.clear();
         self.definite_block_size_stack.clear();
@@ -351,11 +360,12 @@ impl<'a> LayoutBuilder<'a> {
         let root_signature =
             ElementSignature::new(capture.element.tag.clone(), capture.element.attrs.clone());
         self.ancestors.push(root_signature.clone());
-        let child_boxes = box_tree::build_child_boxes(
+        let child_boxes = box_tree::build_child_boxes_with_font_metrics(
             &capture.element,
             stylesheets,
             &replay_style,
             &[root_signature],
+            &mut self.font_system,
         );
         self.layout_element_with_child_boxes(
             &capture.element,
@@ -643,7 +653,7 @@ fn finalize_page_margin_text_decoration_style(style: &mut ComputedStyle) {
 fn page_context_style_from_options(options: &RenderOptions) -> ComputedStyle {
     let mut style = ComputedStyle::initial();
     style.font_size = options.font_size;
-    style.line_height_value = css::ComputedLineHeight::Length(options.line_height);
+    style.line_height_value = css::ComputedLineHeight::from_length(options.line_height);
     style.line_height = options.line_height;
     style.line_height_multiplier = None;
     style.line_height_is_normal = false;
@@ -1894,6 +1904,9 @@ fn page_margin_box_outline_primitives(
         bottom: style.outline_width,
         left: style.outline_width,
     };
+    outline_style.border_width_values = css::CssEdges::all(
+        css::ComputedLengthPercentage::from_length(style.outline_width),
+    );
     outline_style.border_color = style.outline_color;
     outline_style.border_colors = css::BorderColors {
         top: style.outline_color,
@@ -1908,7 +1921,7 @@ fn page_margin_box_outline_primitives(
         left: style.outline_style,
     };
 
-    let outset = style.outline_offset + style.outline_width;
+    let outset = style.outline_offset.length + style.outline_width;
     let (rects, rounded_rects, paths, strokes) = block_paint_ops(
         layout.border_x() - outset,
         layout.border_y() - outset,
@@ -2185,13 +2198,15 @@ fn page_margin_inline_content_style(style: &ComputedStyle) -> ComputedStyle {
     inline_style.padding = css::Edges::ZERO;
     inline_style.border_width = 0.0;
     inline_style.border_widths = css::Edges::ZERO;
+    inline_style.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
     inline_style.border_styles = css::BorderStyles::NONE;
     inline_style.border_radius = css::BorderRadius::ZERO;
     inline_style.corner_shapes = css::CornerShapes::ROUND;
     inline_style.border_image = css::BorderImage::initial();
     inline_style.outline_width = 0.0;
+    inline_style.outline_width_value = css::ComputedLengthPercentage::ZERO;
     inline_style.outline_style = css::BorderStyle::None;
-    inline_style.outline_offset = 0.0;
+    inline_style.outline_offset = css::ComputedLengthPercentage::ZERO;
     inline_style.background_color = None;
     inline_style.background_image = None;
     inline_style.background_layers.clear();

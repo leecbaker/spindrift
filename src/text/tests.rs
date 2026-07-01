@@ -680,6 +680,21 @@ async fn atomic_inline_boundaries_follow_css_text_line_breaking() {
     assert!(inline_atomic_boundary_allows_soft_wrap(
         "A", &object, &style
     ));
+    assert!(inline_atomic_boundary_allows_soft_wrap(
+        "A ", &object, &style
+    ));
+    assert!(!inline_atomic_boundary_allows_soft_wrap(
+        &object, ",", &style
+    ));
+    assert!(inline_atomic_boundary_allows_soft_wrap(
+        ", ", &object, &style
+    ));
+    assert!(inline_atomic_boundary_allows_soft_wrap(
+        &object, "A", &style
+    ));
+    assert!(inline_atomic_boundary_allows_soft_wrap(
+        "A)", &object, &style
+    ));
     assert!(!inline_atomic_boundary_allows_soft_wrap(
         "A\u{034f}",
         &object,

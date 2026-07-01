@@ -2,6 +2,13 @@ use super::super::*;
 
 const FLOAT_EPSILON: f32 = 0.01;
 
+#[derive(Debug, Clone, Copy)]
+struct ResolvedFloatInlineSize {
+    content_width: f32,
+    border_box_width: f32,
+    margin_box_width: f32,
+}
+
 impl FloatRunState {
     fn new(left_x: f32, right_x: f32, row_top: f32) -> Self {
         let row_span = PageInlineSpan::from_edges(left_x, right_x);
@@ -386,6 +393,30 @@ fn vertical_physical_inline_span(
     }
 }
 
+/// Freeze a float's temporary replay style to the used inline size.
+///
+/// CSS 2.2 resolves a float's used width from its original containing block,
+/// then lays out the float's contents in that used box. Quire replays the
+/// floated element in an isolated temporary containing block, so percentage
+/// widths and constraints must not resolve a second time against the replay
+/// block:
+/// <https://www.w3.org/TR/CSS22/visudet.html#float-width> and
+/// <https://www.w3.org/TR/css-cascade-5/#used>.
+fn freeze_float_replay_width(style: &mut ComputedStyle, inline_size: ResolvedFloatInlineSize) {
+    let replay_width = match style.box_sizing {
+        BoxSizing::ContentBox => inline_size.content_width,
+        BoxSizing::BorderBox => inline_size.border_box_width,
+    };
+    style.box_values.width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+        css::ComputedLengthPercentage::from_length(replay_width.max(0.0)),
+    );
+    let content_width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+        css::ComputedLengthPercentage::from_length(inline_size.content_width.max(0.0)),
+    );
+    style.box_values.min_width = content_width;
+    style.box_values.max_width = content_width;
+}
+
 fn named_assignment_delta(
     before: &HashMap<String, Vec<NamedStringAssignment>>,
     after: &HashMap<String, Vec<NamedStringAssignment>>,
@@ -640,7 +671,10 @@ impl<'a> LayoutBuilder<'a> {
         fragment: &FloatPaintFragment,
         run: &mut FloatRunState,
     ) {
-        let shape = FloatShape::from_fragment(fragment);
+        self.push_float_shape(FloatShape::from_fragment(fragment), run);
+    }
+
+    fn push_float_shape(&mut self, shape: FloatShape, run: &mut FloatRunState) {
         self.float_contexts
             .last_mut()
             .expect("root float context exists")
@@ -917,18 +951,19 @@ impl<'a> LayoutBuilder<'a> {
         let inline_size = (self.content_right - self.content_left).max(0.0);
         apply_used_box_metrics(&mut placed_style, inline_size);
 
-        let margin_box_width = self.float_margin_box_width(
+        let inline_size = self.resolved_float_inline_size(
             child_element,
             &placed_style,
             stylesheets,
             inline_size,
             child_children,
         );
+        freeze_float_replay_width(&mut placed_style, inline_size);
         let margin_box_height = self.float_margin_box_height(
             child_element,
             &placed_style,
             stylesheets,
-            margin_box_width,
+            inline_size.margin_box_width,
             child_children,
         );
         self.prebreak_float_if_needed(margin_box_height);
@@ -937,7 +972,7 @@ impl<'a> LayoutBuilder<'a> {
             if matches!(float_side, UsedFloatSide::Top | UsedFloatSide::Bottom) {
                 self.find_vertical_float_avoiding_position(
                     self.cursor_y,
-                    margin_box_width,
+                    inline_size.margin_box_width,
                     margin_box_height,
                     placed_style.clear,
                     placed_style.writing_mode,
@@ -947,7 +982,7 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 let (band_left, top, available_width) = self.find_float_avoiding_position(
                     self.cursor_y,
-                    margin_box_width,
+                    inline_size.margin_box_width,
                     margin_box_height,
                     placed_style.clear,
                     placed_style.writing_mode,
@@ -956,7 +991,7 @@ impl<'a> LayoutBuilder<'a> {
                 let margin_box_left = match float_side {
                     UsedFloatSide::Left => band_left,
                     UsedFloatSide::Right => {
-                        band_left + (available_width - margin_box_width).max(0.0)
+                        band_left + (available_width - inline_size.margin_box_width).max(0.0)
                     }
                     UsedFloatSide::Top | UsedFloatSide::Bottom => unreachable!(),
                 };
@@ -971,7 +1006,7 @@ impl<'a> LayoutBuilder<'a> {
         let previous_writing_mode = self.containing_block_writing_mode;
 
         self.content_left = margin_box_left;
-        self.content_right = margin_box_left + margin_box_width.max(1.0);
+        self.content_right = margin_box_left + inline_size.margin_box_width.max(1.0);
         self.cursor_y = top;
         self.containing_block_direction = placed_style.direction;
         self.containing_block_writing_mode = placed_style.writing_mode;
@@ -998,10 +1033,24 @@ impl<'a> LayoutBuilder<'a> {
         let float_bounds = PageTopRect::new(
             margin_box_left,
             top,
-            margin_box_width,
+            inline_size.margin_box_width,
             (top - actual_bottom).max(0.0),
         )
         .paint_clip();
+        let float_shape = FloatShape::from_rect(
+            float_id,
+            specified_side,
+            float_side,
+            self.next_paint_source_order,
+            paint_page_index,
+            PageTopRect::new(
+                margin_box_left,
+                top,
+                inline_size.margin_box_width,
+                (top - actual_bottom).max(0.0),
+            ),
+        );
+        let mut recorded_float_shape = false;
         let fragmented_float = self.pages.len() != paint_page_index;
         let captures_positioned_descendants = StackingContextPolicy::for_atomic(&placed_style, PaintBand::Float, float_bounds)
                 .captures_positioned_descendants
@@ -1034,7 +1083,7 @@ impl<'a> LayoutBuilder<'a> {
                 paint_page_index,
                 float_side,
                 margin_box_left,
-                margin_box_left + margin_box_width,
+                margin_box_left + inline_size.margin_box_width,
                 float_bounds,
                 &placed_style,
                 fragment,
@@ -1046,6 +1095,7 @@ impl<'a> LayoutBuilder<'a> {
                     float_fragment.context.clone(),
                 );
                 self.push_float_fragment_shape(&float_fragment, run);
+                recorded_float_shape = true;
             }
         } else {
             let fragments =
@@ -1064,7 +1114,7 @@ impl<'a> LayoutBuilder<'a> {
                     page_index,
                     float_side,
                     margin_box_left,
-                    margin_box_left + margin_box_width,
+                    margin_box_left + inline_size.margin_box_width,
                     float_bounds,
                     &placed_style,
                     fragment,
@@ -1109,7 +1159,11 @@ impl<'a> LayoutBuilder<'a> {
                         });
                 }
                 self.push_float_fragment_shape(&float_fragment, run);
+                recorded_float_shape = true;
             }
+        }
+        if !recorded_float_shape {
+            self.push_float_shape(float_shape, run);
         }
 
         self.content_left = previous_left;
@@ -1128,6 +1182,18 @@ impl<'a> LayoutBuilder<'a> {
         containing_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> f32 {
+        self.resolved_float_inline_size(element, style, stylesheets, containing_width, child_boxes)
+            .margin_box_width
+    }
+
+    fn resolved_float_inline_size(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        containing_width: f32,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+    ) -> ResolvedFloatInlineSize {
         let border_widths = used_border_widths(style);
         let horizontal_extras =
             border_widths.left + border_widths.right + style.padding.left + style.padding.right;
@@ -1147,7 +1213,12 @@ impl<'a> LayoutBuilder<'a> {
                     )
                 });
         let content_width = constrain_width(style, content_width, available_outer_width);
-        style.margin.left + content_width + horizontal_extras + style.margin.right
+        let border_box_width = content_width + horizontal_extras;
+        ResolvedFloatInlineSize {
+            content_width,
+            border_box_width,
+            margin_box_width: style.margin.left + border_box_width + style.margin.right,
+        }
     }
 
     fn float_margin_box_height(

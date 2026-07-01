@@ -263,17 +263,25 @@ impl MathValue {
         match (self, other) {
             (Self::Number(left), Self::Number(right)) => Some(Self::Number(left + right)),
             (Self::LengthPercentage(left), Self::LengthPercentage(right)) => {
-                Some(Self::LengthPercentage(ComputedLengthPercentage {
-                    length: left.length + right.length,
-                    percent: left.percent + right.percent,
-                    ch: left.ch + right.ch,
-                    vw: left.vw + right.vw,
-                    vh: left.vh + right.vh,
-                    vmin: left.vmin + right.vmin,
-                    vmax: left.vmax + right.vmax,
-                    vi: left.vi + right.vi,
-                    vb: left.vb + right.vb,
-                }))
+                if let (Some(left), Some(right)) = (left.components(), right.components()) {
+                    return Some(Self::LengthPercentage(ComputedLengthPercentage {
+                        length: left.length + right.length,
+                        percent: left.percent + right.percent,
+                        ch: left.ch + right.ch,
+                        vw: left.vw + right.vw,
+                        vh: left.vh + right.vh,
+                        vmin: left.vmin + right.vmin,
+                        vmax: left.vmax + right.vmax,
+                        vi: left.vi + right.vi,
+                        vb: left.vb + right.vb,
+                        math: None,
+                    }));
+                }
+                Some(Self::LengthPercentage(
+                    ComputedLengthPercentage::from_deferred_math(
+                        DeferredLengthPercentageMath::Sum(left.expression(), right.expression()),
+                    ),
+                ))
             }
             _ => None,
         }
@@ -303,60 +311,37 @@ impl MathValue {
     fn mul_number(self, number: f32) -> Option<Self> {
         Some(match self {
             Self::Number(value) => Self::Number(value * number),
-            Self::LengthPercentage(value) => Self::LengthPercentage(ComputedLengthPercentage {
-                length: value.length * number,
-                percent: value.percent * number,
-                ch: value.ch * number,
-                vw: value.vw * number,
-                vh: value.vh * number,
-                vmin: value.vmin * number,
-                vmax: value.vmax * number,
-                vi: value.vi * number,
-                vb: value.vb * number,
-            }),
+            Self::LengthPercentage(value) => {
+                if let Some(value) = value.components() {
+                    return Some(Self::LengthPercentage(ComputedLengthPercentage {
+                        length: value.length * number,
+                        percent: value.percent * number,
+                        ch: value.ch * number,
+                        vw: value.vw * number,
+                        vh: value.vh * number,
+                        vmin: value.vmin * number,
+                        vmax: value.vmax * number,
+                        vi: value.vi * number,
+                        vb: value.vb * number,
+                        math: None,
+                    }));
+                }
+                Self::LengthPercentage(ComputedLengthPercentage::from_deferred_math(
+                    DeferredLengthPercentageMath::Product(value.expression(), number),
+                ))
+            }
         })
     }
 
-    fn comparable_component(self) -> Option<(ComparableUnit, f32)> {
-        match self {
-            Self::Number(value) => Some((ComparableUnit::Number, value)),
-            Self::LengthPercentage(value)
-                if value.percent == 0.0
-                    && value.vw == 0.0
-                    && value.vh == 0.0
-                    && value.vmin == 0.0
-                    && value.vmax == 0.0
-                    && value.vi == 0.0
-                    && value.vb == 0.0 =>
-            {
-                if value.ch == 0.0 {
-                    Some((ComparableUnit::Length, value.length))
-                } else {
-                    None
-                }
+    fn ordering_against(self, other: Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => left.partial_cmp(&right),
+            (Self::LengthPercentage(left), Self::LengthPercentage(right)) => {
+                length_percentage_component_ordering(left.components()?, right.components()?)
             }
-            Self::LengthPercentage(value)
-                if value.length == 0.0
-                    && value.ch == 0.0
-                    && value.vw == 0.0
-                    && value.vh == 0.0
-                    && value.vmin == 0.0
-                    && value.vmax == 0.0
-                    && value.vi == 0.0
-                    && value.vb == 0.0 =>
-            {
-                Some((ComparableUnit::Percent, value.percent))
-            }
-            Self::LengthPercentage(_) => None,
+            _ => None,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComparableUnit {
-    Number,
-    Length,
-    Percent,
 }
 
 fn parse_math_sum(input: &mut Parser<'_, '_>, font_size: f32) -> Option<MathValue> {
@@ -504,7 +489,9 @@ fn parse_math_function(
     }
     if name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max") {
         let values = parse_comma_separated_math_values(input, font_size)?;
-        return compare_math_values(&values, name.eq_ignore_ascii_case("max"));
+        let choose_max = name.eq_ignore_ascii_case("max");
+        return compare_math_values(&values, choose_max)
+            .or_else(|| defer_min_max_math_values(&values, choose_max));
     }
     if name.eq_ignore_ascii_case("clamp") {
         let values = parse_comma_separated_math_values(input, font_size)?;
@@ -514,7 +501,12 @@ fn parse_math_function(
         let min = *min;
         let center = *center;
         let max = *max;
-        return compare_math_values(&[compare_math_values(&[center, max], false)?, min], true);
+        if let Some(below_max) = compare_math_values(&[center, max], false)
+            && let Some(value) = compare_math_values(&[below_max, min], true)
+        {
+            return Some(value);
+        }
+        return defer_clamp_math_values(min, center, max);
     }
     None
 }
@@ -536,20 +528,68 @@ fn parse_comma_separated_math_values(
 
 fn compare_math_values(values: &[MathValue], choose_max: bool) -> Option<MathValue> {
     let mut best = *values.first()?;
-    let (unit, mut best_value) = best.comparable_component()?;
     for candidate in &values[1..] {
-        let (candidate_unit, candidate_value) = candidate.comparable_component()?;
-        if candidate_unit != unit {
-            return None;
-        }
-        if (choose_max && candidate_value > best_value)
-            || (!choose_max && candidate_value < best_value)
-        {
+        let ordering = candidate.ordering_against(best)?;
+        if (choose_max && ordering.is_gt()) || (!choose_max && ordering.is_lt()) {
             best = *candidate;
-            best_value = candidate_value;
         }
     }
     Some(best)
+}
+
+fn defer_min_max_math_values(values: &[MathValue], choose_max: bool) -> Option<MathValue> {
+    let expressions = values
+        .iter()
+        .map(|value| match value {
+            MathValue::LengthPercentage(value) => Some(value.expression()),
+            MathValue::Number(_) => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    can_defer_until_used_resolution(&expressions)?;
+    let mut expressions = expressions.into_iter();
+    let mut value = expressions.next()?;
+    for next in expressions {
+        value = ComputedLengthPercentage::from_deferred_math(if choose_max {
+            DeferredLengthPercentageMath::Max(value, next)
+        } else {
+            DeferredLengthPercentageMath::Min(value, next)
+        })
+        .expression();
+    }
+    Some(MathValue::LengthPercentage(
+        ComputedLengthPercentage::from_expression(value),
+    ))
+}
+
+fn defer_clamp_math_values(min: MathValue, center: MathValue, max: MathValue) -> Option<MathValue> {
+    let MathValue::LengthPercentage(min) = min else {
+        return None;
+    };
+    let MathValue::LengthPercentage(center) = center else {
+        return None;
+    };
+    let MathValue::LengthPercentage(max) = max else {
+        return None;
+    };
+    let min = min.expression();
+    let center = center.expression();
+    let max = max.expression();
+    can_defer_until_used_resolution(&[min, center, max])?;
+    Some(MathValue::LengthPercentage(
+        ComputedLengthPercentage::from_deferred_math(DeferredLengthPercentageMath::Clamp {
+            min,
+            center,
+            max,
+        }),
+    ))
+}
+
+fn can_defer_until_used_resolution(values: &[LengthPercentageExpression]) -> Option<()> {
+    let mut has_deferred_basis = false;
+    for value in values {
+        has_deferred_basis |= value.depends_on_metric_or_percent()?;
+    }
+    has_deferred_basis.then_some(())
 }
 
 pub(crate) fn set_font_size(style: &mut ComputedStyle, font_size: f32) {
@@ -557,7 +597,35 @@ pub(crate) fn set_font_size(style: &mut ComputedStyle, font_size: f32) {
     project_line_height(style);
 }
 
+pub(crate) fn fallback_ch_advance_for_style(style: &ComputedStyle) -> f32 {
+    fallback_ch_advance_for_font_metrics(
+        style.font_size,
+        style.writing_mode,
+        style.text_orientation,
+    )
+}
+
+pub(crate) fn fallback_ch_advance_for_font_metrics(
+    font_size: f32,
+    writing_mode: WritingMode,
+    text_orientation: TextOrientation,
+) -> f32 {
+    if writing_mode != WritingMode::HorizontalTb && text_orientation == TextOrientation::Upright {
+        font_size
+    } else {
+        font_size * 0.5
+    }
+}
+
 pub(crate) fn parse_font_size(value: &str, parent_font_size: f32) -> Option<f32> {
+    parse_font_size_with_parent_ch_advance(value, parent_font_size, parent_font_size * 0.5)
+}
+
+pub(crate) fn parse_font_size_with_parent_ch_advance(
+    value: &str,
+    parent_font_size: f32,
+    parent_ch_advance: f32,
+) -> Option<f32> {
     let value = trim_css_value(value);
     let lower = value.to_ascii_lowercase();
     match lower.as_str() {
@@ -574,10 +642,9 @@ pub(crate) fn parse_font_size(value: &str, parent_font_size: f32) -> Option<f32>
         _ => {}
     }
 
-    if let Some(value) = parse_computed_length_percentage(value, parent_font_size)
-        && value.ch == 0.0
-    {
-        return Some(value.length + value.percent * parent_font_size);
+    if let Some(mut value) = parse_computed_length_percentage(value, parent_font_size) {
+        value.resolve_font_metric_lengths(parent_ch_advance);
+        return value.used_length_with_percentage_basis(parent_font_size);
     }
     parse_length(value)
 }
@@ -598,14 +665,12 @@ pub(crate) fn parse_computed_line_height(
     if let Ok(multiplier) = value.parse::<f32>() {
         return Some(ComputedLineHeight::Number(multiplier));
     }
-    if let Some(value) = parse_computed_length_percentage(value, font_size)
-        && value.ch == 0.0
-    {
-        return Some(ComputedLineHeight::Length(
-            value.length + value.percent * font_size,
-        ));
+    if let Some(mut value) = parse_computed_length_percentage(value, font_size) {
+        value.length += value.percent * font_size;
+        value.percent = 0.0;
+        return Some(ComputedLineHeight::Length(value));
     }
-    parse_length(value).map(ComputedLineHeight::Length)
+    parse_length(value).map(ComputedLineHeight::from_length)
 }
 
 /// Parses `letter-spacing` into a computed length projection.
@@ -933,13 +998,7 @@ fn is_css_identifier_character(character: char) -> bool {
 /// can consume the typed value directly:
 /// <https://www.w3.org/TR/css-cascade-5/#computed>.
 pub(crate) fn project_line_height(style: &mut ComputedStyle) {
-    let (line_height, multiplier, is_normal) = match style.line_height_value {
-        ComputedLineHeight::Normal => (style.font_size * 1.2, Some(1.2), true),
-        ComputedLineHeight::Number(multiplier) => {
-            (style.font_size * multiplier, Some(multiplier), false)
-        }
-        ComputedLineHeight::Length(length) => (length, None, false),
-    };
+    let (line_height, multiplier, is_normal) = style.line_height_value.projected(style.font_size);
     style.line_height = line_height;
     style.line_height_multiplier = multiplier;
     style.line_height_is_normal = is_normal;

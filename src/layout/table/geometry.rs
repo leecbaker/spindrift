@@ -179,20 +179,6 @@ impl TableCellBorderBox {
         self.top_y(placement) - self.height()
     }
 
-    pub(super) fn rendered_rect(
-        self,
-        placement: TableGridPlacement,
-        fill: Option<Color>,
-    ) -> RenderedRect {
-        PageTopRect::new(
-            self.x(placement),
-            self.top_y(placement),
-            self.width(),
-            self.height(),
-        )
-        .rendered_rect(fill)
-    }
-
     pub(super) fn content_box(
         self,
         placement: TableGridPlacement,

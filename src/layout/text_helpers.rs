@@ -219,7 +219,13 @@ pub(super) fn used_line_indent(
 }
 
 fn used_text_indent(style: &ComputedStyle, available_width: f32) -> f32 {
-    style.text_indent.amount.length + style.text_indent.amount.percent * available_width
+    style
+        .text_indent
+        .amount
+        .used_length_with_percentage_basis(available_width)
+        .unwrap_or(
+            style.text_indent.amount.length + style.text_indent.amount.percent * available_width,
+        )
 }
 
 impl<'a> LayoutBuilder<'a> {

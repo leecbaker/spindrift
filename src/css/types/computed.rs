@@ -17,6 +17,16 @@ pub(crate) struct ComputedStyle {
     pub flex_wrap: FlexWrap,
     pub order: i32,
     pub row_gap: ComputedGap,
+    pub grid_template_rows: GridTrackList,
+    pub grid_template_columns: GridTrackList,
+    pub grid_template_areas: GridTemplateAreas,
+    pub grid_auto_rows: GridAutoTrackList,
+    pub grid_auto_columns: GridAutoTrackList,
+    pub grid_auto_flow: GridAutoFlow,
+    pub grid_row_start: GridPlacement,
+    pub grid_row_end: GridPlacement,
+    pub grid_column_start: GridPlacement,
+    pub grid_column_end: GridPlacement,
     pub column_count: Option<usize>,
     pub column_width: ComputedColumnWidth,
     pub column_gap: ComputedGap,
@@ -27,6 +37,7 @@ pub(crate) struct ComputedStyle {
     pub padding: Edges,
     pub border_width: f32,
     pub border_widths: Edges,
+    pub border_width_values: CssEdges<ComputedLengthPercentage>,
     pub border_color: Color,
     pub border_colors: BorderColors,
     pub border_styles: BorderStyles,
@@ -34,9 +45,10 @@ pub(crate) struct ComputedStyle {
     pub corner_shapes: CornerShapes,
     pub border_image: BorderImage,
     pub outline_width: f32,
+    pub outline_width_value: ComputedLengthPercentage,
     pub outline_color: Color,
     pub outline_style: BorderStyle,
-    pub outline_offset: f32,
+    pub outline_offset: ComputedLengthPercentage,
     pub border_collapse: BorderCollapse,
     pub caption_side: CaptionSide,
     pub table_layout: TableLayout,
@@ -184,6 +196,16 @@ impl ComputedStyle {
             flex_wrap: FlexWrap::NoWrap,
             order: 0,
             row_gap: ComputedGap::NORMAL,
+            grid_template_rows: GridTrackList::NONE,
+            grid_template_columns: GridTrackList::NONE,
+            grid_template_areas: GridTemplateAreas::NONE,
+            grid_auto_rows: GridAutoTrackList::initial(),
+            grid_auto_columns: GridAutoTrackList::initial(),
+            grid_auto_flow: GridAutoFlow::ROW,
+            grid_row_start: GridPlacement::AUTO,
+            grid_row_end: GridPlacement::AUTO,
+            grid_column_start: GridPlacement::AUTO,
+            grid_column_end: GridPlacement::AUTO,
             column_count: None,
             column_width: ComputedColumnWidth::AUTO,
             column_gap: ComputedGap::NORMAL,
@@ -194,6 +216,7 @@ impl ComputedStyle {
             padding: Edges::ZERO,
             border_width: 0.0,
             border_widths: Edges::ZERO,
+            border_width_values: CssEdges::all(ComputedLengthPercentage::ZERO),
             border_color: Color::BLACK,
             border_colors: BorderColors::BLACK,
             border_styles: BorderStyles::NONE,
@@ -201,17 +224,15 @@ impl ComputedStyle {
             corner_shapes: CornerShapes::ROUND,
             border_image: BorderImage::initial(),
             outline_width: 3.0 * CSS_PX_TO_PT,
+            outline_width_value: ComputedLengthPercentage::from_length(3.0 * CSS_PX_TO_PT),
             outline_color: Color::BLACK,
             outline_style: BorderStyle::None,
-            outline_offset: 0.0,
+            outline_offset: ComputedLengthPercentage::ZERO,
             border_collapse: BorderCollapse::Separate,
             caption_side: CaptionSide::Top,
             table_layout: TableLayout::Auto,
             empty_cells: EmptyCells::Show,
-            border_spacing: BorderSpacing {
-                horizontal: 0.0,
-                vertical: 0.0,
-            },
+            border_spacing: BorderSpacing::ZERO,
             border_spacing_explicit: false,
             background_color: None,
             background_image: None,
@@ -350,25 +371,104 @@ impl ComputedStyle {
     /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths> and
     /// <https://www.w3.org/TR/css-cascade-5/#used>.
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.line_height_value
+            .resolve_font_metric_lengths(ch_advance);
+        let (line_height, multiplier, is_normal) = self.line_height_value.projected(self.font_size);
+        self.line_height = line_height;
+        self.line_height_multiplier = multiplier;
+        self.line_height_is_normal = is_normal;
         self.row_gap.resolve_font_metric_lengths(ch_advance);
         self.column_gap.resolve_font_metric_lengths(ch_advance);
+        self.grid_template_rows
+            .resolve_font_metric_lengths(ch_advance);
+        self.grid_template_columns
+            .resolve_font_metric_lengths(ch_advance);
+        self.grid_auto_rows.resolve_font_metric_lengths(ch_advance);
+        self.grid_auto_columns
+            .resolve_font_metric_lengths(ch_advance);
         self.column_width.resolve_font_metric_lengths(ch_advance);
         self.letter_spacing.resolve_font_metric_lengths(ch_advance);
         self.word_spacing.resolve_font_metric_lengths(ch_advance);
         self.box_values.resolve_font_metric_lengths(ch_advance);
+        self.border_radius.resolve_font_metric_lengths(ch_advance);
+        self.border_width_values
+            .top
+            .resolve_font_metric_lengths(ch_advance);
+        self.border_width_values
+            .right
+            .resolve_font_metric_lengths(ch_advance);
+        self.border_width_values
+            .bottom
+            .resolve_font_metric_lengths(ch_advance);
+        self.border_width_values
+            .left
+            .resolve_font_metric_lengths(ch_advance);
+        self.border_widths = Edges {
+            top: self.border_width_values.top.length.max(0.0),
+            right: self.border_width_values.right.length.max(0.0),
+            bottom: self.border_width_values.bottom.length.max(0.0),
+            left: self.border_width_values.left.length.max(0.0),
+        };
+        self.border_width = self
+            .border_widths
+            .top
+            .max(self.border_widths.right)
+            .max(self.border_widths.bottom)
+            .max(self.border_widths.left);
+        self.outline_width_value
+            .resolve_font_metric_lengths(ch_advance);
+        self.outline_width = self.outline_width_value.length.max(0.0);
+        self.outline_offset.resolve_font_metric_lengths(ch_advance);
         self.flex_basis.resolve_font_metric_lengths(ch_advance);
         self.text_indent
             .amount
             .resolve_font_metric_lengths(ch_advance);
+        self.vertical_align.resolve_font_metric_lengths(ch_advance);
         self.tab_size.resolve_font_metric_lengths(ch_advance);
+        if let Some(image) = &mut self.background_image {
+            image.resolve_font_metric_lengths(ch_advance);
+        }
         self.background_size.resolve_font_metric_lengths(ch_advance);
         self.background_position
             .resolve_font_metric_lengths(ch_advance);
         for layer in &mut self.background_layers {
             layer.resolve_font_metric_lengths(ch_advance);
         }
+        for function in &mut self.transform {
+            function.resolve_font_metric_lengths(ch_advance);
+        }
+        self.transform_origin
+            .resolve_font_metric_lengths(ch_advance);
         self.border_image.resolve_font_metric_lengths(ch_advance);
         self.text_decoration.resolve_font_metric_lengths(ch_advance);
+        self.border_spacing.resolve_font_metric_lengths(ch_advance);
+        for shadow in &mut self.text_shadow {
+            shadow.resolve_font_metric_lengths(ch_advance);
+        }
+        for shadow in &mut self.box_shadow {
+            shadow.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+
+    /// Resolves font-metric-relative lengths while preserving physical
+    /// block-size constraints for a later formatting-context-specific pass.
+    ///
+    /// CSS Tables consumes table-cell `height`/`min-height`/`max-height` as
+    /// row-axis constraints, even when the cell's own writing mode is
+    /// orthogonal. Keeping those values metric-aware lets table layout resolve
+    /// their `ch` components against the row-axis writing context instead of
+    /// the cell content writing context.
+    pub(crate) fn resolve_font_metric_lengths_preserving_box_block_sizes(
+        &mut self,
+        ch_advance: f32,
+    ) {
+        let height = self.box_values.height;
+        let min_height = self.box_values.min_height;
+        let max_height = self.box_values.max_height;
+        self.resolve_font_metric_lengths(ch_advance);
+        self.box_values.height = height;
+        self.box_values.min_height = min_height;
+        self.box_values.max_height = max_height;
     }
 
     /// Resolves viewport-relative computed lengths for paged layout.
@@ -396,6 +496,36 @@ impl ComputedStyle {
             viewport_inline,
             viewport_block,
         );
+        self.grid_template_rows.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.grid_template_columns.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.grid_auto_rows.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.grid_auto_columns.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.column_width.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
         self.letter_spacing.resolve_viewport_lengths(
             viewport_width,
             viewport_height,
@@ -414,6 +544,61 @@ impl ComputedStyle {
             viewport_inline,
             viewport_block,
         );
+        self.border_radius.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.border_width_values.top.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.border_width_values.right.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.border_width_values.bottom.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.border_width_values.left.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.border_widths = Edges {
+            top: self.border_width_values.top.length.max(0.0),
+            right: self.border_width_values.right.length.max(0.0),
+            bottom: self.border_width_values.bottom.length.max(0.0),
+            left: self.border_width_values.left.length.max(0.0),
+        };
+        self.border_width = self
+            .border_widths
+            .top
+            .max(self.border_widths.right)
+            .max(self.border_widths.bottom)
+            .max(self.border_widths.left);
+        self.outline_width_value.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.outline_width = self.outline_width_value.length.max(0.0);
+        self.outline_offset.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
         self.flex_basis.resolve_viewport_lengths(
             viewport_width,
             viewport_height,
@@ -426,12 +611,26 @@ impl ComputedStyle {
             viewport_inline,
             viewport_block,
         );
+        self.vertical_align.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
         self.tab_size.resolve_viewport_lengths(
             viewport_width,
             viewport_height,
             viewport_inline,
             viewport_block,
         );
+        if let Some(image) = &mut self.background_image {
+            image.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
         self.background_size.resolve_viewport_lengths(
             viewport_width,
             viewport_height,
@@ -452,6 +651,20 @@ impl ComputedStyle {
                 viewport_block,
             );
         }
+        for function in &mut self.transform {
+            function.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
+        self.transform_origin.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
         self.border_image.resolve_viewport_lengths(
             viewport_width,
             viewport_height,
@@ -464,6 +677,28 @@ impl ComputedStyle {
             viewport_inline,
             viewport_block,
         );
+        self.border_spacing.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        for shadow in &mut self.text_shadow {
+            shadow.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
+        for shadow in &mut self.box_shadow {
+            shadow.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
     }
 
     /// Return the used `letter-spacing` length in layout units.

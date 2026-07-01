@@ -213,6 +213,31 @@ pub(crate) enum BackgroundImage {
     LinearGradient(LinearGradient),
 }
 
+impl BackgroundImage {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        if let Self::LinearGradient(gradient) = self {
+            gradient.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        if let Self::LinearGradient(gradient) = self {
+            gradient.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
+    }
+}
+
 /// Computed values for one CSS background layer.
 ///
 /// CSS Backgrounds and Borders defines every `background-*` longhand except
@@ -242,6 +267,9 @@ impl BackgroundLayer {
     }
 
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        if let Some(image) = &mut self.image {
+            image.resolve_font_metric_lengths(ch_advance);
+        }
         self.size.resolve_font_metric_lengths(ch_advance);
         self.position.resolve_font_metric_lengths(ch_advance);
     }
@@ -253,6 +281,14 @@ impl BackgroundLayer {
         viewport_inline: f32,
         viewport_block: f32,
     ) {
+        if let Some(image) = &mut self.image {
+            image.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
         self.size.resolve_viewport_lengths(
             viewport_width,
             viewport_height,
@@ -271,13 +307,38 @@ impl BackgroundLayer {
 /// Computed `linear-gradient()` image for the supported axis-aligned subset.
 ///
 /// CSS Images Level 3 defines gradient lines and color stops. This stores stop
-/// positions as absolute CSS lengths because current layout has one concrete
-/// background positioning area when painting:
+/// positions as typed CSS length-percentages because percentages resolve
+/// against the concrete gradient line available only when painting:
 /// <https://www.w3.org/TR/css-images-3/#linear-gradients>.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LinearGradient {
     pub direction: LinearGradientDirection,
     pub stops: Vec<GradientColorStop>,
+}
+
+impl LinearGradient {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        for stop in &mut self.stops {
+            stop.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        for stop in &mut self.stops {
+            stop.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
+    }
 }
 
 /// Axis direction for a supported linear gradient.
@@ -295,10 +356,32 @@ pub(crate) enum LinearGradientDirection {
 /// One parsed gradient color stop.
 ///
 /// CSS Images allows omitted and repeated stop positions; the current subset
-/// requires explicit length positions, enough for WPT hard-stop stripe tests:
+/// requires explicit length-percentage positions, enough for hard-stop stripe
+/// tests:
 /// <https://www.w3.org/TR/css-images-3/#color-stop-syntax>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct GradientColorStop {
     pub color: Color,
-    pub position: f32,
+    pub position: ComputedLengthPercentage,
+}
+
+impl GradientColorStop {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.position.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.position.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+    }
 }

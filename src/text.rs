@@ -585,7 +585,6 @@ pub(crate) use bidi::{
 };
 pub(crate) use breaking::contains_bidi_text;
 pub(crate) use breaking::grapheme_cluster_inner_boundaries;
-#[cfg(test)]
 pub(crate) use breaking::inline_atomic_boundary_allows_soft_wrap;
 pub(crate) use breaking::measured_break_opportunities;
 pub(crate) use breaking::text_with_hyphenation_controls;

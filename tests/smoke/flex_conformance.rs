@@ -136,6 +136,108 @@ async fn generated_pseudo_flex_items_participate_in_order_sorting() {
 }
 
 #[tokio::test]
+async fn definite_width_block_flex_container_overflows_without_shrinking_items() {
+    let document = Html::from_string(
+        "<style>@page { size: 500pt 160pt; margin: 20pt } body { margin: 0 }\
+         .row { display: flex; width: 480pt; height: 40pt; background: blue }\
+         .item { flex: 0 1 auto; width: 60pt; height: 20pt }\
+         .a { background: yellow } .b { background: pink }\
+         .c { background: lightblue } .d { background: gray }</style>\
+         <div class=\"row\"><span class=\"item a\">one</span><span class=\"item b\">two</span><span class=\"item c\">three</span><span class=\"item d\">four</span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let container = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("definite-width flex container background should paint");
+    assert!(
+        (container.width() - 480.0).abs() < 0.01,
+        "definite-width block flex container should overflow instead of clamping to the 460pt containing block: {container:?}"
+    );
+
+    for color in [
+        Color::new(255, 255, 0),
+        Color::new(255, 192, 203),
+        Color::new(173, 216, 230),
+        Color::new(128, 128, 128),
+    ] {
+        let item = page
+            .rects
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("expected flex item with fill {color:?}: {:?}", page.rects));
+        assert!(
+            (item.width() - 60.0).abs() < 0.01,
+            "flex: 0 1 auto item should keep its definite width: {item:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fixed_width_block_flex_container_resolves_auto_margins() {
+    let document = Html::from_string(
+        "<style>@page { size: 300pt 120pt; margin: 20pt } body { margin: 0 }\
+         .row { display: flex; width: 100pt; height: 20pt; margin-left: auto; margin-right: auto; background: green }\
+         .item { width: 20pt; height: 20pt }</style>\
+         <div class=\"row\"><div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("centered flex container background should paint");
+    assert!(
+        (green.x() - 100.0).abs() < 0.01 && (green.width() - 100.0).abs() < 0.01,
+        "fixed-width block flex container should resolve auto margins like normal block layout: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn align_content_stretch_overflow_falls_back_to_wrap_reverse_flex_start() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><meta charset=\"utf-8\">\
+         <style>@page { size: 200px 200px; margin: 0 } body { margin: 0 } p { display: none }\
+         #flex { display: flex; width: 200px; height: 200px; flex-wrap: wrap-reverse; align-content: stretch }\
+         #item { width: 200px; height: 400px; background: linear-gradient(to bottom, red 50%, green 50%) }</style>\
+         <p>Test passes if there is a filled green square and no red.</p>\
+         <div style=\"overflow: hidden\"><div id=\"flex\"><div id=\"item\"></div></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = Color::new(0, 128, 0);
+    for (x, y) in [
+        (15.0, 15.0),
+        (75.0, 15.0),
+        (135.0, 15.0),
+        (15.0, 75.0),
+        (75.0, 75.0),
+        (135.0, 75.0),
+        (15.0, 135.0),
+        (75.0, 135.0),
+        (135.0, 135.0),
+    ] {
+        assert_eq!(
+            final_rect_fill_at(page, x, y),
+            Some(green),
+            "align-content:stretch overflow fallback should expose only the green half at ({x}, {y}): {:?}",
+            page.rects
+        );
+    }
+}
+
+#[tokio::test]
 async fn column_wrap_flex_min_content_width_uses_item_cross_contribution() {
     let document = Html::from_string(
         "<style>@page { size: 300px 200px; margin: 0 } body { margin: 0 }\
@@ -190,6 +292,29 @@ async fn column_wrap_inline_flex_min_content_width_uses_item_cross_contribution(
     assert!(
         (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
         "100px inline-flex min-content width should paint as 75pt: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn column_wrap_flex_min_content_width_does_not_sum_wrapped_columns() {
+    let document = Html::from_string(
+        "<style>@page { size: 300px 200px; margin: 0 } body { margin: 0 }\
+         .item { width: 100px; height: 100px; flex: 0 0 auto }\
+         .flex { display: flex; flex-flow: column wrap; height: 100px; width: min-content; background: green }\
+         </style><div class=\"flex\"><div class=\"item\"></div><div class=\"item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("min-content column flex background should paint");
+    assert!(
+        (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
+        "column flex min-content cross size should be the largest item contribution, not the sum of wrapped columns: {green:?}"
     );
 }
 

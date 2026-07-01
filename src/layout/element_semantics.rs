@@ -16,6 +16,7 @@ pub(super) enum ElementLayoutKind {
     GeneratedImage,
     Svg,
     Flex,
+    Grid,
     Table,
     InlineFlow,
     BlockFlow,
@@ -53,6 +54,9 @@ pub(super) fn element_layout_kind(element: &Element, style: &ComputedStyle) -> E
     }
     if style.display.is_flex() {
         return ElementLayoutKind::Flex;
+    }
+    if style.display.is_grid() {
+        return ElementLayoutKind::Grid;
     }
     if style.display.is_table() || is_html_table_element(element) {
         return ElementLayoutKind::Table;

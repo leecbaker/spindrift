@@ -8,6 +8,42 @@ fn fragments_share_visual_line(lines: &[quire::RenderedLine]) -> bool {
 }
 
 #[tokio::test]
+async fn mixed_generic_bold_fragments_share_text_baseline() {
+    let document = Html::from_string(
+        "<style>@page { size: 320pt 120pt; margin: 20pt } body { margin: 0 } p { margin: 0; font: 40px sans-serif }</style><p>normal <strong>bold</strong> normal</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let mut baselines = Vec::new();
+    let mut saw_bold = false;
+    for line in &document.pages[0].lines {
+        if line.color != Color::BLACK
+            || !(line.text.contains("normal") || line.text.contains("bold"))
+        {
+            continue;
+        }
+        saw_bold |= line.text.contains("bold");
+        for run in &line.runs {
+            baselines.push(line.y() + run.y_offset);
+        }
+    }
+
+    assert!(saw_bold, "expected strong text to render as a text run");
+    assert!(
+        baselines.len() >= 2,
+        "expected mixed inline text to produce comparable baselines"
+    );
+    let min = baselines.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = baselines.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        max - min < 0.05,
+        "expected mixed normal/strong text baselines to match, got {baselines:?}"
+    );
+}
+
+#[tokio::test]
 async fn text_shadow_paints_offset_text_without_affecting_layout_text() {
     let document = Html::from_string(
         "<style>@page { size: 200pt 100pt; margin: 10pt } body { margin: 0; font-size: 12pt; line-height: 14pt } p { margin: 0; text-shadow: 4pt 2pt red }</style><p>Shadow</p>",
@@ -2223,6 +2259,48 @@ async fn supports_text_align_justify() {
     assert!(rendered_line_advance(first) > 40.0);
     assert!((three.x() - first.x()).abs() < 0.5);
     assert!(three.y() < first.y());
+}
+
+#[tokio::test]
+async fn text_indent_justify_uses_stable_line_widths() {
+    let text = "This is a long piece of text that will wrap to multiple lines.  ".repeat(12);
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 700pt 240pt; margin: 20pt }}\
+         body {{ margin: 0 }}\
+         p {{ margin: 0; width: 600pt; font-size: 12pt; line-height: 14pt;\
+              text-indent: 100px; text-align: justify }}\
+         span {{ background: yellow }}</style><p><span>{text}</span></p>"
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0]
+        .lines
+        .iter()
+        .filter(|line| line.text.contains("long piece") || line.text.contains("multiple lines"))
+        .collect::<Vec<_>>();
+    assert!(lines.len() > 3, "{:?}", document.pages[0].lines);
+
+    let paragraph_left = 20.0;
+    let paragraph_width = 600.0;
+    let first_indent = 75.0;
+    assert!((lines[0].x() - (paragraph_left + first_indent)).abs() < 0.1);
+    assert!(
+        (rendered_line_advance(lines[0]) - (paragraph_width - first_indent)).abs() < 1.0,
+        "first justified line should fill the indented measure: x={}, width={}",
+        lines[0].x(),
+        rendered_line_advance(lines[0])
+    );
+    for line in lines.iter().skip(1).take(lines.len().saturating_sub(2)) {
+        assert!((line.x() - paragraph_left).abs() < 0.1, "{line:?}");
+        assert!(
+            (rendered_line_advance(line) - paragraph_width).abs() < 1.0,
+            "wrapped justified line should fill the paragraph measure: x={}, width={}",
+            line.x(),
+            rendered_line_advance(line)
+        );
+    }
 }
 
 #[tokio::test]

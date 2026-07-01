@@ -10,6 +10,7 @@ pub(crate) fn normalize_block_container_children<'a>(
         || parent_style.display.is_table_row_group()
         || parent_style.display.is_table_row()
         || parent_style.display.is_flex()
+        || parent_style.display.is_grid()
     {
         return children;
     }
@@ -128,6 +129,11 @@ fn inlinify_run_in_box(box_: &mut FormattingBox<'_>) {
             box_.style.display = box_.style.display.run_in_inlinified();
             inlinify_run_in_children(&mut box_.children);
         }
+        FormattingBox::InlineSplitBlockContext(box_) => {
+            for child in &mut box_.children {
+                inlinify_run_in_box(child);
+            }
+        }
         FormattingBox::AtomicInline(box_) => {
             box_.style.display = box_.style.display.run_in_inlinified();
             inlinify_run_in_children(&mut box_.children);
@@ -166,6 +172,7 @@ fn inlinified_block_descendant(box_: FormattingBox<'_>) -> FormattingBox<'_> {
             FormattingBox::AtomicInline(AtomicInlineBox {
                 element: box_.element,
                 signature: box_.signature,
+                source: box_.source,
                 style: box_.style,
                 marker: box_.marker,
                 children: box_.children,
@@ -214,7 +221,7 @@ fn first_eligible_run_in_descendant_index(target: &FormattingBox<'_>) -> Option<
         .filter(|index| run_in_target_is_eligible(&box_.children[*index]))
 }
 
-/// Splits inline boxes that contain in-flow block-level descendants.
+/// Splits inline boxes that contain block-level descendants.
 ///
 /// CSS 2.2 says an inline box containing an in-flow block-level box is split
 /// around that block. The containing block then sees anonymous block boxes for
@@ -222,6 +229,13 @@ fn first_eligible_run_in_descendant_index(target: &FormattingBox<'_>) -> Option<
 /// which allows normal block formatting and adjoining margin collapsing:
 /// <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level> and
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>.
+///
+/// Absolutely positioned block-level descendants remain out-of-flow, but CSS
+/// 2.2 computes their auto vertical static position from the hypothetical box
+/// position they would have occupied in normal flow. A block-level positioned
+/// child inside an inline therefore uses the same split point as an in-flow
+/// block for static-position measurement:
+/// <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height>.
 fn split_block_in_inline_children<'a>(children: Vec<FormattingBox<'a>>) -> Vec<FormattingBox<'a>> {
     children
         .into_iter()
@@ -231,7 +245,7 @@ fn split_block_in_inline_children<'a>(children: Vec<FormattingBox<'a>>) -> Vec<F
 
 fn split_block_in_inline_child<'a>(child: FormattingBox<'a>) -> Vec<FormattingBox<'a>> {
     match child {
-        FormattingBox::Inline(box_) if inline_box_contains_in_flow_block(&box_) => {
+        FormattingBox::Inline(box_) if inline_box_contains_block_split_boundary(&box_) => {
             split_inline_box_around_blocks(box_)
         }
         child => vec![child],
@@ -245,13 +259,13 @@ fn split_inline_box_around_blocks<'a>(mut box_: InlineBox<'a>) -> Vec<Formatting
     let children = std::mem::take(&mut box_.children);
     for child in children {
         for part in split_block_in_inline_child(child) {
-            if is_in_flow_block_level_box(&part) {
+            if is_block_in_inline_split_boundary(&part) {
                 let fragment_edges = InlineBoxFragmentEdges {
                     owns_start: !saw_block && box_.fragment_edges.owns_start,
                     owns_end: false,
                 };
                 flush_split_inline_run(&mut output, &mut inline_run, &box_, fragment_edges);
-                output.push(part);
+                output.push(split_inline_block_context_or_part(&box_, part));
                 saw_block = true;
             } else {
                 inline_run.push(part);
@@ -264,6 +278,47 @@ fn split_inline_box_around_blocks<'a>(mut box_: InlineBox<'a>) -> Vec<Formatting
     };
     flush_split_inline_run(&mut output, &mut inline_run, &box_, fragment_edges);
     output
+}
+
+fn split_inline_block_context_or_part<'a>(
+    box_: &InlineBox<'a>,
+    part: FormattingBox<'a>,
+) -> FormattingBox<'a> {
+    if !split_inline_style_needs_block_context(&box_.style) {
+        return part;
+    }
+    FormattingBox::InlineSplitBlockContext(InlineSplitBlockContextBox {
+        element: box_.element,
+        signature: box_.signature.clone(),
+        source: box_.source.clone(),
+        style: box_.style.clone(),
+        children: vec![part],
+    })
+}
+
+fn split_inline_style_needs_block_context(style: &ComputedStyle) -> bool {
+    matches!(style.position, Position::Relative | Position::Sticky)
+        || style.z_index.is_some()
+        || style.opacity < 1.0
+        || !style.transform.is_empty()
+        || style.isolation == Isolation::Isolate
+        || style.mix_blend_mode != MixBlendMode::Normal
+        || !matches!(style.filter, FilterValue::None)
+        || style.clip_path != ClipPath::None
+        || style.mask != MaskValue::None
+        || style.contain.paint
+        || matches!(
+            style.content_visibility,
+            ContentVisibility::Auto | ContentVisibility::Hidden
+        )
+        || style.will_change.opacity
+        || style.will_change.transform
+        || style.will_change.filter
+        || style.will_change.clip_path
+        || style.will_change.mask
+        || style.will_change.mix_blend_mode
+        || style.will_change.isolation
+        || style.will_change.contain
 }
 
 fn flush_split_inline_run<'a>(
@@ -279,6 +334,7 @@ fn flush_split_inline_run<'a>(
     output.push(FormattingBox::Inline(InlineBox {
         element: box_.element,
         signature: box_.signature.clone(),
+        source: box_.source.clone(),
         style: box_.style.clone(),
         marker: box_.marker.clone(),
         fragment_edges,
@@ -442,11 +498,24 @@ fn formatting_box_is_empty_text(box_: &FormattingBox<'_>) -> bool {
     matches!(box_, FormattingBox::Text(text) if text.text.is_empty())
 }
 
-fn inline_box_contains_in_flow_block(box_: &InlineBox<'_>) -> bool {
+fn inline_box_contains_block_split_boundary(box_: &InlineBox<'_>) -> bool {
     box_.children.iter().any(|child| match child {
-        FormattingBox::Inline(child) => inline_box_contains_in_flow_block(child),
-        child => is_in_flow_block_level_box(child),
+        FormattingBox::Inline(child) => inline_box_contains_block_split_boundary(child),
+        child => is_block_in_inline_split_boundary(child),
     })
+}
+
+fn is_block_in_inline_split_boundary(box_: &FormattingBox<'_>) -> bool {
+    if !is_block_level_box(box_) {
+        return false;
+    }
+    if !is_out_of_flow_box(box_) {
+        return true;
+    }
+    let Some((_, _, style, _)) = box_.element_parts() else {
+        return false;
+    };
+    !style.abspos_static_source_was_inline_level
 }
 
 fn is_in_flow_block_level_box(box_: &FormattingBox<'_>) -> bool {
@@ -504,6 +573,7 @@ pub(crate) fn flush_anonymous_table<'a>(
         normalized.push(FormattingBox::AtomicInline(AtomicInlineBox {
             element,
             signature: signature.clone(),
+            source: BoxSource::Principal,
             style,
             marker: None,
             children,
@@ -513,6 +583,7 @@ pub(crate) fn flush_anonymous_table<'a>(
         normalized.push(FormattingBox::Table(TableBox {
             element,
             signature: signature.clone(),
+            source: BoxSource::Principal,
             style,
             marker: None,
             children,
@@ -542,6 +613,7 @@ pub(crate) fn anonymous_table_style(parent_style: &ComputedStyle) -> ComputedSty
     style.font_variant_east_asian = parent_style.font_variant_east_asian.clone();
     style.font_variant_emoji = parent_style.font_variant_emoji;
     style.language = parent_style.language.clone();
+    style.line_height_value = parent_style.line_height_value;
     style.line_height_multiplier = parent_style.line_height_multiplier;
     style.line_height_is_normal = parent_style.line_height_is_normal;
     style.word_spacing = parent_style.word_spacing;
@@ -612,6 +684,7 @@ pub(crate) fn is_inline_level_box(box_: &FormattingBox<'_>) -> bool {
             box_.style.display.is_atomic_inline() || box_.style.display.is_replaced()
         }
         FormattingBox::Block(_)
+        | FormattingBox::InlineSplitBlockContext(_)
         | FormattingBox::AnonymousBlock(_)
         | FormattingBox::Line(_)
         | FormattingBox::Table(_)
@@ -623,6 +696,7 @@ pub(crate) fn is_inline_level_box(box_: &FormattingBox<'_>) -> bool {
 pub(crate) fn is_block_level_box(box_: &FormattingBox<'_>) -> bool {
     match box_ {
         FormattingBox::Block(_)
+        | FormattingBox::InlineSplitBlockContext(_)
         | FormattingBox::AnonymousBlock(_)
         | FormattingBox::Table(_)
         | FormattingBox::Flex(_) => true,

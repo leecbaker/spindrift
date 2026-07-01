@@ -49,6 +49,170 @@ async fn supports_percentage_image_widths() {
 }
 
 #[tokio::test]
+async fn floated_percentage_width_replays_resolved_used_width_once() {
+    let document = Html::from_string(
+        "<style>@page { size: 360pt 120pt; margin: 0 } body { margin: 0 }\
+         .test { float: left; width: 33.3333% }\
+         p { margin: 0 10pt 0 0; height: 20pt; background: #ccc }</style>\
+         <div class=\"test\"><p></p></div><div class=\"test\"><p></p></div><div class=\"test\"><p></p></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let mut rects = document.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(204, 204, 204)))
+        .collect::<Vec<_>>();
+    rects.sort_by(|a, b| a.x().total_cmp(&b.x()));
+
+    assert_eq!(rects.len(), 3);
+    for (rect, expected_x) in rects.iter().zip([0.0, 120.0, 240.0]) {
+        assert!(
+            (rect.x() - expected_x).abs() < 0.01,
+            "expected float child at x={expected_x}, got {rect:?}"
+        );
+        assert!(
+            (rect.width() - 110.0).abs() < 0.01,
+            "float percentage width should not be resolved twice: {rect:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn floated_border_box_percentage_width_replay_preserves_content_width() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 120pt; margin: 0 } body { margin: 0 }\
+         .float { float: left; width: 50%; box-sizing: border-box; padding: 0 10pt;\
+                  border-left: 5pt solid green; border-right: 5pt solid green }\
+         .fill { height: 20pt; background: blue }</style>\
+         <div class=\"float\"><div class=\"fill\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let fill = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("blue child should render");
+
+    assert!((fill.x() - 15.0).abs() < 0.01, "blue child: {fill:?}");
+    assert!(
+        (fill.width() - 70.0).abs() < 0.01,
+        "border-box float replay should preserve the resolved content width: {fill:?}"
+    );
+}
+
+#[tokio::test]
+async fn hidden_float_placeholders_reserve_reference_grid_cells() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><meta charset=\"utf-8\">\
+         <style>\
+         @page { size: 900px 600px; margin: 0 } body { margin: 0 }\
+         .flexContainer { height: 60px; width: 60px; font: 10px sans-serif;\
+             background: yellow; float: left; border: 1px solid black }\
+         .flexContainer > * { border: 1px dotted gray; width: 28px; height: 28px;\
+             float: left }\
+         .hidden { visibility: hidden }\
+         </style>\
+         <div class=\"flexContainer\"><div>1</div><div>2</div><div>3</div><div class=\"hidden\">4</div></div>\
+         <div class=\"flexContainer\"><div>2</div><div>1</div><div class=\"hidden\">4</div><div>3</div></div>\
+         <div class=\"flexContainer\"><div>1</div><div>3</div><div>2</div><div class=\"hidden\">4</div></div>\
+         <div class=\"flexContainer\"><div>2</div><div class=\"hidden\">4</div><div>1</div><div>3</div></div>\
+         <div style=\"clear:both\"></div>\
+         <div class=\"flexContainer\"><div>1</div><div>2</div><div>3</div><div class=\"hidden\">4</div></div>\
+         <div class=\"flexContainer\"><div>2</div><div>1</div><div class=\"hidden\">4</div><div>3</div></div>\
+         <div class=\"flexContainer\"><div>1</div><div>3</div><div>2</div><div class=\"hidden\">4</div></div>\
+         <div class=\"flexContainer\"><div>2</div><div class=\"hidden\">4</div><div>1</div><div>3</div></div>\
+         <div style=\"clear:both\"></div>\
+         <div class=\"flexContainer\"><div>3</div><div class=\"hidden\">4</div><div>1</div><div>2</div></div>\
+         <div class=\"flexContainer\"><div class=\"hidden\">4</div><div>3</div><div>2</div><div>1</div></div>\
+         <div class=\"flexContainer\"><div>3</div><div>1</div><div class=\"hidden\">4</div><div>2</div></div>\
+         <div class=\"flexContainer\"><div class=\"hidden\">4</div><div>2</div><div>3</div><div>1</div></div>\
+         <div style=\"clear:both\"></div>\
+         <div class=\"flexContainer\"><div>3</div><div class=\"hidden\">4</div><div>1</div><div>2</div></div>\
+         <div class=\"flexContainer\"><div class=\"hidden\">4</div><div>3</div><div>2</div><div>1</div></div>\
+         <div class=\"flexContainer\"><div>3</div><div>1</div><div class=\"hidden\">4</div><div>2</div></div>\
+         <div class=\"flexContainer\"><div class=\"hidden\">4</div><div>2</div><div>3</div><div>1</div></div>\
+         <div style=\"clear:both\"></div>\
+         <div class=\"flexContainer\"><div>1</div><div>2</div><div>3</div><div class=\"hidden\">4</div></div>\
+         <div class=\"flexContainer\"><div>3</div><div class=\"hidden\">4</div><div>1</div><div>2</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let mut containers = document.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .collect::<Vec<_>>();
+    containers.sort_by(|a, b| {
+        b.y()
+            .total_cmp(&a.y())
+            .then_with(|| a.x().total_cmp(&b.x()))
+    });
+
+    let expected = [
+        [Some("1"), Some("2"), Some("3"), None],
+        [Some("2"), Some("1"), None, Some("3")],
+        [Some("1"), Some("3"), Some("2"), None],
+        [Some("2"), None, Some("1"), Some("3")],
+        [Some("1"), Some("2"), Some("3"), None],
+        [Some("2"), Some("1"), None, Some("3")],
+        [Some("1"), Some("3"), Some("2"), None],
+        [Some("2"), None, Some("1"), Some("3")],
+        [Some("3"), None, Some("1"), Some("2")],
+        [None, Some("3"), Some("2"), Some("1")],
+        [Some("3"), Some("1"), None, Some("2")],
+        [None, Some("2"), Some("3"), Some("1")],
+        [Some("3"), None, Some("1"), Some("2")],
+        [None, Some("3"), Some("2"), Some("1")],
+        [Some("3"), Some("1"), None, Some("2")],
+        [None, Some("2"), Some("3"), Some("1")],
+        [Some("1"), Some("2"), Some("3"), None],
+        [Some("3"), None, Some("1"), Some("2")],
+    ];
+
+    assert_eq!(
+        containers.len(),
+        expected.len(),
+        "containers={containers:?}"
+    );
+    for (container_index, (container, expected_cells)) in
+        containers.iter().zip(expected).enumerate()
+    {
+        let mut actual = [None, None, None, None];
+        for line in document.pages[0].lines.iter().filter(|line| {
+            line.x() >= container.x() - 0.01
+                && line.x() <= container.x() + container.width() + 0.01
+                && line.y() >= container.y() - 0.01
+                && line.y() <= container.y() + container.height() + 0.01
+        }) {
+            let column = if line.x() < container.x() + container.width() / 2.0 {
+                0
+            } else {
+                1
+            };
+            let row = if line.y() > container.y() + container.height() / 2.0 {
+                0
+            } else {
+                1
+            };
+            actual[row * 2 + column] = Some(line.text.as_str());
+        }
+        assert_eq!(
+            actual, expected_cells,
+            "container {container_index} should match reference grid cells: container={container:?}, lines={:?}",
+            document.pages[0].lines
+        );
+    }
+}
+
+#[tokio::test]
 async fn direct_inline_images_reserve_baseline_descent_in_line_box() {
     let document = Html::from_string(
         "<style>@page { size: 200pt 160pt; margin: 20pt } body, div, p { margin: 0; font-size: 12pt; line-height: 12pt } img { height: 20pt }</style>\
@@ -153,6 +317,24 @@ async fn column_flex_replaced_image_min_height_transfers_through_aspect_ratio() 
     let image = &document.pages[0].images[0];
     assert!((image.width() - 75.0).abs() < 0.01, "image={image:?}");
     assert!((image.height() - 75.0).abs() < 0.01, "image={image:?}");
+}
+
+#[tokio::test]
+async fn column_flex_replaced_image_cross_min_width_transfers_to_main_basis() {
+    let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAAFCAYAAABvsz2cAAAAFElEQVR4nGNg+A+EDUAMJkAQtwgAfnURcnh7KuYAAAAASUVORK5CYII=";
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 260pt 160pt; margin: 10pt }} body {{ margin:0 }}\
+         .flex {{ display:flex; flex-direction:column; align-items:flex-start; width:200pt }}\
+         img {{ min-width:20%; min-height:0 }}\
+         </style><div class=\"flex\"><img src=\"{image}\"></div>",
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let image = &document.pages[0].images[0];
+    assert!((image.width() - 40.0).abs() < 0.01, "image={image:?}");
+    assert!((image.height() - 100.0).abs() < 0.01, "image={image:?}");
 }
 
 #[tokio::test]

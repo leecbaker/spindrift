@@ -4,10 +4,7 @@ pub(super) fn table_metrics(element: &Element, style: &ComputedStyle) -> TableMe
     if style.border_collapse == css::BorderCollapse::Collapse {
         return TableMetrics {
             border_collapse: style.border_collapse,
-            spacing: css::BorderSpacing {
-                horizontal: 0.0,
-                vertical: 0.0,
-            },
+            spacing: css::BorderSpacing::ZERO,
         };
     }
 
@@ -18,10 +15,7 @@ pub(super) fn table_metrics(element: &Element, style: &ComputedStyle) -> TableMe
             .attrs
             .get("cellspacing")
             .and_then(|value| parse_html_length(value))
-            .map(|spacing| css::BorderSpacing {
-                horizontal: spacing.max(0.0),
-                vertical: spacing.max(0.0),
-            })
+            .map(|spacing| css::BorderSpacing::from_lengths(spacing.max(0.0), spacing.max(0.0)))
             .unwrap_or(style.border_spacing)
     } else {
         // CSS Tables initial `border-spacing` is zero. The embedded HTML UA
@@ -29,10 +23,7 @@ pub(super) fn table_metrics(element: &Element, style: &ComputedStyle) -> TableMe
         // but authored `display: table` boxes are CSS table boxes, not HTML
         // table elements, and should not receive that HTML-only default.
         // <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
-        css::BorderSpacing {
-            horizontal: 0.0,
-            vertical: 0.0,
-        }
+        css::BorderSpacing::ZERO
     };
 
     TableMetrics {
@@ -67,6 +58,7 @@ pub(super) fn table_rows_from_fragment<'a>(
                 .map(|cell| TableCell {
                     element: cell.element,
                     signature: cell.signature.clone(),
+                    style: cell.style.clone(),
                     children: Some(cell.children.clone()),
                     anonymous: cell.anonymous,
                 })
@@ -501,6 +493,9 @@ fn table_cell_block_child_height(child: &box_tree::FormattingBox<'_>) -> f32 {
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             table_cell_formatting_children_block_height(&box_.children)
         }
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+            table_cell_formatting_children_block_height(&box_.children)
+        }
         box_tree::FormattingBox::Inline(_)
         | box_tree::FormattingBox::AtomicInline(_)
         | box_tree::FormattingBox::Line(_)
@@ -524,6 +519,7 @@ fn table_cell_inline_level_outer_height(child: &box_tree::FormattingBox<'_>) -> 
             &box_.children,
         )),
         box_tree::FormattingBox::AnonymousBlock(_)
+        | box_tree::FormattingBox::InlineSplitBlockContext(_)
         | box_tree::FormattingBox::Block(_)
         | box_tree::FormattingBox::Table(_)
         | box_tree::FormattingBox::Flex(_)
@@ -650,7 +646,8 @@ pub(super) fn table_row_span_height(
 /// https://www.w3.org/TR/CSS22/tables.html#separated-borders
 pub(super) fn table_grid_height(row_heights: &[f32], table_metrics: TableMetrics) -> f32 {
     row_heights.iter().sum::<f32>()
-        + table_metrics.spacing.vertical * table_internal_vertical_gap_count(row_heights) as f32
+        + table_metrics.spacing.vertical.length
+            * table_internal_vertical_gap_count(row_heights) as f32
 }
 
 /// Return separated-border spacing between the table padding edge and edge rows.
@@ -664,7 +661,7 @@ pub(super) fn table_vertical_edge_spacing(row_heights: &[f32], table_metrics: Ta
     if table_metrics.border_collapse == css::BorderCollapse::Separate
         && row_heights.iter().any(|height| *height > 0.0)
     {
-        table_metrics.spacing.vertical
+        table_metrics.spacing.vertical.length
     } else {
         0.0
     }
@@ -699,7 +696,7 @@ pub(super) fn repeated_table_rows_height(
         .map(|(position, row_index)| {
             row_heights[*row_index]
                 + if position + 1 < row_indices.len() {
-                    table_metrics.spacing.vertical
+                    table_metrics.spacing.vertical.length
                 } else {
                     0.0
                 }
@@ -715,7 +712,7 @@ pub(super) fn table_row_top(
 ) -> f32 {
     let row = row.min(row_heights.len());
     let offset = row_heights[..row].iter().sum::<f32>()
-        + table_metrics.spacing.vertical
+        + table_metrics.spacing.vertical.length
             * table_internal_vertical_gap_count_before(row_heights, row) as f32;
     grid_top - offset
 }
@@ -782,7 +779,7 @@ pub(super) fn has_following_uncollapsed_row(
     rows: &[TableRow<'_>],
     table_style: &ComputedStyle,
     stylesheets: &[Stylesheet],
-    builder: &LayoutBuilder,
+    builder: &mut LayoutBuilder<'_>,
 ) -> bool {
     rows.iter().any(|row| {
         !table_row_is_collapsed(&builder.style_for_table_row(row, table_style, stylesheets))

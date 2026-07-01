@@ -193,10 +193,21 @@ impl FontSystem {
     /// Returns the used CSS `ch` advance for a style's selected font.
     ///
     /// CSS Values defines `1ch` as the used advance of the "0" glyph in the
-    /// element's font, falling back to 0.5em when measuring that glyph is not
-    /// possible:
+    /// element's font. In vertical writing with upright text orientation, that
+    /// advance is the vertical inline-axis advance, falling back to 1em when
+    /// the selected face has no vertical metric for "0". Otherwise it falls
+    /// back to 0.5em when measuring that glyph is not possible:
     /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>.
     pub(crate) fn ch_advance(&mut self, style: &ComputedStyle) -> f32 {
+        if style.writing_mode != WritingMode::HorizontalTb
+            && style.text_orientation == TextOrientation::Upright
+        {
+            if let Some(advance) = self.vertical_upright_ch_advance(style) {
+                return advance;
+            }
+            return style.font_size;
+        }
+
         let mut metric_style = style.clone();
         metric_style.letter_spacing = ComputedLengthPercentage::ZERO;
         let advance = self.measure_text("0", &metric_style);
@@ -205,6 +216,23 @@ impl FontSystem {
         } else {
             style.font_size * 0.5
         }
+    }
+
+    fn vertical_upright_ch_advance(&mut self, style: &ComputedStyle) -> Option<f32> {
+        let font_id = self.resolve_style(style)?;
+        let used_font_size = self
+            .font_size_adjusted_size_for_font_id(style, font_id)
+            .unwrap_or(style.font_size);
+        let font = self.document_fonts.get(font_id)?;
+        let face = ttf_parser::Face::parse(&font.data, font.face_index).ok()?;
+        let units_per_em = font.units_per_em.max(1) as f32;
+        let advance = face
+            .glyph_index('0')
+            .and_then(|glyph| face.glyph_ver_advance(glyph))
+            .map(|advance| advance as f32)
+            .filter(|advance| *advance > 0.0)
+            .unwrap_or(units_per_em);
+        Some(advance * used_font_size / units_per_em)
     }
 
     pub(crate) fn used_line_height(&mut self, style: &ComputedStyle) -> f32 {
@@ -791,7 +819,8 @@ impl FontSystem {
         style: &ComputedStyle,
         line_height: f32,
     ) -> Option<ShapedInlineLine> {
-        let runs = position_shaped_runs(self.shape_text_runs_with_parley(text, style));
+        let mut runs = position_shaped_runs(self.shape_text_runs_with_parley(text, style));
+        self.apply_vertical_upright_advances(&mut runs, style);
         let baseline_adjustment = self.shaped_runs_baseline_adjustment(&runs, style, line_height);
         let mut shaped = ShapedInlineLine {
             text: text.to_string(),
@@ -842,8 +871,9 @@ impl FontSystem {
         if spans.is_empty() {
             return None;
         }
-        let runs = position_shaped_runs(self.shape_styled_text_runs_with_parley(spans));
         let first_style = spans.first().map(|span| span.style)?;
+        let mut runs = position_shaped_runs(self.shape_styled_text_runs_with_parley(spans));
+        self.apply_vertical_upright_advances(&mut runs, first_style);
         let baseline_adjustment =
             self.shaped_runs_baseline_adjustment(&runs, first_style, line_height);
         (!runs.is_empty()).then_some(ShapedInlineLine {
@@ -855,6 +885,43 @@ impl FontSystem {
             baseline_adjustment,
             runs,
         })
+    }
+
+    fn apply_vertical_upright_advances(&self, runs: &mut [ShapedInlineRun], style: &ComputedStyle) {
+        if style.writing_mode == WritingMode::HorizontalTb
+            || style.text_orientation != TextOrientation::Upright
+        {
+            return;
+        }
+
+        for run in runs {
+            let Some(font_id) = run.font_id else {
+                continue;
+            };
+            let Some(font) = self.document_fonts.get(font_id) else {
+                continue;
+            };
+            let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
+                continue;
+            };
+            let units_per_em = font.units_per_em.max(1) as f32;
+            let scale = run.font_size / units_per_em;
+            for glyph in &mut run.glyphs {
+                if glyph.source_text == "\t" {
+                    continue;
+                }
+                let vertical_advance = face
+                    .glyph_ver_advance(ttf_parser::GlyphId(glyph.rendered.id))
+                    .map(|advance| advance as f32)
+                    .filter(|advance| *advance > 0.0)
+                    .unwrap_or(units_per_em)
+                    * scale;
+                let extra_spacing =
+                    (glyph.rendered.x_advance - glyph.rendered.nominal_x_advance).max(0.0);
+                glyph.rendered.nominal_x_advance = vertical_advance;
+                glyph.rendered.x_advance = vertical_advance + extra_spacing;
+            }
+        }
     }
 
     /// Shape adjacent styled text spans as one CSS Text shaping context.
@@ -1256,6 +1323,37 @@ impl FontSystem {
             .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
             .unwrap_or(style.font_size);
         self.font_ascent_baseline_adjustment_for_font_size(font_id, style, used_font_size)
+    }
+
+    /// Return a text fragment's baseline offset using shaped-font metrics.
+    ///
+    /// CSS Inline aligns inline text fragments to the line baseline. When text
+    /// has already been shaped, the selected shaped font must be authoritative
+    /// for baseline metrics so generic-family fallback and glyph painting use
+    /// the same face:
+    /// <https://www.w3.org/TR/css-inline-3/#line-box> and
+    /// <https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm>.
+    pub(crate) fn text_fragment_baseline_offset(
+        &mut self,
+        shaped: Option<&ShapedInlineLine>,
+        style: &ComputedStyle,
+        baseline_shift: f32,
+    ) -> f32 {
+        if let Some(run) =
+            shaped.and_then(|line| line.runs.iter().find(|run| run.font_id.is_some()))
+        {
+            let adjustment = self.font_ascent_baseline_adjustment_for_font_size(
+                run.font_id,
+                style,
+                run.font_size,
+            );
+            return style.font_size - adjustment - baseline_shift;
+        }
+
+        let font_id = self.resolve_style(style);
+        let line_height = self.line_height_for_font(font_id, style);
+        let adjustment = self.font_ascent_baseline_adjustment(font_id, style, line_height);
+        style.font_size - adjustment - baseline_shift
     }
 
     fn shaped_runs_baseline_adjustment(

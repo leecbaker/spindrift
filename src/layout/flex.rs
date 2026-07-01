@@ -32,8 +32,13 @@ impl<'a> LayoutBuilder<'a> {
         let child_boxes = if let Some(child_boxes) = child_boxes {
             child_boxes
         } else {
-            built_child_boxes =
-                box_tree::build_child_boxes(element, stylesheets, style, &self.ancestors);
+            built_child_boxes = box_tree::build_child_boxes_with_font_metrics(
+                element,
+                stylesheets,
+                style,
+                &self.ancestors,
+                &mut self.font_system,
+            );
             &built_child_boxes
         };
         let container_signature = self.flex_container_signature(element);

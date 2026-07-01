@@ -93,11 +93,74 @@ Primary references:
 - Divergence: `run-in`, ruby display values, and several authored
   table-internal values remain unsupported or only covered in table-specific
   paths.
+- Divergence: grid display values are parsed and routed to a dedicated layout
+  entrypoint, including a first same-page atomic `inline-grid` path, but the
+  grid path is still a partial same-page implementation and does not cover the
+  full CSS Grid formatting context.
 - Divergence: table-internal display fixup and anonymous box construction are
   not fully spec-complete for every malformed or unusual authored tree.
 - Needed work: expand parsing and layout for the remaining CSS Display values,
   including layout participation, box tree fixup, pagination behavior, and WPT
   coverage.
+
+### CSS Grid Layout
+
+- Spec area: CSS Grid Layout Levels 1 and 2, CSS Box Alignment, CSS Writing
+  Modes, CSS Sizing, CSS Fragmentation.
+- Divergence: Grid Level 1 computed values and a first parser pass exist for
+  explicit tracks, auto tracks, template areas, auto-flow, and basic item
+  placement. Simple same-page normal-flow grid containers use a Taffy-backed
+  layout path with Quire-measured basic grid-item leaf contributions and a
+  first intrinsic-width estimate for simple explicit column tracks, including
+  simple per-track contributions for non-spanning placed items, simple
+  positive/negative numeric and named-line column starts/ends, equal
+  distribution of simple explicit positive spanning-item contributions after
+  crossed gaps, and one fixed-size auto-repeat copy for indefinite intrinsic
+  width queries, but Quire does not yet implement the full CSS Grid placement,
+  intrinsic sizing, baseline alignment, and track-sizing behavior. Same-page `inline-grid`
+  boxes reuse the grid adapter inside an atomic inline fragment and can export
+  a baseline from rendered grid item text, but full grid baseline synthesis,
+  writing-mode-specific self-start/self-end details, and fragmentation
+  interactions remain incomplete. Same-page grid `align-content: space-evenly`
+  and `justify-content: space-evenly` are covered for fixed track
+  distribution through the Taffy-backed path.
+- Divergence: `grid-row` and `grid-column` shorthand parsing exists for
+  explicit and omitted-end forms, but unusual `grid`, `grid-template`, and
+  named-line parser edge cases, `subgrid`, masonry, full grid baseline
+  alignment/export, complete grid-aware absolute static positions, and paged
+  grid fragmentation are not implemented. `grid-area` shorthand expansion for
+  one- through four-value forms, practical `grid-template` and `grid`
+  shorthand forms, covered invalid grid placement custom-ident tokens,
+  covered invalid bracketed track line-name tokens, covered auto-repeat parser
+  validation, named-line occurrence placement, named-area placement,
+  template-area generated
+  `area-start`/`area-end` line placement, rectangular `grid-template-areas`
+  validation, same-page atomic `inline-grid` layout, and same-page
+  row/column/dense auto-placement basics are implemented. Same-page
+  child collection covers ordinary in-flow children, anonymous non-whitespace
+  text grid items, whitespace-only text suppression, ordering, basic
+  out-of-flow splitting, `display: contents` flattening, and tree-abiding
+  `::before`/`::after` generated grid items participating in order-modified
+  auto-placement. Same-page spanning over definite fixed tracks includes row
+  and column gaps in replayed item geometry, and horizontal RTL
+  auto-placement starts at the inline-start/rightmost column. Definite
+  same-page flexible `fr` tracks distribute available inline size for ordinary
+  in-flow grid items, fixed-size same-page `repeat(auto-fill, ...)` expands in
+  definite inline sizes with empty-track `repeat(auto-fit, ...)` collapse, and
+  `grid-auto-rows`/`grid-auto-columns` track lists cycle across simple
+  same-page implicit tracks. Same-page abspos
+  positive/negative numeric explicit-line and
+  positive/negative named explicit-line static positions over fixed explicit
+  tracks and gaps are implemented. Same-page abspos template-area placement,
+  generated template-area line placement, and simple flexible-track,
+  intrinsic-track, and fixed-size `auto-fill` repeated-track static positions
+  are covered through Taffy
+  non-participating probe layout.
+- Needed work: complete grid parsing, broaden Quire-native grid child
+  collection and the Taffy adapter, complete Quire intrinsic contribution
+  measurement, complete grid exported baselines and abspos static positions,
+  and add page-fragment-aware grid fragmentation. See
+  `docs/CSS_GRID_PARITY.md`.
 
 ### CSS Content
 
@@ -146,8 +209,9 @@ Primary references:
 - Divergence: `text-orientation` is parsed, cascaded, and applied to vertical
   glyph placement for `mixed`, `upright`, and `sideways` using Unicode
   `Vertical_Orientation`, and upright units request OpenType `vert`/`vrt2`
-  alternates, but fallback transformed glyph forms for `Tr`/`Tu` classes are
-  not implemented when font-provided alternates are unavailable or incomplete.
+  alternates, vertical inline advances, and vertical `ch` metrics, but fallback
+  transformed glyph forms for `Tr`/`Tu` classes are not implemented when
+  font-provided alternates are unavailable or incomplete.
 - Divergence: `text-autospace` is incomplete for punctuation-specific spacing,
   `replace` semantics, vertical text-orientation interactions, `text-spacing`
   shorthand integration, and dynamic DOM cases from the CSS Text Level 4 draft.
@@ -205,7 +269,9 @@ Primary references:
   PDF profile, but strict PDF/A/PDF/UA failure modes are not exposed through a
   public render option yet.
 - Divergence: baseline and line-box metric mapping still diverges from
-  WeasyPrint/Pango in some contexts.
+  WeasyPrint/Pango in some contexts. Mixed-weight generic-family inline text
+  now uses shaped-font metrics for fragment baselines so normal and strong runs
+  selected from different concrete faces share the same text baseline.
 - Divergence: residual complex-script shaping mismatches may remain outside
   the covered CSS Text join-control and tatweel boundary cases.
 - Needed work: add focused tests and implementation for font synthesis,
@@ -233,9 +299,13 @@ Primary references:
 - Divergence: collapsed row/column clipping has remaining edge cases involving
   partial glyph clipping and rare fragmented table pieces.
 - Divergence: table height distribution and baseline behavior are implemented
-  for common CSS Tables 3 cases, but still need broader WPT and WeasyPrint
-  coverage for mixed writing modes, floats inside cells, large percentage
-  matrices, and complex nested formatting contexts.
+  for common CSS Tables 3 cases, and vertical-writing table-cell baselines no
+  longer inflate physical row height. Full horizontal-axis baseline positioning
+  for mixed writing modes still needs broader WPT and WeasyPrint coverage, as
+  do floats inside cells, large percentage/min-max matrices, and complex nested
+  formatting contexts. Table-cell content relayout now resolves common
+  percentage-height replaced descendants when the cell or table root is
+  explicitly height-sized.
 - Needed work: port WeasyPrint table tests incrementally, finish table fixup
   edge cases, extend table sizing coverage for complex spans and column
   groups, broaden height/baseline coverage, and complete cloned decoration
@@ -416,6 +486,9 @@ Primary references:
   common formatting-context and fragmentation cases.
 - Divergence: exact static-position placeholders are incomplete for multiline
   inline, table, fragmented, and other remaining formatting-context cases.
+  Inline-level absolutely positioned boxes now use their prepared hypothetical
+  placeholder rectangle for auto horizontal and vertical static position,
+  including forced-break and RTL inline alignment cases.
   Block-level absolutely positioned boxes after inline content, including
   block-level absolute descendants encountered inside inline boxes, now use
   the preceding inline line boxes for their auto vertical static position,
@@ -440,11 +513,25 @@ Primary references:
 ### Units and Value Computation
 
 - Spec area: CSS Values and Units, CSS Cascade computed-value processing.
+- Status: `ch` resolves through selected font metrics across render/layout
+  typed length consumers, including vertical-upright inline advances, table grid sizing,
+  separated-table `border-spacing`, multicolumn widths, rounded radii,
+  page-context margins, padding, borders, and sizes, border and outline widths,
+  border-image outsets, outline offsets, transform translations and origins,
+  shadows, background gradient stop positions, baseline shifts, text decoration
+  lengths, and `font-size` during initial box-tree construction, rebuilt child-box
+  construction, builder-owned estimate probes, DOM flow-helper probes,
+  generated and typographic pseudo-element styles, and table
+  row/column/cell/caption helper style reconstruction. CSS math comparisons
+  such as `min(1ch, 2ch)` and `min(calc(1ch + 1pt), calc(2ch + 1pt))`
+  reduce when the unknown components cancel or differ in only one
+  non-negative-basis unit, preserving the unresolved `ch` component.
+  `min()`/`max()`/`clamp()` comparisons such as `min(10pt, 1ch)` and
+  `min(10ch, 50%)` are deferred through nested CSS math until font-metric,
+  viewport-unit, or percentage-basis resolution can choose the used branch.
 - Divergence: container query units (`cqw`, `cqh`, `cqi`, `cqb`, `cqmin`,
   `cqmax`) are not implemented, and additional font/line metric units such as
   `ex`, `cap`, `ic`, `lh`, and `rlh` still need property-wide support.
-- Divergence: mixed length/percentage `min()`, `max()`, and `clamp()`
-  comparisons that depend on a layout basis remain incomplete.
 - Divergence: many property-specific keywords and computed-value models remain
   incomplete.
 - Divergence: multi-layer background lists and full generated image values are

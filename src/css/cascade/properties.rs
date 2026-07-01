@@ -93,6 +93,16 @@ pub(super) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "order",
     "row-gap",
     "column-gap",
+    "grid-template-rows",
+    "grid-template-columns",
+    "grid-template-areas",
+    "grid-auto-rows",
+    "grid-auto-columns",
+    "grid-auto-flow",
+    "grid-row-start",
+    "grid-row-end",
+    "grid-column-start",
+    "grid-column-end",
     "column-count",
     "column-width",
     "margin-trim",
@@ -309,6 +319,18 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "order" => style.order = source.order,
         "row-gap" => style.row_gap = source.row_gap,
         "column-gap" => style.column_gap = source.column_gap,
+        "grid-template-rows" => style.grid_template_rows = source.grid_template_rows.clone(),
+        "grid-template-columns" => {
+            style.grid_template_columns = source.grid_template_columns.clone();
+        }
+        "grid-template-areas" => style.grid_template_areas = source.grid_template_areas.clone(),
+        "grid-auto-rows" => style.grid_auto_rows = source.grid_auto_rows.clone(),
+        "grid-auto-columns" => style.grid_auto_columns = source.grid_auto_columns.clone(),
+        "grid-auto-flow" => style.grid_auto_flow = source.grid_auto_flow,
+        "grid-row-start" => style.grid_row_start = source.grid_row_start.clone(),
+        "grid-row-end" => style.grid_row_end = source.grid_row_end.clone(),
+        "grid-column-start" => style.grid_column_start = source.grid_column_start.clone(),
+        "grid-column-end" => style.grid_column_end = source.grid_column_end.clone(),
         "column-count" => style.column_count = source.column_count,
         "column-width" => style.column_width = source.column_width,
         "margin-trim" => style.margin_trim = source.margin_trim,
@@ -441,16 +463,16 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "border-inline-start-color" => copy_modeled_property(style, source, "border-left-color"),
         "border-inline-end-color" => copy_modeled_property(style, source, "border-right-color"),
         "border-top-width" => {
-            set_border_side_width(style, BorderSide::Top, source.border_widths.top)
+            set_border_side_width(style, BorderSide::Top, source.border_width_values.top)
         }
         "border-right-width" => {
-            set_border_side_width(style, BorderSide::Right, source.border_widths.right)
+            set_border_side_width(style, BorderSide::Right, source.border_width_values.right)
         }
         "border-bottom-width" => {
-            set_border_side_width(style, BorderSide::Bottom, source.border_widths.bottom)
+            set_border_side_width(style, BorderSide::Bottom, source.border_width_values.bottom)
         }
         "border-left-width" => {
-            set_border_side_width(style, BorderSide::Left, source.border_widths.left)
+            set_border_side_width(style, BorderSide::Left, source.border_width_values.left)
         }
         "border-top-style" => style.border_styles.top = source.border_styles.top,
         "border-right-style" => style.border_styles.right = source.border_styles.right,

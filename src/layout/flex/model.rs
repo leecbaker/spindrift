@@ -343,6 +343,8 @@ pub(super) struct FlexItemAvailableSpace {
     pub(super) width_is_definite: bool,
     pub(super) height: Option<f32>,
     pub(super) height_is_definite: bool,
+    pub(super) stretched_width: Option<f32>,
+    pub(super) stretched_height: Option<f32>,
 }
 
 impl FlexItemAvailableSpace {
@@ -352,6 +354,8 @@ impl FlexItemAvailableSpace {
             width_is_definite: available.width_is_definite,
             height: available.height,
             height_is_definite: available.height_is_definite,
+            stretched_width: None,
+            stretched_height: None,
         }
     }
 

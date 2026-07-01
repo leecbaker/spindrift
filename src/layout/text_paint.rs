@@ -512,18 +512,22 @@ impl<'a> LayoutBuilder<'a> {
     /// Paint one inline fragment's background and border for a line box.
     ///
     /// CSS Backgrounds and Borders applies backgrounds and borders to inline
-    /// boxes on each generated line box fragment. CSS Text hanging separators
-    /// remain part of the fragment for painting even when excluded from line
-    /// measurement:
+    /// boxes on each generated line box fragment. CSS 2.2 defines the inline
+    /// box content area independently from line-height; vertical padding and
+    /// borders start at the content-area edges rather than shrinking into
+    /// glyph content. CSS Text hanging separators remain part of the fragment
+    /// for painting even when excluded from line measurement:
+    /// <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>,
+    /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>,
     /// <https://www.w3.org/TR/css-backgrounds-3/#the-background-color> and
     /// <https://www.w3.org/TR/css-text-3/#white-space-phase-2>.
     pub(super) fn paint_inline_fragment_background(
         &mut self,
         fragment: &InlineFragment,
         mut x: f32,
-        y: f32,
+        mut y: f32,
         mut width: f32,
-        height: f32,
+        mut height: f32,
     ) {
         if fragment.style.visibility != Visibility::Visible
             || !fragment.style.display.is_inline_level()
@@ -537,7 +541,14 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         let mut style = fragment.style.clone();
-        apply_inline_fragment_edge_painting(&mut style, fragment.hanging_edges, &mut x, &mut width);
+        apply_inline_fragment_edge_painting(
+            &mut style,
+            fragment.hanging_edges,
+            &mut x,
+            &mut y,
+            &mut width,
+            &mut height,
+        );
         let (rects, rounded_rects, paths, strokes) = block_paint_ops(x, y, width, height, &style);
         for rect in rects {
             self.push_rect_in_band(PaintBand::Inline, rect);
@@ -563,8 +574,8 @@ impl<'a> LayoutBuilder<'a> {
             for pass in text_shadow_paint_passes(*shadow, color) {
                 let mut shadow_line = line.clone();
                 shadow_line.translate_origin(PaintVector::new(
-                    shadow.offset_x + pass.x_offset,
-                    -shadow.offset_y - pass.y_offset,
+                    shadow.offset_x.length + pass.x_offset,
+                    -shadow.offset_y.length - pass.y_offset,
                 ));
                 shadow_line.color = pass.color;
                 self.paint_text_decoration_lines_for_phase_with_color(
@@ -1149,7 +1160,7 @@ fn text_shadow_paint_passes(
     shadow: crate::css::TextShadow,
     color: Color,
 ) -> Vec<TextShadowPaintPass> {
-    if shadow.blur_radius <= 0.0 {
+    if shadow.blur_radius.length <= 0.0 {
         return vec![TextShadowPaintPass {
             x_offset: 0.0,
             y_offset: 0.0,
@@ -1157,7 +1168,7 @@ fn text_shadow_paint_passes(
         }];
     }
 
-    let radius = shadow.blur_radius.max(0.0);
+    let radius = shadow.blur_radius.length.max(0.0);
     let samples = [
         (0.0, 0.0, 0.22),
         (1.0, 0.0, 0.08),
@@ -2088,15 +2099,25 @@ fn vertical_text_decoration_side_position(
 /// CSS Fragmentation defines `box-decoration-break: slice` as the initial
 /// behavior: inline-start decorations are painted only on the first fragment,
 /// inline-end decorations only on the last fragment, while top/bottom
-/// decorations continue on every line fragment:
-/// <https://www.w3.org/TR/css-break-3/#break-decoration>.
+/// decorations continue on every line fragment. CSS 2.2 positions non-replaced
+/// inline padding and borders from the content-area edges, not from the
+/// line-height box:
+/// <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>,
+/// <https://www.w3.org/TR/CSS22/visudet.html#line-height>, and
+/// <https://www.w3.org/TR/css-backgrounds-3/#box-decoration-break>.
 fn apply_inline_fragment_edge_painting(
     style: &mut ComputedStyle,
     edges: InlineHangingEdges,
     x: &mut f32,
+    y: &mut f32,
     width: &mut f32,
+    height: &mut f32,
 ) {
     let borders = used_border_widths(style);
+    let top_extra = borders.top + style.padding.top;
+    let bottom_extra = borders.bottom + style.padding.bottom;
+    *y -= bottom_extra;
+    *height += top_extra + bottom_extra;
     let start_extra = match style.direction {
         Direction::Ltr => borders.left + style.padding.left,
         Direction::Rtl => borders.right + style.padding.right,
@@ -2191,9 +2212,10 @@ fn used_text_decoration_thickness(
         TextDecorationThickness::Auto => (font_size / 16.0).max(0.5),
         TextDecorationThickness::FromFont if line_through => metrics.strikeout_thickness,
         TextDecorationThickness::FromFont => metrics.underline_thickness,
-        TextDecorationThickness::LengthPercentage(value) => {
-            (value.length + value.percent * font_size).max(0.5)
-        }
+        TextDecorationThickness::LengthPercentage(value) => value
+            .used_length_with_percentage_basis(font_size)
+            .unwrap_or(value.length + value.percent * font_size)
+            .max(0.5),
     }
 }
 
@@ -2556,6 +2578,8 @@ fn text_decoration_glyph_is_spacer(unicode: &str) -> bool {
 fn used_text_underline_offset(offset: TextUnderlineOffset, font_size: f32) -> f32 {
     match offset {
         TextUnderlineOffset::Auto => 0.0,
-        TextUnderlineOffset::LengthPercentage(value) => value.length + value.percent * font_size,
+        TextUnderlineOffset::LengthPercentage(value) => value
+            .used_length_with_percentage_basis(font_size)
+            .unwrap_or(value.length + value.percent * font_size),
     }
 }

@@ -131,8 +131,7 @@ pub(super) fn taffy_optional_dimension_with_basis(
     match value {
         css::ComputedLengthPercentageOrAuto::Auto => taffy_layout::Dimension::auto(),
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            if value.percent != 0.0
-                && value.length != 0.0
+            if (value.math.is_some() || (value.percent != 0.0 && value.length != 0.0))
                 && let Some(basis) = percentage_basis
             {
                 return taffy_layout::Dimension::length(
@@ -175,7 +174,7 @@ pub(super) fn taffy_intrinsic_dimension_with_basis(
         css::ComputedLengthPercentageOrAuto::FitContent(limit) => {
             let stretch = limit
                 .and_then(|value| {
-                    if value.percent == 0.0 {
+                    if value.math.is_none() && value.percent == 0.0 {
                         Some(value.length.max(0.0))
                     } else {
                         percentage_basis.map(|basis| used_length_percentage(value, basis).max(0.0))

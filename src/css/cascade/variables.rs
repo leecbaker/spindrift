@@ -16,10 +16,11 @@ pub(super) fn apply_cascaded_custom_property_declarations(
     }
 }
 
-pub(super) fn apply_cascaded_font_size_declarations(
+pub(super) fn apply_cascaded_font_size_declarations_with_parent_ch_advance(
     style: &mut ComputedStyle,
     declarations: &[CascadedDeclaration<'_>],
     defaulted_style: &ComputedStyle,
+    inherited_ch_advance: f32,
 ) {
     let inherited_font_size = style.font_size;
     for declaration in declarations
@@ -51,10 +52,15 @@ pub(super) fn apply_cascaded_font_size_declarations(
             _ => {}
         }
         let font_size = if declaration.name.as_ref() == "font" {
-            parse_font_shorthand(value, inherited_font_size, style.font_weight)
-                .map(|font| font.size)
+            parse_font_shorthand_with_parent_ch_advance(
+                value,
+                inherited_font_size,
+                inherited_ch_advance,
+                style.font_weight,
+            )
+            .map(|font| font.size)
         } else {
-            parse_font_size(value, inherited_font_size)
+            parse_font_size_with_parent_ch_advance(value, inherited_font_size, inherited_ch_advance)
         };
         if let Some(font_size) = font_size {
             set_font_size(style, font_size);

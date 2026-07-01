@@ -15,7 +15,13 @@ impl<'a> LayoutBuilder<'a> {
         let groups = child_boxes
             .map(definition_list_column_groups_from_boxes)
             .unwrap_or_else(|| {
-                definition_list_column_groups(element, style, stylesheets, &self.ancestors)
+                definition_list_column_groups_with_font_metrics(
+                    element,
+                    style,
+                    stylesheets,
+                    &self.ancestors,
+                    &mut self.font_system,
+                )
             });
         if groups.is_empty() {
             return false;
@@ -70,13 +76,13 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
         can_collapse_start_margin: bool,
         can_collapse_end_margin: bool,
-    ) -> bool {
+    ) -> Option<BlockEndMarginCollapse> {
         let sibling_tags = element_sibling_tags(element);
         let mut element_index = 0usize;
         let mut inline_nodes = Vec::new();
         let mut previous_flow_bottom_margin = None;
         let mut seen_flow_child = false;
-        let mut collapsed_end_margin = false;
+        let mut pending_end_margin_collapse = None;
         let mut float_run = self.float_run_state();
 
         for child in &element.children {
@@ -92,12 +98,11 @@ impl<'a> LayoutBuilder<'a> {
                 sibling_tags.clone(),
             );
             element_index += 1;
-            let mut child_style = style_for_layout_element(
+            let mut child_style = self.style_for_layout_element_with_parent_font_metrics(
                 child_element,
                 child_signature.clone(),
                 stylesheets,
                 Some(style),
-                &self.ancestors,
             );
             if child_style.float != Float::None {
                 if self.layout_inline_fragment_block(&inline_nodes, style, stylesheets) {
@@ -135,7 +140,9 @@ impl<'a> LayoutBuilder<'a> {
             }
             inline_nodes.clear();
 
-            if is_collapsible_block_child(child_element, &child_style) {
+            let collapsible_block_child = is_collapsible_block_child(child_element, &child_style);
+            let mut collapses_with_parent_end = false;
+            if collapsible_block_child {
                 if !seen_flow_child && can_collapse_start_margin {
                     child_style.margin.top =
                         collapsed_margin_delta(style.margin.top, child_style.margin.top);
@@ -144,30 +151,45 @@ impl<'a> LayoutBuilder<'a> {
                         collapsed_margin_delta(previous_margin, child_style.margin.top);
                 }
 
-                if can_collapse_end_margin
-                    && !has_later_normal_block_flow_child(
+                collapses_with_parent_end = can_collapse_end_margin
+                    && !has_later_normal_block_flow_child_with_font_metrics(
                         element,
                         element_index,
                         &sibling_tags,
                         style,
                         stylesheets,
                         &self.ancestors,
-                    )
-                {
-                    child_style.margin.bottom =
-                        collapse_margins(child_style.margin.bottom, style.margin.bottom);
-                    collapsed_end_margin = true;
-                }
+                        &mut self.font_system,
+                    );
             }
 
             seen_flow_child = true;
-            previous_flow_bottom_margin = is_collapsible_block_child(child_element, &child_style)
-                .then_some(child_style.margin.bottom);
 
             self.flush_float_run(&mut float_run);
             self.push_ancestor_signature(child_signature);
+            let child_uses_block_layout = matches!(
+                element_layout_kind(child_element, &child_style),
+                ElementLayoutKind::BlockFlow
+            );
+            self.last_block_layout_outcome = BlockLayoutOutcome::default();
             self.layout_element(child_element, &child_style, stylesheets);
             self.ancestors.pop();
+            let child_consumed_bottom_margin = if child_uses_block_layout {
+                self.last_block_layout_outcome.consumed_bottom_margin
+            } else {
+                child_style.margin.bottom
+            };
+            if collapses_with_parent_end {
+                pending_end_margin_collapse = Some(BlockEndMarginCollapse {
+                    child_consumed_margin: child_consumed_bottom_margin,
+                    collapsed_margin: collapse_margins(
+                        child_consumed_bottom_margin,
+                        style.margin.bottom,
+                    ),
+                });
+            }
+            previous_flow_bottom_margin =
+                collapsible_block_child.then_some(child_consumed_bottom_margin);
         }
 
         if self.layout_inline_fragment_block(&inline_nodes, style, stylesheets) {
@@ -177,6 +199,6 @@ impl<'a> LayoutBuilder<'a> {
         self.flush_float_run(&mut float_run);
 
         let _ = previous_flow_bottom_margin;
-        collapsed_end_margin
+        pending_end_margin_collapse
     }
 }

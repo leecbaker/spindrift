@@ -19,6 +19,7 @@ pub(crate) enum DisplayInner {
     Flow,
     FlowRoot,
     Flex,
+    Grid,
     Table,
     TableCaption,
     TableColumnGroup,
@@ -74,6 +75,16 @@ impl Display {
     pub const INLINE_FLEX: Self = Self {
         outer: DisplayOuter::Inline,
         inner: DisplayInner::Flex,
+        list_item: false,
+    };
+    pub const GRID: Self = Self {
+        outer: DisplayOuter::Block,
+        inner: DisplayInner::Grid,
+        list_item: false,
+    };
+    pub const INLINE_GRID: Self = Self {
+        outer: DisplayOuter::Inline,
+        inner: DisplayInner::Grid,
         list_item: false,
     };
     pub const TABLE: Self = Self {
@@ -193,6 +204,10 @@ impl Display {
         self.inner == DisplayInner::Flex
     }
 
+    pub fn is_grid(self) -> bool {
+        self.inner == DisplayInner::Grid
+    }
+
     pub fn is_table(self) -> bool {
         self.inner == DisplayInner::Table
     }
@@ -248,13 +263,14 @@ impl Display {
         self.is_inline_level() && !self.is_flow()
     }
 
-    // CSS 2.2 visual formatting: flow-root, flex, table, and replaced boxes
-    // establish independent formatting contexts instead of joining parent flow.
+    // CSS Display: flow-root, flex, grid, table, and replaced boxes establish
+    // independent formatting contexts instead of joining parent flow.
     pub fn establishes_block_formatting_context(self) -> bool {
         matches!(
             self.inner,
             DisplayInner::FlowRoot
                 | DisplayInner::Flex
+                | DisplayInner::Grid
                 | DisplayInner::Table
                 | DisplayInner::TableCaption
                 | DisplayInner::TableColumnGroup

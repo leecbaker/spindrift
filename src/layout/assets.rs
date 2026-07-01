@@ -4,8 +4,13 @@ impl<'a> LayoutBuilder<'a> {
     pub(super) fn layout_canvas(&mut self, element: &Element, style: &ComputedStyle) {
         let available_width = (self.content_right - self.content_left).max(1.0);
         let mut used_style = self.style_with_current_viewport_lengths(style);
-        let (content_width, content_height) =
-            used_canvas_size(element, &used_style, available_width);
+        let containing_block_height = self.definite_block_size_stack.last().copied().flatten();
+        let (content_width, content_height) = used_canvas_size_with_height_basis(
+            element,
+            &used_style,
+            available_width,
+            containing_block_height,
+        );
         let box_metrics = apply_used_box_metrics(&mut used_style, available_width);
         let style = &used_style;
         let border_box_width = content_width + box_metrics.horizontal_non_content();
@@ -502,13 +507,22 @@ impl<'a> LayoutBuilder<'a> {
         let positioned_available_outer_width =
             (containing_block.width() - style.margin.left - style.margin.right)
                 .max(style.font_size);
-        let static_horizontal_start = (previous_left - containing_block.x()).max(0.0);
         let inline_auto_static_y = style.abspos_static_source_was_inline_level
             && used_inset_top(style, containing_block).is_none()
             && used_inset_bottom(style, containing_block).is_none();
-        let inline_static_baseline_y = inline_auto_static_y
-            .then_some(self.inline_static_baseline_y)
+        let inline_static_position = self.inline_static_position;
+        let inline_static_baseline_position = inline_auto_static_y
+            .then_some(inline_static_position)
             .flatten();
+        let inline_auto_static_x = style.abspos_static_source_was_inline_level
+            && used_inset_left(style, containing_block).is_none()
+            && used_inset_right(style, containing_block).is_none();
+        let static_horizontal_start = inline_auto_static_x
+            .then_some(inline_static_position)
+            .flatten()
+            .map(|position| position.start_x - containing_block.x())
+            .unwrap_or(previous_left - containing_block.x())
+            .max(0.0);
         let static_vertical_base = containing_block.top_y() - previous_cursor_y;
         let mut static_vertical_start = static_vertical_base.max(0.0);
         if !inline_auto_static_y
@@ -655,12 +669,13 @@ impl<'a> LayoutBuilder<'a> {
         let mut positioned_fragments =
             self.take_positioned_fragments_since(paint_page_index, paint_checkpoint);
         for (_, positioned_fragment) in &mut positioned_fragments {
-            if let (Some(static_baseline_y), Some(fragment_baseline_y)) =
-                (inline_static_baseline_y, positioned_fragment.first_line_y())
-            {
+            if let (Some(static_position), Some(fragment_baseline_y)) = (
+                inline_static_baseline_position,
+                positioned_fragment.first_line_y(),
+            ) {
                 *positioned_fragment = positioned_fragment.clone().translated(PaintVector::new(
                     0.0,
-                    static_baseline_y - fragment_baseline_y,
+                    static_position.baseline_y - fragment_baseline_y,
                 ));
             }
         }
@@ -725,19 +740,19 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
-    pub(super) fn layout_positioned_block_with_inline_static_baseline(
+    pub(super) fn layout_positioned_block_with_inline_static_position(
         &mut self,
         element: &Element,
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
-        static_baseline_y: f32,
+        static_position: InlineStaticPosition,
     ) {
-        let previous = self.inline_static_baseline_y;
-        self.inline_static_baseline_y = Some(static_baseline_y);
+        let previous = self.inline_static_position;
+        self.inline_static_position = Some(static_position);
         self.layout_positioned_block(element, style, stylesheets, child_boxes, table_fragment);
-        self.inline_static_baseline_y = previous;
+        self.inline_static_position = previous;
     }
 
     pub(super) fn layout_positioned_block_with_block_static_y_offset(
@@ -859,7 +874,6 @@ impl<'a> LayoutBuilder<'a> {
             table_fragment,
         );
         intrinsic::shrink_to_fit_width(preferred_min, preferred, available_width)
-            .max(style.font_size)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -892,7 +906,6 @@ impl<'a> LayoutBuilder<'a> {
         .unwrap_or_else(|| {
             intrinsic::shrink_to_fit_width(preferred_min, preferred, content_available_width)
         })
-        .max(style.font_size)
     }
 
     fn formatting_context_intrinsic_widths(
@@ -1032,12 +1045,11 @@ impl<'a> LayoutBuilder<'a> {
                     sibling_tags.clone(),
                 );
                 element_index += 1;
-                let child_style = style_for_layout_element(
+                let child_style = self.style_for_layout_element_with_parent_font_metrics(
                     child_element,
                     signature,
                     stylesheets,
                     Some(style),
-                    &self.ancestors,
                 );
                 if child_style.float != Float::None {
                     let child_width = self.float_margin_box_width(
@@ -1717,8 +1729,9 @@ fn resolve_absolute_horizontal(
     containing_direction: Direction,
 ) -> PositionedAxis {
     // CSS 2.1 10.3.7, non-replaced absolutely positioned elements. Static
-    // position is approximated from the layout cursor/content edge at the
-    // element's source position until layout carries explicit placeholders.
+    // position comes from the hypothetical normal-flow rectangle for
+    // placeholder-backed inline sources, and otherwise falls back to the
+    // layout cursor/content edge at the element's source position.
     let left = used_inset_left(style, containing_block);
     let right = used_inset_right(style, containing_block);
     let width = used_content_width_or_auto(
@@ -1743,8 +1756,7 @@ fn resolve_absolute_horizontal(
     let margin_end = style.margin.right;
     let non_content = style.padding.left + style.padding.right + horizontal_border_width(style);
     let fill_between = |start: f32, end: f32| {
-        (containing_block.width() - start - margin_start - non_content - margin_end - end)
-            .max(style.font_size)
+        (containing_block.width() - start - margin_start - non_content - margin_end - end).max(0.0)
     };
     let border_box_size = |content_size: f32| content_size + non_content;
     let start_for_end = |content_size: f32, end: f32| {
@@ -1831,7 +1843,9 @@ fn resolve_absolute_vertical(
     )
     .map(|height| constrain_height(style, height, containing_block.height()));
     let auto_height = constrain_height(style, auto_height, containing_block.height());
-    let static_start = static_start.clamp(0.0, containing_block.height());
+    // CSS 2.2 defines the static position as the hypothetical normal-flow
+    // position. It can fall outside the containing block, especially while a
+    // nested formatting context is measured in temporary coordinates.
     let margin_start = style.margin.top;
     let margin_end = style.margin.bottom;
     let non_content = style.padding.top + style.padding.bottom + vertical_border_width;

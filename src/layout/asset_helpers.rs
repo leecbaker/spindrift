@@ -341,6 +341,23 @@ pub(super) fn used_canvas_size(
     style: &ComputedStyle,
     available_width: f32,
 ) -> (f32, f32) {
+    used_canvas_size_with_height_basis(element, style, available_width, None)
+}
+
+/// Resolve the used content size of an HTML `<canvas>` with an optional
+/// containing-block height for percentage resolution.
+///
+/// CSS 2.2 treats percentage heights as auto unless the containing block has a
+/// definite block size. Table-cell content relayout can provide that definite
+/// basis after row height distribution:
+/// <https://www.w3.org/TR/CSS22/visudet.html#the-height-property> and
+/// <https://drafts.csswg.org/css-tables-3/#table-cell-content-relayout>.
+pub(super) fn used_canvas_size_with_height_basis(
+    element: &Element,
+    style: &ComputedStyle,
+    available_width: f32,
+    height_basis: Option<f32>,
+) -> (f32, f32) {
     let intrinsic_width = element
         .attrs
         .get("width")
@@ -355,7 +372,11 @@ pub(super) fn used_canvas_size(
         .unwrap_or(150.0 * css::CSS_PX_TO_PT);
     let aspect_ratio = intrinsic_width / intrinsic_height;
     let mut width = used_length_percentage_or_auto(style.box_values.width, available_width);
-    let mut height = style.box_values.height.length_if_no_percent();
+    let vertical_non_content =
+        style.padding.top + style.padding.bottom + vertical_border_width(style);
+    let mut height =
+        used_content_height_or_auto_with_optional_basis(style, height_basis, vertical_non_content);
+    let width_was_auto = width.is_none();
     match (width, height) {
         (Some(width_value), None) => height = Some(width_value / aspect_ratio),
         (None, Some(height_value)) => width = Some(height_value * aspect_ratio),
@@ -365,10 +386,78 @@ pub(super) fn used_canvas_size(
         }
         (Some(_), Some(_)) => {}
     }
-    (
-        width.unwrap_or(intrinsic_width).min(available_width),
-        height.unwrap_or(intrinsic_height),
-    )
+    let mut width = width.unwrap_or(intrinsic_width);
+    let mut height = height.unwrap_or(intrinsic_height);
+    constrain_canvas_height(
+        style,
+        height_basis,
+        vertical_non_content,
+        aspect_ratio,
+        width_was_auto,
+        &mut width,
+        &mut height,
+    );
+    (width, height)
+}
+
+fn constrain_canvas_height(
+    style: &ComputedStyle,
+    height_basis: Option<f32>,
+    vertical_non_content: f32,
+    aspect_ratio: f32,
+    width_was_auto: bool,
+    width: &mut f32,
+    height: &mut f32,
+) {
+    let constraints = CanvasHeightConstraints {
+        min_height: used_canvas_content_height_constraint(
+            style.box_values.min_height,
+            style.box_sizing,
+            height_basis,
+            vertical_non_content,
+        ),
+        max_height: used_canvas_content_height_constraint(
+            style.box_values.max_height,
+            style.box_sizing,
+            height_basis,
+            vertical_non_content,
+        ),
+    };
+    if let Some(min_height) = constraints.min_height
+        && *height < min_height
+    {
+        *height = min_height;
+        if width_was_auto {
+            *width = *height * aspect_ratio;
+        }
+    }
+    if let Some(max_height) = constraints.max_height
+        && *height > max_height
+    {
+        *height = max_height;
+        if width_was_auto {
+            *width = *height * aspect_ratio;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CanvasHeightConstraints {
+    min_height: Option<f32>,
+    max_height: Option<f32>,
+}
+
+fn used_canvas_content_height_constraint(
+    value: css::ComputedLengthPercentageOrAuto,
+    box_sizing: BoxSizing,
+    height_basis: Option<f32>,
+    vertical_non_content: f32,
+) -> Option<f32> {
+    let specified = used_length_percentage_or_auto_with_optional_basis(value, height_basis)?;
+    Some(match box_sizing {
+        BoxSizing::BorderBox => (specified - vertical_non_content).max(0.0),
+        BoxSizing::ContentBox => specified.max(0.0),
+    })
 }
 
 pub(super) fn used_background_size(
@@ -608,7 +697,7 @@ pub(super) fn used_border_image_outsets(
 fn used_border_image_outset_value(value: css::BorderImageOutsetValue, border_width: f32) -> f32 {
     match value {
         css::BorderImageOutsetValue::Number(value) => value * border_width,
-        css::BorderImageOutsetValue::Length(value) => value,
+        css::BorderImageOutsetValue::Length(value) => value.length,
     }
     .max(0.0)
 }

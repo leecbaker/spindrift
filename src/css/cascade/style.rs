@@ -17,11 +17,52 @@ pub(crate) fn default_style_for_tag(tag: &str) -> ComputedStyle {
 }
 
 pub(crate) fn style_for_element_with_signature(
+    current: ElementSignature,
+    inline_style: Option<&str>,
+    stylesheets: &[Stylesheet],
+    parent: Option<&ComputedStyle>,
+    ancestors: &[ElementSignature],
+) -> ComputedStyle {
+    let inheritance_source = parent.cloned().unwrap_or_else(ComputedStyle::initial);
+    let parent_ch_advance = fallback_ch_advance_for_style(&inheritance_source);
+    style_for_element_with_signature_inner(
+        current,
+        inline_style,
+        stylesheets,
+        parent,
+        ancestors,
+        parent_ch_advance,
+        true,
+    )
+}
+
+pub(crate) fn style_for_element_with_signature_and_parent_ch_advance(
+    current: ElementSignature,
+    inline_style: Option<&str>,
+    stylesheets: &[Stylesheet],
+    parent: Option<&ComputedStyle>,
+    ancestors: &[ElementSignature],
+    parent_ch_advance: f32,
+) -> ComputedStyle {
+    style_for_element_with_signature_inner(
+        current,
+        inline_style,
+        stylesheets,
+        parent,
+        ancestors,
+        parent_ch_advance,
+        false,
+    )
+}
+
+fn style_for_element_with_signature_inner(
     mut current: ElementSignature,
     inline_style: Option<&str>,
     stylesheets: &[Stylesheet],
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
+    parent_ch_advance: f32,
+    apply_pseudos: bool,
 ) -> ComputedStyle {
     let inheritance_source = parent.cloned().unwrap_or_else(ComputedStyle::initial);
     let mut style = parent
@@ -94,10 +135,11 @@ pub(crate) fn style_for_element_with_signature(
         push_html_direction_declaration(&mut cascaded_declarations, direction);
     }
     sort_cascaded_declarations(&mut cascaded_declarations);
-    apply_cascaded_declarations_with_inheritance_source(
+    apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance(
         &mut style,
         &cascaded_declarations,
         &inheritance_source,
+        parent_ch_advance,
     );
     let quotes_auto_language = match parent {
         Some(parent) => parent.language.as_deref(),
@@ -108,9 +150,16 @@ pub(crate) fn style_for_element_with_signature(
         style.abspos_static_source_was_inline_level = style.display.is_inline_level();
     }
     resolve_ua_relative_margins(&mut style);
-    apply_marker_rules(&mut style, &current, stylesheets, ancestors);
-    apply_generated_pseudo_rules(&mut style, &current, stylesheets, ancestors);
-    apply_typographic_pseudo_rules(&mut style, &current, stylesheets, ancestors);
+    if apply_pseudos {
+        let pseudo_parent_ch_advance = fallback_ch_advance_for_style(&style);
+        apply_pseudo_rules_with_parent_ch_advance(
+            &mut style,
+            &current,
+            stylesheets,
+            ancestors,
+            pseudo_parent_ch_advance,
+        );
+    }
     finalize_text_decoration_layers(&mut style);
     style
 }
@@ -410,11 +459,42 @@ pub(super) fn resolve_ua_relative_margins(style: &mut ComputedStyle) {
     }
 }
 
-pub(super) fn apply_marker_rules(
+pub(crate) fn apply_pseudo_rules_with_parent_ch_advance(
     style: &mut ComputedStyle,
     current: &ElementSignature,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    parent_ch_advance: f32,
+) {
+    apply_marker_rules_with_parent_ch_advance(
+        style,
+        current,
+        stylesheets,
+        ancestors,
+        parent_ch_advance,
+    );
+    apply_generated_pseudo_rules_with_parent_ch_advance(
+        style,
+        current,
+        stylesheets,
+        ancestors,
+        parent_ch_advance,
+    );
+    apply_typographic_pseudo_rules_with_parent_ch_advance(
+        style,
+        current,
+        stylesheets,
+        ancestors,
+        parent_ch_advance,
+    );
+}
+
+pub(super) fn apply_marker_rules_with_parent_ch_advance(
+    style: &mut ComputedStyle,
+    current: &ElementSignature,
+    stylesheets: &[Stylesheet],
+    ancestors: &[ElementSignature],
+    parent_ch_advance: f32,
 ) {
     let mut matching_rules = Vec::new();
     let layer_order = global_layer_order(stylesheets);
@@ -467,10 +547,11 @@ pub(super) fn apply_marker_rules(
         );
     }
     sort_cascaded_declarations(&mut cascaded_declarations);
-    apply_cascaded_marker_declarations_with_inheritance_source(
+    apply_cascaded_marker_declarations_with_inheritance_source_and_parent_ch_advance(
         &mut marker_style,
         &cascaded_declarations,
         &inheritance_source,
+        parent_ch_advance,
     );
     marker_style
         .quotes
@@ -478,33 +559,40 @@ pub(super) fn apply_marker_rules(
     style.marker_style = Some(Box::new(marker_style));
 }
 
-pub(super) fn apply_generated_pseudo_rules(
+pub(super) fn apply_generated_pseudo_rules_with_parent_ch_advance(
     style: &mut ComputedStyle,
     current: &ElementSignature,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    parent_ch_advance: f32,
 ) {
-    style.before_style = generated_pseudo_style(
+    style.before_style = generated_pseudo_style_with_parent_ch_advance(
         style,
         current,
         stylesheets,
         ancestors,
         |stylesheet| &stylesheet.before_rules,
+        parent_ch_advance,
     )
     .map(Box::new);
-    style.after_style =
-        generated_pseudo_style(style, current, stylesheets, ancestors, |stylesheet| {
-            &stylesheet.after_rules
-        })
-        .map(Box::new);
+    style.after_style = generated_pseudo_style_with_parent_ch_advance(
+        style,
+        current,
+        stylesheets,
+        ancestors,
+        |stylesheet| &stylesheet.after_rules,
+        parent_ch_advance,
+    )
+    .map(Box::new);
 }
 
-pub(super) fn generated_pseudo_style(
+pub(super) fn generated_pseudo_style_with_parent_ch_advance(
     originating_style: &ComputedStyle,
     current: &ElementSignature,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
     rule_set: fn(&Stylesheet) -> &[StyleRule],
+    parent_ch_advance: f32,
 ) -> Option<ComputedStyle> {
     let mut matching_rules = Vec::new();
     let layer_order = global_layer_order(stylesheets);
@@ -555,10 +643,11 @@ pub(super) fn generated_pseudo_style(
         );
     }
     sort_cascaded_declarations(&mut cascaded_declarations);
-    apply_cascaded_declarations_with_inheritance_source(
+    apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance(
         &mut pseudo_style,
         &cascaded_declarations,
         &inheritance_source,
+        parent_ch_advance,
     );
     pseudo_style
         .quotes
@@ -566,11 +655,12 @@ pub(super) fn generated_pseudo_style(
     pseudo_style.content.is_generated().then_some(pseudo_style)
 }
 
-pub(super) fn apply_typographic_pseudo_rules(
+pub(super) fn apply_typographic_pseudo_rules_with_parent_ch_advance(
     style: &mut ComputedStyle,
     current: &ElementSignature,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
+    parent_ch_advance: f32,
 ) {
     style.first_line_style = typographic_pseudo_style(
         style,
@@ -579,6 +669,7 @@ pub(super) fn apply_typographic_pseudo_rules(
         ancestors,
         |stylesheet| &stylesheet.first_line_rules,
         is_first_line_allowed_property,
+        parent_ch_advance,
     )
     .map(Box::new);
     style.first_letter_style = typographic_pseudo_style(
@@ -588,6 +679,7 @@ pub(super) fn apply_typographic_pseudo_rules(
         ancestors,
         |stylesheet| &stylesheet.first_letter_rules,
         is_first_letter_allowed_property,
+        parent_ch_advance,
     )
     .map(Box::new);
 }
@@ -599,6 +691,7 @@ pub(super) fn typographic_pseudo_style(
     ancestors: &[ElementSignature],
     rule_set: fn(&Stylesheet) -> &[StyleRule],
     allows_property: fn(&str) -> bool,
+    parent_ch_advance: f32,
 ) -> Option<ComputedStyle> {
     let mut matching_rules = Vec::new();
     let layer_order = global_layer_order(stylesheets);
@@ -652,10 +745,11 @@ pub(super) fn typographic_pseudo_style(
     cascaded_declarations.retain(|declaration| {
         declaration.name.starts_with("--") || allows_property(declaration.name.as_ref())
     });
-    apply_cascaded_declarations_with_inheritance_source(
+    apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance(
         &mut pseudo_style,
         &cascaded_declarations,
         &inheritance_source,
+        parent_ch_advance,
     );
     pseudo_style
         .quotes

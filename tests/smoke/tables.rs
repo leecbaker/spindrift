@@ -1,5 +1,35 @@
 use super::*;
 
+fn assert_green_100px_square(document: &quire::Document) {
+    let green = document.pages[0]
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("expected a green canvas background");
+
+    assert!(
+        (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
+        "expected a 100 CSS px green square, got {green:?}"
+    );
+}
+
+fn rect_covers(covering: &quire::RenderedRect, covered: &quire::RenderedRect) -> bool {
+    covering.x() <= covered.x() + 0.01
+        && covering.y() <= covered.y() + 0.01
+        && covering.x() + covering.width() >= covered.x() + covered.width() - 0.01
+        && covering.y() + covering.height() >= covered.y() + covered.height() - 0.01
+}
+
+fn largest_filled_rect(page: &quire::Page, color: Color) -> &quire::RenderedRect {
+    page.rects
+        .iter()
+        .filter(|rect| rect.fill == Some(color))
+        .max_by(|left, right| {
+            (left.width() * left.height()).total_cmp(&(right.width() * right.height()))
+        })
+        .unwrap_or_else(|| panic!("expected {color:?} rectangle among {:?}", page.rects))
+}
+
 #[tokio::test]
 async fn renders_basic_tables_in_rows_and_columns() {
     let document = Html::from_string(
@@ -16,6 +46,225 @@ async fn renders_basic_tables_in_rows_and_columns() {
     assert!(document.pages[0].lines[2].y() < document.pages[0].lines[0].y());
     assert_eq!(document.pages[0].rects[0].fill, Some(Color::BLACK));
     assert_eq!(document.pages[0].rects[0].stroke, None);
+}
+
+#[tokio::test]
+async fn vertical_upright_ch_units_size_table_rows_like_vertical_reference() {
+    let document = Html::from_string(
+        r#"
+        <style>
+        @page { size: 240pt 240pt; margin: 0 }
+        body { margin: 0 }
+        table {
+          font-size: 20px;
+          border-collapse: collapse;
+          border: none;
+        }
+        td {
+          padding: 0;
+          background: green;
+          height: 5ch;
+        }
+        tr {
+          writing-mode: vertical-rl;
+          text-orientation: upright;
+          line-height: 5ch;
+        }
+        div {
+          font-size: 20px;
+          color: transparent;
+        }
+        div:nth-of-type(1) {
+          background: blue;
+          writing-mode: vertical-rl;
+          text-orientation: upright;
+          width: 5ch;
+        }
+        div:nth-of-type(2) {
+          background: orange;
+          height: 5ch;
+          display: inline-block;
+        }
+        </style>
+        <table><tbody><tr><td>&nbsp;</td></tr></tbody></table>
+        <div>00000</div>
+        <div>00000</div>
+        "#,
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = largest_filled_rect(page, Color::new(0, 128, 0));
+    let blue = largest_filled_rect(page, Color::new(0, 0, 255));
+    let orange = largest_filled_rect(page, Color::new(255, 165, 0));
+
+    for (name, rect) in [("green", green), ("blue", blue), ("orange", orange)] {
+        assert!(
+            (rect.width() - rect.height()).abs() < 0.5,
+            "{name} rect should be square: {rect:?}"
+        );
+    }
+    assert!(
+        (green.width() - blue.width()).abs() < 0.5,
+        "green should match vertical blue reference: green={green:?}, blue={blue:?}"
+    );
+    assert!(
+        (orange.width() - blue.width()).abs() > 1.0,
+        "orange horizontal ch reference should differ from blue vertical reference: orange={orange:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn sideways_vertical_ch_units_size_table_columns_like_sideways_reference() {
+    let document = Html::from_string(
+        r#"
+        <style>
+        @page { size: 240pt 240pt; margin: 0 }
+        body { margin: 0 }
+        table {
+          font-size: 20px;
+          border-collapse: collapse;
+          border: none;
+        }
+        td {
+          padding: 0;
+          background: green;
+          height: 5ch;
+          writing-mode: vertical-rl;
+          text-orientation: upright;
+        }
+        col {
+          writing-mode: vertical-rl;
+          text-orientation: sideways;
+          width: 5ch;
+        }
+        div {
+          font-size: 20px;
+          color: transparent;
+        }
+        div:nth-of-type(1) {
+          background: blue;
+          height: 5ch;
+          display: inline-block;
+        }
+        div:nth-of-type(2) {
+          background: orange;
+          writing-mode: vertical-rl;
+          text-orientation: upright;
+          width: 5ch;
+        }
+        </style>
+        <table><col><tbody><tr><td>&nbsp;</td></tr></tbody></table>
+        <div>00000</div>
+        <div>00000</div>
+        "#,
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = largest_filled_rect(page, Color::new(0, 128, 0));
+    let blue = largest_filled_rect(page, Color::new(0, 0, 255));
+    let orange = largest_filled_rect(page, Color::new(255, 165, 0));
+
+    for (name, rect) in [("green", green), ("blue", blue), ("orange", orange)] {
+        assert!(
+            (rect.width() - rect.height()).abs() < 0.5,
+            "{name} rect should be square: {rect:?}"
+        );
+    }
+    assert!(
+        (green.width() - blue.width()).abs() < 0.5,
+        "green should match sideways blue reference: green={green:?}, blue={blue:?}"
+    );
+    assert!(
+        (orange.width() - blue.width()).abs() > 1.0,
+        "orange upright ch reference should differ from blue sideways reference: orange={orange:?}, blue={blue:?}"
+    );
+}
+
+#[tokio::test]
+async fn table_cell_second_pass_resolves_percentage_height_canvas() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 160pt; margin: 10pt } body { margin: 0 }</style>\
+         <div style=\"display: table; border-spacing: 0\">\
+           <div style=\"display: table-cell; height: 50px; padding: 0\">\
+             <div></div>\
+             <canvas width=\"1\" height=\"1\" style=\"height: 200%; background: green\"></canvas>\
+           </div>\
+           <div style=\"display: table-cell; padding: 0\">\
+             <div style=\"height: 100px\"></div>\
+           </div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_green_100px_square(&document);
+}
+
+#[tokio::test]
+async fn table_cell_second_pass_uses_final_height_for_overflow_auto_min_height_child() {
+    let document = Html::from_string(
+        "<style>@page{size:160pt 160pt;margin:0}body{margin:0}.list-div{overflow-y:auto;height:100%;width:100px;min-height:100px;background:green}#redSquare{height:100px;width:100px;background:red;position:absolute;z-index:-1}</style>\
+         <div id=\"redSquare\"></div><div style=\"display:table;border-spacing:0\"><div style=\"display:table-cell;height:50px;padding:0\"><div class=\"list-div\"></div></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("percentage-height overflow child should paint");
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("positioned red reference square should paint behind green");
+
+    assert!(
+        (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
+        "expected green child to fill the 100 CSS px reference square, got {green:?}"
+    );
+    assert!(
+        rect_covers(green, red),
+        "green square should fully cover the red reference: green={green:?}, red={red:?}"
+    );
+}
+
+#[tokio::test]
+async fn table_cell_first_pass_treats_percent_height_child_as_auto() {
+    let document = Html::from_string(
+        "<style>@page{size:120pt 120pt;margin:0}body{margin:0}.cell{display:table-cell;padding:0;background:red}.child{height:200%;width:20px;background:green}.grand{height:20px}</style>\
+         <div style=\"display:table;border-spacing:0\"><div class=\"cell\"><div class=\"child\"><div class=\"grand\"></div></div></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("table-cell background should paint");
+    let _green = page
+        .rects
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("percentage-height child should paint");
+
+    assert!(
+        (red.height() - 15.0).abs() < 0.01,
+        "percentage height must not inflate the first-pass row minimum: red={red:?}"
+    );
 }
 
 #[tokio::test]
@@ -215,6 +464,83 @@ async fn vertical_table_cell_align_content_overflow_uses_axis_aware_defaults() {
         red[1],
         green[1]
     );
+}
+
+#[tokio::test]
+async fn vertical_writing_table_baseline_alignment_does_not_expand_content_box() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <title>Table Baseline Alignment in Vertical Writing Mode</title>\
+         <style>\
+         @page { size: 220pt 320pt; margin: 10pt }\
+         body { margin: 0 }\
+         table, tr, td {\
+           border: 1px solid;\
+           border-width: 1px 2px 3px 4px;\
+           padding: 5px 6px 7px 8px;\
+           border-spacing: 0;\
+         }\
+         td {\
+           vertical-align: baseline;\
+           background: red;\
+           background-clip: content-box;\
+         }\
+         div {\
+           width: 50px;\
+           height: 100px;\
+           background: green;\
+         }\
+         </style>\
+         <table style=\"writing-mode: vertical-lr\"><tr>\
+         <td><div></div></td><td><div></div></td>\
+         </tr></table>\
+         <table style=\"writing-mode: vertical-rl\"><tr>\
+         <td><div></div></td><td><div></div></td>\
+         </tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let mut red = page
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .collect::<Vec<_>>();
+    red.sort_by(|left, right| {
+        right
+            .y()
+            .total_cmp(&left.y())
+            .then_with(|| left.x().total_cmp(&right.x()))
+    });
+    let mut green = page
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .collect::<Vec<_>>();
+    green.sort_by(|left, right| {
+        right
+            .y()
+            .total_cmp(&left.y())
+            .then_with(|| left.x().total_cmp(&right.x()))
+    });
+
+    assert_eq!(
+        red.len(),
+        4,
+        "expected four content-box backgrounds: {red:?}"
+    );
+    assert_eq!(green.len(), 4, "expected four block children: {green:?}");
+    for (red, green) in red.iter().zip(green.iter()) {
+        assert!(
+            (red.x() - green.x()).abs() < 0.01
+                && (red.y() - green.y()).abs() < 0.01
+                && (red.width() - green.width()).abs() < 0.01
+                && (red.height() - green.height()).abs() < 0.01,
+            "vertical-writing baseline alignment should not expose red excess: red={red:?}, green={green:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2014,11 +2340,25 @@ async fn html_display_table_shrink_wraps_body_inline_blocks() {
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)) && rect.height() < rect.width())
         .collect::<Vec<_>>();
+    let table_horizontal_border = green_horizontal_borders
+        .iter()
+        .find(|rect| (rect.width() - 225.0).abs() < 0.5)
+        .unwrap_or_else(|| panic!("{green_horizontal_borders:?}"));
     assert!(
-        green_horizontal_borders
+        (table_horizontal_border.x() - 137.5).abs() < 0.5,
+        "{table_horizontal_border:?}"
+    );
+
+    let green_vertical_borders = document.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)) && rect.width() < rect.height())
+        .collect::<Vec<_>>();
+    assert!(
+        green_vertical_borders
             .iter()
-            .any(|rect| (rect.width() - 225.0).abs() < 0.5),
-        "{green_horizontal_borders:?}"
+            .any(|rect| (rect.height() - 240.0).abs() < 0.5),
+        "{green_vertical_borders:?}"
     );
 }
 
@@ -2072,12 +2412,12 @@ async fn captions_and_abspos_descendants() {
         "<!DOCTYPE html><meta charset=\"utf-8\">\
          <style>\
          @page { size: 140px 120px; margin: 0 } body { margin: 0 }\
-         table { position: relative; margin: 0 0 0 20px; border-spacing: 0 }\
+         table { margin: 0 0 0 20px; border-spacing: 0 }\
          caption, .cap-fill { height: 100px; width: 50px; background: green; margin: 0; padding: 0 }\
          #redSquare { position: absolute; z-index: -1; left: 20px; top: 0; height: 100px; width: 100px; background: red }\
          </style>\
          <div id=\"redSquare\"></div>\
-         <table><caption><div class=\"cap-fill\" style=\"position: absolute; left: 50px\"></div></caption></table>",
+         <table><caption style=\"position: relative\"><div class=\"cap-fill\" style=\"position: absolute; left: 50px\"></div></caption></table>",
     )
     .render_async(&RenderOptions::default())
     .await
@@ -5002,6 +5342,50 @@ async fn collapsed_table_cell_border_beats_column_border_at_same_edge() {
 
     assert_eq!(blue_edges, 1);
     assert_eq!(red_edges, 0);
+}
+
+#[tokio::test]
+async fn collapsed_table_column_and_column_group_edges_beat_table_edges() {
+    let document = Html::from_string(
+        "<style>@page{size:160pt 120pt;margin:0}body{margin:0}\
+         table{border-collapse:collapse;width:20pt;margin:0 0 10pt 0;border:4pt solid red}\
+         td{padding:0;width:20pt;height:20pt;font-size:0;line-height:0}\
+         .column col,.group colgroup{border:4pt solid green}</style>\
+         <table class=\"column\"><col><tr><td></td></tr></table>\
+         <table class=\"group\"><colgroup></colgroup><tr><td></td></tr></table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green_horizontal_edges = page
+        .rects
+        .iter()
+        .filter(|rect| {
+            rect.fill == Some(Color::new(0, 128, 0))
+                && (rect.height() - 4.0).abs() < 0.01
+                && rect.width() > 20.0
+        })
+        .count();
+    let green_vertical_edges = page
+        .rects
+        .iter()
+        .filter(|rect| {
+            rect.fill == Some(Color::new(0, 128, 0))
+                && (rect.width() - 4.0).abs() < 0.01
+                && rect.height() > 20.0
+        })
+        .count();
+
+    assert_eq!(green_horizontal_edges, 4);
+    assert_eq!(green_vertical_edges, 4);
+    assert!(
+        page.rects
+            .iter()
+            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+        "column and column-group borders should win over table borders on every edge"
+    );
 }
 
 #[tokio::test]

@@ -441,9 +441,9 @@ fn split_background_layer_values(value: &str) -> Vec<&str> {
 
 /// Parses the supported `linear-gradient()` subset.
 ///
-/// CSS Images permits angles, corners, interpolation hints, percentages, and
-/// omitted positions. The current subset accepts `to top/right/bottom/left`
-/// with explicit length stops, which covers WPT hard-stop print references:
+/// CSS Images permits angles, corners, interpolation hints, and omitted
+/// positions. The current subset accepts `to top/right/bottom/left` with
+/// explicit length-percentage stops, which covers hard-stop print references:
 /// <https://www.w3.org/TR/css-images-3/#linear-gradients>.
 pub(crate) fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     let value = trim_css_value(value);
@@ -482,7 +482,7 @@ fn parse_gradient_color_stop(value: &str) -> Option<GradientColorStop> {
     if parts.len() < 2 {
         return None;
     }
-    let position = parse_length(parts.pop()?)?;
+    let position = parse_computed_length_percentage(parts.pop()?, ROOT_FONT_SIZE_PT)?;
     let color_text = parts.join(" ");
     let color = parse_color(&color_text)?;
     Some(GradientColorStop { color, position })

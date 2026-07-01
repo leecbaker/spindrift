@@ -110,7 +110,7 @@ pub(crate) fn apply_border(value: &str, style: &mut ComputedStyle, side: Option<
     for part in split_css_component_values(value) {
         let mut recognized = false;
         if width.is_none() {
-            width = parse_border_width_with_font_size(part, style.font_size);
+            width = parse_computed_border_width(part, style.font_size);
             recognized |= width.is_some();
         }
         if border_style.is_none() {
@@ -126,7 +126,7 @@ pub(crate) fn apply_border(value: &str, style: &mut ComputedStyle, side: Option<
         }
     }
 
-    let width = width.unwrap_or(3.0 * CSS_PX_TO_PT);
+    let width = width.unwrap_or(ComputedLengthPercentage::from_length(3.0 * CSS_PX_TO_PT));
     let border_style = border_style.unwrap_or(BorderStyle::None);
     let color = color.unwrap_or(style.color);
 
@@ -135,8 +135,10 @@ pub(crate) fn apply_border(value: &str, style: &mut ComputedStyle, side: Option<
         set_border_side_style_value(style, side, border_style);
         set_border_side_color(style, side, color);
     } else {
-        style.border_width = width;
-        style.border_widths = edge_all(width);
+        let used_width = used_nonnegative_length(width);
+        style.border_width = used_width;
+        style.border_widths = edge_all(used_width);
+        style.border_width_values = CssEdges::all(width);
         style.border_styles = border_styles_all(border_style);
         style.border_color = color;
         style.border_colors = border_colors_all(color);
@@ -173,16 +175,55 @@ pub(crate) fn apply_logical_border_axis(value: &str, style: &mut ComputedStyle, 
     }
 }
 
-pub(crate) fn parse_border_width(value: &str) -> Option<f32> {
-    parse_border_width_with_font_size(value, ROOT_FONT_SIZE_PT)
+pub(crate) fn parse_border_width_with_font_size(value: &str, font_size: f32) -> Option<f32> {
+    parse_computed_border_width(value, font_size)?.length_if_no_percent()
 }
 
-pub(crate) fn parse_border_width_with_font_size(value: &str, font_size: f32) -> Option<f32> {
+pub(crate) fn parse_computed_border_width(
+    value: &str,
+    font_size: f32,
+) -> Option<ComputedLengthPercentage> {
     match trim_css_value(value).to_ascii_lowercase().as_str() {
-        "thin" => Some(CSS_PX_TO_PT),
-        "medium" => Some(3.0 * CSS_PX_TO_PT),
-        "thick" => Some(5.0 * CSS_PX_TO_PT),
-        _ => parse_length_with_font_size(value, font_size),
+        "thin" => Some(ComputedLengthPercentage::from_length(CSS_PX_TO_PT)),
+        "medium" => Some(ComputedLengthPercentage::from_length(3.0 * CSS_PX_TO_PT)),
+        "thick" => Some(ComputedLengthPercentage::from_length(5.0 * CSS_PX_TO_PT)),
+        _ => {
+            let length = parse_computed_length_percentage(value, font_size)?;
+            (length.percent == 0.0 && !length_percentage_is_definitely_negative(length))
+                .then_some(length)
+        }
+    }
+}
+
+pub(crate) fn parse_border_width_edges(
+    value: &str,
+    font_size: f32,
+) -> Option<CssEdges<ComputedLengthPercentage>> {
+    let values = split_css_component_values(value)
+        .into_iter()
+        .map(|part| parse_computed_border_width(part, font_size))
+        .collect::<Option<Vec<_>>>()?;
+    match values.as_slice() {
+        [all] => Some(CssEdges::all(*all)),
+        [vertical, horizontal] => Some(CssEdges {
+            top: *vertical,
+            right: *horizontal,
+            bottom: *vertical,
+            left: *horizontal,
+        }),
+        [top, horizontal, bottom] => Some(CssEdges {
+            top: *top,
+            right: *horizontal,
+            bottom: *bottom,
+            left: *horizontal,
+        }),
+        [top, right, bottom, left] => Some(CssEdges {
+            top: *top,
+            right: *right,
+            bottom: *bottom,
+            left: *left,
+        }),
+        _ => None,
     }
 }
 
@@ -191,10 +232,13 @@ pub(crate) fn parse_border_width_with_font_size(value: &str, font_size: f32) -> 
 /// CSS Logical Properties defines `border-block-width` and
 /// `border-inline-width` as two-value shorthands for start/end widths:
 /// <https://www.w3.org/TR/css-logical-1/#border-shorthands>.
-pub(crate) fn parse_logical_border_widths(value: &str, font_size: f32) -> Option<[f32; 2]> {
+pub(crate) fn parse_logical_border_widths(
+    value: &str,
+    font_size: f32,
+) -> Option<[ComputedLengthPercentage; 2]> {
     let values = split_css_component_values(value)
         .into_iter()
-        .map(|part| parse_border_width_with_font_size(part, font_size))
+        .map(|part| parse_computed_border_width(part, font_size))
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
         [all] => Some([*all, *all]),
@@ -604,11 +648,10 @@ pub(crate) fn parse_border_image_outset(value: &str, font_size: f32) -> Option<B
 fn parse_border_image_outset_value(value: &str, font_size: f32) -> Option<BorderImageOutsetValue> {
     parse_non_negative_number(value)
         .map(BorderImageOutsetValue::Number)
-        .or_else(|| parse_length(value).map(BorderImageOutsetValue::Length))
         .or_else(|| {
             parse_computed_length_percentage(value, font_size).and_then(|value| {
-                (value.percent == 0.0 && value.ch == 0.0)
-                    .then_some(BorderImageOutsetValue::Length(value.length))
+                (value.percent == 0.0 && !length_percentage_is_definitely_negative(value))
+                    .then_some(BorderImageOutsetValue::Length(value))
             })
         })
 }
@@ -945,16 +988,24 @@ pub(crate) fn parse_radius_components(value: &str, font_size: f32) -> Option<Edg
 }
 
 pub(crate) fn parse_radius_value(value: &str, font_size: f32) -> Option<CssRadius> {
-    if let Some(percent) = parse_percentage(value) {
-        return Some(CssRadius {
-            length: 0.0,
-            percent,
-        });
-    }
-    parse_length_with_font_size(value, font_size).map(|length| CssRadius {
-        length: length.max(0.0),
-        percent: 0.0,
-    })
+    let value = parse_computed_length_percentage(value, font_size)?;
+    (!length_percentage_is_definitely_negative(value)).then_some(CssRadius { value })
+}
+
+fn length_percentage_is_definitely_negative(value: ComputedLengthPercentage) -> bool {
+    let components = [
+        value.length,
+        value.percent,
+        value.ch,
+        value.vw,
+        value.vh,
+        value.vmin,
+        value.vmax,
+        value.vi,
+        value.vb,
+    ];
+    components.iter().any(|component| *component < 0.0)
+        && components.iter().all(|component| *component <= 0.0)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -965,14 +1016,38 @@ pub(crate) struct EdgesOf<T> {
     left: T,
 }
 
-pub(crate) fn set_border_side_width(style: &mut ComputedStyle, side: BorderSide, length: f32) {
+fn used_nonnegative_length(value: ComputedLengthPercentage) -> f32 {
+    value
+        .length_if_no_percent()
+        .unwrap_or(value.length)
+        .max(0.0)
+}
+
+pub(crate) fn set_border_side_width(
+    style: &mut ComputedStyle,
+    side: BorderSide,
+    length: ComputedLengthPercentage,
+) {
+    let used = used_nonnegative_length(length);
     match side {
-        BorderSide::Top => style.border_widths.top = length,
-        BorderSide::Right => style.border_widths.right = length,
-        BorderSide::Bottom => style.border_widths.bottom = length,
-        BorderSide::Left => style.border_widths.left = length,
+        BorderSide::Top => {
+            style.border_width_values.top = length;
+            style.border_widths.top = used;
+        }
+        BorderSide::Right => {
+            style.border_width_values.right = length;
+            style.border_widths.right = used;
+        }
+        BorderSide::Bottom => {
+            style.border_width_values.bottom = length;
+            style.border_widths.bottom = used;
+        }
+        BorderSide::Left => {
+            style.border_width_values.left = length;
+            style.border_widths.left = used;
+        }
     }
-    style.border_width = style.border_width.max(length);
+    style.border_width = max_edge(style.border_widths);
 }
 
 pub(crate) fn set_border_side_style(style: &mut ComputedStyle, side: BorderSide, value: &str) {

@@ -6,15 +6,15 @@ use crate::css::{
     CounterStyleSystem, CssBookmarkState, Declarations, Direction, Display, DisplayInner,
     DominantBaseline, ElementAttributeSignature, ElementSiblingSignature, ElementSignature,
     EmptyCells, FilterValue, FlexDirection, FlexWrap, Float, GeneratedAltTextPart,
-    GeneratedContentPart, GeneratedQuote, Isolation, JustifyContent, LinearGradientDirection,
-    ListStylePosition, ListStyleType, MarkerContent, MarkerContentPart, MarkerSide, MaskValue,
-    MixBlendMode, NamedStringPart, NumericCounterStyle, PageBreak, PageRule, PageSpecificity,
-    PhysicalAxis, PhysicalSide, Position, Quotes, SelfAlignmentKeyword, Stylesheet,
-    StylesheetOrigin, TableCellVerticalAlign, TableLayout, TextAlign, TextAlignLast, TextAutospace,
-    TextDecorationSkipInk, TextDecorationSkipSpaces, TextDecorationStyle, TextDecorationThickness,
-    TextJustify, TextTransformCase, TextUnderlineOffset, TextUnderlinePosition, UnicodeBidi,
-    VerticalAlign, Visibility, WhiteSpace, WritingMode, block_end_side, block_start_side,
-    inline_end_side, inline_start_side,
+    GeneratedContentPart, GeneratedQuote, Isolation, JustifyContent, JustifyItems, JustifySelf,
+    LinearGradientDirection, ListStylePosition, ListStyleType, MarkerContent, MarkerContentPart,
+    MarkerSide, MaskValue, MixBlendMode, NamedStringPart, NumericCounterStyle, PageBreak, PageRule,
+    PageSpecificity, PhysicalAxis, PhysicalSide, Position, Quotes, SelfAlignmentKeyword,
+    Stylesheet, StylesheetOrigin, TableCellVerticalAlign, TableLayout, TextAlign, TextAlignLast,
+    TextAutospace, TextDecorationSkipInk, TextDecorationSkipSpaces, TextDecorationStyle,
+    TextDecorationThickness, TextJustify, TextTransformCase, TextUnderlineOffset,
+    TextUnderlinePosition, UnicodeBidi, VerticalAlign, Visibility, WhiteSpace, WritingMode,
+    block_end_side, block_start_side, inline_end_side, inline_start_side,
 };
 use crate::document::{
     Bookmark, BookmarkState, Document, DocumentMetadata, Page, PaintBand, PaintBlendMode,
@@ -424,7 +424,7 @@ fn layout_text_with_font_system(
 ) -> Document {
     let mut default_style = ComputedStyle::initial();
     default_style.font_size = options.font_size;
-    default_style.line_height_value = css::ComputedLineHeight::Length(options.line_height);
+    default_style.line_height_value = css::ComputedLineHeight::from_length(options.line_height);
     default_style.line_height = options.line_height;
     default_style.line_height_multiplier = None;
     default_style.line_height_is_normal = false;
@@ -514,22 +514,22 @@ pub(crate) async fn layout_dom_async(
     let _timer = DebugTimer::start("layout pipeline");
     let parent_style = ComputedStyle {
         font_size: options.font_size,
-        line_height_value: css::ComputedLineHeight::Length(options.line_height),
+        line_height_value: css::ComputedLineHeight::from_length(options.line_height),
         line_height: options.line_height,
         color: Color::BLACK,
         ..ComputedStyle::initial()
     };
+    let mut font_system = {
+        let _timer = DebugTimer::start("finishing font system load");
+        font_system_load.finish().await
+    };
     let page_progression_direction = {
         let _timer = DebugTimer::start("resolving page progression direction");
-        document_page_progression_direction(root, stylesheets, &parent_style)
+        document_page_progression_direction(root, stylesheets, &parent_style, &mut font_system)
     };
     let page_counter_initial_values = {
         let _timer = DebugTimer::start("resolving page counter seeds");
-        page_counter_initial_values(root, stylesheets, &parent_style)
-    };
-    let font_system = {
-        let _timer = DebugTimer::start("finishing font system load");
-        font_system_load.finish().await
+        page_counter_initial_values(root, stylesheets, &parent_style, &mut font_system)
     };
     let worker_result = {
         let _timer = DebugTimer::start("building and flowing page box content");
@@ -538,9 +538,15 @@ pub(crate) async fn layout_dom_async(
                 .name("quire-layout".to_string())
                 .stack_size(LAYOUT_THREAD_STACK_SIZE)
                 .spawn_scoped(scope, move || {
+                    let mut font_system = font_system;
                     let mut page_box = {
                         let _timer = DebugTimer::start("building formatting box tree");
-                        box_tree::build_page_box(root, stylesheets, &parent_style)
+                        box_tree::build_page_box_with_font_metrics(
+                            root,
+                            stylesheets,
+                            &parent_style,
+                            &mut font_system,
+                        )
                     };
                     let mut builder = LayoutBuilder::new(LayoutBuilderConfig {
                         options,
@@ -605,6 +611,7 @@ fn document_page_progression_direction(
     root: &Node,
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
+    font_system: &mut FontSystem,
 ) -> Direction {
     let NodeKind::Element(root_element) = &root.kind else {
         return parent_style.direction;
@@ -621,8 +628,15 @@ fn document_page_progression_direction(
             element_index,
             sibling_tags.clone(),
         );
-        let style =
-            style_for_layout_element(element, signature, stylesheets, Some(parent_style), &[]);
+        let parent_ch_advance = font_system.ch_advance(parent_style);
+        let style = style_for_layout_element_with_parent_ch_advance(
+            element,
+            signature,
+            stylesheets,
+            Some(parent_style),
+            &[],
+            parent_ch_advance,
+        );
         return style.direction;
     }
     parent_style.direction
@@ -639,6 +653,7 @@ fn page_counter_initial_values(
     root: &Node,
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
+    font_system: &mut FontSystem,
 ) -> HashMap<String, i32> {
     let NodeKind::Element(root_element) = &root.kind else {
         return HashMap::new();
@@ -653,12 +668,14 @@ fn page_counter_initial_values(
         .unwrap_or(root_element);
     let signature =
         ElementSignature::new(counter_element.tag.clone(), counter_element.attrs.clone());
-    let style = style_for_layout_element(
+    let parent_ch_advance = font_system.ch_advance(parent_style);
+    let style = style_for_layout_element_with_parent_ch_advance(
         counter_element,
         signature,
         stylesheets,
         Some(parent_style),
         &[],
+        parent_ch_advance,
     );
     let mut values = HashMap::new();
     for (name, value) in style.counter_resets {
@@ -692,12 +709,13 @@ struct LayoutBuilder<'a> {
     root_canvas_background_defined: bool,
     current_page: Page,
     current_page_has_flow_content: bool,
+    last_block_layout_outcome: BlockLayoutOutcome,
     current_page_name: Option<String>,
     current_page_context: PageContext,
     cursor_y: f32,
     content_left: f32,
     content_right: f32,
-    inline_static_baseline_y: Option<f32>,
+    inline_static_position: Option<InlineStaticPosition>,
     block_static_position_y_offset: Option<f32>,
     containing_block_direction: Direction,
     containing_block_writing_mode: WritingMode,
@@ -706,6 +724,7 @@ struct LayoutBuilder<'a> {
     truncate_page_start_margins: bool,
     avoid_inside_retry_depth: usize,
     out_of_flow_prebreak_suppression_depth: usize,
+    element_side_effect_suppression_depth: usize,
     containing_blocks: Vec<ContainingBlock>,
     list_stack: Vec<ListState>,
     counter_set: CounterSet,
@@ -734,6 +753,17 @@ struct LayoutBuilder<'a> {
     pending_float_side_effects: Vec<PendingFloatSideEffects>,
     applied_clearance_count: usize,
     preserve_scoped_paint_public_order: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct BlockLayoutOutcome {
+    consumed_bottom_margin: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BlockEndMarginCollapse {
+    child_consumed_margin: f32,
+    collapsed_margin: f32,
 }
 
 struct LayoutBuilderConfig<'a> {
@@ -819,6 +849,27 @@ struct FloatShape {
 }
 
 impl FloatShape {
+    fn from_rect(
+        id: FloatId,
+        specified_side: Float,
+        side: UsedFloatSide,
+        source_order: usize,
+        page_index: usize,
+        rect: PageTopRect,
+    ) -> Self {
+        Self {
+            id,
+            specified_side,
+            side,
+            source_order,
+            fragment_index: 0,
+            starts_on_previous_page: false,
+            continues_on_next_page: false,
+            page_index,
+            rect,
+        }
+    }
+
     fn from_fragment(fragment: &FloatPaintFragment) -> Self {
         Self {
             id: fragment.id,
@@ -1614,6 +1665,12 @@ struct DefinitionListColumnItem<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct InlineStaticPosition {
+    start_x: f32,
+    baseline_y: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct InlineLineMetrics {
     width: f32,
     height: f32,
@@ -1646,6 +1703,7 @@ struct PreparedInlineLine {
 /// same baseline, and atomic inline boxes paint as indivisible margin boxes:
 /// <https://www.w3.org/TR/CSS22/zindex.html> and
 /// <https://www.w3.org/TR/css-inline-3/#model>.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 enum PreparedInlinePaintItem {
     FragmentBackground(PreparedInlineFragment),
@@ -2032,6 +2090,17 @@ enum InlineAtomContent {
     Svg {
         fill: Color,
     },
+    /// Non-painting inline-level placeholder for an out-of-flow positioned box.
+    ///
+    /// CSS Positioned Layout resolves auto insets from the static-position
+    /// rectangle, the hypothetical normal-flow position the box would have
+    /// occupied before being taken out of flow. Inline layout carries this atom
+    /// only through temporary line selection and preparation so forced breaks,
+    /// wrapping, line metrics, and inline alignment choose the correct
+    /// static-position rectangle; it must never paint:
+    /// <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height> and
+    /// <https://www.w3.org/TR/css-position-3/#staticpos-rect>.
+    StaticPositionPlaceholder,
     InlineBox {
         sequence: inline_layout::InlineLineSequence,
     },
@@ -2040,9 +2109,32 @@ enum InlineAtomContent {
     Leader(String),
 }
 
+/// One owned inline box edge fragment carried through inline layout.
+///
+/// CSS 2.2 includes inline-axis margin, border, and padding at the start and
+/// end of inline boxes, and negative margins reduce the advance without
+/// removing border or padding paint. Split inline boxes also own only the
+/// relevant start/end decoration under `box-decoration-break: slice`:
+/// <https://www.w3.org/TR/CSS22/box.html#margin-properties>,
+/// <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>, and
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct InlineBoxEdgeFragment {
+    logical_edge: InlineLogicalEdge,
+    physical_side: PhysicalSide,
+    advance: f32,
+    paint_extent: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineLogicalEdge {
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum InlineEdgeRole {
-    BoxEdge,
+    BoxEdge(InlineBoxEdgeFragment),
     TextAutospace,
 }
 
@@ -2052,7 +2144,7 @@ impl InlineAtomContent {
     }
 
     fn is_box_edge(&self) -> bool {
-        matches!(self, Self::InlineEdge(InlineEdgeRole::BoxEdge))
+        matches!(self, Self::InlineEdge(InlineEdgeRole::BoxEdge(_)))
     }
 }
 
@@ -2101,12 +2193,13 @@ struct LayoutSnapshot {
     root_canvas_background_defined: bool,
     current_page: Page,
     current_page_has_flow_content: bool,
+    last_block_layout_outcome: BlockLayoutOutcome,
     current_page_name: Option<String>,
     current_page_context: PageContext,
     cursor_y: f32,
     content_left: f32,
     content_right: f32,
-    inline_static_baseline_y: Option<f32>,
+    inline_static_position: Option<InlineStaticPosition>,
     block_static_position_y_offset: Option<f32>,
     containing_block_writing_mode: WritingMode,
     fragment_top_offsets: Vec<f32>,
@@ -2114,6 +2207,7 @@ struct LayoutSnapshot {
     truncate_page_start_margins: bool,
     avoid_inside_retry_depth: usize,
     out_of_flow_prebreak_suppression_depth: usize,
+    element_side_effect_suppression_depth: usize,
     containing_blocks: Vec<ContainingBlock>,
     list_stack: Vec<ListState>,
     counter_set: CounterSet,
@@ -2191,7 +2285,14 @@ mod tests {
 
     fn inline_box_edge(width: f32, style: &ComputedStyle) -> InlineItem {
         InlineItem::Atom(Box::new(InlineAtom {
-            content: InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge),
+            content: InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(
+                InlineBoxEdgeFragment {
+                    logical_edge: InlineLogicalEdge::End,
+                    physical_side: inline_end_side(style.writing_mode, style.direction),
+                    advance: width,
+                    paint_extent: width.max(0.0),
+                },
+            )),
             style: style.clone(),
             escaped_positioned_layers: None,
             width,
@@ -3543,7 +3644,14 @@ mod tests {
         builder.cursor_y = 100.0;
         let left = InlineLineItem::Fragment(inline_fragment("A", style.clone()));
         let atom = InlineLineItem::Atom(InlineAtom {
-            content: InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge),
+            content: InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(
+                InlineBoxEdgeFragment {
+                    logical_edge: InlineLogicalEdge::End,
+                    physical_side: PhysicalSide::Right,
+                    advance: 10.0,
+                    paint_extent: 10.0,
+                },
+            )),
             style: style.clone(),
             escaped_positioned_layers: None,
             width: 10.0,
@@ -3626,6 +3734,83 @@ mod tests {
             (atom_x - (line_left + carried_left_width)).abs() < 0.01,
             "mixed inline painting should advance with the carried graph width"
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_split_inline_end_edge_keeps_border_paint_with_negative_margin() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_size = 150.0;
+        style.line_height = 150.0;
+        style.border_widths.right = 150.0;
+        style.border_styles.right = BorderStyle::Solid;
+        style.border_colors.right = Color::new(0, 128, 0);
+        style.margin.right = -150.0;
+        builder.cursor_y = 180.0;
+
+        let edge = InlineBoxEdgeFragment {
+            logical_edge: InlineLogicalEdge::End,
+            physical_side: PhysicalSide::Right,
+            advance: 0.0,
+            paint_extent: 150.0,
+        };
+        let line_fragment = inline_layout::InlineLineFragment {
+            items: vec![inline_layout::MeasuredInlineItem {
+                item: InlineLineItem::Atom(InlineAtom {
+                    content: InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)),
+                    style: style.clone(),
+                    escaped_positioned_layers: None,
+                    width: edge.advance,
+                    height: style.line_height,
+                    baseline_offset: style.font_size,
+                    baseline_shift: 0.0,
+                    link_target: None,
+                    alt_text: None,
+                }),
+                width: edge.advance,
+                shaped: None,
+            }],
+            metrics: InlineLineMetrics {
+                width: edge.advance,
+                height: style.line_height,
+                baseline_offset: style.font_size,
+            },
+            hanging_widths: HangingPunctuationWidths::default(),
+            indent: 0.0,
+            available_width: 300.0,
+            suppress_float_adjust: false,
+            text: String::new(),
+        };
+
+        let prepared = builder
+            .prepare_inline_line_fragment(
+                &line_fragment,
+                InlinePaintContext {
+                    block_style: &style,
+                    direction: style.direction,
+                    available_width: 300.0,
+                    padding_left: 0.0,
+                    line_indent: 0.0,
+                    text_align: TextAlign::Left,
+                    is_first_line: true,
+                },
+            )
+            .expect("edge-only split inline line should prepare");
+        let edge_rect = prepared
+            .paint_items
+            .iter()
+            .find_map(|item| match item {
+                PreparedInlinePaintItem::Atom(atom) => Some(atom.content_rect),
+                _ => None,
+            })
+            .expect("edge-only split inline should prepare an edge paint atom");
+
+        assert_eq!(line_fragment.metrics.width, 0.0);
+        assert_eq!(edge_rect.width(), 150.0);
+        assert_eq!(edge_rect.height(), 150.0);
     }
 
     #[tokio::test]
@@ -3755,6 +3940,16 @@ mod tests {
             .collect()
     }
 
+    fn formatting_box_contains_text(box_: &box_tree::FormattingBox<'_>, needle: &str) -> bool {
+        match box_ {
+            box_tree::FormattingBox::Text(text) => text.text.contains(needle),
+            _ => box_
+                .children()
+                .iter()
+                .any(|child| formatting_box_contains_text(child, needle)),
+        }
+    }
+
     fn prepared_fragment_backgrounds(
         prepared: &PreparedInlineLine,
     ) -> Vec<&PreparedInlineFragment> {
@@ -3786,9 +3981,18 @@ mod tests {
         };
         let page = box_tree::build_page_box(&root, &stylesheets, &parent_style);
         let body = &page.children[0].children()[0];
-        let box_tree::FormattingBox::AnonymousBlock(anonymous) = &body.children()[1] else {
-            panic!("span text after the block should be wrapped in an anonymous block");
-        };
+        let anonymous = body
+            .children()
+            .iter()
+            .find_map(|child| match child {
+                box_tree::FormattingBox::AnonymousBlock(anonymous)
+                    if formatting_box_contains_text(child, "Two") =>
+                {
+                    Some(anonymous)
+                }
+                _ => None,
+            })
+            .expect("span text after the block should be wrapped in an anonymous block");
         let options = RenderOptions::default();
         let resource_cache = ResourceCache::default();
         let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
@@ -3813,7 +4017,7 @@ mod tests {
                         InlineItem::Atom(atom)
                             if matches!(
                                 &atom.content,
-                                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge)
+                                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
                             )
                     )
                 })
@@ -3826,7 +4030,7 @@ mod tests {
             Some(InlineItem::Atom(atom))
                 if matches!(
                     &atom.content,
-                    InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge)
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
                 )
         ));
 
@@ -4077,6 +4281,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_justified_line_uses_boundary_shaped_width_for_expansion() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 16.0;
+        style.line_height = 20.0;
+        style.text_align = TextAlign::Justify;
+        style.text_align_last = TextAlignLast::Align(TextAlign::Justify);
+        builder.cursor_y = 100.0;
+
+        let text = "A B";
+        let measured_width = builder.font_system.measure_text(text, &style);
+        let left_width = builder.font_system.measure_text("A", &style);
+        let space_width = builder.font_system.measure_text(" ", &style);
+        let right_width = builder.font_system.measure_text("B", &style);
+        let record = inline_line_record_for_items(
+            vec![
+                inline_layout::MeasuredInlineItem {
+                    item: InlineLineItem::Fragment(inline_fragment("A", style.clone())),
+                    width: left_width,
+                    shaped: None,
+                },
+                inline_layout::MeasuredInlineItem {
+                    item: InlineLineItem::Fragment(inline_fragment(" ", style.clone())),
+                    width: space_width,
+                    shaped: None,
+                },
+                inline_layout::MeasuredInlineItem {
+                    item: InlineLineItem::Fragment(inline_fragment("B", style.clone())),
+                    width: right_width,
+                    shaped: None,
+                },
+            ],
+            text,
+            measured_width + 5.0,
+            120.0,
+            &style,
+        );
+        let mut plaintext_state = None;
+        let prepared = builder
+            .prepare_inline_line_record(
+                &record,
+                inline_paragraph_context(&style, 120.0),
+                &mut plaintext_state,
+            )
+            .expect("justified line should prepare");
+
+        let group = prepared_text_groups(&prepared)[0];
+        assert_eq!(group.shaped.text, text);
+        assert!(
+            (group.width() - 120.0).abs() < 0.01,
+            "justification should fill from painted text width, got {}",
+            group.width()
+        );
+    }
+
+    #[tokio::test]
     async fn prepared_inline_line_record_excludes_trailing_tracking_once() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
@@ -4114,6 +4378,188 @@ mod tests {
         assert!(
             (background.rect.width() - (measured_width - style.used_letter_spacing())).abs() < 0.01
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_inline_fragment_background_uses_font_content_area() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 16.0;
+        style.line_height = 24.0;
+        style.border_widths.top = 5.0;
+        style.border_widths.right = 5.0;
+        style.border_widths.bottom = 5.0;
+        style.border_widths.left = 5.0;
+        style.border_styles.top = BorderStyle::Solid;
+        style.border_styles.right = BorderStyle::Solid;
+        style.border_styles.bottom = BorderStyle::Solid;
+        style.border_styles.left = BorderStyle::Solid;
+        builder.cursor_y = 100.0;
+
+        let measured_width = builder.font_system.measure_text("inspect", &style);
+        let record = inline_line_record_for_items(
+            vec![inline_layout::MeasuredInlineItem {
+                item: InlineLineItem::Fragment(InlineFragment {
+                    hanging_edges: InlineHangingEdges {
+                        blocks_start: true,
+                        blocks_end: true,
+                    },
+                    ..inline_fragment("inspect", style.clone())
+                }),
+                width: measured_width,
+                shaped: None,
+            }],
+            "inspect",
+            measured_width,
+            200.0,
+            &style,
+        );
+        let mut plaintext_state = None;
+        let prepared = builder
+            .prepare_inline_line_record(
+                &record,
+                inline_paragraph_context(&style, 200.0),
+                &mut plaintext_state,
+            )
+            .expect("inline line should prepare");
+
+        let background = prepared_fragment_backgrounds(&prepared)[0];
+        assert!(
+            (background.rect.height() - style.font_size).abs() < 0.01,
+            "prepared fragment geometry should be the CSS inline content area: {background:?}"
+        );
+        builder.paint_prepared_inline_line(&prepared);
+        let purple_rects = builder
+            .current_page
+            .rects
+            .iter()
+            .filter(|rect| rect.fill == Some(Color::BLACK))
+            .collect::<Vec<_>>();
+        assert_eq!(purple_rects.len(), 4, "{purple_rects:?}");
+        let top = purple_rects
+            .iter()
+            .find(|rect| (rect.height() - 5.0).abs() < 0.01 && rect.y() > background.rect.y())
+            .expect("top border should paint above the content area");
+        let bottom = purple_rects
+            .iter()
+            .find(|rect| (rect.height() - 5.0).abs() < 0.01 && rect.y() < background.rect.y())
+            .expect("bottom border should paint below the content area");
+        assert!(
+            (top.y() - (background.rect.y() + style.font_size)).abs() < 0.01,
+            "top border should begin at content top: top={top:?} background={background:?}"
+        );
+        assert!(
+            ((bottom.y() + bottom.height()) - background.rect.y()).abs() < 0.01,
+            "bottom border should end at content bottom: bottom={bottom:?} background={background:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rtl_inline_border_backgrounds_expand_away_from_text_content() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.direction = Direction::Rtl;
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 16.0;
+        style.line_height = 24.0;
+        style.border_widths.top = 5.0;
+        style.border_widths.right = 5.0;
+        style.border_widths.bottom = 5.0;
+        style.border_widths.left = 5.0;
+        style.border_styles.top = BorderStyle::Solid;
+        style.border_styles.right = BorderStyle::Solid;
+        style.border_styles.bottom = BorderStyle::Solid;
+        style.border_styles.left = BorderStyle::Solid;
+        builder.cursor_y = 100.0;
+
+        for (items, expected_backgrounds) in [
+            (
+                vec![
+                    inline_layout::MeasuredInlineItem {
+                        item: InlineLineItem::Fragment(InlineFragment {
+                            hanging_edges: InlineHangingEdges {
+                                blocks_start: true,
+                                blocks_end: true,
+                            },
+                            ..inline_fragment("inspect", style.clone())
+                        }),
+                        width: builder.font_system.measure_text("inspect", &style),
+                        shaped: None,
+                    },
+                    inline_layout::MeasuredInlineItem {
+                        item: InlineLineItem::Fragment(inline_fragment("pause", style.clone())),
+                        width: builder.font_system.measure_text("pause", &style),
+                        shaped: None,
+                    },
+                ],
+                2usize,
+            ),
+            (
+                vec![
+                    inline_layout::MeasuredInlineItem {
+                        item: InlineLineItem::Fragment(InlineFragment {
+                            hanging_edges: InlineHangingEdges {
+                                blocks_start: true,
+                                blocks_end: true,
+                            },
+                            ..inline_fragment("inspect", style.clone())
+                        }),
+                        width: builder.font_system.measure_text("inspect", &style),
+                        shaped: None,
+                    },
+                    inline_layout::MeasuredInlineItem {
+                        item: InlineLineItem::Fragment(inline_fragment(" ", style.clone())),
+                        width: builder.font_system.measure_text(" ", &style),
+                        shaped: None,
+                    },
+                    inline_layout::MeasuredInlineItem {
+                        item: InlineLineItem::Fragment(inline_fragment("pause", style.clone())),
+                        width: builder.font_system.measure_text("pause", &style),
+                        shaped: None,
+                    },
+                ],
+                3usize,
+            ),
+            (
+                vec![inline_layout::MeasuredInlineItem {
+                    item: InlineLineItem::Fragment(InlineFragment {
+                        hanging_edges: InlineHangingEdges {
+                            blocks_start: true,
+                            blocks_end: true,
+                        },
+                        ..inline_fragment("inspectpause", style.clone())
+                    }),
+                    width: builder.font_system.measure_text("inspectpause", &style),
+                    shaped: None,
+                }],
+                1usize,
+            ),
+        ] {
+            let width = items.iter().map(|item| item.width).sum::<f32>();
+            let record = inline_line_record_for_items(items, "inspectpause", width, 300.0, &style);
+            let mut plaintext_state = None;
+            let prepared = builder
+                .prepare_inline_line_record(
+                    &record,
+                    inline_paragraph_context(&style, 300.0),
+                    &mut plaintext_state,
+                )
+                .expect("RTL inline line should prepare");
+            let backgrounds = prepared_fragment_backgrounds(&prepared);
+            assert_eq!(backgrounds.len(), expected_backgrounds, "{prepared:?}");
+            let bordered = backgrounds[0];
+            assert!(
+                (bordered.rect.height() - style.font_size).abs() < 0.01,
+                "RTL bordered inline content area should remain font-sized: {bordered:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5555,7 +6001,7 @@ mod tests {
         assert!(matches!(
             measured[1].item,
             InlineLineItem::Atom(InlineAtom {
-                content: InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge),
+                content: InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_)),
                 ..
             })
         ));

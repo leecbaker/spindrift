@@ -8,6 +8,14 @@ pub(super) struct PageNameScope {
     start_page_has_content: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct InlineSplitBlockPaintScope {
+    page_index: usize,
+    checkpoint: PaintCheckpoint,
+    positioned_layer_start: usize,
+    source_order: usize,
+}
+
 impl<'a> LayoutBuilder<'a> {
     pub(super) fn new(config: LayoutBuilderConfig<'a>) -> Self {
         let mut page_margin_boxes = HashMap::new();
@@ -61,12 +69,13 @@ impl<'a> LayoutBuilder<'a> {
             root_canvas_background_defined: false,
             current_page: page_for_context(page_context),
             current_page_has_flow_content: false,
+            last_block_layout_outcome: BlockLayoutOutcome::default(),
             current_page_name: None,
             current_page_context: page_context,
             cursor_y: page_context.top(),
             content_left: page_context.left(),
             content_right: page_context.right(),
-            inline_static_baseline_y: None,
+            inline_static_position: None,
             block_static_position_y_offset: None,
             containing_block_direction: Direction::Ltr,
             containing_block_writing_mode: WritingMode::HorizontalTb,
@@ -75,6 +84,7 @@ impl<'a> LayoutBuilder<'a> {
             truncate_page_start_margins: false,
             avoid_inside_retry_depth: 0,
             out_of_flow_prebreak_suppression_depth: 0,
+            element_side_effect_suppression_depth: 0,
             containing_blocks: Vec::new(),
             list_stack: Vec::new(),
             counter_set: CounterSet::new(),
@@ -195,6 +205,12 @@ impl<'a> LayoutBuilder<'a> {
                     self.resolve_font_metric_lengths_in_box(child);
                 }
             }
+            box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+                self.resolve_style_font_metric_lengths(&mut box_.style);
+                for child in &mut box_.children {
+                    self.resolve_font_metric_lengths_in_box(child);
+                }
+            }
             box_tree::FormattingBox::AnonymousBlock(box_) => {
                 self.resolve_style_font_metric_lengths(&mut box_.style);
                 for child in &mut box_.children {
@@ -203,6 +219,9 @@ impl<'a> LayoutBuilder<'a> {
             }
             box_tree::FormattingBox::AtomicInline(box_) => {
                 self.resolve_style_font_metric_lengths(&mut box_.style);
+                if let Some(fragment) = &mut box_.table_fragment {
+                    self.resolve_font_metric_lengths_in_table_fragment(fragment);
+                }
                 for child in &mut box_.children {
                     self.resolve_font_metric_lengths_in_box(child);
                 }
@@ -218,6 +237,7 @@ impl<'a> LayoutBuilder<'a> {
             }
             box_tree::FormattingBox::Table(box_) => {
                 self.resolve_style_font_metric_lengths(&mut box_.style);
+                self.resolve_font_metric_lengths_in_table_fragment(&mut box_.fragment);
                 for child in &mut box_.children {
                     self.resolve_font_metric_lengths_in_box(child);
                 }
@@ -237,6 +257,48 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
+    fn resolve_font_metric_lengths_in_table_fragment(
+        &mut self,
+        fragment: &mut box_tree::TableFragment<'_>,
+    ) {
+        for row in &mut fragment.rows {
+            if let Some(style) = &mut row.style {
+                self.resolve_style_font_metric_lengths(style);
+            }
+            for group in &mut row.row_groups {
+                if let Some(style) = &mut group.style {
+                    self.resolve_style_font_metric_lengths(style);
+                }
+            }
+            for cell in &mut row.cells {
+                if let Some(style) = &mut cell.style {
+                    self.resolve_table_cell_style_font_metric_lengths(style);
+                }
+                for child in &mut cell.children {
+                    self.resolve_font_metric_lengths_in_box(child);
+                }
+            }
+        }
+        for caption in &mut fragment.captions {
+            if let Some(style) = &mut caption.style {
+                self.resolve_style_font_metric_lengths(style);
+            }
+            for child in &mut caption.children {
+                self.resolve_font_metric_lengths_in_box(child);
+            }
+        }
+        for column in &mut fragment.columns {
+            if let Some(style) = &mut column.style {
+                self.resolve_style_font_metric_lengths(style);
+            }
+            if let Some(group) = &mut column.group
+                && let Some(style) = &mut group.style
+            {
+                self.resolve_style_font_metric_lengths(style);
+            }
+        }
+    }
+
     fn resolve_style_font_metric_lengths(&mut self, style: &mut ComputedStyle) {
         let ch_advance = self.font_system.ch_advance(style);
         style.resolve_font_metric_lengths(ch_advance);
@@ -249,6 +311,108 @@ impl<'a> LayoutBuilder<'a> {
         if let Some(style) = &mut style.after_style {
             self.resolve_style_font_metric_lengths(style);
         }
+        if let Some(style) = &mut style.first_line_style {
+            self.resolve_style_font_metric_lengths(style);
+        }
+        if let Some(style) = &mut style.first_letter_style {
+            self.resolve_style_font_metric_lengths(style);
+        }
+    }
+
+    fn resolve_table_cell_style_font_metric_lengths(&mut self, style: &mut ComputedStyle) {
+        let ch_advance = self.font_system.ch_advance(style);
+        style.resolve_font_metric_lengths_preserving_box_block_sizes(ch_advance);
+        if let Some(style) = &mut style.marker_style {
+            self.resolve_style_font_metric_lengths(style);
+        }
+        if let Some(style) = &mut style.before_style {
+            self.resolve_style_font_metric_lengths(style);
+        }
+        if let Some(style) = &mut style.after_style {
+            self.resolve_style_font_metric_lengths(style);
+        }
+        if let Some(style) = &mut style.first_line_style {
+            self.resolve_style_font_metric_lengths(style);
+        }
+        if let Some(style) = &mut style.first_letter_style {
+            self.resolve_style_font_metric_lengths(style);
+        }
+    }
+
+    pub(super) fn style_for_layout_element_with_parent_font_metrics(
+        &mut self,
+        element: &Element,
+        signature: ElementSignature,
+        stylesheets: &[Stylesheet],
+        parent: Option<&ComputedStyle>,
+    ) -> ComputedStyle {
+        let ancestors = self.ancestors.clone();
+        self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
+            element,
+            signature,
+            stylesheets,
+            parent,
+            &ancestors,
+        )
+    }
+
+    pub(super) fn style_for_layout_element_with_parent_font_metrics_and_ancestors(
+        &mut self,
+        element: &Element,
+        signature: ElementSignature,
+        stylesheets: &[Stylesheet],
+        parent: Option<&ComputedStyle>,
+        ancestors: &[ElementSignature],
+    ) -> ComputedStyle {
+        let inheritance_source = parent.cloned().unwrap_or_else(ComputedStyle::initial);
+        let parent_ch_advance = self.font_system.ch_advance(&inheritance_source);
+        let mut style = style_for_layout_element_with_parent_ch_advance(
+            element,
+            signature.clone(),
+            stylesheets,
+            parent,
+            ancestors,
+            parent_ch_advance,
+        );
+        let pseudo_parent_ch_advance = self.font_system.ch_advance(&style);
+        let signature = layout_element_signature(element, signature, parent);
+        css::apply_pseudo_rules_with_parent_ch_advance(
+            &mut style,
+            &signature,
+            stylesheets,
+            ancestors,
+            pseudo_parent_ch_advance,
+        );
+        style
+    }
+
+    pub(super) fn style_for_signature_with_parent_font_metrics(
+        &mut self,
+        signature: ElementSignature,
+        inline_style: Option<&str>,
+        stylesheets: &[Stylesheet],
+        parent: Option<&ComputedStyle>,
+        ancestors: &[ElementSignature],
+    ) -> ComputedStyle {
+        let inheritance_source = parent.cloned().unwrap_or_else(ComputedStyle::initial);
+        let parent_ch_advance = self.font_system.ch_advance(&inheritance_source);
+        let mut style = css::style_for_element_with_signature_and_parent_ch_advance(
+            signature.clone(),
+            inline_style,
+            stylesheets,
+            parent,
+            ancestors,
+            parent_ch_advance,
+        );
+        let pseudo_parent_ch_advance = self.font_system.ch_advance(&style);
+        css::apply_pseudo_rules_with_parent_ch_advance(
+            &mut style,
+            &signature,
+            stylesheets,
+            ancestors,
+            pseudo_parent_ch_advance,
+        );
+        style
     }
 
     pub(super) fn layout_formatting_box(
@@ -262,6 +426,7 @@ impl<'a> LayoutBuilder<'a> {
                 &box_.style,
                 stylesheets,
                 box_.signature.clone(),
+                &box_.source,
                 &box_.run_in_children,
                 &box_.children,
             ),
@@ -270,17 +435,22 @@ impl<'a> LayoutBuilder<'a> {
                 &box_.style,
                 stylesheets,
                 box_.signature.clone(),
+                &box_.source,
                 &[],
                 &box_.children,
             ),
             box_tree::FormattingBox::AnonymousBlock(box_) => {
                 self.layout_anonymous_block(&box_.style, &box_.children, stylesheets, None)
             }
+            box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+                self.layout_inline_split_block_context(box_, stylesheets)
+            }
             box_tree::FormattingBox::AtomicInline(box_) => self.layout_element_box(
                 box_.element,
                 &box_.style,
                 stylesheets,
                 box_.signature.clone(),
+                &box_.source,
                 &[],
                 &box_.children,
             ),
@@ -290,6 +460,7 @@ impl<'a> LayoutBuilder<'a> {
                     &box_.style,
                     stylesheets,
                     box_.signature.clone(),
+                    &box_.source,
                     &box_.children,
                     &box_.fragment,
                 );
@@ -299,6 +470,7 @@ impl<'a> LayoutBuilder<'a> {
                 &box_.style,
                 stylesheets,
                 box_.signature.clone(),
+                &box_.source,
                 &[],
                 &box_.children,
             ),
@@ -307,6 +479,7 @@ impl<'a> LayoutBuilder<'a> {
                 &box_.style,
                 stylesheets,
                 box_.signature.clone(),
+                &box_.source,
                 &[],
                 &box_.children,
             ),
@@ -324,23 +497,39 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn layout_element_box(
         &mut self,
         element: &Element,
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         signature: ElementSignature,
+        source: &box_tree::BoxSource<'_>,
         run_in_children: &[box_tree::FormattingBox<'_>],
         children: &[box_tree::FormattingBox<'_>],
     ) {
         self.push_ancestor_signature(signature);
-        self.layout_element_with_child_boxes_and_run_ins(
-            element,
-            style,
-            stylesheets,
-            run_in_children,
-            Some(children),
-        );
+        match source {
+            box_tree::BoxSource::Principal => {
+                self.layout_element_with_child_boxes_and_run_ins(
+                    element,
+                    style,
+                    stylesheets,
+                    run_in_children,
+                    Some(children),
+                );
+            }
+            box_tree::BoxSource::GeneratedPseudo(_) => {
+                self.layout_generated_pseudo_box(
+                    element,
+                    style,
+                    stylesheets,
+                    run_in_children,
+                    Some(children),
+                    None,
+                );
+            }
+        }
         self.ancestors.pop();
     }
 
@@ -353,25 +542,64 @@ impl<'a> LayoutBuilder<'a> {
     /// break-inside entry behavior:
     /// <https://www.w3.org/TR/css-page-3/#using-named-pages> and
     /// <https://www.w3.org/TR/CSS22/tables.html#model>.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn layout_table_box(
         &mut self,
         element: &Element,
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         signature: ElementSignature,
+        source: &box_tree::BoxSource<'_>,
         children: &[box_tree::FormattingBox<'_>],
         fragment: &box_tree::TableFragment<'_>,
     ) {
         self.push_ancestor_signature(signature);
-        self.layout_element_with_child_boxes_run_ins_and_table_fragment(
+        match source {
+            box_tree::BoxSource::Principal => {
+                self.layout_element_with_child_boxes_run_ins_and_table_fragment(
+                    element,
+                    style,
+                    stylesheets,
+                    &[],
+                    Some(children),
+                    Some(fragment),
+                );
+            }
+            box_tree::BoxSource::GeneratedPseudo(_) => {
+                self.layout_generated_pseudo_box(
+                    element,
+                    style,
+                    stylesheets,
+                    &[],
+                    Some(children),
+                    Some(fragment),
+                );
+            }
+        }
+        self.ancestors.pop();
+    }
+
+    fn layout_generated_pseudo_box(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        run_in_children: &[box_tree::FormattingBox<'_>],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+    ) {
+        let counter_scope = self.begin_pseudo_counter_scope(style);
+        self.element_side_effect_suppression_depth += 1;
+        self.layout_element_inner(
             element,
             style,
             stylesheets,
-            &[],
-            Some(children),
-            Some(fragment),
+            run_in_children,
+            child_boxes,
+            table_fragment,
         );
-        self.ancestors.pop();
+        self.element_side_effect_suppression_depth -= 1;
+        self.end_counter_scope(counter_scope);
     }
 
     pub(super) fn layout_element(
@@ -822,13 +1050,19 @@ impl<'a> LayoutBuilder<'a> {
             ElementLayoutKind::GeneratedImage => self.layout_generated_image(element, style),
             ElementLayoutKind::Svg => self.layout_svg(element, style),
             ElementLayoutKind::Flex => self.layout_flex(element, style, stylesheets, child_boxes),
+            ElementLayoutKind::Grid => self.layout_grid(element, style, stylesheets, child_boxes),
             ElementLayoutKind::Table => {
                 let built_child_boxes;
                 let table_children = if let Some(children) = child_boxes {
                     children
                 } else {
-                    built_child_boxes =
-                        box_tree::build_child_boxes(element, stylesheets, style, &self.ancestors);
+                    built_child_boxes = box_tree::build_child_boxes_with_font_metrics(
+                        element,
+                        stylesheets,
+                        style,
+                        &self.ancestors,
+                        &mut self.font_system,
+                    );
                     &built_child_boxes
                 };
                 let built_fragment;
@@ -1005,13 +1239,16 @@ impl<'a> LayoutBuilder<'a> {
         if style.abspos_static_source_was_inline_level
             && let Some(static_baseline_y) = self.current_page.lines.last().map(|line| line.y())
         {
-            self.layout_positioned_block_with_inline_static_baseline(
+            self.layout_positioned_block_with_inline_static_position(
                 element,
                 style,
                 stylesheets,
                 child_boxes,
                 table_fragment,
-                static_baseline_y,
+                InlineStaticPosition {
+                    start_x: self.content_left,
+                    baseline_y: static_baseline_y,
+                },
             );
             return;
         }
@@ -1074,6 +1311,136 @@ impl<'a> LayoutBuilder<'a> {
         }
         if !items.is_empty() {
             self.layout_inline_items(items, style, available_width, 0.0, 0.0, stylesheets);
+        }
+    }
+
+    pub(super) fn layout_inline_split_block_context(
+        &mut self,
+        context: &box_tree::InlineSplitBlockContextBox<'_>,
+        stylesheets: &[Stylesheet],
+    ) {
+        let scope = self.begin_inline_split_block_paint_scope();
+        for child in &context.children {
+            self.layout_formatting_box(child, stylesheets);
+        }
+        self.finish_inline_split_block_paint_scope(context, scope);
+    }
+
+    pub(super) fn begin_inline_split_block_paint_scope(&mut self) -> InlineSplitBlockPaintScope {
+        InlineSplitBlockPaintScope {
+            page_index: self.pages.len(),
+            checkpoint: self.current_page.paint_checkpoint(),
+            positioned_layer_start: self.positioned_layers.len(),
+            source_order: self.next_paint_source_order(),
+        }
+    }
+
+    /// Replays a block-in-inline split segment under its inline ancestor's
+    /// visual positioning and stacking policy.
+    ///
+    /// CSS 2.2 splits an inline around in-flow block-level descendants, but
+    /// relative positioning applies to all generated boxes for that inline and
+    /// Appendix E paints a positioned inline's generated content at the inline's
+    /// stack level. This scopes only paint; normal-flow layout has already used
+    /// the split block child directly:
+    /// <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>,
+    /// <https://www.w3.org/TR/CSS22/visuren.html#relative-positioning>, and
+    /// <https://www.w3.org/TR/CSS22/zindex.html>.
+    pub(super) fn finish_inline_split_block_paint_scope(
+        &mut self,
+        context: &box_tree::InlineSplitBlockContextBox<'_>,
+        scope: InlineSplitBlockPaintScope,
+    ) {
+        let initial_policy = StackingContextPolicy::for_non_positioned_effect(
+            &context.style,
+            PaintClip::from_paint_rect(paint_space_rect(0.0, 0.0, 0.0, 0.0)),
+        );
+        let child_layers = if scope.positioned_layer_start < self.positioned_layers.len()
+            && !matches!(
+                initial_policy.child_layer_policy,
+                ChildLayerPolicy::EscapeAll
+            ) {
+            self.positioned_layers
+                .split_off(scope.positioned_layer_start)
+        } else {
+            Vec::new()
+        };
+        let (child_layers, escaped_layers): (Vec<_>, Vec<_>) =
+            match initial_policy.child_layer_policy {
+                ChildLayerPolicy::CaptureAll => (child_layers, Vec::new()),
+                ChildLayerPolicy::CaptureAutoLevel => child_layers
+                    .into_iter()
+                    .partition(|layer| matches!(layer.stack_level, StackLevel::Auto)),
+                ChildLayerPolicy::EscapeAll => (Vec::new(), child_layers),
+            };
+        self.positioned_layers.extend(escaped_layers);
+
+        let mut fragments =
+            self.take_positioned_fragments_since(scope.page_index, scope.checkpoint);
+        for layer in &child_layers {
+            if !fragments
+                .iter()
+                .any(|(page_index, _)| *page_index == layer.page_index)
+            {
+                fragments.push((
+                    layer.page_index,
+                    PaintFragment::from_primitives(Vec::new(), Vec::new()),
+                ));
+            }
+        }
+
+        let offset = relative_position_offset(&context.style, self.current_containing_block());
+        let paint_offset = PaintVector::new(offset.x, offset.y);
+        for (page_index, fragment) in fragments {
+            let child_contexts = child_layers
+                .iter()
+                .filter(|layer| layer.page_index == page_index)
+                .cloned()
+                .map(|layer| {
+                    layer
+                        .context
+                        .translated(paint_offset)
+                        .with_links(layer.links)
+                })
+                .collect::<Vec<_>>();
+            let fragment = fragment.translated(paint_offset);
+            if fragment.is_empty() && child_contexts.is_empty() {
+                continue;
+            }
+            let (page_width, page_height) = if page_index < self.pages.len() {
+                (
+                    self.pages[page_index].width(),
+                    self.pages[page_index].height(),
+                )
+            } else {
+                (self.current_page.width(), self.current_page.height())
+            };
+            let bounds = fragment
+                .bounds()
+                .unwrap_or(PaintClip::from_paint_rect(paint_space_rect(
+                    0.0,
+                    0.0,
+                    page_width,
+                    page_height,
+                )));
+            let policy = StackingContextPolicy::for_non_positioned_effect(&context.style, bounds);
+            let context = PaintStackingContext::from_banded_fragment_with_stack_level(
+                policy.stack_level,
+                fragment,
+                child_contexts,
+            )
+            .with_source_order(scope.source_order)
+            .with_effects(policy.effects)
+            .with_bounds(bounds);
+            let fragment =
+                PaintFragment::from_stacking_context_in_band(policy.parent_band, context);
+            let target_page = if page_index < self.pages.len() {
+                &mut self.pages[page_index]
+            } else {
+                &mut self.current_page
+            };
+            target_page.append_paint_fragment(&fragment, PaintVector::new(0.0, 0.0));
+            target_page.sort_paint_tree_stacking_contexts();
         }
     }
 
@@ -1237,49 +1604,60 @@ impl<'a> LayoutBuilder<'a> {
         self.current_page_context.area_height()
     }
 
-    fn resolved_page_context(&self, page_number: usize, is_blank: bool) -> PageContext {
+    fn resolved_page_context(&mut self, page_number: usize, is_blank: bool) -> PageContext {
         let declarations = self.page_declarations_for_page(
             page_number,
             self.current_page_name.as_deref(),
             is_blank,
         );
         let base = PageContext::from_options(self.options);
+        let ch_advance = self.page_ch_advance_for_declarations(&declarations);
         // CSS Paged Media defines page size and page margins in the page
         // context; these declarations select the page box before its content
         // area is used for layout.
         // https://www.w3.org/TR/css-page-3/#page-model
-        let size = css::page_size_from(&declarations, base.size);
-        let page_edges = page_box_edges_from_declarations(&declarations, size);
+        let size = css::page_size_from_with_ch_advance(&declarations, base.size, ch_advance);
+        let page_edges =
+            page_box_edges_from_declarations_with_ch_advance(&declarations, size, ch_advance);
         PageContext {
             size,
-            margins: css::page_margins_from_for_size_and_edges(
+            margins: css::page_margins_from_for_size_and_edges_with_ch_advance(
                 &declarations,
                 base.margins,
                 size,
                 page_edges.total(),
+                ch_advance,
             ),
             edges: page_edges,
             rotation: css::page_rotation_from(&declarations, base.rotation),
         }
     }
 
-    fn finished_page_context(&self, page_number: usize, page_size: PageSize) -> PageContext {
+    fn finished_page_context(&mut self, page_number: usize, page_size: PageSize) -> PageContext {
         let page_name = self.page_name_for_number(page_number);
         let is_blank = self.page_is_blank_for_number(page_number);
         let declarations = self.page_declarations_for_page(page_number, page_name, is_blank);
         let base = PageContext::from_options(self.options);
-        let page_edges = page_box_edges_from_declarations(&declarations, page_size);
+        let ch_advance = self.page_ch_advance_for_declarations(&declarations);
+        let page_edges =
+            page_box_edges_from_declarations_with_ch_advance(&declarations, page_size, ch_advance);
         PageContext {
             size: page_size,
-            margins: css::page_margins_from_for_size_and_edges(
+            margins: css::page_margins_from_for_size_and_edges_with_ch_advance(
                 &declarations,
                 base.margins,
                 page_size,
                 page_edges.total(),
+                ch_advance,
             ),
             edges: page_edges,
             rotation: css::page_rotation_from(&declarations, base.rotation),
         }
+    }
+
+    pub(super) fn page_ch_advance_for_declarations(&mut self, declarations: &Declarations) -> f32 {
+        let style = css::page_style_for_declarations(declarations);
+        self.font_system.ch_advance(&style)
     }
 
     fn rebuild_empty_current_page_context(&mut self) {
@@ -1374,12 +1752,13 @@ impl<'a> LayoutBuilder<'a> {
             root_canvas_background_defined: self.root_canvas_background_defined,
             current_page: self.current_page.clone(),
             current_page_has_flow_content: self.current_page_has_flow_content,
+            last_block_layout_outcome: self.last_block_layout_outcome,
             current_page_name: self.current_page_name.clone(),
             current_page_context: self.current_page_context,
             cursor_y: self.cursor_y,
             content_left: self.content_left,
             content_right: self.content_right,
-            inline_static_baseline_y: self.inline_static_baseline_y,
+            inline_static_position: self.inline_static_position,
             block_static_position_y_offset: self.block_static_position_y_offset,
             containing_block_writing_mode: self.containing_block_writing_mode,
             fragment_top_offsets: self.fragment_top_offsets.clone(),
@@ -1387,6 +1766,7 @@ impl<'a> LayoutBuilder<'a> {
             truncate_page_start_margins: self.truncate_page_start_margins,
             avoid_inside_retry_depth: self.avoid_inside_retry_depth,
             out_of_flow_prebreak_suppression_depth: self.out_of_flow_prebreak_suppression_depth,
+            element_side_effect_suppression_depth: self.element_side_effect_suppression_depth,
             containing_blocks: self.containing_blocks.clone(),
             list_stack: self.list_stack.clone(),
             counter_set: self.counter_set.clone(),
@@ -1423,12 +1803,13 @@ impl<'a> LayoutBuilder<'a> {
         self.root_canvas_background_defined = snapshot.root_canvas_background_defined;
         self.current_page = snapshot.current_page;
         self.current_page_has_flow_content = snapshot.current_page_has_flow_content;
+        self.last_block_layout_outcome = snapshot.last_block_layout_outcome;
         self.current_page_name = snapshot.current_page_name;
         self.current_page_context = snapshot.current_page_context;
         self.cursor_y = snapshot.cursor_y;
         self.content_left = snapshot.content_left;
         self.content_right = snapshot.content_right;
-        self.inline_static_baseline_y = snapshot.inline_static_baseline_y;
+        self.inline_static_position = snapshot.inline_static_position;
         self.block_static_position_y_offset = snapshot.block_static_position_y_offset;
         self.containing_block_writing_mode = snapshot.containing_block_writing_mode;
         self.fragment_top_offsets = snapshot.fragment_top_offsets;
@@ -1437,6 +1818,7 @@ impl<'a> LayoutBuilder<'a> {
         self.avoid_inside_retry_depth = snapshot.avoid_inside_retry_depth;
         self.out_of_flow_prebreak_suppression_depth =
             snapshot.out_of_flow_prebreak_suppression_depth;
+        self.element_side_effect_suppression_depth = snapshot.element_side_effect_suppression_depth;
         self.containing_blocks = snapshot.containing_blocks;
         self.list_stack = snapshot.list_stack;
         self.counter_set = snapshot.counter_set;
@@ -1484,7 +1866,7 @@ impl<'a> LayoutBuilder<'a> {
                     let mut style = ComputedStyle::initial();
                     style.font_size = self.options.font_size;
                     style.line_height_value =
-                        css::ComputedLineHeight::Length(self.options.line_height);
+                        css::ComputedLineHeight::from_length(self.options.line_height);
                     style.line_height = self.options.line_height;
                     style.line_height_multiplier = None;
                     style.line_height_is_normal = false;
@@ -1544,6 +1926,8 @@ impl<'a> LayoutBuilder<'a> {
             if !declarations.is_empty() {
                 let mut style = ComputedStyle::initial();
                 css::apply_declarations(&mut style, &declarations);
+                let page_ch_advance = self.font_system.ch_advance(&style);
+                style.resolve_font_metric_lengths(page_ch_advance);
                 has_visible_page_paint = page_style_has_visible_paint(&style);
                 let page_margins = PageContext::from_options(self.options).margins;
                 let mut images = Vec::new();
@@ -1564,12 +1948,14 @@ impl<'a> LayoutBuilder<'a> {
                         page_margins,
                         page_size,
                         layer.origin,
+                        page_ch_advance,
                     );
                     let clip_area = page_background_positioning_area(
                         &declarations,
                         page_margins,
                         page_size,
                         layer.clip,
+                        page_ch_advance,
                     );
                     images.extend(clip_background_images_to_area(
                         self.background_images(
@@ -1586,6 +1972,8 @@ impl<'a> LayoutBuilder<'a> {
 
                 let mut background_style = style.clone();
                 background_style.border_widths = css::Edges::ZERO;
+                background_style.border_width_values =
+                    css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
                 background_style.border_styles = css::BorderStyles::NONE;
                 background_style.border_width = 0.0;
                 let (rects, rounded_rects, paths, strokes) =
@@ -1687,6 +2075,9 @@ impl<'a> LayoutBuilder<'a> {
         x: f32,
         y: f32,
     ) {
+        if self.element_side_effect_suppression_depth > 0 {
+            return;
+        }
         let Some(level) = style.bookmark_level else {
             return;
         };
@@ -1725,6 +2116,9 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
     ) {
+        if self.element_side_effect_suppression_depth > 0 {
+            return;
+        }
         if !is_document_canvas_element(element) {
             return;
         }
@@ -1750,6 +2144,9 @@ impl<'a> LayoutBuilder<'a> {
     /// content such as `target-counter(..., page)` to resolve those targets:
     /// <https://www.w3.org/TR/css-gcpm-3/#cross-references>.
     pub(super) fn add_page_anchor(&mut self, element: &Element, style: &ComputedStyle) {
+        if self.element_side_effect_suppression_depth > 0 {
+            return;
+        }
         if let Some(id) = element.attrs.get("id").filter(|value| !value.is_empty()) {
             self.page_anchors
                 .entry(id.clone())
@@ -1858,6 +2255,7 @@ pub(super) fn page_for_context(context: PageContext) -> Page {
 fn canvas_background_style(style: &ComputedStyle) -> ComputedStyle {
     let mut style = style.clone();
     style.border_widths = css::Edges::ZERO;
+    style.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
     style.border_styles = css::BorderStyles::NONE;
     style.border_width = 0.0;
     style.border_image = css::BorderImage::initial();
@@ -1900,18 +2298,24 @@ fn collect_target_element_text(node: &Node, output: &mut String) {
 /// size before layout consumes used values:
 /// <https://www.w3.org/TR/css-page-3/#page-model> and
 /// <https://www.w3.org/TR/CSS22/box.html#padding-properties>.
-pub(super) fn page_box_edges_from_declarations(
+pub(super) fn page_box_edges_from_declarations_with_ch_advance(
     declarations: &Declarations,
     page_size: PageSize,
+    ch_advance: f32,
 ) -> PageBoxEdges {
     if declarations.is_empty() {
         return PageBoxEdges::ZERO;
     }
     let mut style = ComputedStyle::initial();
     css::apply_declarations(&mut style, declarations);
+    style.resolve_font_metric_lengths(ch_advance);
     PageBoxEdges {
         border: used_border_widths(&style),
-        padding: css::page_padding_from_for_size(declarations, page_size),
+        padding: css::page_padding_from_for_size_with_ch_advance(
+            declarations,
+            page_size,
+            ch_advance,
+        ),
     }
 }
 
@@ -1953,13 +2357,16 @@ fn page_background_positioning_area(
     base_margins: PageMargins,
     page_size: PageSize,
     origin: css::BackgroundBox,
+    ch_advance: f32,
 ) -> PageBackgroundArea {
-    let edges = page_box_edges_from_declarations(declarations, page_size);
-    let margins = css::page_margins_from_for_size_and_edges(
+    let edges =
+        page_box_edges_from_declarations_with_ch_advance(declarations, page_size, ch_advance);
+    let margins = css::page_margins_from_for_size_and_edges_with_ch_advance(
         declarations,
         base_margins,
         page_size,
         edges.total(),
+        ch_advance,
     );
     let border_box = PageBackgroundArea {
         x: margins.left,
@@ -2108,4 +2515,76 @@ fn positioned_layer_fragment(layer: &PositionedPaintLayer) -> PaintFragment {
 
 fn fixed_layer_fragment(layer: &FixedPaintLayer) -> PaintFragment {
     PaintFragment::from_stacking_context(layer.context.clone().with_links(layer.links.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::css::{
+        ComputedBoxValues, ComputedLengthPercentage, ComputedLengthPercentageOrAuto,
+        ComputedLineHeight, CssEdges,
+    };
+
+    fn test_layout_builder<'a>(
+        options: &'a RenderOptions,
+        stylesheets: &'a [Stylesheet],
+        resource_cache: &'a ResourceCache,
+    ) -> LayoutBuilder<'a> {
+        LayoutBuilder::new(LayoutBuilderConfig {
+            options,
+            stylesheets,
+            base_url: None,
+            root_url: None,
+            resource_cache,
+            page_progression_direction: Direction::Ltr,
+            page_counter_initial_values: HashMap::new(),
+            font_system: FontSystem::new(),
+        })
+    }
+
+    #[test]
+    fn resolves_font_metric_lengths_in_typographic_pseudo_styles() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle {
+            font_size: 20.0,
+            ..ComputedStyle::initial()
+        };
+        style.first_line_style = Some(Box::new(ComputedStyle {
+            line_height_value: ComputedLineHeight::Length(ComputedLengthPercentage::from_ch(2.0)),
+            ..style.clone()
+        }));
+        style.first_letter_style = Some(Box::new(ComputedStyle {
+            box_values: ComputedBoxValues {
+                margin: CssEdges {
+                    left: ComputedLengthPercentageOrAuto::LengthPercentage(
+                        ComputedLengthPercentage::from_ch(3.0),
+                    ),
+                    ..ComputedBoxValues::initial().margin
+                },
+                ..ComputedBoxValues::initial()
+            },
+            ..style.clone()
+        }));
+
+        builder.resolve_style_font_metric_lengths(&mut style);
+
+        let first_line = style.first_line_style.as_ref().unwrap();
+        let ComputedLineHeight::Length(line_height) = first_line.line_height_value else {
+            panic!("expected first-line length line-height");
+        };
+        assert_eq!(line_height.ch, 0.0);
+        assert!(line_height.length > 0.0);
+
+        let first_letter = style.first_letter_style.as_ref().unwrap();
+        let ComputedLengthPercentageOrAuto::LengthPercentage(margin_left) =
+            first_letter.box_values.margin.left
+        else {
+            panic!("expected first-letter length margin");
+        };
+        assert_eq!(margin_left.ch, 0.0);
+        assert!(margin_left.length > 0.0);
+    }
 }

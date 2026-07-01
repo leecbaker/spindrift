@@ -162,6 +162,52 @@ async fn supports_positioned_right_and_bottom_offsets() {
 }
 
 #[tokio::test]
+async fn fixed_generated_before_and_after_boxes_paint_at_page_bottom_right() {
+    let document = Html::from_string(
+        r#"
+        <style>
+          @page { size: 200pt 200pt; margin: 0 }
+          html, body { margin: 0 }
+          #test::before,
+          #test::after {
+            background: blue;
+            bottom: 0;
+            content: "";
+            height: 100pt;
+            position: fixed;
+            right: 0;
+            width: 50pt;
+          }
+          #test::before {
+            right: 50pt;
+          }
+        </style>
+        <p>Test passes if there is a square at the bottom right of the page.</p>
+        <div id="test"></div>
+        "#,
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let mut blue_rects = document.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .collect::<Vec<_>>();
+    blue_rects.sort_by(|left, right| left.x().total_cmp(&right.x()));
+
+    assert_eq!(blue_rects.len(), 2, "blue rects: {blue_rects:?}");
+    assert!((blue_rects[0].x() - 100.0).abs() < 0.01);
+    assert!((blue_rects[1].x() - 150.0).abs() < 0.01);
+    for rect in blue_rects {
+        assert!((rect.y() - 0.0).abs() < 0.01, "{rect:?}");
+        assert!((rect.width() - 50.0).abs() < 0.01, "{rect:?}");
+        assert!((rect.height() - 100.0).abs() < 0.01, "{rect:?}");
+    }
+}
+
+#[tokio::test]
 async fn absolute_positioned_table_bottom_anchors_border_box_to_page_area() {
     let document = Html::from_string(
         "<style>@page { size: 200pt 240pt; margin: 20pt } body { margin: 0; font-size: 10pt; line-height: 10pt } footer { height: 60pt } table#total { position: absolute; bottom: 0; margin: 0; width: 100pt; border: 10pt solid #eeeeee; background: #eeeeee; border-collapse: collapse } td { padding: 0 }</style>\
@@ -317,6 +363,58 @@ async fn absolute_block_level_abspos_static_position_after_inline_content() {
 }
 
 #[tokio::test]
+async fn inline_origin_abspos_before_forced_break_uses_placeholder_static_position_ltr_and_rtl() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 360pt 180pt; margin: 0 }\
+         body, div { margin: 0; font: 10pt/10pt monospace }\
+         .case { width: 220pt }\
+         .rtl { direction: rtl }\
+         .absolute { position: absolute }\
+         .green { background-color: lime; padding: 0 1ch }\
+         </style>\
+         <div class=\"case\">\
+           <span class=\"absolute green\">LTRABS</span>\
+           <br>\
+         </div>\
+         <div class=\"case\">LTRFOLLOW</div>\
+         <div class=\"case rtl\">\
+           <span class=\"absolute green\">RTLABS</span>\
+           <br>\
+         </div>\
+         <div class=\"case rtl\">RTLFOLLOW</div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = |text: &str| {
+        document.pages[0]
+            .lines
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines))
+    };
+
+    let ltr_abs = line("LTRABS");
+    let ltr_following = line("LTRFOLLOW");
+    let rtl_abs = line("RTLABS");
+    let rtl_following = line("RTLFOLLOW");
+
+    assert!((ltr_abs.y() - ltr_following.y()).abs() < 0.01);
+    assert!((rtl_abs.y() - rtl_following.y()).abs() < 0.01);
+    assert!(
+        ltr_abs.x() < 20.0,
+        "ltr abspos should use the inline-start placeholder at the left edge: {ltr_abs:?}",
+    );
+    assert!(
+        rtl_abs.x() > 80.0,
+        "rtl abspos should use the inline-start placeholder at the right edge: {rtl_abs:?}",
+    );
+}
+
+#[tokio::test]
 async fn auto_positioned_abspos_after_text_before_float() {
     let document = Html::from_string(
         "<!DOCTYPE html>\
@@ -359,6 +457,91 @@ async fn auto_positioned_abspos_after_text_before_float() {
         "green abspos should paint after red: operations={:?} rects={:?}",
         page.paint_operations(),
         page.rects,
+    );
+}
+
+#[tokio::test]
+async fn inline_abspos_static_position_after_forced_break_uses_second_line() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>@page { size: 300px 160px; margin: 0 } body { margin: 0; font-size: 20px; line-height: 20px }</style>\
+         <span>Line 1<br><span style=\"position:absolute\">Line 2</span></span>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = |text: &str| {
+        document.pages[0]
+            .lines
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines))
+    };
+    let first = line("Line 1");
+    let second = line("Line 2");
+
+    assert!(
+        (first.y() - second.y() - 15.0).abs() < 0.01,
+        "abspos inline static position should use the line after the forced break: first={first:?} second={second:?}",
+    );
+}
+
+#[tokio::test]
+async fn inline_abspos_static_position_after_inline_text_stays_on_same_line() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>@page { size: 300px 160px; margin: 0 } body { margin: 0; font-size: 20px; line-height: 20px }</style>\
+         <span>Line 1 <span style=\"position:absolute\">Line 2</span></span>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = |text: &str| {
+        document.pages[0]
+            .lines
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines))
+    };
+    let first = line("Line 1");
+    let second = line("Line 2");
+
+    assert!(
+        (first.y() - second.y()).abs() < 0.01,
+        "abspos inline without a forced break should keep the existing line static position: first={first:?} second={second:?}",
+    );
+}
+
+#[tokio::test]
+async fn inline_abspos_static_position_after_forced_break_preserves_inline_padding_context() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>@page { size: 400px 180px; margin: 0 } body { margin: 0; font-size: 20px; line-height: 20px }</style>\
+         <span style=\"padding-left:100px;\">Line 1<br><span style=\"position:absolute; padding-left:100px;\">Line 2</span></span>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = |text: &str| {
+        document.pages[0]
+            .lines
+            .iter()
+            .find(|line| line.text == text)
+            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines))
+    };
+    let first = line("Line 1");
+    let second = line("Line 2");
+
+    assert!(
+        (first.y() - second.y() - 15.0).abs() < 0.01,
+        "nested inline padding case should place the abspos line below the first line: first={first:?} second={second:?}",
+    );
+    assert!(
+        (first.x() - second.x()).abs() < 0.01,
+        "nested inline padding should preserve the existing horizontal static position behavior: first={first:?} second={second:?}",
     );
 }
 
@@ -1235,6 +1418,84 @@ async fn collapses_adjacent_block_sibling_vertical_margins() {
 
     assert_line_baseline_at_top(&document, first, 180.0);
     assert_line_baseline_at_top(&document, second, 140.0);
+}
+
+#[tokio::test]
+async fn min_height_smaller_than_content_allows_last_child_bottom_margin_to_collapse() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>@page { size: 200px 200px; margin: 0 } body { margin: 0 }\
+         .parent { min-height: 5px; width: 100px; background: green }\
+         .child { height: 30px; margin-bottom: 50px }\
+         .footer { width: 100px; height: 50px; background: green }</style>\
+         <div class=\"parent\"><div class=\"child\"></div></div><div class=\"footer\"></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let mut green_rects = document.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .collect::<Vec<_>>();
+    green_rects.sort_by(|a, b| b.y().total_cmp(&a.y()));
+
+    assert_eq!(
+        green_rects.len(),
+        2,
+        "expected parent and footer backgrounds: {green_rects:?}"
+    );
+    let parent = green_rects[0];
+    let footer = green_rects[1];
+    let gap = parent.y() - (footer.y() + footer.height());
+    assert!(
+        (parent.height() - 22.5).abs() < 0.01,
+        "parent background should only cover the 30px child content: parent={parent:?}"
+    );
+    assert!(
+        (gap - 37.5).abs() < 0.01,
+        "50px child bottom margin should collapse through as an external gap: parent={parent:?} footer={footer:?}"
+    );
+}
+
+#[tokio::test]
+async fn min_height_that_grows_parent_keeps_last_child_bottom_margin_inside() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>@page { size: 200px 240px; margin: 0 } body { margin: 0 }\
+         .parent { min-height: 100px; width: 100px; background: green }\
+         .child { height: 30px; margin-bottom: 50px }\
+         .footer { width: 100px; height: 50px; background: green }</style>\
+         <div class=\"parent\"><div class=\"child\"></div></div><div class=\"footer\"></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let mut green_rects = document.pages[0]
+        .rects
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .collect::<Vec<_>>();
+    green_rects.sort_by(|a, b| b.y().total_cmp(&a.y()));
+
+    assert_eq!(
+        green_rects.len(),
+        2,
+        "expected parent and footer backgrounds: {green_rects:?}"
+    );
+    let parent = green_rects[0];
+    let footer = green_rects[1];
+    let gap = parent.y() - (footer.y() + footer.height());
+    assert!(
+        (parent.height() - 75.0).abs() < 0.01,
+        "parent background should grow to the 100px min-height: parent={parent:?}"
+    );
+    assert!(
+        gap.abs() < 0.01,
+        "footer should follow the min-height-grown parent without an external collapsed gap: parent={parent:?} footer={footer:?}"
+    );
 }
 
 #[tokio::test]
@@ -2940,6 +3201,38 @@ async fn z_index_auto_and_zero_share_source_order_level() {
     assert_eq!(
         painted_red_blue_rect_fills(&document.pages[0]),
         vec![Color::new(255, 0, 0), Color::new(0, 0, 255)]
+    );
+}
+
+#[tokio::test]
+async fn positioned_inline_z_index_offsets_split_block_segment() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>@page { size: 200px 200px; margin: 0 } body { margin: 0 }</style>\
+         <div style=\"position: relative; z-index: 1; background: red; width: 100px; height: 100px;\"></div>\
+         <span style=\"position: relative; z-index: 2; top: -100px;\">\
+           <div style=\"background: green; width: 100px; height: 100px;\"></div>\
+         </span>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = filled_rect(page, Color::new(255, 0, 0));
+    let green = filled_rect(page, Color::new(0, 128, 0));
+    assert!(
+        (green.x() - red.x()).abs() < 0.01
+            && (green.y() - red.y()).abs() < 0.01
+            && (green.width() - red.width()).abs() < 0.01
+            && (green.height() - red.height()).abs() < 0.01,
+        "split block should move with positioned inline: red={red:?} green={green:?}",
+    );
+    assert!(
+        first_rect_paint_operation_index(page, Color::new(0, 128, 0))
+            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+        "positioned inline z-index should paint split block above red: operations={:?}",
+        page.operations
     );
 }
 

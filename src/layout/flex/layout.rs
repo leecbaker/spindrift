@@ -182,15 +182,17 @@ impl<'a> LayoutBuilder<'a> {
         let containing_inline_size = (self.content_right - self.content_left).max(0.0);
         let mut used_style = self.style_with_current_viewport_lengths(style);
         let box_metrics = apply_used_box_metrics(&mut used_style, containing_inline_size);
-        let style = &used_style;
 
-        let relative_offset = relative_position_offset(style, self.current_containing_block());
-        if matches!(style.position, Position::Relative | Position::Sticky) {
+        let relative_offset =
+            relative_position_offset(&used_style, self.current_containing_block());
+        if matches!(used_style.position, Position::Relative | Position::Sticky) {
             self.cursor_y += relative_offset.y;
         }
 
-        let available_outer_width =
-            self.content_right - self.content_left - style.margin.left - style.margin.right;
+        let available_outer_width = self.content_right
+            - self.content_left
+            - used_style.margin.left
+            - used_style.margin.right;
         let border_widths = box_metrics.border;
         let horizontal_extras = box_metrics.horizontal_non_content();
         let vertical_extras = box_metrics.vertical_non_content();
@@ -199,31 +201,40 @@ impl<'a> LayoutBuilder<'a> {
         let child_boxes = if let Some(child_boxes) = child_boxes {
             child_boxes
         } else {
-            built_child_boxes =
-                box_tree::build_child_boxes(element, stylesheets, style, &self.ancestors);
+            built_child_boxes = box_tree::build_child_boxes_with_font_metrics(
+                element,
+                stylesheets,
+                &used_style,
+                &self.ancestors,
+                &mut self.font_system,
+            );
             &built_child_boxes
         };
         let container_signature = self.flex_container_signature(element);
         let (mut children, mut positioned_children) =
-            flex_child_lists_from_boxes(element, &container_signature, style, child_boxes);
+            flex_child_lists_from_boxes(element, &container_signature, &used_style, child_boxes);
         self.resolve_styled_children_viewport_lengths(&mut children);
         self.resolve_styled_children_viewport_lengths(&mut positioned_children);
 
         let requested_content_width = self.used_flex_container_content_width(
             &children,
-            style,
+            &used_style,
             stylesheets,
             available_outer_width,
             horizontal_extras,
         );
-        let content_width = constrain_width(style, requested_content_width, available_outer_width);
-        let outer_width = if style.float != Float::None {
-            (content_width + horizontal_extras).max(0.0)
-        } else {
-            (content_width + horizontal_extras)
-                .min(available_outer_width)
-                .max(0.0)
-        };
+        let content_width =
+            constrain_width(&used_style, requested_content_width, available_outer_width);
+        let outer_width = (content_width + horizontal_extras).max(0.0);
+        if used_style.float == Float::None {
+            resolve_normal_flow_block_auto_margins(
+                &mut used_style,
+                containing_inline_size,
+                outer_width,
+                self.containing_block_direction,
+            );
+        }
+        let style = &used_style;
         let mut outer_x = normal_flow_block_outer_x(
             self.content_left,
             self.content_right,
@@ -1058,6 +1069,9 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let mut hypothetical_child = child.clone();
         hypothetical_child.style.position = Position::Static;
+        hypothetical_child.style.flex_grow = 0.0;
+        hypothetical_child.style.flex_shrink = 0.0;
+        hypothetical_child.style.flex_basis = css::ComputedFlexBasis::Auto;
         if hypothetical_child.style.display.is_inline_level() {
             hypothetical_child.style.display = hypothetical_child.style.display.blockified();
         }

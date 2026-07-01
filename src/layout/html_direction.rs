@@ -10,11 +10,74 @@ use super::*;
 /// <https://html.spec.whatwg.org/multipage/rendering.html#bidi-rendering>.
 pub(super) fn style_for_layout_element(
     element: &Element,
-    mut signature: ElementSignature,
+    signature: ElementSignature,
     stylesheets: &[Stylesheet],
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
 ) -> ComputedStyle {
+    style_for_layout_element_with_signature_transform(
+        element,
+        signature,
+        stylesheets,
+        parent,
+        ancestors,
+        None,
+    )
+}
+
+pub(super) fn style_for_layout_element_with_parent_ch_advance(
+    element: &Element,
+    signature: ElementSignature,
+    stylesheets: &[Stylesheet],
+    parent: Option<&ComputedStyle>,
+    ancestors: &[ElementSignature],
+    parent_ch_advance: f32,
+) -> ComputedStyle {
+    style_for_layout_element_with_signature_transform(
+        element,
+        signature,
+        stylesheets,
+        parent,
+        ancestors,
+        Some(parent_ch_advance),
+    )
+}
+
+fn style_for_layout_element_with_signature_transform(
+    element: &Element,
+    signature: ElementSignature,
+    stylesheets: &[Stylesheet],
+    parent: Option<&ComputedStyle>,
+    ancestors: &[ElementSignature],
+    parent_ch_advance: Option<f32>,
+) -> ComputedStyle {
+    let signature = layout_element_signature(element, signature, parent);
+    let inline_style = element.attrs.get("style").map(String::as_str);
+    if let Some(parent_ch_advance) = parent_ch_advance {
+        css::style_for_element_with_signature_and_parent_ch_advance(
+            signature,
+            inline_style,
+            stylesheets,
+            parent,
+            ancestors,
+            parent_ch_advance,
+        )
+    } else {
+        css::style_for_element_with_signature(
+            signature,
+            inline_style,
+            stylesheets,
+            parent,
+            ancestors,
+        )
+    }
+}
+
+pub(super) fn layout_element_signature(
+    element: &Element,
+    mut signature: ElementSignature,
+    parent: Option<&ComputedStyle>,
+) -> ElementSignature {
     let selector_signature = element_selector_signature(element);
     signature.namespace_url = selector_signature.namespace_url.clone();
     signature.namespace_attrs = selector_signature.namespace_attrs.clone();
@@ -32,13 +95,7 @@ pub(super) fn style_for_layout_element(
         .or_else(|| parent.map(|style| style.direction))
         .unwrap_or(Direction::Ltr);
     signature = signature.with_resolved_direction(resolved_direction);
-    css::style_for_element_with_signature(
-        signature,
-        element.attrs.get("style").map(String::as_str),
-        stylesheets,
-        parent,
-        ancestors,
-    )
+    signature
 }
 
 /// Apply HTML's dynamic `dir=auto`/`bdi` directionality to a computed style.

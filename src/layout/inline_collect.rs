@@ -421,14 +421,16 @@ impl<'a> LayoutBuilder<'a> {
         if block_bidi_scope_needs_inline_controls(style) {
             self.push_bidi_scope_start(style, None, 0.0, &mut items);
         }
-        self.push_generated_pseudo_items(
-            element,
-            style.before_style.as_deref(),
-            None,
-            0.0,
-            GeneratedPseudoCounterMode::Rollback,
-            &mut items,
-        );
+        if child_boxes.is_none() {
+            self.push_generated_pseudo_items(
+                element,
+                style.before_style.as_deref(),
+                None,
+                0.0,
+                GeneratedPseudoCounterMode::Rollback,
+                &mut items,
+            );
+        }
         if let Some(child_boxes) = child_boxes {
             if style.content.is_generated() {
                 self.push_intrinsic_element_content_items_from_boxes(
@@ -464,14 +466,16 @@ impl<'a> LayoutBuilder<'a> {
                 &mut items,
             );
         }
-        self.push_generated_pseudo_items(
-            element,
-            style.after_style.as_deref(),
-            None,
-            0.0,
-            GeneratedPseudoCounterMode::Rollback,
-            &mut items,
-        );
+        if child_boxes.is_none() {
+            self.push_generated_pseudo_items(
+                element,
+                style.after_style.as_deref(),
+                None,
+                0.0,
+                GeneratedPseudoCounterMode::Rollback,
+                &mut items,
+            );
+        }
         if block_bidi_scope_needs_inline_controls(style) {
             self.push_bidi_scope_end(style, None, 0.0, &mut items);
         }
@@ -816,14 +820,6 @@ impl<'a> LayoutBuilder<'a> {
             style.text_decoration,
             &mut items,
         );
-        self.push_generated_pseudo_items(
-            element,
-            style.before_style.as_deref(),
-            link_target.clone(),
-            0.0,
-            GeneratedPseudoCounterMode::Commit,
-            &mut items,
-        );
         if style.content.is_generated() {
             self.push_element_content_items_from_boxes(
                 element,
@@ -847,14 +843,6 @@ impl<'a> LayoutBuilder<'a> {
                 &mut items,
             );
         }
-        self.push_generated_pseudo_items(
-            element,
-            style.after_style.as_deref(),
-            link_target.clone(),
-            0.0,
-            GeneratedPseudoCounterMode::Commit,
-            &mut items,
-        );
         if block_bidi_scope_needs_inline_controls(style) {
             self.push_bidi_scope_end(style, link_target, 0.0, &mut items);
         }
@@ -893,12 +881,11 @@ impl<'a> LayoutBuilder<'a> {
                         sibling_tags.clone(),
                     );
                     element_index += 1;
-                    let mut child_style = style_for_layout_element(
+                    let mut child_style = self.style_for_layout_element_with_parent_font_metrics(
                         child_element,
                         child_signature,
                         stylesheets,
                         Some(style),
-                        &self.ancestors,
                     );
                     if child_style.float != Float::None
                         || matches!(child_style.position, Position::Absolute | Position::Fixed)
@@ -1090,12 +1077,11 @@ impl<'a> LayoutBuilder<'a> {
     /// Push a regular inline box edge into the inline formatting stream.
     ///
     /// CSS Inline treats inline-level margin, border, and padding as part of
-    /// the inline box fragments. Keeping the start/end edges as explicit
-    /// non-painting atomic items lets line fitting account for positive,
-    /// negative, and zero-net inline margins/borders without turning them into
-    /// text or shaping boundaries:
+    /// the inline box fragments. Keeping the start/end edges as explicit atomic
+    /// items lets line fitting account for positive, negative, and zero-net
+    /// inline margins while preserving the nonnegative border/padding paint:
     /// <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting> and
-    /// <https://www.w3.org/TR/css-inline-3/#model>.
+    /// <https://www.w3.org/TR/css-break-3/#break-decoration>.
     fn push_inline_box_edge_item(
         &mut self,
         style: &ComputedStyle,
@@ -1108,9 +1094,19 @@ impl<'a> LayoutBuilder<'a> {
         if !inline_box_edge_has_nonzero_component(style, edge) {
             return;
         }
+        let (_, border, padding) = inline_box_edge_components(style, edge);
+        let edge_fragment = InlineBoxEdgeFragment {
+            logical_edge: match edge {
+                InlineBoxEdge::Start => InlineLogicalEdge::Start,
+                InlineBoxEdge::End => InlineLogicalEdge::End,
+            },
+            physical_side: inline_box_edge_physical_side(style, edge),
+            advance: width,
+            paint_extent: (border + padding).max(0.0),
+        };
         let baseline_offset = self.inline_box_text_line_layout_baseline_offset(style);
         output.push(InlineItem::Atom(Box::new(InlineAtom {
-            content: InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge),
+            content: InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge_fragment)),
             style: style.clone(),
             escaped_positioned_layers: None,
             width,
@@ -1343,12 +1339,11 @@ impl<'a> LayoutBuilder<'a> {
                         sibling_tags.clone(),
                     );
                     element_index += 1;
-                    let mut child_style = style_for_layout_element(
+                    let mut child_style = self.style_for_layout_element_with_parent_font_metrics(
                         child_element,
                         child_signature.clone(),
                         stylesheets,
                         Some(style),
-                        &self.ancestors,
                     );
                     if child_style.float != Float::None {
                         output.push(InlineItem::Float(Box::new(InlineFloat {
@@ -1507,14 +1502,6 @@ impl<'a> LayoutBuilder<'a> {
                             .with_fragment_edges(box_.fragment_edges),
                         output,
                     );
-                    self.push_generated_pseudo_items(
-                        box_.element,
-                        inline_style.before_style.as_deref(),
-                        link.clone(),
-                        child_baseline_shift,
-                        GeneratedPseudoCounterMode::Commit,
-                        output,
-                    );
                     if inline_style.content.is_generated() {
                         self.push_element_content_items_from_boxes(
                             box_.element,
@@ -1538,14 +1525,6 @@ impl<'a> LayoutBuilder<'a> {
                             output,
                         );
                     }
-                    self.push_generated_pseudo_items(
-                        box_.element,
-                        inline_style.after_style.as_deref(),
-                        link.clone(),
-                        child_baseline_shift,
-                        GeneratedPseudoCounterMode::Commit,
-                        output,
-                    );
                     self.end_inline_element_scope(scope, &inline_style, output);
                 }
                 box_tree::FormattingBox::AtomicInline(box_) => {
@@ -1604,6 +1583,7 @@ impl<'a> LayoutBuilder<'a> {
                     output,
                 ),
                 box_tree::FormattingBox::Block(_)
+                | box_tree::FormattingBox::InlineSplitBlockContext(_)
                 | box_tree::FormattingBox::Table(_)
                 | box_tree::FormattingBox::Flex(_)
                 | box_tree::FormattingBox::Replaced(_) => {}
@@ -1622,15 +1602,27 @@ impl<'a> LayoutBuilder<'a> {
         block_style: &ComputedStyle,
         output: &[InlineItem],
     ) {
-        if style.abspos_static_source_was_inline_level || style.position == Position::Fixed {
-            let static_baseline_y = self.inline_static_baseline_y_from_buffer(output, style);
-            self.layout_positioned_block_with_inline_static_baseline(
+        let source_was_inline_level =
+            style.abspos_static_source_was_inline_level || style.display.is_inline_level();
+        if source_was_inline_level {
+            let mut positioned_style = style.clone();
+            positioned_style.abspos_static_source_was_inline_level = true;
+            let static_position = self.inline_static_position_from_hypothetical_placeholder(
                 element,
-                style,
+                &positioned_style,
                 stylesheets,
                 child_boxes,
                 table_fragment,
-                static_baseline_y,
+                block_style,
+                output,
+            );
+            self.layout_positioned_block_with_inline_static_position(
+                element,
+                &positioned_style,
+                stylesheets,
+                child_boxes,
+                table_fragment,
+                static_position,
             );
             return;
         }
@@ -1644,6 +1636,144 @@ impl<'a> LayoutBuilder<'a> {
             table_fragment,
             static_y_offset,
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inline_static_position_from_hypothetical_placeholder(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+        block_style: &ComputedStyle,
+        output: &[InlineItem],
+    ) -> InlineStaticPosition {
+        let placeholder = self.inline_static_position_placeholder_atom(
+            element,
+            style,
+            stylesheets,
+            child_boxes,
+            table_fragment,
+        );
+        let mut hypothetical_items = Vec::with_capacity(output.len() + 1);
+        hypothetical_items.extend_from_slice(output);
+        hypothetical_items.push(InlineItem::Atom(Box::new(placeholder)));
+        let available_width = (self.content_right - self.content_left).max(1.0);
+        // CSS Positioned Layout defines the static-position rectangle as the
+        // box's hypothetical normal-flow position. Carrying a non-painting
+        // placeholder through ordinary inline line selection keeps forced
+        // breaks, wrapping, and line metrics aligned with the same CSS Text
+        // machinery used for real inline content:
+        // https://www.w3.org/TR/css-position-3/#staticpos-rect
+        // https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height
+        let sequence = self.collect_inline_line_sequence(
+            hypothetical_items,
+            block_style,
+            available_width,
+            0.0,
+            0.0,
+        );
+        self.inline_static_position_from_placeholder_sequence(&sequence, block_style)
+            .unwrap_or_else(|| InlineStaticPosition {
+                start_x: self.content_left,
+                baseline_y: self.inline_static_baseline_y_from_buffer(output, style),
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inline_static_position_placeholder_atom(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        table_fragment: Option<&box_tree::TableFragment<'_>>,
+    ) -> InlineAtom {
+        let available_width = (self.content_right - self.content_left).max(style.font_size);
+        let mut placeholder_style = self.style_with_current_viewport_lengths(style);
+        apply_used_box_metrics(&mut placeholder_style, available_width);
+        let horizontal_non_content = placeholder_style.padding.left
+            + placeholder_style.padding.right
+            + horizontal_border_width(&placeholder_style);
+        let positioned_available_outer_width =
+            (available_width - placeholder_style.margin.left - placeholder_style.margin.right)
+                .max(placeholder_style.font_size);
+        let content_width = self.used_intrinsic_or_shrink_to_fit_width(
+            element,
+            &placeholder_style,
+            stylesheets,
+            positioned_available_outer_width,
+            horizontal_non_content,
+            child_boxes,
+            table_fragment,
+        );
+        let border_box_width = content_width + horizontal_non_content;
+        let line_baseline_offset = self
+            .font_system
+            .rendered_first_line_baseline_offset(&placeholder_style);
+
+        InlineAtom {
+            content: InlineAtomContent::StaticPositionPlaceholder,
+            style: placeholder_style.clone(),
+            escaped_positioned_layers: None,
+            width: border_box_width
+                + placeholder_style.margin.left
+                + placeholder_style.margin.right,
+            height: placeholder_style.line_height
+                + placeholder_style.margin.top
+                + placeholder_style.margin.bottom,
+            baseline_offset: line_baseline_offset,
+            baseline_shift: 0.0,
+            link_target: None,
+            alt_text: None,
+        }
+    }
+
+    fn inline_static_position_from_placeholder_sequence(
+        &mut self,
+        sequence: &inline_layout::InlineLineSequence,
+        block_style: &ComputedStyle,
+    ) -> Option<InlineStaticPosition> {
+        let saved_cursor_y = self.cursor_y;
+        let context = sequence.context(block_style);
+        let mut plaintext_direction_state = None;
+        let mut line_top = self.cursor_y;
+        for record in &sequence.records {
+            if let Some(fragment) = &record.fragment
+                && fragment.items.iter().any(|item| {
+                    matches!(
+                        &item.item,
+                        InlineLineItem::Atom(atom)
+                            if matches!(atom.content, InlineAtomContent::StaticPositionPlaceholder)
+                    )
+                })
+            {
+                self.cursor_y = line_top;
+                let position = self
+                    .prepare_inline_line_record(record, context, &mut plaintext_direction_state)
+                    .and_then(|prepared| {
+                        prepared.paint_items.iter().find_map(|item| {
+                            let PreparedInlinePaintItem::Atom(atom) = item else {
+                                return None;
+                            };
+                            matches!(
+                                atom.atom.content,
+                                InlineAtomContent::StaticPositionPlaceholder
+                            )
+                            .then_some(InlineStaticPosition {
+                                start_x: atom.content_rect.x(),
+                                baseline_y: line_top - prepared.metrics.baseline_offset,
+                            })
+                        })
+                    });
+                self.cursor_y = saved_cursor_y;
+                return position;
+            }
+            line_top -= record.line_height;
+        }
+        self.cursor_y = saved_cursor_y;
+        None
     }
 
     fn collect_intrinsic_inline_box_items(
@@ -1705,14 +1835,6 @@ impl<'a> LayoutBuilder<'a> {
                             .with_fragment_edges(box_.fragment_edges),
                         output,
                     );
-                    self.push_generated_pseudo_items(
-                        box_.element,
-                        inline_style.before_style.as_deref(),
-                        link.clone(),
-                        child_baseline_shift,
-                        GeneratedPseudoCounterMode::Rollback,
-                        output,
-                    );
                     if inline_style.content.is_generated() {
                         self.push_intrinsic_element_content_items_from_boxes(
                             box_.element,
@@ -1736,14 +1858,6 @@ impl<'a> LayoutBuilder<'a> {
                             output,
                         );
                     }
-                    self.push_generated_pseudo_items(
-                        box_.element,
-                        inline_style.after_style.as_deref(),
-                        link.clone(),
-                        child_baseline_shift,
-                        GeneratedPseudoCounterMode::Rollback,
-                        output,
-                    );
                     self.end_inline_element_scope(scope, &inline_style, output);
                 }
                 box_tree::FormattingBox::AtomicInline(box_) => {
@@ -1802,6 +1916,7 @@ impl<'a> LayoutBuilder<'a> {
                         output,
                     ),
                 box_tree::FormattingBox::Block(_)
+                | box_tree::FormattingBox::InlineSplitBlockContext(_)
                 | box_tree::FormattingBox::Table(_)
                 | box_tree::FormattingBox::Flex(_)
                 | box_tree::FormattingBox::Replaced(_) => {}
@@ -1855,7 +1970,14 @@ impl<'a> LayoutBuilder<'a> {
         }
         let (width, height, baseline_offset) = match replaced_element_kind(element) {
             Some(ReplacedElementKind::Canvas) => {
-                let (width, height) = used_canvas_size(element, style, available_width);
+                let containing_block_height =
+                    self.definite_block_size_stack.last().copied().flatten();
+                let (width, height) = used_canvas_size_with_height_basis(
+                    element,
+                    style,
+                    available_width,
+                    containing_block_height,
+                );
                 (
                     width + style.margin.left + style.margin.right,
                     height + style.margin.top + style.margin.bottom,
@@ -1936,6 +2058,16 @@ impl<'a> LayoutBuilder<'a> {
                     style.line_height,
                     style.line_height,
                 )
+            }
+            None if style.display.is_grid() && style.display.is_inline_level() => {
+                return Some(self.intrinsic_inline_grid_atom_for_element(
+                    element,
+                    style,
+                    children,
+                    stylesheets,
+                    baseline_shift,
+                    link_target,
+                ));
             }
             None if style.display.is_atomic_inline() => {
                 let box_metrics = used_box_metrics(style, available_width);
@@ -2064,8 +2196,25 @@ impl<'a> LayoutBuilder<'a> {
         // run:
         // https://www.w3.org/TR/css-position-3/#absolute-positioning
         // https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height
-        self.collect_inline_line_sequence(output.to_vec(), block_style, available_width, 0.0, 0.0)
-            .total_height()
+        let line_height = self
+            .collect_inline_line_sequence(output.to_vec(), block_style, available_width, 0.0, 0.0)
+            .total_height();
+        // Split inline edge atoms preserve decoration boundaries, but do not
+        // themselves occupy the line that selects the static position.
+        let has_buffered_content = output.iter().any(|item| match item {
+            InlineItem::Word(_) => true,
+            InlineItem::Atom(atom) => !atom.content.is_inline_edge(),
+            InlineItem::Float(_)
+            | InlineItem::Break
+            | InlineItem::PageScopeStart(_)
+            | InlineItem::PageScopeEnd => false,
+        });
+        line_height
+            + if has_buffered_content {
+                block_style.line_height
+            } else {
+                0.0
+            }
     }
 
     pub(in crate::layout) fn push_generated_pseudo_items(
@@ -2416,7 +2565,14 @@ impl<'a> LayoutBuilder<'a> {
             Some(ReplacedElementKind::Canvas) => {
                 let available_width = (self.content_right - self.content_left).max(1.0);
                 let style = self.style_with_current_viewport_lengths(style);
-                let (width, height) = used_canvas_size(element, &style, available_width);
+                let containing_block_height =
+                    self.definite_block_size_stack.last().copied().flatten();
+                let (width, height) = used_canvas_size_with_height_basis(
+                    element,
+                    &style,
+                    available_width,
+                    containing_block_height,
+                );
                 let atom_width = width + style.margin.left + style.margin.right;
                 Some(InlineAtom {
                     content: InlineAtomContent::Canvas,
@@ -2482,6 +2638,16 @@ impl<'a> LayoutBuilder<'a> {
                 Some(self.inline_flex_atom_for_element(
                     element,
                     signature,
+                    style,
+                    children,
+                    stylesheets,
+                    baseline_shift,
+                    link_target,
+                ))
+            }
+            None if style.display.is_grid() && style.display.is_inline_level() => {
+                Some(self.inline_grid_atom_for_element(
+                    element,
                     style,
                     children,
                     stylesheets,
@@ -2688,6 +2854,15 @@ impl<'a> LayoutBuilder<'a> {
         }
         self.push_page_name_scope_suppression();
         self.push_float_context();
+        let previous_block_static_position_y_offset = self.block_static_position_y_offset;
+        // The inline-block fragment is laid out on a temporary page, while an
+        // absolutely positioned descendant's containing block can still be an
+        // ancestor outside that temporary coordinate space. For auto vertical
+        // insets, CSS 2.2 uses the hypothetical normal-flow static position;
+        // preserve the temporary-flow y instead of clamping it to the outer
+        // containing block top.
+        // <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height>.
+        self.block_static_position_y_offset = Some(0.0);
         if !has_non_inline_formatting_box(children) && formatting_box_has_inline_content(children) {
             // CSS 2.2 lays out inline-block contents as a separate formatting
             // context. When that context contains inline-level children, they
@@ -2703,6 +2878,7 @@ impl<'a> LayoutBuilder<'a> {
         {
             self.cursor_y = self.cursor_y.min(float_bottom);
         }
+        self.block_static_position_y_offset = previous_block_static_position_y_offset;
         self.pop_float_context();
         self.pop_page_name_scope_suppression();
         if establishes_positioning_containing_block {
@@ -2731,12 +2907,13 @@ impl<'a> LayoutBuilder<'a> {
             if matches!(policy.child_layer_policy, ChildLayerPolicy::EscapeAll)
                 && positioned_layer_start < self.positioned_layers.len()
             {
-                let child_layers = self.positioned_layers.split_off(positioned_layer_start);
-                let (captured_layers, escaped_layers): (Vec<_>, Vec<_>) = child_layers
-                    .into_iter()
-                    .partition(|layer| matches!(layer.stack_level, StackLevel::Auto));
-                self.positioned_layers.extend(captured_layers);
-                escaped_layers
+                // CSS 2.2 Appendix E treats inline-blocks as atomically
+                // painted inline-level pseudo stacking contexts, but
+                // positioned descendants still participate in the parent
+                // stacking context rather than being captured by that pseudo
+                // context:
+                // <https://www.w3.org/TR/CSS22/zindex.html>.
+                self.positioned_layers.split_off(positioned_layer_start)
             } else {
                 Vec::new()
             };
@@ -3008,40 +3185,31 @@ struct InlineElementScopeState {
 /// punctuation:
 /// <https://www.w3.org/TR/CSS22/box.html#inline-boxes>.
 fn inline_box_edge_width(style: &ComputedStyle, edge: InlineBoxEdge) -> f32 {
-    let borders = used_border_widths(style);
-    match (style.direction, edge) {
-        (Direction::Ltr, InlineBoxEdge::Start) => {
-            style.margin.left + borders.left + style.padding.left
-        }
-        (Direction::Ltr, InlineBoxEdge::End) => {
-            style.margin.right + borders.right + style.padding.right
-        }
-        (Direction::Rtl, InlineBoxEdge::Start) => {
-            style.margin.right + borders.right + style.padding.right
-        }
-        (Direction::Rtl, InlineBoxEdge::End) => {
-            style.margin.left + borders.left + style.padding.left
-        }
-    }
+    let (margin, border, padding) = inline_box_edge_components(style, edge);
+    margin + border + padding
 }
 
 fn inline_box_edge_has_nonzero_component(style: &ComputedStyle, edge: InlineBoxEdge) -> bool {
-    let borders = used_border_widths(style);
-    let (margin, border, padding) = match (style.direction, edge) {
-        (Direction::Ltr, InlineBoxEdge::Start) => {
-            (style.margin.left, borders.left, style.padding.left)
-        }
-        (Direction::Ltr, InlineBoxEdge::End) => {
-            (style.margin.right, borders.right, style.padding.right)
-        }
-        (Direction::Rtl, InlineBoxEdge::Start) => {
-            (style.margin.right, borders.right, style.padding.right)
-        }
-        (Direction::Rtl, InlineBoxEdge::End) => {
-            (style.margin.left, borders.left, style.padding.left)
-        }
-    };
+    let (margin, border, padding) = inline_box_edge_components(style, edge);
     margin.abs() > 0.001 || border.abs() > 0.001 || padding.abs() > 0.001
+}
+
+fn inline_box_edge_components(style: &ComputedStyle, edge: InlineBoxEdge) -> (f32, f32, f32) {
+    let side = inline_box_edge_physical_side(style, edge);
+    let borders = used_border_widths(style);
+    match side {
+        PhysicalSide::Top => (style.margin.top, borders.top, style.padding.top),
+        PhysicalSide::Right => (style.margin.right, borders.right, style.padding.right),
+        PhysicalSide::Bottom => (style.margin.bottom, borders.bottom, style.padding.bottom),
+        PhysicalSide::Left => (style.margin.left, borders.left, style.padding.left),
+    }
+}
+
+fn inline_box_edge_physical_side(style: &ComputedStyle, edge: InlineBoxEdge) -> PhysicalSide {
+    match edge {
+        InlineBoxEdge::Start => inline_start_side(style.writing_mode, style.direction),
+        InlineBoxEdge::End => inline_end_side(style.writing_mode, style.direction),
+    }
 }
 
 /// Mark the text items blocked by an inline box's edge decorations.

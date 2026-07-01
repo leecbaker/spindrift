@@ -1144,6 +1144,7 @@ fn shared_prefix_len(left: &[PaintDisplayItem], right: &[PaintDisplayItem]) -> u
 /// CSS 2.2 Appendix E and CSS Positioned Layout stack levels:
 /// <https://www.w3.org/TR/CSS22/zindex.html> and
 /// <https://www.w3.org/TR/css-position-3/#painting-order>.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PaintDisplayItem {
     Operation(PaintOperation),

@@ -86,22 +86,6 @@ pub(crate) fn physical_padding_side_longhand(side: BoxSide) -> &'static str {
     }
 }
 
-pub(crate) fn parse_edges_with_font_size(value: &str, font_size: f32) -> Option<Edges> {
-    let typed = parse_edge_values(value, font_size)?;
-    let values = [
-        typed.top.length_if_no_percent()?,
-        typed.right.length_if_no_percent()?,
-        typed.bottom.length_if_no_percent()?,
-        typed.left.length_if_no_percent()?,
-    ];
-    Some(Edges {
-        top: values[0],
-        right: values[1],
-        bottom: values[2],
-        left: values[3],
-    })
-}
-
 pub(crate) fn parse_edge_values(
     value: &str,
     font_size: f32,
@@ -166,22 +150,43 @@ pub(crate) fn parse_margin_edge_values(
     }
 }
 
-pub(crate) fn parse_border_spacing(value: &str) -> Option<BorderSpacing> {
-    let values = value
-        .split_whitespace()
-        .filter_map(parse_length)
-        .collect::<Vec<_>>();
+pub(crate) fn parse_border_spacing(value: &str, font_size: f32) -> Option<BorderSpacing> {
+    let values = split_css_component_values(value)
+        .into_iter()
+        .map(|part| parse_non_negative_length(part, font_size))
+        .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
         [both] => Some(BorderSpacing {
-            horizontal: (*both).max(0.0),
-            vertical: (*both).max(0.0),
+            horizontal: *both,
+            vertical: *both,
         }),
         [horizontal, vertical] => Some(BorderSpacing {
-            horizontal: (*horizontal).max(0.0),
-            vertical: (*vertical).max(0.0),
+            horizontal: *horizontal,
+            vertical: *vertical,
         }),
         _ => None,
     }
+}
+
+fn parse_non_negative_length(value: &str, font_size: f32) -> Option<ComputedLengthPercentage> {
+    let length = parse_computed_length_percentage(value, font_size)?;
+    (length.percent == 0.0 && !length_percentage_is_definitely_negative(length)).then_some(length)
+}
+
+fn length_percentage_is_definitely_negative(value: ComputedLengthPercentage) -> bool {
+    let components = [
+        value.length,
+        value.percent,
+        value.ch,
+        value.vw,
+        value.vh,
+        value.vmin,
+        value.vmax,
+        value.vi,
+        value.vb,
+    ];
+    components.iter().any(|component| *component < 0.0)
+        && components.iter().all(|component| *component <= 0.0)
 }
 
 pub(crate) fn edge_all(value: f32) -> Edges {

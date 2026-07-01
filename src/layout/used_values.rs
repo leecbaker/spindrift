@@ -75,7 +75,9 @@ pub(super) fn used_length_percentage(
     value: css::ComputedLengthPercentage,
     percentage_basis: f32,
 ) -> f32 {
-    value.length + value.percent * percentage_basis
+    value
+        .used_length_with_percentage_basis(percentage_basis)
+        .unwrap_or(value.length + value.percent * percentage_basis)
 }
 
 /// Resolves a computed `<length-percentage> | auto` value, preserving `auto`.
@@ -115,7 +117,7 @@ pub(super) fn used_length_percentage_or_auto_with_optional_basis(
     match value {
         css::ComputedLengthPercentageOrAuto::Auto => None,
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            if value.percent == 0.0 {
+            if value.percent == 0.0 && value.math.is_none() {
                 Some(value.length)
             } else {
                 Some(used_length_percentage(value, percentage_basis?))
@@ -176,6 +178,7 @@ pub(super) fn used_multicol_column_count(
     let css::ComputedColumnWidth::Length(width) = style.column_width else {
         return None;
     };
+    let width = width.length_if_no_percent()?;
     if width <= 0.0 {
         return None;
     }
@@ -313,28 +316,60 @@ pub(super) fn resolve_normal_flow_block_auto_margins(
         return;
     }
 
+    resolve_normal_flow_auto_margins_for_known_width(
+        style,
+        containing_inline_size,
+        border_box_width,
+        containing_direction,
+    );
+}
+
+/// Resolve horizontal `auto` margins when the formatting context has already
+/// resolved a concrete border-box width.
+///
+/// CSS table wrappers with `width:auto` can shrink-wrap to their final grid
+/// width, so they need the same CSS 2.2 block-width auto-margin equation after
+/// table width resolution rather than normal block auto-width fill. When the
+/// equation is over-constrained, CSS first treats any auto horizontal margins
+/// as zero and then ignores the containing block's end-side margin:
+/// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth> and
+/// <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>.
+pub(super) fn resolve_normal_flow_auto_margins_for_known_width(
+    style: &mut ComputedStyle,
+    containing_inline_size: f32,
+    border_box_width: f32,
+    containing_direction: Direction,
+) {
+    let left_auto = style.box_values.margin.left.is_auto();
+    let right_auto = style.box_values.margin.right.is_auto();
+    if !left_auto && !right_auto {
+        return;
+    }
+
     let free_space =
         containing_inline_size - style.margin.left - border_box_width - style.margin.right;
-    if left_auto && right_auto {
-        if free_space >= 0.0 {
-            style.margin.left = free_space / 2.0;
-            style.margin.right = free_space / 2.0;
-        } else {
-            match containing_direction {
-                Direction::Ltr => {
-                    style.margin.left = 0.0;
-                    style.margin.right = free_space;
-                }
-                Direction::Rtl => {
-                    style.margin.left = free_space;
-                    style.margin.right = 0.0;
-                }
+    if free_space < 0.0 {
+        if left_auto {
+            style.margin.left = 0.0;
+        }
+        if right_auto {
+            style.margin.right = 0.0;
+        }
+        match containing_direction {
+            Direction::Ltr => {
+                style.margin.right = containing_inline_size - style.margin.left - border_box_width;
+            }
+            Direction::Rtl => {
+                style.margin.left = containing_inline_size - border_box_width - style.margin.right;
             }
         }
+    } else if left_auto && right_auto {
+        style.margin.left = free_space / 2.0;
+        style.margin.right = free_space / 2.0;
     } else if left_auto {
-        style.margin.left = free_space.max(0.0);
+        style.margin.left = free_space;
     } else if right_auto {
-        style.margin.right = free_space.max(0.0);
+        style.margin.right = free_space;
     }
 }
 
@@ -753,6 +788,84 @@ pub(super) fn taffy_length_percentage_auto(
 mod tests {
     use super::*;
 
+    fn style_with_horizontal_margins(
+        left: css::ComputedLengthPercentageOrAuto,
+        right: css::ComputedLengthPercentageOrAuto,
+        used_left: f32,
+        used_right: f32,
+    ) -> ComputedStyle {
+        let mut style = ComputedStyle::initial();
+        style.box_values.margin.left = left;
+        style.box_values.margin.right = right;
+        style.margin.left = used_left;
+        style.margin.right = used_right;
+        style
+    }
+
+    #[test]
+    fn both_auto_margins_keep_start_side_zero_when_ltr_block_overflows() {
+        let mut style = style_with_horizontal_margins(
+            css::ComputedLengthPercentageOrAuto::Auto,
+            css::ComputedLengthPercentageOrAuto::Auto,
+            0.0,
+            0.0,
+        );
+
+        resolve_normal_flow_auto_margins_for_known_width(&mut style, 100.0, 200.0, Direction::Ltr);
+
+        assert_eq!(style.margin.left, 0.0);
+        assert_eq!(style.margin.right, -100.0);
+    }
+
+    #[test]
+    fn right_auto_margin_can_be_negative_when_ltr_block_overflows() {
+        let mut style = style_with_horizontal_margins(
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_length(25.0),
+            ),
+            css::ComputedLengthPercentageOrAuto::Auto,
+            25.0,
+            0.0,
+        );
+
+        resolve_normal_flow_auto_margins_for_known_width(&mut style, 100.0, 200.0, Direction::Ltr);
+
+        assert_eq!(style.margin.left, 25.0);
+        assert_eq!(style.margin.right, -125.0);
+    }
+
+    #[test]
+    fn left_auto_margin_stays_zero_when_ltr_block_overflows() {
+        let mut style = style_with_horizontal_margins(
+            css::ComputedLengthPercentageOrAuto::Auto,
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(
+                css::ComputedLengthPercentage::from_length(25.0),
+            ),
+            0.0,
+            25.0,
+        );
+
+        resolve_normal_flow_auto_margins_for_known_width(&mut style, 100.0, 200.0, Direction::Ltr);
+
+        assert_eq!(style.margin.left, 0.0);
+        assert_eq!(style.margin.right, -100.0);
+    }
+
+    #[test]
+    fn both_auto_margins_keep_end_side_zero_when_rtl_block_overflows() {
+        let mut style = style_with_horizontal_margins(
+            css::ComputedLengthPercentageOrAuto::Auto,
+            css::ComputedLengthPercentageOrAuto::Auto,
+            0.0,
+            0.0,
+        );
+
+        resolve_normal_flow_auto_margins_for_known_width(&mut style, 100.0, 200.0, Direction::Rtl);
+
+        assert_eq!(style.margin.left, -100.0);
+        assert_eq!(style.margin.right, 0.0);
+    }
+
     #[tokio::test]
     async fn used_lengths_resolve_percentage_against_basis() {
         let value = css::ComputedLengthPercentage {
@@ -784,7 +897,8 @@ mod tests {
     #[tokio::test]
     async fn multicol_count_can_derive_from_computed_column_width() {
         let mut style = ComputedStyle::initial();
-        style.column_width = css::ComputedColumnWidth::Length(40.0);
+        style.column_width =
+            css::ComputedColumnWidth::Length(css::ComputedLengthPercentage::from_length(40.0));
 
         assert_eq!(used_multicol_column_count(&style, 150.0, 10.0), Some(3));
 

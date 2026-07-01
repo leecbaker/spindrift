@@ -56,7 +56,7 @@ pub(in crate::layout) fn inline_atom_boundary_role(
     content: &InlineAtomContent,
 ) -> InlineBoundaryRole {
     match content {
-        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge) => {
+        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_)) => {
             InlineBoundaryRole::TransparentTextBoundary
         }
         InlineAtomContent::InlineBox { .. } | InlineAtomContent::InlineFragment(_) => {
@@ -65,6 +65,7 @@ pub(in crate::layout) fn inline_atom_boundary_role(
         InlineAtomContent::Canvas
         | InlineAtomContent::Image(_)
         | InlineAtomContent::Svg { .. }
+        | InlineAtomContent::StaticPositionPlaceholder
         | InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace)
         | InlineAtomContent::Leader(_) => InlineBoundaryRole::OpaqueAtomic,
     }

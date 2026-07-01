@@ -35,8 +35,9 @@ pub(super) fn parse_column_width(value: &str, font_size: f32) -> Option<Computed
     if value.eq_ignore_ascii_case("auto") {
         Some(ComputedColumnWidth::Auto)
     } else {
-        parse_length_with_font_size(value, font_size)
-            .filter(|length| *length >= 0.0)
+        parse_computed_length_percentage(value, font_size)
+            .filter(|length| length.percent == 0.0)
+            .filter(|length| !length_percentage_is_definitely_negative(*length))
             .map(ComputedColumnWidth::Length)
     }
 }

@@ -11,7 +11,7 @@ pub(in crate::layout) use graph::{
 pub(in crate::layout) use items::{InlineLineRecord, InlineLineSequence};
 
 #[cfg(test)]
-pub(in crate::layout) use graph::{MeasuredInlineItem, measured_inline_items};
+pub(in crate::layout) use graph::MeasuredInlineItem;
 #[cfg(test)]
 pub(in crate::layout) use graph::{
     InlineBreakKind, InlineGraphPosition, InlineGraphRange, InlineLineFragment,

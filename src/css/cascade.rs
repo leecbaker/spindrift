@@ -14,11 +14,14 @@ mod variables;
 use background::*;
 use columns::*;
 pub(crate) use declarations::{
-    CascadedDeclaration, apply_cascaded_declarations_with_inheritance_source,
-    apply_cascaded_marker_declarations_with_inheritance_source, apply_declarations,
-    declaration_is_important, declarations_affect_same_property, origin_importance_rank,
-    sort_cascaded_declarations,
+    CascadedDeclaration, apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance,
+    apply_cascaded_marker_declarations_with_inheritance_source_and_parent_ch_advance,
+    apply_declarations, declaration_is_important, declarations_affect_same_property,
+    origin_importance_rank, sort_cascaded_declarations,
 };
 use properties::*;
-pub(crate) use style::{default_style_for_tag, style_for_element_with_signature};
+pub(crate) use style::{
+    apply_pseudo_rules_with_parent_ch_advance, default_style_for_tag,
+    style_for_element_with_signature, style_for_element_with_signature_and_parent_ch_advance,
+};
 use variables::*;

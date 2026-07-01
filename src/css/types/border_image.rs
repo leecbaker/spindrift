@@ -31,6 +31,7 @@ impl BorderImage {
 
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
         self.width.resolve_font_metric_lengths(ch_advance);
+        self.outset.resolve_font_metric_lengths(ch_advance);
     }
 
     pub(crate) fn resolve_viewport_lengths(
@@ -41,6 +42,12 @@ impl BorderImage {
         viewport_block: f32,
     ) {
         self.width.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.outset.resolve_viewport_lengths(
             viewport_width,
             viewport_height,
             viewport_inline,
@@ -201,18 +208,83 @@ pub(crate) struct BorderImageOutset {
 impl BorderImageOutset {
     pub(crate) fn initial() -> Self {
         Self {
-            top: BorderImageOutsetValue::Length(0.0),
-            right: BorderImageOutsetValue::Length(0.0),
-            bottom: BorderImageOutsetValue::Length(0.0),
-            left: BorderImageOutsetValue::Length(0.0),
+            top: BorderImageOutsetValue::Length(ComputedLengthPercentage::ZERO),
+            right: BorderImageOutsetValue::Length(ComputedLengthPercentage::ZERO),
+            bottom: BorderImageOutsetValue::Length(ComputedLengthPercentage::ZERO),
+            left: BorderImageOutsetValue::Length(ComputedLengthPercentage::ZERO),
         }
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.top.resolve_font_metric_lengths(ch_advance);
+        self.right.resolve_font_metric_lengths(ch_advance);
+        self.bottom.resolve_font_metric_lengths(ch_advance);
+        self.left.resolve_font_metric_lengths(ch_advance);
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.top.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.right.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.bottom.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.left.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum BorderImageOutsetValue {
     Number(f32),
-    Length(f32),
+    Length(ComputedLengthPercentage),
+}
+
+impl BorderImageOutsetValue {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        if let Self::Length(value) = self {
+            value.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        if let Self::Length(value) = self {
+            value.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
+    }
 }
 
 /// Computed `border-image-repeat` value for horizontal and vertical axes.

@@ -5,15 +5,16 @@ use super::types::{
     inline_start_side,
 };
 use super::values::{
-    parse_computed_length_percentage, parse_computed_length_percentage_auto, parse_font_size,
-    parse_length, parse_length_with_font_size, parse_line_height, trim_css_value,
+    fallback_ch_advance_for_style, parse_computed_length_percentage,
+    parse_computed_length_percentage_auto, parse_computed_line_height, parse_font_size,
+    parse_line_height, trim_css_value,
 };
 use crate::{PageMargins, PageSize, RenderOptions};
 
 pub(crate) fn apply_stylesheet_options(css: &Css, options: &mut RenderOptions) {
     let stylesheet = parse_stylesheet(css);
-    if let Some(size) = stylesheet.page_declarations.get("size") {
-        apply_page_size_to(size, &mut options.page_size);
+    if stylesheet.page_declarations.get("size").is_some() {
+        options.page_size = page_size_from(&stylesheet.page_declarations, options.page_size);
     }
     options.set_page_margins(page_margins_from_for_size(
         &stylesheet.page_declarations,
@@ -27,18 +28,17 @@ pub(crate) fn apply_stylesheet_options(css: &Css, options: &mut RenderOptions) {
             .iter()
             .filter(|rule| rule.selector_text.eq_ignore_ascii_case(selector))
         {
-            if let Some(font_size) = rule
-                .declarations
-                .get("font-size")
-                .and_then(|value| parse_font_size(value, options.font_size))
+            if let Some(value) = rule.declarations.get("font-size")
+                && !font_size_value_depends_on_ch(value, options.font_size)
+                && let Some(font_size) = parse_font_size(value, options.font_size)
             {
                 options.font_size = font_size;
                 options.line_height = font_size * 1.2;
             }
-            if let Some(line_height) = rule
-                .declarations
-                .get("line-height")
-                .and_then(|value| parse_line_height(value, options.font_size).map(|item| item.0))
+            if let Some(value) = rule.declarations.get("line-height")
+                && !line_height_value_depends_on_ch(value, options.font_size)
+                && let Some(line_height) =
+                    parse_line_height(value, options.font_size).map(|item| item.0)
             {
                 options.line_height = line_height;
             }
@@ -46,13 +46,34 @@ pub(crate) fn apply_stylesheet_options(css: &Css, options: &mut RenderOptions) {
     }
 }
 
+fn font_size_value_depends_on_ch(value: &str, parent_font_size: f32) -> bool {
+    parse_computed_length_percentage(value, parent_font_size).is_some_and(|length| length.ch != 0.0)
+}
+
+fn line_height_value_depends_on_ch(value: &str, font_size: f32) -> bool {
+    match parse_computed_line_height(value, font_size) {
+        Some(super::types::ComputedLineHeight::Length(length)) => length.ch != 0.0,
+        _ => false,
+    }
+}
+
 pub(crate) fn page_size_from(declarations: &Declarations, base: PageSize) -> PageSize {
+    let style = page_style_for_declarations(declarations);
+    page_size_from_with_ch_advance(declarations, base, fallback_ch_advance_for_style(&style))
+}
+
+pub(crate) fn page_size_from_with_ch_advance(
+    declarations: &Declarations,
+    base: PageSize,
+    ch_advance: f32,
+) -> PageSize {
+    let style = page_style_for_declarations(declarations);
     let mut page_size = base;
     if let Some(size) = declarations.get("size") {
-        apply_page_size_to(size, &mut page_size);
+        apply_page_size_to_with_metrics(size, &mut page_size, style.font_size, ch_advance);
         return page_size;
     }
-    descriptor_page_size_from_width_height(declarations).unwrap_or(page_size)
+    descriptor_page_size_from_width_height(declarations, ch_advance).unwrap_or(page_size)
 }
 
 /// Resolves a sheet size from `@page width`/`height` and fixed margins.
@@ -62,17 +83,21 @@ pub(crate) fn page_size_from(declarations: &Declarations, base: PageSize) -> Pag
 /// area/content box; fixed margins expand that to the sheet/page-box size:
 /// <https://www.w3.org/TR/css-page-3/#page-properties> and
 /// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth>.
-fn descriptor_page_size_from_width_height(declarations: &Declarations) -> Option<PageSize> {
+fn descriptor_page_size_from_width_height(
+    declarations: &Declarations,
+    ch_advance: f32,
+) -> Option<PageSize> {
     let style = page_style_for_declarations(declarations);
     let width = declarations
         .get("width")
-        .and_then(|value| parse_length_with_font_size(value, style.font_size))
+        .and_then(|value| parse_page_fixed_length(value, style.font_size, ch_advance))
         .filter(|value| *value >= 0.0)?;
     let height = declarations
         .get("height")
-        .and_then(|value| parse_length_with_font_size(value, style.font_size))
+        .and_then(|value| parse_page_fixed_length(value, style.font_size, ch_advance))
         .filter(|value| *value >= 0.0)?;
-    let margins = fixed_page_margin_lengths_without_size(declarations, style.font_size)?;
+    let margins =
+        fixed_page_margin_lengths_without_size(declarations, style.font_size, ch_advance)?;
     Some(PageSize {
         width: width + margins.left + margins.right,
         height: height + margins.top + margins.bottom,
@@ -82,6 +107,7 @@ fn descriptor_page_size_from_width_height(declarations: &Declarations) -> Option
 fn fixed_page_margin_lengths_without_size(
     declarations: &Declarations,
     font_size: f32,
+    ch_advance: f32,
 ) -> Option<PageMargins> {
     let mut margins = PageMarginEdges::from_lengths(PageMargins::all(0.0));
     for (name, value) in declarations {
@@ -96,17 +122,17 @@ fn fixed_page_margin_lengths_without_size(
         }
     }
     Some(PageMargins {
-        top: fixed_page_margin_edge_length(margins.top)?,
-        right: fixed_page_margin_edge_length(margins.right)?,
-        bottom: fixed_page_margin_edge_length(margins.bottom)?,
-        left: fixed_page_margin_edge_length(margins.left)?,
+        top: fixed_page_margin_edge_length(margins.top, ch_advance)?,
+        right: fixed_page_margin_edge_length(margins.right, ch_advance)?,
+        bottom: fixed_page_margin_edge_length(margins.bottom, ch_advance)?,
+        left: fixed_page_margin_edge_length(margins.left, ch_advance)?,
     })
 }
 
-fn fixed_page_margin_edge_length(edge: PageMarginEdge) -> Option<f32> {
+fn fixed_page_margin_edge_length(edge: PageMarginEdge, ch_advance: f32) -> Option<f32> {
     match edge {
-        PageMarginEdge::LengthPercentage(value) if value.percent == 0.0 && value.ch == 0.0 => {
-            Some(value.length)
+        PageMarginEdge::LengthPercentage(value) if value.percent == 0.0 => {
+            Some(resolve_length_with_ch(value, ch_advance))
         }
         PageMarginEdge::LengthPercentage(_) | PageMarginEdge::Auto => None,
     }
@@ -131,9 +157,23 @@ pub(crate) fn page_rotation_from(declarations: &Declarations, base: i32) -> i32 
 /// and padding properties are relative to the corresponding page-box
 /// dimension, so top/bottom use page height and left/right use page width:
 /// <https://www.w3.org/TR/css-page-3/#page-properties>.
+#[cfg(test)]
 pub(crate) fn page_padding_from_for_size(
     declarations: &Declarations,
     page_size: PageSize,
+) -> Edges {
+    let style = page_style_for_declarations(declarations);
+    page_padding_from_for_size_with_ch_advance(
+        declarations,
+        page_size,
+        fallback_ch_advance_for_style(&style),
+    )
+}
+
+pub(crate) fn page_padding_from_for_size_with_ch_advance(
+    declarations: &Declarations,
+    page_size: PageSize,
+    ch_advance: f32,
 ) -> Edges {
     if declarations.is_empty() {
         return Edges::ZERO;
@@ -191,10 +231,25 @@ pub(crate) fn page_padding_from_for_size(
         }
     }
     Edges {
-        top: resolve_page_length_percentage(padding.top, PhysicalSide::Top, page_size),
-        right: resolve_page_length_percentage(padding.right, PhysicalSide::Right, page_size),
-        bottom: resolve_page_length_percentage(padding.bottom, PhysicalSide::Bottom, page_size),
-        left: resolve_page_length_percentage(padding.left, PhysicalSide::Left, page_size),
+        top: resolve_page_length_percentage(padding.top, PhysicalSide::Top, page_size, ch_advance),
+        right: resolve_page_length_percentage(
+            padding.right,
+            PhysicalSide::Right,
+            page_size,
+            ch_advance,
+        ),
+        bottom: resolve_page_length_percentage(
+            padding.bottom,
+            PhysicalSide::Bottom,
+            page_size,
+            ch_advance,
+        ),
+        left: resolve_page_length_percentage(
+            padding.left,
+            PhysicalSide::Left,
+            page_size,
+            ch_advance,
+        ),
     }
 }
 
@@ -240,6 +295,23 @@ pub(crate) fn page_margins_from_for_size_and_edges(
     base: PageMargins,
     page_size: PageSize,
     non_margin_edges: Edges,
+) -> PageMargins {
+    let style = page_style_for_declarations(declarations);
+    page_margins_from_for_size_and_edges_with_ch_advance(
+        declarations,
+        base,
+        page_size,
+        non_margin_edges,
+        fallback_ch_advance_for_style(&style),
+    )
+}
+
+pub(crate) fn page_margins_from_for_size_and_edges_with_ch_advance(
+    declarations: &Declarations,
+    base: PageMargins,
+    page_size: PageSize,
+    non_margin_edges: Edges,
+    ch_advance: f32,
 ) -> PageMargins {
     let style = page_style_for_declarations(declarations);
     let mut margins = PageMarginEdges::from_lengths(base);
@@ -301,13 +373,13 @@ pub(crate) fn page_margins_from_for_size_and_edges(
                 }
             }
             "width" => {
-                if let Some(length) = parse_length_with_font_size(value, style.font_size) {
+                if let Some(length) = parse_page_fixed_length(value, style.font_size, ch_advance) {
                     width = Some(length);
                     changed = true;
                 }
             }
             "height" => {
-                if let Some(length) = parse_length_with_font_size(value, style.font_size) {
+                if let Some(length) = parse_page_fixed_length(value, style.font_size, ch_advance) {
                     height = Some(length);
                     changed = true;
                 }
@@ -324,6 +396,7 @@ pub(crate) fn page_margins_from_for_size_and_edges(
                 page_size.height,
                 margins.top,
                 margins.bottom,
+                ch_advance,
             )
             .0,
             right: resolve_page_margin_axis(
@@ -333,6 +406,7 @@ pub(crate) fn page_margins_from_for_size_and_edges(
                 page_size.width,
                 margins.left,
                 margins.right,
+                ch_advance,
             )
             .1,
             bottom: resolve_page_margin_axis(
@@ -342,6 +416,7 @@ pub(crate) fn page_margins_from_for_size_and_edges(
                 page_size.height,
                 margins.top,
                 margins.bottom,
+                ch_advance,
             )
             .1,
             left: resolve_page_margin_axis(
@@ -351,6 +426,7 @@ pub(crate) fn page_margins_from_for_size_and_edges(
                 page_size.width,
                 margins.left,
                 margins.right,
+                ch_advance,
             )
             .0,
         }
@@ -392,7 +468,7 @@ enum PageMarginEdge {
     Auto,
 }
 
-fn page_style_for_declarations(declarations: &Declarations) -> ComputedStyle {
+pub(crate) fn page_style_for_declarations(declarations: &Declarations) -> ComputedStyle {
     let mut style = ComputedStyle::initial();
     super::apply_declarations(&mut style, declarations);
     style
@@ -577,13 +653,14 @@ fn resolve_page_margin_axis(
     percentage_basis: f32,
     start: PageMarginEdge,
     end: PageMarginEdge,
+    ch_advance: f32,
 ) -> (f32, f32) {
     let containing_size = containing_size.max(0.0);
     let non_margin_size = non_margin_size.max(0.0);
     let mut start_auto = start == PageMarginEdge::Auto;
     let mut end_auto = end == PageMarginEdge::Auto;
-    let mut start = page_margin_edge_length(start, percentage_basis);
-    let mut end = page_margin_edge_length(end, percentage_basis);
+    let mut start = page_margin_edge_length(start, percentage_basis, ch_advance);
+    let mut end = page_margin_edge_length(end, percentage_basis, ch_advance);
 
     if let Some(content_size) = specified_content_size {
         let content_size = content_size.max(0.0);
@@ -617,7 +694,7 @@ fn resolve_page_margin_axis(
     (start, end)
 }
 
-fn page_margin_edge_length(edge: PageMarginEdge, percentage_basis: f32) -> f32 {
+fn page_margin_edge_length(edge: PageMarginEdge, percentage_basis: f32, ch_advance: f32) -> f32 {
     match edge {
         PageMarginEdge::LengthPercentage(value) => resolve_page_length_percentage(
             value,
@@ -626,30 +703,35 @@ fn page_margin_edge_length(edge: PageMarginEdge, percentage_basis: f32) -> f32 {
                 width: percentage_basis,
                 height: percentage_basis,
             },
+            ch_advance,
         ),
         PageMarginEdge::Auto => 0.0,
     }
 }
 
 fn resolve_page_length_percentage(
-    value: ComputedLengthPercentage,
+    mut value: ComputedLengthPercentage,
     side: PhysicalSide,
     page_size: PageSize,
+    ch_advance: f32,
 ) -> f32 {
     let basis = match side {
         PhysicalSide::Top | PhysicalSide::Bottom => page_size.height,
         PhysicalSide::Right | PhysicalSide::Left => page_size.width,
     };
-    value.length + value.percent * basis
+    value.resolve_font_metric_lengths(ch_advance);
+    value
+        .used_length_with_percentage_basis(basis)
+        .unwrap_or(value.length + value.percent * basis)
 }
 
-/// Applies a CSS Paged Media `size` descriptor to the page box.
-///
-/// The descriptor accepts named sizes, orientation keywords, two lengths
-/// (`width height`), and one length for a square page:
-/// <https://www.w3.org/TR/css-page-3/#page-size-prop>.
-pub(crate) fn apply_page_size_to(value: &str, page_size: &mut PageSize) {
-    if let Some(parsed) = parse_page_size_descriptor(value, *page_size) {
+pub(crate) fn apply_page_size_to_with_metrics(
+    value: &str,
+    page_size: &mut PageSize,
+    font_size: f32,
+    ch_advance: f32,
+) {
+    if let Some(parsed) = parse_page_size_descriptor(value, *page_size, font_size, ch_advance) {
         *page_size = parsed;
     }
 }
@@ -661,7 +743,12 @@ pub(crate) fn apply_page_size_to(value: &str, page_size: &mut PageSize) {
 /// orientation keyword. Invalid extra tokens invalidate the descriptor instead
 /// of allowing partial application:
 /// <https://www.w3.org/TR/css-page-3/#page-size-prop>.
-fn parse_page_size_descriptor(value: &str, base: PageSize) -> Option<PageSize> {
+fn parse_page_size_descriptor(
+    value: &str,
+    base: PageSize,
+    font_size: f32,
+    ch_advance: f32,
+) -> Option<PageSize> {
     let value = value.trim().to_ascii_lowercase();
     if value.is_empty() {
         return None;
@@ -701,7 +788,9 @@ fn parse_page_size_descriptor(value: &str, base: PageSize) -> Option<PageSize> {
 
     let lengths = parts
         .iter()
-        .map(|part| parse_length(part).filter(|length| *length >= 0.0))
+        .map(|part| {
+            parse_page_fixed_length(part, font_size, ch_advance).filter(|length| *length >= 0.0)
+        })
         .collect::<Option<Vec<_>>>()?;
     match lengths.as_slice() {
         [side] => Some(PageSize {
@@ -714,6 +803,15 @@ fn parse_page_size_descriptor(value: &str, base: PageSize) -> Option<PageSize> {
         }),
         _ => None,
     }
+}
+
+fn parse_page_fixed_length(value: &str, font_size: f32, ch_advance: f32) -> Option<f32> {
+    let value = parse_computed_length_percentage(value, font_size)?;
+    (value.percent == 0.0).then(|| resolve_length_with_ch(value, ch_advance))
+}
+
+fn resolve_length_with_ch(value: ComputedLengthPercentage, ch_advance: f32) -> f32 {
+    value.length + value.ch * ch_advance
 }
 
 fn oriented_page_size(width: f32, height: f32, orientation: &str) -> (f32, f32) {

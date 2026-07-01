@@ -7,7 +7,7 @@ use super::types::{
 };
 use super::values::{
     parse_color, parse_css_string_token, parse_display, parse_font_family_names, parse_font_style,
-    parse_font_weight, parse_font_width, parse_length, split_css_component_values, trim_css_value,
+    parse_font_weight, parse_font_width, split_css_component_values, trim_css_value,
 };
 use cssparser::{
     BasicParseErrorKind, CowRcStr, Parser, ParserInput, ParserState, RuleBodyItemParser,

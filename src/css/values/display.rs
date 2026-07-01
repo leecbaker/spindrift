@@ -59,6 +59,11 @@ pub(crate) fn parse_display(value: &str, current: Display) -> Display {
                     return current;
                 }
             }
+            "grid" => {
+                if inner.replace(DisplayInner::Grid).is_some() {
+                    return current;
+                }
+            }
             "list-item" => {
                 if list_item {
                     return current;
@@ -93,6 +98,8 @@ fn parse_display_legacy(lower: &str) -> Option<Display> {
         "inline-block" => Some(Display::INLINE_BLOCK),
         "flex" => Some(Display::FLEX),
         "inline-flex" => Some(Display::INLINE_FLEX),
+        "grid" => Some(Display::GRID),
+        "inline-grid" => Some(Display::INLINE_GRID),
         "table" => Some(Display::TABLE),
         "inline-table" => Some(Display::INLINE_TABLE),
         "table-caption" => Some(Display::TABLE_CAPTION),

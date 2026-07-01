@@ -39,11 +39,12 @@ impl<'a> LayoutBuilder<'a> {
                     let table_children = if let Some(children) = child_boxes {
                         children
                     } else {
-                        built_child_boxes = box_tree::build_child_boxes(
+                        built_child_boxes = box_tree::build_child_boxes_with_font_metrics(
                             element,
                             stylesheets,
                             style,
                             &self.ancestors,
+                            &mut self.font_system,
                         );
                         &built_child_boxes
                     };
@@ -150,8 +151,18 @@ impl<'a> LayoutBuilder<'a> {
             }
         } else {
             let has_direct_inline_replaced_row = has_direct_inline_replaced_child(element)
-                && !has_direct_flow_child(element, style, stylesheets);
-            let has_direct_flow_child = has_direct_flow_child(element, style, stylesheets);
+                && !has_direct_flow_child_with_font_metrics(
+                    element,
+                    style,
+                    stylesheets,
+                    &mut self.font_system,
+                );
+            let has_direct_flow_child = has_direct_flow_child_with_font_metrics(
+                element,
+                style,
+                stylesheets,
+                &mut self.font_system,
+            );
             let text = if is_document_canvas_element(element) || has_direct_flow_child {
                 // CSS 2.2 lays direct block-flow children in block formatting
                 // context; their descendant text must not also contribute as a
@@ -189,12 +200,11 @@ impl<'a> LayoutBuilder<'a> {
                         sibling_tags.clone(),
                     );
                     element_index += 1;
-                    let child_style = style_for_layout_element(
+                    let child_style = self.style_for_layout_element_with_parent_font_metrics(
                         child_element,
                         child_signature,
                         stylesheets,
                         Some(style),
-                        &self.ancestors,
                     );
                     if (child_style.display.is_block_level()
                         || is_document_canvas_element(element)
@@ -290,5 +300,18 @@ impl<'a> LayoutBuilder<'a> {
         let available_width = (available_width - padding_left - padding_right).max(1.0);
         self.intrinsic_inline_measurement_for_text(text, style, available_width)
             .height()
+    }
+
+    pub(in crate::layout) fn estimate_text_physical_height(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        available_width: f32,
+        padding_left: f32,
+        padding_right: f32,
+    ) -> f32 {
+        let available_width = (available_width - padding_left - padding_right).max(1.0);
+        self.intrinsic_inline_measurement_for_text(text, style, available_width)
+            .physical_height(style)
     }
 }

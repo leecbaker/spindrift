@@ -8,17 +8,24 @@ mod ua;
 mod values;
 
 pub(crate) use cascade::apply_declarations;
+pub(crate) use cascade::apply_pseudo_rules_with_parent_ch_advance;
 pub(crate) use cascade::declarations_affect_same_property;
 pub(crate) use cascade::default_style_for_tag;
 pub(crate) use cascade::origin_importance_rank;
 pub(crate) use cascade::style_for_element_with_signature;
+pub(crate) use cascade::style_for_element_with_signature_and_parent_ch_advance;
 #[cfg(test)]
 pub(crate) use page::page_margins_from;
 #[cfg(test)]
 pub(crate) use page::page_margins_from_for_size;
 pub(crate) use page::{
-    apply_stylesheet_options, page_margins_from_for_size_and_edges, page_padding_from_for_size,
-    page_rotation_from, page_size_from,
+    apply_stylesheet_options, page_margins_from_for_size_and_edges_with_ch_advance,
+    page_padding_from_for_size_with_ch_advance, page_rotation_from, page_size_from_with_ch_advance,
+    page_style_for_declarations,
+};
+#[cfg(test)]
+pub(crate) use page::{
+    page_margins_from_for_size_and_edges, page_padding_from_for_size, page_size_from,
 };
 #[cfg(test)]
 pub(crate) use parse::cascade_page_declarations;

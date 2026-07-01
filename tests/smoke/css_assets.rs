@@ -1053,6 +1053,39 @@ async fn normal_block_one_sided_auto_margins_absorb_free_space() {
 }
 
 #[tokio::test]
+async fn normal_block_auto_margins_follow_overconstrained_block_width_equation() {
+    let document = Html::from_string(
+        "<style>\
+         @page{size:500pt 120pt;margin:0}body{margin:0}\
+         .wrapper{width:100pt;margin-left:250pt}\
+         .test{width:50pt;height:5pt;margin:auto;background:green}\
+         .big{width:200pt;background:blue}\
+         .fixed-right{margin-left:auto;margin-right:125pt;background:red}\
+         </style>\
+         <div class=\"wrapper\">\
+           <div class=\"test\"></div>\
+           <div class=\"test big\"></div>\
+           <div class=\"test fixed-right\"></div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = filled_rect(&document.pages[0], Color::new(0, 128, 0));
+    assert!((green.x() - 275.0).abs() < 0.01, "{green:?}");
+    assert!((green.width() - 50.0).abs() < 0.01, "{green:?}");
+
+    let blue = filled_rect(&document.pages[0], Color::new(0, 0, 255));
+    assert!((blue.x() - 250.0).abs() < 0.01, "{blue:?}");
+    assert!((blue.width() - 200.0).abs() < 0.01, "{blue:?}");
+
+    let red = filled_rect(&document.pages[0], Color::new(255, 0, 0));
+    assert!((red.x() - 250.0).abs() < 0.01, "{red:?}");
+    assert!((red.width() - 50.0).abs() < 0.01, "{red:?}");
+}
+
+#[tokio::test]
 async fn rtl_overconstrained_fixed_width_blocks_keep_end_side() {
     let document = Html::from_string(
         "<style>@page{size:120pt 80pt;margin:10pt}body{margin:0;direction:rtl}.box{width:80pt;height:10pt;margin-left:15pt;margin-right:20pt;background:green}</style><div class=\"box\"></div>",

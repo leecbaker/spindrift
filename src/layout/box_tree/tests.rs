@@ -1,5 +1,9 @@
 use super::*;
-use crate::css::Css;
+use crate::css::{
+    ComputedLengthPercentage, ComputedLengthPercentageOrAuto, ComputedLineHeight, Css, FontFamily,
+    TextOrientation,
+};
+use std::path::PathBuf;
 
 fn parent_style() -> ComputedStyle {
     ComputedStyle {
@@ -14,6 +18,19 @@ fn build_test_page<'a>(root: &'a Node, author_stylesheets: &[Stylesheet]) -> Pag
     let mut stylesheets = vec![css::html5_user_agent_stylesheet()];
     stylesheets.extend_from_slice(author_stylesheets);
     build_page_box(root, &stylesheets, &parent_style())
+}
+
+async fn build_test_page_with_font_metrics<'a>(
+    root: &'a Node,
+    author_stylesheets: &[Stylesheet],
+) -> PageBox<'a> {
+    let mut stylesheets = vec![css::html5_user_agent_stylesheet()];
+    stylesheets.extend_from_slice(author_stylesheets);
+    let mut font_system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&stylesheets)
+        .finish()
+        .await;
+    build_page_box_with_font_metrics(root, &stylesheets, &parent_style(), &mut font_system)
 }
 
 #[tokio::test]
@@ -115,6 +132,45 @@ async fn pure_inline_content_keeps_inline_and_text_boxes() {
 }
 
 #[tokio::test]
+async fn generated_fixed_pseudos_are_out_of_flow_tree_abiding_boxes() {
+    let root = dom::parse("<html><body><div id=\"test\"></div></body></html>");
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        r#"#test::before,
+           #test::after {
+             content: "";
+             position: fixed;
+             width: 50pt;
+             height: 100pt;
+           }"#,
+    ));
+    let page = build_test_page(&root, &[stylesheet]);
+    let div = &page.children[0].children()[0].children()[0];
+    let children = div.children();
+
+    assert_eq!(
+        children.iter().map(FormattingBox::kind).collect::<Vec<_>>(),
+        vec![FormattingBoxKind::Block, FormattingBoxKind::Block]
+    );
+    assert!(is_out_of_flow_box(&children[0]));
+    assert!(is_out_of_flow_box(&children[1]));
+
+    let FormattingBox::Block(before) = &children[0] else {
+        panic!("expected generated ::before block");
+    };
+    let FormattingBox::Block(after) = &children[1] else {
+        panic!("expected generated ::after block");
+    };
+    assert!(matches!(
+        &before.source,
+        BoxSource::GeneratedPseudo(pseudo) if pseudo.kind == GeneratedPseudoKind::Before
+    ));
+    assert!(matches!(
+        &after.source,
+        BoxSource::GeneratedPseudo(pseudo) if pseudo.kind == GeneratedPseudoKind::After
+    ));
+}
+
+#[tokio::test]
 async fn box_tree_preserves_font_shorthand_unit_line_height() {
     let root = dom::parse(
         "<html><body><div class=\"ref\">XX<br>XX</div><div class=\"test\">&#x3000;&#x3000;XX</div></body></html>",
@@ -133,6 +189,112 @@ async fn box_tree_preserves_font_shorthand_unit_line_height() {
     assert!((test_div.style().font_size - 37.5).abs() < 0.001);
     assert!((test_div.style().line_height - 37.5).abs() < 0.001);
     assert!(!test_div.style().line_height_is_normal);
+}
+
+#[tokio::test]
+async fn font_size_ch_uses_measured_parent_zero_advance_during_box_tree_build() {
+    let root = dom::parse(
+        "<html><body><div><span style=\"font-size: 2ch\">probe</span></div></body></html>",
+    );
+    let stylesheet = css::parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: MetricProbe;
+                src: url("tests/resources/fonts/noto-sans-v8-latin-regular.woff");
+            }
+            div {
+                font-family: MetricProbe;
+                font-size: 40pt;
+            }"#,
+        )
+        .with_base_url(Some(PathBuf::from("."))),
+    );
+    let mut metric_style = ComputedStyle {
+        font_family: FontFamily::Names(vec!["MetricProbe".to_string()]),
+        font_size: 40.0,
+        ..ComputedStyle::initial()
+    };
+    metric_style.line_height = metric_style.font_size;
+    let mut font_system = FontSystem::start_loading()
+        .load_stylesheet_fonts(std::slice::from_ref(&stylesheet))
+        .finish()
+        .await;
+    let parent_ch_advance = font_system.ch_advance(&metric_style);
+    assert!(
+        (parent_ch_advance - metric_style.font_size * 0.5).abs() > 0.01,
+        "fixture must differ from the generic 0.5em ch fallback"
+    );
+
+    let page = build_test_page_with_font_metrics(&root, &[stylesheet]).await;
+    let span = &page.children[0].children()[0].children()[0].children()[0];
+
+    assert!(
+        (span.style().font_size - parent_ch_advance * 2.0).abs() < 0.01,
+        "font-size: 2ch should resolve against the measured parent zero advance"
+    );
+}
+
+#[tokio::test]
+async fn pseudo_font_size_ch_uses_measured_originating_zero_advance_during_box_tree_build() {
+    let root = dom::parse("<html><body><p>Probe</p></body></html>");
+    let stylesheet = css::parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: MetricProbe;
+                src: url("tests/resources/fonts/noto-sans-v8-latin-regular.woff");
+            }
+            p {
+                font-family: MetricProbe;
+                font-size: 40pt;
+            }
+            p::before {
+                content: "x";
+                font-size: 2ch;
+            }
+            p::first-line {
+                font-size: 3ch;
+            }
+            p::first-letter {
+                font-size: 4ch;
+            }"#,
+        )
+        .with_base_url(Some(PathBuf::from("."))),
+    );
+    let mut metric_style = ComputedStyle {
+        font_family: FontFamily::Names(vec!["MetricProbe".to_string()]),
+        font_size: 40.0,
+        ..ComputedStyle::initial()
+    };
+    metric_style.line_height = metric_style.font_size;
+    let mut font_system = FontSystem::start_loading()
+        .load_stylesheet_fonts(std::slice::from_ref(&stylesheet))
+        .finish()
+        .await;
+    let originating_ch_advance = font_system.ch_advance(&metric_style);
+    assert!(
+        (originating_ch_advance - metric_style.font_size * 0.5).abs() > 0.01,
+        "fixture must differ from the generic 0.5em ch fallback"
+    );
+
+    let page = build_test_page_with_font_metrics(&root, &[stylesheet]).await;
+    let paragraph = &page.children[0].children()[0].children()[0];
+    let style = paragraph.style();
+
+    assert!(
+        (style.before_style.as_ref().unwrap().font_size - originating_ch_advance * 2.0).abs()
+            < 0.01,
+        "::before font-size: 2ch should use the measured originating zero advance"
+    );
+    assert!(
+        (style.first_line_style.as_ref().unwrap().font_size - originating_ch_advance * 3.0).abs()
+            < 0.01,
+        "::first-line font-size: 3ch should use the measured originating zero advance"
+    );
+    assert!(
+        (style.first_letter_style.as_ref().unwrap().font_size - originating_ch_advance * 4.0).abs()
+            < 0.01,
+        "::first-letter font-size: 4ch should use the measured originating zero advance"
+    );
 }
 
 #[tokio::test]
@@ -178,6 +340,36 @@ async fn block_inside_inline_is_split_into_parent_block_flow() {
 }
 
 #[tokio::test]
+async fn positioned_inline_block_split_preserves_inline_context_for_block_segment() {
+    let root = dom::parse(
+        "<html><body><span style=\"position:relative; z-index:2; top:-100px\"><div>Block</div></span></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let body = &page.children[0].children()[0];
+
+    assert_eq!(
+        body.children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![FormattingBoxKind::InlineSplitBlockContext]
+    );
+    let FormattingBox::InlineSplitBlockContext(context) = &body.children()[0] else {
+        panic!("positioned inline split should preserve a transparent block context");
+    };
+    assert_eq!(context.style.position, Position::Relative);
+    assert_eq!(context.style.z_index, Some(2));
+    assert_eq!(
+        context
+            .children
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![FormattingBoxKind::Block]
+    );
+}
+
+#[tokio::test]
 async fn block_inside_inline_preserves_empty_fragment_with_owned_inline_start_edge() {
     let root = dom::parse("<html><body><span><div>Block</div>X</span></body></html>");
     let stylesheet = css::parse_stylesheet(&Css::from_string(
@@ -211,6 +403,52 @@ async fn block_inside_inline_preserves_empty_fragment_with_owned_inline_start_ed
 }
 
 #[tokio::test]
+async fn block_abspos_inside_inline_splits_static_position_fragments() {
+    let root = dom::parse(
+        "<html><body><span><div style=\"position:absolute\"></div>X</span></body></html>",
+    );
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        "body > span { margin-left: -100px; border-left: 100px solid transparent }",
+    ));
+    let page = build_test_page(&root, &[stylesheet]);
+    let body = &page.children[0].children()[0];
+
+    assert_eq!(
+        body.children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![
+            FormattingBoxKind::Inline,
+            FormattingBoxKind::Block,
+            FormattingBoxKind::Inline,
+        ]
+    );
+    let FormattingBox::Inline(before_span) = &body.children()[0] else {
+        panic!("pre-abspos inline fragment should be preserved");
+    };
+    assert!(before_span.children.is_empty());
+    assert_eq!(
+        before_span.fragment_edges,
+        InlineBoxFragmentEdges {
+            owns_start: true,
+            owns_end: false,
+        }
+    );
+    assert!(is_out_of_flow_box(&body.children()[1]));
+    let FormattingBox::Inline(after_span) = &body.children()[2] else {
+        panic!("post-abspos inline fragment should be preserved");
+    };
+    assert_eq!(
+        after_span.fragment_edges,
+        InlineBoxFragmentEdges {
+            owns_start: false,
+            owns_end: true,
+        }
+    );
+}
+
+#[tokio::test]
 async fn block_inside_inline_after_fragment_owns_only_inline_end_edge() {
     let root = dom::parse("<html><body><span><div>One</div>Two</span></body></html>");
     let stylesheet =
@@ -223,17 +461,31 @@ async fn block_inside_inline_after_fragment_owns_only_inline_end_edge() {
             .iter()
             .map(FormattingBox::kind)
             .collect::<Vec<_>>(),
-        vec![FormattingBoxKind::Block, FormattingBoxKind::AnonymousBlock]
+        vec![
+            FormattingBoxKind::AnonymousBlock,
+            FormattingBoxKind::Block,
+            FormattingBoxKind::AnonymousBlock
+        ]
+    );
+    let FormattingBox::Inline(before_span) = &body.children()[0].children()[0] else {
+        panic!("pre-block anonymous block should contain the span inline fragment");
+    };
+    assert_eq!(
+        before_span.fragment_edges,
+        InlineBoxFragmentEdges {
+            owns_start: true,
+            owns_end: false,
+        }
     );
     assert_eq!(
-        body.children()[1]
+        body.children()[2]
             .children()
             .iter()
             .map(FormattingBox::kind)
             .collect::<Vec<_>>(),
         vec![FormattingBoxKind::Inline]
     );
-    let FormattingBox::Inline(span_fragment) = &body.children()[1].children()[0] else {
+    let FormattingBox::Inline(span_fragment) = &body.children()[2].children()[0] else {
         panic!("post-block anonymous block should contain the span inline fragment");
     };
     assert_eq!(
@@ -608,6 +860,51 @@ async fn table_fragment_ignores_whitespace_between_internal_cells() {
 }
 
 #[tokio::test]
+async fn table_fragment_preserves_metric_dependent_row_and_cell_styles() {
+    let root = dom::parse(
+        r#"<html><body><table><col style="writing-mode:vertical-rl;text-orientation:sideways;width:5ch"><tbody><tr style="writing-mode:vertical-rl;text-orientation:upright;line-height:5ch"><td style="height:5ch">A</td></tr></tbody></table></body></html>"#,
+    );
+    let page = build_test_page(&root, &[]);
+    let table = &page.children[0].children()[0].children()[0];
+
+    let FormattingBox::Table(table) = table else {
+        panic!("expected table formatting box");
+    };
+    let row_style = table.fragment.rows[0]
+        .style
+        .as_ref()
+        .expect("row style should be preserved");
+    assert_eq!(row_style.writing_mode, WritingMode::VerticalRl);
+    assert_eq!(row_style.text_orientation, TextOrientation::Upright);
+    assert_eq!(
+        row_style.line_height_value,
+        ComputedLineHeight::Length(ComputedLengthPercentage::from_ch(5.0))
+    );
+
+    let cell_style = table.fragment.rows[0].cells[0]
+        .style
+        .as_ref()
+        .expect("cell style should be preserved");
+    assert_eq!(cell_style.writing_mode, WritingMode::VerticalRl);
+    assert_eq!(cell_style.text_orientation, TextOrientation::Upright);
+    assert_eq!(
+        cell_style.box_values.height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_ch(5.0))
+    );
+
+    let column_style = table.fragment.columns[0]
+        .style
+        .as_ref()
+        .expect("column style should be preserved");
+    assert_eq!(column_style.writing_mode, WritingMode::VerticalRl);
+    assert_eq!(column_style.text_orientation, TextOrientation::Sideways);
+    assert_eq!(
+        column_style.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_ch(5.0))
+    );
+}
+
+#[tokio::test]
 async fn display_contents_inside_table_flattens_children_with_inherited_style() {
     let root = dom::parse(
         "<html><body><div style=\"display:table;color:red\"><div style=\"display:contents;color:green\">X<div style=\"display:table-cell\">X</div>X<div style=\"display:table-row\">X</div>X</div></div></body></html>",
@@ -618,8 +915,8 @@ async fn display_contents_inside_table_flattens_children_with_inherited_style() 
     let FormattingBox::Table(table) = table else {
         panic!("expected table formatting box");
     };
-    assert_eq!(table.style.border_spacing.horizontal, 0.0);
-    assert_eq!(table.style.border_spacing.vertical, 0.0);
+    assert_eq!(table.style.border_spacing.horizontal.length, 0.0);
+    assert_eq!(table.style.border_spacing.vertical.length, 0.0);
     assert!(!table.style.border_spacing_explicit);
     assert_eq!(table.fragment.rows.len(), 3);
     assert_eq!(table.fragment.rows[0].cells.len(), 3);
@@ -857,6 +1154,13 @@ async fn run_in_prelude_sits_after_marker_and_before_generated_before() {
             .iter()
             .map(FormattingBox::kind)
             .collect::<Vec<_>>(),
-        vec![FormattingBoxKind::Text]
+        vec![FormattingBoxKind::Inline, FormattingBoxKind::Text]
     );
+    let FormattingBox::Inline(before) = &paragraph.children[0] else {
+        panic!("expected generated ::before inline box");
+    };
+    assert!(matches!(
+        &before.source,
+        BoxSource::GeneratedPseudo(pseudo) if pseudo.kind == GeneratedPseudoKind::Before
+    ));
 }

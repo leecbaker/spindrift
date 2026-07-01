@@ -157,7 +157,13 @@ impl<'a> LayoutBuilder<'a> {
         let pushed_list_context = self.push_list_context(element, style);
 
         let use_ordered_mixed_flow = child_boxes.is_none()
-            && has_ordered_mixed_flow_content(element, style, stylesheets, &self.ancestors);
+            && has_ordered_mixed_flow_content_with_font_metrics(
+                element,
+                style,
+                stylesheets,
+                &self.ancestors,
+                &mut self.font_system,
+            );
         let has_generated_content = style.content.is_generated();
         let has_normalized_flow_children = !has_generated_content
             && child_boxes
@@ -192,10 +198,15 @@ impl<'a> LayoutBuilder<'a> {
         };
         let has_generated_inline_content = !detached_normalized_text
             && (has_generated_content
-                || style.before_style.is_some()
-                || style.after_style.is_some());
-        let has_styled_inline_descendant =
-            has_styled_inline_descendant(element, style, stylesheets, &self.ancestors);
+                || (child_boxes.is_none()
+                    && (style.before_style.is_some() || style.after_style.is_some())));
+        let has_styled_inline_descendant = has_styled_inline_descendant_with_font_metrics(
+            element,
+            style,
+            stylesheets,
+            &self.ancestors,
+            &mut self.font_system,
+        );
         let has_collectable_inline_content = !text.is_empty() || has_generated_inline_content;
         let use_inline_items = has_collectable_inline_content
             && (has_styled_inline_descendant
@@ -258,6 +269,28 @@ impl<'a> LayoutBuilder<'a> {
             || use_box_inline_items
             || !text.is_empty()
             || laid_out_column_children;
+        if style.writing_mode != WritingMode::HorizontalTb && has_direct_inline_content {
+            let vertical_inline_height = if use_box_inline_items {
+                child_boxes
+                    .map(|child_boxes| {
+                        self.intrinsic_inline_measurement_for_boxes(
+                            child_boxes,
+                            style,
+                            stylesheets,
+                            inner_width,
+                        )
+                        .physical_height(style)
+                    })
+                    .unwrap_or(0.0)
+            } else if !text.is_empty() {
+                self.estimate_text_physical_height(&text, style, inner_width, 0.0, 0.0)
+            } else {
+                0.0
+            };
+            if vertical_inline_height > 0.0 {
+                self.cursor_y = self.cursor_y.min(content_top - vertical_inline_height);
+            }
+        }
         if let Some(marker) = list_marker.as_ref()
             && text.is_empty()
             && !use_box_inline_items
@@ -285,9 +318,16 @@ impl<'a> LayoutBuilder<'a> {
         let self_collapsing_block = if let Some(child_boxes) = child_boxes {
             is_self_collapsing_block_box(element, style, child_boxes)
         } else {
-            is_self_collapsing_block_dom(element, style, stylesheets, &self.ancestors)
+            is_self_collapsing_block_dom_with_font_metrics(
+                element,
+                style,
+                stylesheets,
+                &self.ancestors,
+                &mut self.font_system,
+            )
         };
         let mut collapsed_end_margin = false;
+        let mut pending_end_margin_collapse = None;
         let mut previous_flow_bottom_margin = None;
         let mut seen_flow_child = false;
         let mut trim_block_start_adjoining_margins = style.margin_trim.block_start;
@@ -295,7 +335,7 @@ impl<'a> LayoutBuilder<'a> {
 
         if !laid_out_column_children && !use_box_inline_items {
             if use_ordered_mixed_flow {
-                collapsed_end_margin = self.layout_ordered_mixed_flow_children(
+                pending_end_margin_collapse = self.layout_ordered_mixed_flow_children(
                     element,
                     style,
                     stylesheets,
@@ -309,7 +349,15 @@ impl<'a> LayoutBuilder<'a> {
                 let mut previous_break_after_avoid = false;
                 let mut child_box_index = 0usize;
                 while child_box_index < child_boxes.len() {
-                    let child_box = &child_boxes[child_box_index];
+                    let raw_child_box = &child_boxes[child_box_index];
+                    let (split_block_context, child_box) = match raw_child_box {
+                        box_tree::FormattingBox::InlineSplitBlockContext(context)
+                            if context.children.len() == 1 =>
+                        {
+                            (Some(context), &context.children[0])
+                        }
+                        _ => (None, raw_child_box),
+                    };
                     let child_start_candidate = AvoidBreakRunCandidate {
                         snapshot: self.snapshot(),
                         index: child_box_index,
@@ -439,6 +487,7 @@ impl<'a> LayoutBuilder<'a> {
                         child_style.margin.bottom = 0.0;
                     }
 
+                    let mut collapses_with_parent_end = false;
                     if is_flow_child {
                         let collapses_with_parent =
                             is_collapsible_block_child(child_element, &child_style);
@@ -463,18 +512,13 @@ impl<'a> LayoutBuilder<'a> {
                                     - descendant_margin_adjustment;
                         }
 
-                        if collapses_with_parent
+                        collapses_with_parent_end = collapses_with_parent
                             && can_collapse_end_margin
                             && !has_later_normal_block_flow_box_child(
                                 child_boxes,
                                 child_box_index + 1,
                                 element,
-                            )
-                        {
-                            child_style.margin.bottom =
-                                collapse_margins(child_style.margin.bottom, style.margin.bottom);
-                            collapsed_end_margin = true;
-                        }
+                            );
                     }
 
                     let available_outer_width = (self.content_right
@@ -530,6 +574,86 @@ impl<'a> LayoutBuilder<'a> {
                         if trim_block_start_adjoining_margins && !self_collapsing_child {
                             trim_block_start_adjoining_margins = false;
                         }
+                    } else {
+                        previous_flow_bottom_margin = None;
+                    }
+
+                    let child_uses_block_layout = matches!(
+                        element_layout_kind(child_element, &child_style),
+                        ElementLayoutKind::BlockFlow
+                    );
+                    self.last_block_layout_outcome = BlockLayoutOutcome::default();
+                    if child_style.display.is_block_level()
+                        || is_document_canvas_element(element)
+                        || is_replaced_element(child_element)
+                    {
+                        self.push_ancestor_signature(child_signature.clone());
+                        if zero_height_page_boundary {
+                            self.push_page_name_element_scope_suppression();
+                        }
+                        if let box_tree::FormattingBox::Table(table_box) = child_box {
+                            let split_scope = split_block_context
+                                .map(|_| self.begin_inline_split_block_paint_scope());
+                            self.layout_element_with_child_boxes_and_table_fragment(
+                                table_box.element,
+                                &child_style,
+                                stylesheets,
+                                Some(&table_box.children),
+                                Some(&table_box.fragment),
+                            );
+                            if let (Some(context), Some(scope)) = (split_block_context, split_scope)
+                            {
+                                self.finish_inline_split_block_paint_scope(context, scope);
+                            }
+                        } else if let box_tree::FormattingBox::Block(block_box) = child_box {
+                            let split_scope = split_block_context
+                                .map(|_| self.begin_inline_split_block_paint_scope());
+                            self.layout_element_with_child_boxes_and_run_ins(
+                                child_element,
+                                &child_style,
+                                stylesheets,
+                                &block_box.run_in_children,
+                                Some(child_children),
+                            );
+                            if let (Some(context), Some(scope)) = (split_block_context, split_scope)
+                            {
+                                self.finish_inline_split_block_paint_scope(context, scope);
+                            }
+                        } else {
+                            let split_scope = split_block_context
+                                .map(|_| self.begin_inline_split_block_paint_scope());
+                            self.layout_element_with_child_boxes(
+                                child_element,
+                                &child_style,
+                                stylesheets,
+                                Some(child_children),
+                            );
+                            if let (Some(context), Some(scope)) = (split_block_context, split_scope)
+                            {
+                                self.finish_inline_split_block_paint_scope(context, scope);
+                            }
+                        }
+                        if zero_height_page_boundary {
+                            self.pop_page_name_element_scope_suppression();
+                        }
+                        self.ancestors.pop();
+                        self.flush_float_run(&mut float_run);
+                    }
+                    if is_flow_child {
+                        let child_consumed_bottom_margin = if child_uses_block_layout {
+                            self.last_block_layout_outcome.consumed_bottom_margin
+                        } else {
+                            child_style.margin.bottom
+                        };
+                        if collapses_with_parent_end {
+                            pending_end_margin_collapse = Some(BlockEndMarginCollapse {
+                                child_consumed_margin: child_consumed_bottom_margin,
+                                collapsed_margin: collapse_margins(
+                                    child_consumed_bottom_margin,
+                                    style.margin.bottom,
+                                ),
+                            });
+                        }
                         previous_flow_bottom_margin = if self_collapsing_child {
                             Some(if trimmed_block_start_margin {
                                 0.0
@@ -542,49 +666,8 @@ impl<'a> LayoutBuilder<'a> {
                             })
                         } else {
                             is_sibling_margin_collapsible_block_child(child_element, &child_style)
-                                .then_some(child_style.margin.bottom)
+                                .then_some(child_consumed_bottom_margin)
                         };
-                    } else {
-                        previous_flow_bottom_margin = None;
-                    }
-
-                    if child_style.display.is_block_level()
-                        || is_document_canvas_element(element)
-                        || is_replaced_element(child_element)
-                    {
-                        self.push_ancestor_signature(child_signature.clone());
-                        if zero_height_page_boundary {
-                            self.push_page_name_element_scope_suppression();
-                        }
-                        if let box_tree::FormattingBox::Table(table_box) = child_box {
-                            self.layout_element_with_child_boxes_and_table_fragment(
-                                table_box.element,
-                                &child_style,
-                                stylesheets,
-                                Some(&table_box.children),
-                                Some(&table_box.fragment),
-                            );
-                        } else if let box_tree::FormattingBox::Block(block_box) = child_box {
-                            self.layout_element_with_child_boxes_and_run_ins(
-                                child_element,
-                                &child_style,
-                                stylesheets,
-                                &block_box.run_in_children,
-                                Some(child_children),
-                            );
-                        } else {
-                            self.layout_element_with_child_boxes(
-                                child_element,
-                                &child_style,
-                                stylesheets,
-                                Some(child_children),
-                            );
-                        }
-                        if zero_height_page_boundary {
-                            self.pop_page_name_element_scope_suppression();
-                        }
-                        self.ancestors.pop();
-                        self.flush_float_run(&mut float_run);
                     }
                     if let Some(child_page_start) = effective_child_page_start {
                         previous_child_page_end = Some(child_page_start);
@@ -594,8 +677,12 @@ impl<'a> LayoutBuilder<'a> {
                     }
                     avoid_run_candidate = if is_flow_child {
                         child_estimated_height.map(|child_height| {
-                            run_start_candidate
-                                .with_height(run_start_candidate.height + child_height)
+                            let this = &run_start_candidate;
+                            let height = run_start_candidate.height + child_height;
+                            AvoidBreakRunCandidate {
+                                height,
+                                ..this.clone()
+                            }
                         })
                     } else {
                         None
@@ -637,12 +724,11 @@ impl<'a> LayoutBuilder<'a> {
                         sibling_tags.clone(),
                     );
                     element_index += 1;
-                    let mut child_style = style_for_layout_element(
+                    let mut child_style = self.style_for_layout_element_with_parent_font_metrics(
                         child_element,
                         child_signature.clone(),
                         stylesheets,
                         Some(style),
-                        &self.ancestors,
                     );
                     if self.layout_floating_child(
                         child_element,
@@ -669,28 +755,31 @@ impl<'a> LayoutBuilder<'a> {
                         && can_collapse_block_start_margin(
                             &child_style,
                             used_border_widths(&child_style),
-                            has_direct_inline_content_dom(
+                            has_direct_inline_content_dom_with_font_metrics(
                                 child_element,
                                 &child_style,
                                 stylesheets,
                                 &child_ancestors,
+                                &mut self.font_system,
                             ),
                         ))
                     .then(|| {
-                        collapsible_first_child_start_margin_dom(
+                        collapsible_first_child_start_margin_dom_with_font_metrics(
                             child_element,
                             &child_style,
                             stylesheets,
                             &child_ancestors,
+                            &mut self.font_system,
                         )
                     })
                     .flatten();
                     let self_collapsing_child = is_flow_child
-                        && is_self_collapsing_block_dom(
+                        && is_self_collapsing_block_dom_with_font_metrics(
                             child_element,
                             &child_style,
                             stylesheets,
                             &child_ancestors,
+                            &mut self.font_system,
                         );
                     let self_collapsing_margin_set = self_collapsing_child.then(|| {
                         self_collapsing_block_margin_set_for_box(
@@ -724,6 +813,7 @@ impl<'a> LayoutBuilder<'a> {
                         child_style.margin.bottom = 0.0;
                     }
 
+                    let mut collapses_with_parent_end = false;
                     if is_flow_child {
                         let collapses_with_parent =
                             is_collapsible_block_child(child_element, &child_style);
@@ -748,21 +838,17 @@ impl<'a> LayoutBuilder<'a> {
                                     - descendant_margin_adjustment;
                         }
 
-                        if collapses_with_parent
+                        collapses_with_parent_end = collapses_with_parent
                             && can_collapse_end_margin
-                            && !has_later_normal_block_flow_child(
+                            && !has_later_normal_block_flow_child_with_font_metrics(
                                 element,
                                 element_index,
                                 &sibling_tags,
                                 style,
                                 stylesheets,
                                 &self.ancestors,
-                            )
-                        {
-                            child_style.margin.bottom =
-                                collapse_margins(child_style.margin.bottom, style.margin.bottom);
-                            collapsed_end_margin = true;
-                        }
+                                &mut self.font_system,
+                            );
                     }
 
                     let available_outer_width = (self.content_right
@@ -818,6 +904,39 @@ impl<'a> LayoutBuilder<'a> {
                         if trim_block_start_adjoining_margins && !self_collapsing_child {
                             trim_block_start_adjoining_margins = false;
                         }
+                    } else {
+                        previous_flow_bottom_margin = None;
+                    }
+
+                    let child_uses_block_layout = matches!(
+                        element_layout_kind(child_element, &child_style),
+                        ElementLayoutKind::BlockFlow
+                    );
+                    self.last_block_layout_outcome = BlockLayoutOutcome::default();
+                    if child_style.display.is_block_level()
+                        || is_document_canvas_element(element)
+                        || is_replaced_element(child_element)
+                    {
+                        self.push_ancestor_signature(child_signature);
+                        self.layout_element(child_element, &child_style, stylesheets);
+                        self.ancestors.pop();
+                        self.flush_float_run(&mut float_run);
+                    }
+                    if is_flow_child {
+                        let child_consumed_bottom_margin = if child_uses_block_layout {
+                            self.last_block_layout_outcome.consumed_bottom_margin
+                        } else {
+                            child_style.margin.bottom
+                        };
+                        if collapses_with_parent_end {
+                            pending_end_margin_collapse = Some(BlockEndMarginCollapse {
+                                child_consumed_margin: child_consumed_bottom_margin,
+                                collapsed_margin: collapse_margins(
+                                    child_consumed_bottom_margin,
+                                    style.margin.bottom,
+                                ),
+                            });
+                        }
                         previous_flow_bottom_margin = if self_collapsing_child {
                             Some(if trimmed_block_start_margin {
                                 0.0
@@ -830,25 +949,17 @@ impl<'a> LayoutBuilder<'a> {
                             })
                         } else {
                             is_sibling_margin_collapsible_block_child(child_element, &child_style)
-                                .then_some(child_style.margin.bottom)
+                                .then_some(child_consumed_bottom_margin)
                         };
-                    } else {
-                        previous_flow_bottom_margin = None;
-                    }
-
-                    if child_style.display.is_block_level()
-                        || is_document_canvas_element(element)
-                        || is_replaced_element(child_element)
-                    {
-                        self.push_ancestor_signature(child_signature);
-                        self.layout_element(child_element, &child_style, stylesheets);
-                        self.ancestors.pop();
-                        self.flush_float_run(&mut float_run);
                     }
                     avoid_run_candidate = if is_flow_child {
                         child_estimated_height.map(|child_height| {
-                            run_start_candidate
-                                .with_height(run_start_candidate.height + child_height)
+                            let this = &run_start_candidate;
+                            let height = run_start_candidate.height + child_height;
+                            AvoidBreakRunCandidate {
+                                height,
+                                ..this.clone()
+                            }
                         })
                     } else {
                         None
@@ -889,6 +1000,22 @@ impl<'a> LayoutBuilder<'a> {
             && self.applied_clearance_count == clearance_count_at_block_entry
         {
             self.cursor_y = content_top;
+        }
+
+        let mut block_end_margin_to_consume = style.margin.bottom;
+        if let Some(pending) = pending_end_margin_collapse {
+            let content_height_with_child_margin = content_top - self.cursor_y;
+            let content_height_without_child_margin =
+                content_height_with_child_margin - pending.child_consumed_margin;
+            if block_end_margin_collapse_survives_height_constraints(
+                style,
+                content_width,
+                vertical_extras,
+                content_height_without_child_margin,
+            ) {
+                self.cursor_y += pending.child_consumed_margin;
+                block_end_margin_to_consume = pending.collapsed_margin;
+            }
         }
 
         if !has_auto_height(style)
@@ -1011,9 +1138,10 @@ impl<'a> LayoutBuilder<'a> {
                     context,
                 );
             }
-            if !collapsed_end_margin {
-                self.cursor_y -= style.margin.bottom;
-            }
+            self.cursor_y -= block_end_margin_to_consume;
+            self.last_block_layout_outcome = BlockLayoutOutcome {
+                consumed_bottom_margin: block_end_margin_to_consume,
+            };
             if matches!(style.position, Position::Relative | Position::Sticky) {
                 self.cursor_y -= relative_offset.y;
             }
@@ -1075,9 +1203,10 @@ impl<'a> LayoutBuilder<'a> {
                     .append_paint_fragment(&fragment, PaintVector::new(0.0, 0.0));
             }
         }
-        if !collapsed_end_margin {
-            self.cursor_y -= style.margin.bottom;
-        }
+        self.cursor_y -= block_end_margin_to_consume;
+        self.last_block_layout_outcome = BlockLayoutOutcome {
+            consumed_bottom_margin: block_end_margin_to_consume,
+        };
         if matches!(style.position, Position::Relative | Position::Sticky) {
             self.cursor_y -= relative_offset.y;
         }
@@ -1109,7 +1238,7 @@ impl<'a> LayoutBuilder<'a> {
     /// the box contents before they can be converted to a used content width:
     /// <https://www.w3.org/TR/css-sizing-3/#sizing-values> and
     /// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth>.
-    pub(super) fn used_block_content_width(
+    pub(in crate::layout) fn used_block_content_width(
         &mut self,
         element: &Element,
         style: &ComputedStyle,
@@ -1163,6 +1292,15 @@ impl<'a> LayoutBuilder<'a> {
     ) -> (f32, f32) {
         if style.display.is_flex() {
             return self.estimate_flex_intrinsic_widths(
+                element,
+                style,
+                stylesheets,
+                available_outer_width,
+                child_boxes,
+            );
+        }
+        if style.display.is_grid() {
+            return self.estimate_grid_intrinsic_widths(
                 element,
                 style,
                 stylesheets,
@@ -1227,9 +1365,7 @@ impl<'a> LayoutBuilder<'a> {
             vertical_extras,
         )
         .map(|height| constrain_height(&used_style, height, content_width));
-        let outer_width = (content_width + horizontal_extras)
-            .min(available_outer_width)
-            .max(0.0);
+        let outer_width = (content_width + horizontal_extras).max(0.0);
         resolve_normal_flow_block_auto_margins(
             &mut used_style,
             containing_inline_size,
@@ -1298,6 +1434,28 @@ fn vertical_block_align_content_x_offset(
         }
         PhysicalSide::Top | PhysicalSide::Bottom => 0.0,
     }
+}
+
+/// Return whether a last child's bottom margin can stay collapsed through the parent.
+///
+/// CSS 2.2 lets an in-flow last child's bottom margin adjoin its parent's bottom
+/// margin when the parent has auto height and no separating border/padding/line
+/// boxes. A used `min-height` only blocks that collapse when it increases the
+/// parent's used content height, so block layout compares constraints against
+/// the content height with the candidate child margin removed:
+/// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins> and
+/// <https://www.w3.org/TR/CSS22/visudet.html#min-max-heights>.
+fn block_end_margin_collapse_survives_height_constraints(
+    style: &ComputedStyle,
+    content_width: f32,
+    vertical_extras: f32,
+    content_height_without_child_margin: f32,
+) -> bool {
+    let requested_content_height =
+        used_content_height_or_auto(style, content_height_without_child_margin, vertical_extras)
+            .unwrap_or(content_height_without_child_margin);
+    let constrained_height = constrain_height(style, requested_content_height, content_width);
+    constrained_height <= content_height_without_child_margin + 0.01
 }
 
 #[cfg(test)]
@@ -1555,13 +1713,7 @@ struct AvoidBreakRunCandidate {
     height: f32,
 }
 
-impl AvoidBreakRunCandidate {
-    fn with_height(&self, height: f32) -> Self {
-        let mut candidate = self.clone();
-        candidate.height = height;
-        candidate
-    }
-}
+impl AvoidBreakRunCandidate {}
 
 fn should_move_avoid_break_run_to_next_page(
     run_height: f32,

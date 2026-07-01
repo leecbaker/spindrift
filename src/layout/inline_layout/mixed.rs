@@ -1015,15 +1015,18 @@ impl<'a> LayoutBuilder<'a> {
         self.visual_ordered_mixed_inline_line(&line_items, block_style)
             .into_iter()
             .map(|item| {
+                let shaped = match &item {
+                    InlineLineItem::Fragment(fragment) => self.font_system.shape_unwrapped_line(
+                        &fragment.text,
+                        &fragment.style,
+                        fragment.style.line_height,
+                    ),
+                    InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
+                };
                 let width = match &item {
-                    InlineLineItem::Fragment(fragment) => self
-                        .font_system
-                        .shape_unwrapped_line(
-                            &fragment.text,
-                            &fragment.style,
-                            fragment.style.line_height,
-                        )
-                        .map(|line| line.advance_width())
+                    InlineLineItem::Fragment(_) => shaped
+                        .as_ref()
+                        .map(ShapedInlineLine::advance_width)
                         .unwrap_or(0.0),
                     InlineLineItem::Atom(atom) => {
                         inline_atom_logical_inline_size(atom, block_style)
@@ -1033,7 +1036,7 @@ impl<'a> LayoutBuilder<'a> {
                 MeasuredInlineItem {
                     item,
                     width,
-                    shaped: None,
+                    shaped,
                 }
             })
             .collect()
@@ -1047,15 +1050,19 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://www.w3.org/TR/css-inline-3/#line-box>.
     fn inline_line_item_baseline_offset(
         &mut self,
-        item: &InlineLineItem,
+        item: &MeasuredInlineItem,
         block_style: &ComputedStyle,
     ) -> f32 {
-        match item {
+        match &item.item {
             InlineLineItem::Fragment(fragment) => {
                 if fragment.style.vertical_align.aligns_to_line_box_edge() {
                     return 0.0;
                 }
-                self.inline_style_baseline_offset(&fragment.style, fragment.baseline_shift)
+                self.font_system.text_fragment_baseline_offset(
+                    item.shaped.as_ref(),
+                    &fragment.style,
+                    fragment.baseline_shift,
+                )
             }
             InlineLineItem::Atom(atom) => inline_atom_logical_baseline_offset(atom, block_style),
             InlineLineItem::Float(_) => 0.0,
@@ -1073,21 +1080,48 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>.
     fn inline_line_item_baseline_extents(
         &mut self,
-        item: &InlineLineItem,
+        item: &MeasuredInlineItem,
         block_style: &ComputedStyle,
     ) -> (f32, f32) {
-        let baseline = self
-            .inline_line_item_baseline_offset(item, block_style)
-            .max(0.0);
-        let descent = match item {
+        match &item.item {
             InlineLineItem::Fragment(_) => {
-                inline_line_item_logical_block_size(item, block_style) - baseline
+                let baseline = self
+                    .inline_line_item_baseline_offset(item, block_style)
+                    .max(0.0);
+                let descent =
+                    inline_line_item_logical_block_size(&item.item, block_style) - baseline;
+                (baseline, descent)
             }
-            InlineLineItem::Atom(_) => {
-                (inline_line_item_logical_block_size(item, block_style) - baseline).max(0.0)
+            InlineLineItem::Atom(atom) => {
+                Self::inline_atom_line_baseline_extents(atom, block_style)
             }
-            InlineLineItem::Float(_) => 0.0,
+            InlineLineItem::Float(_) => (0.0, 0.0),
+        }
+    }
+
+    /// Return an atomic inline margin box's shifted extents around the line baseline.
+    ///
+    /// CSS 2.2 `vertical-align` shifts the whole inline-level box relative to
+    /// the parent baseline. Line metrics must enclose the shifted margin-box
+    /// top and bottom, instead of reusing the shifted baseline offset as the
+    /// box's unshifted ascent; otherwise `vertical-align: middle` lowers an
+    /// inline-block and incorrectly inflates the row advance:
+    /// <https://www.w3.org/TR/CSS22/visudet.html#line-height> and
+    /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>.
+    fn inline_atom_line_baseline_extents(
+        atom: &InlineAtom,
+        containing_style: &ComputedStyle,
+    ) -> (f32, f32) {
+        let block_size = inline_atom_logical_block_size(atom, containing_style);
+        let unshifted_baseline = match containing_style.writing_mode {
+            WritingMode::HorizontalTb => atom.style.margin.top + atom.baseline_offset,
+            WritingMode::VerticalRl | WritingMode::VerticalLr => {
+                inline_atom_logical_block_start_margin(atom, containing_style)
+                    + inline_atom_logical_border_block_size(atom, containing_style)
+            }
         };
+        let baseline = (unshifted_baseline + atom.baseline_shift).max(0.0);
+        let descent = (block_size - baseline).max(0.0);
         (baseline, descent)
     }
 
@@ -1146,15 +1180,12 @@ impl<'a> LayoutBuilder<'a> {
     /// calculation:
     /// <https://www.w3.org/TR/css-inline-3/#line-box> and
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>.
-    fn mixed_inline_line_metrics<T>(
+    fn mixed_inline_line_metrics(
         &mut self,
-        items: &[T],
+        items: &[MeasuredInlineItem],
         block_style: &ComputedStyle,
         width: f32,
-    ) -> InlineLineMetrics
-    where
-        T: AsRef<InlineLineItem>,
-    {
+    ) -> InlineLineMetrics {
         let (baseline_offset, descent) =
             self.mixed_inline_line_baseline_extents(items, block_style);
         let edge_aligned_height = self.mixed_inline_line_edge_aligned_height(items, block_style);
@@ -1179,18 +1210,14 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
-    fn mixed_inline_line_baseline_extents<T>(
+    fn mixed_inline_line_baseline_extents(
         &mut self,
-        items: &[T],
+        items: &[MeasuredInlineItem],
         block_style: &ComputedStyle,
-    ) -> (f32, f32)
-    where
-        T: AsRef<InlineLineItem>,
-    {
+    ) -> (f32, f32) {
         let (mut baseline_offset, mut descent) = self.inline_style_line_extents(block_style, 0.0);
         for item in items {
-            let item = item.as_ref();
-            if Self::inline_line_item_aligns_to_line_box_edge(item) {
+            if Self::inline_line_item_aligns_to_line_box_edge(&item.item) {
                 continue;
             }
             let (item_baseline_offset, item_descent) =

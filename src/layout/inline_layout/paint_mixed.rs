@@ -35,15 +35,20 @@ impl<'a> LayoutBuilder<'a> {
             source_items
                 .into_iter()
                 .map(|item| {
-                    let width = match &item {
-                        InlineLineItem::Fragment(fragment) => self
-                            .font_system
-                            .shape_unwrapped_line(
+                    let shaped = match &item {
+                        InlineLineItem::Fragment(fragment) => {
+                            self.font_system.shape_unwrapped_line(
                                 &fragment.text,
                                 &fragment.style,
                                 fragment.style.line_height,
                             )
-                            .map(|line| line.advance_width())
+                        }
+                        InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
+                    };
+                    let width = match &item {
+                        InlineLineItem::Fragment(_) => shaped
+                            .as_ref()
+                            .map(ShapedInlineLine::advance_width)
                             .unwrap_or(0.0),
                         InlineLineItem::Atom(atom) => {
                             inline_atom_logical_inline_size(atom, block_style)
@@ -53,7 +58,7 @@ impl<'a> LayoutBuilder<'a> {
                     MeasuredInlineItem {
                         item,
                         width,
-                        shaped: None,
+                        shaped,
                     }
                 })
                 .collect::<Vec<_>>()
@@ -63,15 +68,18 @@ impl<'a> LayoutBuilder<'a> {
             ))
             .into_iter()
             .map(|item| {
+                let shaped = match &item {
+                    InlineLineItem::Fragment(fragment) => self.font_system.shape_unwrapped_line(
+                        &fragment.text,
+                        &fragment.style,
+                        fragment.style.line_height,
+                    ),
+                    InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
+                };
                 let width = match &item {
-                    InlineLineItem::Fragment(fragment) => self
-                        .font_system
-                        .shape_unwrapped_line(
-                            &fragment.text,
-                            &fragment.style,
-                            fragment.style.line_height,
-                        )
-                        .map(|line| line.advance_width())
+                    InlineLineItem::Fragment(_) => shaped
+                        .as_ref()
+                        .map(ShapedInlineLine::advance_width)
                         .unwrap_or(0.0),
                     InlineLineItem::Atom(atom) => {
                         inline_atom_logical_inline_size(atom, block_style)
@@ -81,7 +89,7 @@ impl<'a> LayoutBuilder<'a> {
                 MeasuredInlineItem {
                     item,
                     width,
-                    shaped: None,
+                    shaped,
                 }
             })
             .collect::<Vec<_>>()
@@ -102,8 +110,24 @@ impl<'a> LayoutBuilder<'a> {
             block_style.text_justify,
             should_justify_line,
         );
+        let justification_line_width = if should_justify_line {
+            let natural_width = self
+                .natural_painted_inline_width_for_justification(
+                    &line,
+                    &justification_plan,
+                    block_style,
+                )
+                .max(0.0);
+            if natural_width > 0.0 {
+                natural_width
+            } else {
+                line_metrics.width
+            }
+        } else {
+            line_metrics.width
+        };
         let extra_space_width =
-            justification_plan.extra_space_width(line_metrics.width, line_available_width);
+            justification_plan.extra_space_width(justification_line_width, line_available_width);
         let mut line_logical_inline_start = line_geometry.alignment_offset(
             line_alignment_width,
             if should_justify_line {
@@ -134,11 +158,14 @@ impl<'a> LayoutBuilder<'a> {
                         previous_item_was_opaque_atom = false;
                         continue;
                     }
-                    let fragment_baseline_offset =
-                        self.inline_paint_fragment_baseline_offset(&fragment);
+                    let fragment_baseline_offset = self.inline_paint_fragment_baseline_offset(
+                        &fragment,
+                        measured_item.shaped.as_ref(),
+                    );
+                    let fragment_content_block_size = fragment.style.font_size;
                     let fragment_background_y = self.cursor_y - line_baseline_offset
                         + fragment_baseline_offset
-                        - fragment.style.line_height;
+                        - fragment_content_block_size;
                     if !fragment.style.vertical_align.aligns_to_line_box_edge() {
                         let natural_baseline_offset =
                             fragment_baseline_offset + fragment.baseline_shift;
@@ -164,7 +191,7 @@ impl<'a> LayoutBuilder<'a> {
                         inline_position,
                         width + extra_space_width * fragment_expansion_count as f32,
                         fragment_background_y,
-                        fragment.style.line_height,
+                        fragment_content_block_size,
                     );
                     paint_items.push(PreparedInlinePaintItem::FragmentBackground(
                         PreparedInlineFragment {
@@ -268,6 +295,43 @@ impl<'a> LayoutBuilder<'a> {
                     }
                     pending_fragments.clear();
                     pending_preserve_leading_summary_space = false;
+                    if let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) =
+                        atom.content
+                    {
+                        let content_block_size = atom.style.line_height;
+                        let y = inline_atom_horizontal_content_y(
+                            atom,
+                            block_style,
+                            self.cursor_y,
+                            line_metrics.height,
+                            line_baseline_offset,
+                            content_block_size,
+                        );
+                        if edge.logical_edge == InlineLogicalEdge::End
+                            && !inline_box_edge_is_painted_by_adjacent_fragment(
+                                &line, item_index, edge,
+                            )
+                        {
+                            let paint_inline_start =
+                                inline_position + inline_box_edge_paint_offset(edge);
+                            let content_rect = line_geometry.visual_line_item_rect(
+                                line_logical_inline_start,
+                                line_physical_origin,
+                                paint_inline_start,
+                                edge.paint_extent,
+                                y,
+                                content_block_size,
+                            );
+                            paint_items.push(PreparedInlinePaintItem::Atom(PreparedInlineAtom {
+                                atom: atom.clone(),
+                                content_rect,
+                            }));
+                        }
+                        inline_position += edge.advance;
+                        previous_item_was_opaque_atom =
+                            inline_atom_content_preserves_adjacent_space_summary(&atom.content);
+                        continue;
+                    }
                     let logical_inline_start_margin =
                         inline_atom_logical_inline_start_margin(atom, block_style);
                     let content_inline_size =
@@ -357,6 +421,158 @@ impl<'a> LayoutBuilder<'a> {
             metrics: line_metrics,
             paint_items,
         })
+    }
+
+    fn natural_painted_inline_width_for_justification(
+        &mut self,
+        line: &[MeasuredInlineItem],
+        justification_plan: &InlineJustificationPlan,
+        block_style: &ComputedStyle,
+    ) -> f32 {
+        let mut natural_width = 0.0f32;
+        let mut inline_position = 0.0f32;
+        let mut pending_fragments = Vec::new();
+        let mut pending_inline_position = inline_position;
+        let mut pending_preserve_leading_summary_space = false;
+        let mut previous_item_was_opaque_atom = false;
+
+        for (item_index, measured_item) in line.iter().enumerate() {
+            match &measured_item.item {
+                InlineLineItem::Fragment(fragment) => {
+                    let fragment = fragment.clone();
+                    if inline_fragment_is_join_control_only(&fragment) {
+                        if pending_fragments.is_empty() {
+                            pending_inline_position = inline_position;
+                            pending_preserve_leading_summary_space = previous_item_was_opaque_atom;
+                        }
+                        pending_fragments.push(fragment);
+                        previous_item_was_opaque_atom = false;
+                        continue;
+                    }
+
+                    let mut width = measured_item
+                        .shaped
+                        .as_ref()
+                        .map(ShapedInlineLine::advance_width)
+                        .unwrap_or(measured_item.width);
+                    if item_index + 1 == line.len() {
+                        width = (width
+                            - trailing_letter_spacing_width_for_line_items(std::slice::from_ref(
+                                &measured_item.item,
+                            )))
+                        .max(0.0);
+                    }
+
+                    let can_append = justification_plan.justifies_inter_word()
+                        && pending_fragments.last().is_some_and(|previous| {
+                            can_queue_inline_fragments_for_shaping(previous, &fragment)
+                        });
+                    if pending_fragments.is_empty() {
+                        pending_inline_position = inline_position;
+                        pending_preserve_leading_summary_space = previous_item_was_opaque_atom;
+                    } else if !can_append {
+                        self.extend_natural_width_with_pending_text_group(
+                            &pending_fragments,
+                            pending_inline_position,
+                            pending_preserve_leading_summary_space,
+                            &mut natural_width,
+                        );
+                        pending_fragments.clear();
+                        pending_inline_position = inline_position;
+                        pending_preserve_leading_summary_space = false;
+                    }
+
+                    if fragment.style.visibility == Visibility::Visible
+                        && inline_fragment_has_visible_text_paint(&fragment)
+                    {
+                        pending_fragments.push(fragment);
+                    } else {
+                        natural_width = natural_width.max(inline_position + width);
+                    }
+                    inline_position += width;
+                    previous_item_was_opaque_atom = false;
+                }
+                InlineLineItem::Atom(atom) => {
+                    if matches!(atom.content, InlineAtomContent::Leader(_)) {
+                        continue;
+                    }
+                    self.extend_natural_width_with_pending_text_group(
+                        &pending_fragments,
+                        pending_inline_position,
+                        pending_preserve_leading_summary_space,
+                        &mut natural_width,
+                    );
+                    pending_fragments.clear();
+                    pending_preserve_leading_summary_space = false;
+
+                    if let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) =
+                        atom.content
+                    {
+                        if edge.logical_edge == InlineLogicalEdge::End
+                            && !inline_box_edge_is_painted_by_adjacent_fragment(
+                                line, item_index, edge,
+                            )
+                        {
+                            let paint_inline_start =
+                                inline_position + inline_box_edge_paint_offset(edge);
+                            natural_width =
+                                natural_width.max(paint_inline_start + edge.paint_extent);
+                        }
+                        inline_position += edge.advance;
+                        previous_item_was_opaque_atom =
+                            inline_atom_content_preserves_adjacent_space_summary(&atom.content);
+                        continue;
+                    }
+
+                    let logical_inline_start_margin =
+                        inline_atom_logical_inline_start_margin(atom, block_style);
+                    let content_inline_size =
+                        inline_atom_logical_border_inline_size(atom, block_style);
+                    natural_width = natural_width
+                        .max(inline_position + logical_inline_start_margin + content_inline_size);
+                    inline_position += inline_atom_logical_inline_size(atom, block_style);
+                    previous_item_was_opaque_atom =
+                        inline_atom_content_preserves_adjacent_space_summary(&atom.content);
+                }
+                InlineLineItem::Float(_) => {
+                    self.extend_natural_width_with_pending_text_group(
+                        &pending_fragments,
+                        pending_inline_position,
+                        pending_preserve_leading_summary_space,
+                        &mut natural_width,
+                    );
+                    pending_fragments.clear();
+                    pending_preserve_leading_summary_space = false;
+                    inline_position += measured_item.width;
+                    natural_width = natural_width.max(inline_position);
+                    previous_item_was_opaque_atom = false;
+                }
+            }
+        }
+
+        self.extend_natural_width_with_pending_text_group(
+            &pending_fragments,
+            pending_inline_position,
+            pending_preserve_leading_summary_space,
+            &mut natural_width,
+        );
+        natural_width
+    }
+
+    fn extend_natural_width_with_pending_text_group(
+        &mut self,
+        fragments: &[InlineFragment],
+        inline_position: f32,
+        preserve_leading_summary_space: bool,
+        natural_width: &mut f32,
+    ) {
+        if let Some(group) = self.prepare_inline_text_group_with_summary_policy(
+            fragments,
+            0.0,
+            preserve_leading_summary_space,
+        ) {
+            *natural_width = natural_width.max(inline_position + group.width());
+        }
     }
 
     fn prepare_inline_text_group_at_inline_position(
@@ -449,9 +665,15 @@ impl<'a> LayoutBuilder<'a> {
         if atom.style.visibility != Visibility::Visible {
             return;
         }
+        if let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) = atom.content {
+            self.paint_prepared_inline_box_edge(prepared, edge);
+            return;
+        }
         if matches!(
             atom.content,
-            InlineAtomContent::InlineEdge(_) | InlineAtomContent::Leader(_)
+            InlineAtomContent::InlineEdge(_)
+                | InlineAtomContent::Leader(_)
+                | InlineAtomContent::StaticPositionPlaceholder
         ) {
             return;
         }
@@ -483,22 +705,24 @@ impl<'a> LayoutBuilder<'a> {
         let content_width = prepared.content_rect.width();
         let content_height = prepared.content_rect.height();
         match &atom.content {
-            InlineAtomContent::InlineEdge(_) | InlineAtomContent::Leader(_) => {}
+            InlineAtomContent::InlineEdge(_)
+            | InlineAtomContent::Leader(_)
+            | InlineAtomContent::StaticPositionPlaceholder => {}
             InlineAtomContent::Canvas => {
                 if atom.style.background_color.is_some() || used_border_width(&atom.style) > 0.0 {
                     let (rects, rounded_rects, paths, strokes) =
                         block_paint_ops(content_x, y, content_width, content_height, &atom.style);
                     for rect in rects {
-                        self.push_rect_in_band(PaintBand::Inline, rect);
+                        self.push_rect_in_band(PaintBand::BackgroundBorder, rect);
                     }
                     for rounded_rect in rounded_rects {
-                        self.push_rounded_rect_in_band(PaintBand::Inline, rounded_rect);
+                        self.push_rounded_rect_in_band(PaintBand::BackgroundBorder, rounded_rect);
                     }
                     for path in paths {
-                        self.push_path_in_band(PaintBand::Inline, path);
+                        self.push_path_in_band(PaintBand::BackgroundBorder, path);
                     }
                     for stroke in strokes {
-                        self.push_stroke_in_band(PaintBand::Inline, stroke);
+                        self.push_stroke_in_band(PaintBand::BackgroundBorder, stroke);
                     }
                 }
             }
@@ -507,15 +731,15 @@ impl<'a> LayoutBuilder<'a> {
                     let (rects, rounded_rects, paths, strokes) =
                         block_paint_ops(content_x, y, content_width, content_height, &atom.style);
                     for rect in rects {
-                        self.push_rect_in_band(PaintBand::Inline, rect);
+                        self.push_rect_in_band(PaintBand::BackgroundBorder, rect);
                     }
                     for rounded_rect in rounded_rects {
-                        self.push_rounded_rect_in_band(PaintBand::Inline, rounded_rect);
+                        self.push_rounded_rect_in_band(PaintBand::BackgroundBorder, rounded_rect);
                     }
                     for path in paths {
-                        self.push_path_in_band(PaintBand::Inline, path);
+                        self.push_path_in_band(PaintBand::BackgroundBorder, path);
                     }
-                    self.extend_strokes_in_band(PaintBand::Inline, strokes);
+                    self.extend_strokes_in_band(PaintBand::BackgroundBorder, strokes);
                 }
                 let borders = used_border_widths(&atom.style);
                 let image_x = content_x + borders.left + atom.style.padding.left;
@@ -561,15 +785,15 @@ impl<'a> LayoutBuilder<'a> {
                     let (rects, rounded_rects, paths, strokes) =
                         block_paint_ops(content_x, y, content_width, content_height, &atom.style);
                     for rect in rects {
-                        self.push_rect_in_band(PaintBand::Inline, rect);
+                        self.push_rect_in_band(PaintBand::BackgroundBorder, rect);
                     }
                     for rect in rounded_rects {
-                        self.push_rounded_rect_in_band(PaintBand::Inline, rect);
+                        self.push_rounded_rect_in_band(PaintBand::BackgroundBorder, rect);
                     }
                     for path in paths {
-                        self.push_path_in_band(PaintBand::Inline, path);
+                        self.push_path_in_band(PaintBand::BackgroundBorder, path);
                     }
-                    self.extend_strokes_in_band(PaintBand::Inline, strokes);
+                    self.extend_strokes_in_band(PaintBand::BackgroundBorder, strokes);
                 }
                 let borders = used_border_widths(&atom.style);
                 let text_top = y + content_height - borders.top - atom.style.padding.top;
@@ -593,15 +817,15 @@ impl<'a> LayoutBuilder<'a> {
                     let (rects, rounded_rects, paths, strokes) =
                         block_paint_ops(content_x, y, content_width, content_height, &atom.style);
                     for rect in rects {
-                        self.push_rect_in_band(PaintBand::Inline, rect);
+                        self.push_rect_in_band(PaintBand::BackgroundBorder, rect);
                     }
                     for rect in rounded_rects {
-                        self.push_rounded_rect_in_band(PaintBand::Inline, rect);
+                        self.push_rounded_rect_in_band(PaintBand::BackgroundBorder, rect);
                     }
                     for path in paths {
-                        self.push_path_in_band(PaintBand::Inline, path);
+                        self.push_path_in_band(PaintBand::BackgroundBorder, path);
                     }
-                    self.extend_strokes_in_band(PaintBand::Inline, strokes);
+                    self.extend_strokes_in_band(PaintBand::BackgroundBorder, strokes);
                 }
                 self.current_page
                     .append_paint_fragment(fragment, PaintVector::new(content_x, y));
@@ -653,15 +877,58 @@ impl<'a> LayoutBuilder<'a> {
     /// font metrics; mixed-line painting shifts each fragment from its natural
     /// font baseline to the shared line baseline:
     /// <https://www.w3.org/TR/css-inline-3/#line-box>.
-    fn inline_paint_fragment_baseline_offset(&mut self, fragment: &InlineFragment) -> f32 {
-        let font_id = self.font_system.resolve_style(&fragment.style);
-        let line_height = self
-            .font_system
-            .line_height_for_font(font_id, &fragment.style);
-        let adjustment =
-            self.font_system
-                .font_ascent_baseline_adjustment(font_id, &fragment.style, line_height);
-        fragment.style.font_size - adjustment - fragment.baseline_shift
+    fn inline_paint_fragment_baseline_offset(
+        &mut self,
+        fragment: &InlineFragment,
+        shaped: Option<&ShapedInlineLine>,
+    ) -> f32 {
+        self.font_system.text_fragment_baseline_offset(
+            shaped,
+            &fragment.style,
+            fragment.baseline_shift,
+        )
+    }
+
+    /// Paint the owned decoration of a split inline box edge.
+    ///
+    /// CSS margins affect layout advance, but backgrounds, borders, and padding
+    /// paint over the border/padding area. Keeping this separate for box-edge
+    /// atoms preserves negative-margin behavior without clipping the border:
+    /// <https://www.w3.org/TR/CSS22/box.html#margin-properties> and
+    /// <https://www.w3.org/TR/css-break-3/#break-decoration>.
+    fn paint_prepared_inline_box_edge(
+        &mut self,
+        prepared: &PreparedInlineAtom,
+        edge: InlineBoxEdgeFragment,
+    ) {
+        if edge.paint_extent <= 0.0 || prepared.content_rect.height() <= 0.0 {
+            return;
+        }
+        let mut style = prepared.atom.style.clone();
+        apply_inline_box_edge_paint_style(&mut style, edge);
+        if style.background_color.is_none()
+            && style.background_image.is_none()
+            && used_border_width(&style) == 0.0
+        {
+            return;
+        }
+        let (rects, rounded_rects, paths, strokes) = block_paint_ops(
+            prepared.content_rect.x(),
+            prepared.content_rect.y(),
+            prepared.content_rect.width(),
+            prepared.content_rect.height(),
+            &style,
+        );
+        for rect in rects {
+            self.push_rect_in_band(PaintBand::Inline, rect);
+        }
+        for rounded_rect in rounded_rects {
+            self.push_rounded_rect_in_band(PaintBand::Inline, rounded_rect);
+        }
+        for path in paths {
+            self.push_path_in_band(PaintBand::Inline, path);
+        }
+        self.extend_strokes_in_band(PaintBand::Inline, strokes);
     }
 }
 
@@ -709,8 +976,87 @@ fn inline_atom_content_preserves_adjacent_space_summary(content: &InlineAtomCont
             | InlineAtomContent::Svg { .. }
             | InlineAtomContent::InlineBox { .. }
             | InlineAtomContent::InlineFragment(_)
-            | InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge)
+            | InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
     )
+}
+
+fn inline_box_edge_paint_offset(edge: InlineBoxEdgeFragment) -> f32 {
+    match edge.logical_edge {
+        InlineLogicalEdge::Start => edge.advance - edge.paint_extent,
+        InlineLogicalEdge::End => 0.0,
+    }
+}
+
+fn inline_box_edge_is_painted_by_adjacent_fragment(
+    line: &[MeasuredInlineItem],
+    item_index: usize,
+    edge: InlineBoxEdgeFragment,
+) -> bool {
+    match edge.logical_edge {
+        InlineLogicalEdge::Start => line[item_index + 1..]
+            .iter()
+            .find_map(|item| adjacent_fragment_paints_or_stops_edge(item, edge.logical_edge))
+            .unwrap_or(false),
+        InlineLogicalEdge::End => line[..item_index]
+            .iter()
+            .rev()
+            .find_map(|item| adjacent_fragment_paints_or_stops_edge(item, edge.logical_edge))
+            .unwrap_or(false),
+    }
+}
+
+fn adjacent_fragment_paints_or_stops_edge(
+    item: &MeasuredInlineItem,
+    edge: InlineLogicalEdge,
+) -> Option<bool> {
+    match &item.item {
+        InlineLineItem::Fragment(fragment) => Some(match edge {
+            InlineLogicalEdge::Start => fragment.hanging_edges.blocks_start,
+            InlineLogicalEdge::End => fragment.hanging_edges.blocks_end,
+        }),
+        InlineLineItem::Atom(atom) if atom.content.is_box_edge() => None,
+        _ => Some(false),
+    }
+}
+
+fn apply_inline_box_edge_paint_style(style: &mut ComputedStyle, edge: InlineBoxEdgeFragment) {
+    style.margin = css::Edges::ZERO;
+    let opposite = opposite_physical_side(edge.physical_side);
+    clear_box_edge_side(style, opposite);
+}
+
+fn clear_box_edge_side(style: &mut ComputedStyle, side: PhysicalSide) {
+    match side {
+        PhysicalSide::Top => {
+            style.border_widths.top = 0.0;
+            style.border_styles.top = BorderStyle::None;
+            style.padding.top = 0.0;
+        }
+        PhysicalSide::Right => {
+            style.border_widths.right = 0.0;
+            style.border_styles.right = BorderStyle::None;
+            style.padding.right = 0.0;
+        }
+        PhysicalSide::Bottom => {
+            style.border_widths.bottom = 0.0;
+            style.border_styles.bottom = BorderStyle::None;
+            style.padding.bottom = 0.0;
+        }
+        PhysicalSide::Left => {
+            style.border_widths.left = 0.0;
+            style.border_styles.left = BorderStyle::None;
+            style.padding.left = 0.0;
+        }
+    }
+}
+
+fn opposite_physical_side(side: PhysicalSide) -> PhysicalSide {
+    match side {
+        PhysicalSide::Top => PhysicalSide::Bottom,
+        PhysicalSide::Right => PhysicalSide::Left,
+        PhysicalSide::Bottom => PhysicalSide::Top,
+        PhysicalSide::Left => PhysicalSide::Right,
+    }
 }
 
 fn visual_leading_inline_end_box_edge_width(
@@ -727,7 +1073,10 @@ fn visual_leading_inline_end_box_edge_width(
             matches!(
                 &item.item,
                 InlineLineItem::Atom(atom)
-                    if matches!(atom.content, InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge))
+                    if matches!(
+                        atom.content,
+                        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
+                    )
             )
         })
         .map(|item| item.width)

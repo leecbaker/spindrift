@@ -412,6 +412,14 @@ impl<'a> LayoutBuilder<'a> {
                 container_cross_size,
             );
         }
+        apply_stretch_align_content_overflow_fallback_offsets(
+            &mut active_items,
+            &mut active_lines,
+            &active_children,
+            style,
+            physical_direction,
+            container_cross_size,
+        );
         let source_lines = active_lines
             .iter()
             .map(|line| {
@@ -561,9 +569,11 @@ fn flex_item_estimate_available_space(
     if physical_direction.is_row_axis() {
         item_available.height = Some(stretched_cross_size);
         item_available.height_is_definite = true;
+        item_available.stretched_height = Some(stretched_cross_size);
     } else {
         item_available.width = stretched_cross_size;
         item_available.width_is_definite = true;
+        item_available.stretched_width = Some(stretched_cross_size);
     }
     item_available
 }
@@ -1091,6 +1101,7 @@ fn preserve_stretched_flex_line_cross_bounds(
         line.cross_start = 0.0;
         line.cross_end = container_cross_size
             .max(0.0)
+            .max(line.cross_end)
             .max(line.cross_start + line.largest_collapsed_strut());
         return;
     }
@@ -1730,6 +1741,103 @@ fn flex_line_group_cross_bounds(lines: &[FlexLineLayout]) -> Option<(f32, f32)> 
         })
 }
 
+/// Applies `align-content: stretch` fallback when stretched flex lines overflow.
+///
+/// CSS Align defines `stretch` as falling back to `flex-start`, not
+/// `safe flex-start`, so an overflowing wrapped line remains packed against
+/// the flex cross-start side. Taffy 0.11 applies the older generic
+/// distribution fallback, so Quire corrects only the overflow case after
+/// recovering flex line metadata:
+/// <https://drafts.csswg.org/css-align/#valdef-align-content-stretch> and
+/// <https://www.w3.org/TR/css-flexbox-1/#align-content-property>.
+fn apply_stretch_align_content_overflow_fallback_offsets(
+    items: &mut [FlexItemLayout],
+    lines: &mut [FlexLineLayout],
+    children: &[StyledChild<'_>],
+    container_style: &ComputedStyle,
+    physical_direction: FlexDirection,
+    container_cross_size: f32,
+) {
+    if container_style.flex_wrap == FlexWrap::NoWrap
+        || !matches!(
+            container_style.align_content.keyword,
+            ContentAlignmentKeyword::Normal | ContentAlignmentKeyword::Stretch
+        )
+    {
+        return;
+    }
+
+    let Some((group_start, group_end)) =
+        flex_line_alignment_subject_cross_bounds(lines, items, children, physical_direction)
+    else {
+        return;
+    };
+    let group_size = (group_end - group_start).max(0.0);
+    if group_size <= container_cross_size.max(0.0) + 0.01 {
+        return;
+    }
+
+    align_flex_line_group_cross_side_from_bounds(
+        lines,
+        items,
+        physical_direction,
+        flex_line_packing_flex_start_side(container_style),
+        container_cross_size,
+        group_start,
+        group_end,
+    );
+}
+
+fn flex_line_packing_flex_start_side(style: &ComputedStyle) -> PhysicalSide {
+    if style.flex_wrap == FlexWrap::WrapReverse {
+        flex_cross_end_side(style)
+    } else {
+        flex_cross_start_side(style)
+    }
+}
+
+fn flex_line_alignment_subject_cross_bounds(
+    lines: &[FlexLineLayout],
+    items: &[FlexItemLayout],
+    children: &[StyledChild<'_>],
+    physical_direction: FlexDirection,
+) -> Option<(f32, f32)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            if line.item_indices.is_empty() {
+                return Some((line.cross_start, line.cross_end));
+            }
+            line.item_indices
+                .iter()
+                .map(|&index| {
+                    item_outer_cross_bounds(
+                        &items[index],
+                        &children[index].style,
+                        physical_direction,
+                    )
+                })
+                .fold(None::<(f32, f32)>, |bounds, item_bounds| {
+                    Some(match bounds {
+                        Some((start, end)) => (start.min(item_bounds.0), end.max(item_bounds.1)),
+                        None => item_bounds,
+                    })
+                })
+                .map(|(start, end)| {
+                    (
+                        start.min(line.cross_start),
+                        end.max(line.cross_start + line.largest_collapsed_strut()),
+                    )
+                })
+        })
+        .fold(None, |bounds, line_bounds| {
+            Some(match bounds {
+                Some((start, end)) => (start.min(line_bounds.0), end.max(line_bounds.1)),
+                None => line_bounds,
+            })
+        })
+}
+
 fn align_flex_line_group_cross_side(
     lines: &mut [FlexLineLayout],
     items: &mut [FlexItemLayout],
@@ -1740,6 +1848,26 @@ fn align_flex_line_group_cross_side(
     let Some((group_start, group_end)) = flex_line_group_cross_bounds(lines) else {
         return;
     };
+    align_flex_line_group_cross_side_from_bounds(
+        lines,
+        items,
+        physical_direction,
+        side,
+        container_cross_size,
+        group_start,
+        group_end,
+    );
+}
+
+fn align_flex_line_group_cross_side_from_bounds(
+    lines: &mut [FlexLineLayout],
+    items: &mut [FlexItemLayout],
+    physical_direction: FlexDirection,
+    side: PhysicalSide,
+    container_cross_size: f32,
+    group_start: f32,
+    group_end: f32,
+) {
     let delta = if side.is_start_edge() {
         -group_start
     } else if side.is_end_edge() {
@@ -2247,14 +2375,18 @@ fn measured_item_border_box_baseline(
     child_style: &ComputedStyle,
     container_style: &ComputedStyle,
     baseline_set: FlexBaselineSet,
-    physical_direction: FlexDirection,
 ) -> f32 {
     let measured = match baseline_set {
         FlexBaselineSet::First => estimate.first_baseline,
         FlexBaselineSet::Last => estimate.last_baseline,
     };
     measured.unwrap_or_else(|| {
-        synthesized_item_border_box_baseline(item, child_style, container_style, physical_direction)
+        synthesized_item_border_box_baseline(
+            item,
+            child_style,
+            container_style,
+            flex_baseline_line_axis(container_style),
+        )
     })
 }
 
@@ -2264,14 +2396,18 @@ fn measured_item_horizontal_border_box_baseline(
     child_style: &ComputedStyle,
     container_style: &ComputedStyle,
     baseline_set: FlexBaselineSet,
-    physical_direction: FlexDirection,
 ) -> f32 {
     let measured = match baseline_set {
         FlexBaselineSet::First => estimate.first_horizontal_baseline,
         FlexBaselineSet::Last => estimate.last_horizontal_baseline,
     };
     measured.unwrap_or_else(|| {
-        synthesized_item_border_box_baseline(item, child_style, container_style, physical_direction)
+        synthesized_item_border_box_baseline(
+            item,
+            child_style,
+            container_style,
+            flex_baseline_line_axis(container_style),
+        )
     })
 }
 
@@ -2290,7 +2426,6 @@ fn measured_item_cross_axis_border_box_baseline(
             child_style,
             container_style,
             baseline_set,
-            physical_direction,
         )
     } else {
         measured_item_horizontal_border_box_baseline(
@@ -2299,7 +2434,6 @@ fn measured_item_cross_axis_border_box_baseline(
             child_style,
             container_style,
             baseline_set,
-            physical_direction,
         )
     }
 }
@@ -2317,17 +2451,12 @@ fn synthesized_item_border_box_baseline(
     item: &FlexItemLayout,
     child_style: &ComputedStyle,
     container_style: &ComputedStyle,
-    physical_direction: FlexDirection,
+    baseline_line_axis: PhysicalAxis,
 ) -> f32 {
-    let baseline_axis = if physical_direction.is_row_axis() {
-        PhysicalAxis::Horizontal
-    } else {
-        PhysicalAxis::Vertical
-    };
     match line_under_side(synthesis_writing_mode(
         child_style,
         container_style,
-        baseline_axis,
+        baseline_line_axis,
     )) {
         PhysicalSide::Top => 0.0,
         PhysicalSide::Right => item.width(),
@@ -2336,15 +2465,35 @@ fn synthesized_item_border_box_baseline(
     }
 }
 
+/// Return the physical axis that flex baseline lines are parallel to.
+///
+/// CSS Flexbox derives row flex baselines from item baseline sets parallel to
+/// the flex container's main axis, and CSS Writing Modes maps that CSS axis
+/// into physical page coordinates. Keeping this as CSS-axis metadata prevents
+/// baseline synthesis from depending on Taffy's row/column adapter encoding:
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+fn flex_baseline_line_axis(container_style: &ComputedStyle) -> PhysicalAxis {
+    match (
+        container_style.flex_direction.is_row_axis(),
+        container_style.writing_mode,
+    ) {
+        (true, WritingMode::HorizontalTb)
+        | (false, WritingMode::VerticalRl | WritingMode::VerticalLr) => PhysicalAxis::Horizontal,
+        (true, WritingMode::VerticalRl | WritingMode::VerticalLr)
+        | (false, WritingMode::HorizontalTb) => PhysicalAxis::Vertical,
+    }
+}
+
 fn synthesis_writing_mode(
     child_style: &ComputedStyle,
     container_style: &ComputedStyle,
-    baseline_axis: PhysicalAxis,
+    baseline_line_axis: PhysicalAxis,
 ) -> WritingMode {
-    if block_start_side(child_style.writing_mode).axis() != baseline_axis {
+    if block_start_side(child_style.writing_mode).axis() != baseline_line_axis {
         return child_style.writing_mode;
     }
-    if block_start_side(container_style.writing_mode).axis() != baseline_axis {
+    if block_start_side(container_style.writing_mode).axis() != baseline_line_axis {
         return container_style.writing_mode;
     }
     match (child_style.writing_mode, child_style.direction) {
@@ -2386,7 +2535,6 @@ fn measured_item_cross_axis_baseline(
                 style,
                 container_style,
                 baseline_set,
-                physical_direction,
             );
     }
     item.x()
@@ -2397,7 +2545,6 @@ fn measured_item_cross_axis_baseline(
             style,
             container_style,
             baseline_set,
-            physical_direction,
         )
 }
 

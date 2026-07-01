@@ -22,21 +22,14 @@ pub(super) fn flex_children_from_boxes<'a>(
 /// <https://www.w3.org/TR/css-position-3/#absolute-positioning> and
 /// <https://www.w3.org/TR/css-flexbox-1/#abspos-items>.
 pub(super) fn flex_child_lists_from_boxes<'a>(
-    container_element: &'a Element,
-    container_signature: &ElementSignature,
-    container_style: &ComputedStyle,
+    _container_element: &'a Element,
+    _container_signature: &ElementSignature,
+    _container_style: &ComputedStyle,
     child_boxes: &'a [box_tree::FormattingBox<'a>],
 ) -> (Vec<StyledChild<'a>>, Vec<StyledChild<'a>>) {
     let mut in_flow = Vec::new();
     let mut positioned = Vec::new();
     let mut anonymous_run = Vec::new();
-    push_generated_pseudo_flex_child(
-        &mut in_flow,
-        &mut positioned,
-        container_element,
-        container_signature,
-        container_style.before_style.as_deref(),
-    );
     for box_ in child_boxes {
         if matches!(box_, box_tree::FormattingBox::Text(_)) {
             anonymous_run.push(box_.clone());
@@ -70,55 +63,8 @@ pub(super) fn flex_child_lists_from_boxes<'a>(
         }
     }
     flush_anonymous_flex_run(&mut in_flow, &mut anonymous_run);
-    push_generated_pseudo_flex_child(
-        &mut in_flow,
-        &mut positioned,
-        container_element,
-        container_signature,
-        container_style.after_style.as_deref(),
-    );
     sort_flex_items_by_order(&mut in_flow);
     (in_flow, positioned)
-}
-
-/// Adds a generated `::before`/`::after` box as a flex item.
-///
-/// CSS Pseudo-Elements defines generated `::before`/`::after` boxes as
-/// tree-abiding children of their originating element, and CSS Flexbox makes
-/// every in-flow child of a flex container a flex item:
-/// <https://www.w3.org/TR/css-pseudo-4/#generated-content> and
-/// <https://www.w3.org/TR/css-flexbox-1/#flex-items>.
-fn push_generated_pseudo_flex_child<'a>(
-    in_flow: &mut Vec<StyledChild<'a>>,
-    positioned: &mut Vec<StyledChild<'a>>,
-    element: &'a Element,
-    signature: &ElementSignature,
-    pseudo_style: Option<&ComputedStyle>,
-) {
-    let Some(pseudo_style) = pseudo_style else {
-        return;
-    };
-    if pseudo_style.display.is_none() || !pseudo_style.content.is_generated() {
-        return;
-    }
-
-    let mut style = pseudo_style.clone();
-    // Flex item box generation blockifies generated pseudo-element boxes just
-    // like element child boxes.
-    style.display = style.display.blockified();
-    let child = StyledChild {
-        kind: StyledChildKind::Element {
-            element,
-            signature: Box::new(signature.clone()),
-            children: Some(std::borrow::Cow::Owned(Vec::new())),
-        },
-        style,
-    };
-    if matches!(child.style.position, Position::Absolute | Position::Fixed) {
-        positioned.push(child);
-    } else {
-        in_flow.push(child);
-    }
 }
 
 /// Returns the child box list appropriate for a generated flex item.
@@ -199,6 +145,7 @@ fn formatting_box_style<'a>(box_: &'a box_tree::FormattingBox<'a>) -> &'a Comput
     match box_ {
         box_tree::FormattingBox::Block(box_) => &box_.style,
         box_tree::FormattingBox::Inline(box_) => &box_.style,
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => &box_.style,
         box_tree::FormattingBox::AnonymousBlock(box_) => &box_.style,
         box_tree::FormattingBox::AtomicInline(box_) => &box_.style,
         box_tree::FormattingBox::Line(box_) => &box_.style,

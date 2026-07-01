@@ -20,6 +20,7 @@ Prefer the following resources for implementation:
 * Relevant HTML, CSS, W3 specs.
 * Weasyprint source code is checked out at `Weasyprint/`
 * Weasyprint examples at `weasyprint-samples`
+* Weasyprint is installed locally via homebrew, you can run it.
 
 Note that we aim to be much more spec compliant and performant than weasyprint. Use it only as a source of checking how they think about things, but don't necessarily copy behaviour without determining it to be the best solution.
 
@@ -31,7 +32,7 @@ Note that we aim to be much more spec compliant and performant than weasyprint. 
 ## Development guidelines
 
 * With every significant change, consider if the architecture of the components being modified is appropriate to support the full feature set. For example, when designing a module, ensure the design is appropriate for when we have the full set of features implemented.
-* Ensure that `cargo clippy` passes at the end of each change.
+* Ensure that `cargo clippy` passes at the end of each change, and format with `cargo +nightly fmt`.
 * Before adding a crate, the user must approve. Don't avoid asking the user; if it's the best solution, recommend it to the user.
 * For functions or structs implementing a feature, cite the relevant W3C specs, or PDF specs in the Rustdoc.
 * Once a page is over about 500-1000 lines, then consider breaking it out into a module for better organization.

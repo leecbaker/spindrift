@@ -522,12 +522,12 @@ async fn local_alreq_text_encoding_subset_matches_presentation_forms() {
 
     for variant in variants {
         for (index, (actual_text, reference_text)) in variant.cases().into_iter().enumerate() {
-            let actual_document = Html::from_string(&variant.html_for_text(actual_text))
+            let actual_document = Html::from_string(variant.html_for_text(actual_text))
                 .with_base_url(".")
                 .render_async(&RenderOptions::default())
                 .await
                 .unwrap();
-            let reference_document = Html::from_string(&variant.html_for_text(reference_text))
+            let reference_document = Html::from_string(variant.html_for_text(reference_text))
                 .with_base_url(".")
                 .render_async(&RenderOptions::default())
                 .await

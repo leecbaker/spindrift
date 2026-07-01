@@ -1,8 +1,9 @@
 use super::super::*;
 use super::items::InlineLineSequence;
 use crate::text::{
-    grapheme_cluster_inner_boundaries, is_css_preserved_document_space,
-    measured_break_opportunities, text_break_is_min_content_eligible,
+    grapheme_cluster_inner_boundaries, inline_atomic_boundary_allows_soft_wrap,
+    is_css_preserved_document_space, measured_break_opportunities,
+    text_break_is_min_content_eligible,
 };
 /// One normalized inline formatting participant in an inline paragraph graph.
 ///
@@ -332,6 +333,26 @@ pub(in crate::layout) struct InlineIntrinsicMeasurement {
 impl InlineIntrinsicMeasurement {
     pub(in crate::layout) fn height(&self) -> f32 {
         self.sequence.total_height()
+    }
+
+    pub(in crate::layout) fn physical_height(&self, style: &ComputedStyle) -> f32 {
+        match style.writing_mode {
+            WritingMode::HorizontalTb => self.height(),
+            WritingMode::VerticalRl | WritingMode::VerticalLr => self
+                .sequence
+                .records
+                .iter()
+                .filter_map(|record| record.fragment.as_ref())
+                .map(|fragment| fragment.metrics.width)
+                .fold(0.0, f32::max),
+        }
+    }
+
+    pub(in crate::layout) fn physical_width(&self, style: &ComputedStyle) -> f32 {
+        match style.writing_mode {
+            WritingMode::HorizontalTb => self.contribution.max_content,
+            WritingMode::VerticalRl | WritingMode::VerticalLr => self.height(),
+        }
     }
 
     pub(in crate::layout) fn line_count(&self) -> usize {
@@ -927,9 +948,7 @@ fn inline_break_opportunities_for_runs(runs: &[InlineParagraphRun]) -> Vec<Inlin
     }
     opportunities.extend(inline_break_opportunities_across_transparent_edges(runs));
     for boundary in 1..runs.len() {
-        let previous = &runs[boundary - 1].item;
-        let next = &runs[boundary].item;
-        if let Some(opportunity) = inline_break_opportunity_at_boundary(boundary, previous, next) {
+        if let Some(opportunity) = inline_break_opportunity_at_boundary(boundary, runs) {
             opportunities.push(opportunity);
         }
     }
@@ -1050,9 +1069,10 @@ fn inline_text_break_opportunity(
 
 fn inline_break_opportunity_at_boundary(
     boundary: usize,
-    previous: &InlineLineItem,
-    next: &InlineLineItem,
+    runs: &[InlineParagraphRun],
 ) -> Option<InlineBreakOpportunity> {
+    let previous = &runs[boundary - 1].item;
+    let next = &runs[boundary].item;
     if inline_line_item_is_collapsible_space(next)
         || inline_line_item_is_pre_wrap_hanging_space(next)
     {
@@ -1128,16 +1148,7 @@ fn inline_break_opportunity_at_boundary(
         });
     }
     if inline_line_item_is_css_atomic(previous) || inline_line_item_is_css_atomic(next) {
-        return Some(InlineBreakOpportunity {
-            position: InlineGraphPosition::at_run_start(boundary),
-            kind: InlineBreakKind::AtomicBoundary,
-            priority: 120,
-            trims: false,
-            hangs: false,
-            soft_hyphen: false,
-            emergency: false,
-            min_content: true,
-        });
+        return inline_atomic_boundary_opportunity(boundary, runs);
     }
     if let (InlineLineItem::Fragment(previous), InlineLineItem::Fragment(next)) = (previous, next) {
         return inline_fragment_boundary_opportunity(boundary, previous, next);
@@ -1154,6 +1165,62 @@ fn inline_line_item_is_css_atomic(item: &InlineLineItem) -> bool {
                 InlineAtomContent::InlineEdge(_) | InlineAtomContent::Leader(_)
             )
     )
+}
+
+fn inline_atomic_boundary_opportunity(
+    boundary: usize,
+    runs: &[InlineParagraphRun],
+) -> Option<InlineBreakOpportunity> {
+    let (before, style) = inline_break_context_before_boundary(runs, boundary)?;
+    let after = inline_break_context_after_boundary(runs, boundary)?;
+    inline_atomic_boundary_allows_soft_wrap(&before, &after, style).then_some(
+        InlineBreakOpportunity {
+            position: InlineGraphPosition::at_run_start(boundary),
+            kind: InlineBreakKind::AtomicBoundary,
+            priority: 120,
+            trims: false,
+            hangs: false,
+            soft_hyphen: false,
+            emergency: false,
+            min_content: true,
+        },
+    )
+}
+
+fn inline_break_context_before_boundary(
+    runs: &[InlineParagraphRun],
+    boundary: usize,
+) -> Option<(String, &ComputedStyle)> {
+    for run in runs[..boundary].iter().rev() {
+        match &run.item {
+            InlineLineItem::Fragment(fragment) => {
+                return Some((fragment.text.clone(), &fragment.style));
+            }
+            InlineLineItem::Atom(atom) if atom.content.is_box_edge() => {}
+            InlineLineItem::Atom(atom) if inline_line_item_is_css_atomic(&run.item) => {
+                return Some((OBJECT_REPLACEMENT_CHARACTER.to_string(), &atom.style));
+            }
+            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => return None,
+        }
+    }
+    None
+}
+
+fn inline_break_context_after_boundary(
+    runs: &[InlineParagraphRun],
+    boundary: usize,
+) -> Option<String> {
+    for run in &runs[boundary..] {
+        match &run.item {
+            InlineLineItem::Fragment(fragment) => return Some(fragment.text.clone()),
+            InlineLineItem::Atom(atom) if atom.content.is_box_edge() => {}
+            InlineLineItem::Atom(_) if inline_line_item_is_css_atomic(&run.item) => {
+                return Some(OBJECT_REPLACEMENT_CHARACTER.to_string());
+            }
+            InlineLineItem::Float(_) | InlineLineItem::Atom(_) => return None,
+        }
+    }
+    None
 }
 
 fn inline_line_item_is_float_marker(item: &InlineLineItem) -> bool {

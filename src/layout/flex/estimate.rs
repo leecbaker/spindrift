@@ -86,8 +86,13 @@ impl<'a> LayoutBuilder<'a> {
                 let child_boxes = if let Some(child_boxes) = child_boxes {
                     child_boxes
                 } else {
-                    built_child_boxes =
-                        box_tree::build_child_boxes(element, stylesheets, style, &layout.ancestors);
+                    built_child_boxes = box_tree::build_child_boxes_with_font_metrics(
+                        element,
+                        stylesheets,
+                        style,
+                        &layout.ancestors,
+                        &mut layout.font_system,
+                    );
                     &built_child_boxes
                 };
                 let children = flex_children_from_boxes(element, signature, style, child_boxes);
@@ -148,6 +153,7 @@ impl<'a> LayoutBuilder<'a> {
                 element,
                 style,
                 containing_width,
+                available,
                 self.base_url,
                 self.root_url,
                 self.resource_cache,
@@ -179,7 +185,12 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         if has_direct_inline_replaced_child(element)
-            && !has_direct_flow_child(element, style, stylesheets)
+            && !has_direct_flow_child_with_font_metrics(
+                element,
+                style,
+                stylesheets,
+                &mut self.font_system,
+            )
         {
             let (row_width, row_height) =
                 self.measure_direct_inline_row(element, style, stylesheets);
@@ -467,12 +478,11 @@ impl<'a> LayoutBuilder<'a> {
                 sibling_tags.clone(),
             );
             element_index += 1;
-            let child_style = style_for_layout_element(
+            let child_style = self.style_for_layout_element_with_parent_font_metrics(
                 child_element,
                 signature.clone(),
                 stylesheets,
                 Some(parent_style),
-                &self.ancestors,
             );
             if child_style.display.is_none()
                 || matches!(child_style.position, Position::Absolute | Position::Fixed)
@@ -585,12 +595,11 @@ impl<'a> LayoutBuilder<'a> {
                 sibling_tags.clone(),
             );
             element_index += 1;
-            let child_style = style_for_layout_element(
+            let child_style = self.style_for_layout_element_with_parent_font_metrics(
                 child_element,
                 signature.clone(),
                 stylesheets,
                 Some(parent_style),
-                &self.ancestors,
             );
             if !flex_min_content_block_child_participates(child_element, &child_style) {
                 continue;
@@ -833,7 +842,13 @@ impl<'a> LayoutBuilder<'a> {
         let groups = child_boxes
             .map(definition_list_column_groups_from_boxes)
             .unwrap_or_else(|| {
-                definition_list_column_groups(element, style, stylesheets, &self.ancestors)
+                definition_list_column_groups_with_font_metrics(
+                    element,
+                    style,
+                    stylesheets,
+                    &self.ancestors,
+                    &mut self.font_system,
+                )
             });
         if groups.is_empty() {
             return None;
@@ -897,17 +912,22 @@ impl<'a> LayoutBuilder<'a> {
     }
 }
 
-/// Estimates a replaced image flex item without letting min-size alter flex basis.
+/// Estimates a replaced image flex item without letting main-size constraints alter flex basis.
 ///
 /// CSS Flexbox computes the flex base size from the item's used flex-basis
 /// while ignoring min/max main-size constraints, but the hypothetical size and
-/// cross-size contribution still reflect replaced-element aspect-ratio sizing:
-/// <https://www.w3.org/TR/css-flexbox-1/#algo-main-item> and
+/// cross-size contribution still reflect replaced-element aspect-ratio sizing.
+/// For replaced elements with an intrinsic ratio, cross-axis min/max constraints
+/// transfer through the ratio into the content-basis candidate used by
+/// `flex-basis:auto`:
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>,
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>, and
 /// <https://www.w3.org/TR/css-sizing-3/#aspect-ratio>.
 fn estimate_replaced_image_flex_item(
     element: &Element,
     style: &ComputedStyle,
     containing_width: f32,
+    available: FlexItemAvailableSpace,
     base_url: Option<&Path>,
     root_url: Option<&Path>,
     resource_cache: &ResourceCache,
@@ -924,10 +944,20 @@ fn estimate_replaced_image_flex_item(
         borders.top + borders.bottom + style.padding.top + style.padding.bottom;
     let specified_width =
         used_content_width_or_auto(style, containing_width, horizontal_non_content)
-            .or(intrinsic.attr_width);
+            .or(intrinsic.attr_width)
+            .or_else(|| {
+                available
+                    .stretched_width
+                    .map(|width| (width - horizontal_non_content).max(0.0))
+            });
     let specified_height =
         definite_image_content_height_without_percent(style, vertical_non_content)
-            .or(intrinsic.attr_height);
+            .or(intrinsic.attr_height)
+            .or_else(|| {
+                available
+                    .stretched_height
+                    .map(|height| (height - vertical_non_content).max(0.0))
+            });
     let width_is_auto = specified_width.is_none();
     let height_is_auto = specified_height.is_none();
     let (base_width, base_height) = match (specified_width, specified_height) {
@@ -953,13 +983,50 @@ fn estimate_replaced_image_flex_item(
             max_height: used_max_height(style, containing_width),
         },
     );
+
+    let mut width_constrained_width = base_width;
+    let mut height_from_width_constraints = base_height;
+    constrain_replaced_size_with_aspect_ratio(
+        &mut width_constrained_width,
+        &mut height_from_width_constraints,
+        aspect_ratio,
+        ReplacedAutoAxes {
+            width: width_is_auto,
+            height: height_is_auto,
+        },
+        ReplacedSizeConstraints {
+            min_width: used_min_width(style, containing_width),
+            max_width: used_max_width(style, containing_width),
+            min_height: None,
+            max_height: None,
+        },
+    );
+
+    let mut width_from_height_constraints = base_width;
+    let mut height_constrained_height = base_height;
+    constrain_replaced_size_with_aspect_ratio(
+        &mut width_from_height_constraints,
+        &mut height_constrained_height,
+        aspect_ratio,
+        ReplacedAutoAxes {
+            width: width_is_auto,
+            height: height_is_auto,
+        },
+        ReplacedSizeConstraints {
+            min_width: None,
+            max_width: None,
+            min_height: used_min_height(style, containing_width),
+            max_height: used_max_height(style, containing_width),
+        },
+    );
+
     Some(FlexItemEstimate {
         width: width.max(1.0),
         height: height.max(1.0),
         min_width: width.max(1.0),
         min_height: height.max(1.0),
-        content_width: base_width.max(1.0),
-        content_height: base_height.max(1.0),
+        content_width: width_from_height_constraints.max(1.0),
+        content_height: height_from_width_constraints.max(1.0),
         first_baseline: None,
         last_baseline: None,
         first_horizontal_baseline: None,
@@ -1458,8 +1525,8 @@ fn intrinsic_flex_container_cross_sizes(
         intrinsic_flex_container_line_limit(style, direction, available, min_main, max_main)
     {
         let lines = intrinsic_flex_lines(items, line_limit, gap);
-        let min_cross = lines.iter().map(|line| line.min_cross).sum::<f32>()
-            + intrinsic_gap_total(gap, lines.len());
+        let min_cross =
+            intrinsic_flex_container_min_cross_size_for_lines(direction, items, &lines, gap);
         let max_cross = lines.iter().map(|line| line.max_cross).sum::<f32>()
             + intrinsic_gap_total(gap, lines.len());
         return (min_cross, max_cross.max(min_cross));
@@ -1483,6 +1550,30 @@ fn intrinsic_flex_container_cross_sizes(
             .fold(0.0f32, f32::max);
         (min_cross, max_cross.max(min_cross))
     }
+}
+
+/// Return the min-content cross-size for known intrinsic flex lines.
+///
+/// CSS Flexbox's multi-line intrinsic cross-size rules are asymmetric: row
+/// containers sum the per-line min-content cross sizes, but column containers
+/// use the largest flex item min-content cross contribution. A definite column
+/// main size can still form multiple lines for max-content sizing, but those
+/// lines do not make the container's min-content inline size wider:
+/// <https://www.w3.org/TR/css-flexbox-1/#intrinsic-cross-sizes>.
+fn intrinsic_flex_container_min_cross_size_for_lines(
+    direction: FlexDirection,
+    items: &[FlexIntrinsicItem],
+    lines: &[IntrinsicFlexLine],
+    gap: f32,
+) -> f32 {
+    if direction.is_column_axis() {
+        return items
+            .iter()
+            .map(|item| item.min_cross_contribution)
+            .fold(0.0f32, f32::max);
+    }
+
+    lines.iter().map(|line| line.min_cross).sum::<f32>() + intrinsic_gap_total(gap, lines.len())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2122,9 +2213,11 @@ fn estimated_flex_item_available_space(
     if physical_direction.is_row_axis() {
         item_available.height = Some(stretched_cross_size);
         item_available.height_is_definite = true;
+        item_available.stretched_height = Some(stretched_cross_size);
     } else {
         item_available.width = stretched_cross_size;
         item_available.width_is_definite = true;
+        item_available.stretched_width = Some(stretched_cross_size);
     }
     item_available
 }
