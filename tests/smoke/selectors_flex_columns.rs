@@ -8,9 +8,9 @@ async fn supports_structural_pseudo_class_selectors() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].color, Color::new(255, 0, 0));
-    assert_eq!(document.pages[0].lines[1].color, Color::new(0, 0, 255));
-    assert_eq!(document.pages[0].lines[1].font_size, 16.0);
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(255, 0, 0));
+    assert_eq!(document.pages[0].lines()[1].color, Color::new(0, 0, 255));
+    assert_eq!(document.pages[0].lines()[1].font_size, 16.0);
 }
 
 #[tokio::test]
@@ -32,7 +32,7 @@ async fn supports_nth_last_child_of_selector_list() {
     .unwrap();
 
     let lime_backgrounds = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 255, 0)))
         .count();
@@ -60,13 +60,13 @@ async fn target_fragment_option_styles_target_and_target_within() {
 
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(0, 0, 255)))
     );
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(0, 255, 0)))
     );
@@ -88,15 +88,87 @@ async fn supports_first_line_and_first_letter_pseudo_elements() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "\"A\"");
-    assert_eq!(document.pages[0].lines[0].color, Color::new(0, 0, 255));
-    assert_eq!(document.pages[0].lines[1].color, Color::new(255, 0, 0));
+    assert_eq!(document.pages[0].lines()[0].text, "\"A\"");
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(0, 0, 255));
+    assert_eq!(document.pages[0].lines()[1].color, Color::new(255, 0, 0));
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .skip(2)
             .any(|line| line.color == Color::BLACK)
+    );
+}
+
+#[tokio::test]
+async fn block_in_inline_split_does_not_restart_originating_first_line() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 520pt 180pt; margin: 10pt }\
+         body, div { margin: 0; font-size: 10pt; line-height: 14pt }\
+         body > div { width: 480pt }\
+         div::first-line { background: orange; color: orange }\
+         </style>\
+         <div><span>\
+           First line.<br>\
+           Second line.\
+           <div>First line in 1st block box.<br>Second line.</div>\
+           <div>First line in 2nd block box.<br>Second line.</div>\
+           First line after block-in-inline is not ::first-line.<br>\
+           Second line.\
+         </span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0]
+        .lines()
+        .iter()
+        .filter(|line| !line.text.trim().is_empty())
+        .collect::<Vec<_>>();
+    let line_texts = lines
+        .iter()
+        .map(|line| line.text.trim().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        line_texts,
+        vec![
+            "First line.",
+            "Second line.",
+            "First line in 1st block box.",
+            "Second line.",
+            "First line in 2nd block box.",
+            "Second line.",
+            "First line after block-in-inline is not ::first-line.",
+            "Second line.",
+        ]
+    );
+
+    let orange = Color::new(255, 165, 0);
+    let orange_line_indexes = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line.color == orange).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        orange_line_indexes,
+        vec![0, 2, 4],
+        "only the outer first line and each nested div first line should match ::first-line"
+    );
+
+    let mut orange_background_rows = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(orange))
+        .map(|rect| (rect.y() * 100.0).round() as i32)
+        .collect::<Vec<_>>();
+    orange_background_rows.sort_unstable();
+    orange_background_rows.dedup();
+    assert_eq!(
+        orange_background_rows.len(),
+        3,
+        "only three first-line background rows should paint: {orange_background_rows:?}"
     );
 }
 
@@ -109,12 +181,12 @@ async fn supports_of_type_structural_pseudo_class_selectors() {
     .unwrap();
 
     let first = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "First")
         .unwrap();
     let second = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Second")
         .unwrap();
@@ -133,7 +205,7 @@ async fn supports_nested_css_for_flex_children() {
 
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(220, 224, 229)))
             .count()
@@ -141,7 +213,7 @@ async fn supports_nested_css_for_flex_children() {
     );
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(220, 224, 229))
                 && rect.width() > 10.0
@@ -158,7 +230,7 @@ async fn padding_zero_removes_default_list_indent_for_flex_lists() {
     .unwrap();
 
     let left_label = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(220, 224, 229)))
         .min_by(|left, right| left.x().total_cmp(&right.x()))
@@ -177,14 +249,14 @@ async fn flex_column_items_honor_vertical_margins() {
 
     let page = &document.pages[0];
     let mut left_box_rows = page
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(220, 224, 229)))
         .filter(|rect| rect.height() > 5.0 && rect.x() < page.width() / 2.0)
         .map(|rect| (rect.y() * 10.0).round() as i32)
         .collect::<Vec<_>>();
     let mut right_box_rows = page
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(220, 224, 229)))
         .filter(|rect| rect.height() > 5.0 && rect.x() >= page.width() / 2.0)
@@ -208,12 +280,12 @@ async fn flex_container_margin_bottom_separates_following_block() {
     .unwrap();
 
     let flex = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Flex")
         .unwrap();
     let after = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "After")
         .unwrap();
@@ -231,13 +303,13 @@ async fn flex_items_keep_small_explicit_cross_size_when_centered() {
 
     let fill = Color::new(220, 224, 229);
     let left_label = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(fill) && rect.height() > 10.0)
         .min_by(|left, right| left.x().total_cmp(&right.x()))
         .unwrap();
     let connector = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| {
             rect.fill == Some(fill)
@@ -267,11 +339,11 @@ async fn renders_and_deduplicates_page_margin_background_images() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].images.len(), 1);
-    assert_eq!(document.pages[1].images.len(), 1);
-    assert_eq!(document.pages[0].images[0].width(), 5.0);
-    assert_eq!(document.pages[0].images[0].height(), 5.0);
-    assert!(document.pages[0].images[0].interpolate);
+    assert_eq!(document.pages[0].images().len(), 1);
+    assert_eq!(document.pages[1].images().len(), 1);
+    assert_eq!(document.pages[0].images()[0].width(), 5.0);
+    assert_eq!(document.pages[0].images()[0].height(), 5.0);
+    assert!(document.pages[0].images()[0].interpolate);
 
     let pdf = document.write_pdf_bytes().unwrap();
     let rendered = String::from_utf8_lossy(&pdf);
@@ -295,7 +367,7 @@ async fn page_margin_content_supports_mixed_generated_items_and_images() {
     .unwrap();
 
     let margin_text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -303,10 +375,10 @@ async fn page_margin_content_supports_mixed_generated_items_and_images() {
     assert!(margin_text.contains("[A]"), "{margin_text}");
     assert!(margin_text.contains("..."), "{margin_text}");
     assert!(margin_text.contains("1 fallback"), "{margin_text}");
-    assert_eq!(document.pages[0].images.len(), 1);
-    assert_eq!(document.pages[0].images[0].pixel_width, 1);
-    assert_eq!(document.pages[0].images[0].pixel_height, 1);
-    assert!(document.pages[0].images[0].y() >= 68.0);
+    assert_eq!(document.pages[0].images().len(), 1);
+    assert_eq!(document.pages[0].images()[0].pixel_width, 1);
+    assert_eq!(document.pages[0].images()[0].pixel_height, 1);
+    assert!(document.pages[0].images()[0].y() >= 68.0);
 }
 
 #[tokio::test]
@@ -323,16 +395,12 @@ async fn page_margin_text_decoration_paints_text_primitives() {
     .await
     .unwrap();
 
-    let red_decoration_rects = document.pages[0]
-        .rects
-        .iter()
-        .filter(|rect| {
-            rect.fill == Some(Color::new(255, 0, 0))
-                && rect.width() > rect.height()
-                && rect.height() > 0.0
-        })
-        .collect::<Vec<_>>();
-    assert!(red_decoration_rects.len() >= 2);
+    let red_decoration_rects = document.pages[0].rects().iter().filter(|rect| {
+        rect.fill == Some(Color::new(255, 0, 0))
+            && rect.width() > rect.height()
+            && rect.height() > 0.0
+    });
+    assert!(red_decoration_rects.count() >= 2);
 }
 
 #[tokio::test]
@@ -350,7 +418,7 @@ async fn page_margin_text_shadow_and_emphasis_use_inline_paint_order() {
     .unwrap();
 
     let margin_text_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text == "AB")
         .collect::<Vec<_>>();
@@ -364,7 +432,7 @@ async fn page_margin_text_shadow_and_emphasis_use_inline_paint_order() {
     );
     assert_eq!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .filter(|line| line.text == "•" && line.color == Color::new(0, 0, 255))
             .count(),
@@ -387,7 +455,7 @@ async fn page_margin_text_shadow_currentcolor_resolves_against_margin_box_color(
     .unwrap();
 
     let margin_text_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text == "AB")
         .collect::<Vec<_>>();
@@ -421,19 +489,19 @@ async fn page_margin_boxes_match_first_left_and_right_page_selectors() {
     assert_eq!(document.pages.len(), 2);
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "first")
     );
     assert!(
         document.pages[1]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "left")
     );
     assert!(
         !document.pages[0]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "right")
     );
@@ -455,19 +523,19 @@ async fn side_and_corner_page_margin_boxes_use_page_margin_regions() {
     .await
     .unwrap();
 
-    assert!(document.pages[0].rects.iter().any(|rect| {
+    assert!(document.pages[0].rects().iter().any(|rect| {
         (rect.x() - 0.0).abs() < 0.01
             && (rect.y() - 40.0).abs() < 0.01
             && (rect.width() - 10.0).abs() < 0.01
             && (rect.height() - 20.0).abs() < 0.01
     }));
-    assert!(document.pages[0].rects.iter().any(|rect| {
+    assert!(document.pages[0].rects().iter().any(|rect| {
         (rect.x() - 90.0).abs() < 0.01
             && (rect.y() - 40.0).abs() < 0.01
             && (rect.width() - 10.0).abs() < 0.01
             && (rect.height() - 20.0).abs() < 0.01
     }));
-    assert!(document.pages[0].rects.iter().any(|rect| {
+    assert!(document.pages[0].rects().iter().any(|rect| {
         (rect.x() - 0.0).abs() < 0.01
             && (rect.y() - 90.0).abs() < 0.01
             && (rect.width() - 10.0).abs() < 0.01
@@ -490,7 +558,7 @@ async fn page_margin_boxes_without_generated_content_are_not_created() {
     .await
     .unwrap();
 
-    assert!(!document.pages[0].rects.iter().any(|rect| {
+    assert!(!document.pages[0].rects().iter().any(|rect| {
         rect.fill == Some(Color::BLACK)
             && ((rect.x() - 0.0).abs() < 0.01 || (rect.x() - 90.0).abs() < 0.01)
             && (rect.y() - 90.0).abs() < 0.01
@@ -514,19 +582,19 @@ async fn named_pages_select_named_page_margin_boxes() {
     assert_eq!(document.pages.len(), 3);
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "base")
     );
     assert!(
         document.pages[1]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "report")
     );
     assert!(
         document.pages[2]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "base")
     );
@@ -549,7 +617,7 @@ async fn named_pages_combine_with_left_page_pseudo_class() {
 
     assert_eq!(document.pages.len(), 3);
     let lines = document.pages[1]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -579,7 +647,7 @@ async fn named_string_start_inside_moved_flex_item_uses_final_fragment() {
         .pages
         .iter()
         .map(|page| {
-            page.lines
+            page.lines()
                 .iter()
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>()
@@ -617,7 +685,7 @@ async fn running_element_start_inside_moved_flex_item_uses_item_fragment() {
         .pages
         .iter()
         .map(|page| {
-            page.lines
+            page.lines()
                 .iter()
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>()
@@ -632,6 +700,44 @@ async fn running_element_start_inside_moved_flex_item_uses_item_fragment() {
 }
 
 #[tokio::test]
+async fn flex_item_inline_multicol_balances_and_paints_rule() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 260pt 100pt; margin: 10pt }\
+         body { margin: 0 }\
+         div { width: 240pt; background: blue; display: flex; justify-content: space-around }\
+         p { font-family: monospace; font-size: 12pt; line-height: 12pt; background: yellow;\
+             column-gap: 12pt; column-rule: 12pt solid lime; columns: 2; width: 150pt; margin: 0 }\
+         </style>\
+         <div><p>one two three four five</p></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let text = page
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for word in ["one", "two", "three", "four", "five"] {
+        assert!(text.split_whitespace().any(|part| part == word), "{text:?}");
+    }
+
+    assert!(
+        page.strokes().iter().any(|stroke| {
+            stroke.color == Color::new(0, 255, 0)
+                && (stroke.width - 12.0).abs() < 0.01
+                && (stroke.x1() - stroke.x2()).abs() < 0.01
+        }),
+        "expected lime column rule in {:?}",
+        page.strokes()
+    );
+}
+
+#[tokio::test]
 async fn definition_lists_can_lay_out_term_groups_in_columns() {
     let document = Html::from_string(
         "<style>@page { size: 220pt 120pt; margin: 10pt } body, dl, dt, dd { margin: 0; font-size: 10pt; line-height: 10pt } dl { columns: 4; column-gap: 4pt; width: 160pt }</style><dl><dt>Flight</dt><dd>AB123</dd><dt>Gate</dt><dd>17</dd><dt>Seat</dt><dd>4A</dd><dt>Zone</dt><dd>2</dd></dl>",
@@ -641,20 +747,20 @@ async fn definition_lists_can_lay_out_term_groups_in_columns() {
 
     let page = &document.pages[0];
     assert_eq!(
-        page.lines
+        page.lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
         vec!["Flight", "AB123", "Gate", "17", "Seat", "4A", "Zone", "2"]
     );
 
-    let term_lines = page.lines.iter().step_by(2).collect::<Vec<_>>();
+    let term_lines = page.lines().iter().step_by(2).collect::<Vec<_>>();
     for pair in term_lines.windows(2) {
         assert!((pair[1].x() - pair[0].x() - 41.0).abs() < 0.01);
         assert!((pair[1].y() - pair[0].y()).abs() < 0.01);
     }
 
-    for group in page.lines.chunks(2) {
+    for group in page.lines().chunks(2) {
         assert!((group[0].x() - group[1].x()).abs() < 0.01);
         assert!((group[0].y() - group[1].y() - 10.0).abs() < 0.01);
     }
@@ -676,7 +782,7 @@ async fn definition_list_multicol_align_content_uses_multicol_overflow_defaults(
 
     let line = |text: &str| {
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .find(|line| line.text == text)
             .unwrap_or_else(|| panic!("{text} should render"))
@@ -684,12 +790,12 @@ async fn definition_list_multicol_align_content_uses_multicol_overflow_defaults(
     let default = line("Default");
     let safe = line("Safe");
     let default_box = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .expect("default multicol background should paint");
     let safe_box = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("safe multicol background should paint");

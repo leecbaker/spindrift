@@ -322,6 +322,20 @@ impl<'a> LayoutBuilder<'a> {
                 NamedStringPart::ContentText => {
                     push_named_string_text_part(&mut output, &inline_text(element));
                 }
+                NamedStringPart::ContentFirstLetter => {
+                    let text = inline_text(element);
+                    if let Some(range) = first_letter_byte_range(&text) {
+                        push_named_string_text_part(&mut output, &text[range]);
+                    }
+                }
+                NamedStringPart::ContentMarker => {
+                    if let Some(marker) =
+                        self.marker_for_list_item(element, style, self.containing_block_direction)
+                        && !marker.text.is_empty()
+                    {
+                        push_named_string_text_part(&mut output, &marker.text);
+                    }
+                }
                 NamedStringPart::BeforeContent => {
                     let items = self.evaluate_generated_pseudo_items_rollback(
                         element,
@@ -336,18 +350,28 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     push_named_string_items(&mut output, items);
                 }
-                NamedStringPart::Attr(name) => {
+                NamedStringPart::Attr { name, fallback } => {
                     if let Some(value) = element.attrs.get(name) {
                         push_named_string_text_part(&mut output, value);
+                    } else if let Some(fallback) = fallback {
+                        push_named_string_text_part(&mut output, fallback);
                     }
                 }
-                NamedStringPart::Image(url) => output.push(
+                NamedStringPart::Image(image) => output.push(
                     page_generated::PageMarginContentItem::Inline(GeneratedContentPart::Image {
-                        url: url.clone(),
-                        base_url: self.base_url.map(Path::to_path_buf),
-                        root_url: self.root_url.map(Path::to_path_buf),
+                        image: image_with_context_urls(image.clone(), self.base_url, self.root_url),
                     }),
                 ),
+                NamedStringPart::Quote(quote) => {
+                    output.push(page_generated::PageMarginContentItem::Inline(
+                        GeneratedContentPart::Quote(*quote),
+                    ))
+                }
+                NamedStringPart::Leader(text) => {
+                    output.push(page_generated::PageMarginContentItem::Inline(
+                        GeneratedContentPart::Leader(text.clone()),
+                    ))
+                }
                 NamedStringPart::Counter {
                     name,
                     style: counter_style,
@@ -384,6 +408,21 @@ impl<'a> LayoutBuilder<'a> {
                         })
                         .collect::<Vec<_>>();
                     push_named_string_text_part(&mut output, &counters.join(separator));
+                }
+                NamedStringPart::TargetCounter {
+                    target,
+                    name,
+                    style,
+                } => output.push(page_generated::PageMarginContentItem::TargetCounter {
+                    target: target.clone(),
+                    name: name.clone(),
+                    style: style.clone(),
+                }),
+                NamedStringPart::TargetText { target, keyword } => {
+                    output.push(page_generated::PageMarginContentItem::TargetText {
+                        target: target.clone(),
+                        keyword: *keyword,
+                    })
                 }
             }
         }
@@ -428,6 +467,21 @@ impl<'a> LayoutBuilder<'a> {
                     );
                     push_named_string_text_part(&mut output, &text);
                 }
+                GeneratedContentPart::TargetCounter {
+                    target,
+                    name,
+                    style,
+                } => output.push(page_generated::PageMarginContentItem::TargetCounter {
+                    target: target.clone(),
+                    name: name.clone(),
+                    style: style.clone(),
+                }),
+                GeneratedContentPart::TargetText { target, keyword } => {
+                    output.push(page_generated::PageMarginContentItem::TargetText {
+                        target: target.clone(),
+                        keyword: *keyword,
+                    })
+                }
                 GeneratedContentPart::Quote(_)
                 | GeneratedContentPart::Leader(_)
                 | GeneratedContentPart::Image { .. } => {
@@ -459,6 +513,9 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
     ) -> Vec<AssignmentId> {
+        if self.element_side_effect_suppression_depth > 0 {
+            return Vec::new();
+        }
         let mut ids = Vec::new();
         for set in &style.string_sets {
             // CSS GCPM named strings capture generated text at element layout
@@ -489,6 +546,9 @@ impl<'a> LayoutBuilder<'a> {
         let Some(name) = &style.running_element_name else {
             return false;
         };
+        if self.element_side_effect_suppression_depth > 0 {
+            return true;
+        }
         let value = self.running_element_text_with_counter_scopes(element, style);
         let content_parts =
             running_element_content_parts(element, &value, self.base_url, self.root_url);
@@ -619,6 +679,122 @@ impl<'a> LayoutBuilder<'a> {
             self.pages.len(),
         );
     }
+
+    /// Captures GCPM assignments for a source element represented by an already-planned fragment.
+    ///
+    /// Split table-cell replay can paint a source fragment without passing
+    /// through the normal element layout wrapper. GCPM `string(..., start)` and
+    /// `element(..., start)` still resolve from the final source fragment, so
+    /// callers provide the fragment-backed placement directly:
+    /// <https://www.w3.org/TR/css-gcpm-3/#named-strings> and
+    /// <https://www.w3.org/TR/css-gcpm-3/#running-elements>.
+    pub(in crate::layout) fn capture_assignments_for_fragment_source(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        placement: AssignmentPlacement,
+    ) -> bool {
+        if style.display.is_none() {
+            return false;
+        }
+        let counter_scope = self.begin_counter_scope(element, style);
+        self.begin_assignment_capture_frame();
+        let named_assignment_ids = self.capture_named_strings(element, style);
+        let captured_running_element = self.capture_running_element(element, style);
+        let assignment_ids = self.end_assignment_capture_frame();
+        self.update_named_assignment_placements(&named_assignment_ids, placement);
+        self.update_running_assignment_placements(&assignment_ids, placement);
+        self.end_counter_scope(counter_scope);
+        captured_running_element
+    }
+
+    /// Captures named strings for a source element represented by a final fragment.
+    ///
+    /// Table row fragments do not pass through the normal block element wrapper,
+    /// but CSS GCPM still sets named strings when the source element is laid out.
+    /// Running table rows require removal from table layout, so this helper is
+    /// deliberately limited to `string-set` and updates placement from the final
+    /// visible row fragment:
+    /// <https://www.w3.org/TR/css-gcpm-3/#setting-named-strings>.
+    pub(in crate::layout) fn capture_named_strings_for_fragment_source(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        placement: AssignmentPlacement,
+    ) {
+        if style.display.is_none() || style.string_sets.is_empty() {
+            return;
+        }
+        let counter_scope = self.begin_counter_scope(element, style);
+        let named_assignment_ids = self.capture_named_strings(element, style);
+        self.update_named_assignment_placements(&named_assignment_ids, placement);
+        self.end_counter_scope(counter_scope);
+    }
+
+    /// Copies GCPM assignment values emitted in an isolated fragment layout.
+    ///
+    /// Split table-cell nested table/flex replay lays descendants out on a
+    /// temporary page and restores the caller state afterwards. Capture the
+    /// values before restore, then re-emit them against the real page fragment:
+    /// <https://www.w3.org/TR/css-gcpm-3/#named-strings> and
+    /// <https://www.w3.org/TR/css-gcpm-3/#running-elements>.
+    pub(in crate::layout) fn captured_current_page_assignment_values(
+        &self,
+    ) -> Vec<CapturedPageAssignment> {
+        let mut output = Vec::new();
+        push_captured_assignment_values(&mut output, &self.current_page_named_strings);
+        push_captured_assignment_values(&mut output, &self.current_page_running_elements);
+        output
+    }
+
+    pub(in crate::layout) fn replay_captured_page_assignments(
+        &mut self,
+        assignments: &[CapturedPageAssignment],
+        placement: AssignmentPlacement,
+    ) {
+        for assignment in assignments {
+            let id = self.next_assignment_id();
+            let page_assignment = NamedStringAssignment {
+                id,
+                value: assignment.value.clone(),
+                placement,
+            };
+            match &assignment.value {
+                PageAssignmentValue::GeneratedContent(_) => {
+                    insert_assignment_for_page(
+                        &mut self.page_named_strings,
+                        &mut self.current_page_named_strings,
+                        placement.page_index,
+                        assignment.name.clone(),
+                        page_assignment,
+                        self.pages.len(),
+                    );
+                }
+                PageAssignmentValue::RunningElement(_) => {
+                    insert_assignment_for_page(
+                        &mut self.page_running_elements,
+                        &mut self.current_page_running_elements,
+                        placement.page_index,
+                        assignment.name.clone(),
+                        page_assignment,
+                        self.pages.len(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn push_captured_assignment_values(
+    output: &mut Vec<CapturedPageAssignment>,
+    assignments: &HashMap<String, Vec<NamedStringAssignment>>,
+) {
+    for (name, values) in assignments {
+        output.extend(values.iter().map(|assignment| CapturedPageAssignment {
+            name: name.clone(),
+            value: assignment.value.clone(),
+        }));
+    }
 }
 
 fn update_assignment_placements_for_maps(
@@ -725,6 +901,27 @@ fn push_named_string_items(
     }
 }
 
+fn image_with_context_urls(
+    mut image: css::BackgroundImage,
+    base_url: Option<&Path>,
+    root_url: Option<&Path>,
+) -> css::BackgroundImage {
+    if let css::BackgroundImage::Url {
+        base_url: image_base_url,
+        root_url: image_root_url,
+        ..
+    } = &mut image
+    {
+        if image_base_url.is_none() {
+            *image_base_url = base_url.map(Path::to_path_buf);
+        }
+        if image_root_url.is_none() {
+            *image_root_url = root_url.map(Path::to_path_buf);
+        }
+    }
+    image
+}
+
 /// Captures the generated-content replay form for `position: running()`.
 ///
 /// CSS GCPM defines `element()` as replaying a running element in generated
@@ -741,9 +938,11 @@ fn running_element_content_parts(
         && let Some(url) = element.attrs.get("src").filter(|value| !value.is_empty())
     {
         return vec![GeneratedContentPart::Image {
-            url: url.clone(),
-            base_url: base_url.map(Path::to_path_buf),
-            root_url: root_url.map(Path::to_path_buf),
+            image: css::BackgroundImage::Url {
+                src: url.clone(),
+                base_url: base_url.map(Path::to_path_buf),
+                root_url: root_url.map(Path::to_path_buf),
+            },
         }];
     }
     if fallback_text.is_empty() {

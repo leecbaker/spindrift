@@ -50,7 +50,7 @@ impl FontSystem {
                     font.family,
                     font.post_script_name
                 );
-                self.family_cache.insert(cache_key.clone(), id);
+                self.family_cache.insert(cache_key, id);
                 self.family_cache
                     .insert(FontRequest::single_name(name, weight, style, width), id);
                 return Some(id);
@@ -73,5 +73,56 @@ impl FontSystem {
 
         log::trace!("CSS font-family {:?} did not resolve", family);
         None
+    }
+
+    /// Resolve the first available font used for CSS line metrics.
+    ///
+    /// CSS 2.2 positions the explicit `line-height` inline box from the element's
+    /// selected font metrics, while CSS Fonts `unicode-range` only decides which
+    /// face is used for each character. Metric-only lookups therefore walk the
+    /// authored family list directly and avoid full-stack caches that may have
+    /// been populated while shaping a later fallback glyph:
+    /// <https://www.w3.org/TR/CSS22/visudet.html#line-height> and
+    /// <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>.
+    pub(crate) fn resolve_metric_font_for_style(&mut self, style: &ComputedStyle) -> Option<usize> {
+        if let FontFamily::Names(names) = &style.font_family {
+            let mut fallback_family = None;
+            for name in names {
+                if let Some(known) = known_font_family(name) {
+                    fallback_family.get_or_insert(known);
+                    continue;
+                }
+                if let Some(id) = self.resolve_single_family(
+                    name,
+                    style.font_weight,
+                    style.font_style,
+                    style.font_width,
+                ) {
+                    return Some(id);
+                }
+            }
+            if let Some(known) = fallback_family {
+                return self.resolve_generic_family(
+                    &known,
+                    style.font_weight,
+                    style.font_style,
+                    style.font_width,
+                );
+            }
+        } else if let Some(id) = self.resolve_generic_family(
+            &style.font_family,
+            style.font_weight,
+            style.font_style,
+            style.font_width,
+        ) {
+            return Some(id);
+        }
+
+        self.resolve_generic_family(
+            &FontFamily::SansSerif,
+            style.font_weight,
+            style.font_style,
+            style.font_width,
+        )
     }
 }

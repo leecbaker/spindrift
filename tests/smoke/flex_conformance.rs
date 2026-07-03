@@ -18,6 +18,108 @@ body { color: red }\
 .c10 { color: black }\
 .b { background: inherit }";
 
+fn rects_overlap_y(a: &quire::RenderedRect, b: &quire::RenderedRect) -> bool {
+    a.y() < b.y() + b.height() - 0.01 && b.y() < a.y() + a.height() - 0.01
+}
+
+fn rects_have_gap_x(a: &quire::RenderedRect, b: &quire::RenderedRect, expected: f32) -> bool {
+    let gap = if a.x() <= b.x() {
+        b.x() - (a.x() + a.width())
+    } else {
+        a.x() - (b.x() + b.width())
+    };
+    (gap - expected).abs() < 0.5
+}
+
+fn rects_have_gap_y(a: &quire::RenderedRect, b: &quire::RenderedRect, expected: f32) -> bool {
+    let gap = if a.y() <= b.y() {
+        b.y() - (a.y() + a.height())
+    } else {
+        a.y() - (b.y() + b.height())
+    };
+    (gap - expected).abs() < 0.5
+}
+
+async fn assert_vertical_rl_inline_flex_column_wrap_gap(html: &str) {
+    let document = Html::from_string(html)
+        .render_async(&RenderOptions::default())
+        .await
+        .unwrap();
+    let page = &document.pages[0];
+    let green = Color::new(0, 128, 0);
+    let gray = Color::new(128, 128, 128);
+    let container = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(green))
+        .unwrap_or_else(|| panic!("expected green inline-flex background: {:?}", page.rects()));
+    assert!(
+        (container.width() - 100.0).abs() < 0.01 && (container.height() - 200.0).abs() < 0.01,
+        "vertical inline-flex should keep block-size as physical width and inline-size as physical height: {container:?}"
+    );
+
+    let items = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(gray))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        items.len(),
+        4,
+        "expected four grey flex item backgrounds: {:?}",
+        page.rects()
+    );
+    assert!(
+        items.iter().all(|rect| rect.width() <= 20.0),
+        "vertical text flex item physical widths should come from line-height, not text advance: {items:?}"
+    );
+    assert!(
+        items.iter().enumerate().any(|(index, item)| {
+            items[index + 1..]
+                .iter()
+                .any(|other| rects_overlap_y(item, other) && rects_have_gap_x(item, other, 20.0))
+        }),
+        "same flex line should have a 20pt physical horizontal gap between vertical text items: {items:?}"
+    );
+    assert!(
+        items.iter().enumerate().any(|(index, item)| {
+            items[index + 1..]
+                .iter()
+                .any(|other| !rects_overlap_y(item, other) && rects_have_gap_y(item, other, 20.0))
+        }),
+        "wrapped flex lines should have a 20pt physical vertical gap: {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn inherited_vertical_rl_inline_flex_column_wrap_gap_uses_logical_item_block_sizes() {
+    assert_vertical_rl_inline_flex_column_wrap_gap(
+        "<!DOCTYPE html><style>@page { size: 400pt 400pt; margin: 0 }\
+         body { margin: 0; writing-mode: vertical-rl }\
+         section { background-color: green; block-size: 100pt; inline-size: 200pt;\
+                   display: inline-flex; flex-direction: column; flex-wrap: wrap;\
+                   gap: 20pt; line-height: 18pt; font-size: 12pt; vertical-align: top }\
+         section > div { background-color: grey; color: white }</style>\
+         <section><div>Black Panther</div><div>Wonder Woman</div><div>Storm</div><div>Flash</div></section>",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn direct_vertical_rl_inline_flex_column_wrap_gap_uses_logical_item_block_sizes() {
+    assert_vertical_rl_inline_flex_column_wrap_gap(
+        "<!DOCTYPE html><style>@page { size: 400pt 400pt; margin: 0 }\
+         body { margin: 0 }\
+         section { writing-mode: vertical-rl; background-color: green; block-size: 100pt;\
+                   inline-size: 200pt; display: inline-flex; flex-direction: column;\
+                   flex-wrap: wrap; gap: 20pt; line-height: 18pt; font-size: 12pt;\
+                   vertical-align: top }\
+         section > div { background-color: grey; color: white }</style>\
+         <section><div>Black Panther</div><div>Wonder Woman</div><div>Storm</div><div>Flash</div></section>",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn stretched_vertical_flex_item_defines_descendant_percentage_padding_basis() {
     let document = Html::from_string(
@@ -33,19 +135,356 @@ async fn stretched_vertical_flex_item_defines_descendant_percentage_padding_basi
     .unwrap();
 
     let green = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "expected green flex item background: {:?}",
-                document.pages[0].rects
+                document.pages[0].rects()
             )
         });
     assert!(
         (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
         "stretched vertical item should use its 100px inline size for descendant percentage padding: {green:?}"
     );
+}
+
+#[tokio::test]
+async fn stretched_replaced_descendant_transfers_size_from_stretched_flex_item() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 140px 140px; margin: 0 } body { margin: 0 } p { display: none }\
+         </style>\
+         <p>Test passes if there is a filled green square.</p>\
+         <div style=\"display: inline-flex; height: 100px; background: green;\">\
+           <div><canvas width=\"10\" height=\"10\" style=\"height: 100%\"></canvas></div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected green inline-flex background: {:?}",
+                document.pages[0].rects()
+            )
+        });
+
+    assert!(
+        (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
+        "stretched flex item should give the canvas a definite 100px percentage-height basis and transfer width through its 1:1 ratio: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn block_flex_item_contains_first_child_margin() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 200pt 200pt; margin: 0 } body { margin: 0 }\
+         .flex { display: flex; align-items: flex-start; width: 100pt }\
+         .item { background: green; width: 50pt }\
+         .item > div { margin-top: 20pt; height: 10pt; background: red }\
+         </style><div class=\"flex\"><div class=\"item\"><div></div></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected flex item background: {:?}",
+                document.pages[0].rects()
+            )
+        });
+    assert!(
+        (green.height() - 30.0).abs() < 0.01,
+        "flex item should establish an independent formatting context and contain first-child margin: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn block_flex_item_contains_internal_float_height() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 200pt 200pt; margin: 0 } body { margin: 0 }\
+         .flex { display: flex; align-items: flex-start; width: 100pt }\
+         .item { background: green; width: 50pt }\
+         .float { float: left; width: 30pt; height: 25pt; background: red }\
+         </style><div class=\"flex\"><div class=\"item\"><div class=\"float\"></div></div><div style=\"width: 10pt; height: 10pt; background: blue\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected flex item background: {:?}",
+                document.pages[0].rects()
+            )
+        });
+    assert!(
+        (green.height() - 25.0).abs() < 0.01,
+        "flex item should contain internal floats in its independent formatting context: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn inline_flex_item_contains_first_child_margin() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 200pt 200pt; margin: 0 } body { margin: 0 }\
+         .flex { display: inline-flex; align-items: flex-start; vertical-align: top }\
+         .item { background: green; width: 50pt }\
+         .item > span { display: block; margin-top: 20pt; height: 10pt; background: red }\
+         </style><span class=\"flex\"><span class=\"item\"><span></span></span></span>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected inline-flex item background: {:?}",
+                document.pages[0].rects()
+            )
+        });
+    assert!(
+        (green.height() - 30.0).abs() < 0.01,
+        "inline-flex item should use the same independent formatting context semantics: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn flex_blockified_inline_item_paints_source_background_once() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 200pt 200pt; margin: 0 } body { margin: 0 }\
+         .flex { display: flex; width: 100pt; font-size: 10pt; line-height: 10pt }\
+         .item { display: inline; background: rgb(10, 20, 30); color: transparent }\
+         </style><div class=\"flex\"><span class=\"item\">text</span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let painted = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(10, 20, 30)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        painted.len(),
+        1,
+        "blockified inline flex item should not also paint inline text-fragment background: {painted:?}"
+    );
+}
+
+#[tokio::test]
+async fn column_flex_stretched_aspect_ratio_item_keeps_content_auto_minimum() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 240px 180px; margin: 0 } body { margin: 0 } p { display: none }\
+         </style>\
+         <p>Test passes if there is a filled green square.</p>\
+         <div style=\"display: flex; flex-direction: column; width: 100px; height: 0px;\">\
+           <div style=\"background: green; aspect-ratio: 2/1;\">\
+             <div style=\"height: 100px;\"></div>\
+           </div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected green flex item background: {:?}",
+                document.pages[0].rects()
+            )
+        });
+
+    assert!(
+        (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
+        "stretched column flex item should be a 100px square after content auto-minimum sizing: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn empty_column_flex_stretched_aspect_ratio_item_keeps_transferred_basis() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 240px 180px; margin: 0 } body { margin: 0 }\
+         </style>\
+         <div style=\"display: flex; flex-direction: column; width: 100px; height: 0px;\">\
+           <div style=\"background: green; aspect-ratio: 2/1;\"></div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected green flex item background: {:?}",
+                document.pages[0].rects()
+            )
+        });
+
+    assert!(
+        (green.width() - 75.0).abs() < 0.01 && (green.height() - 37.5).abs() < 0.01,
+        "empty stretched column flex item should keep the 100px by 50px transferred flex basis: {green:?}"
+    );
+}
+
+#[tokio::test]
+async fn stretch_min_cross_size_preserves_non_negative_content_box() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 220px 220px; margin: 0 } body { margin: 0 } p { display: none }\
+         #red { position: absolute; z-index: -1; width: 200px; height: 200px; background: red }\
+         #flex-container { display: flex; flex-direction: row; height: 0 }\
+         #flex-item { min-height: stretch; border: 100px solid green }\
+         </style>\
+         <p>Test passes if there is a filled green square and no red.</p>\
+         <div id=\"red\"></div><div id=\"flex-container\"><div id=\"flex-item\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = Color::new(0, 128, 0);
+    for (x, y) in [(37.5, 37.5), (112.5, 37.5), (37.5, 112.5), (112.5, 112.5)] {
+        assert_eq!(
+            final_rect_fill_at(page, x, y),
+            Some(green),
+            "stretched flex item border should cover the red reference square at ({x}, {y}): {:?}",
+            page.rects()
+        );
+    }
+}
+
+#[tokio::test]
+async fn abspos_auto_position_honors_flex_alignment_on_both_axes() {
+    let document = Html::from_string(
+        "<!doctype html><style>\
+         @page { size: 220px 220px; margin: 0 } body { margin: 0 }\
+         .parent { position: fixed; top: 0; left: 0; display: flex;\
+           align-items: center; justify-content: center; width: 200px; height: 200px;\
+           background: yellow }\
+         .child { position: absolute; width: 100px; height: 100px; background: green }\
+         </style><div class=\"parent\"><div class=\"child\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let yellow = Color::new(255, 255, 0);
+    let green = Color::new(0, 128, 0);
+    let parent = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(yellow))
+        .unwrap_or_else(|| panic!("expected yellow flex container: {:?}", page.rects()));
+    let child = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(green))
+        .unwrap_or_else(|| panic!("expected green abspos flex child: {:?}", page.rects()));
+
+    let px = 0.75;
+    let expected_offset = 50.0 * px;
+    assert!(
+        (child.x() - parent.x() - expected_offset).abs() < 0.01
+            && (child.y() - parent.y() - expected_offset).abs() < 0.01
+            && (child.width() - 100.0 * px).abs() < 0.01
+            && (child.height() - 100.0 * px).abs() < 0.01,
+        "abspos flex child should be centered by justify-content and align-items: parent={parent:?}, child={child:?}"
+    );
+}
+
+#[tokio::test]
+async fn abspos_auto_position_covers_vertical_writing_flex_content_box() {
+    for writing_mode in ["vertical-lr", "vertical-rl"] {
+        let document = Html::from_string(format!(
+            "<!DOCTYPE html><style>\
+             @page {{ size: 140px 140px; margin: 0 }} body {{ margin: 0 }} p {{ display: none }}\
+             .flex {{ display: flex; position: relative; writing-mode: {writing_mode}; direction: ltr;\
+               width: 100px; height: 100px; border: solid white; border-left-width: 20px; left: -20px;\
+               border-top-width: 5px; top: -5px; border-right-width: 10px; border-bottom-width: 15px;\
+               background: red }}\
+             .flex > div {{ position: absolute; width: 100%; height: 100%; background: green }}\
+             </style><p>Test passes if there is a filled green square and no red.</p>\
+             <div class=\"flex\"><div></div></div>"
+        ))
+        .render_async(&RenderOptions::default())
+        .await
+        .unwrap();
+
+        let page = &document.pages[0];
+        let red = page
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected flex background for {writing_mode}: {:?}",
+                    page.rects()
+                )
+            });
+        let green = Color::new(0, 128, 0);
+        let px = 0.75;
+        let content_left = red.x() + 20.0 * px;
+        let content_bottom = red.y() + 15.0 * px;
+        let content_width = 100.0 * px;
+        let content_height = 100.0 * px;
+        for (x, y) in [
+            (
+                content_left + content_width / 2.0,
+                content_bottom + content_height / 2.0,
+            ),
+            (content_left + content_width / 2.0, content_bottom + 1.0),
+            (
+                content_left + content_width / 2.0,
+                content_bottom + content_height - 1.0,
+            ),
+        ] {
+            assert_eq!(
+                final_rect_fill_at(page, x, y),
+                Some(green),
+                "{writing_mode} abspos child should cover red flex background at ({x}, {y}): {:?}",
+                page.rects()
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -81,7 +520,7 @@ div::after {
 
     let page = &document.pages[0];
     let yellow = page
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(255, 255, 0)))
         .collect::<Vec<_>>();
@@ -89,16 +528,16 @@ div::after {
         yellow.len(),
         2,
         "real child and generated ::after should both paint yellow flex item backgrounds: {:?}",
-        page.rects
+        page.rects()
     );
     assert!(
         yellow[1].x() > yellow[0].x() + yellow[0].width(),
         "generated ::after flex item should be laid out after the real child: {yellow:?}"
     );
     assert!(
-        page.lines.iter().any(|line| line.text == "yyy"),
+        page.lines().iter().any(|line| line.text == "yyy"),
         "generated ::after text should render as flex item content: {:?}",
-        page.lines
+        page.lines()
     );
 }
 
@@ -118,7 +557,7 @@ async fn generated_pseudo_flex_items_participate_in_order_sorting() {
     .unwrap();
 
     let mut line_text_by_x = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| (line.x(), line.text.as_str()))
         .collect::<Vec<_>>();
@@ -131,7 +570,41 @@ async fn generated_pseudo_flex_items_participate_in_order_sorting() {
         text,
         vec!["C", "B", "A"],
         "pseudo and element flex items should share order-modified document order: {:?}",
-        document.pages[0].lines
+        document.pages[0].lines()
+    );
+}
+
+#[tokio::test]
+async fn flex_order_painting_uses_order_modified_document_order_with_negative_margin() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 200px 160px; margin: 0 } body { margin: 0 } p { display: none }\
+         </style>\
+         <p>This test passes if there is no red showing.</p>\
+         <div style=\"display: flex; width: 100px;\">\
+         <div style=\"order: 2; background-color: green; width: 100px; height: 100px; margin-left: -50px;\"></div>\
+         <div style=\"order: 1; background-color: red; width: 50px; height: 100px;\"></div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .unwrap_or_else(|| panic!("expected red flex item background: {:?}", page.rects()));
+    assert_eq!(
+        final_rect_fill_at(
+            page,
+            red.x() + red.width() / 2.0,
+            red.y() + red.height() / 2.0
+        ),
+        Some(Color::new(0, 128, 0)),
+        "order-modified flex painting should cover the lower-order red item with the negative-margin green item: {:?}",
+        page.rects()
     );
 }
 
@@ -151,7 +624,7 @@ async fn definite_width_block_flex_container_overflows_without_shrinking_items()
 
     let page = &document.pages[0];
     let container = page
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("definite-width flex container background should paint");
@@ -167,15 +640,73 @@ async fn definite_width_block_flex_container_overflows_without_shrinking_items()
         Color::new(128, 128, 128),
     ] {
         let item = page
-            .rects
+            .rects()
             .iter()
             .find(|rect| rect.fill == Some(color))
-            .unwrap_or_else(|| panic!("expected flex item with fill {color:?}: {:?}", page.rects));
+            .unwrap_or_else(|| {
+                panic!("expected flex item with fill {color:?}: {:?}", page.rects())
+            });
         assert!(
             (item.width() - 60.0).abs() < 0.01,
             "flex: 0 1 auto item should keep its definite width: {item:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn auto_height_row_flex_container_applies_min_max_height_constraints() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 240pt 220pt; margin: 0 } body { margin: 0 }\
+         .flexbox { width: 200px; border: 1px dashed blue; background: lightgreen;\
+           font-size: 10px; display: flex; margin-bottom: 5px }\
+         .flexbox > div { width: 200px }\
+         </style>\
+         <div class=\"flexbox\"><div>text</div></div>\
+         <div class=\"flexbox\" style=\"min-height: 2px\"><div>text</div></div>\
+         <div class=\"flexbox\" style=\"max-height: 300px\"><div>text</div></div>\
+         <div class=\"flexbox\" style=\"min-height: 30px\"><div>text</div></div>\
+         <div class=\"flexbox\" style=\"max-height: 6px\"><div>text</div></div>\
+         <div class=\"flexbox\" style=\"min-height: 30px; max-height: 5px\"><div>text</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let mut flexboxes = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(144, 238, 144)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        flexboxes.len(),
+        6,
+        "expected six flex container backgrounds: {:?}",
+        document.pages[0].rects()
+    );
+    flexboxes.sort_by(|a, b| b.y().partial_cmp(&a.y()).unwrap());
+
+    let px = 0.75;
+    let border_box_extra = 2.0 * px;
+    let shrinkwrapped_height = flexboxes[0].height();
+    for index in 0..3 {
+        assert!(
+            (flexboxes[index].height() - shrinkwrapped_height).abs() < 0.01,
+            "unconstraining min/max-height should preserve shrinkwrapped auto height: {flexboxes:?}"
+        );
+    }
+    assert!(
+        (flexboxes[3].height() - (30.0 * px + border_box_extra)).abs() < 0.01,
+        "min-height should floor the auto-height flex container: {flexboxes:?}"
+    );
+    assert!(
+        (flexboxes[4].height() - (6.0 * px + border_box_extra)).abs() < 0.01,
+        "max-height should clamp the auto-height flex container without using overflowing item extents: {flexboxes:?}"
+    );
+    assert!(
+        (flexboxes[5].height() - (30.0 * px + border_box_extra)).abs() < 0.01,
+        "min-height should win when it is larger than max-height: {flexboxes:?}"
+    );
 }
 
 #[tokio::test]
@@ -191,7 +722,7 @@ async fn fixed_width_block_flex_container_resolves_auto_margins() {
     .unwrap();
 
     let green = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("centered flex container background should paint");
@@ -202,10 +733,87 @@ async fn fixed_width_block_flex_container_resolves_auto_margins() {
 }
 
 #[tokio::test]
+async fn horizontal_flex_img_items_use_flex_resolved_content_widths() {
+    let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let document = Html::from_string(format!(
+        "<!DOCTYPE html><style>\
+         @page {{ size: 260px 260px; margin: 0 }} body {{ margin: 0 }}\
+         div.flexbox {{ width: 200px; background: lightgreen; display: flex;\
+           justify-content: space-between; margin-bottom: 5px; line-height: 8px }}\
+         img {{ min-width: 0; width: 10px; height: 20px; border: 1px dotted green }}\
+         </style>\
+         <div class=\"flexbox\"><img src=\"{image}\"></div>\
+         <div class=\"flexbox\">some words <img src=\"{image}\"></div>\
+         <div class=\"flexbox\"><img src=\"{image}\" style=\"flex: 5\"><img src=\"{image}\" style=\"flex: 3\"></div>\
+         <div class=\"flexbox\"><img src=\"{image}\" style=\"width: 33px; flex: 2 auto\"><img src=\"{image}\" style=\"width: 13px; flex: 3 auto\"></div>\
+         <div class=\"flexbox\"><img src=\"{image}\" style=\"width: 150px; flex: 1 4 auto\"><img src=\"{image}\" style=\"width: 100px; flex: 1 3 auto\"></div>\
+         <div class=\"flexbox\"><img src=\"{image}\" style=\"width: 33px; flex: 2 auto\"><img src=\"{image}\" style=\"width: 13px; max-width: 90px; flex: 3 auto\"></div>\
+         <div class=\"flexbox\"><img src=\"{image}\" style=\"width: 33px; flex: 2 auto\"><img src=\"{image}\" style=\"width: 13px; min-width: 150px; flex: 3 auto\"></div>",
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let px = 0.75;
+    let mut images = document.pages[0]
+        .images()
+        .iter()
+        .filter(|image| !image.background)
+        .collect::<Vec<_>>();
+    images.sort_by(|left, right| {
+        right
+            .y()
+            .partial_cmp(&left.y())
+            .unwrap()
+            .then_with(|| left.x().partial_cmp(&right.x()).unwrap())
+    });
+    let rows = images
+        .chunk_by(|left, right| (left.y() - right.y()).abs() < 0.5)
+        .map(|row| {
+            row.iter()
+                .map(|image| image.width() / px)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        rows.len(),
+        7,
+        "expected one rendered image row for each flexbox: {images:?}"
+    );
+    assert!(
+        images[1].x() / px > 185.0,
+        "text and image should be separate flex items so space-between packs the image at the far edge: {images:?}"
+    );
+    let expected: &[&[f32]] = &[
+        &[10.0],
+        &[10.0],
+        &[122.5, 73.5],
+        &[93.0, 103.0],
+        &[114.0, 82.0],
+        &[106.0, 90.0],
+        &[46.0, 150.0],
+    ];
+    for (row, expected_row) in rows.iter().zip(expected) {
+        assert_eq!(
+            row.len(),
+            expected_row.len(),
+            "unexpected image count in row: rows={rows:?}, images={images:?}"
+        );
+        for (actual, expected) in row.iter().zip(*expected_row) {
+            assert!(
+                (actual - expected).abs() < 0.25,
+                "expected image content width {expected}px, got {actual}px; rows={rows:?}, images={images:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn align_content_stretch_overflow_falls_back_to_wrap_reverse_flex_start() {
     let document = Html::from_string(
         "<!DOCTYPE html><meta charset=\"utf-8\">\
-         <style>@page { size: 200px 200px; margin: 0 } body { margin: 0 } p { display: none }\
+         <style>@page { size: 420px 420px; margin: 0 } body { margin: 0 }\
          #flex { display: flex; width: 200px; height: 200px; flex-wrap: wrap-reverse; align-content: stretch }\
          #item { width: 200px; height: 400px; background: linear-gradient(to bottom, red 50%, green 50%) }</style>\
          <p>Test passes if there is a filled green square and no red.</p>\
@@ -217,22 +825,63 @@ async fn align_content_stretch_overflow_falls_back_to_wrap_reverse_flex_start() 
 
     let page = &document.pages[0];
     let green = Color::new(0, 128, 0);
-    for (x, y) in [
-        (15.0, 15.0),
-        (75.0, 15.0),
-        (135.0, 15.0),
-        (15.0, 75.0),
-        (75.0, 75.0),
-        (135.0, 75.0),
-        (15.0, 135.0),
-        (75.0, 135.0),
-        (135.0, 135.0),
-    ] {
+    let red = Color::new(255, 0, 0);
+    let green_rect = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(green) && rect.width() > 149.0 && rect.height() > 149.0)
+        .unwrap_or_else(|| panic!("expected clipped green square: {:?}", page.rects()));
+    assert_ne!(
+        final_rect_fill_at(
+            page,
+            green_rect.x() + 75.0,
+            green_rect.y() + green_rect.height() + 10.0
+        ),
+        Some(red),
+        "align-content:stretch overflow fallback must not expose the red half above {green_rect:?}: {:?}",
+        page.rects()
+    );
+    for (x, y) in [(10.0, 10.0), (75.0, 75.0), (140.0, 140.0)] {
+        assert_eq!(
+            final_rect_fill_at(page, green_rect.x() + x, green_rect.y() + y),
+            Some(green),
+            "align-content:stretch overflow fallback should expose only the green half at ({x}, {y}) inside {green_rect:?}: {:?}",
+            page.rects()
+        );
+    }
+}
+
+#[tokio::test]
+async fn flex_shrink_to_fit_item_remeasures_against_column_line_cross_size() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><meta charset=\"utf-8\">\
+         <style>@page { size: 260px 240px; margin: 0 } body { margin: 0 }\
+         #container { display: flex; flex-flow: column wrap; width: 100px; border-right: 100px solid red }\
+         #item { align-self: start; background: linear-gradient(to bottom, red 50%, green 50%) }\
+         .float { float: left; width: 100px; height: 100px; background: green }</style>\
+         <div id=\"container\"><div id=\"item\"><div class=\"float\"></div><div class=\"float\"></div></div><div style=\"width: 200px\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = Color::new(0, 128, 0);
+    let red = Color::new(255, 0, 0);
+    for (x, y) in [(10.0, 50.0), (140.0, 50.0), (10.0, 150.0), (140.0, 150.0)] {
+        let x = x * 0.75;
+        let y = y * 0.75;
         assert_eq!(
             final_rect_fill_at(page, x, y),
             Some(green),
-            "align-content:stretch overflow fallback should expose only the green half at ({x}, {y}): {:?}",
-            page.rects
+            "shrink-to-fit flex item should cover the 200px line cross-size at ({x}, {y}): {:?}",
+            page.rects()
+        );
+        assert_ne!(
+            final_rect_fill_at(page, x, y),
+            Some(red),
+            "final 200px square should not expose red at ({x}, {y}): {:?}",
+            page.rects()
         );
     }
 }
@@ -252,7 +901,7 @@ async fn column_wrap_flex_min_content_width_uses_item_cross_contribution() {
 
     let page = &document.pages[0];
     let green = page
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("min-content flex container background should paint");
@@ -268,7 +917,7 @@ async fn column_wrap_flex_min_content_width_uses_item_cross_contribution() {
         ),
         Some(Color::new(0, 128, 0)),
         "green flex container should fully cover the red reference square: {:?}",
-        page.rects
+        page.rects()
     );
 }
 
@@ -285,7 +934,7 @@ async fn column_wrap_inline_flex_min_content_width_uses_item_cross_contribution(
     .unwrap();
 
     let green = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("inline-flex background should paint");
@@ -308,7 +957,7 @@ async fn column_wrap_flex_min_content_width_does_not_sum_wrapped_columns() {
     .unwrap();
 
     let green = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("min-content column flex background should paint");
@@ -331,7 +980,7 @@ async fn wrapped_row_flex_min_content_width_uses_largest_item_contribution() {
     .unwrap();
 
     let green = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("min-content wrapped flex background should paint");
@@ -361,7 +1010,7 @@ async fn floated_row_flex_min_content_caps_non_growing_item_by_flex_base() {
 
     let page = &document.pages[0];
     let green = page
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("floated flex container background should paint");
@@ -377,7 +1026,7 @@ async fn floated_row_flex_min_content_caps_non_growing_item_by_flex_base() {
         ),
         Some(Color::new(0, 128, 0)),
         "green flex container should fully cover the red reference square: {:?}",
-        page.rects
+        page.rects()
     );
 }
 
@@ -394,7 +1043,7 @@ async fn nowrap_row_flex_min_content_width_keeps_all_items_on_one_line() {
     .unwrap();
 
     let green = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("min-content nowrap flex background should paint");
@@ -417,7 +1066,7 @@ async fn flex_intrinsic_width_percentage_gap_contributes_only_length_component()
     .unwrap();
 
     let green = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("max-content flex background should paint");
@@ -441,7 +1090,7 @@ async fn flex_max_content_width_uses_growing_item_max_content_contributions() {
     .unwrap();
 
     let green = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("max-content flex background should paint");
@@ -467,14 +1116,14 @@ async fn visibility_collapse_keeps_cross_strut_without_painting_item() {
 
     let page = &document.pages[0];
     assert!(
-        page.rects
+        page.rects()
             .iter()
             .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
         "collapsed flex item should not paint: {:?}",
-        page.rects
+        page.rects()
     );
     let container = page
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::BLACK) && rect.width() >= 89.0)
         .expect("flex container background should paint");
@@ -502,19 +1151,19 @@ async fn visibility_collapse_strut_reflows_wrapped_lines() {
 
     let page = &document.pages[0];
     assert!(
-        page.rects
+        page.rects()
             .iter()
             .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
         "collapsed flex item should not paint: {:?}",
-        page.rects
+        page.rects()
     );
     let green = page
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("first flex line item should paint");
     let blue = page
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("second flex line item should paint");
@@ -540,18 +1189,132 @@ async fn baseline_aligned_row_items_share_text_baseline() {
 
     let page = &document.pages[0];
     let big = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("large baseline participant should render");
     let small = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("small baseline participant should render");
     assert!(
         (big.y() - small.y()).abs() < 0.01,
         "baseline-aligned flex items should share a baseline: big={big:?}, small={small:?}"
+    );
+}
+
+#[tokio::test]
+async fn wrapped_row_align_items_baseline_preserves_line_cross_slots() {
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 340px 140px; margin: 0 } body { margin: 0 } p { display: none }\
+         #flexbox {\
+           background-color: red;\
+           background-image: linear-gradient(to bottom,\
+             green 0, green 16px, red 17px, red 35px,\
+             green 36px, green 66px, red 67px, red 85px,\
+             green 86px, green 100px);\
+           align-items: baseline; display: flex; flex-flow: wrap;\
+           height: 100px; width: 300px;\
+         }\
+         #flexbox > div {\
+           background-color: green; color: green;\
+           font: 20px/20px monospace; height: 40px; width: 75px;\
+         }\
+         #div3, #div7 { font-size: 40px; line-height: 40px }\
+         </style>\
+         <p>Test passes if there is no red visible on the page.</p>\
+         <div id=\"flexbox\">\
+           <div id=\"div1\">d1</div><div id=\"div2\">d2</div>\
+           <div id=\"div3\">d3</div><div id=\"div4\">d4</div>\
+           <div id=\"div5\">d5</div><div id=\"div6\">d6</div>\
+           <div id=\"div7\">d7</div><div id=\"div8\">d8</div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let px = 0.75;
+    let green = Some(Color::new(0, 128, 0));
+    let flexbox = page
+        .rects()
+        .iter()
+        .find(|rect| {
+            (rect.width() - 300.0 * px).abs() < 0.01 && (rect.height() - 100.0 * px).abs() < 0.01
+        })
+        .unwrap_or_else(|| panic!("expected flex container background: {:?}", page.rects()));
+    for y_px in [25.0, 75.0] {
+        for x_px in [37.5, 112.5, 187.5, 262.5] {
+            assert_eq!(
+                final_rect_fill_at(page, flexbox.x() + x_px * px, flexbox.y() + y_px * px),
+                green,
+                "baseline-aligned wrapped row should cover red band sample at ({x_px}px, {y_px}px): {:?}",
+                page.rects()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn baseline_aligned_row_items_use_block_child_baseline() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 120pt; margin: 10pt } body { margin: 0 }\
+         .row { display: flex; align-items: baseline; width: 140pt; font-size: 25pt; line-height: 25pt }\
+         .row * { margin: 0 }</style>\
+         <div class=\"row\"><span>XX</span><div><div>YY</div></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let direct = page
+        .lines()
+        .iter()
+        .find(|line| line.text == "XX")
+        .expect("direct flex item text should render");
+    let nested = page
+        .lines()
+        .iter()
+        .find(|line| line.text == "YY")
+        .expect("block-descendant flex item text should render");
+    assert!(
+        (direct.y() - nested.y()).abs() < 0.01,
+        "baseline-aligned row flex items should use an in-flow block descendant baseline: direct={direct:?}, nested={nested:?}"
+    );
+}
+
+#[tokio::test]
+async fn last_baseline_aligned_row_items_use_block_child_baseline() {
+    let document = Html::from_string(
+        "<style>@page { size: 220pt 160pt; margin: 10pt } body { margin: 0 }\
+         .row { display: flex; align-items: last baseline; width: 180pt }\
+         .row * { margin: 0 }\
+         .small { font-size: 10pt; line-height: 10pt }\
+         .big { font-size: 30pt; line-height: 30pt }</style>\
+         <div class=\"row\"><div><div class=\"small\">Top</div><div class=\"big\">Last</div></div><span class=\"small\">Peer</span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let nested_last = page
+        .lines()
+        .iter()
+        .find(|line| line.text == "Last")
+        .expect("last block-descendant flex item baseline participant should render");
+    let peer = page
+        .lines()
+        .iter()
+        .find(|line| line.text == "Peer")
+        .expect("peer last-baseline participant should render");
+    assert!(
+        (nested_last.y() - peer.y()).abs() < 0.01,
+        "last-baseline row flex items should use the last in-flow block descendant baseline: nested_last={nested_last:?}, peer={peer:?}"
     );
 }
 
@@ -572,12 +1335,12 @@ async fn baseline_aligned_row_items_use_nested_flex_exported_baseline() {
 
     let page = &document.pages[0];
     let nested = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("nested flex baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("peer baseline participant should render");
@@ -605,12 +1368,12 @@ async fn baseline_aligned_row_items_use_nested_wrapped_flex_first_line_baseline(
 
     let page = &document.pages[0];
     let nested_first = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("nested wrapped flex first baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer baseline participant should render");
@@ -638,12 +1401,12 @@ async fn baseline_aligned_row_items_use_nested_row_reverse_wrapped_startmost_bas
 
     let page = &document.pages[0];
     let nested_startmost = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("nested row-reverse first-line startmost baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer baseline participant should render");
@@ -671,12 +1434,12 @@ async fn baseline_aligned_row_items_use_nested_wrap_reverse_startmost_line_basel
 
     let page = &document.pages[0];
     let nested_startmost = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("nested wrap-reverse startmost line baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer baseline participant should render");
@@ -704,12 +1467,12 @@ async fn baseline_aligned_row_items_use_nested_max_width_wrapped_first_line_base
 
     let page = &document.pages[0];
     let nested_first = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("nested max-width wrapped first baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer baseline participant should render");
@@ -737,12 +1500,12 @@ async fn baseline_aligned_row_items_use_nested_fit_content_wrapped_first_line_ba
 
     let page = &document.pages[0];
     let nested_first = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("nested fit-content wrapped first baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer baseline participant should render");
@@ -769,12 +1532,12 @@ async fn last_baseline_aligned_row_items_use_nested_flex_exported_baseline() {
 
     let page = &document.pages[0];
     let nested_last = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("nested flex last baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer last baseline participant should render");
@@ -802,12 +1565,12 @@ async fn last_baseline_aligned_row_items_use_nested_fit_content_wrapped_last_lin
 
     let page = &document.pages[0];
     let nested_last = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("nested fit-content wrapped last baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer last baseline participant should render");
@@ -835,12 +1598,12 @@ async fn last_baseline_aligned_row_items_use_nested_max_content_gap_baseline() {
 
     let page = &document.pages[0];
     let nested_endmost = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("nested max-content gap baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer last baseline participant should render");
@@ -868,12 +1631,12 @@ async fn last_baseline_aligned_row_items_use_nested_max_width_wrapped_last_line_
 
     let page = &document.pages[0];
     let nested_last = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("nested max-width wrapped last baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer last baseline participant should render");
@@ -901,12 +1664,12 @@ async fn last_baseline_aligned_row_items_use_nested_wrap_reverse_endmost_line_ba
 
     let page = &document.pages[0];
     let nested_endmost = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("nested wrap-reverse endmost line baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer last baseline participant should render");
@@ -934,12 +1697,12 @@ async fn last_baseline_aligned_row_items_use_nested_row_reverse_wrapped_endmost_
 
     let page = &document.pages[0];
     let nested_endmost = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "E")
         .expect("nested row-reverse last-line endmost baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer last baseline participant should render");
@@ -967,12 +1730,12 @@ async fn last_baseline_aligned_row_items_use_nested_wrapped_flex_last_line_basel
 
     let page = &document.pages[0];
     let nested_last = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("nested wrapped flex last baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer last baseline participant should render");
@@ -1000,12 +1763,12 @@ async fn baseline_aligned_vertical_row_items_use_nested_vertical_flex_exported_b
 
     let page = &document.pages[0];
     let nested_first = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("nested vertical first baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical baseline participant should render");
@@ -1033,12 +1796,12 @@ async fn last_baseline_aligned_vertical_row_items_use_nested_vertical_flex_expor
 
     let page = &document.pages[0];
     let nested_last = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("nested vertical last baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical last baseline participant should render");
@@ -1066,12 +1829,12 @@ async fn baseline_aligned_vertical_row_items_use_auto_width_nested_vertical_expo
 
     let page = &document.pages[0];
     let nested_first = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("auto-width nested vertical first baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical first baseline participant should render");
@@ -1100,12 +1863,12 @@ async fn last_baseline_aligned_vertical_row_items_use_auto_width_nested_vertical
 
     let page = &document.pages[0];
     let nested_last = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("auto-width nested vertical last baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical last baseline participant should render");
@@ -1133,12 +1896,12 @@ async fn baseline_aligned_vertical_row_items_use_nested_wrap_reverse_exported_ba
 
     let page = &document.pages[0];
     let nested_first = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("nested vertical wrap-reverse first baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical first baseline participant should render");
@@ -1166,12 +1929,12 @@ async fn last_baseline_aligned_vertical_row_items_use_nested_wrap_reverse_export
 
     let page = &document.pages[0];
     let nested_last = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("nested vertical wrap-reverse last baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical last baseline participant should render");
@@ -1200,11 +1963,11 @@ async fn baseline_aligned_vertical_row_items_use_auto_width_nested_wrap_reverse_
 
     let page = &document.pages[0];
     let nested_first =
-        page.lines.iter().find(|line| line.text == "A").expect(
+        page.lines().iter().find(|line| line.text == "A").expect(
             "auto-width nested vertical wrap-reverse first baseline participant should render",
         );
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical first baseline participant should render");
@@ -1233,11 +1996,11 @@ async fn last_baseline_aligned_vertical_row_items_use_auto_width_nested_wrap_rev
 
     let page = &document.pages[0];
     let nested_last =
-        page.lines.iter().find(|line| line.text == "B").expect(
+        page.lines().iter().find(|line| line.text == "B").expect(
             "auto-width nested vertical wrap-reverse last baseline participant should render",
         );
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical last baseline participant should render");
@@ -1266,12 +2029,12 @@ async fn baseline_aligned_vertical_row_items_use_percentage_width_nested_vertica
 
     let page = &document.pages[0];
     let nested_first = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("percentage-width nested vertical first baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical first baseline participant should render");
@@ -1300,12 +2063,12 @@ async fn last_baseline_aligned_vertical_row_items_use_percentage_width_nested_ve
 
     let page = &document.pages[0];
     let nested_last = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("percentage-width nested vertical last baseline participant should render");
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical last baseline participant should render");
@@ -1333,11 +2096,11 @@ async fn baseline_aligned_vertical_row_items_use_percentage_width_nested_wrap_re
     .unwrap();
 
     let page = &document.pages[0];
-    let nested_first = page.lines.iter().find(|line| line.text == "A").expect(
+    let nested_first = page.lines().iter().find(|line| line.text == "A").expect(
         "percentage-width nested vertical wrap-reverse first baseline participant should render",
     );
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical first baseline participant should render");
@@ -1365,11 +2128,11 @@ async fn last_baseline_aligned_vertical_row_items_use_percentage_width_nested_wr
     .unwrap();
 
     let page = &document.pages[0];
-    let nested_last = page.lines.iter().find(|line| line.text == "B").expect(
+    let nested_last = page.lines().iter().find(|line| line.text == "B").expect(
         "percentage-width nested vertical wrap-reverse last baseline participant should render",
     );
     let peer = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("peer vertical last baseline participant should render");
@@ -1395,12 +2158,12 @@ async fn align_content_baseline_packs_wrapped_row_line_baselines() {
 
     let page = &document.pages[0];
     let big = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("first flex line should render");
     let small = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("second flex line should render");
@@ -1425,12 +2188,12 @@ async fn vertical_row_align_content_baseline_packs_wrapped_line_baselines() {
 
     let page = &document.pages[0];
     let first = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("first vertical flex line should render");
     let second = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("second vertical flex line should render");
@@ -1456,12 +2219,12 @@ async fn vertical_row_align_content_last_baseline_packs_wrapped_line_baselines()
 
     let page = &document.pages[0];
     let first = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("first vertical flex line should render");
     let second = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("second vertical flex line should render");
@@ -1488,12 +2251,12 @@ async fn align_content_last_baseline_packs_wrapped_row_line_baselines() {
 
     let page = &document.pages[0];
     let first_last = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .expect("last baseline of first flex line should render");
     let second = page
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "C")
         .expect("second flex line should render");
@@ -1517,12 +2280,12 @@ async fn column_flex_align_content_last_baseline_uses_safe_end_fallback() {
 
     let page = &document.pages[0];
     let red = page
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .expect("flex container background should paint");
     let first_green = page
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .min_by(|left, right| left.x().total_cmp(&right.x()))
@@ -1547,13 +2310,43 @@ async fn abspos_flex_child_static_position_uses_flex_alignment() {
     .unwrap();
 
     let red = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .expect("absolutely positioned flex child should paint");
     assert!(
         (red.x() - 50.0).abs() < 0.5,
         "static position should honor main-axis flex centering: {red:?}"
+    );
+}
+
+#[tokio::test]
+async fn inline_source_abspos_flex_child_uses_flex_static_rect_for_auto_horizontal_insets() {
+    let document = Html::from_string(
+        "<style>@page { size: 160pt 120pt; margin: 10pt } body { margin: 0 }\
+         .container { position: relative; display: flex; justify-content: center; align-items: center; width: 100pt; height: 40pt }\
+         .ref, .abs { position: absolute; width: 20pt; height: 10pt }\
+         .ref { background: red } .abs { background: green }</style>\
+         <div class=\"container\"><div class=\"ref\"></div><span class=\"abs\"></span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("block-source absolutely positioned flex child should paint");
+    let green = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("inline-source absolutely positioned flex child should paint");
+    assert!(
+        (green.x() - red.x()).abs() < 0.01,
+        "inline-source abspos flex child should share the block-source flex static x: red={red:?}, green={green:?}"
     );
 }
 
@@ -1570,14 +2363,14 @@ async fn display_contents_inline_flex_item_normalizes_mixed_flow_children() {
 
     let page = &document.pages[0];
     assert!(
-        page.lines.iter().any(|line| line.text == "2a"),
+        page.lines().iter().any(|line| line.text == "2a"),
         "leading inline text in a blockified flex item should render: {:?}",
-        page.lines
+        page.lines()
     );
     assert!(
-        page.lines.iter().any(|line| line.text == "2"),
+        page.lines().iter().any(|line| line.text == "2"),
         "block descendant in the same flex item should still render: {:?}",
-        page.lines
+        page.lines()
     );
 }
 
@@ -1599,17 +2392,17 @@ async fn display_contents_children_participate_as_flex_items() {
 
     let page = &document.pages[0];
     let green = page
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("first display: contents child should paint");
     let blue = page
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("second display: contents child should paint");
     let yellow = page
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
         .expect("following flex item should paint");
@@ -1681,9 +2474,9 @@ fn assert_display_contents_wpt_flex_output(document: &quire::Document) {
     let page = &document.pages[0];
     for text in ["0x", "y", "2a", "3", "4", "5a", "5b", "6", "8", "10"] {
         assert!(
-            page.lines.iter().any(|line| line.text == text),
+            page.lines().iter().any(|line| line.text == text),
             "expected rendered text {text:?}: {:?}",
-            page.lines
+            page.lines()
         );
     }
     let line_2bb = rendered_line(page, "2bb");
@@ -1714,10 +2507,10 @@ fn assert_display_contents_wpt_flex_output(document: &quire::Document) {
 }
 
 fn rendered_line<'a>(page: &'a quire::Page, text: &str) -> &'a quire::RenderedLine {
-    page.lines
+    page.lines()
         .iter()
         .find(|line| line.text == text)
-        .unwrap_or_else(|| panic!("expected rendered text {text:?}: {:?}", page.lines))
+        .unwrap_or_else(|| panic!("expected rendered text {text:?}: {:?}", page.lines()))
 }
 
 fn glyph_start_x(line: &quire::RenderedLine, index: usize) -> f32 {
@@ -1754,7 +2547,7 @@ fn assert_blue_at_text_position(page: &quire::Page, line: &quire::RenderedLine, 
     assert!(
         blue_rect_covers_text_position(page, line, x),
         "expected blue background at x={x} for {line:?}; rects={:?}",
-        page.rects
+        page.rects()
     );
 }
 
@@ -1762,12 +2555,12 @@ fn assert_no_blue_at_text_position(page: &quire::Page, line: &quire::RenderedLin
     assert!(
         !blue_rect_covers_text_position(page, line, x),
         "suppressed .contents.c2 should not paint blue background at x={x} for {line:?}; rects={:?}",
-        page.rects
+        page.rects()
     );
 }
 
 fn blue_rect_covers_text_position(page: &quire::Page, line: &quire::RenderedLine, x: f32) -> bool {
-    page.rects.iter().any(|rect| {
+    page.rects().iter().any(|rect| {
         rect.fill == Some(Color::new(0, 0, 255))
             && x >= rect.x() - 0.5
             && x <= rect.x() + rect.width() + 0.5
@@ -1792,11 +2585,11 @@ async fn display_contents_text_runs_form_anonymous_flex_items_without_contents_b
 
     let page = &document.pages[0];
     let line_x = |text: &str| {
-        page.lines
+        page.lines()
             .iter()
             .find(|line| line.text == text)
             .map(|line| line.x())
-            .unwrap_or_else(|| panic!("expected rendered text {text:?}: {:?}", page.lines))
+            .unwrap_or_else(|| panic!("expected rendered text {text:?}: {:?}", page.lines()))
     };
     let nine_x = line_x("9");
     let a_x = line_x("a");
@@ -1804,10 +2597,10 @@ async fn display_contents_text_runs_form_anonymous_flex_items_without_contents_b
     assert!(
         a_x - nine_x < 12.0 && b_x - a_x > 20.0,
         "9 and a should be contiguous inside one anonymous flex item, with the flex gap before b: {:?}",
-        page.lines
+        page.lines()
     );
     let blue_rects = page
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .collect::<Vec<_>>();
@@ -1837,12 +2630,12 @@ async fn column_flex_fragments_by_item_progression() {
     );
     for (page_index, page) in document.pages.iter().enumerate() {
         assert!(
-            page.rects
+            page.rects()
                 .iter()
                 .any(|rect| rect.fill == Some(Color::new(0, 128, 0))
                     && (rect.height() - 40.0).abs() < 0.01),
             "page {page_index} should contain one flex item: {:?}",
-            page.rects
+            page.rects()
         );
     }
 }
@@ -1866,12 +2659,12 @@ async fn wrapped_row_flex_fragments_by_line() {
     );
     for (page_index, page) in document.pages.iter().enumerate() {
         assert!(
-            page.rects
+            page.rects()
                 .iter()
                 .any(|rect| rect.fill == Some(Color::new(0, 0, 255))
                     && (rect.height() - 40.0).abs() < 0.01),
             "page {page_index} should contain one row flex line: {:?}",
-            page.rects
+            page.rects()
         );
     }
 }
@@ -1895,11 +2688,13 @@ async fn fragmented_row_flex_clones_container_background() {
     );
     for (page_index, page) in document.pages.iter().enumerate() {
         assert!(
-            page.rects.iter().any(|rect| rect.fill == Some(Color::BLACK)
-                && (rect.width() - 60.0).abs() < 0.01
-                && rect.height() >= 39.9),
+            page.rects()
+                .iter()
+                .any(|rect| rect.fill == Some(Color::BLACK)
+                    && (rect.width() - 60.0).abs() < 0.01
+                    && rect.height() >= 39.9),
             "page {page_index} should contain a cloned flex container background: {:?}",
-            page.rects
+            page.rects()
         );
     }
 }
@@ -1923,14 +2718,14 @@ async fn flex_item_break_before_is_consumed_at_container_layer() {
     );
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(255, 0, 0))),
         "first item should stay on page 1"
     );
     assert!(
         document.pages[1]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(255, 0, 0))),
         "second item should render on page 2"
@@ -1957,14 +2752,14 @@ async fn final_flex_item_break_after_propagates_after_container() {
     );
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(0, 128, 0))),
         "flex item should render before the break"
     );
     assert!(
         document.pages[1]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(0, 0, 255))),
         "following block should render after the propagated break"
@@ -1989,12 +2784,12 @@ async fn oversized_column_flex_item_splits_across_pages() {
         "oversized column flex item should split over two 60pt fragmentainers"
     );
     let first = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .expect("first item slice should paint");
     let second = document.pages[1]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .expect("second item slice should paint");
@@ -2022,12 +2817,12 @@ async fn oversized_wrapped_row_flex_line_splits_across_pages() {
         "oversized row flex line should split over two 60pt fragmentainers"
     );
     let first = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("first line slice should paint");
     let second = document.pages[1]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("second line slice should paint");
@@ -2058,28 +2853,28 @@ async fn split_flex_item_continuation_replays_later_child_content() {
     );
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(0, 128, 0))
                 && (rect.height() - 60.0).abs() < 0.5),
         "first page should paint the first child content: {:?}",
-        document.pages[0].rects
+        document.pages[0].rects()
     );
     assert!(
         document.pages[1]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(0, 0, 255))
                 && (rect.height() - 40.0).abs() < 0.5),
         "second page should paint the later child content: {:?}",
-        document.pages[1].rects
+        document.pages[1].rects()
     );
     assert!(
         !document.pages[1]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(0, 128, 0))),
         "second page must not replay the start of the flex item: {:?}",
-        document.pages[1].rects
+        document.pages[1].rects()
     );
 }

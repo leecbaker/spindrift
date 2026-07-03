@@ -8,6 +8,155 @@ fn fragments_share_visual_line(lines: &[quire::RenderedLine]) -> bool {
 }
 
 #[tokio::test]
+async fn segment_break_between_inline_blocks_forces_wrap_in_block_container() {
+    let document = Html::from_string(
+        r#"<!doctype html>
+        <style>
+        @page { size: 600px 140px; margin: 0 }
+        body { margin: 0; font-size: 16px; line-height: 20px }
+        .outer {
+          display: block;
+          width: 500px;
+          background: purple;
+          border: 1px solid green;
+        }
+        .half {
+          display: inline-block;
+          width: 50%;
+          background: blue;
+        }
+        .half + .half {
+          background: yellow;
+        }
+        </style>
+        <div class="outer">
+          <div class="half">A</div>
+          <!-- White space here should take up space -->
+          <div class="half">B</div>
+        </div>"#,
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let a = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "A")
+        .unwrap();
+    let b = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "B")
+        .unwrap();
+
+    assert!(
+        b.y() < a.y() - 1.0,
+        "collapsed segment-break whitespace should force B onto the next line: a={a:?}, b={b:?}"
+    );
+    assert!(
+        (a.x() - b.x()).abs() < 1.0,
+        "wrapped inline-block should restart near the same inline position: a={a:?}, b={b:?}"
+    );
+}
+
+#[tokio::test]
+async fn inline_block_with_only_preserved_newline_uses_forced_line_baseline() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 240px 240px; margin: 0 }\
+         body { margin: 0 }\
+         .wrapper { width: 200px; font-size: 0; line-height: 0; background: red }\
+         .inline-block { display: inline-block; width: 100px; height: 200px; background: green }\
+         </style>\
+         <div class=\"wrapper\">\
+           <div class=\"inline-block\">text</div>\
+           <div class=\"inline-block\" style=\"white-space: pre\">&#10;</div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green = Color::new(0, 128, 0);
+    let red = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .max_by(|left, right| {
+            (left.width() * left.height()).total_cmp(&(right.width() * right.height()))
+        })
+        .expect("wrapper background should paint");
+    for (x, y) in [
+        (red.x() + red.width() * 0.25, red.y() + red.height() * 0.25),
+        (red.x() + red.width() * 0.75, red.y() + red.height() * 0.25),
+        (red.x() + red.width() * 0.25, red.y() + red.height() * 0.75),
+        (red.x() + red.width() * 0.75, red.y() + red.height() * 0.75),
+    ] {
+        assert_eq!(
+            final_rect_fill_at(page, x, y),
+            Some(green),
+            "sample at ({x}, {y}) should be green; rects={:?}",
+            page.rects()
+        );
+    }
+
+    let mut green_blocks = page
+        .rects()
+        .iter()
+        .filter(|rect| {
+            rect.fill == Some(green)
+                && (rect.width() - red.width() / 2.0).abs() < 0.01
+                && (rect.height() - red.height()).abs() < 0.01
+        })
+        .collect::<Vec<_>>();
+    green_blocks.sort_by(|left, right| left.x().total_cmp(&right.x()));
+    assert_eq!(green_blocks.len(), 2, "rects={:?}", page.rects());
+    assert!(
+        (green_blocks[0].y() - green_blocks[1].y()).abs() < 0.01,
+        "inline-block top edges should align: {green_blocks:?}"
+    );
+}
+
+#[tokio::test]
+async fn orthogonal_flow_uses_min_height_floored_available_inline_size() {
+    let document = Html::from_string(
+        "<style>\
+         body > div { font-family: monospace; font-size: 20px; max-height: 4ch;\
+         min-height: 8ch; color: transparent; position: relative }\
+         div > div { writing-mode: vertical-rl }\
+         span { background: green; display: inline-block }\
+         #red { position: absolute; background: red; left: 0; writing-mode: vertical-rl;\
+         z-index: -1 }</style>\
+         <p>Test passes if there is a <strong>green rectangle</strong> below and \
+         <strong>no red</strong>.</p>\
+         <div><aside id=\"red\">0</aside><div>0 0 0 0 <span>0</span> 0 0 0</div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("absolute red reference should paint behind the span");
+    let green = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .expect("green inline-block reference should paint");
+    assert!(
+        green.x() + green.width() <= red.x() + 1.0
+            && (red.y() - green.y() - green.height()).abs() < 0.1,
+        "orthogonal child should use the min-height-floored inline size and wrap the green span at the preserved soft opportunity before the red reference column: green={green:?}, red={red:?}"
+    );
+}
+
+#[tokio::test]
 async fn mixed_generic_bold_fragments_share_text_baseline() {
     let document = Html::from_string(
         "<style>@page { size: 320pt 120pt; margin: 20pt } body { margin: 0 } p { margin: 0; font: 40px sans-serif }</style><p>normal <strong>bold</strong> normal</p>",
@@ -18,7 +167,7 @@ async fn mixed_generic_bold_fragments_share_text_baseline() {
 
     let mut baselines = Vec::new();
     let mut saw_bold = false;
-    for line in &document.pages[0].lines {
+    for line in document.pages[0].lines() {
         if line.color != Color::BLACK
             || !(line.text.contains("normal") || line.text.contains("bold"))
         {
@@ -52,7 +201,7 @@ async fn text_shadow_paints_offset_text_without_affecting_layout_text() {
     .await
     .unwrap();
 
-    let lines = &document.pages[0].lines;
+    let lines = document.pages[0].lines();
     let shadow_lines = lines
         .iter()
         .filter(|line| line.text == "Shadow")
@@ -86,7 +235,7 @@ async fn blurred_text_shadow_paints_translucent_replay_without_layout_text() {
     .unwrap();
 
     let blur_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text == "Blur")
         .collect::<Vec<_>>();
@@ -115,7 +264,7 @@ async fn inherited_text_shadow_currentcolor_resolves_on_painting_element() {
     .unwrap();
 
     let text_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text == "Green shadow")
         .collect::<Vec<_>>();
@@ -142,7 +291,7 @@ async fn text_emphasis_marks_are_painted_without_changing_base_text() {
     .unwrap();
 
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -165,7 +314,7 @@ async fn vertical_text_emphasis_marks_follow_prepared_run_offsets() {
     .unwrap();
 
     let marks = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text == "\u{FE45}")
         .collect::<Vec<_>>();
@@ -189,11 +338,11 @@ async fn page_margin_text_emphasis_uses_prepared_annotations() {
 
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "\u{FE45}"),
         "{:?}",
-        document.pages[0].lines
+        document.pages[0].lines()
     );
 }
 
@@ -211,7 +360,7 @@ async fn min_content_inline_sizing_counts_edges_and_atoms() {
     .unwrap();
 
     let paragraph = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .unwrap();
@@ -230,7 +379,7 @@ async fn renders_dictionary_run_in_terms() {
     .await
     .unwrap();
 
-    let lines = &document.pages[0].lines;
+    let lines = document.pages[0].lines();
     assert_eq!(lines[0].text, "alpha: ");
     assert_eq!(lines[1].text, "first entry");
     assert!(fragments_share_visual_line(&lines[..2]));
@@ -246,8 +395,8 @@ async fn run_in_before_flow_root_does_not_merge() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "Term");
-    assert_eq!(document.pages[0].lines[1].text, "Block");
+    assert_eq!(document.pages[0].lines()[0].text, "Term");
+    assert_eq!(document.pages[0].lines()[1].text, "Block");
 }
 
 #[tokio::test]
@@ -259,7 +408,7 @@ async fn run_in_with_block_descendant_stays_inline_with_target() {
     .await
     .unwrap();
 
-    let lines = &document.pages[0].lines;
+    let lines = document.pages[0].lines();
     let texts = lines
         .iter()
         .map(|line| line.text.as_str())
@@ -280,7 +429,7 @@ async fn run_in_list_item_keeps_marker_and_merges_text() {
     .await
     .unwrap();
 
-    let lines = &document.pages[0].lines;
+    let lines = document.pages[0].lines();
     let texts = lines
         .iter()
         .map(|line| line.text.as_str())
@@ -298,11 +447,11 @@ async fn renders_basic_unordered_lists() {
         .await
         .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "\u{2022}");
-    assert_eq!(document.pages[0].lines[1].text, "One");
-    assert_eq!(document.pages[0].lines[2].text, "\u{2022}");
-    assert_eq!(document.pages[0].lines[3].text, "Two");
-    assert!(document.pages[0].lines[0].x() < document.pages[0].lines[1].x());
+    assert_eq!(document.pages[0].lines()[0].text, "\u{2022}");
+    assert_eq!(document.pages[0].lines()[1].text, "One");
+    assert_eq!(document.pages[0].lines()[2].text, "\u{2022}");
+    assert_eq!(document.pages[0].lines()[3].text, "Two");
+    assert!(document.pages[0].lines()[0].x() < document.pages[0].lines()[1].x());
 }
 
 #[tokio::test]
@@ -312,10 +461,10 @@ async fn renders_basic_ordered_lists() {
         .await
         .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "1.");
-    assert_eq!(document.pages[0].lines[1].text, "One");
-    assert_eq!(document.pages[0].lines[2].text, "2.");
-    assert_eq!(document.pages[0].lines[3].text, "Two");
+    assert_eq!(document.pages[0].lines()[0].text, "1.");
+    assert_eq!(document.pages[0].lines()[1].text, "One");
+    assert_eq!(document.pages[0].lines()[2].text, "2.");
+    assert_eq!(document.pages[0].lines()[3].text, "Two");
 }
 
 #[tokio::test]
@@ -326,11 +475,11 @@ async fn supports_basic_list_style_types() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "a.");
-    assert_eq!(document.pages[0].lines[1].text, "One");
-    assert_eq!(document.pages[0].lines[2].text, "b.");
-    assert_eq!(document.pages[0].lines[3].text, "Two");
-    assert_eq!(document.pages[0].lines[4].text, "Plain");
+    assert_eq!(document.pages[0].lines()[0].text, "a.");
+    assert_eq!(document.pages[0].lines()[1].text, "One");
+    assert_eq!(document.pages[0].lines()[2].text, "b.");
+    assert_eq!(document.pages[0].lines()[3].text, "Two");
+    assert_eq!(document.pages[0].lines()[4].text, "Plain");
 }
 
 #[tokio::test]
@@ -342,7 +491,7 @@ async fn supports_common_builtin_list_marker_styles() {
     .unwrap();
 
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -373,7 +522,7 @@ async fn supports_predefined_counter_style_markers() {
     let texts = document
         .pages
         .iter()
-        .flat_map(|page| page.lines.iter())
+        .flat_map(|page| page.lines().iter())
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
     let contains = |needle: &[&str]| texts.windows(needle.len()).any(|pair| pair == needle);
@@ -414,7 +563,7 @@ async fn supports_complex_predefined_counter_style_markers() {
     let texts = document
         .pages
         .iter()
-        .flat_map(|page| page.lines.iter())
+        .flat_map(|page| page.lines().iter())
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
     for marker in [
@@ -464,7 +613,7 @@ async fn supports_custom_counter_style_markers() {
     let texts = document
         .pages
         .iter()
-        .flat_map(|page| page.lines.iter())
+        .flat_map(|page| page.lines().iter())
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
     let contains = |needle: &[&str]| texts.windows(needle.len()).any(|pair| pair == needle);
@@ -491,7 +640,7 @@ async fn supports_symbols_function_counter_styles() {
     let texts = document
         .pages
         .iter()
-        .flat_map(|page| page.lines.iter())
+        .flat_map(|page| page.lines().iter())
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
     let contains = |needle: &[&str]| texts.windows(needle.len()).any(|pair| pair == needle);
@@ -512,7 +661,7 @@ async fn supports_named_counter_and_counters_marker_content() {
     let texts = document
         .pages
         .iter()
-        .flat_map(|page| page.lines.iter())
+        .flat_map(|page| page.lines().iter())
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
     let contains = |needle: &[&str]| texts.windows(needle.len()).any(|pair| pair == needle);
@@ -530,7 +679,7 @@ async fn generated_counter_content_renders_outside_marker() {
     .unwrap();
 
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -549,7 +698,7 @@ async fn generated_counter_names_preserve_custom_ident_case() {
     .unwrap();
 
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -566,7 +715,7 @@ async fn generated_pseudo_counter_increment_applies_before_content() {
     .unwrap();
 
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -583,7 +732,7 @@ async fn empty_generated_pseudo_content_still_applies_counter_effects() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -601,7 +750,7 @@ async fn non_generated_pseudo_content_does_not_apply_counter_effects() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -619,7 +768,7 @@ async fn generated_pseudo_counters_instantiate_across_following_list_items() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -641,7 +790,7 @@ async fn counter_reset_without_ancestor_scope_is_visible_to_following_siblings()
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -663,7 +812,7 @@ async fn counter_reset_that_shadows_ancestor_does_not_replace_ancestor_counter()
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -681,7 +830,7 @@ async fn generated_counter_content_uses_exotic_counter_styles() {
     .unwrap();
 
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -710,7 +859,7 @@ async fn inline_generated_counters_use_inline_element_counter_scope() {
     let texts = document
         .pages
         .iter()
-        .flat_map(|page| page.lines.iter())
+        .flat_map(|page| page.lines().iter())
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
     let expected = "01 02 03 04 05 06 07 08 09 10 11 12 99 13 14";
@@ -730,7 +879,7 @@ async fn generated_attr_content_renders_and_transforms() {
     .unwrap();
 
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -746,15 +895,49 @@ async fn generated_image_content_renders_inline_atom() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].images.len(), 1);
-    let image = &document.pages[0].images[0];
+    assert_eq!(document.pages[0].images().len(), 1);
+    let image = &document.pages[0].images()[0];
     assert!((image.width() - 8.0).abs() < 0.01);
     assert!((image.height() - 6.0).abs() < 0.01);
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == " Icon")
+    );
+}
+
+#[tokio::test]
+async fn generated_gradient_content_renders_inline_atom() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 180pt 80pt; margin: 10pt }\
+         body, p { margin: 0; font-size: 10pt; line-height: 12pt }\
+         p::before { content: linear-gradient(red, blue) \" \"; width: 8pt; height: 6pt }\
+         p::after { content: radial-gradient(circle, red, blue); width: 6pt; height: 6pt }\
+         </style><p>Grad</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let images = document.pages[0].images();
+    assert_eq!(images.len(), 2);
+    assert!(
+        images
+            .iter()
+            .any(|image| (image.width() - 8.0).abs() < 0.01 && (image.height() - 6.0).abs() < 0.01)
+    );
+    assert!(
+        images
+            .iter()
+            .any(|image| (image.width() - 6.0).abs() < 0.01 && (image.height() - 6.0).abs() < 0.01)
+    );
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .any(|line| line.text == " Grad")
     );
 }
 
@@ -766,9 +949,9 @@ async fn invalid_generated_image_is_skipped_without_suppressing_text() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].images.len(), 0);
+    assert_eq!(document.pages[0].images().len(), 0);
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -784,14 +967,14 @@ async fn element_content_replacement_suppresses_children_and_pseudos() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].images.len(), 1);
+    assert_eq!(document.pages[0].images().len(), 1);
     assert_eq!(
-        document.pages[0].images[0].alt_text.as_deref(),
+        document.pages[0].images()[0].alt_text.as_deref(),
         Some("Replacement")
     );
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .all(|line| { !matches!(line.text.as_str(), "Hidden" | "Before" | "After") })
     );
@@ -807,7 +990,7 @@ async fn element_content_none_preserves_children() {
 
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "Visible")
     );
@@ -822,7 +1005,7 @@ async fn element_content_contents_splices_children_once() {
     .unwrap();
 
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -838,7 +1021,7 @@ async fn q_elements_render_generated_quotes() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -858,7 +1041,7 @@ async fn no_quote_keywords_adjust_depth_without_text() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -877,7 +1060,7 @@ async fn auto_quotes_follow_document_language() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -894,7 +1077,7 @@ async fn auto_quotes_follow_nested_language_override() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -910,20 +1093,31 @@ async fn auto_quotes_use_q_parent_language_not_q_language() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
+    let first_y = document.pages[0].lines()[0].y();
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
-        .filter(|line| (line.y() - document.pages[0].lines[0].y()).abs() < 0.1)
+        .filter(|line| line.y() > first_y - 0.1)
         .map(|line| line.text.as_str())
         .collect::<String>();
     let reference = document.pages[0]
-        .lines
+        .lines()
         .iter()
-        .find(|line| (line.y() - document.pages[0].lines[0].y()).abs() >= 0.1)
+        .filter(|line| line.y() < first_y - 0.1)
         .map(|line| line.text.as_str())
-        .expect("expected literal reference line");
-    assert_eq!(texts, "One “two ‘three 『four』’”");
-    assert_eq!(reference, "One “two ‘three 『four』’”");
+        .collect::<String>();
+    assert_eq!(
+        texts,
+        "One “two ‘three 『four』’”",
+        "lines={:?}",
+        document.pages[0].lines()
+    );
+    assert_eq!(
+        reference,
+        "One “two ‘three 『four』’”",
+        "lines={:?}",
+        document.pages[0].lines()
+    );
 }
 
 #[tokio::test]
@@ -935,7 +1129,7 @@ async fn auto_quotes_cover_greek_and_farsi_nesting() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -952,7 +1146,7 @@ async fn authored_quotes_and_quotes_none_override_language_auto() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
     let explicit_text = explicit.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -967,7 +1161,7 @@ async fn authored_quotes_and_quotes_none_override_language_auto() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
     let none_text = none.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -984,7 +1178,7 @@ async fn leader_content_expands_between_inline_items() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -1007,7 +1201,7 @@ async fn page_margin_leader_content_uses_sequence_owned_resolution() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -1032,11 +1226,11 @@ async fn page_margin_forced_breaks_use_plaintext_alignment_without_controls() {
     .unwrap();
 
     let margin_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text.contains('א') || line.text.contains('ב') || line.text == "abc")
         .collect::<Vec<_>>();
-    assert_eq!(margin_lines.len(), 2, "{:?}", document.pages[0].lines);
+    assert_eq!(margin_lines.len(), 2, "{:?}", document.pages[0].lines());
     assert!(
         margin_lines
             .iter()
@@ -1071,7 +1265,7 @@ async fn inline_block_leader_content_matches_normal_inline_resolution() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -1095,13 +1289,13 @@ async fn rtl_and_vertical_leaders_use_prepared_text_placement() {
     .unwrap();
 
     let rtl_text = rtl.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
         .join("");
     let vertical_text = vertical.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
@@ -1111,14 +1305,14 @@ async fn rtl_and_vertical_leaders_use_prepared_text_placement() {
     assert!(vertical_text.contains("..."), "{vertical_text}");
     assert!(
         vertical.pages[0]
-            .lines
+            .lines()
             .iter()
             .flat_map(|line| line.runs.iter())
             .any(|run| {
                 run.text.contains('.') && run.text_matrix == quire::RenderedTextMatrix::ROTATE_CW
             }),
         "{:?}",
-        vertical.pages[0].lines
+        vertical.pages[0].lines()
     );
 }
 
@@ -1131,9 +1325,9 @@ async fn generated_image_alt_text_is_captured() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].images.len(), 1);
+    assert_eq!(document.pages[0].images().len(), 1);
     assert_eq!(
-        document.pages[0].images[0].alt_text.as_deref(),
+        document.pages[0].images()[0].alt_text.as_deref(),
         Some("Generated")
     );
 }
@@ -1146,10 +1340,10 @@ async fn supports_string_list_style_type() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "Note: ");
-    assert_eq!(document.pages[0].lines[1].text.trim_start(), "Alpha");
-    assert!((document.pages[0].lines[0].y() - document.pages[0].lines[1].y()).abs() < 0.01);
-    assert!(document.pages[0].lines[0].x() < document.pages[0].lines[1].x());
+    assert_eq!(document.pages[0].lines()[0].text, "Note: ");
+    assert_eq!(document.pages[0].lines()[1].text.trim_start(), "Alpha");
+    assert!((document.pages[0].lines()[0].y() - document.pages[0].lines()[1].y()).abs() < 0.01);
+    assert!(document.pages[0].lines()[0].x() < document.pages[0].lines()[1].x());
 }
 
 #[tokio::test]
@@ -1160,7 +1354,7 @@ async fn supports_string_list_style_type_in_shorthand() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let lines = &document.pages[0].lines;
+    let lines = document.pages[0].lines();
     let first_visual_line = lines
         .iter()
         .take_while(|line| (line.y() - lines[0].y()).abs() < 0.01)
@@ -1182,7 +1376,7 @@ async fn outside_list_markers_do_not_indent_wrapped_content_lines() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let lines = &document.pages[0].lines;
+    let lines = document.pages[0].lines();
     assert!(lines.len() > 1);
     assert_eq!(lines[0].text, "\u{2022}");
     assert!(lines[1].text.starts_with("Alpha"));
@@ -1199,7 +1393,7 @@ async fn inside_list_markers_participate_in_first_line() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let lines = &document.pages[0].lines;
+    let lines = document.pages[0].lines();
     assert!(lines.len() > 1);
     assert_eq!(lines[0].text, "1.");
     assert!(lines[1].text.trim_start().starts_with("Alpha"));
@@ -1240,7 +1434,7 @@ async fn inside_image_marker_keeps_following_space_extractable() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].images.len(), 1);
+    assert_eq!(document.pages[0].images().len(), 1);
     let lines = grouped_line_texts(&document.pages[0]);
     assert_eq!(lines, vec![" Item"]);
 }
@@ -1254,12 +1448,12 @@ async fn rtl_outside_list_markers_paint_on_inline_start_right_side() {
     .unwrap();
 
     let marker = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "\u{2022}")
         .expect("expected marker");
     let content = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Alpha")
         .expect("expected content");
@@ -1275,12 +1469,12 @@ async fn html_dir_rtl_outside_list_markers_match_css_direction_rtl() {
     .unwrap();
 
     let marker = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "\u{2022}")
         .expect("expected marker");
     let content = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Alpha")
         .expect("expected content");
@@ -1297,11 +1491,11 @@ async fn rtl_outside_image_markers_paint_on_inline_start_right_side() {
     .unwrap();
 
     let image = document.pages[0]
-        .images
+        .images()
         .first()
         .expect("expected marker image");
     let content = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Alpha")
         .expect("expected content");
@@ -1317,13 +1511,13 @@ async fn rtl_outside_list_marker_only_paints_on_first_wrapped_line() {
     .unwrap();
 
     let markers = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text == "\u{2022}")
         .collect::<Vec<_>>();
     assert_eq!(markers.len(), 1);
     let content_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text != "\u{2022}")
         .collect::<Vec<_>>();
@@ -1346,14 +1540,13 @@ async fn outside_list_marker_only_paints_on_first_fragmented_sequence_line() {
     let markers = document
         .pages
         .iter()
-        .flat_map(|page| page.lines.iter())
-        .filter(|line| line.text == "\u{2022}")
-        .collect::<Vec<_>>();
-    assert_eq!(markers.len(), 1);
+        .flat_map(|page| page.lines().iter())
+        .filter(|line| line.text == "\u{2022}");
+    assert_eq!(markers.count(), 1);
     let pages_with_content = document
         .pages
         .iter()
-        .filter(|page| page.lines.iter().any(|line| line.text != "\u{2022}"))
+        .filter(|page| page.lines().iter().any(|line| line.text != "\u{2022}"))
         .count();
     assert!(pages_with_content > 1);
 }
@@ -1381,22 +1574,22 @@ async fn marker_side_controls_mixed_direction_outside_marker_side() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
     let left_marker = match_self.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "1.")
         .expect("expected first marker");
     let left_content = match_self.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Left")
         .expect("expected first content");
     let right_marker = match_self.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "2.")
         .expect("expected second marker");
     let right_content = match_self.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Right")
         .expect("expected second content");
@@ -1409,12 +1602,12 @@ async fn marker_side_controls_mixed_direction_outside_marker_side() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
     let second_marker = match_parent.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "2.")
         .expect("expected second marker");
     let second_content = match_parent.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Right")
         .expect("expected second content");
@@ -1432,7 +1625,7 @@ async fn capitalize_tailors_dutch_ij_digraphs() {
 
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "IJsland IJssel")
     );
@@ -1448,7 +1641,7 @@ async fn text_justify_inter_character_distributes_between_letters() {
     .unwrap();
 
     let x_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text == "X")
         .collect::<Vec<_>>();
@@ -1466,7 +1659,7 @@ async fn text_justify_inter_character_preserves_arabic_joining_sequences() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text == "سلام" || line.text.chars().rev().collect::<String>() == "سلام")
         .collect::<Vec<_>>();
@@ -1482,10 +1675,10 @@ async fn supports_display_list_item_on_arbitrary_elements() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "1.");
-    assert_eq!(document.pages[0].lines[1].text, "One");
-    assert_eq!(document.pages[0].lines[2].text, "2.");
-    assert_eq!(document.pages[0].lines[3].text, "Two");
+    assert_eq!(document.pages[0].lines()[0].text, "1.");
+    assert_eq!(document.pages[0].lines()[1].text, "One");
+    assert_eq!(document.pages[0].lines()[2].text, "2.");
+    assert_eq!(document.pages[0].lines()[3].text, "Two");
 }
 
 #[tokio::test]
@@ -1496,7 +1689,7 @@ async fn supports_inline_display_list_item_markers() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let lines = &document.pages[0].lines;
+    let lines = document.pages[0].lines();
     assert_eq!(lines[0].text, "1.");
     assert_eq!(lines[1].text.trim_start(), "Inline one");
     assert!((lines[0].y() - lines[1].y()).abs() < 0.01);
@@ -1516,7 +1709,7 @@ async fn supports_html_ordered_list_start_reversed_and_value() {
     .unwrap();
 
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -1537,7 +1730,7 @@ async fn nested_list_item_counters_use_unified_counter_stack() {
     .unwrap();
 
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -1564,7 +1757,7 @@ async fn supports_list_item_counter_increment_reset_and_set() {
     .unwrap();
 
     let texts = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -1585,8 +1778,8 @@ async fn marker_pseudo_element_styles_marker_without_affecting_content() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let marker = &document.pages[0].lines[0];
-    let content = &document.pages[0].lines[1];
+    let marker = &document.pages[0].lines()[0];
+    let content = &document.pages[0].lines()[1];
     assert_eq!(marker.text, "\u{2022}");
     assert_eq!(content.text, "Item");
     assert!((marker.font_size - 14.0).abs() < 0.01);
@@ -1602,7 +1795,7 @@ async fn marker_pseudo_element_content_overrides_automatic_marker() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let lines = &document.pages[0].lines;
+    let lines = document.pages[0].lines();
     assert_eq!(lines[0].text, "a) ");
     assert_eq!(lines[1].text, "One");
     assert!((lines[0].y() - lines[1].y()).abs() < 0.01);
@@ -1622,11 +1815,16 @@ async fn supports_outside_list_style_image_markers() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].images.len(), 1);
-    assert!(document.pages[0].lines.iter().all(|line| line.text != "1."));
-    let image = &document.pages[0].images[0];
+    assert_eq!(document.pages[0].images().len(), 1);
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .all(|line| line.text != "1.")
+    );
+    let image = &document.pages[0].images()[0];
     let item = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text.trim_start() == "Item")
         .unwrap();
@@ -1642,10 +1840,10 @@ async fn supports_inside_list_style_image_markers() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].images.len(), 1);
-    let image = &document.pages[0].images[0];
+    assert_eq!(document.pages[0].images().len(), 1);
+    let image = &document.pages[0].images()[0];
     let item = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text.trim_start() == "Item")
         .unwrap();
@@ -1662,9 +1860,9 @@ async fn marker_content_overrides_list_style_image() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].images.len(), 0);
-    assert_eq!(document.pages[0].lines[0].text, "x ");
-    assert_eq!(document.pages[0].lines[1].text, "Item");
+    assert_eq!(document.pages[0].images().len(), 0);
+    assert_eq!(document.pages[0].lines()[0].text, "x ");
+    assert_eq!(document.pages[0].lines()[1].text, "Item");
 }
 
 #[tokio::test]
@@ -1676,8 +1874,8 @@ async fn supports_text_alignment() {
     .render_async(&options).await
     .unwrap();
 
-    let aligned_offset = document.pages[0].lines[0].x() - options.page_margins().left;
-    let expected_offset = 100.0 - rendered_line_advance(&document.pages[0].lines[0]);
+    let aligned_offset = document.pages[0].lines()[0].x() - options.page_margins().left();
+    let expected_offset = 100.0 - rendered_line_advance(&document.pages[0].lines()[0]);
     assert!(
         (aligned_offset - expected_offset).abs() < 0.01,
         "expected right-aligned offset {expected_offset}, got {aligned_offset}"
@@ -1693,8 +1891,8 @@ async fn supports_text_align_start_from_rtl_dir_attribute() {
     .render_async(&options).await
     .unwrap();
 
-    let aligned_offset = document.pages[0].lines[0].x() - options.page_margins().left;
-    let expected_offset = 100.0 - rendered_line_advance(&document.pages[0].lines[0]);
+    let aligned_offset = document.pages[0].lines()[0].x() - options.page_margins().left();
+    let expected_offset = 100.0 - rendered_line_advance(&document.pages[0].lines()[0]);
     assert!(
         (aligned_offset - expected_offset).abs() < 0.01,
         "expected rtl start-aligned offset {expected_offset}, got {aligned_offset}"
@@ -1710,7 +1908,7 @@ async fn preserved_tabs_use_computed_tab_size() {
     .await
     .unwrap();
 
-    let lines = &document.pages[0].lines;
+    let lines = document.pages[0].lines();
     assert_eq!(lines[0].text, "A\tB");
     assert_eq!(lines[1].text, "A\tB");
     assert_eq!(lines[2].text, "A\tB");
@@ -1738,12 +1936,12 @@ async fn inline_block_auto_width_uses_graph_tab_size_max_content() {
     .unwrap();
 
     let two = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(10, 20, 30)))
         .expect("expected tab-size:2 inline-block background");
     let four = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(30, 20, 10)))
         .expect("expected tab-size:4 inline-block background");
@@ -1769,12 +1967,12 @@ async fn hanging_punctuation_last_excludes_rtl_closing_punctuation_from_alignmen
     .unwrap();
 
     let hang = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == ")MMMM")
         .unwrap();
     let reference = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "MMMM")
         .unwrap();
@@ -1805,7 +2003,7 @@ async fn hanging_punctuation_first_places_opening_quote_outside_line_measure() {
     .unwrap();
 
     assert!(
-        hanging.pages[0].lines[0].x() < normal.pages[0].lines[0].x() - 1.0,
+        hanging.pages[0].lines()[0].x() < normal.pages[0].lines()[0].x() - 1.0,
         "expected first hanging quote to move into the line-start margin"
     );
 }
@@ -1842,18 +2040,18 @@ async fn hanging_punctuation_first_places_rtl_opening_punctuation_outside_line_m
     .unwrap();
 
     assert!(
-        hanging.pages[0].lines[0].x() > normal.pages[0].lines[0].x() + 1.0,
+        hanging.pages[0].lines()[0].x() > normal.pages[0].lines()[0].x() + 1.0,
         "expected RTL first hanging punctuation to move into the line-start margin: normal={}, hanging={}",
-        normal.pages[0].lines[0].x(),
-        hanging.pages[0].lines[0].x(),
+        normal.pages[0].lines()[0].x(),
+        hanging.pages[0].lines()[0].x(),
     );
     assert!(
-        (blocked.pages[0].lines[0].x() - blocked_reference.pages[0].lines[0].x()).abs() < 1.0,
+        (blocked.pages[0].lines()[0].x() - blocked_reference.pages[0].lines()[0].x()).abs() < 1.0,
         "expected nonzero RTL inline-start border to block first hanging punctuation: reference={}, blocked={}, blocked text={:?}",
-        blocked_reference.pages[0].lines[0].x(),
-        blocked.pages[0].lines[0].x(),
+        blocked_reference.pages[0].lines()[0].x(),
+        blocked.pages[0].lines()[0].x(),
         blocked.pages[0]
-            .lines
+            .lines()
             .iter()
             .map(|line| (line.text.as_str(), line.x()))
             .collect::<Vec<_>>()
@@ -1885,16 +2083,16 @@ async fn text_indent_offsets_rtl_inline_start_edge() {
     .unwrap();
 
     assert!(
-        negative_indent.pages[0].lines[0].x() > normal.pages[0].lines[0].x() + 1.0,
+        negative_indent.pages[0].lines()[0].x() > normal.pages[0].lines()[0].x() + 1.0,
         "expected negative RTL text-indent to move the inline-start edge outward: normal={}, indented={}",
-        normal.pages[0].lines[0].x(),
-        negative_indent.pages[0].lines[0].x(),
+        normal.pages[0].lines()[0].x(),
+        negative_indent.pages[0].lines()[0].x(),
     );
     assert!(
-        positive_indent.pages[0].lines[0].x() < normal.pages[0].lines[0].x() - 1.0,
+        positive_indent.pages[0].lines()[0].x() < normal.pages[0].lines()[0].x() - 1.0,
         "expected positive RTL text-indent to move the inline-start edge inward: normal={}, indented={}",
-        normal.pages[0].lines[0].x(),
-        positive_indent.pages[0].lines[0].x(),
+        normal.pages[0].lines()[0].x(),
+        positive_indent.pages[0].lines()[0].x(),
     );
 }
 
@@ -1912,12 +2110,12 @@ async fn text_indent_on_blank_rtl_left_aligned_line_does_not_indent_following_li
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("expected container background");
     let hotpink = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(255, 105, 180)))
         .expect("expected inline-block background");
@@ -1950,10 +2148,10 @@ async fn fixed_width_rtl_block_ignores_overconstrained_left_margin() {
     .unwrap();
 
     assert!(
-        (both_margins.pages[0].lines[0].x() - right_margin.pages[0].lines[0].x()).abs() < 1.0,
+        (both_margins.pages[0].lines()[0].x() - right_margin.pages[0].lines()[0].x()).abs() < 1.0,
         "expected fixed-width RTL block to ignore over-constrained left margin: both={}, right={}",
-        both_margins.pages[0].lines[0].x(),
-        right_margin.pages[0].lines[0].x(),
+        both_margins.pages[0].lines()[0].x(),
+        right_margin.pages[0].lines()[0].x(),
     );
 }
 
@@ -1975,10 +2173,10 @@ async fn hanging_punctuation_force_end_excludes_terminal_stop_from_alignment() {
     .unwrap();
 
     assert!(
-        hanging.pages[0].lines[0].x() > normal.pages[0].lines[0].x() + 1.0,
+        hanging.pages[0].lines()[0].x() > normal.pages[0].lines()[0].x() + 1.0,
         "expected force-end punctuation to hang past the right line edge: normal={}, hanging={}",
-        normal.pages[0].lines[0].x(),
-        hanging.pages[0].lines[0].x(),
+        normal.pages[0].lines()[0].x(),
+        hanging.pages[0].lines()[0].x(),
     );
 }
 
@@ -1996,29 +2194,44 @@ async fn hanging_punctuation_last_is_blocked_by_inline_end_border() {
     .await
     .unwrap();
 
-    let lines = document.pages[0]
-        .lines
+    let first_y = document.pages[0].lines()[0].y();
+    let blocked_parts = document.pages[0]
+        .lines()
         .iter()
-        .filter(|line| line.text == ")MMMM")
+        .filter(|line| (line.y() - first_y).abs() < 0.1)
         .collect::<Vec<_>>();
-    assert_eq!(lines.len(), 2);
+    let blocked_text = blocked_parts
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<String>();
+    let reference = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| (line.y() - first_y).abs() >= 0.1 && line.text == ")MMMM")
+        .expect("expected unblocked reference line");
+    assert_eq!(
+        blocked_text,
+        ")MMMM",
+        "lines={:?}",
+        document.pages[0].lines()
+    );
     let border = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .expect("expected inline-end border");
     assert!(
-        (border.x() - lines[1].x()).abs() < 0.5,
-        "expected inline-end border to occupy the ordinary rtl edge, got border {} vs reference {}",
-        border.x(),
-        lines[1].x()
-    );
-    assert!(
-        lines[0].x() >= border.x() + border.width() - 0.5,
+        blocked_parts[0].x() >= border.x() + border.width() - 0.5,
         "expected blocked punctuation text to start after its inline-end border, got text {} border {}..{}",
-        lines[0].x(),
+        blocked_parts[0].x(),
         border.x(),
         border.x() + border.width()
+    );
+    assert!(
+        reference.x() + 1.0 < blocked_parts[0].x(),
+        "unblocked RTL reference punctuation should still hang past the blocked punctuation toward inline-end: blocked={}, reference={}",
+        blocked_parts[0].x(),
+        reference.x()
     );
 }
 
@@ -2044,8 +2257,8 @@ async fn hanging_punctuation_allow_end_ignores_empty_inline_but_respects_bordere
     .await
     .unwrap();
 
-    assert_eq!(allowed.pages[0].lines[0].text, "12 34,");
-    assert_eq!(blocked.pages[0].lines[0].text, "12");
+    assert_eq!(allowed.pages[0].lines()[0].text, "12 34,");
+    assert_eq!(blocked.pages[0].lines()[0].text, "12");
 }
 
 #[tokio::test]
@@ -2070,7 +2283,7 @@ async fn wpt_hanging_punctuation_allow_end_inline_boundaries() {
     .await
     .unwrap();
 
-    let mut rendered_lines = document.pages[0].lines.clone();
+    let mut rendered_lines = document.pages[0].lines().to_vec();
     rendered_lines.sort_by(|left, right| {
         right
             .y()
@@ -2129,12 +2342,12 @@ async fn wpt_hanging_punctuation_first_and_last_match_negative_margin_reference(
     .unwrap();
 
     let target_lines = target.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| (line.text.as_str(), line.x(), rendered_line_advance(line)))
         .collect::<Vec<_>>();
     let reference_lines = reference.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| (line.text.as_str(), line.x(), rendered_line_advance(line)))
         .collect::<Vec<_>>();
@@ -2178,7 +2391,7 @@ async fn wpt_hanging_punctuation_inline_background_includes_hung_stop() {
     assert_eq!(lines, vec!["まだよく", "ています。", "しかし特"]);
 
     let green_rects = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 255, 0)))
         .collect::<Vec<_>>();
@@ -2216,7 +2429,10 @@ async fn wpt_hanging_punctuation_uses_punctuation_font_size() {
     .await
     .unwrap();
 
-    for (target_line, reference_line) in target.pages[0].lines.iter().zip(&reference.pages[0].lines)
+    for (target_line, reference_line) in target.pages[0]
+        .lines()
+        .iter()
+        .zip(reference.pages[0].lines())
     {
         assert_eq!(target_line.text, reference_line.text);
         assert!(
@@ -2246,12 +2462,12 @@ async fn supports_text_align_justify() {
     .unwrap();
 
     let first = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "one two")
         .unwrap();
     let three = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "three")
         .unwrap();
@@ -2276,11 +2492,11 @@ async fn text_indent_justify_uses_stable_line_widths() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text.contains("long piece") || line.text.contains("multiple lines"))
         .collect::<Vec<_>>();
-    assert!(lines.len() > 3, "{:?}", document.pages[0].lines);
+    assert!(lines.len() > 3, "{:?}", document.pages[0].lines());
 
     let paragraph_left = 20.0;
     let paragraph_width = 600.0;
@@ -2319,7 +2535,7 @@ async fn text_justify_none_disables_inter_word_distribution() {
     .unwrap();
 
     let space_advances = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .flat_map(|line| line.runs.iter())
         .flat_map(|run| run.glyphs.as_deref().unwrap_or(&[]))
@@ -2349,7 +2565,7 @@ async fn text_justify_ignores_pre_wrap_trailing_space_ltr() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let mut groups = lines_grouped_by_y(&document.pages[0].lines);
+    let mut groups = lines_grouped_by_y(document.pages[0].lines());
     groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(groups.len(), 2, "{groups:?}");
     assert_eq!(
@@ -2384,7 +2600,7 @@ async fn text_justify_ignores_pre_wrap_trailing_space_rtl() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let mut groups = lines_grouped_by_y(&document.pages[0].lines);
+    let mut groups = lines_grouped_by_y(document.pages[0].lines());
     groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(groups.len(), 2, "{groups:?}");
     assert_eq!(
@@ -2419,7 +2635,7 @@ async fn wpt_text_justify_hangs_pre_wrap_trailing_space_inside_split_fragment() 
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let mut groups = lines_grouped_by_y(&document.pages[0].lines);
+    let mut groups = lines_grouped_by_y(document.pages[0].lines());
     groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(groups.len(), 2, "{groups:?}");
     let first_span = rendered_fragment_group_span(&groups[0]);
@@ -2462,7 +2678,7 @@ async fn wpt_text_justify_inter_word_expands_unicode_word_separators() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let mut groups = visual_line_groups(&document.pages[0].lines);
+    let mut groups = visual_line_groups(document.pages[0].lines());
     groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(groups.len(), separators.len() * 2, "{groups:?}");
     for (index, first_line) in groups.iter().step_by(2).enumerate() {
@@ -2474,12 +2690,15 @@ async fn wpt_text_justify_inter_word_expands_unicode_word_separators() {
     }
     let hidden_separators = separators.iter().skip(2).collect::<Vec<_>>();
     assert!(
-        document.pages[0].lines.iter().all(|line| hidden_separators
+        document.pages[0]
+            .lines()
             .iter()
-            .all(|separator| !line.text.contains(*separator))),
+            .all(|line| hidden_separators
+                .iter()
+                .all(|separator| !line.text.contains(*separator))),
         "transparent word separators should not emit visible text lines: {:?}",
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>()
@@ -2509,12 +2728,15 @@ async fn local_wpt_text_justify_word_separators_hide_separator_glyphs_if_availab
         "\u{1091f}",
     ];
     assert!(
-        document.pages[0].lines.iter().all(|line| hidden_separators
+        document.pages[0]
+            .lines()
             .iter()
-            .all(|separator| !line.text.contains(separator))),
+            .all(|line| hidden_separators
+                .iter()
+                .all(|separator| !line.text.contains(separator))),
         "transparent WPT word separators should not emit visible text lines: {:?}",
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>()
@@ -2529,7 +2751,7 @@ async fn supports_text_align_last_justify_over_center() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let mut line_groups = visual_line_groups(&document.pages[0].lines);
+    let mut line_groups = visual_line_groups(document.pages[0].lines());
     line_groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(line_groups.len(), 2);
     let first_line = &line_groups[0];
@@ -2558,7 +2780,7 @@ async fn supports_text_align_justify_all_on_final_line() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let line_groups = visual_line_groups(&document.pages[0].lines);
+    let line_groups = visual_line_groups(document.pages[0].lines());
     assert_eq!(line_groups.len(), 2);
 
     let first_span = rendered_fragment_group_span(&line_groups[0]);
@@ -2592,12 +2814,12 @@ async fn wpt_text_align_end_rtl_aligns_to_physical_left() {
     .unwrap();
 
     let test = target.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "TESTI")
         .unwrap();
     let reference = target.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "REFER")
         .unwrap();
@@ -2627,7 +2849,7 @@ async fn wpt_text_align_justify_rtl_uses_start_on_last_line() {
     .await
     .unwrap();
 
-    let mut groups = visual_line_groups(&document.pages[0].lines);
+    let mut groups = visual_line_groups(document.pages[0].lines());
     groups.retain(|group| group.iter().any(|line| line.text.contains("TES")));
     assert_eq!(groups.len(), 3, "{groups:?}");
     assert!(
@@ -2670,7 +2892,7 @@ async fn wpt_text_align_justify_all_ltr_justifies_final_line_in_rtl_parent() {
     .await
     .unwrap();
 
-    let mut groups = visual_line_groups(&document.pages[0].lines);
+    let mut groups = visual_line_groups(document.pages[0].lines());
     groups.retain(|group| group.iter().any(|line| line.text.contains("TES")));
     assert_eq!(groups.len(), 3, "{groups:?}");
     let first_span = rendered_fragment_group_span(&groups[0]);
@@ -2699,7 +2921,7 @@ async fn justified_inline_spans_keep_one_shaped_text_group() {
     .unwrap();
 
     let line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "XXXX XXXX")
         .expect("justified inline spans should paint as one text group");
@@ -2728,7 +2950,7 @@ async fn justified_bidi_line_expands_visual_span() {
     .unwrap();
 
     let line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text.contains("גבא"))
         .expect("expected bidi visual text line");
@@ -2756,7 +2978,7 @@ async fn justified_mixed_inline_shifts_atom_and_later_text() {
     .await
     .unwrap();
 
-    let group = visual_line_groups(&document.pages[0].lines)
+    let group = visual_line_groups(document.pages[0].lines())
         .into_iter()
         .find(|group| group.iter().any(|line| line.text.contains("XXXX")))
         .expect("expected mixed inline text group");
@@ -2783,7 +3005,7 @@ async fn justified_text_and_styled_spans_share_inline_paint_adjustment() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text == "Alpha Beta")
         .collect::<Vec<_>>();
@@ -2815,7 +3037,7 @@ async fn generated_inline_text_uses_shared_justified_paint_adjustment() {
     .unwrap();
 
     let line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Alpha Beta")
         .expect("generated inline text should paint");
@@ -2835,7 +3057,7 @@ async fn page_margin_text_uses_shared_justified_paint_adjustment() {
     .unwrap();
 
     let line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Alpha Beta")
         .expect("page-margin generated inline text should paint");
@@ -2858,8 +3080,8 @@ async fn supports_word_spacing_in_text_measurement_and_painting() {
     .await
     .unwrap();
 
-    let normal_width = rendered_line_advance(&normal.pages[0].lines[0]);
-    let spaced_width = rendered_line_advance(&spaced.pages[0].lines[0]);
+    let normal_width = rendered_line_advance(&normal.pages[0].lines()[0]);
+    let spaced_width = rendered_line_advance(&spaced.pages[0].lines()[0]);
 
     assert!(
         spaced_width - normal_width > 19.0,
@@ -2885,12 +3107,12 @@ async fn wpt_text_autospace_inserts_ideograph_alpha_spacing() {
     .unwrap();
 
     let off_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.y() > 90.0)
         .collect::<Vec<_>>();
     let on_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.y() <= 90.0)
         .collect::<Vec<_>>();
@@ -2920,7 +3142,7 @@ async fn wpt_text_autospace_does_not_treat_punctuation_as_normal_alpha_spacing()
     .await
     .unwrap();
 
-    let mut groups = lines_grouped_by_y(&document.pages[0].lines);
+    let mut groups = lines_grouped_by_y(document.pages[0].lines());
     groups.sort_by(|left, right| right[0].y().total_cmp(&left[0].y()));
     assert_eq!(groups.len(), 2);
     let off = rendered_fragment_group_span(&groups[0]);
@@ -2947,7 +3169,7 @@ async fn nonzero_letter_spacing_disables_common_ligature_shaping() {
     .await
     .unwrap();
 
-    let glyph_text = document.pages[0].lines[0]
+    let glyph_text = document.pages[0].lines()[0]
         .runs
         .iter()
         .flat_map(|run| run.glyphs.as_deref().unwrap_or_default())
@@ -2974,7 +3196,7 @@ async fn letter_spacing_crosses_text_empty_inline_boundaries() {
     .unwrap();
 
     let line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "AD")
         .expect("expected text-empty inline content to preserve A/D text");
@@ -3014,7 +3236,7 @@ fn lines_grouped_by_y(lines: &[quire::RenderedLine]) -> Vec<Vec<&quire::Rendered
 
 fn grouped_line_texts(page: &quire::Page) -> Vec<String> {
     let mut groups = Vec::<Vec<&quire::RenderedLine>>::new();
-    for line in &page.lines {
+    for line in page.lines() {
         if let Some(group) = groups
             .iter_mut()
             .find(|group| (group[0].y() - line.y()).abs() < 4.0)
@@ -3034,6 +3256,12 @@ fn grouped_line_texts(page: &quire::Page) -> Vec<String> {
                 .collect::<String>()
         })
         .collect()
+}
+
+fn rendered_rects_share_row(left: &quire::RenderedRect, right: &quire::RenderedRect) -> bool {
+    let left_center = left.y() + left.height() / 2.0;
+    let right_center = right.y() + right.height() / 2.0;
+    (left_center - right_center).abs() < 24.0
 }
 
 fn rendered_line_visual_bounds(line: &quire::RenderedLine) -> (f32, f32) {
@@ -3081,22 +3309,22 @@ async fn supports_first_line_text_indent_lengths() {
     )
     .render_async(&options).await
     .unwrap();
-    let lines = &positive.pages[0].lines;
+    let lines = &positive.pages[0].lines();
 
     assert!(lines.len() > 1);
-    assert!((lines[0].x() - (options.page_margins.left + 10.0)).abs() < 0.01);
-    assert!((lines[1].x() - options.page_margins.left).abs() < 0.01);
+    assert!((lines[0].x() - (options.page_margins.left() + 10.0)).abs() < 0.01);
+    assert!((lines[1].x() - options.page_margins.left()).abs() < 0.01);
 
     let negative = Html::from_string(
         "<style>body { margin: 0; font-size: 10pt; line-height: 10pt } p { margin: 0; width: 40pt; text-indent: -10pt }</style><p>aa aa aa aa aa aa aa aa</p>",
     )
     .render_async(&options).await
     .unwrap();
-    let lines = &negative.pages[0].lines;
+    let lines = &negative.pages[0].lines();
 
     assert!(lines.len() > 1);
-    assert!((lines[0].x() - (options.page_margins.left - 10.0)).abs() < 0.01);
-    assert!((lines[1].x() - options.page_margins.left).abs() < 0.01);
+    assert!((lines[0].x() - (options.page_margins.left() - 10.0)).abs() < 0.01);
+    assert!((lines[1].x() - options.page_margins.left()).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -3116,12 +3344,12 @@ async fn vertical_writing_text_indent_moves_logical_inline_start() {
     .unwrap();
 
     let normal_line = normal.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("normal vertical line should render");
     let indented_line = indented.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A")
         .expect("indented vertical line should render");
@@ -3142,7 +3370,7 @@ async fn vertical_writing_mixed_text_emits_writing_mode_aware_runs() {
     .unwrap();
 
     let runs = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .flat_map(|line| line.runs.iter())
         .collect::<Vec<_>>();
@@ -3165,7 +3393,7 @@ async fn vertical_mixed_text_uses_unicode_vertical_orientation() {
     .unwrap();
 
     let runs = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .flat_map(|line| line.runs.iter())
         .collect::<Vec<_>>();
@@ -3194,7 +3422,7 @@ async fn vertical_text_orientation_upright_paints_latin_upright() {
     .unwrap();
 
     let runs = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .flat_map(|line| line.runs.iter())
         .collect::<Vec<_>>();
@@ -3220,7 +3448,7 @@ async fn vertical_text_orientation_sideways_rotates_cjk_and_latin() {
     .unwrap();
 
     let runs = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .flat_map(|line| line.runs.iter())
         .collect::<Vec<_>>();
@@ -3249,7 +3477,7 @@ async fn page_margin_text_orientation_uses_shared_vertical_placement() {
 
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .flat_map(|line| line.runs.iter())
             .any(|run| {
@@ -3258,7 +3486,7 @@ async fn page_margin_text_orientation_uses_shared_vertical_placement() {
     );
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .flat_map(|line| line.runs.iter())
             .any(|run| {
@@ -3277,7 +3505,7 @@ async fn page_margin_mixed_text_uses_unicode_vertical_orientation() {
     .unwrap();
 
     let runs = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .flat_map(|line| line.runs.iter())
         .collect::<Vec<_>>();
@@ -3301,7 +3529,7 @@ async fn inline_block_text_orientation_uses_shared_vertical_placement() {
 
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .flat_map(|line| line.runs.iter())
             .any(|run| {
@@ -3324,7 +3552,7 @@ async fn vertical_inline_forced_break_stacks_atomic_lines_in_block_axis() {
 
     let rect = |color| {
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .find(|rect| rect.fill == Some(color))
             .unwrap()
@@ -3352,12 +3580,12 @@ async fn inline_block_text_uses_sequence_for_forced_empty_lines() {
     .unwrap();
 
     let alpha = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "alpha")
         .expect("inline-block first line should render");
     let beta = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "beta")
         .expect("inline-block second visible line should render");
@@ -3382,7 +3610,7 @@ async fn inline_block_text_atom_uses_sequence_for_zwsp_and_soft_hyphen() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -3409,7 +3637,7 @@ async fn text_indent_each_line_applies_after_forced_breaks_only() {
     .await
     .unwrap();
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| !line.text.trim().is_empty())
         .collect::<Vec<_>>();
@@ -3423,11 +3651,11 @@ async fn text_indent_each_line_applies_after_forced_breaks_only() {
     assert_eq!(lines[2].text.trim(), "red");
     assert_eq!(lines[3].text.trim(), "blue");
     assert_eq!(lines[4].text.trim(), "green");
-    assert!((lines[0].x() - (options.page_margins.left + 12.0)).abs() < 0.01);
-    assert!((lines[1].x() - options.page_margins.left).abs() < 0.01);
-    assert!((lines[2].x() - (options.page_margins.left + 12.0)).abs() < 0.01);
-    assert!((lines[3].x() - options.page_margins.left).abs() < 0.01);
-    assert!((lines[4].x() - options.page_margins.left).abs() < 0.01);
+    assert!((lines[0].x() - (options.page_margins.left() + 12.0)).abs() < 0.01);
+    assert!((lines[1].x() - options.page_margins.left()).abs() < 0.01);
+    assert!((lines[2].x() - (options.page_margins.left() + 12.0)).abs() < 0.01);
+    assert!((lines[3].x() - options.page_margins.left()).abs() < 0.01);
+    assert!((lines[4].x() - options.page_margins.left()).abs() < 0.01);
 }
 
 #[tokio::test]
@@ -3438,8 +3666,8 @@ async fn supports_text_transform() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "HELLO WORLD");
-    assert_eq!(document.pages[0].lines[1].text, "Mixed CASE Words");
+    assert_eq!(document.pages[0].lines()[0].text, "HELLO WORLD");
+    assert_eq!(document.pages[0].lines()[1].text, "Mixed CASE Words");
 }
 
 #[tokio::test]
@@ -3451,7 +3679,7 @@ async fn capitalize_leaves_non_initial_word_characters_unchanged() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "MIXed CaSE 123abc");
+    assert_eq!(document.pages[0].lines()[0].text, "MIXed CaSE 123abc");
 }
 
 #[tokio::test]
@@ -3462,7 +3690,7 @@ async fn capitalize_uses_icu_full_case_mapping_for_latin_1() {
             .await
             .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "Aaa Μµµ Ààà Ÿÿÿ");
+    assert_eq!(document.pages[0].lines()[0].text, "Aaa Μµµ Ààà Ÿÿÿ");
 }
 
 #[tokio::test]
@@ -3477,10 +3705,10 @@ async fn text_transform_uses_language_tailored_case_mapping() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "İ I");
-    assert_eq!(document.pages[0].lines[1].text, "i ı");
-    assert_eq!(document.pages[0].lines[2].text, "ος οσα");
-    assert_eq!(document.pages[0].lines[3].text, "i\u{0307}\u{0301}");
+    assert_eq!(document.pages[0].lines()[0].text, "İ I");
+    assert_eq!(document.pages[0].lines()[1].text, "i ı");
+    assert_eq!(document.pages[0].lines()[2].text, "ος οσα");
+    assert_eq!(document.pages[0].lines()[3].text, "i\u{0307}\u{0301}");
 }
 
 #[tokio::test]
@@ -3494,9 +3722,9 @@ async fn supports_full_width_and_full_size_kana_text_transform() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "Ａ　１　ガ");
-    assert_eq!(document.pages[0].lines[1].text, "あアフ");
-    assert_eq!(document.pages[0].lines[2].text, "ＡＢ　ア");
+    assert_eq!(document.pages[0].lines()[0].text, "Ａ　１　ガ");
+    assert_eq!(document.pages[0].lines()[1].text, "あアフ");
+    assert_eq!(document.pages[0].lines()[2].text, "ＡＢ　ア");
 }
 
 #[tokio::test]
@@ -3507,7 +3735,7 @@ async fn supports_text_transform_inside_text_only_inline_block() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "HELLO WORLD");
+    assert_eq!(document.pages[0].lines()[0].text, "HELLO WORLD");
 }
 
 #[tokio::test]
@@ -3537,7 +3765,7 @@ async fn capitalize_does_not_treat_inline_boundaries_as_word_boundaries() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "AbCD EF");
+    assert_eq!(document.pages[0].lines()[0].text, "AbCD EF");
 }
 
 #[tokio::test]
@@ -3549,7 +3777,7 @@ async fn capitalize_uses_unicode_word_boundaries_across_inline_fragments() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "Mark’d Ye Mark’d");
+    assert_eq!(document.pages[0].lines()[0].text, "Mark’d Ye Mark’d");
 }
 
 #[tokio::test]
@@ -3561,7 +3789,7 @@ async fn renders_bidi_text_in_visual_order() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "abc גבא def");
+    assert_eq!(document.pages[0].lines()[0].text, "abc גבא def");
 }
 
 #[tokio::test]
@@ -3573,9 +3801,9 @@ async fn renders_styled_bidi_inline_text_in_visual_order() {
     .await
     .unwrap();
 
-    let y = document.pages[0].lines[0].y();
+    let y = document.pages[0].lines()[0].y();
     let mut line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| (line.y() - y).abs() < 0.1)
         .collect::<Vec<_>>();
@@ -3589,6 +3817,119 @@ async fn renders_styled_bidi_inline_text_in_visual_order() {
 }
 
 #[tokio::test]
+async fn bidi_reorders_inline_box_decorations_with_neutral_spaces() {
+    let document = Html::from_string(
+        "<style>@page { size: 420pt 220pt; margin: 20pt } body { margin: 0 }\
+         .container { width: 300px; background: pink; font-size: 30px; line-height: 42px }\
+         div { margin-bottom: 10px }\
+         .purple { border: purple solid 5px }\
+         .orange { background: orange }</style>\
+         <div class=\"container\">\
+           <div dir=\"rtl\"><span class=\"purple\">inspect</span><span class=\"orange\">pause</span></div>\
+           <div dir=\"rtl\"><span class=\"purple\">inspect</span> <span class=\"orange\">pause</span></div>\
+           <div dir=\"rtl\"><span class=\"purple\">inspect<span class=\"orange\">pause</span></span></div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let text_rows = grouped_line_texts(page)
+        .into_iter()
+        .filter(|text| text.contains("inspect") || text.contains("pause"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text_rows,
+        vec!["inspectpause", "inspect pause", "inspectpause"]
+    );
+
+    let mut orange_rects = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(255, 165, 0)))
+        .collect::<Vec<_>>();
+    orange_rects.sort_by(|left, right| right.y().total_cmp(&left.y()));
+    assert_eq!(orange_rects.len(), 3, "{orange_rects:?}");
+
+    let purple_rects = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(128, 0, 128)))
+        .collect::<Vec<_>>();
+    assert!(
+        purple_rects.len() >= 9,
+        "expected purple border rectangles for all three rows: {purple_rects:?}"
+    );
+
+    for (index, orange) in orange_rects.iter().enumerate() {
+        let row_purple = purple_rects
+            .iter()
+            .copied()
+            .filter(|rect| rendered_rects_share_row(rect, orange))
+            .collect::<Vec<_>>();
+        assert!(
+            row_purple.len() >= 2,
+            "row {index} should have purple border fragments near orange={orange:?}: {row_purple:?}"
+        );
+        let vertical_edges = row_purple
+            .iter()
+            .copied()
+            .filter(|rect| rect.width() <= 5.5 && rect.height() > 10.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vertical_edges.len(),
+            2,
+            "row {index} should have exactly two purple vertical border edges near orange={orange:?}: {row_purple:?}"
+        );
+        let purple_left = row_purple
+            .iter()
+            .map(|rect| rect.x())
+            .fold(f32::INFINITY, f32::min);
+        let purple_right = row_purple
+            .iter()
+            .map(|rect| rect.x() + rect.width())
+            .fold(f32::NEG_INFINITY, f32::max);
+        let vertical_left = vertical_edges
+            .iter()
+            .map(|rect| rect.x())
+            .fold(f32::INFINITY, f32::min);
+        let vertical_right = vertical_edges
+            .iter()
+            .map(|rect| rect.x() + rect.width())
+            .fold(f32::NEG_INFINITY, f32::max);
+        let orange_left = orange.x();
+        let orange_right = orange.x() + orange.width();
+
+        if index < 2 {
+            assert!(
+                orange_left >= purple_right - 0.5,
+                "sibling orange span should paint after the purple border in row {index}: orange={orange:?}, purple=({purple_left}, {purple_right})"
+            );
+            assert!(
+                vertical_right <= orange_left + 0.5,
+                "sibling purple right edge should border inspect before orange in row {index}: orange={orange:?}, vertical_edges={vertical_edges:?}"
+            );
+            assert!(
+                vertical_edges
+                    .iter()
+                    .all(|edge| edge.x() + edge.width() < orange_right - 0.5),
+                "sibling purple vertical edge should not be painted at the far right of pause in row {index}: orange={orange:?}, vertical_edges={vertical_edges:?}"
+            );
+        } else {
+            assert!(
+                orange_left >= purple_left - 0.5 && orange_right <= purple_right + 0.5,
+                "nested orange span should stay inside the purple outer span: orange={orange:?}, purple=({purple_left}, {purple_right})"
+            );
+            assert!(
+                vertical_left <= orange_left + 0.5 && vertical_right >= orange_right - 0.5,
+                "nested purple vertical edges should wrap the orange child span: orange={orange:?}, vertical_edges={vertical_edges:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn mixed_inline_ltr_atomic_child_inside_rtl_parent_uses_parent_base_direction() {
     let document = Html::from_string(
         "<p style=\"margin:0; font-size:12pt; line-height:12pt; direction:rtl\">אבג \
@@ -3599,17 +3940,17 @@ async fn mixed_inline_ltr_atomic_child_inside_rtl_parent_uses_parent_base_direct
     .unwrap();
 
     let left_hebrew = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text.trim() == "והד")
         .expect("expected inline-end Hebrew run");
     let atom = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "abc")
         .expect("expected LTR atomic child");
     let right_hebrew = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text.trim() == "גבא")
         .expect("expected inline-start Hebrew run");
@@ -3629,17 +3970,17 @@ async fn mixed_inline_rtl_atomic_child_inside_ltr_parent_uses_parent_base_direct
     .unwrap();
 
     let left_latin = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text.trim() == "abc")
         .expect("expected inline-start Latin run");
     let atom = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "גבא")
         .expect("expected RTL atomic child");
     let right_latin = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text.trim() == "def")
         .expect("expected inline-end Latin run");
@@ -3661,7 +4002,7 @@ async fn unicode_bidi_plaintext_aligns_lines_by_first_strong_character() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| {
             line.text.contains("français")
@@ -3696,7 +4037,7 @@ async fn unicode_bidi_override_scopes_inline_visual_order() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "abc fed ghi");
+    assert_eq!(document.pages[0].lines()[0].text, "abc fed ghi");
 }
 
 #[tokio::test]
@@ -3711,12 +4052,12 @@ async fn html_dir_auto_sets_direction_from_first_strong_descendant_text() {
     .unwrap();
 
     let latin = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "abc")
         .expect("expected ltr line");
     let hebrew = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "גבא")
         .expect("expected rtl visual line");
@@ -3736,12 +4077,12 @@ async fn author_direction_overrides_html_dir_auto_directionality() {
     .unwrap();
 
     let line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "גבא")
         .expect("expected visual rtl text");
 
-    assert!(line.x() < RenderOptions::default().page_margins.left + 20.0);
+    assert!(line.x() < RenderOptions::default().page_margins.left() + 20.0);
 }
 
 #[tokio::test]
@@ -3753,7 +4094,7 @@ async fn html_bdo_uses_ua_isolate_override() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "abc fed ghi");
+    assert_eq!(document.pages[0].lines()[0].text, "abc fed ghi");
 }
 
 #[tokio::test]
@@ -3764,7 +4105,7 @@ async fn join_controls_do_not_split_inline_shaping_runs() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let line = &document.pages[0].lines[0];
+    let line = &document.pages[0].lines()[0];
     assert_eq!(line.text, "A\u{200c}B");
     assert_eq!(line.runs.len(), 1);
     assert_eq!(line.runs[0].text, "A\u{200c}B");
@@ -3779,7 +4120,7 @@ async fn generated_control_characters_render_as_visible_glyphs() {
     .unwrap();
 
     let line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "\u{fffd}")
         .expect("generated control character should be replaced by a visible glyph");
@@ -3794,9 +4135,9 @@ async fn supports_white_space_pre_wrap_newlines() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "One");
-    assert_eq!(document.pages[0].lines[1].text, "Two");
-    assert!(document.pages[0].lines[1].y() < document.pages[0].lines[0].y());
+    assert_eq!(document.pages[0].lines()[0].text, "One");
+    assert_eq!(document.pages[0].lines()[1].text, "Two");
+    assert!(document.pages[0].lines()[1].y() < document.pages[0].lines()[0].y());
 }
 
 #[tokio::test]
@@ -3813,6 +4154,36 @@ async fn html_br_line_break_comes_from_generated_before_content() {
         lines,
         vec!["OneTwo"],
         "author-overridden br::before should suppress the UA generated line break"
+    );
+}
+
+#[tokio::test]
+async fn html_br_clear_both_clears_prior_floats() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 200pt 200pt; margin: 0 }\
+         body { margin: 0; font-size: 10pt; line-height: 10pt }\
+         .box { float: left; width: 20pt; height: 20pt; background: green }\
+         </style>\
+         <div class=\"box\"></div><br style=\"clear:both\"><div class=\"box\"></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green_rects = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| {
+            rect.fill == Some(Color::new(0, 128, 0))
+                && (rect.width() - 20.0).abs() < 0.01
+                && (rect.height() - 20.0).abs() < 0.01
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(green_rects.len(), 2, "{green_rects:?}");
+    assert!(
+        green_rects[1].y() < green_rects[0].y() - 19.0,
+        "second float should clear below the first: {green_rects:?}"
     );
 }
 
@@ -3842,16 +4213,7 @@ async fn pre_wrap_break_word_prefers_preserved_space_opportunities() {
     .await
     .unwrap();
 
-    let lines = document.pages[0]
-        .lines
-        .iter()
-        .map(|line| {
-            line.runs
-                .iter()
-                .map(|run| run.text.as_str())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>();
+    let lines = grouped_line_texts(&document.pages[0]);
 
     assert_eq!(lines, vec![" XX".to_string(), "XXX ".to_string()]);
 }
@@ -3870,7 +4232,7 @@ async fn pre_wrap_tabs_break_after_tab_sequence() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| {
             line.runs
@@ -3897,7 +4259,7 @@ async fn ch_width_uses_selected_font_zero_advance() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -3913,8 +4275,8 @@ async fn supports_white_space_nowrap() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines.len(), 1);
-    assert_eq!(document.pages[0].lines[0].text, "one two three four");
+    assert_eq!(document.pages[0].lines().len(), 1);
+    assert_eq!(document.pages[0].lines()[0].text, "one two three four");
 }
 
 #[tokio::test]
@@ -3926,8 +4288,8 @@ async fn supports_white_space_pre() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, " A  B");
-    assert_eq!(document.pages[0].lines[1].text, "C");
+    assert_eq!(document.pages[0].lines()[0].text, " A  B");
+    assert_eq!(document.pages[0].lines()[1].text, "C");
 }
 
 #[tokio::test]
@@ -3938,8 +4300,8 @@ async fn supports_white_space_pre_line() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "A B");
-    assert_eq!(document.pages[0].lines[1].text, "C");
+    assert_eq!(document.pages[0].lines()[0].text, "A B");
+    assert_eq!(document.pages[0].lines()[1].text, "C");
 }
 
 #[tokio::test]
@@ -3954,7 +4316,7 @@ async fn pre_line_consecutive_forced_breaks_keep_empty_sequence_line() {
 
     let lines = grouped_line_texts(&document.pages[0]);
     assert_eq!(lines, vec!["A", "B"]);
-    let y_gap = document.pages[0].lines[0].y() - document.pages[0].lines[1].y();
+    let y_gap = document.pages[0].lines()[0].y() - document.pages[0].lines()[1].y();
     assert!(
         (y_gap - 20.0).abs() < 0.01,
         "expected an empty sequence line between A and B, got y gap {y_gap}"
@@ -3969,8 +4331,8 @@ async fn supports_white_space_break_spaces() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "A  ");
-    assert_eq!(document.pages[0].lines[1].text, " B");
+    assert_eq!(document.pages[0].lines()[0].text, "A  ");
+    assert_eq!(document.pages[0].lines()[1].text, " B");
 }
 
 #[tokio::test]
@@ -4124,7 +4486,7 @@ async fn supports_overflow_wrap_anywhere() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -4142,7 +4504,7 @@ async fn supports_word_break_break_all() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -4166,7 +4528,7 @@ async fn min_content_width_uses_css_text_line_break_opportunities() {
     // CSS Sizing's min-content inline size must be computed from CSS Text
     // soft-wrap opportunities, not just from document whitespace.
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -4214,7 +4576,7 @@ async fn transparent_inline_padding_edge_allows_cjk_latin_wrap() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -4235,7 +4597,7 @@ async fn transparent_inline_padding_edge_preserves_wbr_opportunity() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -4284,7 +4646,7 @@ async fn inherits_css_text_breaking_controls() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -4302,7 +4664,7 @@ async fn supports_line_break_anywhere() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -4321,7 +4683,7 @@ async fn cjk_inline_text_wraps_before_ascii_closing_brace() {
     .unwrap();
 
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -4342,7 +4704,7 @@ async fn mixed_inline_soft_wrap_uses_hard_break_line_metrics() {
     .unwrap();
 
     let boxes = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(10, 20, 30)))
         .collect::<Vec<_>>();
@@ -4380,7 +4742,7 @@ async fn hides_unbroken_soft_hyphens() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "hyphenation");
+    assert_eq!(document.pages[0].lines()[0].text, "hyphenation");
 }
 
 #[tokio::test]
@@ -4391,11 +4753,11 @@ async fn shows_soft_hyphens_when_line_breaks_there() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert!(document.pages[0].lines.len() > 1);
-    assert_eq!(document.pages[0].lines[0].text, "hyphen-");
+    assert!(document.pages[0].lines().len() > 1);
+    assert_eq!(document.pages[0].lines()[0].text, "hyphen-");
     assert_eq!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<String>(),
@@ -4413,13 +4775,13 @@ async fn styled_inline_soft_hyphens_follow_manual_hyphenation() {
 
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "hyphen-")
     );
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "ation")
     );
@@ -4433,8 +4795,8 @@ async fn hyphens_none_suppresses_soft_hyphen_breaks() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines.len(), 1);
-    assert_eq!(document.pages[0].lines[0].text, "hyphenation");
+    assert_eq!(document.pages[0].lines().len(), 1);
+    assert_eq!(document.pages[0].lines()[0].text, "hyphenation");
 }
 
 #[tokio::test]
@@ -4446,15 +4808,15 @@ async fn hyphens_auto_uses_document_language() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.replace('-', ""))
         .collect::<String>();
 
-    assert!(document.pages[0].lines.len() > 1);
+    assert!(document.pages[0].lines().len() > 1);
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text.ends_with('-'))
     );
@@ -4470,12 +4832,12 @@ async fn break_spaces_exposes_breaks_before_atomic_inline_boxes() {
     .unwrap();
 
     let a = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "A  ")
         .unwrap();
     let b = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "B")
         .unwrap();
@@ -4492,7 +4854,7 @@ async fn overflow_wrap_applies_before_atomic_inline_boxes() {
     .unwrap();
 
     let text_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text != "B")
         .collect::<Vec<_>>();
@@ -4514,12 +4876,12 @@ async fn mixed_inline_text_decorations_paint_with_atomic_inline_boxes() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Text")
         .unwrap();
 
-    assert!(document.pages[0].rects.iter().any(|rect| {
+    assert!(document.pages[0].rects().iter().any(|rect| {
         rect.fill == Some(Color::BLACK)
             && (rect.x() - text.x()).abs() < 0.1
             && rect.y() < text.y()
@@ -4537,7 +4899,7 @@ async fn text_decoration_wavy_paints_as_paths() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert!(document.pages[0].paths.iter().any(|path| {
+    assert!(document.pages[0].paths().iter().any(|path| {
         path.stroke == Some(Color::BLACK) && path.stroke_width >= 1.9 && path.commands.len() > 2
     }));
 }
@@ -4552,13 +4914,13 @@ async fn spelling_and_grammar_error_decorations_paint_wavy_indicators() {
 
     assert!(
         document.pages[0]
-            .paths
+            .paths()
             .iter()
             .any(|path| path.stroke == Some(Color::new(255, 0, 0)))
     );
     assert!(
         document.pages[0]
-            .paths
+            .paths()
             .iter()
             .any(|path| path.stroke == Some(Color::new(0, 128, 0)))
     );
@@ -4578,12 +4940,12 @@ async fn text_decoration_skip_ink_splits_underlines_around_glyph_ink() {
     .unwrap();
 
     let unskipped_width: f32 = without_skip.pages[0]
-        .rects
+        .rects()
         .iter()
         .map(|rect| rect.width())
         .sum();
     let skipped_width: f32 = with_skip.pages[0]
-        .rects
+        .rects()
         .iter()
         .map(|rect| rect.width())
         .sum();
@@ -4608,10 +4970,14 @@ async fn text_decoration_skip_spaces_trims_preserved_line_edge_spaces() {
     let line = document
         .pages
         .first()
-        .and_then(|page| page.lines.iter().find(|line| line.text.contains("ABCDEF")))
+        .and_then(|page| {
+            page.lines()
+                .iter()
+                .find(|line| line.text.contains("ABCDEF"))
+        })
         .unwrap();
     let underline = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .max_by(|left, right| {
@@ -4656,19 +5022,19 @@ async fn vertical_text_decoration_underline_uses_logical_side() {
     .unwrap();
 
     let text = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text.contains('中'))
         .unwrap();
     assert!(
-        document.pages[0].rects.iter().any(|rect| {
+        document.pages[0].rects().iter().any(|rect| {
             rect.fill == Some(Color::new(255, 0, 0))
                 && rect.height() > 10.0
                 && rect.width() >= 1.5
                 && rect.x() < text.x()
         }),
         "{:?}",
-        (document.pages[0].rects.clone(), text)
+        (document.pages[0].rects().to_vec(), text)
     );
 }
 
@@ -4685,11 +5051,11 @@ async fn page_margin_text_decoration_uses_prepared_strokes() {
 
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(0, 0, 255)) && rect.width() > 5.0),
         "{:?}",
-        document.pages[0].rects
+        document.pages[0].rects()
     );
 }
 
@@ -4706,13 +5072,13 @@ async fn inline_block_vertical_text_decoration_uses_prepared_strokes() {
     .unwrap();
 
     assert!(
-        document.pages[0].rects.iter().any(|rect| {
+        document.pages[0].rects().iter().any(|rect| {
             rect.fill == Some(Color::new(0, 128, 0)) && rect.height() > rect.width()
         }),
         "{:?}",
         (
-            document.pages[0].rects.clone(),
-            document.pages[0].lines.clone()
+            document.pages[0].rects().to_vec(),
+            document.pages[0].lines().to_vec()
         )
     );
 }
@@ -4730,15 +5096,15 @@ async fn inline_block_text_decoration_paints_for_transparent_text() {
     .unwrap();
 
     assert!(
-        document.pages[0].rects.iter().any(|rect| {
+        document.pages[0].rects().iter().any(|rect| {
             rect.fill == Some(Color::new(0, 128, 0))
                 && rect.width() > 20.0
                 && (rect.height() - 15.0).abs() < 0.1
         }),
         "expected green underline rects, got {:?}",
         (
-            document.pages[0].rects.clone(),
-            document.pages[0].lines.clone()
+            document.pages[0].rects().to_vec(),
+            document.pages[0].lines().to_vec()
         )
     );
 }
@@ -4756,12 +5122,12 @@ async fn floated_auto_width_uses_definite_child_width_not_overflow_text() {
     .unwrap();
 
     let first = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text.contains("XXXXXXXXXX"))
         .unwrap();
     let second = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Y")
         .unwrap();
@@ -4786,7 +5152,7 @@ async fn thick_overline_is_clipped_by_overflow_hidden_block() {
     .unwrap();
 
     let green_rects = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .collect::<Vec<_>>();
@@ -4800,7 +5166,7 @@ async fn thick_overline_is_clipped_by_overflow_hidden_block() {
     assert!((green_rects[0].height() - 15.0).abs() < 0.01);
     assert!(
         !document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(255, 0, 0)))
     );
@@ -4818,13 +5184,139 @@ async fn font_shorthand_unit_line_height_sets_inline_background_height() {
     .unwrap();
 
     let green = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("green background should paint");
 
     assert!((green.width() - 75.0).abs() < 0.01, "{green:?}");
     assert!((green.height() - 75.0).abs() < 0.01, "{green:?}");
+}
+
+#[tokio::test]
+async fn vertical_align_edge_values_do_not_expand_negative_leading_line_boxes() {
+    let document = Html::from_string(
+        "<style>@page { size: 260pt 240pt; margin: 0 } html, body { margin: 0 }\
+         .container { margin: 20pt 0 0 0; width: 200pt; color: orange;\
+             background: blue; line-height: 10pt; font-size: 30pt; font-family: monospace }\
+         span { background: purple }\
+         .top { vertical-align: top }\
+         .bottom { vertical-align: bottom }\
+         .text-top { vertical-align: text-top }\
+         .text-bottom { vertical-align: text-bottom }</style>\
+         <div class=\"container\"><span class=\"top\">XX</span> <span>XX</span> <span class=\"bottom\">XX</span></div>\
+         <div class=\"container\"><span class=\"text-top\">XX</span> <span>XX</span> <span class=\"text-bottom\">XX</span></div>\
+         <div class=\"container\"><span class=\"top\">XX</span></div>\
+         <div class=\"container\"><span class=\"bottom\">XX</span></div>\
+         <div class=\"container\"><span class=\"text-top\">XX</span></div>\
+         <div class=\"container\"><span class=\"text-bottom\">XX</span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let blue_rects = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .collect::<Vec<_>>();
+    assert_eq!(blue_rects.len(), 6, "{blue_rects:?}");
+    let mut blue_rows = blue_rects;
+    blue_rows.sort_by(|left, right| right.y().total_cmp(&left.y()));
+    let expected_blue_heights = [10.0, 30.0, 10.0, 10.0, 20.0, 20.0];
+    for (row_index, (rect, expected_height)) in
+        blue_rows.iter().zip(expected_blue_heights).enumerate()
+    {
+        assert!(
+            (rect.height() - expected_height).abs() < 0.01,
+            "row {} should match WPT reference line height {expected_height}: {rect:?}",
+            row_index + 1
+        );
+    }
+
+    let purple_rects = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(128, 0, 128)))
+        .collect::<Vec<_>>();
+    assert!(
+        purple_rects.len() >= 10,
+        "expected span backgrounds for every aligned run: {purple_rects:?}"
+    );
+    assert!(
+        purple_rects.iter().all(|rect| rect.height() > 25.0),
+        "negative-leading inline content should overflow the 10pt line boxes: {purple_rects:?}"
+    );
+    let single_span_lines = page
+        .lines()
+        .iter()
+        .filter(|line| {
+            line.color == Color::new(255, 165, 0)
+                && line.text.trim() == "XX"
+                && rendered_line_baseline_top(&document, line) < 180.0
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        single_span_lines.len() >= 4,
+        "expected visible text runs for the single-span aligned rows: {single_span_lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn text_top_bottom_paint_to_parent_content_edges_with_mixed_font_sizes() {
+    let document = Html::from_string(
+        "<style>@page { size: 220pt 140pt; margin: 0 } html, body { margin: 0 }\
+         .container { margin: 20pt 0 0 0; width: 180pt; color: transparent;\
+             background: blue; line-height: 10pt; font-size: 30pt; font-family: monospace }\
+         .reference { background: green }\
+         .small { background: purple; font-size: 10pt; line-height: 10pt }\
+         .text-top { vertical-align: text-top }\
+         .text-bottom { vertical-align: text-bottom }</style>\
+         <div class=\"container\"><span class=\"reference\">XX</span><span class=\"small text-top\">XX</span></div>\
+         <div class=\"container\"><span class=\"reference\">XX</span><span class=\"small text-bottom\">XX</span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let blue_rects = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .collect::<Vec<_>>();
+    assert_eq!(blue_rects.len(), 2, "{blue_rects:?}");
+
+    let mut reference_rects = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .collect::<Vec<_>>();
+    let mut small_rects = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(128, 0, 128)))
+        .collect::<Vec<_>>();
+    reference_rects.sort_by(|left, right| right.y().total_cmp(&left.y()));
+    small_rects.sort_by(|left, right| right.y().total_cmp(&left.y()));
+    assert_eq!(reference_rects.len(), 2, "{reference_rects:?}");
+    assert_eq!(small_rects.len(), 2, "{small_rects:?}");
+
+    let top_reference = reference_rects[0];
+    let top_small = small_rects[0];
+    assert!(
+        ((top_small.y() + top_small.height()) - (top_reference.y() + top_reference.height())).abs()
+            < 0.01,
+        "text-top child content top should match parent content top: reference={top_reference:?}, small={top_small:?}"
+    );
+
+    let bottom_reference = reference_rects[1];
+    let bottom_small = small_rects[1];
+    assert!(
+        (bottom_small.y() - bottom_reference.y()).abs() < 0.01,
+        "text-bottom child content bottom should match parent content bottom: reference={bottom_reference:?}, small={bottom_small:?}"
+    );
 }
 
 #[tokio::test]
@@ -4845,7 +5337,7 @@ async fn explicit_line_height_overrides_loaded_font_metrics() {
     .unwrap();
 
     let green = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .expect("green background should paint");
@@ -4873,7 +5365,7 @@ async fn trailing_ideographic_space_hangs_and_paints_inline_background() {
     .unwrap();
 
     let green_rects = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .collect::<Vec<_>>();
@@ -4909,12 +5401,12 @@ async fn combining_grapheme_joiner_suppresses_wrap_before_atomic_inline() {
     .unwrap();
 
     let red_background = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .expect("div background should paint");
     let visible_green = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.color == Color::new(0, 128, 0))
         .expect("visible Ahem A should paint green");

@@ -32,13 +32,8 @@ impl<'a> LayoutBuilder<'a> {
         let child_boxes = if let Some(child_boxes) = child_boxes {
             child_boxes
         } else {
-            built_child_boxes = box_tree::build_child_boxes_with_font_metrics(
-                element,
-                stylesheets,
-                style,
-                &self.ancestors,
-                &mut self.font_system,
-            );
+            built_child_boxes =
+                self.build_frozen_child_boxes_with_current_ancestors(element, stylesheets, style);
             &built_child_boxes
         };
         let container_signature = self.flex_container_signature(element);
@@ -59,13 +54,80 @@ impl<'a> LayoutBuilder<'a> {
                 height_is_definite: !style.box_values.height.is_auto(),
             },
         );
-        (intrinsic.min_width.max(0.0), intrinsic.width.max(0.0))
+        (
+            intrinsic.min_width.points().max(0.0),
+            intrinsic.width.points().max(0.0),
+        )
     }
 
     fn flex_container_signature(&self, element: &Element) -> ElementSignature {
         self.ancestors
             .last()
             .cloned()
-            .unwrap_or_else(|| ElementSignature::new(element.tag.clone(), element.attrs.clone()))
+            .unwrap_or_else(|| element_signature(element))
     }
+
+    /// Scope a definite flex item height for percentage-height descendants.
+    ///
+    /// CSS Flexbox treats stretched cross sizes and post-flexing main sizes as
+    /// definite for descendant layout, and CSS Sizing lets replaced elements
+    /// transfer a resolved percentage height through their intrinsic aspect
+    /// ratio:
+    /// <https://drafts.csswg.org/css-flexbox/#definite-sizes> and
+    /// <https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes>.
+    fn with_flex_item_percentage_height_basis<R>(
+        &mut self,
+        basis: Option<f32>,
+        layout: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(basis) = basis else {
+            return layout(self);
+        };
+        self.definite_block_size_stack.push(Some(basis));
+        let result = layout(self);
+        self.definite_block_size_stack.pop();
+        result
+    }
+}
+
+/// Convert a flex item's definite border-box height to a content-box basis.
+///
+/// Flex layout stores final item sizes as border-box sizes after margins have
+/// been removed. Percentage `height` descendants resolve against the
+/// containing block's content box, so padding and borders must be excluded:
+/// <https://www.w3.org/TR/css-flexbox-1/#algo-stretch> and
+/// <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>.
+fn flex_item_content_height_percentage_basis(
+    style: &ComputedStyle,
+    border_box_height: f32,
+) -> Option<f32> {
+    Some(
+        (border_box_height
+            - style.padding.top
+            - style.padding.bottom
+            - vertical_border_width(style))
+        .max(0.0),
+    )
+}
+
+fn flex_item_estimate_percentage_height_basis(
+    style: &ComputedStyle,
+    available: FlexItemAvailableSpace,
+) -> Option<f32> {
+    available
+        .stretched_height
+        .and_then(|height| flex_item_content_height_percentage_basis(style, height))
+}
+
+fn flex_item_replay_percentage_height_basis(
+    child: &StyledChild<'_>,
+    style: &ComputedStyle,
+    border_box_height: f32,
+) -> Option<f32> {
+    let has_direct_inline_replaced_descendant = child
+        .element_parts()
+        .is_some_and(|(element, _, _)| has_direct_inline_replaced_child(element));
+    has_direct_inline_replaced_descendant
+        .then(|| flex_item_content_height_percentage_basis(style, border_box_height))
+        .flatten()
 }

@@ -13,7 +13,7 @@
 //!    block dimensions before a writing mode or `direction` has chosen physical
 //!    sides.
 //! 2. Formatting-context geometry: [`InlineRect`], [`BlockRect`],
-//!    [`ContainerRect`], table-grid rectangles, and grid rectangles represent
+//!    [`ContainerRect`], and table-grid rectangles represent
 //!    resolved physical geometry local to the formatting context that produced
 //!    it.
 //! 3. Page layout geometry: [`PageTopRect`] represents boxes whose physical
@@ -26,10 +26,7 @@
 //!
 //! Flex and table each add domain-specific adapters around this shared layer:
 //! flex quarantines raw Taffy output in [`TaffyRect`], while table code
-//! distinguishes logical slot-grid areas from physical table-grid boxes. Grid
-//! should follow the table pattern: keep logical line/area indices separate
-//! from physical track rectangles, then project through a single placement
-//! helper.
+//! distinguishes logical slot-grid areas from physical table-grid boxes.
 //!
 //! This module intentionally does not define one universal rectangle type for
 //! all layout. The common unification point is the conversion vocabulary:
@@ -88,32 +85,7 @@ pub(super) enum InlineSpace {}
 /// [`PageTopRect`] for painting:
 /// <https://www.w3.org/TR/CSS22/visuren.html#block-formatting>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(super) enum BlockSpace {}
-
-/// Physical coordinates inside a CSS grid container.
-///
-/// Quire does not yet have a CSS Grid layout algorithm, but grid placement will
-/// need the same typed boundary as flex and table: logical grid lines and
-/// writing-mode-aware track placement should project into this physical
-/// container-local space before page painting:
-/// <https://www.w3.org/TR/css-grid-2/#grid-model>.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(super) enum GridSpace {}
-
-/// Physical coordinates in the current PDF page box.
-///
-/// This is the page-local coordinate system used by layout cursors and page
-/// placement after CSS Paged Media has resolved the page box and page area.
-/// Its origin is the physical bottom-left of the page box, `x` increases to
-/// the right, and `y` increases upward. Many layout algorithms store the
-/// physical top edge of a box in this space because CSS block flow advances
-/// downward from the page-area top:
-/// <https://www.w3.org/TR/css-page-3/#page-model>.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(super) enum PageSpace {}
 
 /// A point in physical container coordinates.
 pub(super) type ContainerPoint = euclid::Point2D<f32, ContainerSpace>;
@@ -123,43 +95,24 @@ pub(super) type ContainerSize = euclid::Size2D<f32, ContainerSpace>;
 pub(super) type ContainerRect = euclid::Rect<f32, ContainerSpace>;
 /// A point in resolved inline formatting-context coordinates.
 pub(super) type InlinePoint = euclid::Point2D<f32, InlineSpace>;
+/// A vector in resolved inline formatting-context coordinates.
+pub(super) type InlineVector = euclid::Vector2D<f32, InlineSpace>;
 /// A size in resolved inline formatting-context coordinates.
 pub(super) type InlineSize = euclid::Size2D<f32, InlineSpace>;
 /// A rectangle in resolved inline formatting-context coordinates.
 pub(super) type InlineRect = euclid::Rect<f32, InlineSpace>;
 /// A point in block formatting-context coordinates.
-#[allow(dead_code)]
 pub(super) type BlockPoint = euclid::Point2D<f32, BlockSpace>;
 /// A size in block formatting-context coordinates.
-#[allow(dead_code)]
 pub(super) type BlockSize = euclid::Size2D<f32, BlockSpace>;
 /// A rectangle in block formatting-context coordinates.
-#[allow(dead_code)]
 pub(super) type BlockRect = euclid::Rect<f32, BlockSpace>;
-/// A point in CSS grid container coordinates.
-#[allow(dead_code)]
-pub(super) type GridPoint = euclid::Point2D<f32, GridSpace>;
-/// A size in CSS grid container coordinates.
-#[allow(dead_code)]
-pub(super) type GridSize = euclid::Size2D<f32, GridSpace>;
-/// A rectangle in CSS grid container coordinates.
-#[allow(dead_code)]
-pub(super) type GridRect = euclid::Rect<f32, GridSpace>;
 /// A point in raw Taffy output coordinates.
 pub(super) type TaffyPoint = euclid::Point2D<f32, TaffySpace>;
 /// A size in raw Taffy output coordinates.
 pub(super) type TaffySize = euclid::Size2D<f32, TaffySpace>;
 /// An axis-aligned rectangle in raw Taffy output coordinates.
 pub(super) type TaffyRect = euclid::Rect<f32, TaffySpace>;
-/// A point in page-box physical coordinates.
-#[allow(dead_code)]
-pub(super) type PagePoint = euclid::Point2D<f32, PageSpace>;
-/// A size in page-box physical coordinates.
-#[allow(dead_code)]
-pub(super) type PageGeomSize = euclid::Size2D<f32, PageSpace>;
-/// A bottom-left-origin rectangle in page-box physical coordinates.
-#[allow(dead_code)]
-pub(super) type PageRect = euclid::Rect<f32, PageSpace>;
 
 /// A physical horizontal span in the CSS page box.
 ///
@@ -233,20 +186,14 @@ impl PageBlockSpan {
     pub(super) fn bottom_y(self) -> f32 {
         self.top_y - self.height
     }
-
-    #[allow(dead_code)]
-    pub(super) fn height(self) -> f32 {
-        self.height
-    }
 }
 
 /// A point in the CSS page box using the top-edge layout convention.
 ///
-/// Unlike [`PagePoint`], whose `y` coordinate follows bottom-left page/paint
-/// space, this point stores a physical `top_y` value. Use it for origins of
-/// formatting contexts whose local coordinates increase downward, such as table
-/// grid boxes and future grid containers, before converting their rectangles
-/// through [`PageTopRect`]:
+/// This point stores a physical `top_y` value. Use it for origins of formatting
+/// contexts whose local coordinates increase downward, such as table grid boxes
+/// and future grid containers, before converting their rectangles through
+/// [`PageTopRect`]:
 /// <https://www.w3.org/TR/css-page-3/#page-model>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct PageTopPoint {
@@ -314,14 +261,6 @@ impl PageTopRect {
         self.top_y - self.height
     }
 
-    #[allow(dead_code)]
-    pub(super) fn page_rect(self) -> PageRect {
-        PageRect::new(
-            PagePoint::new(self.x, self.bottom_y()),
-            PageGeomSize::new(self.width, self.height),
-        )
-    }
-
     pub(super) fn paint_rect(self) -> PaintRect {
         PaintRect::new(
             PaintPoint::new(self.x, self.bottom_y()),
@@ -378,6 +317,9 @@ pub(super) fn paint_space_point(x: f32, y: f32) -> PaintPoint {
 /// physical coordinate system:
 /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
 #[derive(Debug, Clone, Copy, PartialEq)]
+// Retained as the spec-backed logical/physical conversion boundary for
+// writing-mode work; current production callers still mostly use physical
+// geometry directly, while unit tests lock down the conversion behavior.
 #[allow(dead_code)]
 pub(super) struct LogicalPoint {
     pub(super) inline: f32,
@@ -390,6 +332,7 @@ pub(super) struct LogicalPoint {
 /// In vertical writing modes this maps to physical height/width respectively:
 /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
 #[derive(Debug, Clone, Copy, PartialEq)]
+// See the `LogicalPoint` rationale above.
 #[allow(dead_code)]
 pub(super) struct LogicalSize {
     pub(super) inline: f32,
@@ -437,6 +380,7 @@ impl LogicalInlineSpan {
 /// must go through [`FlowAxes`]:
 /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
 #[derive(Debug, Clone, Copy, PartialEq)]
+// See the `LogicalPoint` rationale above.
 #[allow(dead_code)]
 pub(super) struct LogicalRect {
     pub(super) origin: LogicalPoint,
@@ -468,16 +412,22 @@ impl FlowAxes {
         Self::new(style.writing_mode, style.direction)
     }
 
+    // Retained with the logical geometry types as the single place for
+    // writing-mode coordinate projection.
     #[allow(dead_code)]
     pub(super) fn inline_start_side(self) -> PhysicalSide {
         inline_start_side(self.writing_mode, self.direction)
     }
 
+    // Retained with the logical geometry types as the single place for
+    // writing-mode coordinate projection.
     #[allow(dead_code)]
     pub(super) fn block_start_side(self) -> PhysicalSide {
         block_start_side(self.writing_mode)
     }
 
+    // Retained with the logical geometry types as the single place for
+    // writing-mode coordinate projection.
     #[allow(dead_code)]
     pub(super) fn physical_size_from_logical(self, size: LogicalSize) -> ContainerSize {
         match self.writing_mode {
@@ -488,6 +438,8 @@ impl FlowAxes {
         }
     }
 
+    // Retained with the logical geometry types as the single place for
+    // writing-mode coordinate projection.
     #[allow(dead_code)]
     pub(super) fn logical_size_from_physical(self, size: ContainerSize) -> LogicalSize {
         match self.writing_mode {
@@ -502,6 +454,8 @@ impl FlowAxes {
         }
     }
 
+    // Retained with the logical geometry types as the single place for
+    // writing-mode coordinate projection.
     #[allow(dead_code)]
     pub(super) fn rect_from_logical(
         self,
@@ -624,10 +578,6 @@ mod tests {
         let rect = PageTopRect::new(20.0, 180.0, 50.0, 30.0);
 
         assert_eq!(rect.bottom_y(), 150.0);
-        assert_eq!(
-            rect.page_rect(),
-            PageRect::new(PagePoint::new(20.0, 150.0), PageGeomSize::new(50.0, 30.0))
-        );
         assert_eq!(
             rect.paint_rect(),
             PaintRect::new(PaintPoint::new(20.0, 150.0), PaintSize::new(50.0, 30.0))

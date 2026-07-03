@@ -11,6 +11,7 @@ mod properties;
 mod style;
 mod variables;
 
+pub(crate) use background::parse_background_image;
 use background::*;
 use columns::*;
 pub(crate) use declarations::{

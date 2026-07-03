@@ -36,7 +36,7 @@ pub(crate) fn parse_stylesheet(css: &Css) -> Stylesheet {
         base_url: css.base_url().map(Path::to_path_buf),
         root_url: css.root_url().map(Path::to_path_buf),
         layers: layers.clone(),
-        namespaces: namespaces.clone(),
+        namespaces,
         current_layer: css.import_layer_name().map(ToOwned::to_owned),
         current_scopes: Vec::new(),
     };

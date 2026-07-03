@@ -2,16 +2,18 @@ use super::*;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct GridItemEstimate {
-    pub(super) width: f32,
-    pub(super) height: f32,
-    pub(super) min_width: f32,
-    pub(super) min_height: f32,
-    pub(super) content_width: f32,
-    pub(super) content_height: f32,
+    pub(super) width: ContentBoxLength,
+    pub(super) height: ContentBoxLength,
+    pub(super) min_width: ContentBoxLength,
+    pub(super) min_height: ContentBoxLength,
+    pub(super) content_width: ContentBoxLength,
+    pub(super) content_height: ContentBoxLength,
 }
 
 impl GridItemEstimate {
     pub(super) fn fixed(width: f32, height: f32) -> Self {
+        let width = content_box_pt(width);
+        let height = content_box_pt(height);
         Self {
             width,
             height,
@@ -45,13 +47,8 @@ impl<'a> LayoutBuilder<'a> {
         let child_boxes = if let Some(child_boxes) = child_boxes {
             child_boxes
         } else {
-            built_child_boxes = box_tree::build_child_boxes_with_font_metrics(
-                element,
-                stylesheets,
-                style,
-                &self.ancestors,
-                &mut self.font_system,
-            );
+            built_child_boxes =
+                self.build_frozen_child_boxes_with_current_ancestors(element, stylesheets, style);
             &built_child_boxes
         };
         let (mut children, _) = grid_child_lists_from_boxes(child_boxes);
@@ -88,7 +85,8 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         available_height: Option<f32>,
     ) -> GridItemEstimate {
-        let style = &child.style;
+        let layout_style = grid_item_layout_style(&child.style);
+        let style = &layout_style;
         let inline_available = match style.writing_mode {
             WritingMode::HorizontalTb => available_width,
             WritingMode::VerticalRl | WritingMode::VerticalLr => {
@@ -135,14 +133,15 @@ impl<'a> LayoutBuilder<'a> {
                     layout.resource_cache,
                 )
             {
+                let content_size = image.content_size;
                 return grid_item_estimate_from_intrinsic(
                     style,
                     available_width,
                     inline_basis,
                     block_basis,
-                    image.content_width.max(1.0),
-                    image.content_width.max(1.0),
-                    image.content_height.max(1.0),
+                    content_size.width.max(1.0),
+                    content_size.width.max(1.0),
+                    content_size.height.max(1.0),
                 );
             }
 
@@ -322,7 +321,7 @@ fn grid_track_intrinsic_contributions(
     let mut auto_cursor = 0_usize;
 
     for (child, estimate) in children.iter().zip(estimates) {
-        let contribution = (estimate.min_width, estimate.content_width);
+        let contribution = (estimate.min_width.points(), estimate.content_width.points());
         if let Some(range) = simple_grid_child_column_range(
             &child.style,
             track_count,
@@ -351,7 +350,10 @@ fn grid_item_intrinsic_contribution(
     estimates: impl Iterator<Item = GridItemEstimate>,
 ) -> (f32, f32) {
     estimates.fold((0.0_f32, 0.0_f32), |(min, max), estimate| {
-        (min.max(estimate.min_width), max.max(estimate.content_width))
+        (
+            min.max(estimate.min_width.points()),
+            max.max(estimate.content_width.points()),
+        )
     })
 }
 
@@ -378,7 +380,7 @@ fn simple_grid_child_column_range(
         *auto_cursor += 1;
         return Some(index..index + 1);
     }
-    let start = simple_grid_line_index(&style.grid_column_start, line_names)?;
+    let start = grid_line_index(&style.grid_column_start, line_names)?;
     let track_index = usize::try_from(start - 1).ok()?;
     if track_index >= track_count {
         return None;
@@ -392,60 +394,6 @@ fn simple_grid_child_column_range(
     }
 }
 
-fn simple_grid_line_index(
-    placement: &css::GridPlacement,
-    line_names: &[Vec<String>],
-) -> Option<i32> {
-    let css::GridPlacement::Line(line) = placement else {
-        return None;
-    };
-    if let Some(name) = &line.name {
-        named_grid_line_index(line_names, name, line.index.unwrap_or(1))
-    } else {
-        explicit_grid_line_index(line.index?, line_names)
-    }
-}
-
-fn explicit_grid_line_index(index: i32, line_names: &[Vec<String>]) -> Option<i32> {
-    let line_count = i32::try_from(line_names.len()).ok()?;
-    if index > 0 {
-        (index <= line_count).then_some(index)
-    } else if index < 0 {
-        let resolved = line_count + index + 1;
-        (1..=line_count).contains(&resolved).then_some(resolved)
-    } else {
-        None
-    }
-}
-
-fn named_grid_line_index(line_names: &[Vec<String>], name: &str, occurrence: i32) -> Option<i32> {
-    if occurrence == 0 {
-        return None;
-    }
-    let target = occurrence.unsigned_abs();
-    let mut matches_seen = 0_u32;
-    if occurrence > 0 {
-        for (index, names) in line_names.iter().enumerate() {
-            if names.iter().any(|line_name| line_name == name) {
-                matches_seen += 1;
-                if matches_seen == target {
-                    return i32::try_from(index + 1).ok();
-                }
-            }
-        }
-    } else {
-        for (index, names) in line_names.iter().enumerate().rev() {
-            if names.iter().any(|line_name| line_name == name) {
-                matches_seen += 1;
-                if matches_seen == target {
-                    return i32::try_from(index + 1).ok();
-                }
-            }
-        }
-    }
-    None
-}
-
 fn simple_grid_child_column_span(
     end: &css::GridPlacement,
     start: i32,
@@ -457,7 +405,7 @@ fn simple_grid_child_column_span(
             span.span.map(usize::from).filter(|span| *span > 0)
         }
         css::GridPlacement::Line(_) => {
-            let end = simple_grid_line_index(end, line_names)?;
+            let end = grid_line_index(end, line_names)?;
             (end > start)
                 .then_some(end - start)
                 .and_then(|span| usize::try_from(span).ok())
@@ -561,12 +509,16 @@ fn grid_item_estimate_from_intrinsic(
     let content_height = used_length_percentage_or_auto(style.box_values.height, block_basis)
         .unwrap_or(content_height);
     GridItemEstimate {
-        width: constrain_width(style, content_width, available_width),
-        height: constrain_height(style, content_height, block_basis),
-        min_width: constrain_width(style, min_content, available_width),
-        min_height: constrain_height(style, content_height.min(style.line_height), block_basis),
-        content_width: max_content,
-        content_height,
+        width: content_box_pt(constrain_width(style, content_width, available_width)),
+        height: content_box_pt(constrain_height(style, content_height, block_basis)),
+        min_width: content_box_pt(constrain_width(style, min_content, available_width)),
+        min_height: content_box_pt(constrain_height(
+            style,
+            content_height.min(style.line_height),
+            block_basis,
+        )),
+        content_width: content_box_pt(max_content),
+        content_height: content_box_pt(content_height),
     }
 }
 
@@ -582,12 +534,12 @@ pub(super) fn measure_grid_item(
     estimate: Option<&mut GridItemEstimate>,
 ) -> taffy_layout::Size<f32> {
     let estimate = estimate.copied().unwrap_or(GridItemEstimate {
-        width: 0.0,
-        height: 0.0,
-        min_width: 0.0,
-        min_height: 0.0,
-        content_width: 0.0,
-        content_height: 0.0,
+        width: content_box_pt(0.0),
+        height: content_box_pt(0.0),
+        min_width: content_box_pt(0.0),
+        min_height: content_box_pt(0.0),
+        content_width: content_box_pt(0.0),
+        content_height: content_box_pt(0.0),
     });
     taffy_layout::Size {
         width: known_dimensions
@@ -615,6 +567,19 @@ pub(super) fn measure_grid_item(
     }
 }
 
+fn grid_item_measured_size(
+    available_space: taffy_layout::AvailableSpace,
+    preferred: ContentBoxLength,
+    min_content: ContentBoxLength,
+    max_content: ContentBoxLength,
+) -> f32 {
+    match available_space {
+        taffy_layout::AvailableSpace::MinContent => min_content.points(),
+        taffy_layout::AvailableSpace::MaxContent => max_content.points(),
+        taffy_layout::AvailableSpace::Definite(_) => preferred.points(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,12 +587,78 @@ mod tests {
     fn fixed_track(size: f32) -> css::GridTrackSize {
         css::GridTrackSize {
             min: css::GridMinTrackBreadth::LengthPercentage(
-                css::ComputedLengthPercentage::from_length(size),
+                css::ComputedLengthPercentage::from_points(size),
             ),
             max: css::GridMaxTrackBreadth::LengthPercentage(
-                css::ComputedLengthPercentage::from_length(size),
+                css::ComputedLengthPercentage::from_points(size),
             ),
         }
+    }
+
+    #[test]
+    fn grid_item_fixed_estimate_preserves_content_box_lengths() {
+        let estimate = GridItemEstimate::fixed(24.0, 36.0);
+
+        assert_eq!(estimate.width.points(), 24.0);
+        assert_eq!(estimate.height.points(), 36.0);
+        assert_eq!(estimate.min_width.points(), 24.0);
+        assert_eq!(estimate.min_height.points(), 36.0);
+        assert_eq!(estimate.content_width.points(), 24.0);
+        assert_eq!(estimate.content_height.points(), 36.0);
+    }
+
+    #[test]
+    fn grid_item_measurement_extracts_typed_content_box_lengths() {
+        let mut estimate = GridItemEstimate {
+            width: content_box_pt(40.0),
+            height: content_box_pt(50.0),
+            min_width: content_box_pt(10.0),
+            min_height: content_box_pt(20.0),
+            content_width: content_box_pt(90.0),
+            content_height: content_box_pt(100.0),
+        };
+
+        let min_content = measure_grid_item(
+            taffy_layout::Size {
+                width: None,
+                height: None,
+            },
+            taffy_layout::Size {
+                width: taffy_layout::AvailableSpace::MinContent,
+                height: taffy_layout::AvailableSpace::MinContent,
+            },
+            Some(&mut estimate),
+        );
+        assert_eq!(min_content.width, 10.0);
+        assert_eq!(min_content.height, 20.0);
+
+        let max_content = measure_grid_item(
+            taffy_layout::Size {
+                width: None,
+                height: None,
+            },
+            taffy_layout::Size {
+                width: taffy_layout::AvailableSpace::MaxContent,
+                height: taffy_layout::AvailableSpace::MaxContent,
+            },
+            Some(&mut estimate),
+        );
+        assert_eq!(max_content.width, 90.0);
+        assert_eq!(max_content.height, 100.0);
+
+        let preferred = measure_grid_item(
+            taffy_layout::Size {
+                width: None,
+                height: None,
+            },
+            taffy_layout::Size {
+                width: taffy_layout::AvailableSpace::Definite(300.0),
+                height: taffy_layout::AvailableSpace::Definite(300.0),
+            },
+            Some(&mut estimate),
+        );
+        assert_eq!(preferred.width, 40.0);
+        assert_eq!(preferred.height, 50.0);
     }
 
     #[test]
@@ -651,18 +682,5 @@ mod tests {
             expanded.line_names,
             vec![Vec::<String>::new(), vec!["end".to_string()]]
         );
-    }
-}
-
-fn grid_item_measured_size(
-    available_space: taffy_layout::AvailableSpace,
-    preferred: f32,
-    min_content: f32,
-    max_content: f32,
-) -> f32 {
-    match available_space {
-        taffy_layout::AvailableSpace::MinContent => min_content,
-        taffy_layout::AvailableSpace::MaxContent => max_content,
-        taffy_layout::AvailableSpace::Definite(_) => preferred,
     }
 }

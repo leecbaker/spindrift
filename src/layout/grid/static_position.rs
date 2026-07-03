@@ -45,6 +45,7 @@ impl<'a> LayoutBuilder<'a> {
                 y: 0.0,
                 width: context.inner_width,
                 height: child.style.line_height,
+                area: None,
             });
         if let Some(x) = grid_line_static_offset(
             &context.container_style.grid_template_columns,
@@ -65,202 +66,17 @@ impl<'a> LayoutBuilder<'a> {
             hypothetical.y = y;
         }
 
-        let previous_left = self.content_left;
-        let previous_right = self.content_right;
-        let previous_cursor_y = self.cursor_y;
-
-        self.content_left = context.inner_x + hypothetical.x;
-        self.content_right = self.content_left + hypothetical.width.max(1.0);
-        self.cursor_y = context.content_top - hypothetical.y;
-
-        let mut positioned_style = child.style.clone();
-        if positioned_style.display.is_inline_level() {
-            positioned_style.display = positioned_style.display.blockified();
-        }
-        positioned_style.abspos_static_source_was_inline_level = true;
-        if let Some((child_element, signature, child_boxes)) = child.element_parts() {
-            self.push_ancestor_signature(signature.clone());
-            self.layout_positioned_block_with_inline_static_position(
-                child_element,
-                &positioned_style,
-                context.stylesheets,
-                child_boxes,
-                None,
-                InlineStaticPosition {
-                    start_x: self.content_left,
-                    baseline_y: self.cursor_y,
-                },
-            );
-            self.ancestors.pop();
-        }
-
-        self.content_left = previous_left;
-        self.content_right = previous_right;
-        self.cursor_y = previous_cursor_y;
-    }
-}
-
-fn grid_line_static_offset(
-    tracks: &css::GridTrackList,
-    placement: &css::GridPlacement,
-    gap: css::ComputedGap,
-    container_size: f32,
-) -> Option<f32> {
-    let css::GridPlacement::Line(line) = placement else {
-        return None;
-    };
-    let css::GridTrackList::Tracks {
-        components,
-        trailing_names,
-    } = tracks
-    else {
-        return None;
-    };
-    let track_sizes = definite_grid_track_sizes(components, container_size)?;
-    let explicit_line_count = i32::try_from(track_sizes.len() + 1).ok()?;
-    let line_index = if let Some(name) = &line.name {
-        named_grid_line_index(components, trailing_names, name, line.index.unwrap_or(1))?
-    } else {
-        explicit_grid_line_index(line.index?, explicit_line_count)?
-    };
-    if line_index <= 1 {
-        return None;
-    }
-    let track_count = usize::try_from(line_index - 1).ok()?;
-    if track_count > track_sizes.len() {
-        return None;
-    }
-    let gap = definite_grid_gap_size(gap, container_size);
-    let crossed_gaps = track_count.min(track_sizes.len().saturating_sub(1));
-    Some(track_sizes[..track_count].iter().sum::<f32>() + gap * crossed_gaps as f32)
-}
-
-fn explicit_grid_line_index(index: i32, explicit_line_count: i32) -> Option<i32> {
-    if index > 0 {
-        (index <= explicit_line_count).then_some(index)
-    } else if index < 0 {
-        let resolved = explicit_line_count + index + 1;
-        (1..=explicit_line_count)
-            .contains(&resolved)
-            .then_some(resolved)
-    } else {
-        None
-    }
-}
-
-fn named_grid_line_index(
-    components: &[css::GridTrackListComponent],
-    trailing_names: &[String],
-    name: &str,
-    occurrence: i32,
-) -> Option<i32> {
-    if occurrence == 0 {
-        return None;
-    }
-    let lines = explicit_grid_line_names(components, trailing_names)?;
-    let target = occurrence.unsigned_abs();
-    let mut matches_seen = 0_u32;
-    if occurrence > 0 {
-        for (index, names) in lines.iter().enumerate() {
-            if names.iter().any(|line_name| line_name == name) {
-                matches_seen += 1;
-                if matches_seen == target {
-                    return i32::try_from(index + 1).ok();
-                }
-            }
-        }
-    } else {
-        for (index, names) in lines.iter().enumerate().rev() {
-            if names.iter().any(|line_name| line_name == name) {
-                matches_seen += 1;
-                if matches_seen == target {
-                    return i32::try_from(index + 1).ok();
-                }
-            }
-        }
-    }
-    None
-}
-
-fn explicit_grid_line_names(
-    components: &[css::GridTrackListComponent],
-    trailing_names: &[String],
-) -> Option<Vec<Vec<String>>> {
-    let mut lines = Vec::new();
-    let mut current_line_names = Vec::new();
-    collect_explicit_grid_line_names(components, &mut current_line_names, &mut lines)?;
-    current_line_names.extend(trailing_names.iter().cloned());
-    lines.push(current_line_names);
-    Some(lines)
-}
-
-fn collect_explicit_grid_line_names(
-    components: &[css::GridTrackListComponent],
-    current_line_names: &mut Vec<String>,
-    lines: &mut Vec<Vec<String>>,
-) -> Option<()> {
-    for component in components {
-        match component {
-            css::GridTrackListComponent::Track(names, _) => {
-                current_line_names.extend(names.iter().cloned());
-                lines.push(std::mem::take(current_line_names));
-            }
-            css::GridTrackListComponent::Repeat(names, repeat) => {
-                let css::GridRepeatCount::Number(count) = repeat.count else {
-                    return None;
-                };
-                current_line_names.extend(names.iter().cloned());
-                for _ in 0..count {
-                    collect_explicit_grid_line_names(&repeat.tracks, current_line_names, lines)?;
-                    current_line_names.extend(repeat.trailing_names.iter().cloned());
-                }
-            }
-        }
-    }
-    Some(())
-}
-
-fn definite_grid_track_sizes(
-    components: &[css::GridTrackListComponent],
-    container_size: f32,
-) -> Option<Vec<f32>> {
-    let mut sizes = Vec::new();
-    for component in components {
-        collect_definite_grid_track_sizes(component, container_size, &mut sizes)?;
-    }
-    Some(sizes)
-}
-
-fn collect_definite_grid_track_sizes(
-    component: &css::GridTrackListComponent,
-    container_size: f32,
-    sizes: &mut Vec<f32>,
-) -> Option<()> {
-    match component {
-        css::GridTrackListComponent::Track(_, size) => {
-            sizes.push(definite_grid_track_size(*size, container_size)?);
-        }
-        css::GridTrackListComponent::Repeat(_, repeat) => {
-            let css::GridRepeatCount::Number(count) = repeat.count else {
-                return None;
-            };
-            for _ in 0..count {
-                for repeated in &repeat.tracks {
-                    collect_definite_grid_track_sizes(repeated, container_size, sizes)?;
-                }
-            }
-        }
-    }
-    Some(())
-}
-
-fn definite_grid_track_size(size: css::GridTrackSize, container_size: f32) -> Option<f32> {
-    match (size.min, size.max) {
-        (
-            css::GridMinTrackBreadth::LengthPercentage(min),
-            css::GridMaxTrackBreadth::LengthPercentage(max),
-        ) if min == max => min.used_length_with_percentage_basis(container_size),
-        _ => None,
+        let static_left = context.inner_x + hypothetical.x;
+        self.layout_positioned_formatting_context_child(
+            child,
+            context.stylesheets,
+            PositionedChildStaticRect::new(
+                static_left,
+                static_left + hypothetical.width,
+                context.content_top - hypothetical.y,
+            ),
+            PositionedFormattingChildReplayMode::InlineStaticPosition,
+        );
     }
 }
 
@@ -276,10 +92,10 @@ mod tests {
                     Vec::new(),
                     css::GridTrackSize {
                         min: css::GridMinTrackBreadth::LengthPercentage(
-                            css::ComputedLengthPercentage::from_length(20.0),
+                            css::ComputedLengthPercentage::from_points(20.0),
                         ),
                         max: css::GridMaxTrackBreadth::LengthPercentage(
-                            css::ComputedLengthPercentage::from_length(20.0),
+                            css::ComputedLengthPercentage::from_points(20.0),
                         ),
                     },
                 ),
@@ -287,10 +103,10 @@ mod tests {
                     Vec::new(),
                     css::GridTrackSize {
                         min: css::GridMinTrackBreadth::LengthPercentage(
-                            css::ComputedLengthPercentage::from_length(20.0),
+                            css::ComputedLengthPercentage::from_points(20.0),
                         ),
                         max: css::GridMaxTrackBreadth::LengthPercentage(
-                            css::ComputedLengthPercentage::from_length(20.0),
+                            css::ComputedLengthPercentage::from_points(20.0),
                         ),
                     },
                 ),
@@ -305,7 +121,7 @@ mod tests {
             grid_line_static_offset(
                 &tracks,
                 &placement,
-                css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_length(5.0),),
+                css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_points(5.0),),
                 45.0,
             ),
             Some(25.0)
@@ -316,10 +132,10 @@ mod tests {
     fn named_line_static_offset_resolves_explicit_line_occurrences() {
         let fixed_track = css::GridTrackSize {
             min: css::GridMinTrackBreadth::LengthPercentage(
-                css::ComputedLengthPercentage::from_length(20.0),
+                css::ComputedLengthPercentage::from_points(20.0),
             ),
             max: css::GridMaxTrackBreadth::LengthPercentage(
-                css::ComputedLengthPercentage::from_length(20.0),
+                css::ComputedLengthPercentage::from_points(20.0),
             ),
         };
         let tracks = css::GridTrackList::Tracks {
@@ -337,7 +153,7 @@ mod tests {
             grid_line_static_offset(
                 &tracks,
                 &placement,
-                css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_length(5.0),),
+                css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_points(5.0),),
                 45.0,
             ),
             Some(25.0)
@@ -348,10 +164,10 @@ mod tests {
     fn negative_numeric_line_static_offset_counts_from_explicit_grid_end() {
         let fixed_track = css::GridTrackSize {
             min: css::GridMinTrackBreadth::LengthPercentage(
-                css::ComputedLengthPercentage::from_length(20.0),
+                css::ComputedLengthPercentage::from_points(20.0),
             ),
             max: css::GridMaxTrackBreadth::LengthPercentage(
-                css::ComputedLengthPercentage::from_length(20.0),
+                css::ComputedLengthPercentage::from_points(20.0),
             ),
         };
         let tracks = css::GridTrackList::Tracks {
@@ -369,7 +185,7 @@ mod tests {
             grid_line_static_offset(
                 &tracks,
                 &placement,
-                css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_length(5.0),),
+                css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_points(5.0),),
                 45.0,
             ),
             Some(45.0)
@@ -380,10 +196,10 @@ mod tests {
     fn negative_named_line_static_offset_counts_from_explicit_grid_end() {
         let fixed_track = css::GridTrackSize {
             min: css::GridMinTrackBreadth::LengthPercentage(
-                css::ComputedLengthPercentage::from_length(20.0),
+                css::ComputedLengthPercentage::from_points(20.0),
             ),
             max: css::GridMaxTrackBreadth::LengthPercentage(
-                css::ComputedLengthPercentage::from_length(20.0),
+                css::ComputedLengthPercentage::from_points(20.0),
             ),
         };
         let tracks = css::GridTrackList::Tracks {
@@ -401,7 +217,7 @@ mod tests {
             grid_line_static_offset(
                 &tracks,
                 &placement,
-                css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_length(5.0),),
+                css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_points(5.0),),
                 45.0,
             ),
             Some(45.0)

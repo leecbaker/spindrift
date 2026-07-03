@@ -38,34 +38,51 @@ pub(super) fn table_rows_from_fragment<'a>(
     let rows = fragment
         .rows
         .iter()
-        .map(|row| TableRow {
-            element: row.element,
-            signature: row.signature.clone(),
-            ancestors: row.ancestors.clone(),
-            row_groups: row
-                .row_groups
-                .iter()
-                .map(|group| TableRowGroup {
-                    element: group.element,
-                    signature: group.signature.clone(),
-                    style: group.style.clone(),
-                })
-                .collect(),
-            style: row.style.clone(),
-            cells: row
-                .cells
-                .iter()
-                .map(|cell| TableCell {
+        .map(|row| {
+            let mut cells = Vec::new();
+            let mut running_cells = Vec::new();
+            for cell in &row.cells {
+                let table_cell = TableCell {
                     element: cell.element,
                     signature: cell.signature.clone(),
                     style: cell.style.clone(),
                     children: Some(cell.children.clone()),
                     anonymous: cell.anonymous,
-                })
-                .collect(),
+                };
+                if table_fragment_cell_is_running(cell) {
+                    running_cells.push(table_cell);
+                } else {
+                    cells.push(table_cell);
+                }
+            }
+            TableRow {
+                element: row.element,
+                signature: row.signature.clone(),
+                ancestors: row.ancestors.clone(),
+                row_groups: row
+                    .row_groups
+                    .iter()
+                    .map(|group| TableRowGroup {
+                        element: group.element,
+                        signature: group.signature.clone(),
+                        style: group.style.clone(),
+                    })
+                    .collect(),
+                style: row.style.clone(),
+                cells,
+                running_cells,
+            }
         })
         .collect();
     order_table_rows(rows)
+}
+
+fn table_fragment_cell_is_running(cell: &box_tree::TableFragmentCell<'_>) -> bool {
+    !cell.anonymous
+        && cell
+            .style
+            .as_ref()
+            .is_some_and(|style| style.running_element_name.is_some())
 }
 
 /// Apply CSS table row-group visual ordering before grid construction.
@@ -498,7 +515,6 @@ fn table_cell_block_child_height(child: &box_tree::FormattingBox<'_>) -> f32 {
         }
         box_tree::FormattingBox::Inline(_)
         | box_tree::FormattingBox::AtomicInline(_)
-        | box_tree::FormattingBox::Line(_)
         | box_tree::FormattingBox::Text(_)
         | box_tree::FormattingBox::Replaced(_) => 0.0,
     }
@@ -523,7 +539,6 @@ fn table_cell_inline_level_outer_height(child: &box_tree::FormattingBox<'_>) -> 
         | box_tree::FormattingBox::Block(_)
         | box_tree::FormattingBox::Table(_)
         | box_tree::FormattingBox::Flex(_)
-        | box_tree::FormattingBox::Line(_)
         | box_tree::FormattingBox::Text(_) => None,
     }
 }
@@ -595,9 +610,7 @@ pub(super) fn table_cell_content_offset(
             ContentAlignmentKeyword::Baseline | ContentAlignmentKeyword::LastBaseline
         ) {
             if let Some(baseline) = row_baseline_offset {
-                return (baseline - cell_baseline_offset)
-                    .max(0.0)
-                    .min(free_space.max(0.0));
+                return (baseline - cell_baseline_offset).max(0.0);
             }
             if block_start_side(style.writing_mode).axis() == PhysicalAxis::Vertical {
                 return content_alignment_offset_toward_end(
@@ -625,6 +638,7 @@ pub(super) fn table_cell_content_offset(
 
 pub(super) fn table_row_span_height(
     row_heights: &[f32],
+    row_occupancy: &[bool],
     row: usize,
     rowspan: usize,
     table_metrics: TableMetrics,
@@ -633,35 +647,56 @@ pub(super) fn table_row_span_height(
     if row >= end {
         return 0.0;
     }
-    table_grid_height(&row_heights[row..end], table_metrics)
+    table_grid_height(
+        &row_heights[row..end],
+        &row_occupancy[row..end.min(row_occupancy.len())],
+        table_metrics,
+    )
 }
 
 /// Return the block-axis size of the table row grid.
 ///
-/// CSS 2.2 separated borders add vertical `border-spacing` only between cells
-/// that occupy adjacent rows; rows collapsed by `visibility: collapse` and rows
-/// suppressed by `empty-cells: hide` have zero used height and do not add a
-/// second spacing interval.
+/// CSS 2.2 separated borders add vertical `border-spacing` only between
+/// participating adjacent row tracks. Rows collapsed by `visibility: collapse`
+/// and rows suppressed by `empty-cells: hide` are non-participating; visible
+/// zero-height rows still participate in edge and inter-row spacing.
 /// https://www.w3.org/TR/CSS22/tables.html#dynamic-effects
 /// https://www.w3.org/TR/CSS22/tables.html#separated-borders
-pub(super) fn table_grid_height(row_heights: &[f32], table_metrics: TableMetrics) -> f32 {
-    row_heights.iter().sum::<f32>()
-        + table_metrics.spacing.vertical.length
-            * table_internal_vertical_gap_count(row_heights) as f32
+pub(super) fn table_grid_height(
+    row_heights: &[f32],
+    row_occupancy: &[bool],
+    table_metrics: TableMetrics,
+) -> f32 {
+    row_heights
+        .iter()
+        .enumerate()
+        .filter_map(|(index, height)| {
+            row_occupancy
+                .get(index)
+                .copied()
+                .unwrap_or(*height > 0.0)
+                .then_some(*height)
+        })
+        .sum::<f32>()
+        + table_metrics.spacing.vertical.length_points()
+            * table_internal_vertical_gap_count(row_occupancy) as f32
 }
 
 /// Return separated-border spacing between the table padding edge and edge rows.
 ///
 /// CSS 2.2 separated borders put the distance between a table padding edge and
 /// an edge cell border at table padding plus the relevant `border-spacing`
-/// value. Collapsed rows and rows whose measured height is zero do not create
-/// edge cells for this spacing calculation.
+/// value. Collapsed rows and hidden-empty rows do not create edge cells for this
+/// spacing calculation, but visible zero-height rows do.
 /// https://www.w3.org/TR/CSS22/tables.html#separated-borders
-pub(super) fn table_vertical_edge_spacing(row_heights: &[f32], table_metrics: TableMetrics) -> f32 {
+pub(super) fn table_vertical_edge_spacing(
+    row_occupancy: &[bool],
+    table_metrics: TableMetrics,
+) -> f32 {
     if table_metrics.border_collapse == css::BorderCollapse::Separate
-        && row_heights.iter().any(|height| *height > 0.0)
+        && row_occupancy.iter().any(|occupied| *occupied)
     {
-        table_metrics.spacing.vertical.length
+        table_metrics.spacing.vertical.length_points()
     } else {
         0.0
     }
@@ -673,9 +708,13 @@ pub(super) fn table_vertical_edge_spacing(row_heights: &[f32], table_metrics: Ta
 /// cells and between edge cells and the table padding edge; row group, row, and
 /// column backgrounds still use the row grid, not this outer spacing area.
 /// https://www.w3.org/TR/CSS22/tables.html#separated-borders
-pub(super) fn table_content_height(row_heights: &[f32], table_metrics: TableMetrics) -> f32 {
-    table_grid_height(row_heights, table_metrics)
-        + table_vertical_edge_spacing(row_heights, table_metrics) * 2.0
+pub(super) fn table_content_height(
+    row_heights: &[f32],
+    row_occupancy: &[bool],
+    table_metrics: TableMetrics,
+) -> f32 {
+    table_grid_height(row_heights, row_occupancy, table_metrics)
+        + table_vertical_edge_spacing(row_occupancy, table_metrics) * 2.0
 }
 
 /// Return the block-axis height occupied by repeated table row fragments.
@@ -688,32 +727,47 @@ pub(super) fn table_content_height(row_heights: &[f32], table_metrics: TableMetr
 pub(super) fn repeated_table_rows_height(
     row_indices: &[usize],
     row_heights: &[f32],
+    row_occupancy: &[bool],
     table_metrics: TableMetrics,
 ) -> f32 {
-    row_indices
+    let occupied_heights = row_indices
         .iter()
-        .enumerate()
-        .map(|(position, row_index)| {
-            row_heights[*row_index]
-                + if position + 1 < row_indices.len() {
-                    table_metrics.spacing.vertical.length
-                } else {
-                    0.0
-                }
+        .filter(|row_index| {
+            row_occupancy
+                .get(**row_index)
+                .copied()
+                .unwrap_or_else(|| row_heights.get(**row_index).copied().unwrap_or(0.0) > 0.0)
         })
-        .sum()
+        .map(|row_index| row_heights.get(*row_index).copied().unwrap_or(0.0))
+        .collect::<Vec<_>>();
+    table_grid_height(
+        &occupied_heights,
+        &vec![true; occupied_heights.len()],
+        table_metrics,
+    )
 }
 
 pub(super) fn table_row_top(
     grid_top: f32,
     row_heights: &[f32],
+    row_occupancy: &[bool],
     table_metrics: TableMetrics,
     row: usize,
 ) -> f32 {
     let row = row.min(row_heights.len());
-    let offset = row_heights[..row].iter().sum::<f32>()
-        + table_metrics.spacing.vertical.length
-            * table_internal_vertical_gap_count_before(row_heights, row) as f32;
+    let offset = row_heights[..row]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, height)| {
+            row_occupancy
+                .get(index)
+                .copied()
+                .unwrap_or(*height > 0.0)
+                .then_some(*height)
+        })
+        .sum::<f32>()
+        + table_metrics.spacing.vertical.length_points()
+            * table_internal_vertical_gap_count_before(row_occupancy, row) as f32;
     grid_top - offset
 }
 
@@ -729,40 +783,50 @@ pub(super) fn inline_table_first_occupying_row_range(
     table_border_widths: css::Edges,
     table_padding: css::Edges,
     row_heights: &[f32],
+    row_occupancy: &[bool],
     table_metrics: TableMetrics,
 ) -> Option<(f32, f32)> {
     let (row_index, row_height) = row_heights
         .iter()
         .copied()
         .enumerate()
-        .find(|(_, height)| *height > 0.0)?;
+        .find(|(index, _)| row_occupancy.get(*index).copied().unwrap_or(false))?;
     let grid_top = table_top
         - top_caption_height
         - table_border_widths.top
         - table_padding.top
-        - table_vertical_edge_spacing(row_heights, table_metrics);
-    let row_top = table_row_top(grid_top, row_heights, table_metrics, row_index);
+        - table_vertical_edge_spacing(row_occupancy, table_metrics);
+    let row_top = table_row_top(
+        grid_top,
+        row_heights,
+        row_occupancy,
+        table_metrics,
+        row_index,
+    );
     Some((row_top, row_top - row_height))
 }
 
-fn table_internal_vertical_gap_count(row_heights: &[f32]) -> usize {
-    row_heights
+fn table_internal_vertical_gap_count(row_occupancy: &[bool]) -> usize {
+    row_occupancy
         .iter()
-        .filter(|height| **height > 0.0)
+        .filter(|occupied| **occupied)
         .count()
         .saturating_sub(1)
 }
 
-pub(super) fn table_internal_vertical_gap_count_before(row_heights: &[f32], row: usize) -> usize {
-    let row = row.min(row_heights.len());
-    let occupied_before = row_heights[..row]
+pub(super) fn table_internal_vertical_gap_count_before(
+    row_occupancy: &[bool],
+    row: usize,
+) -> usize {
+    let row = row.min(row_occupancy.len());
+    let occupied_before = row_occupancy[..row]
         .iter()
-        .filter(|height| **height > 0.0)
+        .filter(|occupied| **occupied)
         .count();
     if occupied_before == 0 {
         return 0;
     }
-    if row_heights[row..].iter().any(|height| *height > 0.0) {
+    if row_occupancy[row..].iter().any(|occupied| *occupied) {
         occupied_before
     } else {
         occupied_before.saturating_sub(1)
@@ -773,17 +837,6 @@ pub(super) fn table_row_is_collapsed(style: &ComputedStyle) -> bool {
     // CSS 2.2 `visibility: collapse` on table rows removes the row's occupied
     // space; outside table row/column objects it behaves like `hidden`.
     style.visibility == Visibility::Collapse
-}
-
-pub(super) fn has_following_uncollapsed_row(
-    rows: &[TableRow<'_>],
-    table_style: &ComputedStyle,
-    stylesheets: &[Stylesheet],
-    builder: &mut LayoutBuilder<'_>,
-) -> bool {
-    rows.iter().any(|row| {
-        !table_row_is_collapsed(&builder.style_for_table_row(row, table_style, stylesheets))
-    })
 }
 
 pub(super) fn table_horizontal_borders(style: &ComputedStyle) -> f32 {

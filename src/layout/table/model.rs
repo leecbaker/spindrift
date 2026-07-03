@@ -13,22 +13,23 @@ pub(super) struct TableRow<'a> {
     pub(super) signature: ElementSignature,
     pub(super) ancestors: Vec<ElementSignature>,
     pub(super) row_groups: Vec<TableRowGroup<'a>>,
-    pub(super) style: Option<ComputedStyle>,
+    pub(super) style: Option<box_tree::SharedStyle>,
     pub(super) cells: Vec<TableCell<'a>>,
+    pub(super) running_cells: Vec<TableCell<'a>>,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct TableRowGroup<'a> {
     pub(super) element: &'a Element,
     pub(super) signature: ElementSignature,
-    pub(super) style: Option<ComputedStyle>,
+    pub(super) style: Option<box_tree::SharedStyle>,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct TableCell<'a> {
     pub(super) element: Option<&'a Element>,
     pub(super) signature: ElementSignature,
-    pub(super) style: Option<ComputedStyle>,
+    pub(super) style: Option<box_tree::SharedStyle>,
     pub(super) children: Option<Vec<box_tree::FormattingBox<'a>>>,
     pub(super) anonymous: bool,
 }
@@ -51,7 +52,7 @@ pub(super) struct TableCellPlacement {
 pub(super) struct TableCaption<'a> {
     pub(super) element: &'a Element,
     pub(super) signature: ElementSignature,
-    pub(super) style: Option<ComputedStyle>,
+    pub(super) style: Option<box_tree::SharedStyle>,
     pub(super) children: Option<Vec<box_tree::FormattingBox<'a>>>,
 }
 
@@ -59,7 +60,7 @@ pub(super) struct TableCaption<'a> {
 pub(super) struct TableColumn<'a> {
     pub(super) element: &'a Element,
     pub(super) signature: ElementSignature,
-    pub(super) style: Option<ComputedStyle>,
+    pub(super) style: Option<box_tree::SharedStyle>,
     pub(super) group: Option<TableColumnGroup<'a>>,
     pub(super) span: usize,
 }
@@ -68,7 +69,7 @@ pub(super) struct TableColumn<'a> {
 pub(super) struct TableColumnGroup<'a> {
     pub(super) element: &'a Element,
     pub(super) signature: ElementSignature,
-    pub(super) style: Option<ComputedStyle>,
+    pub(super) style: Option<box_tree::SharedStyle>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,10 +173,14 @@ impl TableColumnPlan {
 
     /// Return physical inline bounds for a logical column span.
     ///
-    /// CSS Tables assigns cells to logical grid slots, then CSS Writing Modes
-    /// maps those slots to physical inline positions according to `direction`.
-    /// This helper is the table boundary for that projection:
-    /// <https://drafts.csswg.org/css-tables-3/#cell-assignment> and
+    /// CSS Tables assigns cells to logical grid slots, with separated
+    /// `border-spacing` outside the edge cells and between adjacent cells. CSS
+    /// Writing Modes then maps those slots to physical inline positions
+    /// according to `direction`. Use the resolved span width to find the
+    /// logical end edge so RTL spans mirror the actual cell area, not the
+    /// table grid's trailing outer spacing:
+    /// <https://drafts.csswg.org/css-tables-3/#cell-assignment>,
+    /// <https://www.w3.org/TR/CSS22/tables.html#separated-borders>, and
     /// <https://www.w3.org/TR/css-writing-modes-4/#direction>.
     pub(super) fn inline_bounds_for_span(
         &self,
@@ -183,12 +188,15 @@ impl TableColumnPlan {
         colspan: usize,
     ) -> TableInlineBounds {
         let end = (column + colspan.max(1)).min(self.widths.len());
+        let width = self.width_for_span(column, colspan);
+        let logical_start = self.logical_boundary_offset(column);
+        let logical_end = logical_start + width;
         let start = self.axes.span_start_x(
             self.total_width(),
-            self.logical_boundary_offset(column),
-            self.logical_boundary_offset(end),
+            logical_start,
+            logical_end.min(self.logical_boundary_offset(end)),
         );
-        TableInlineBounds::new(start, self.width_for_span(column, colspan))
+        TableInlineBounds::new(start, width)
     }
 
     pub(super) fn inline_bounds_for_area(&self, area: TableGridArea) -> TableInlineBounds {
@@ -277,18 +285,18 @@ mod tests {
         let plan = column_plan(Direction::Rtl);
         assert_eq!(
             plan.inline_bounds_for_span(0, 1),
-            TableInlineBounds::new(60.0, 10.0)
+            TableInlineBounds::new(65.0, 10.0)
         );
         assert_eq!(plan.boundary_x(0), 75.0);
         assert_eq!(plan.boundary_x(3), 0.0);
     }
 
     #[test]
-    fn rtl_colspan_uses_the_physical_minimum_boundary_as_origin() {
+    fn rtl_colspan_leaves_outer_spacing_on_both_sides() {
         let plan = column_plan(Direction::Rtl);
         assert_eq!(
             plan.inline_bounds_for_span(1, 2),
-            TableInlineBounds::new(0.0, 55.0)
+            TableInlineBounds::new(5.0, 55.0)
         );
     }
 
@@ -328,7 +336,7 @@ mod tests {
         let border_box = plan.cell_border_box(area, TableRowBounds::new(40.0, 25.0));
         assert_eq!(border_box.x(placement), 120.0);
         assert_eq!(border_box.top_y(placement), 260.0);
-        assert_eq!(border_box.bottom_y(placement), 235.0);
+        assert_eq!(border_box.top_y(placement) - border_box.height(), 235.0);
         assert_eq!(border_box.width(), 55.0);
         assert_eq!(border_box.height(), 25.0);
     }

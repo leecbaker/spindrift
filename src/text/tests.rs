@@ -320,7 +320,7 @@ async fn inter_word_justification_mutates_shaped_separator_advances() {
         .runs
         .iter()
         .flat_map(|run| &run.glyphs)
-        .find(|glyph| glyph.source_text == " ")
+        .find(|glyph| glyph.source_text() == " ")
         .map(|glyph| glyph.rendered.x_advance)
         .expect("space glyph");
 
@@ -330,7 +330,7 @@ async fn inter_word_justification_mutates_shaped_separator_advances() {
         .runs
         .iter()
         .flat_map(|run| &run.glyphs)
-        .find(|glyph| glyph.source_text == " ")
+        .find(|glyph| glyph.source_text() == " ")
         .map(|glyph| glyph.rendered.x_advance)
         .expect("space glyph");
     assert!((added_width - 10.0).abs() < 0.01);
@@ -371,7 +371,7 @@ async fn inter_word_justification_preserves_bidi_visual_glyph_order() {
         .runs
         .iter()
         .flat_map(|run| &run.glyphs)
-        .map(|glyph| glyph.source_text.clone())
+        .map(|glyph| glyph.source_text().to_string())
         .collect::<Vec<_>>();
     let original_run_font_ids = shaped
         .runs
@@ -387,7 +387,7 @@ async fn inter_word_justification_preserves_bidi_visual_glyph_order() {
             .runs
             .iter()
             .flat_map(|run| &run.glyphs)
-            .map(|glyph| glyph.source_text.clone())
+            .map(|glyph| glyph.source_text().to_string())
             .collect::<Vec<_>>(),
         original_sources
     );
@@ -448,7 +448,7 @@ async fn line_measure_excludes_inline_end_letter_spacing() {
     let mut style = ComputedStyle::initial();
     style.font_family = FontFamily::Monospace;
     style.font_size = 12.0;
-    style.letter_spacing = ComputedLengthPercentage::from_length(10.0);
+    style.letter_spacing = ComputedLengthPercentage::from_points(10.0);
 
     let mut untracked = style.clone();
     untracked.letter_spacing = ComputedLengthPercentage::ZERO;

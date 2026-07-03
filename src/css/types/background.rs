@@ -200,8 +200,8 @@ pub(crate) enum BackgroundBox {
 
 /// Computed single-layer CSS background image.
 ///
-/// CSS Images defines gradients as generated images. The renderer currently
-/// supports URL images and an axis-aligned `linear-gradient()` subset:
+/// CSS Images defines gradients as generated images. The renderer supports URL
+/// images and CSS Images Level 3 linear and radial gradients:
 /// <https://www.w3.org/TR/css-images-3/#gradients>.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BackgroundImage {
@@ -211,12 +211,15 @@ pub(crate) enum BackgroundImage {
         root_url: Option<PathBuf>,
     },
     LinearGradient(LinearGradient),
+    RadialGradient(RadialGradient),
 }
 
 impl BackgroundImage {
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
-        if let Self::LinearGradient(gradient) = self {
-            gradient.resolve_font_metric_lengths(ch_advance);
+        match self {
+            Self::LinearGradient(gradient) => gradient.resolve_font_metric_lengths(ch_advance),
+            Self::RadialGradient(gradient) => gradient.resolve_font_metric_lengths(ch_advance),
+            Self::Url { .. } => {}
         }
     }
 
@@ -227,13 +230,20 @@ impl BackgroundImage {
         viewport_inline: f32,
         viewport_block: f32,
     ) {
-        if let Self::LinearGradient(gradient) = self {
-            gradient.resolve_viewport_lengths(
+        match self {
+            Self::LinearGradient(gradient) => gradient.resolve_viewport_lengths(
                 viewport_width,
                 viewport_height,
                 viewport_inline,
                 viewport_block,
-            );
+            ),
+            Self::RadialGradient(gradient) => gradient.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            ),
+            Self::Url { .. } => {}
         }
     }
 }
@@ -304,22 +314,167 @@ impl BackgroundLayer {
     }
 }
 
-/// Computed `linear-gradient()` image for the supported axis-aligned subset.
+/// Computed `linear-gradient()` or `repeating-linear-gradient()` image.
 ///
-/// CSS Images Level 3 defines gradient lines and color stops. This stores stop
-/// positions as typed CSS length-percentages because percentages resolve
-/// against the concrete gradient line available only when painting:
+/// CSS Images Level 3 defines the gradient direction, color-stop list, and
+/// repeating behavior. Stop positions remain typed length-percentages because
+/// percentages resolve against the concrete gradient line only when painting:
 /// <https://www.w3.org/TR/css-images-3/#linear-gradients>.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LinearGradient {
     pub direction: LinearGradientDirection,
+    pub repeating: bool,
     pub stops: Vec<GradientColorStop>,
+    pub hints: Vec<GradientColorHint>,
+}
+
+/// Computed `radial-gradient()` or `repeating-radial-gradient()` image.
+///
+/// CSS Images Level 3 defines radial gradients by a shape, ending size,
+/// center position, color stops, and optional repeating behavior:
+/// <https://www.w3.org/TR/css-images-3/#radial-gradients>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RadialGradient {
+    pub shape: RadialGradientShape,
+    pub size: RadialGradientSize,
+    pub position: BackgroundPosition,
+    pub repeating: bool,
+    pub stops: Vec<GradientColorStop>,
+    pub hints: Vec<GradientColorHint>,
+}
+
+impl RadialGradient {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        self.size.resolve_font_metric_lengths(ch_advance);
+        self.position.resolve_font_metric_lengths(ch_advance);
+        for stop in &mut self.stops {
+            stop.resolve_font_metric_lengths(ch_advance);
+        }
+        for hint in &mut self.hints {
+            hint.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        self.size.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.position.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        for stop in &mut self.stops {
+            stop.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
+        for hint in &mut self.hints {
+            hint.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RadialGradientShape {
+    Circle,
+    Ellipse,
+}
+
+/// Computed radial-gradient ending size.
+///
+/// Extent keywords are resolved only when the concrete gradient box and center
+/// point are known. Explicit radii stay as length-percentages so percentages
+/// can resolve against the concrete gradient box at paint time:
+/// <https://www.w3.org/TR/css-images-3/#typedef-radial-size>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum RadialGradientSize {
+    Extent(RadialGradientExtent),
+    CircleRadius(ComputedLengthPercentage),
+    EllipseRadii {
+        x: ComputedLengthPercentage,
+        y: ComputedLengthPercentage,
+    },
+}
+
+impl RadialGradientSize {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        match self {
+            Self::CircleRadius(radius) => radius.resolve_font_metric_lengths(ch_advance),
+            Self::EllipseRadii { x, y } => {
+                x.resolve_font_metric_lengths(ch_advance);
+                y.resolve_font_metric_lengths(ch_advance);
+            }
+            Self::Extent(_) => {}
+        }
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        match self {
+            Self::CircleRadius(radius) => radius.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            ),
+            Self::EllipseRadii { x, y } => {
+                x.resolve_viewport_lengths(
+                    viewport_width,
+                    viewport_height,
+                    viewport_inline,
+                    viewport_block,
+                );
+                y.resolve_viewport_lengths(
+                    viewport_width,
+                    viewport_height,
+                    viewport_inline,
+                    viewport_block,
+                );
+            }
+            Self::Extent(_) => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RadialGradientExtent {
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
 }
 
 impl LinearGradient {
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
         for stop in &mut self.stops {
             stop.resolve_font_metric_lengths(ch_advance);
+        }
+        for hint in &mut self.hints {
+            hint.resolve_font_metric_lengths(ch_advance);
         }
     }
 
@@ -338,34 +493,94 @@ impl LinearGradient {
                 viewport_block,
             );
         }
+        for hint in &mut self.hints {
+            hint.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
     }
 }
 
-/// Axis direction for a supported linear gradient.
+/// Normalized linear-gradient direction.
 ///
-/// CSS Images uses `to <side-or-corner>` syntax for gradient direction:
-/// <https://www.w3.org/TR/css-images-3/#typedef-side-or-corner>.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// CSS Images Level 3 maps side keywords to angles, but corner directions
+/// depend on the concrete gradient box dimensions and must be kept distinct
+/// until paint-time gradient-line construction:
+/// <https://www.w3.org/TR/css-images-3/#linear-gradients>.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum LinearGradientDirection {
-    Bottom,
-    Top,
-    Right,
+    Angle(f32),
+    Corner {
+        horizontal: GradientHorizontalDirection,
+        vertical: GradientVerticalDirection,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GradientHorizontalDirection {
     Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GradientVerticalDirection {
+    Top,
+    Bottom,
 }
 
 /// One parsed gradient color stop.
 ///
-/// CSS Images allows omitted and repeated stop positions; the current subset
-/// requires explicit length-percentage positions, enough for hard-stop stripe
-/// tests:
+/// CSS Images allows omitted stop positions and two-position stops. The parser
+/// expands two-position stops into two adjacent stops and keeps omitted
+/// positions as `None` until the CSS Images fixup algorithm runs with the
+/// concrete gradient line:
 /// <https://www.w3.org/TR/css-images-3/#color-stop-syntax>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct GradientColorStop {
     pub color: Color,
-    pub position: ComputedLengthPercentage,
+    pub position: Option<ComputedLengthPercentage>,
 }
 
 impl GradientColorStop {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+        if let Some(position) = &mut self.position {
+            position.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+
+    pub(crate) fn resolve_viewport_lengths(
+        &mut self,
+        viewport_width: f32,
+        viewport_height: f32,
+        viewport_inline: f32,
+        viewport_block: f32,
+    ) {
+        if let Some(position) = &mut self.position {
+            position.resolve_viewport_lengths(
+                viewport_width,
+                viewport_height,
+                viewport_inline,
+                viewport_block,
+            );
+        }
+    }
+}
+
+/// One color interpolation hint between two adjacent color stops.
+///
+/// CSS Images Level 3 permits an unlabeled `<linear-color-hint>` between two
+/// color stops to move the midpoint of interpolation:
+/// <https://www.w3.org/TR/css-images-3/#color-stop-syntax>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GradientColorHint {
+    pub after_stop: usize,
+    pub position: ComputedLengthPercentage,
+}
+
+impl GradientColorHint {
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
         self.position.resolve_font_metric_lengths(ch_advance);
     }

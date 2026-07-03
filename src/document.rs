@@ -2,9 +2,10 @@ mod paint;
 
 pub(crate) use paint::{
     PagePaintTree, PaintBand, PaintBlendMode, PaintCheckpoint, PaintClip, PaintClipPathEffect,
-    PaintDisplayItem, PaintEffectStep, PaintEffects, PaintFilterEffect, PaintFragment,
-    PaintMaskEffect, PaintPrimitive, PaintStackingContext, PaintTransform, PaintVector,
-    RenderedPathCommandPoints, StackLevel, paint_point_to_pdf, paint_rect_to_pdf,
+    PaintDisplayItem, PaintEffectScope, PaintEffectStep, PaintEffects, PaintFilterEffect,
+    PaintFragment, PaintMaskEffect, PaintPrimitive, PaintStackingContext, PaintTransform,
+    PaintVector, RenderedLineSource, RenderedPathCommandPoints, StackLevel, paint_point_to_pdf,
+    paint_rect_to_pdf,
 };
 pub use paint::{
     PaintOperation, PaintPoint, PaintRect, PaintSize, RenderedCornerRadius, RenderedGlyph,
@@ -226,14 +227,14 @@ pub enum BookmarkState {
 pub struct Page {
     size: PaintSize,
     pub rotation: i32,
-    pub operations: Vec<PaintOperation>,
-    pub rects: Vec<RenderedRect>,
-    pub rounded_rects: Vec<RenderedRoundedRect>,
-    pub paths: Vec<RenderedPath>,
-    pub strokes: Vec<RenderedStroke>,
-    pub lines: Vec<RenderedLine>,
-    pub links: Vec<RenderedLink>,
-    pub images: Vec<RenderedImage>,
+    pub(crate) operations: Vec<PaintOperation>,
+    pub(crate) rects: Vec<RenderedRect>,
+    pub(crate) rounded_rects: Vec<RenderedRoundedRect>,
+    pub(crate) paths: Vec<RenderedPath>,
+    pub(crate) strokes: Vec<RenderedStroke>,
+    pub(crate) lines: Vec<RenderedLine>,
+    pub(crate) links: Vec<RenderedLink>,
+    pub(crate) images: Vec<RenderedImage>,
     paint_tree: Option<paint::PagePaintTree>,
 }
 
@@ -260,6 +261,38 @@ impl Page {
 
     pub fn height(&self) -> f32 {
         self.size.height
+    }
+
+    pub fn operations(&self) -> &[PaintOperation] {
+        &self.operations
+    }
+
+    pub fn rects(&self) -> &[RenderedRect] {
+        &self.rects
+    }
+
+    pub fn rounded_rects(&self) -> &[RenderedRoundedRect] {
+        &self.rounded_rects
+    }
+
+    pub fn paths(&self) -> &[RenderedPath] {
+        &self.paths
+    }
+
+    pub fn strokes(&self) -> &[RenderedStroke] {
+        &self.strokes
+    }
+
+    pub fn lines(&self) -> &[RenderedLine] {
+        &self.lines
+    }
+
+    pub fn links(&self) -> &[RenderedLink] {
+        &self.links
+    }
+
+    pub fn images(&self) -> &[RenderedImage] {
+        &self.images
     }
 
     pub(crate) fn paint_size(&self) -> PaintSize {

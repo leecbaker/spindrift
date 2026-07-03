@@ -1,3 +1,4 @@
+use super::declarations::split_top_level_once;
 use super::*;
 
 pub(super) fn apply_background_shorthand(
@@ -249,17 +250,19 @@ pub(super) fn extract_css_url(value: &str) -> Option<String> {
 /// Parses a single supported CSS background image.
 ///
 /// CSS Backgrounds delegates image values to CSS Images. This parser supports
-/// URL images and an axis-aligned `linear-gradient()` subset for generated
-/// images:
+/// URL images and CSS Images Level 3 linear/radial gradients as generated images:
 /// <https://www.w3.org/TR/css-backgrounds-3/#the-background-image> and
-/// <https://www.w3.org/TR/css-images-3/#linear-gradients>.
-pub(super) fn parse_background_image(
+/// <https://www.w3.org/TR/css-images-3/#gradients>.
+pub(crate) fn parse_background_image(
     value: &str,
     base_url: Option<&std::path::Path>,
     root_url: Option<&std::path::Path>,
 ) -> Option<BackgroundImage> {
     if let Some(gradient) = parse_linear_gradient(value) {
         return Some(BackgroundImage::LinearGradient(gradient));
+    }
+    if let Some(gradient) = parse_radial_gradient(value) {
+        return Some(BackgroundImage::RadialGradient(gradient));
     }
     parse_first_css_url(value).map(|src| BackgroundImage::Url {
         src,
@@ -439,53 +442,450 @@ fn split_background_layer_values(value: &str) -> Vec<&str> {
     parts
 }
 
-/// Parses the supported `linear-gradient()` subset.
+/// Parses CSS Images Level 3 `linear-gradient()` and
+/// `repeating-linear-gradient()`.
 ///
-/// CSS Images permits angles, corners, interpolation hints, and omitted
-/// positions. The current subset accepts `to top/right/bottom/left` with
-/// explicit length-percentage stops, which covers hard-stop print references:
+/// The parser accepts the Level 3 direction grammar, color stops, two-position
+/// stops, omitted stop positions, and interpolation hints. Stop-position fixup
+/// runs at paint time because percentages resolve against the concrete
+/// gradient line:
 /// <https://www.w3.org/TR/css-images-3/#linear-gradients>.
 pub(crate) fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     let value = trim_css_value(value);
-    let lower = value.to_ascii_lowercase();
-    let start = lower.find("linear-gradient(")?;
-    let args_start = start + "linear-gradient(".len();
+    let (repeating, start, name_len) = find_linear_gradient_function(value)?;
+    let function_text = &value[start..];
+    let mut input = cssparser::ParserInput::new(function_text);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let name = parser.expect_function().ok()?.clone();
+    if repeating {
+        if !name.eq_ignore_ascii_case("repeating-linear-gradient") {
+            return None;
+        }
+    } else if !name.eq_ignore_ascii_case("linear-gradient") {
+        return None;
+    }
+    let args_start = start + name_len;
     let args_end = matching_function_end(value, args_start - 1)?;
     let args = &value[args_start..args_end];
     let parts = split_comma_function_args(args);
-    if parts.len() < 3 {
+    if parts.len() < 2 {
         return None;
     }
-    let direction = parse_linear_gradient_direction(parts[0].trim())?;
+    let mut first_stop = 0usize;
+    let direction = if let Some(direction) = parse_linear_gradient_direction(parts[0].trim()) {
+        first_stop = 1;
+        direction
+    } else {
+        LinearGradientDirection::Angle(180.0)
+    };
     let mut stops = Vec::new();
-    for part in &parts[1..] {
-        stops.push(parse_gradient_color_stop(part.trim())?);
+    let mut hints = Vec::new();
+    for part in &parts[first_stop..] {
+        parse_gradient_item(part.trim(), &mut stops, &mut hints)?;
     }
     if stops.len() < 2 {
         return None;
     }
-    Some(LinearGradient { direction, stops })
+    if hints.iter().any(|hint| hint.after_stop + 1 >= stops.len()) {
+        return None;
+    }
+    Some(LinearGradient {
+        direction,
+        repeating,
+        stops,
+        hints,
+    })
+}
+
+/// Parses CSS Images Level 3 `radial-gradient()` and
+/// `repeating-radial-gradient()`.
+///
+/// This covers the Level 3 shape, extent keyword, explicit radius/radii,
+/// `at <position>`, color-stop, two-position stop, and interpolation hint
+/// grammar. Radius percentages remain unresolved until paint, where the
+/// concrete gradient box is known:
+/// <https://www.w3.org/TR/css-images-3/#radial-gradients>.
+pub(crate) fn parse_radial_gradient(value: &str) -> Option<RadialGradient> {
+    let value = trim_css_value(value);
+    let (repeating, start, name_len) = find_radial_gradient_function(value)?;
+    let function_text = &value[start..];
+    let mut input = cssparser::ParserInput::new(function_text);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let name = parser.expect_function().ok()?.clone();
+    if repeating {
+        if !name.eq_ignore_ascii_case("repeating-radial-gradient") {
+            return None;
+        }
+    } else if !name.eq_ignore_ascii_case("radial-gradient") {
+        return None;
+    }
+    let args_start = start + name_len;
+    let args_end = matching_function_end(value, args_start - 1)?;
+    let args = &value[args_start..args_end];
+    let parts = split_comma_function_args(args);
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut first_stop = 0usize;
+    let (shape, size, position) = if let Some(prelude) = parse_radial_gradient_prelude(&parts[0]) {
+        first_stop = 1;
+        prelude
+    } else {
+        (
+            RadialGradientShape::Ellipse,
+            RadialGradientSize::Extent(RadialGradientExtent::FarthestCorner),
+            radial_gradient_center_position(),
+        )
+    };
+    let mut stops = Vec::new();
+    let mut hints = Vec::new();
+    for part in &parts[first_stop..] {
+        parse_gradient_item(part.trim(), &mut stops, &mut hints)?;
+    }
+    if stops.len() < 2 {
+        return None;
+    }
+    if hints.iter().any(|hint| hint.after_stop + 1 >= stops.len()) {
+        return None;
+    }
+    Some(RadialGradient {
+        shape,
+        size,
+        position,
+        repeating,
+        stops,
+        hints,
+    })
+}
+
+fn parse_radial_gradient_prelude(
+    value: &str,
+) -> Option<(RadialGradientShape, RadialGradientSize, BackgroundPosition)> {
+    let (size_text, position) = split_radial_gradient_position(value)?;
+    let (shape, size) = parse_radial_gradient_shape_and_size(&size_text)?;
+    Some((shape, size, position))
+}
+
+fn split_radial_gradient_position(value: &str) -> Option<(String, BackgroundPosition)> {
+    let tokens = split_css_top_level_whitespace(value);
+    let Some(at_index) = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("at"))
+    else {
+        return Some((value.to_string(), radial_gradient_center_position()));
+    };
+    let before = tokens[..at_index].join(" ");
+    let after = tokens[at_index + 1..].join(" ");
+    if after.trim().is_empty() {
+        return None;
+    }
+    let position = parse_radial_gradient_position(&after)?;
+    Some((before, position))
+}
+
+fn parse_radial_gradient_shape_and_size(
+    value: &str,
+) -> Option<(RadialGradientShape, RadialGradientSize)> {
+    let tokens = split_css_top_level_whitespace(value);
+    if tokens.is_empty() {
+        return Some((
+            RadialGradientShape::Ellipse,
+            RadialGradientSize::Extent(RadialGradientExtent::FarthestCorner),
+        ));
+    }
+    let mut shape = None;
+    let mut extent = None;
+    let mut lengths = Vec::new();
+    for token in tokens {
+        match token.to_ascii_lowercase().as_str() {
+            "circle" if shape.is_none() => shape = Some(RadialGradientShape::Circle),
+            "ellipse" if shape.is_none() => shape = Some(RadialGradientShape::Ellipse),
+            "closest-side" if extent.is_none() => {
+                extent = Some(RadialGradientExtent::ClosestSide);
+            }
+            "farthest-side" if extent.is_none() => {
+                extent = Some(RadialGradientExtent::FarthestSide);
+            }
+            "closest-corner" if extent.is_none() => {
+                extent = Some(RadialGradientExtent::ClosestCorner);
+            }
+            "farthest-corner" if extent.is_none() => {
+                extent = Some(RadialGradientExtent::FarthestCorner);
+            }
+            _ => lengths.push(parse_computed_length_percentage(&token, ROOT_FONT_SIZE_PT)?),
+        }
+    }
+    if extent.is_some() && !lengths.is_empty() {
+        return None;
+    }
+    let shape = shape.unwrap_or(if lengths.len() == 1 {
+        RadialGradientShape::Circle
+    } else {
+        RadialGradientShape::Ellipse
+    });
+    let size = if let Some(extent) = extent {
+        RadialGradientSize::Extent(extent)
+    } else {
+        match lengths.as_slice() {
+            [] => RadialGradientSize::Extent(RadialGradientExtent::FarthestCorner),
+            [radius] if shape == RadialGradientShape::Circle => {
+                RadialGradientSize::CircleRadius(*radius)
+            }
+            [x, y] if shape == RadialGradientShape::Ellipse => {
+                RadialGradientSize::EllipseRadii { x: *x, y: *y }
+            }
+            _ => return None,
+        }
+    };
+    Some((shape, size))
+}
+
+fn parse_radial_gradient_position(value: &str) -> Option<BackgroundPosition> {
+    let tokens = split_css_top_level_whitespace(value);
+    let lengths = tokens
+        .iter()
+        .map(|token| parse_computed_length_percentage(token, ROOT_FONT_SIZE_PT))
+        .collect::<Option<Vec<_>>>();
+    match lengths.as_deref() {
+        Some([x]) => {
+            return Some(BackgroundPosition {
+                x: BackgroundPositionAxis {
+                    origin: BackgroundPositionOrigin::Start,
+                    offset: *x,
+                },
+                y: BackgroundPositionAxis {
+                    origin: BackgroundPositionOrigin::Center,
+                    offset: ComputedLengthPercentage::ZERO,
+                },
+            });
+        }
+        Some([x, y]) => {
+            return Some(BackgroundPosition {
+                x: BackgroundPositionAxis {
+                    origin: BackgroundPositionOrigin::Start,
+                    offset: *x,
+                },
+                y: BackgroundPositionAxis {
+                    origin: BackgroundPositionOrigin::Start,
+                    offset: *y,
+                },
+            });
+        }
+        _ => {}
+    }
+    parse_background_position(value, ROOT_FONT_SIZE_PT)
+}
+
+fn radial_gradient_center_position() -> BackgroundPosition {
+    BackgroundPosition {
+        x: BackgroundPositionAxis {
+            origin: BackgroundPositionOrigin::Center,
+            offset: ComputedLengthPercentage::ZERO,
+        },
+        y: BackgroundPositionAxis {
+            origin: BackgroundPositionOrigin::Center,
+            offset: ComputedLengthPercentage::ZERO,
+        },
+    }
 }
 
 fn parse_linear_gradient_direction(value: &str) -> Option<LinearGradientDirection> {
-    match value.to_ascii_lowercase().as_str() {
-        "to bottom" => Some(LinearGradientDirection::Bottom),
-        "to top" => Some(LinearGradientDirection::Top),
-        "to right" => Some(LinearGradientDirection::Right),
-        "to left" => Some(LinearGradientDirection::Left),
+    let value = trim_css_value(value);
+    if let Some(angle) = parse_css_angle_degrees(value) {
+        return Some(LinearGradientDirection::Angle(angle));
+    }
+    let tokens = value
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let first = tokens.first()?;
+    if first != "to" {
+        return None;
+    }
+    let rest = &tokens[1..];
+    if rest.is_empty() || rest.len() > 2 {
+        return None;
+    }
+    let mut horizontal = None;
+    let mut vertical = None;
+    for token in rest {
+        match token.as_str() {
+            "left" if horizontal.is_none() => horizontal = Some(GradientHorizontalDirection::Left),
+            "right" if horizontal.is_none() => {
+                horizontal = Some(GradientHorizontalDirection::Right);
+            }
+            "top" if vertical.is_none() => vertical = Some(GradientVerticalDirection::Top),
+            "bottom" if vertical.is_none() => vertical = Some(GradientVerticalDirection::Bottom),
+            _ => return None,
+        }
+    }
+    match (horizontal, vertical) {
+        (None, Some(GradientVerticalDirection::Top)) => Some(LinearGradientDirection::Angle(0.0)),
+        (Some(GradientHorizontalDirection::Right), None) => {
+            Some(LinearGradientDirection::Angle(90.0))
+        }
+        (None, Some(GradientVerticalDirection::Bottom)) => {
+            Some(LinearGradientDirection::Angle(180.0))
+        }
+        (Some(GradientHorizontalDirection::Left), None) => {
+            Some(LinearGradientDirection::Angle(270.0))
+        }
+        (Some(horizontal), Some(vertical)) => Some(LinearGradientDirection::Corner {
+            horizontal,
+            vertical,
+        }),
         _ => None,
     }
 }
 
-fn parse_gradient_color_stop(value: &str) -> Option<GradientColorStop> {
-    let mut parts = value.split_whitespace().collect::<Vec<_>>();
-    if parts.len() < 2 {
+fn parse_css_angle_degrees(value: &str) -> Option<f32> {
+    let value = trim_css_value(value);
+    let mut input = cssparser::ParserInput::new(value);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let token = parser.next().ok()?.clone();
+    let angle = match token {
+        cssparser::Token::Number { value: 0.0, .. } => 0.0,
+        cssparser::Token::Dimension { value, unit, .. } if unit.eq_ignore_ascii_case("deg") => {
+            value
+        }
+        cssparser::Token::Dimension { value, unit, .. } if unit.eq_ignore_ascii_case("grad") => {
+            value * 0.9
+        }
+        cssparser::Token::Dimension { value, unit, .. } if unit.eq_ignore_ascii_case("turn") => {
+            value * 360.0
+        }
+        cssparser::Token::Dimension { value, unit, .. } if unit.eq_ignore_ascii_case("rad") => {
+            value * 180.0 / std::f32::consts::PI
+        }
+        _ => return None,
+    };
+    parser.is_exhausted().then_some(angle)
+}
+
+fn parse_gradient_item(
+    value: &str,
+    stops: &mut Vec<GradientColorStop>,
+    hints: &mut Vec<GradientColorHint>,
+) -> Option<()> {
+    if let Some(position) = parse_computed_length_percentage(value, ROOT_FONT_SIZE_PT) {
+        if stops.is_empty() {
+            return None;
+        }
+        hints.push(GradientColorHint {
+            after_stop: stops.len() - 1,
+            position,
+        });
+        return Some(());
+    }
+    let mut parts = split_css_top_level_whitespace(value);
+    if parts.is_empty() {
         return None;
     }
-    let position = parse_computed_length_percentage(parts.pop()?, ROOT_FONT_SIZE_PT)?;
+    let second_position = parts
+        .last()
+        .and_then(|part| parse_computed_length_percentage(part, ROOT_FONT_SIZE_PT));
+    let first_position = if second_position.is_some() {
+        parts.pop();
+        parts
+            .last()
+            .and_then(|part| parse_computed_length_percentage(part, ROOT_FONT_SIZE_PT))
+    } else {
+        None
+    };
+    if first_position.is_some() {
+        parts.pop();
+    }
     let color_text = parts.join(" ");
     let color = parse_color(&color_text)?;
-    Some(GradientColorStop { color, position })
+    stops.push(GradientColorStop {
+        color,
+        position: first_position.or(second_position),
+    });
+    if let Some(second_position) = first_position.and(second_position) {
+        stops.push(GradientColorStop {
+            color,
+            position: Some(second_position),
+        });
+    }
+    Some(())
+}
+
+fn find_linear_gradient_function(value: &str) -> Option<(bool, usize, usize)> {
+    let lower = value.to_ascii_lowercase();
+    let repeating_name = "repeating-linear-gradient(";
+    let normal_name = "linear-gradient(";
+    let repeating = lower.find(repeating_name);
+    let normal = lower.find(normal_name);
+    match (repeating, normal) {
+        (Some(repeating), Some(normal)) if repeating <= normal => {
+            Some((true, repeating, repeating_name.len()))
+        }
+        (Some(repeating), None) => Some((true, repeating, repeating_name.len())),
+        (_, Some(normal)) => Some((false, normal, normal_name.len())),
+        _ => None,
+    }
+}
+
+fn find_radial_gradient_function(value: &str) -> Option<(bool, usize, usize)> {
+    let lower = value.to_ascii_lowercase();
+    let repeating_name = "repeating-radial-gradient(";
+    let normal_name = "radial-gradient(";
+    let repeating = lower.find(repeating_name);
+    let normal = lower.find(normal_name);
+    match (repeating, normal) {
+        (Some(repeating), Some(normal)) if repeating <= normal => {
+            Some((true, repeating, repeating_name.len()))
+        }
+        (Some(repeating), None) => Some((true, repeating, repeating_name.len())),
+        (_, Some(normal)) => Some((false, normal, normal_name.len())),
+        _ => None,
+    }
+}
+
+fn split_css_top_level_whitespace(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote.is_some() {
+            if character == '\\' {
+                escaped = true;
+            } else if Some(character) == quote {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '"' | '\'' => quote = Some(character),
+            '(' => {
+                depth += 1;
+                start.get_or_insert(index);
+            }
+            ')' => depth = depth.saturating_sub(1),
+            ch if ch.is_whitespace() && depth == 0 => {
+                if let Some(token_start) = start.take()
+                    && token_start < index
+                {
+                    parts.push(value[token_start..index].to_string());
+                }
+            }
+            _ => {
+                start.get_or_insert(index);
+            }
+        }
+    }
+    if let Some(token_start) = start
+        && token_start < value.len()
+    {
+        parts.push(value[token_start..].to_string());
+    }
+    parts
 }
 
 fn matching_function_end(value: &str, open_paren: usize) -> Option<usize> {
@@ -528,9 +928,9 @@ fn split_comma_function_args(value: &str) -> Vec<String> {
 }
 
 pub(super) fn split_background_position_size(value: &str) -> Option<(String, String)> {
-    let slash = value.find('/')?;
-    let before = strip_background_noise(&value[..slash]);
-    let after = strip_background_noise(&value[slash + 1..]);
+    let (position, size) = split_top_level_once(value, '/')?;
+    let before = strip_background_noise(position);
+    let after = strip_background_noise(size);
     Some((before, after))
 }
 

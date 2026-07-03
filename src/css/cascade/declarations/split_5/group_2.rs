@@ -1,0 +1,591 @@
+use super::*;
+
+pub(in crate::css) fn apply_cascaded_declaration_group_2(
+    style: &mut ComputedStyle,
+    name: &str,
+    value: &str,
+    declaration: &CascadedDeclaration<'_>,
+    inheritance_source: &ComputedStyle,
+    parent_ch_advance: f32,
+) -> bool {
+    match name {
+        "outline-offset" => {
+            if let Some(length) = parse_computed_length_percentage(value, style.font_size)
+                && length.percent == 0.0
+            {
+                style.outline_offset = length;
+            }
+        }
+        "border-block-style" => {
+            if let Some([start, end]) = parse_logical_border_styles(value)
+                && let Some([start_side, end_side]) =
+                    logical_axis_sides(name, style.direction, style.writing_mode)
+            {
+                set_border_side_style_value(style, start_side, start);
+                set_border_side_style_value(style, end_side, end);
+            }
+        }
+        "border-inline-style" => {
+            if let Some([start, end]) = parse_logical_border_styles(value)
+                && let Some([start_side, end_side]) =
+                    logical_axis_sides(name, style.direction, style.writing_mode)
+            {
+                set_border_side_style_value(style, start_side, start);
+                set_border_side_style_value(style, end_side, end);
+            }
+        }
+        "border-radius" => {
+            if let Some(radius) = parse_border_radius(value, style.font_size) {
+                style.border_radius = radius;
+            }
+        }
+        "corner" => {
+            if let Some((radius, shapes)) = parse_corner_shorthand(value, style.font_size) {
+                style.border_radius = radius;
+                style.corner_shapes = shapes;
+            }
+        }
+        "corner-shape" => {
+            if let Some(shapes) = parse_corner_shapes(value) {
+                style.corner_shapes = shapes;
+            }
+        }
+        "border-top-left-radius" => {
+            if let Some(radius) = parse_corner_radius(value, style.font_size) {
+                style.border_radius.top_left = radius;
+            }
+        }
+        "border-top-right-radius" => {
+            if let Some(radius) = parse_corner_radius(value, style.font_size) {
+                style.border_radius.top_right = radius;
+            }
+        }
+        "border-bottom-right-radius" => {
+            if let Some(radius) = parse_corner_radius(value, style.font_size) {
+                style.border_radius.bottom_right = radius;
+            }
+        }
+        "border-bottom-left-radius" => {
+            if let Some(radius) = parse_corner_radius(value, style.font_size) {
+                style.border_radius.bottom_left = radius;
+            }
+        }
+        "corner-top-left-shape" => {
+            if let Some(shape) = parse_corner_shape(value) {
+                style.corner_shapes.top_left = shape;
+            }
+        }
+        "corner-top-right-shape" => {
+            if let Some(shape) = parse_corner_shape(value) {
+                style.corner_shapes.top_right = shape;
+            }
+        }
+        "corner-bottom-right-shape" => {
+            if let Some(shape) = parse_corner_shape(value) {
+                style.corner_shapes.bottom_right = shape;
+            }
+        }
+        "corner-bottom-left-shape" => {
+            if let Some(shape) = parse_corner_shape(value) {
+                style.corner_shapes.bottom_left = shape;
+            }
+        }
+        "border-start-start-radius"
+        | "border-start-end-radius"
+        | "border-end-start-radius"
+        | "border-end-end-radius" => {
+            if let Some(physical) =
+                logical_corner_radius_longhand(name, style.direction, style.writing_mode)
+                && let Some(radius) = parse_corner_radius(value, style.font_size)
+            {
+                match physical {
+                    "border-top-left-radius" => style.border_radius.top_left = radius,
+                    "border-top-right-radius" => style.border_radius.top_right = radius,
+                    "border-bottom-right-radius" => style.border_radius.bottom_right = radius,
+                    "border-bottom-left-radius" => style.border_radius.bottom_left = radius,
+                    _ => {}
+                }
+            }
+        }
+        "border-top-style" => set_border_side_style(style, BorderSide::Top, value),
+        "border-right-style" => set_border_side_style(style, BorderSide::Right, value),
+        "border-bottom-style" => set_border_side_style(style, BorderSide::Bottom, value),
+        "border-left-style" => set_border_side_style(style, BorderSide::Left, value),
+        "border-block-start-style"
+        | "border-block-end-style"
+        | "border-inline-start-style"
+        | "border-inline-end-style" => {
+            if let Some(side) = logical_border_side(name, style.direction, style.writing_mode) {
+                set_border_side_style(style, side, value);
+            }
+        }
+        "border-collapse" => {
+            style.border_collapse = match value.to_ascii_lowercase().as_str() {
+                "collapse" => BorderCollapse::Collapse,
+                "separate" => BorderCollapse::Separate,
+                _ => style.border_collapse,
+            };
+        }
+        "caption-side" => {
+            style.caption_side = match value.to_ascii_lowercase().as_str() {
+                "top" => CaptionSide::Top,
+                "bottom" => CaptionSide::Bottom,
+                _ => style.caption_side,
+            };
+        }
+        "table-layout" => {
+            style.table_layout = match value.to_ascii_lowercase().as_str() {
+                "auto" => TableLayout::Auto,
+                "fixed" => TableLayout::Fixed,
+                _ => style.table_layout,
+            };
+        }
+        "empty-cells" => {
+            style.empty_cells = match value.to_ascii_lowercase().as_str() {
+                "show" => EmptyCells::Show,
+                "hide" => EmptyCells::Hide,
+                _ => style.empty_cells,
+            };
+        }
+        "border-spacing" => {
+            if let Some(spacing) = parse_border_spacing(value, style.font_size) {
+                style.border_spacing = spacing;
+                style.border_spacing_explicit = declaration.origin == StylesheetOrigin::Author;
+            }
+        }
+        "background" => {
+            apply_background_shorthand(style, value, declaration.base_url, declaration.root_url)
+        }
+        "background-color" => {
+            style.background_color = parse_color(value);
+        }
+        "background-image" => {
+            apply_background_image_list(style, value, declaration.base_url, declaration.root_url);
+        }
+        "background-size" => {
+            apply_background_size_list(style, value);
+        }
+        "background-position" => {
+            apply_background_position_list(style, value);
+        }
+        "background-repeat" => {
+            apply_background_repeat_list(style, value);
+        }
+        "background-origin" => {
+            apply_background_origin_list(style, value);
+        }
+        "background-clip" => {
+            apply_background_clip_list(style, value);
+        }
+        "border-image" => {
+            if let Some(mut border_image) = parse_border_image(value, style.font_size) {
+                border_image.source_base_url = border_image
+                    .source
+                    .as_ref()
+                    .and_then(|_| declaration.base_url.map(std::path::Path::to_path_buf));
+                border_image.source_root_url = border_image
+                    .source
+                    .as_ref()
+                    .and_then(|_| declaration.root_url.map(std::path::Path::to_path_buf));
+                style.border_image = border_image;
+            }
+        }
+        "border-image-source" => {
+            if let Some(source) = parse_border_image_source(value) {
+                style.border_image.source = source;
+                style.border_image.source_base_url = style
+                    .border_image
+                    .source
+                    .as_ref()
+                    .and_then(|_| declaration.base_url.map(std::path::Path::to_path_buf));
+                style.border_image.source_root_url = style
+                    .border_image
+                    .source
+                    .as_ref()
+                    .and_then(|_| declaration.root_url.map(std::path::Path::to_path_buf));
+            }
+        }
+        "border-image-slice" => {
+            if let Some(slice) = parse_border_image_slice(value) {
+                style.border_image.slice = slice;
+            }
+        }
+        "border-image-width" => {
+            if let Some(width) = parse_border_image_width(value, style.font_size) {
+                style.border_image.width = width;
+            }
+        }
+        "border-image-outset" => {
+            if let Some(outset) = parse_border_image_outset(value, style.font_size) {
+                style.border_image.outset = outset;
+            }
+        }
+        "border-image-repeat" => {
+            if let Some(repeat) = parse_border_image_repeat(value) {
+                style.border_image.repeat = repeat;
+            }
+        }
+        "color" => {
+            if let Some(color) = parse_color(value) {
+                style.color = color;
+            }
+        }
+        "font-size" => {
+            // Applied in a pre-pass so same-rule `em` lengths use the
+            // element's computed font size instead of declaration order.
+        }
+        "font" => {
+            if let Some(font) = parse_font_shorthand_with_line_height_font_size(
+                value,
+                inheritance_source.font_size,
+                parent_ch_advance,
+                style.font_weight,
+                Some(style.font_size),
+            ) {
+                style.font_style = font.style;
+                style.font_weight = font.weight;
+                style.font_width = font.width;
+                style.font_family = font.family;
+                style.font_size_adjust = FontSizeAdjust::None;
+                style.font_variant_ligatures = FontVariantLigatures::Normal;
+                style.font_variant_position = FontVariantPosition::Normal;
+                style.font_variant_caps = font.variant_caps;
+                style.font_variant_numeric = FontVariantNumeric::Normal;
+                style.font_variant_alternates = FontVariantAlternates::Normal;
+                style.font_variant_east_asian = FontVariantEastAsian::Normal;
+                style.font_variant_emoji = FontVariantEmoji::Normal;
+                style.line_height_value = font.line_height.unwrap_or(ComputedLineHeight::Normal);
+                project_line_height(style);
+            }
+        }
+        "line-height" => {
+            if let Some(line_height) = parse_computed_line_height(value, style.font_size) {
+                style.line_height_value = line_height;
+                project_line_height(style);
+            }
+        }
+        "letter-spacing" => {
+            if let Some(letter_spacing) = parse_letter_spacing(value, style.font_size) {
+                style.letter_spacing = letter_spacing;
+            }
+        }
+        "word-spacing" => {
+            if let Some(word_spacing) = parse_word_spacing(value, style.font_size) {
+                style.word_spacing = word_spacing;
+            }
+        }
+        "width" => {
+            style.box_values.width =
+                parse_computed_box_size(value, style.font_size).unwrap_or(style.box_values.width);
+        }
+        "height" => {
+            style.box_values.height =
+                parse_computed_box_size(value, style.font_size).unwrap_or(style.box_values.height);
+        }
+        "aspect-ratio" => {
+            if let Some(aspect_ratio) = parse_aspect_ratio(value) {
+                style.aspect_ratio = aspect_ratio;
+            }
+        }
+        "min-width" => {
+            style.box_values.min_width = parse_computed_box_size(value, style.font_size)
+                .unwrap_or(style.box_values.min_width);
+        }
+        "max-width" => {
+            style.box_values.max_width = parse_computed_box_size(value, style.font_size)
+                .unwrap_or(style.box_values.max_width);
+        }
+        "min-height" => {
+            style.box_values.min_height = parse_computed_box_size(value, style.font_size)
+                .unwrap_or(style.box_values.min_height);
+        }
+        "max-height" => {
+            style.box_values.max_height = parse_computed_box_size(value, style.font_size)
+                .unwrap_or(style.box_values.max_height);
+        }
+        "box-sizing" => {
+            style.box_sizing = match value.to_ascii_lowercase().as_str() {
+                "border-box" => BoxSizing::BorderBox,
+                "content-box" => BoxSizing::ContentBox,
+                _ => style.box_sizing,
+            };
+        }
+        "left" => {
+            style.box_values.inset_left =
+                parse_computed_length_percentage_auto(value, style.font_size)
+                    .unwrap_or(style.box_values.inset_left);
+        }
+        "top" => {
+            style.box_values.inset_top =
+                parse_computed_length_percentage_auto(value, style.font_size)
+                    .unwrap_or(style.box_values.inset_top);
+        }
+        "right" => {
+            style.box_values.inset_right =
+                parse_computed_length_percentage_auto(value, style.font_size)
+                    .unwrap_or(style.box_values.inset_right);
+        }
+        "bottom" => {
+            style.box_values.inset_bottom =
+                parse_computed_length_percentage_auto(value, style.font_size)
+                    .unwrap_or(style.box_values.inset_bottom);
+        }
+        "position" => {
+            if let Some(name) = parse_running_position(value) {
+                // CSS GCPM running elements are removed from normal flow
+                // and become available to page-margin `element()`.
+                // https://www.w3.org/TR/css-gcpm-3/#running-elements
+                style.position = Position::Static;
+                style.running_element_name = Some(name);
+            } else {
+                style.position = match value.to_ascii_lowercase().as_str() {
+                    "absolute" => Position::Absolute,
+                    "fixed" => Position::Fixed,
+                    "sticky" => Position::Sticky,
+                    "relative" => Position::Relative,
+                    "static" => Position::Static,
+                    _ => style.position,
+                };
+                style.running_element_name = None;
+            }
+        }
+        "float" => {
+            style.float = match value.to_ascii_lowercase().as_str() {
+                "left" => Float::Left,
+                "right" => Float::Right,
+                "inline-start" => Float::InlineStart,
+                "inline-end" => Float::InlineEnd,
+                "none" => Float::None,
+                _ => style.float,
+            };
+        }
+        "clear" => {
+            style.clear = match value.to_ascii_lowercase().as_str() {
+                "left" => Clear::Left,
+                "right" => Clear::Right,
+                "both" => Clear::Both,
+                "inline-start" => Clear::InlineStart,
+                "inline-end" => Clear::InlineEnd,
+                "none" => Clear::None,
+                _ => style.clear,
+            };
+        }
+        "z-index" => {
+            let value = value.trim();
+            style.z_index = if value.eq_ignore_ascii_case("auto") {
+                None
+            } else {
+                value.parse::<i32>().ok().or(style.z_index)
+            };
+        }
+        "opacity" => {
+            if let Some(opacity) = parse_opacity(value) {
+                style.opacity = opacity;
+            }
+        }
+        "transform" => {
+            if let Some(transform) = parse_transform(value, style.font_size) {
+                style.transform = transform;
+            }
+        }
+        "transform-origin" => {
+            if let Some(origin) = parse_transform_origin(value, style.font_size) {
+                style.transform_origin = origin;
+            }
+        }
+        "isolation" => {
+            style.isolation = match value.to_ascii_lowercase().as_str() {
+                "isolate" => Isolation::Isolate,
+                "auto" => Isolation::Auto,
+                _ => style.isolation,
+            };
+        }
+        "mix-blend-mode" => {
+            if let Some(mode) = parse_mix_blend_mode(value) {
+                style.mix_blend_mode = mode;
+            }
+        }
+        "filter" => {
+            let value = trim_css_value(value);
+            style.filter = if value.eq_ignore_ascii_case("none") {
+                FilterValue::None
+            } else {
+                FilterValue::Functions(value.to_string())
+            };
+        }
+        "clip-path" => {
+            if let Some(clip_path) = parse_clip_path(value) {
+                style.clip_path = clip_path;
+            }
+        }
+        "mask" | "mask-image" => {
+            let value = trim_css_value(value);
+            style.mask = if value.eq_ignore_ascii_case("none") {
+                MaskValue::None
+            } else {
+                MaskValue::Image(value.to_string())
+            };
+        }
+        "contain" => {
+            if let Some(contain) = parse_contain(value) {
+                style.contain = contain;
+            }
+        }
+        "content-visibility" => {
+            style.content_visibility = match value.to_ascii_lowercase().as_str() {
+                "visible" => ContentVisibility::Visible,
+                "auto" => ContentVisibility::Auto,
+                "hidden" => ContentVisibility::Hidden,
+                _ => style.content_visibility,
+            };
+        }
+        "will-change" => {
+            if let Some(will_change) = parse_will_change(value) {
+                style.will_change = will_change;
+            }
+        }
+        "text-align" => {
+            if value.eq_ignore_ascii_case("justify-all") {
+                style.text_align = TextAlign::JustifyAll;
+                style.text_align_last = TextAlignLast::Auto;
+            } else if let Some(align) = parse_text_align_all(value, inheritance_source, true) {
+                style.text_align = align;
+                style.text_align_last = TextAlignLast::Auto;
+            }
+        }
+        "text-align-all" => {
+            if let Some(align) = parse_text_align_all(value, inheritance_source, false) {
+                style.text_align = align;
+            }
+        }
+        "text-align-last" => {
+            if let Some(align) = parse_text_align_last(value, inheritance_source) {
+                style.text_align_last = align;
+            }
+        }
+        "text-justify" => {
+            style.text_justify = match value.trim().to_ascii_lowercase().as_str() {
+                "auto" => TextJustify::Auto,
+                "inter-word" => TextJustify::InterWord,
+                "inter-character" | "distribute" => TextJustify::InterCharacter,
+                "none" => TextJustify::None,
+                _ => style.text_justify,
+            };
+        }
+        "text-autospace" => {
+            if let Some(text_autospace) = parse_text_autospace(value) {
+                style.text_autospace = text_autospace;
+            }
+        }
+        "text-indent" => {
+            if let Some(text_indent) = parse_text_indent(value, style.font_size) {
+                style.text_indent = text_indent;
+            }
+        }
+        "hanging-punctuation" => {
+            if let Some(hanging_punctuation) = parse_hanging_punctuation(value) {
+                style.hanging_punctuation = hanging_punctuation;
+            }
+        }
+        "vertical-align" => {
+            if let Some(vertical_align) = parse_vertical_align(value, style.font_size) {
+                style.vertical_align = vertical_align;
+            }
+        }
+        "dominant-baseline" => {
+            if let Some(dominant_baseline) = parse_dominant_baseline(value) {
+                style.vertical_align.dominant_baseline = dominant_baseline;
+            }
+        }
+        "alignment-baseline" => {
+            if let Some(alignment_baseline) = parse_alignment_baseline(value) {
+                style.vertical_align.alignment_baseline = alignment_baseline;
+            }
+        }
+        "baseline-source" => {
+            if let Some(baseline_source) = parse_baseline_source(value) {
+                style.vertical_align.baseline_source = baseline_source;
+            }
+        }
+        "baseline-shift" => {
+            if let Some(baseline_shift) = parse_baseline_shift(value, style.font_size) {
+                style.vertical_align.baseline_shift = baseline_shift;
+            }
+        }
+        "font-weight" => {
+            if let Some(weight) = parse_font_weight(value, style.font_weight) {
+                style.font_weight = weight;
+            }
+        }
+        "font-style" => {
+            if let Some(font_style) = parse_font_style(value) {
+                style.font_style = font_style;
+            }
+        }
+        "font-width" | "font-stretch" => {
+            if let Some(width) = parse_font_width(value) {
+                style.font_width = width;
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Parses CSS Sizing `aspect-ratio`.
+///
+/// The computed value preserves whether `auto` was supplied so replaced
+/// elements can continue to use their natural ratio, while non-replaced boxes
+/// can expose the authored preferred ratio:
+/// <https://www.w3.org/TR/css-sizing-4/#aspect-ratio>.
+fn parse_aspect_ratio(value: &str) -> Option<AspectRatio> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("auto") {
+        return Some(AspectRatio::AUTO);
+    }
+
+    let normalized = value.replace('/', " / ");
+    let mut tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let auto = if tokens
+        .first()
+        .is_some_and(|token| token.eq_ignore_ascii_case("auto"))
+    {
+        tokens.remove(0);
+        true
+    } else if tokens
+        .last()
+        .is_some_and(|token| token.eq_ignore_ascii_case("auto"))
+    {
+        tokens.pop();
+        true
+    } else {
+        false
+    };
+
+    if tokens.is_empty()
+        || tokens
+            .iter()
+            .any(|token| token.eq_ignore_ascii_case("auto"))
+    {
+        return None;
+    }
+
+    let ratio = match tokens.as_slice() {
+        [width] => parse_positive_css_number(width)?,
+        [width, "/", height] => {
+            parse_positive_css_number(width)? / parse_positive_css_number(height)?
+        }
+        _ => return None,
+    };
+
+    if auto {
+        Some(AspectRatio::auto_with_ratio(ratio))
+    } else {
+        Some(AspectRatio::from_ratio(ratio))
+    }
+}
+
+fn parse_positive_css_number(value: &str) -> Option<f32> {
+    let number = value.parse::<f32>().ok()?;
+    (number.is_finite() && number > 0.0).then_some(number)
+}

@@ -174,11 +174,6 @@ impl TableCellBorderBox {
         placement.top_y_for(self.rect.origin.y)
     }
 
-    #[allow(dead_code)]
-    pub(super) fn bottom_y(self, placement: TableGridPlacement) -> f32 {
-        self.top_y(placement) - self.height()
-    }
-
     pub(super) fn content_box(
         self,
         placement: TableGridPlacement,
@@ -218,6 +213,16 @@ pub(super) struct TableCellContentBox {
 }
 
 impl TableCellContentBox {
+    /// Construct a projected content box from an already resolved page-top rect.
+    ///
+    /// This is used by replay/planning paths that create the same table-cell
+    /// block-container coordinate system without going back through grid
+    /// placement:
+    /// <https://www.w3.org/TR/CSS22/tables.html#model>.
+    pub(super) fn from_page_top_rect(rect: PageTopRect) -> Self {
+        Self { rect }
+    }
+
     /// The physical inline-start edge used by Quire's block container state.
     ///
     /// The value is page/container-local after projecting the CSS table-cell
@@ -349,7 +354,7 @@ mod tests {
         );
         assert_eq!(border_box.x(placement), 35.0);
         assert_eq!(border_box.top_y(placement), 175.0);
-        assert_eq!(border_box.bottom_y(placement), 145.0);
+        assert_eq!(border_box.top_y(placement) - border_box.height(), 145.0);
         assert_eq!(
             placement.overflow_clip_for(border_box.rect()),
             OverflowClip::from_paint_rect(paint_space_rect(35.0, 145.0, 60.0, 30.0))

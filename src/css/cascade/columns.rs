@@ -44,16 +44,17 @@ pub(super) fn parse_column_width(value: &str, font_size: f32) -> Option<Computed
 
 /// Parses `column-gap` into its computed CSS value.
 ///
-/// CSS Box Alignment defines `column-gap` as `normal | <length-percentage>`;
-/// Multi-column layout gives `normal` a used value of `1em`, so the computed
-/// keyword must be preserved until layout:
-/// <https://www.w3.org/TR/css-align-3/#column-row-gap> and
+/// CSS Gaps defines `column-gap` as `normal | <length-percentage> |
+/// <line-width>`. Multi-column layout gives `normal` a used value of `1em`,
+/// so the computed keyword must be preserved until layout:
+/// <https://drafts.csswg.org/css-gaps-1/#column-row-gap> and
 /// <https://www.w3.org/TR/css-multicol-1/#cgap>.
 pub(super) fn parse_column_gap(value: &str, font_size: f32) -> Option<ComputedGap> {
     if trim_css_value(value).eq_ignore_ascii_case("normal") {
         Some(ComputedGap::Normal)
     } else {
-        let gap = parse_computed_length_percentage(value, font_size)?;
+        let gap = parse_computed_border_width(value, font_size)
+            .or_else(|| parse_computed_length_percentage(value, font_size))?;
         (!length_percentage_is_definitely_negative(gap))
             .then_some(ComputedGap::LengthPercentage(gap))
     }
@@ -61,14 +62,15 @@ pub(super) fn parse_column_gap(value: &str, font_size: f32) -> Option<ComputedGa
 
 /// Parses `row-gap`/`gap` components into computed CSS gap values.
 ///
-/// CSS Box Alignment defines gap properties as `normal | <length-percentage>`
-/// and requires negative values to be invalid:
-/// <https://www.w3.org/TR/css-align-3/#gaps>.
+/// CSS Gaps defines gap properties as `normal | <length-percentage> |
+/// <line-width>` and requires negative values to be invalid:
+/// <https://drafts.csswg.org/css-gaps-1/#column-row-gap>.
 pub(super) fn parse_gap(value: &str, font_size: f32) -> Option<ComputedGap> {
     if trim_css_value(value).eq_ignore_ascii_case("normal") {
         Some(ComputedGap::Normal)
     } else {
-        let gap = parse_computed_length_percentage(value, font_size)?;
+        let gap = parse_computed_border_width(value, font_size)
+            .or_else(|| parse_computed_length_percentage(value, font_size))?;
         (!length_percentage_is_definitely_negative(gap))
             .then_some(ComputedGap::LengthPercentage(gap))
     }
@@ -83,7 +85,7 @@ pub(super) fn parse_gap(value: &str, font_size: f32) -> Option<ComputedGap> {
 /// <https://www.w3.org/TR/css-align-3/#gaps> and
 /// <https://www.w3.org/TR/css-values-4/#calc-range>.
 fn length_percentage_is_definitely_negative(value: ComputedLengthPercentage) -> bool {
-    let components = [value.length, value.percent, value.ch];
+    let components = [value.length_points(), value.percent, value.ch];
     components.iter().any(|component| *component < 0.0)
         && components.iter().all(|component| *component <= 0.0)
 }

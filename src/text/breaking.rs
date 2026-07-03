@@ -3,38 +3,6 @@ use super::*;
 pub(super) const SOFT_HYPHEN: char = '\u{00ad}';
 pub(super) const ZERO_WIDTH_SPACE: char = '\u{200b}';
 
-#[allow(dead_code)]
-pub(super) fn line_ends_with_visible_soft_hyphen(
-    text: &str,
-    range: &Range<usize>,
-    break_reason: BreakReason,
-) -> bool {
-    matches!(break_reason, BreakReason::Regular | BreakReason::Emergency)
-        && range.end > range.start
-        && text[..range.end].ends_with(SOFT_HYPHEN)
-}
-
-#[allow(dead_code)]
-pub(super) fn normalize_soft_hyphens(
-    mut text: String,
-    visible_trailing_soft_hyphen: bool,
-) -> String {
-    if text.contains(ZERO_WIDTH_SPACE) {
-        text = text.replace(ZERO_WIDTH_SPACE, "");
-    }
-    if !text.contains(SOFT_HYPHEN) {
-        return text;
-    }
-    if visible_trailing_soft_hyphen && text.ends_with(SOFT_HYPHEN) {
-        text.pop();
-        text = text.replace(SOFT_HYPHEN, "");
-        text.push('-');
-        text
-    } else {
-        text.replace(SOFT_HYPHEN, "")
-    }
-}
-
 pub(crate) fn text_with_hyphenation_controls<'a>(
     text: &'a str,
     style: &ComputedStyle,
@@ -275,7 +243,6 @@ fn pre_wrap_preserved_tab_breaks(text: &str) -> impl Iterator<Item = usize> + '_
 /// CSS Text's atomic-inline tailoring still allows U+00A0 NBSP next to an
 /// atomic inline:
 /// <https://www.w3.org/TR/css-text-3/#line-break-details>.
-#[allow(dead_code)]
 pub(crate) fn inline_atomic_boundary_allows_soft_wrap(
     before: &str,
     after: &str,
@@ -397,16 +364,6 @@ fn line_break_class_suppresses_line_start(character: char) -> bool {
             | LineBreak::BreakSymbols
             | LineBreak::Nonstarter
     )
-}
-
-#[allow(dead_code)]
-pub(super) fn measured_emergency_breaks_allowed(style: &ComputedStyle) -> bool {
-    matches!(style.word_break, CssWordBreak::BreakAll)
-        || matches!(style.line_break, CssLineBreak::Anywhere)
-        || matches!(
-            style.overflow_wrap,
-            CssOverflowWrap::Anywhere | CssOverflowWrap::BreakWord
-        )
 }
 
 pub(crate) fn contains_bidi_text(text: &str) -> bool {

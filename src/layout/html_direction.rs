@@ -82,10 +82,13 @@ pub(super) fn layout_element_signature(
     signature.namespace_url = selector_signature.namespace_url.clone();
     signature.namespace_attrs = selector_signature.namespace_attrs.clone();
     signature.is_target = selector_signature.is_target;
-    signature = signature.with_children(
+    signature = signature.with_child_list(
         selector_signature.children,
         selector_signature.has_text_child,
     );
+    if let Some(direction) = element_document_direction(element) {
+        signature = signature.with_document_direction(direction);
+    }
     let html_direction = html_directionality(element);
     if let Some(direction) = html_direction {
         signature = signature.with_html_direction(direction);
@@ -96,6 +99,18 @@ pub(super) fn layout_element_signature(
         .unwrap_or(Direction::Ltr);
     signature = signature.with_resolved_direction(resolved_direction);
     signature
+}
+
+/// Return HTML/document directionality determined by the element itself.
+///
+/// Selectors `:dir()` is defined in terms of the document language, not CSS
+/// `direction`. Explicit `dir=ltr`/`dir=rtl`, `dir=auto`, and omitted `<bdi>`
+/// establish an element direction; an undefined `dir` inherits from the parent
+/// during selector matching:
+/// <https://drafts.csswg.org/selectors/#the-dir-pseudo> and
+/// <https://html.spec.whatwg.org/multipage/dom.html#the-directionality>.
+pub(in crate::layout) fn element_document_direction(element: &Element) -> Option<Direction> {
+    element_dir_attribute_direction(element).or_else(|| html_directionality(element))
 }
 
 /// Apply HTML's dynamic `dir=auto`/`bdi` directionality to a computed style.

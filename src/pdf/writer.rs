@@ -4,9 +4,11 @@ use pdf_writer::types::{
     ActionType, AnnotationType, BlendMode, CidFontType, FontFlags, SystemInfo,
 };
 use pdf_writer::{Name, Pdf, Rect, Ref, Settings, Str, TextStr};
+use std::time::Duration;
 
 pub(crate) fn write_document(document: &Document, variant: PdfVariant) -> Vec<u8> {
-    let _timer = DebugTimer::start("serializing PDF document");
+    let total_timer = DebugTimer::start("serializing PDF document");
+    let mut timings = PdfTimingSummary::new();
     let page_count = document.pages.len();
     let mut allocator = PdfObjectAllocator::new();
 
@@ -16,161 +18,250 @@ pub(crate) fn write_document(document: &Document, variant: PdfVariant) -> Vec<u8
     let page_ids = allocator.alloc_ids(page_count);
     let content_ids = allocator.alloc_ids(page_count);
 
-    let shaped_document = {
-        let _timer = DebugTimer::start("shaping document text for PDF");
-        shape_document_text(document)
-    };
-    let embedded_font_plans = {
-        let first_embedded_font_id = allocator.peek_id();
-        let _timer = DebugTimer::start(format!(
+    let (embedded_font_plans, font_timings) = timings.measure(
+        format!(
             "planning PDF font embedding for {} document font(s)",
             document.fonts.len()
-        ));
-        let profile = if variant.is_pdfa() {
-            PdfFontValidationProfile::PdfA
-        } else {
-            PdfFontValidationProfile::Default
-        };
-        let plans = embedded_font_plans_with_profile(
-            document,
-            &shaped_document,
-            first_embedded_font_id,
-            profile,
-        );
-        allocator.advance_to(
-            first_embedded_font_id + plans.fonts.len() * profile.embedded_font_object_count(),
-        );
-        plans
-    };
+        ),
+        || {
+            let first_embedded_font_id = allocator.peek_id();
+            let profile = if variant.is_pdfa() {
+                PdfFontValidationProfile::PdfA
+            } else {
+                PdfFontValidationProfile::Default
+            };
+            let (plans, font_timings) =
+                timed_embedded_font_plans_with_profile(document, first_embedded_font_id, profile);
+            allocator.advance_to(
+                first_embedded_font_id + plans.fonts.len() * profile.embedded_font_object_count(),
+            );
+            (plans, font_timings)
+        },
+    );
+    timings.record(
+        "PDF font embedding: used glyph collection",
+        font_timings.used_glyph_collection,
+    );
+    timings.record(
+        "PDF font embedding: document font resource mapping",
+        font_timings.font_resource_mapping,
+    );
+    timings.record(
+        "PDF font embedding: audit and subsetting",
+        font_timings.font_audit_subsetting,
+    );
 
-    let (unique_images, page_image_unique_indexes) = deduplicate_images(document);
-    let unique_image_ids = unique_images
-        .iter()
-        .map(|image| {
-            let image_id = allocator.alloc_id();
-            let alpha_mask_id = image.alpha.as_ref().map(|_| allocator.alloc_id());
-            ImageObjectIds {
-                image_id,
-                alpha_mask_id,
-            }
-        })
-        .collect::<Vec<_>>();
-    let page_image_ids = page_image_unique_indexes
-        .iter()
-        .map(|page_images| {
-            page_images
+    let (unique_images, page_image_unique_indexes) = timings
+        .measure("deduplicating and preparing PDF image resources", || {
+            deduplicate_images(document)
+        });
+    let (unique_image_ids, page_image_ids) =
+        timings.measure("assigning PDF image object IDs", || {
+            let unique_image_ids = unique_images
                 .iter()
-                .map(|index| unique_image_ids[*index].image_id)
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+                .map(|image| {
+                    let image_id = allocator.alloc_id();
+                    let alpha_mask_id = image.alpha.as_ref().map(|_| allocator.alloc_id());
+                    ImageObjectIds {
+                        image_id,
+                        alpha_mask_id,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let page_image_ids = page_image_unique_indexes
+                .iter()
+                .map(|page_images| {
+                    page_images
+                        .iter()
+                        .map(|index| unique_image_ids[*index].image_id)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            (unique_image_ids, page_image_ids)
+        });
 
-    let page_renders = {
-        let _timer = DebugTimer::start(format!("building {page_count} page content stream(s)"));
+    let page_renders = timings.measure(
+        format!("building {page_count} page content stream(s)"),
+        || {
+            document
+                .pages
+                .iter()
+                .map(|page| {
+                    let mut next_dynamic_object_id = allocator.peek_id();
+                    let render = page_content_render(
+                        page,
+                        &embedded_font_plans,
+                        &mut next_dynamic_object_id,
+                    );
+                    allocator.advance_to(next_dynamic_object_id);
+                    render
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    let page_ext_gstate_plans = timings.measure("planning PDF page ExtGState resources", || {
         document
             .pages
             .iter()
-            .enumerate()
-            .map(|(index, page)| {
-                let mut next_dynamic_object_id = allocator.peek_id();
-                let render = page_content_render(
-                    page,
-                    &shaped_document.pages[index],
-                    &embedded_font_plans,
-                    &mut next_dynamic_object_id,
-                );
-                allocator.advance_to(next_dynamic_object_id);
-                render
+            .map(|page| {
+                page_ext_gstate_resources(page)
+                    .into_iter()
+                    .map(|resource| ExtGStateObjectPlan {
+                        id: allocator.alloc_id(),
+                        resource,
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>()
-    };
-    let page_ext_gstate_plans = document
-        .pages
-        .iter()
-        .map(|page| {
-            page_ext_gstate_resources(page)
-                .into_iter()
-                .map(|resource| ExtGStateObjectPlan {
-                    id: allocator.alloc_id(),
-                    resource,
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+    });
 
     let info_id = allocator.alloc_id();
     let metadata_id = allocator.alloc_id();
-    let page_annotation_ids = document
-        .pages
-        .iter()
-        .map(|page| page.links.iter().map(|_| allocator.alloc_id()).collect())
-        .collect::<Vec<Vec<_>>>();
-    let outline_plan = {
-        let _timer = DebugTimer::start(format!(
+    let page_annotation_ids = timings.measure("planning PDF annotation IDs", || {
+        document
+            .pages
+            .iter()
+            .map(|page| page.links.iter().map(|_| allocator.alloc_id()).collect())
+            .collect::<Vec<Vec<_>>>()
+    });
+    let outline_plan = timings.measure(
+        format!(
             "planning {} bookmark outline item(s)",
             document.bookmarks.len()
-        ));
-        let plan = outline_plan(document, allocator.peek_id());
-        if let Some(plan) = &plan {
-            allocator.reserve_ids(1 + plan.nodes.len());
-        }
-        plan
-    };
+        ),
+        || {
+            let plan = outline_plan(document, allocator.peek_id());
+            if let Some(plan) = &plan {
+                allocator.reserve_ids(1 + plan.nodes.len());
+            }
+            plan
+        },
+    );
 
     let mut pdf = Pdf::with_settings(Settings::default());
     let (major_version, minor_version) = variant.pdf_version();
     pdf.set_version(major_version, minor_version);
     pdf.set_binary_marker(b"\xE2\xE3\xCF\xD3");
 
-    write_catalog(
-        &mut pdf,
-        catalog_id,
-        pages_id,
-        metadata_id,
-        outline_plan.as_ref(),
-    );
-    write_pages(&mut pdf, pages_id, &page_ids);
-    write_font_resources(&mut pdf, font_id, &embedded_font_plans.fonts);
-    write_pages_and_content(
-        &mut pdf,
-        document,
-        pages_id,
-        font_id,
-        &page_ids,
-        &content_ids,
-        &page_image_ids,
-        &page_annotation_ids,
-        &page_renders,
-        &page_ext_gstate_plans,
-    );
-    write_embedded_fonts(&mut pdf, &embedded_font_plans.fonts);
-    write_images(&mut pdf, &unique_images, &unique_image_ids);
-    write_form_xobjects(
-        &mut pdf,
-        font_id,
-        &page_image_ids,
-        &page_renders,
-        &page_ext_gstate_plans,
-    );
-    write_ext_gstate_objects(&mut pdf, &page_ext_gstate_plans);
-    write_document_info(&mut pdf, pdf_ref(info_id), &document.metadata);
-    write_document_xmp_metadata(&mut pdf, pdf_ref(metadata_id), &document.metadata, variant);
-    write_annotations(&mut pdf, document, &page_annotation_ids);
-    if let Some(outline_plan) = &outline_plan {
-        write_outlines(&mut pdf, outline_plan, &page_ids, document);
-    }
-    pdf.set_file_id(pdf_file_identifier(
-        document,
-        &page_renders,
-        &embedded_font_plans.fonts,
-        &unique_images,
-        &page_ext_gstate_plans,
-    ));
+    timings.measure("writing PDF page tree and content objects", || {
+        write_catalog(
+            &mut pdf,
+            catalog_id,
+            pages_id,
+            metadata_id,
+            outline_plan.as_ref(),
+        );
+        write_pages(&mut pdf, pages_id, &page_ids);
+        write_font_resources(&mut pdf, font_id, &embedded_font_plans.fonts);
+        write_pages_and_content(
+            &mut pdf,
+            document,
+            pages_id,
+            font_id,
+            &page_ids,
+            &content_ids,
+            &page_image_ids,
+            &page_annotation_ids,
+            &page_renders,
+            &page_ext_gstate_plans,
+        );
+    });
+    timings.measure("writing PDF embedded font objects", || {
+        write_embedded_fonts(&mut pdf, &embedded_font_plans.fonts);
+    });
+    timings.measure("writing PDF image objects", || {
+        write_images(&mut pdf, &unique_images, &unique_image_ids);
+    });
+    timings.measure("writing PDF form XObjects", || {
+        write_form_xobjects(
+            &mut pdf,
+            font_id,
+            &page_image_ids,
+            &page_renders,
+            &page_ext_gstate_plans,
+        );
+    });
+    timings.measure("writing PDF ExtGState objects", || {
+        write_ext_gstate_objects(&mut pdf, &page_ext_gstate_plans);
+    });
+    timings.measure("writing PDF metadata, annotations, and outlines", || {
+        write_document_info(&mut pdf, pdf_ref(info_id), &document.metadata);
+        write_document_xmp_metadata(&mut pdf, pdf_ref(metadata_id), &document.metadata, variant);
+        write_annotations(&mut pdf, document, &page_annotation_ids);
+        if let Some(outline_plan) = &outline_plan {
+            write_outlines(&mut pdf, outline_plan, &page_ids, document);
+        }
+    });
+    timings.measure("building deterministic PDF file identifier", || {
+        pdf.set_file_id(pdf_file_identifier(
+            document,
+            &page_renders,
+            &embedded_font_plans.fonts,
+            &unique_images,
+            &page_ext_gstate_plans,
+        ));
+    });
 
-    {
-        let object_count = allocator.peek_id().saturating_sub(1);
-        let _timer = DebugTimer::start(format!("assembling {object_count} PDF object(s)"));
+    let object_count = allocator.peek_id().saturating_sub(1);
+    let bytes = timings.measure(format!("assembling {object_count} PDF object(s)"), || {
         pdf.finish()
+    });
+    let total = total_timer.finish();
+    timings.log_summary(total);
+    bytes
+}
+
+#[derive(Debug, Default)]
+struct PdfTimingSummary {
+    stages: Vec<PdfTimingStage>,
+}
+
+#[derive(Debug)]
+struct PdfTimingStage {
+    label: String,
+    elapsed: Duration,
+}
+
+impl PdfTimingSummary {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn measure<T>(&mut self, label: impl Into<String>, work: impl FnOnce() -> T) -> T {
+        let label = label.into();
+        let timer = DebugTimer::start(label.clone());
+        let output = work();
+        let elapsed = timer.finish();
+        self.record(label, elapsed);
+        output
+    }
+
+    fn record(&mut self, label: impl Into<String>, elapsed: Duration) {
+        self.stages.push(PdfTimingStage {
+            label: label.into(),
+            elapsed,
+        });
+    }
+
+    fn log_summary(&self, total: Duration) {
+        let total_seconds = total.as_secs_f64();
+        log::debug!(
+            "PDF timing summary: total {:.3?}; nested stages included, percentages are of total and do not sum to 100%",
+            total
+        );
+        for stage in &self.stages {
+            let percent = if total_seconds > 0.0 {
+                stage.elapsed.as_secs_f64() * 100.0 / total_seconds
+            } else {
+                0.0
+            };
+            log::debug!(
+                "PDF timing summary: {:>6.2}% {:>10.3?} {}",
+                percent,
+                stage.elapsed,
+                stage.label
+            );
+        }
     }
 }
 

@@ -44,7 +44,7 @@ pub(crate) fn parse_rgb_function(value: &str) -> Option<Color> {
         if !(parts.len() == 3 || parts.len() == 4) {
             return None;
         }
-        let rgb_parts = parts.iter().take(3).copied().collect::<Vec<_>>();
+        let rgb_parts = parts.iter().take(3).copied();
         let alpha_part = parts
             .get(3)
             .copied()
@@ -52,7 +52,6 @@ pub(crate) fn parse_rgb_function(value: &str) -> Option<Color> {
             .or(alpha);
         (
             rgb_parts
-                .into_iter()
                 .map(parse_rgb_channel)
                 .collect::<Option<Vec<_>>>()?,
             alpha_part,

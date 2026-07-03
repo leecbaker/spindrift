@@ -1,7 +1,8 @@
 use crate::document::FontProgramKind;
 use crate::{
     Bookmark, BookmarkState, Color, Document, DocumentFont, DocumentMetadata, Page, PdfVariant,
-    RenderedImage, RenderedPath, RenderedPathCommand, RenderedPathFillRule, RenderedRoundedRect,
+    RenderedGlyph, RenderedImage, RenderedPath, RenderedPathCommand, RenderedPathFillRule,
+    RenderedRoundedRect, RenderedTextMatrix,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -44,36 +45,6 @@ const EMBEDDED_FONT_OBJECTS: usize = 5;
 const EMBEDDED_FONT_OBJECTS_WITH_CID_SET: usize = 6;
 
 #[derive(Debug, Clone, PartialEq)]
-struct ShapedDocument {
-    pages: Vec<Vec<Option<ShapedLine>>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct ShapedLine {
-    runs: Vec<ShapedRun>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct ShapedRun {
-    document_font_id: usize,
-    x_offset: f32,
-    y_offset: f32,
-    text_matrix: crate::RenderedTextMatrix,
-    font_size: f32,
-    glyphs: Vec<ShapedGlyph>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct ShapedGlyph {
-    id: u16,
-    x_advance: f32,
-    nominal_x_advance: f32,
-    x_offset: f32,
-    y_offset: f32,
-    unicode: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 struct EmbeddedFontPlan<'a> {
     font: &'a DocumentFont,
     resource_name: String,
@@ -92,7 +63,6 @@ struct EmbeddedFontPlan<'a> {
     cid_set_data: Option<Vec<u8>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FontEmbeddingKind {
     SubsetRetainedGids,
@@ -101,18 +71,17 @@ enum FontEmbeddingKind {
     Rejected { reason: String },
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PdfFontValidationProfile {
     Default,
+    #[cfg(test)]
     StrictPdf,
     PdfA,
-    PdfUa,
 }
 
 impl PdfFontValidationProfile {
     fn emits_cid_set(self) -> bool {
-        matches!(self, Self::PdfA | Self::PdfUa)
+        matches!(self, Self::PdfA)
     }
 
     fn embedded_font_object_count(self) -> usize {
@@ -194,7 +163,7 @@ mod fonts;
 mod metadata;
 mod outlines;
 mod resources;
-mod shaping;
+mod text;
 mod writer;
 
 use content::*;
@@ -203,7 +172,7 @@ use fonts::*;
 use metadata::*;
 use outlines::*;
 use resources::*;
-use shaping::*;
+use text::*;
 pub(crate) use writer::write_document;
 
 #[cfg(test)]

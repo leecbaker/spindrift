@@ -1,10 +1,11 @@
-# reasyprint
+# Quire PDF renderer
 
-`reasyprint` is a from-scratch Rust HTML/CSS to PDF renderer inspired by
+`quire` is a from-scratch Rust HTML/CSS to PDF renderer inspired by
 WeasyPrint. It exposes a crate API and a CLI, parses HTML with `html5ever`,
-parses CSS syntax with `cssparser`, matches selectors with Servo's `selectors`
-crate, performs simple paged layout, and emits deterministic PDF files with
-Parley-measured text, embedded system fonts, and Type 0 Unicode text resources.
+parses explicit/XML-declared XML input with `xml5ever`, parses CSS syntax with
+`cssparser`, matches selectors with Servo's `selectors` crate, performs simple
+paged layout, and emits deterministic PDF files with Parley-measured text,
+embedded system fonts, and Type 0 Unicode text resources.
 
 The long-term goal is feature parity with WeasyPrint's print-oriented pipeline:
 HTML parsing, CSS cascade, formatting boxes, paged layout, drawing, and PDF
@@ -13,6 +14,9 @@ for parity research and test migration; it is not a runtime dependency.
 
 Current implementation status and the resume checklist live in
 [`PROGRESS.md`](PROGRESS.md).
+
+Design notes on current async usage and future PDF/rendering parallelism live in
+[`docs/CONCURRENCY_AND_PARALLELISM.md`](docs/CONCURRENCY_AND_PARALLELISM.md).
 
 Implemented now:
 
@@ -74,6 +78,10 @@ Use `--string` to force the first argument to be treated as HTML source:
 cargo run -- --string '<h1>Hello</h1><p>From Rust.</p>' /tmp/hello.pdf
 ```
 
+Use `--input-syntax xml` to force XML/XHTML parsing. The default
+`--input-syntax auto` keeps HTML parsing unless the source begins with an XML
+declaration such as `<?xml version="1.0"?>`.
+
 External stylesheets are supported:
 
 ```sh
@@ -104,4 +112,26 @@ use quire::{Html, RenderOptions};
 Html::from_file("KinSNP_example.html")?
     .write_pdf("/tmp/kinsnp.pdf", &RenderOptions::default())?;
 # Ok::<(), quire::Error>(())
+```
+
+## Benchmarking
+
+`cargo bench` has a few useful benchmarks.
+
+When profiling using instruments, you may need to add an entitlement to allow Instruments to inspect the process:
+
+```bash
+codesign --force  --sign - --timestamp=none --entitlements debug.entitlements target/release/quire
+```
+
+```xml
+<!-- debug.entitlements -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.get-task-allow</key>
+  <true/>
+</dict>
+</plist>
 ```

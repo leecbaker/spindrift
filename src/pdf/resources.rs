@@ -188,9 +188,41 @@ fn collect_paint_tree_ext_gstates(
     }
     for band in crate::document::PaintBand::ORDER {
         for item in &context.bands.bands[band.index()] {
-            if let crate::document::PaintDisplayItem::StackingContext(child) = item {
+            match item {
+                crate::document::PaintDisplayItem::StackingContext(child) => {
+                    collect_paint_tree_ext_gstates(alpha_keys, blend_modes, child);
+                }
+                crate::document::PaintDisplayItem::EffectScope(scope) => {
+                    collect_effect_scope_ext_gstates(alpha_keys, blend_modes, scope);
+                }
+                crate::document::PaintDisplayItem::Operation(_)
+                | crate::document::PaintDisplayItem::Primitive(_)
+                | crate::document::PaintDisplayItem::Link(_) => {}
+            }
+        }
+    }
+}
+
+fn collect_effect_scope_ext_gstates(
+    alpha_keys: &mut BTreeMap<u16, ()>,
+    blend_modes: &mut BTreeMap<crate::document::PaintBlendMode, ()>,
+    scope: &crate::document::PaintEffectScope,
+) {
+    collect_opacity_key(alpha_keys, scope.effects.opacity);
+    if scope.effects.blend_mode != crate::document::PaintBlendMode::Normal {
+        blend_modes.insert(scope.effects.blend_mode, ());
+    }
+    for item in &scope.items {
+        match item {
+            crate::document::PaintDisplayItem::StackingContext(child) => {
                 collect_paint_tree_ext_gstates(alpha_keys, blend_modes, child);
             }
+            crate::document::PaintDisplayItem::EffectScope(child) => {
+                collect_effect_scope_ext_gstates(alpha_keys, blend_modes, child);
+            }
+            crate::document::PaintDisplayItem::Operation(_)
+            | crate::document::PaintDisplayItem::Primitive(_)
+            | crate::document::PaintDisplayItem::Link(_) => {}
         }
     }
 }

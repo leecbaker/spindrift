@@ -6,7 +6,7 @@ fn assert_no_red_or_hotpink_rects(document: &quire::Document) {
     let painted = document
         .pages
         .iter()
-        .flat_map(|page| &page.rects)
+        .flat_map(|page| page.rects())
         .filter(|rect| matches!(rect.fill, Some(color) if color == red || color == hotpink))
         .collect::<Vec<_>>();
     assert!(
@@ -25,28 +25,28 @@ async fn supports_absolute_positioned_blocks() {
     .unwrap();
 
     let flow = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Flow")
         .unwrap();
     let abs = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Abs")
         .unwrap();
     let after = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "After")
         .unwrap();
 
     assert_eq!(flow.text, "Flow");
     assert_eq!(abs.text, "Abs");
-    assert_eq!(abs.x(), options.page_margins.left + 20.0);
+    assert_eq!(abs.x(), options.page_margins.left() + 20.0);
     assert_line_baseline_at_top(
         &document,
         abs,
-        options.page_size.height() - options.page_margins.top - 30.0,
+        options.page_size.height() - options.page_margins.top() - 30.0,
     );
     assert_eq!(after.text, "After");
     assert!(after.y() < flow.y());
@@ -157,8 +157,8 @@ async fn supports_positioned_right_and_bottom_offsets() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].x(), 120.0);
-    assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 60.0);
+    assert_eq!(document.pages[0].lines()[0].x(), 120.0);
+    assert_line_baseline_at_top(&document, &document.pages[0].lines()[0], 60.0);
 }
 
 #[tokio::test]
@@ -191,7 +191,7 @@ async fn fixed_generated_before_and_after_boxes_paint_at_page_bottom_right() {
     .unwrap();
 
     let mut blue_rects = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
         .collect::<Vec<_>>();
@@ -217,7 +217,7 @@ async fn absolute_positioned_table_bottom_anchors_border_box_to_page_area() {
     .unwrap();
 
     let table_background = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(238, 238, 238)))
         .max_by(|left, right| left.width().total_cmp(&right.width()))
@@ -239,7 +239,7 @@ async fn generated_before_and_after_content_participates_in_inline_layout() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    let lines = &document.pages[0].lines;
+    let lines = &document.pages[0].lines();
     let invoice = lines
         .iter()
         .find(|line| line.text == "Invoice number:12345")
@@ -260,9 +260,9 @@ async fn absolute_position_static_auto_offsets_start_at_containing_block() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "Auto");
-    assert!((document.pages[0].lines[0].x() - 10.0).abs() < 0.01);
-    assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 110.0);
+    assert_eq!(document.pages[0].lines()[0].text, "Auto");
+    assert!((document.pages[0].lines()[0].x() - 10.0).abs() < 0.01);
+    assert_line_baseline_at_top(&document, &document.pages[0].lines()[0], 110.0);
 }
 
 #[tokio::test]
@@ -274,7 +274,7 @@ async fn absolute_position_applies_non_auto_margins_to_border_edge() {
     .unwrap();
 
     let line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Margin")
         .unwrap();
@@ -292,17 +292,17 @@ async fn absolute_position_auto_offsets_use_static_position_after_flow() {
     .unwrap();
 
     let flow = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Flow")
         .unwrap();
     let auto = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Auto")
         .unwrap();
     let after = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "After")
         .unwrap();
@@ -335,10 +335,10 @@ async fn absolute_block_level_abspos_static_position_after_inline_content() {
 
     let line = |text: &str| {
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .find(|line| line.text == text)
-            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines))
+            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines()))
     };
 
     let inline_before_ltr = line("inline before ltr");
@@ -349,16 +349,33 @@ async fn absolute_block_level_abspos_static_position_after_inline_content() {
     let abs_before_rtl = line("abs before rtl");
     let inline_after_rtl = line("inline after rtl");
     let abs_after_rtl = line("abs after rtl");
+    let line_right = |line: &quire::RenderedLine| line.x() + rendered_line_advance(line);
 
     assert!((abs_before_ltr.y() - inline_before_ltr.y()).abs() < 0.01);
+    assert!(
+        (abs_before_ltr.x() - inline_before_ltr.x()).abs() < 0.01,
+        "ltr before abspos should share the inline-start left edge: inline={inline_before_ltr:?} abs={abs_before_ltr:?}",
+    );
     assert!(
         abs_after_ltr.y() < inline_after_ltr.y() - 7.0,
         "ltr after abspos should be below inline content: inline={inline_after_ltr:?} abs={abs_after_ltr:?}",
     );
+    assert!(
+        (abs_after_ltr.x() - inline_after_ltr.x()).abs() < 0.01,
+        "ltr after abspos should share the inline-start left edge: inline={inline_after_ltr:?} abs={abs_after_ltr:?}",
+    );
     assert!((abs_before_rtl.y() - inline_before_rtl.y()).abs() < 0.01);
+    assert!(
+        (line_right(abs_before_rtl) - line_right(inline_before_rtl)).abs() < 0.01,
+        "rtl before abspos should share the inline-start right edge: inline={inline_before_rtl:?} abs={abs_before_rtl:?}",
+    );
     assert!(
         abs_after_rtl.y() < inline_after_rtl.y() - 7.0,
         "rtl after abspos should be below inline content: inline={inline_after_rtl:?} abs={abs_after_rtl:?}",
+    );
+    assert!(
+        (line_right(abs_after_rtl) - line_right(inline_after_rtl)).abs() < 0.01,
+        "rtl after abspos should share the inline-start right edge: inline={inline_after_rtl:?} abs={abs_after_rtl:?}",
     );
 }
 
@@ -391,10 +408,10 @@ async fn inline_origin_abspos_before_forced_break_uses_placeholder_static_positi
 
     let line = |text: &str| {
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .find(|line| line.text == text)
-            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines))
+            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines()))
     };
 
     let ltr_abs = line("LTRABS");
@@ -402,8 +419,14 @@ async fn inline_origin_abspos_before_forced_break_uses_placeholder_static_positi
     let rtl_abs = line("RTLABS");
     let rtl_following = line("RTLFOLLOW");
 
-    assert!((ltr_abs.y() - ltr_following.y()).abs() < 0.01);
-    assert!((rtl_abs.y() - rtl_following.y()).abs() < 0.01);
+    assert!(
+        ltr_following.y() < ltr_abs.y() - 7.0,
+        "ltr following line should be below the terminal br line: abs={ltr_abs:?} following={ltr_following:?}",
+    );
+    assert!(
+        rtl_following.y() < rtl_abs.y() - 7.0,
+        "rtl following line should be below the terminal br line: abs={rtl_abs:?} following={rtl_following:?}",
+    );
     assert!(
         ltr_abs.x() < 20.0,
         "ltr abspos should use the inline-start placeholder at the left edge: {ltr_abs:?}",
@@ -415,49 +438,131 @@ async fn inline_origin_abspos_before_forced_break_uses_placeholder_static_positi
 }
 
 #[tokio::test]
-async fn auto_positioned_abspos_after_text_before_float() {
+async fn terminal_br_after_inline_abspos_keeps_following_inline_content_visible() {
     let document = Html::from_string(
         "<!DOCTYPE html>\
-         <style>@page { size: 260px 260px; margin: 0 } body, p, div { margin: 0 }</style>\
-         <p style=\"display:none\">Test passes if there is a filled green square and no red.</p>\
-         <div style=\"line-height:20px;\">\
-           &nbsp;\
-           <div style=\"position:absolute; width:200px; height:200px; background:green;\"></div>\
-           <div style=\"float:left; margin-top:20px; width:200px; height:200px; background:red;\"></div>\
-         </div>",
+         <style>\
+         @page { size: 500pt 180pt; margin: 0 }\
+         body, div { margin: 0; font: 10pt/10pt sans-serif }\
+         .rtl { direction: rtl }\
+         .absolute { position: absolute }\
+         .green { background-color: lime; padding: 0 1ch }\
+         </style>\
+         <body>\
+           <div>\
+             <span class=\"absolute green\">Block-level abspos before inline content</span>\
+             <br>\
+           </div>\
+           <div>\
+             <div>Inline content</div>\
+             <div>Block-level abspos after inline content</div>\
+           </div>\
+           <div class=\"rtl\">\
+             <span class=\"absolute green\">Block-level abspos before inline content</span>\
+             <br>\
+           </div>\
+           <div class=\"rtl\">\
+             <div>Inline content</div>\
+             <div>Block-level abspos after inline content</div>\
+           </div>\
+         </body>",
     )
     .render_async(&RenderOptions::default())
     .await
     .unwrap();
 
-    let page = &document.pages[0];
-    let red_index = page
-        .rects
+    let mut abs_lines = document.pages[0]
+        .lines()
         .iter()
-        .position(|rect| rect.fill == Some(Color::new(255, 0, 0)))
-        .expect("red float rectangle should be painted");
-    let green_index = page
-        .rects
+        .filter(|line| line.text == "Block-level abspos before inline content")
+        .collect::<Vec<_>>();
+    let mut inline_lines = document.pages[0]
+        .lines()
         .iter()
-        .position(|rect| rect.fill == Some(Color::new(0, 128, 0)))
-        .unwrap_or_else(|| panic!("green abspos rectangle should be painted: {:?}", page.rects));
-    let red = &page.rects[red_index];
-    let green = &page.rects[green_index];
+        .filter(|line| line.text == "Inline content")
+        .collect::<Vec<_>>();
+    abs_lines.sort_by(|a, b| b.y().total_cmp(&a.y()));
+    inline_lines.sort_by(|a, b| b.y().total_cmp(&a.y()));
 
-    assert!(
-        (green.x() - red.x()).abs() < 0.01
-            && (green.y() - red.y()).abs() < 0.01
-            && (green.width() - red.width()).abs() < 0.01
-            && (green.height() - red.height()).abs() < 0.01,
-        "green abspos should cover the later float: red={red:?} green={green:?}",
-    );
-    assert!(
-        first_rect_paint_operation_index(page, Color::new(0, 128, 0))
-            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
-        "green abspos should paint after red: operations={:?} rects={:?}",
-        page.paint_operations(),
-        page.rects,
-    );
+    assert_eq!(abs_lines.len(), 2, "absolute lines: {abs_lines:?}");
+    assert_eq!(inline_lines.len(), 2, "inline lines: {inline_lines:?}");
+    for (abs, inline) in abs_lines.iter().zip(inline_lines.iter()) {
+        assert!(
+            inline.y() < abs.y() - 7.0,
+            "inline content should be below the terminal br line instead of covered: abs={abs:?} inline={inline:?}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn auto_positioned_abspos_after_text_before_float() {
+    for (case, html) in [
+        (
+            "normal",
+            String::from(
+                "<!DOCTYPE html>\
+             <style>@page { size: 260px 260px; margin: 0 } body, p, div { margin: 0 }</style>\
+             <p style=\"display:none\">Test passes if there is a filled green square and no red.</p>\
+             <div style=\"line-height:20px;\">\
+               &nbsp;\
+               <div style=\"position:absolute; width:200px; height:200px; background:green;\"></div>\
+               <div style=\"float:left; margin-top:20px; width:200px; height:200px; background:red;\"></div>\
+             </div>",
+            ),
+        ),
+        (
+            "negative-margin",
+            String::from(
+                "<!DOCTYPE html>\
+                 <style>@page { size: 800px 600px; margin: 0 }</style>\
+                 <p>Test passes if there is a filled green square and <strong>no red</strong>.</p>\
+                 <div style=\"line-height:20px; margin-top:-20px;\">\
+                   &nbsp;\
+                   <div style=\"position:absolute; width:200px; height:200px; background:green;\"></div>\
+                   <div style=\"float:left; margin-top:20px; width:200px; height:200px; background:red;\"></div>\
+                 </div>",
+            ),
+        ),
+    ] {
+        let document = Html::from_string(html)
+            .render_async(&RenderOptions::default())
+            .await
+            .unwrap();
+
+        let page = &document.pages[0];
+        let red_index = page
+            .rects()
+            .iter()
+            .position(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+            .expect("red float rectangle should be painted");
+        let green_index = page
+            .rects()
+            .iter()
+            .position(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+            .unwrap_or_else(|| {
+                panic!(
+                    "green abspos rectangle should be painted: {:?}",
+                    page.rects()
+                )
+            });
+        let red = &page.rects()[red_index];
+        let green = &page.rects()[green_index];
+
+        assert!(
+            (green.x() - red.x()).abs() < 0.01
+                && (green.y() - red.y()).abs() < 0.01
+                && (green.width() - red.width()).abs() < 0.01
+                && (green.height() - red.height()).abs() < 0.01,
+            "{case}: green abspos should cover the later float: red={red:?} green={green:?}",
+        );
+        assert!(
+            first_rect_paint_operation_index(page, Color::new(0, 128, 0))
+                > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+            "{case}: green abspos should paint after red: operations={:?} rects={:?}",
+            page.paint_operations(),
+            page.rects(),
+        );
+    }
 }
 
 #[tokio::test]
@@ -473,10 +578,10 @@ async fn inline_abspos_static_position_after_forced_break_uses_second_line() {
 
     let line = |text: &str| {
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .find(|line| line.text == text)
-            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines))
+            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines()))
     };
     let first = line("Line 1");
     let second = line("Line 2");
@@ -500,10 +605,10 @@ async fn inline_abspos_static_position_after_inline_text_stays_on_same_line() {
 
     let line = |text: &str| {
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .find(|line| line.text == text)
-            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines))
+            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines()))
     };
     let first = line("Line 1");
     let second = line("Line 2");
@@ -511,6 +616,158 @@ async fn inline_abspos_static_position_after_inline_text_stays_on_same_line() {
     assert!(
         (first.y() - second.y()).abs() < 0.01,
         "abspos inline without a forced break should keep the existing line static position: first={first:?} second={second:?}",
+    );
+}
+
+#[tokio::test]
+async fn inline_block_abspos_static_position_uses_margin_box_top() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 500px 200px; margin: 0 }\
+         body { margin: 0 }\
+         div { background: blue; margin: 1em 0; border: 1px solid black; height: 8em; width: 30em; position: relative }\
+         span { background: yellow; margin: 1em 0; width: 6em; max-width: 6em; height: 6em; position: absolute; left: 7em; display: inline-block }\
+         span:nth-child(2) { background: pink; left: 15em }\
+         span:nth-child(3) { background: lightblue; left: 23em }\
+         </style>\
+         <div><span>one</span><span>two</span><span>three</span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let rect = |color: Color| {
+        page.rects()
+            .iter()
+            .find(|rect| rect.fill == Some(color))
+            .unwrap_or_else(|| panic!("missing {color:?} rect: {:?}", page.rects()))
+    };
+    let parent = rect(Color::new(0, 0, 255));
+    let parent_content_top = parent.y() + parent.height() - 0.75;
+
+    for color in [
+        Color::new(255, 255, 0),
+        Color::new(255, 192, 203),
+        Color::new(173, 216, 230),
+    ] {
+        let child = rect(color);
+        let child_top = child.y() + child.height();
+        assert!(
+            (child.height() - 72.0).abs() < 0.01,
+            "expected 6em child height, got {child:?}",
+        );
+        assert!(
+            (parent_content_top - child_top - 12.0).abs() < 0.01,
+            "inline-block abspos child should start after its 1em top margin: parent={parent:?} child={child:?}",
+        );
+    }
+}
+
+async fn render_inline_abspos_static_position_text_box_trim_case(
+    target_extra: &str,
+    body: &str,
+) -> quire::Document {
+    Html::from_string(format!(
+        "<!DOCTYPE html>\
+         <style>\
+         @page {{ size: 300px 220px; margin: 0 }}\
+         html, body {{ margin: 0; padding: 0 }}\
+         .target {{ position: relative; font: 50px/2 sans-serif; text-box-edge: text; {target_extra} }}\
+         .abs {{ position: absolute; text-box-trim: none }}\
+         </style>\
+         <div class=\"target\">{body}</div>"
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn inline_abspos_static_position_uses_trimmed_text_box_paint_origin() {
+    let body = "A<span class=\"abs\">Abs</span>";
+    let untrimmed = render_inline_abspos_static_position_text_box_trim_case("", body).await;
+    let trimmed =
+        render_inline_abspos_static_position_text_box_trim_case("text-box-trim: trim-start;", body)
+            .await;
+
+    let abs_line_y = |document: &quire::Document| {
+        document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text == "Abs")
+            .unwrap_or_else(|| panic!("missing abspos line: {:?}", document.pages[0].lines()))
+            .y()
+    };
+
+    let delta = abs_line_y(&trimmed) - abs_line_y(&untrimmed);
+    assert!(
+        (delta - 18.75).abs() < 0.5,
+        "trim-start should move the inline abspos static position by the removed start leading: delta={delta}",
+    );
+}
+
+#[tokio::test]
+async fn inline_abspos_static_position_advances_by_trimmed_text_box_line_height() {
+    let body = "A<br><span class=\"abs\">Abs</span>";
+    let untrimmed = render_inline_abspos_static_position_text_box_trim_case("", body).await;
+    let trimmed =
+        render_inline_abspos_static_position_text_box_trim_case("text-box-trim: trim-start;", body)
+            .await;
+
+    let abs_line_y = |document: &quire::Document| {
+        document.pages[0]
+            .lines()
+            .iter()
+            .find(|line| line.text == "Abs")
+            .unwrap_or_else(|| panic!("missing abspos line: {:?}", document.pages[0].lines()))
+            .y()
+    };
+
+    let delta = abs_line_y(&trimmed) - abs_line_y(&untrimmed);
+    assert!(
+        (delta - 18.75).abs() < 0.5,
+        "trimmed first-line height should advance the later inline abspos static position by the removed start leading: delta={delta}",
+    );
+}
+
+#[tokio::test]
+async fn block_abspos_static_position_after_inline_uses_trimmed_text_box_line_height() {
+    let render = |target_extra: &str| {
+        Html::from_string(format!(
+            "<!DOCTYPE html>\
+             <style>\
+             @page {{ size: 300px 220px; margin: 0 }}\
+             html, body, div {{ margin: 0; padding: 0 }}\
+             .target {{ position: relative; font: 50px/2 sans-serif; text-box-edge: text; {target_extra} }}\
+             .abs {{ position: absolute; width: 20px; height: 20px; background: rgb(0, 128, 0); text-box-trim: none }}\
+             </style>\
+             <div class=\"target\"><span>A<div class=\"abs\"></div>X</span></div>"
+        ))
+    };
+    let untrimmed = render("")
+        .render_async(&RenderOptions::default())
+        .await
+        .unwrap();
+    let trimmed = render("text-box-trim: trim-start;")
+        .render_async(&RenderOptions::default())
+        .await
+        .unwrap();
+
+    let abs_rect_y = |document: &quire::Document| {
+        document.pages[0]
+            .rects()
+            .iter()
+            .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+            .unwrap_or_else(|| panic!("missing abspos rect: {:?}", document.pages[0].rects()))
+            .y()
+    };
+
+    let delta = abs_rect_y(&trimmed) - abs_rect_y(&untrimmed);
+    assert!(
+        (delta - 18.75).abs() < 0.5,
+        "trimmed preceding line height should move the block-in-inline abspos static position by the removed start leading: delta={delta}",
     );
 }
 
@@ -527,10 +784,10 @@ async fn inline_abspos_static_position_after_forced_break_preserves_inline_paddi
 
     let line = |text: &str| {
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .find(|line| line.text == text)
-            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines))
+            .unwrap_or_else(|| panic!("missing line {text:?}: {:?}", document.pages[0].lines()))
     };
     let first = line("Line 1");
     let second = line("Line 2");
@@ -548,15 +805,19 @@ async fn inline_abspos_static_position_after_forced_break_preserves_inline_paddi
 #[tokio::test]
 async fn fixed_static_position_inside_static_position_absolute() {
     let document = Html::from_string(
-        "<!DOCTYPE html>\
-         <title>Static position fixed inside static position absolute</title>\
-         <style>@page { size: 100px 100px; margin: 0 } body, p { margin: 0 } p { display: none }</style>\
-         <p>Test passes if there is a filled green square and <strong>no red</strong>.</p>\
-         <div style=\"display: absolute; width: 100px; height: 100px; background: green;\">\
-             <div style=\"position: absolute; width: 50px; height: 50px; margin-left: 50px; margin-top: 50px; background: red;\">\
-                 <div style=\"position: fixed; width: 50px; height: 50px; background: green;\"></div>\
-             </div>\
-         </div>",
+        r#"<!DOCTYPE html>
+<title>Static position fixed inside static position absolute</title>
+<link rel="author" title="Martin Robinson" href="mrobinson@igalia.com">
+<link rel="help" href="https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-width" title="10.3.7 Absolutely positioned, non-replaced elements">
+<link rel="match" href="../../reference/ref-filled-green-100px-square.xht">
+
+<p>Test passes if there is a filled green square and <strong>no red</strong>.</p>
+
+<div style="display: absolute; width: 100px; height: 100px; background: green;">
+    <div style="position: absolute; width: 50px; height: 50px; margin-left: 50px; margin-top: 50px; background: red;">
+        <div style="position: fixed; width: 50px; height: 50px; background: green;"></div>
+    </div>
+</div>"#,
     )
     .render_async(&RenderOptions::default())
     .await
@@ -566,30 +827,71 @@ async fn fixed_static_position_inside_static_position_absolute() {
     let green = Color::new(0, 128, 0);
     let red = Color::new(255, 0, 0);
 
-    for (x, y) in [(3.75, 71.25), (18.75, 18.75), (56.25, 18.75), (71.25, 3.75)] {
-        assert_eq!(final_rect_fill_at(page, x, y), Some(green));
-    }
+    let emitted_rects = emitted_rects_with_fills(page, &[green, red]);
+    assert_eq!(
+        emitted_rects.len(),
+        3,
+        "expected outer green, red absolute, and fixed green rectangles: {emitted_rects:?}",
+    );
+    assert_eq!(
+        emitted_rects
+            .iter()
+            .map(|(_, rect)| rect.fill)
+            .collect::<Vec<_>>(),
+        vec![Some(green), Some(red), Some(green)],
+        "emitted rectangles should follow tree paint order: {emitted_rects:?}",
+    );
 
-    let small_green_operation = page
-        .paint_operations()
-        .iter()
-        .position(|operation| {
-            let quire::PaintOperation::Rect(index) = operation else {
-                return false;
-            };
-            page.rects.get(*index).is_some_and(|rect| {
-                rect.fill == Some(green)
-                    && (rect.width() - 37.5).abs() < 0.01
-                    && (rect.height() - 37.5).abs() < 0.01
-            })
-        })
-        .expect("fixed green rectangle should be present");
+    let (_, outer_green_rect) = emitted_rects[0];
+    let (red_operation, red_rect) = emitted_rects[1];
+    let (small_green_operation, small_green_rect) = emitted_rects[2];
 
     assert!(
-        small_green_operation > first_rect_paint_operation_index(page, red),
+        (outer_green_rect.width() - 75.0).abs() < 0.01
+            && (outer_green_rect.height() - 75.0).abs() < 0.01,
+        "outer green square should be present: {outer_green_rect:?}",
+    );
+
+    assert_eq!(red_rect.x(), small_green_rect.x());
+    assert_eq!(red_rect.y(), small_green_rect.y());
+    assert_eq!(red_rect.height(), small_green_rect.height());
+    assert_eq!(red_rect.width(), small_green_rect.width());
+
+    assert!(
+        (red_rect.width() - 37.5).abs() < 0.01 && (red_rect.height() - 37.5).abs() < 0.01,
+        "red absolute rect should have the expected emitted size: {red_rect:?}",
+    );
+    assert!(
+        same_rect(small_green_rect, red_rect),
+        "fixed green should cover red absolute parent: red={red_rect:?} green={small_green_rect:?}",
+    );
+    assert_final_rect_fill(page, red_rect, green);
+
+    assert!(
+        small_green_operation > red_operation,
         "fixed green should paint after red absolute parent: operations={:?} rects={:?}",
         page.paint_operations(),
-        page.rects,
+        page.rects(),
+    );
+
+    let pdf = document.write_pdf_bytes().unwrap();
+    let pdf_rects = pdf_emitted_rects_with_fills(&pdf, &[green, red]);
+    assert_eq!(
+        pdf_rects.len(),
+        3,
+        "expected three colored PDF rectangles: {pdf_rects:?}",
+    );
+    assert_eq!(
+        pdf_rects.iter().map(|rect| rect.fill).collect::<Vec<_>>(),
+        vec![green, red, green],
+        "PDF rectangles should be emitted in tree paint order: {pdf_rects:?}",
+    );
+
+    let pdf_red_rect = pdf_rects[1].rect;
+    let pdf_small_green_rect = pdf_rects[2].rect;
+    assert!(
+        same_pdf_rect(pdf_red_rect, pdf_small_green_rect),
+        "fixed green PDF rectangle should cover red PDF rectangle: red={pdf_red_rect:?} green={pdf_small_green_rect:?}",
     );
 }
 
@@ -602,7 +904,7 @@ async fn absolute_auto_width_fills_between_left_and_right() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -620,7 +922,7 @@ async fn absolute_auto_width_between_insets_subtracts_non_auto_margins() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -638,7 +940,7 @@ async fn absolute_auto_width_between_insets_subtracts_padding_and_borders() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -656,7 +958,7 @@ async fn absolute_right_offset_anchors_margin_box_edge() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -674,7 +976,7 @@ async fn absolute_overconstrained_horizontal_axis_uses_containing_direction() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -706,7 +1008,7 @@ async fn absolute_right_anchored_width_applies_min_width_before_positioning() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -724,7 +1026,7 @@ async fn absolute_auto_height_fills_between_top_and_bottom() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -756,7 +1058,7 @@ async fn absolute_auto_height_between_insets_subtracts_non_auto_margins() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -774,7 +1076,7 @@ async fn absolute_auto_height_between_insets_subtracts_padding_and_borders() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -792,12 +1094,12 @@ async fn relative_position_offsets_visual_box_without_affecting_flow() {
     .unwrap();
 
     let moved = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Moved")
         .unwrap();
     let after = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "After")
         .unwrap();
@@ -816,9 +1118,36 @@ async fn absolute_position_applies_to_replaced_images() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].images.len(), 1);
-    assert!((document.pages[0].images[0].x() - 30.0).abs() < 0.01);
-    assert!((document.pages[0].images[0].y() - 80.0).abs() < 0.01);
+    assert_eq!(document.pages[0].images().len(), 1);
+    assert!((document.pages[0].images()[0].x() - 30.0).abs() < 0.01);
+    assert!((document.pages[0].images()[0].y() - 80.0).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn absolute_positioned_image_uses_intrinsic_auto_size() {
+    let green_60_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADwAAAA8CAIAAAC1nk4lAAAAAXNSR0IArs4c6QAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oFFQg4GNq2yCEAAAAZdEVYdENvbW1lbnQAQ3JlYXRlZCB3aXRoIEdJTVBXgQ4XAAAAR0lEQVRo3u3OQQ0AAAgEoNPkRjeFDzdIQGXyTifS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0vcWUo0A+IZA5H8AAAAASUVORK5CYII=";
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 160pt 120pt; margin: 10pt }} body {{ margin: 0 }}</style>\
+         <img style=\"position:absolute; left:40px; top:20px\" src=\"{green_60_png}\">"
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected intrinsic solid image fill: {:?}",
+                document.pages[0].rects()
+            )
+        });
+    assert!((green.x() - 40.0).abs() < 0.01, "green={green:?}");
+    assert!((green.y() - 50.0).abs() < 0.01, "green={green:?}");
+    assert!((green.width() - 45.0).abs() < 0.01, "green={green:?}");
+    assert!((green.height() - 45.0).abs() < 0.01, "green={green:?}");
 }
 
 #[tokio::test]
@@ -829,9 +1158,9 @@ async fn absolute_position_applies_to_tables() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "Cell");
-    assert!((document.pages[0].lines[0].x() - 40.0).abs() < 0.01);
-    assert_line_baseline_at_top(&document, &document.pages[0].lines[0], 90.0);
+    assert_eq!(document.pages[0].lines()[0].text, "Cell");
+    assert!((document.pages[0].lines()[0].x() - 40.0).abs() < 0.01);
+    assert_line_baseline_at_top(&document, &document.pages[0].lines()[0], 90.0);
 }
 
 #[tokio::test]
@@ -845,7 +1174,7 @@ async fn absolute_table_auto_margins_center_like_block_between_insets() {
     let page = &document.pages[0];
     let red = filled_rect(page, Color::new(255, 0, 0));
     let green = page
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .max_by(|left, right| {
@@ -880,17 +1209,17 @@ async fn absolute_auto_width_table_uses_fragment_intrinsic_width() {
     .unwrap();
 
     let wide = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Wide")
         .unwrap();
     let cell = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Cell")
         .unwrap();
     let table_background = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(238, 238, 238)))
         .max_by(|left, right| left.width().total_cmp(&right.width()))
@@ -917,7 +1246,7 @@ async fn absolute_collapsed_table_bottom_uses_fragment_border_insets() {
     .unwrap();
 
     let table_background = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 170, 0)))
         .max_by(|left, right| left.width().total_cmp(&right.width()))
@@ -939,17 +1268,17 @@ async fn relative_position_offsets_flex_and_table_boxes() {
     .unwrap();
 
     let flex = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Flex")
         .unwrap();
     let table = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Table")
         .unwrap();
     let after = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "After")
         .unwrap();
@@ -971,10 +1300,10 @@ async fn bottom_positioned_auto_height_uses_content_height() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 1);
-    assert_eq!(document.pages[0].lines.len(), 3);
-    assert_eq!(document.pages[0].lines[0].text, "One");
-    assert_eq!(document.pages[0].lines[2].text, "Three");
-    assert!(document.pages[0].lines[0].y() > document.pages[0].lines[2].y());
+    assert_eq!(document.pages[0].lines().len(), 3);
+    assert_eq!(document.pages[0].lines()[0].text, "One");
+    assert_eq!(document.pages[0].lines()[2].text, "Three");
+    assert!(document.pages[0].lines()[0].y() > document.pages[0].lines()[2].y());
 }
 
 #[tokio::test]
@@ -986,7 +1315,7 @@ async fn positions_absolute_children_against_relative_containing_blocks() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -1004,7 +1333,7 @@ async fn transformed_block_establishes_containing_block_for_absolute_child() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -1022,7 +1351,7 @@ async fn positioned_containing_block_uses_relative_parent_padding_box() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -1040,7 +1369,7 @@ async fn positioned_table_cell_establishes_padding_box_containing_block() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -1058,7 +1387,7 @@ async fn positioned_table_wrapper_establishes_containing_block_for_cell_descenda
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
@@ -1076,13 +1405,55 @@ async fn positioned_inline_block_fragment_captures_absolute_descendants() {
     .unwrap();
 
     let blue = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 11.0).abs() < 0.01);
     assert!((blue.y() - 99.0).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn abspos_float_inside_positioned_inline_uses_inline_containing_block() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 220px 300px; margin: 0 }\
+         body, p, div, span { margin: 0; font-size: 16px; line-height: 20px }\
+         #abs { position: absolute; top: 0; left: 0; right: 0; height: 100px; background: green }\
+         #float { float: left }\
+         span { position: relative; padding-left: 100px }\
+         </style>\
+         <p>Test passes if there is green square.</p>\
+         <div><span><div id=\"float\"><div id=\"abs\"></div></div></span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = document.pages[0]
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .unwrap_or_else(|| {
+            panic!(
+                "green abspos rectangle should be painted: {:?}",
+                document.pages[0].rects()
+            )
+        });
+
+    let expected_css_100px = 75.0;
+    assert!(
+        (green.width() - expected_css_100px).abs() < 0.01,
+        "{green:?}"
+    );
+    assert!(
+        (green.height() - expected_css_100px).abs() < 0.01,
+        "{green:?}"
+    );
+    assert!((green.x() - 0.0).abs() < 0.01, "{green:?}");
+    assert!((green.y() - 90.0).abs() < 0.01, "{green:?}");
 }
 
 #[tokio::test]
@@ -1094,7 +1465,7 @@ async fn absolute_table_cell_descendants_do_not_affect_row_height() {
     .unwrap();
 
     let after = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "After")
         .unwrap();
@@ -1111,7 +1482,7 @@ async fn absolute_positioned_children_do_not_affect_flow_height() {
     .unwrap();
 
     let after = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "After")
         .unwrap();
@@ -1128,7 +1499,7 @@ async fn collapses_first_child_top_margin_through_parent_block() {
     .unwrap();
 
     let line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Nested")
         .unwrap();
@@ -1150,7 +1521,10 @@ async fn collapses_first_descendant_top_margin_through_transparent_wrappers() {
     .await
     .unwrap();
 
-    assert_eq!(wrapped.pages[0].lines[0].y(), direct.pages[0].lines[0].y());
+    assert_eq!(
+        wrapped.pages[0].lines()[0].y(),
+        direct.pages[0].lines()[0].y()
+    );
 }
 
 #[tokio::test]
@@ -1218,7 +1592,7 @@ async fn block_in_inline_start_margin_collapses_like_unwrapped_block() {
     .await
     .unwrap();
 
-    assert_eq!(wrapped.pages[0].rects, direct.pages[0].rects);
+    assert_eq!(wrapped.pages[0].rects(), direct.pages[0].rects());
 }
 
 #[tokio::test]
@@ -1237,7 +1611,7 @@ async fn block_in_inline_zero_height_margins_collapse_to_larger_gap() {
     .await
     .unwrap();
 
-    assert_eq!(wrapped.pages[0].rects, reference.pages[0].rects);
+    assert_eq!(wrapped.pages[0].rects(), reference.pages[0].rects());
 }
 
 #[tokio::test]
@@ -1263,12 +1637,12 @@ async fn block_in_inline_only_child_self_collapsing_margins_collapse_through_par
     .unwrap();
 
     assert_no_red_or_hotpink_rects(&wrapped);
-    assert_eq!(wrapped.pages[0].rects, direct.pages[0].rects);
-    assert_eq!(wrapped.pages[0].rects, reference.pages[0].rects);
+    assert_eq!(wrapped.pages[0].rects(), direct.pages[0].rects());
+    assert_eq!(wrapped.pages[0].rects(), reference.pages[0].rects());
 
     let green = Color::new(0, 128, 0);
     let green_rects = wrapped.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(green))
         .collect::<Vec<_>>();
@@ -1297,7 +1671,7 @@ async fn block_in_inline_text_align_does_not_move_split_block_child() {
     .unwrap();
 
     let target_lines = target.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| {
             (
@@ -1308,7 +1682,7 @@ async fn block_in_inline_text_align_does_not_move_split_block_child() {
         })
         .collect::<Vec<_>>();
     let reference_lines = reference.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| {
             (
@@ -1320,7 +1694,7 @@ async fn block_in_inline_text_align_does_not_move_split_block_child() {
         .collect::<Vec<_>>();
 
     assert_eq!(target_lines, reference_lines);
-    assert_eq!(target.pages[0].rects, reference.pages[0].rects);
+    assert_eq!(target.pages[0].rects(), reference.pages[0].rects());
 }
 
 #[tokio::test]
@@ -1349,7 +1723,7 @@ async fn wpt_block_in_inline_align_matches_reference_if_available() {
         .unwrap();
 
     let target_lines = target.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| {
             (
@@ -1360,7 +1734,7 @@ async fn wpt_block_in_inline_align_matches_reference_if_available() {
         })
         .collect::<Vec<_>>();
     let reference_lines = reference.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| {
             (
@@ -1372,7 +1746,7 @@ async fn wpt_block_in_inline_align_matches_reference_if_available() {
         .collect::<Vec<_>>();
 
     assert_eq!(target_lines, reference_lines);
-    assert_eq!(target.pages[0].rects, reference.pages[0].rects);
+    assert_eq!(target.pages[0].rects(), reference.pages[0].rects());
 }
 
 #[tokio::test]
@@ -1384,7 +1758,7 @@ async fn discards_collapsed_top_margin_after_avoid_break_to_page_top() {
     .unwrap();
 
     let moved = document.pages[1]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Moved")
         .unwrap();
@@ -1406,12 +1780,12 @@ async fn collapses_adjacent_block_sibling_vertical_margins() {
     .unwrap();
 
     let first = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "One")
         .unwrap();
     let second = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text == "Two")
         .unwrap();
@@ -1435,7 +1809,7 @@ async fn min_height_smaller_than_content_allows_last_child_bottom_margin_to_coll
     .unwrap();
 
     let mut green_rects = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .collect::<Vec<_>>();
@@ -1474,7 +1848,7 @@ async fn min_height_that_grows_parent_keeps_last_child_bottom_margin_inside() {
     .unwrap();
 
     let mut green_rects = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .collect::<Vec<_>>();
@@ -1491,6 +1865,50 @@ async fn min_height_that_grows_parent_keeps_last_child_bottom_margin_inside() {
     assert!(
         (parent.height() - 75.0).abs() < 0.01,
         "parent background should grow to the 100px min-height: parent={parent:?}"
+    );
+    assert!(
+        gap.abs() < 0.01,
+        "footer should follow the min-height-grown parent without an external collapsed gap: parent={parent:?} footer={footer:?}"
+    );
+}
+
+#[tokio::test]
+async fn min_height_blocks_large_last_child_bottom_margin_from_growing_parent() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>@page { size: 800px 800px; margin: 0 } body { margin: 0 }\
+         .wrapper { width: 100px; background: red }\
+         .parent { min-height: 100px; background: green }\
+         .child { height: 30px; margin-bottom: 550px }\
+         .footer { height: 50px; background: green }</style>\
+         <div class=\"wrapper\"><div class=\"parent\"><div class=\"child\"></div></div><div class=\"footer\"></div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let mut green_rects = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .collect::<Vec<_>>();
+    green_rects.sort_by(|a, b| b.y().total_cmp(&a.y()));
+
+    assert_eq!(
+        green_rects.len(),
+        2,
+        "expected parent and footer backgrounds: {green_rects:?}"
+    );
+    let parent = green_rects[0];
+    let footer = green_rects[1];
+    let gap = parent.y() - (footer.y() + footer.height());
+    assert!(
+        (parent.height() - 75.0).abs() < 0.01,
+        "parent background should be the 100px min-height, not include the 550px child margin: parent={parent:?}"
+    );
+    assert!(
+        (footer.height() - 37.5).abs() < 0.01,
+        "footer should keep its 50px height: footer={footer:?}"
     );
     assert!(
         gap.abs() < 0.01,
@@ -1531,7 +1949,7 @@ async fn paints_body_background_on_page() {
         .await
         .unwrap();
 
-    let background = &document.pages[0].rects[0];
+    let background = &document.pages[0].rects()[0];
     assert_eq!(background.x(), 0.0);
     assert_eq!(background.y(), 0.0);
     assert_eq!(background.width(), document.pages[0].width());
@@ -1549,8 +1967,8 @@ async fn supports_forced_page_breaks() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].lines[0].text, "First");
-    assert_eq!(document.pages[1].lines[0].text, "Second");
+    assert_eq!(document.pages[0].lines()[0].text, "First");
+    assert_eq!(document.pages[1].lines()[0].text, "Second");
 }
 
 #[tokio::test]
@@ -1567,7 +1985,7 @@ async fn fixed_position_repeats_on_pages_created_by_absolute_overflow() {
     assert_eq!(document.pages.len(), 3);
     for (index, page) in document.pages.iter().enumerate() {
         let fixed = page
-            .lines
+            .lines()
             .iter()
             .filter(|line| line.text == "This should repeat on every page.")
             .collect::<Vec<_>>();
@@ -1578,7 +1996,7 @@ async fn fixed_position_repeats_on_pages_created_by_absolute_overflow() {
             index + 1
         );
         assert!(
-            fixed[0].y() < RenderOptions::default().page_margins.bottom + 20.0,
+            fixed[0].y() < RenderOptions::default().page_margins.bottom() + 20.0,
             "fixed-position line should be at page bottom on page {}: {:?}",
             index + 1,
             fixed[0]
@@ -1602,9 +2020,9 @@ async fn forced_break_before_defeats_previous_break_after_avoid_without_leading_
         .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].lines[0].text, "Page one");
-    assert_eq!(document.pages[1].lines[0].text, "Page two");
-    assert!(document.pages.iter().all(|page| !page.lines.is_empty()));
+    assert_eq!(document.pages[0].lines()[0].text, "Page one");
+    assert_eq!(document.pages[1].lines()[0].text, "Page two");
+    assert!(document.pages.iter().all(|page| !page.lines().is_empty()));
 }
 
 #[tokio::test]
@@ -1624,16 +2042,16 @@ async fn forced_breaks_retain_flow_only_min_height_pages() {
         .await
         .unwrap();
     assert_eq!(trailing_empty.pages.len(), 2);
-    assert_eq!(trailing_empty.pages[0].lines[0].text, "Page");
-    assert!(trailing_empty.pages[1].lines.is_empty());
+    assert_eq!(trailing_empty.pages[0].lines()[0].text, "Page");
+    assert!(trailing_empty.pages[1].lines().is_empty());
 
     let leading_empty = Html::from_string(source("<div></div><div>Page</div>"))
         .render_async(&RenderOptions::default())
         .await
         .unwrap();
     assert_eq!(leading_empty.pages.len(), 2);
-    assert!(leading_empty.pages[0].lines.is_empty());
-    assert_eq!(leading_empty.pages[1].lines[0].text, "Page");
+    assert!(leading_empty.pages[0].lines().is_empty());
+    assert_eq!(leading_empty.pages[1].lines()[0].text, "Page");
 }
 
 #[tokio::test]
@@ -1682,10 +2100,10 @@ async fn named_page_change_and_break_before_page_create_one_break() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].lines[0].text, "AAA");
-    assert_eq!(document.pages[1].lines[0].text, "BBB");
-    assert_eq!(document.pages[0].lines[0].x(), 30.0);
-    assert_eq!(document.pages[1].lines[0].x(), 50.0);
+    assert_eq!(document.pages[0].lines()[0].text, "AAA");
+    assert_eq!(document.pages[1].lines()[0].text, "BBB");
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1708,12 +2126,12 @@ async fn explicit_page_auto_exits_ancestor_named_page_group() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[0].lines[0].text, "A");
-    assert_eq!(document.pages[1].lines[0].text, "B");
-    assert_eq!(document.pages[2].lines[0].text, "C");
-    assert_eq!(document.pages[0].lines[0].x(), 30.0);
-    assert_eq!(document.pages[1].lines[0].x(), 10.0);
-    assert_eq!(document.pages[2].lines[0].x(), 50.0);
+    assert_eq!(document.pages[0].lines()[0].text, "A");
+    assert_eq!(document.pages[1].lines()[0].text, "B");
+    assert_eq!(document.pages[2].lines()[0].text, "C");
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 10.0);
+    assert_eq!(document.pages[2].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1734,10 +2152,10 @@ async fn nested_page_names_use_first_and_last_in_flow_descendant_values() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 1);
-    assert_eq!(document.pages[0].lines[0].text, "A");
-    assert_eq!(document.pages[0].lines[1].text, "B");
-    assert_eq!(document.pages[0].lines[0].x(), 30.0);
-    assert_eq!(document.pages[0].lines[1].x(), 30.0);
+    assert_eq!(document.pages[0].lines()[0].text, "A");
+    assert_eq!(document.pages[0].lines()[1].text, "B");
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[0].lines()[1].x(), 30.0);
 }
 
 #[tokio::test]
@@ -1758,10 +2176,10 @@ async fn nested_page_scope_exit_does_not_split_following_same_named_page_group()
     .unwrap();
 
     assert_eq!(document.pages.len(), 1);
-    assert_eq!(document.pages[0].lines[0].text, "A");
-    assert_eq!(document.pages[0].lines[1].text, "C");
-    assert_eq!(document.pages[0].lines[0].x(), 30.0);
-    assert_eq!(document.pages[0].lines[1].x(), 30.0);
+    assert_eq!(document.pages[0].lines()[0].text, "A");
+    assert_eq!(document.pages[0].lines()[1].text, "C");
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[0].lines()[1].x(), 30.0);
 }
 
 #[tokio::test]
@@ -1784,12 +2202,12 @@ async fn nested_page_name_boundary_splits_when_sibling_page_values_differ() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 3);
-    assert!(document.pages[0].lines[0].text.starts_with("Large"));
-    assert_eq!(document.pages[1].lines[0].text, "Small");
-    assert!(document.pages[2].lines[0].text.starts_with("Large"));
-    assert_eq!(document.pages[0].lines[0].x(), 30.0);
-    assert_eq!(document.pages[1].lines[0].x(), 50.0);
-    assert_eq!(document.pages[2].lines[0].x(), 30.0);
+    assert!(document.pages[0].lines()[0].text.starts_with("Large"));
+    assert_eq!(document.pages[1].lines()[0].text, "Small");
+    assert!(document.pages[2].lines()[0].text.starts_with("Large"));
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
+    assert_eq!(document.pages[2].lines()[0].x(), 30.0);
 }
 
 #[tokio::test]
@@ -1808,8 +2226,18 @@ async fn absolutely_positioned_page_name_does_not_create_named_page_group() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 1);
-    assert!(document.pages[0].lines.iter().any(|line| line.text == "A"));
-    assert!(document.pages[0].lines.iter().any(|line| line.text == "B"));
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .any(|line| line.text == "A")
+    );
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .any(|line| line.text == "B")
+    );
 }
 
 #[tokio::test]
@@ -1832,7 +2260,7 @@ async fn page_names_inside_absolutely_positioned_subtree_are_ignored() {
 
     assert_eq!(document.pages.len(), 1);
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -1863,18 +2291,28 @@ async fn fixed_position_page_name_does_not_create_named_page_group() {
     assert_eq!(document.pages.len(), 2);
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "fixed")
     );
-    assert!(document.pages[0].lines.iter().any(|line| line.text == "A"));
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .any(|line| line.text == "A")
+    );
     assert!(
         document.pages[1]
-            .lines
+            .lines()
             .iter()
             .any(|line| line.text == "fixed")
     );
-    assert!(document.pages[1].lines.iter().any(|line| line.text == "B"));
+    assert!(
+        document.pages[1]
+            .lines()
+            .iter()
+            .any(|line| line.text == "B")
+    );
 }
 
 #[tokio::test]
@@ -1906,12 +2344,12 @@ async fn fixed_auto_width_shrink_to_fit_uses_nested_column_flex_intrinsics() {
     // max-content inline contribution so descendant percentage widths resolve
     // against a definite fixed box width.
     let red = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .unwrap();
     let green_rows = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
         .collect::<Vec<_>>();
@@ -1945,8 +2383,18 @@ async fn floated_page_name_does_not_create_named_page_group_before_first_in_flow
     .unwrap();
 
     assert_eq!(document.pages.len(), 1);
-    assert!(document.pages[0].lines.iter().any(|line| line.text == "A"));
-    assert!(document.pages[0].lines.iter().any(|line| line.text == "B"));
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .any(|line| line.text == "A")
+    );
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .any(|line| line.text == "B")
+    );
 }
 
 #[tokio::test]
@@ -1967,11 +2415,26 @@ async fn floated_page_name_is_ignored_between_in_flow_named_page_siblings() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert!(document.pages[0].lines.iter().any(|line| line.text == "A"));
-    assert!(document.pages[0].lines.iter().any(|line| line.text == "B"));
-    assert!(document.pages[1].lines.iter().any(|line| line.text == "C"));
-    assert_eq!(document.pages[0].lines[0].x(), 30.0);
-    assert_eq!(document.pages[1].lines[0].x(), 50.0);
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .any(|line| line.text == "A")
+    );
+    assert!(
+        document.pages[0]
+            .lines()
+            .iter()
+            .any(|line| line.text == "B")
+    );
+    assert!(
+        document.pages[1]
+            .lines()
+            .iter()
+            .any(|line| line.text == "C")
+    );
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -1994,7 +2457,7 @@ async fn inline_block_descendant_page_names_do_not_fragment_atomic_layout() {
 
     assert_eq!(document.pages.len(), 1);
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -2030,7 +2493,7 @@ async fn inline_block_page_values_create_boundary_after_atomic_box() {
             .pages
             .iter()
             .map(|page| {
-                page.lines
+                page.lines()
                     .iter()
                     .map(|line| (line.text.as_str(), line.x(), line.y()))
                     .collect::<Vec<_>>()
@@ -2038,19 +2501,19 @@ async fn inline_block_page_values_create_boundary_after_atomic_box() {
             .collect::<Vec<_>>()
     );
     let page_zero_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
     let page_one_lines = document.pages[1]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
     assert!(page_zero_lines.contains(&"A"), "{page_zero_lines:?}");
     assert!(page_zero_lines.contains(&"B"), "{page_zero_lines:?}");
     assert!(page_one_lines.contains(&"C"), "{page_one_lines:?}");
-    assert_eq!(document.pages[1].lines[0].x(), 70.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 70.0);
 }
 
 #[tokio::test]
@@ -2071,7 +2534,7 @@ async fn adjacent_inline_block_page_names_do_not_create_inline_boundary_breaks()
 
     assert_eq!(document.pages.len(), 1);
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -2100,12 +2563,12 @@ async fn non_leading_inline_page_name_splits_inline_formatting_context() {
     // page group for following inline content:
     // https://www.w3.org/TR/css-page-3/#using-named-pages
     assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[0].lines[0].text, "Before");
-    assert_eq!(document.pages[0].lines[0].x(), 30.0);
-    assert_eq!(document.pages[1].lines[0].text, "Named");
-    assert_eq!(document.pages[1].lines[0].x(), 50.0);
-    assert_eq!(document.pages[2].lines[0].text, "After");
-    assert_eq!(document.pages[2].lines[0].x(), 30.0);
+    assert_eq!(document.pages[0].lines()[0].text, "Before");
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines()[0].text, "Named");
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
+    assert_eq!(document.pages[2].lines()[0].text, "After");
+    assert_eq!(document.pages[2].lines()[0].x(), 30.0);
 }
 
 fn red_png_data_uri() -> &'static str {
@@ -2135,17 +2598,22 @@ async fn absolute_block_inside_inline_uses_split_inline_static_position() {
 
     let page = &document.pages[0];
     let red_index = page
-        .rects
+        .rects()
         .iter()
         .position(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .expect("red abspos rectangle should be painted");
     let green_index = page
-        .rects
+        .rects()
         .iter()
         .position(|rect| rect.fill == Some(Color::new(0, 128, 0)))
-        .unwrap_or_else(|| panic!("green abspos rectangle should be painted: {:?}", page.rects));
-    let red = &page.rects[red_index];
-    let green = &page.rects[green_index];
+        .unwrap_or_else(|| {
+            panic!(
+                "green abspos rectangle should be painted: {:?}",
+                page.rects()
+            )
+        });
+    let red = &page.rects()[red_index];
+    let green = &page.rects()[green_index];
 
     assert!(
         (green.x() - red.x()).abs() < 0.01
@@ -2159,7 +2627,7 @@ async fn absolute_block_inside_inline_uses_split_inline_static_position() {
             > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
         "green abspos should paint after red: operations={:?} rects={:?}",
         page.paint_operations(),
-        page.rects,
+        page.rects(),
     );
 }
 
@@ -2184,8 +2652,8 @@ async fn inline_replaced_page_name_is_ignored_before_block_sibling_boundary() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[1].lines[0].text, "B");
-    assert_eq!(document.pages[1].lines[0].x(), 50.0);
+    assert_eq!(document.pages[1].lines()[0].text, "B");
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -2209,9 +2677,9 @@ async fn inline_replaced_page_name_is_ignored_after_block_sibling_boundary() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].lines[0].text, "A");
-    assert_eq!(document.pages[0].lines[0].x(), 50.0);
-    assert_eq!(document.pages[1].images.len(), 1);
+    assert_eq!(document.pages[0].lines()[0].text, "A");
+    assert_eq!(document.pages[0].lines()[0].x(), 50.0);
+    assert_eq!(document.pages[1].images().len(), 1);
 }
 
 #[tokio::test]
@@ -2235,9 +2703,9 @@ async fn block_replaced_page_name_participates_in_named_page_group() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 1);
-    assert_eq!(document.pages[0].images.len(), 1);
-    assert_eq!(document.pages[0].lines[0].text, "B");
-    assert_eq!(document.pages[0].lines[0].x(), 50.0);
+    assert_eq!(document.pages[0].images().len(), 1);
+    assert_eq!(document.pages[0].lines()[0].text, "B");
+    assert_eq!(document.pages[0].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -2261,9 +2729,9 @@ async fn block_replaced_page_name_matches_previous_named_block_group() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 1);
-    assert_eq!(document.pages[0].lines[0].text, "A");
-    assert_eq!(document.pages[0].lines[0].x(), 50.0);
-    assert_eq!(document.pages[0].images.len(), 1);
+    assert_eq!(document.pages[0].lines()[0].text, "A");
+    assert_eq!(document.pages[0].lines()[0].x(), 50.0);
+    assert_eq!(document.pages[0].images().len(), 1);
 }
 
 #[tokio::test]
@@ -2287,8 +2755,8 @@ async fn inline_canvas_page_name_is_ignored_before_block_sibling_boundary() {
 
     // WPT: css/css-page/page-name-canvas-001-print.html.
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[1].lines[0].text, "B");
-    assert_eq!(document.pages[1].lines[0].x(), 50.0);
+    assert_eq!(document.pages[1].lines()[0].text, "B");
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -2312,8 +2780,8 @@ async fn inline_canvas_page_name_is_ignored_after_block_sibling_boundary() {
 
     // WPT: css/css-page/page-name-canvas-002-print.html.
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].lines[0].text, "A");
-    assert_eq!(document.pages[0].lines[0].x(), 50.0);
+    assert_eq!(document.pages[0].lines()[0].text, "A");
+    assert_eq!(document.pages[0].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -2337,8 +2805,8 @@ async fn block_canvas_page_name_participates_in_named_page_group() {
 
     // WPT: css/css-page/page-name-canvas-003-print.html.
     assert_eq!(document.pages.len(), 1);
-    assert_eq!(document.pages[0].lines[0].text, "B");
-    assert_eq!(document.pages[0].lines[0].x(), 50.0);
+    assert_eq!(document.pages[0].lines()[0].text, "B");
+    assert_eq!(document.pages[0].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -2362,8 +2830,8 @@ async fn block_canvas_page_name_splits_before_following_unnamed_block() {
 
     // WPT: css/css-page/page-name-canvas-004-print.html.
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[1].lines[0].text, "B");
-    assert_eq!(document.pages[1].lines[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines()[0].text, "B");
+    assert_eq!(document.pages[1].lines()[0].x(), 30.0);
 }
 
 #[tokio::test]
@@ -2387,12 +2855,12 @@ async fn trailing_unnamed_page_after_named_page_uses_default_page_context() {
     // The third page has no named page owner and must return to the default
     // page context rather than inheriting the previous named page.
     assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[0].lines[0].text, "First");
-    assert_eq!(document.pages[0].lines[0].x(), 10.0);
-    assert_eq!(document.pages[1].lines[0].text, "Named");
-    assert_eq!(document.pages[1].lines[0].x(), 40.0);
-    assert_eq!(document.pages[2].lines[0].text, "Trailing");
-    assert_eq!(document.pages[2].lines[0].x(), 10.0);
+    assert_eq!(document.pages[0].lines()[0].text, "First");
+    assert_eq!(document.pages[0].lines()[0].x(), 10.0);
+    assert_eq!(document.pages[1].lines()[0].text, "Named");
+    assert_eq!(document.pages[1].lines()[0].x(), 40.0);
+    assert_eq!(document.pages[2].lines()[0].text, "Trailing");
+    assert_eq!(document.pages[2].lines()[0].x(), 10.0);
 }
 
 #[tokio::test]
@@ -2423,7 +2891,7 @@ async fn flex_item_page_names_do_not_create_container_page_breaks() {
             .pages
             .iter()
             .map(|page| {
-                page.lines
+                page.lines()
                     .iter()
                     .map(|line| (line.text.as_str(), line.x(), line.y()))
                     .collect::<Vec<_>>()
@@ -2431,7 +2899,7 @@ async fn flex_item_page_names_do_not_create_container_page_breaks() {
             .collect::<Vec<_>>()
     );
     let lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
@@ -2460,11 +2928,11 @@ async fn flex_container_own_page_name_creates_boundary_around_container() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[0].lines[0].text, "A");
-    assert_eq!(document.pages[1].lines[0].text, "B");
-    assert_eq!(document.pages[1].lines[1].text, "C");
-    assert_eq!(document.pages[2].lines[0].text, "D");
-    assert_eq!(document.pages[1].lines[0].x(), 40.0);
+    assert_eq!(document.pages[0].lines()[0].text, "A");
+    assert_eq!(document.pages[1].lines()[0].text, "B");
+    assert_eq!(document.pages[1].lines()[1].text, "C");
+    assert_eq!(document.pages[2].lines()[0].text, "D");
+    assert_eq!(document.pages[1].lines()[0].x(), 40.0);
 }
 
 #[tokio::test]
@@ -2494,18 +2962,18 @@ async fn nested_block_page_names_inside_flex_item_create_internal_breaks_only() 
             .pages
             .iter()
             .map(|page| {
-                page.lines
+                page.lines()
                     .iter()
                     .map(|line| (line.text.as_str(), line.x(), line.y()))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>()
     );
-    assert_eq!(document.pages[0].lines[0].text, "A");
-    assert_eq!(document.pages[0].lines[1].text, "B");
-    assert_eq!(document.pages[1].lines[0].text, "C");
-    assert_eq!(document.pages[1].lines[1].text, "D");
-    assert_eq!(document.pages[1].lines[0].x(), 50.0);
+    assert_eq!(document.pages[0].lines()[0].text, "A");
+    assert_eq!(document.pages[0].lines()[1].text, "B");
+    assert_eq!(document.pages[1].lines()[0].text, "C");
+    assert_eq!(document.pages[1].lines()[1].text, "D");
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -2532,16 +3000,336 @@ async fn table_own_page_name_selects_named_page_context() {
     assert_eq!(document.pages[0].height(), 360.0);
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .all(|line| (line.x() - 30.0).abs() < 0.01),
         "{:?}",
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .map(|line| (line.text.as_str(), line.x(), line.y()))
             .collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn table_row_page_names_select_page_context_per_fragment() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin: 10pt }\
+         @page firstrow { margin-left: 30pt }\
+         @page secondrow { margin-left: 50pt }\
+         body, table, tr, td, div { margin: 0; padding: 0; border: 0; font-size: 10pt; line-height: 10pt }\
+         table { border-collapse: collapse; width: 80pt }\
+         tr { height: 80pt }\
+         </style>\
+         <table>\
+           <tr style=\"page:firstrow\"><td><div>First</div></td></tr>\
+           <tr style=\"page:secondrow\"><td><div>Second</div></td></tr>\
+         </table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_lines = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| (line.text.as_str(), line.x(), line.y()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(document.pages.len(), 2, "{page_lines:?}");
+    assert_eq!(document.pages[0].lines()[0].text, "First");
+    assert_eq!(document.pages[1].lines()[0].text, "Second");
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
+}
+
+#[tokio::test]
+async fn table_cell_descendant_page_names_select_page_context_per_fragment() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin: 10pt }\
+         @page firstrow { margin-left: 30pt }\
+         @page secondrow { margin-left: 50pt }\
+         body, table, tr, td, div { margin: 0; padding: 0; border: 0; font-size: 10pt; line-height: 10pt }\
+         table { border-collapse: collapse; width: 80pt }\
+         tr { height: 80pt }\
+         </style>\
+         <table>\
+           <tr><td><div style=\"page:firstrow\">First</div></td></tr>\
+           <tr><td><div style=\"page:secondrow\">Second</div></td></tr>\
+         </table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_lines = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| (line.text.as_str(), line.x(), line.y()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(document.pages.len(), 2, "{page_lines:?}");
+    assert_eq!(document.pages[0].lines()[0].text, "First");
+    assert_eq!(document.pages[1].lines()[0].text, "Second");
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
+}
+
+#[tokio::test]
+async fn rowspanning_table_cell_page_name_persists_across_spanned_rows() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin: 10pt }\
+         @page spanpage { margin-left: 50pt }\
+         body, table, tr, td, div { margin: 0; padding: 0; border: 0; font-size: 10pt; line-height: 10pt }\
+         table { border-collapse: collapse; width: 60pt }\
+         td { vertical-align: top }\
+         </style>\
+         <table>\
+           <tr><td rowspan=\"2\" style=\"page:spanpage\"><div>SpanTop</div><div style=\"height:70pt\"></div><div>SpanBottom</div></td><td>First</td></tr>\
+           <tr><td>Second</td></tr>\
+         </table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_lines = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| (line.text.as_str(), line.x(), line.y()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert!(document.pages.len() >= 2, "{page_lines:?}");
+    let bottom = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines())
+        .find(|line| line.text == "SpanBottom")
+        .unwrap_or_else(|| panic!("missing spanning cell continuation: {page_lines:?}"));
+    assert_eq!(bottom.x(), 50.0, "{page_lines:?}");
+}
+
+#[tokio::test]
+async fn explicit_page_auto_row_exits_named_rowspan_context() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin-left: 10pt; margin-top: 10pt; margin-right: 10pt; margin-bottom: 10pt }\
+         @page spanpage { margin-left: 50pt }\
+         body, table, tr, td, div { margin: 0; padding: 0; border: 0; font-size: 10pt; line-height: 10pt }\
+         table { border-collapse: collapse; width: 60pt }\
+         td { vertical-align: top }\
+         </style>\
+         <table>\
+           <tr><td rowspan=\"2\" style=\"page:spanpage\"><div>SpanTop</div><div style=\"height:70pt\"></div><div>SpanBottom</div></td><td>First</td></tr>\
+           <tr style=\"page:auto\"><td>Second</td></tr>\
+         </table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_lines = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| (line.text.as_str(), line.x(), line.y()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let second = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines())
+        .find(|line| line.text == "Second")
+        .unwrap_or_else(|| panic!("missing explicit auto row text: {page_lines:?}"));
+    let first = document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines())
+        .find(|line| line.text == "First")
+        .unwrap_or_else(|| panic!("missing named context row text: {page_lines:?}"));
+    assert!(
+        (first.x() - second.x() - 40.0).abs() < 0.01,
+        "explicit page:auto row should use the default page context: {page_lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn repeated_table_header_copy_uses_destination_page_context() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin: 10pt }\
+         @page headerpage { margin-left: 50pt }\
+         @page bodypage { margin-left: 30pt }\
+         body, table, thead, tbody, tr, td { margin: 0; padding: 0; border: 0; font-size: 10pt; line-height: 10pt }\
+         table { border-collapse: collapse; width: 60pt }\
+         thead tr { page: headerpage; height: 10pt }\
+         tbody tr { page: bodypage; height: 70pt }\
+         </style>\
+         <table>\
+           <thead><tr><td>Head</td></tr></thead>\
+           <tbody><tr><td>BodyOne</td></tr><tr><td>BodyTwo</td></tr></tbody>\
+         </table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_lines = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| (line.text.as_str(), line.x(), line.y()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert!(document.pages.len() >= 3, "{page_lines:?}");
+    let first_header = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "Head")
+        .unwrap_or_else(|| panic!("missing source header: {page_lines:?}"));
+    let body_two_page = document
+        .pages
+        .iter()
+        .find(|page| page.lines().iter().any(|line| line.text == "BodyTwo"))
+        .unwrap_or_else(|| panic!("missing second body page: {page_lines:?}"));
+    let repeated_header = body_two_page
+        .lines()
+        .iter()
+        .find(|line| line.text == "Head")
+        .unwrap_or_else(|| panic!("missing repeated header: {page_lines:?}"));
+    let body_two = body_two_page
+        .lines()
+        .iter()
+        .find(|line| line.text == "BodyTwo")
+        .unwrap_or_else(|| panic!("missing second body row: {page_lines:?}"));
+
+    assert_eq!(first_header.x(), 50.0, "{page_lines:?}");
+    assert_eq!(repeated_header.x(), 30.0, "{page_lines:?}");
+    assert_eq!(body_two.x(), 30.0, "{page_lines:?}");
+}
+
+#[tokio::test]
+async fn repeated_table_footer_copy_uses_destination_page_context() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin: 10pt }\
+         @page bodypage { margin-left: 30pt }\
+         @page footerpage { margin-left: 50pt }\
+         body, table, thead, tbody, tfoot, tr, td { margin: 0; padding: 0; border: 0; font-size: 10pt; line-height: 10pt }\
+         table { border-collapse: collapse; width: 60pt }\
+         tbody tr { page: bodypage; height: 70pt }\
+         tfoot tr { page: footerpage; height: 10pt }\
+         </style>\
+         <table>\
+           <tbody><tr><td>BodyOne</td></tr><tr><td>BodyTwo</td></tr></tbody>\
+           <tfoot><tr><td>Foot</td></tr></tfoot>\
+         </table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_lines = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| (line.text.as_str(), line.x(), line.y()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let first_body_page = document
+        .pages
+        .iter()
+        .find(|page| page.lines().iter().any(|line| line.text == "BodyOne"))
+        .unwrap_or_else(|| panic!("missing first body page: {page_lines:?}"));
+    let repeated_footer = first_body_page
+        .lines()
+        .iter()
+        .find(|line| line.text == "Foot")
+        .unwrap_or_else(|| panic!("missing repeated footer with first body row: {page_lines:?}"));
+    let body_one = first_body_page
+        .lines()
+        .iter()
+        .find(|line| line.text == "BodyOne")
+        .unwrap();
+    let source_footer = document
+        .pages
+        .iter()
+        .rev()
+        .flat_map(|page| page.lines())
+        .find(|line| line.text == "Foot")
+        .unwrap_or_else(|| panic!("missing source footer: {page_lines:?}"));
+
+    assert_eq!(body_one.x(), 30.0, "{page_lines:?}");
+    assert_eq!(repeated_footer.x(), 30.0, "{page_lines:?}");
+    assert_eq!(source_footer.x(), 50.0, "{page_lines:?}");
+}
+
+#[tokio::test]
+async fn table_row_explicit_page_auto_exits_table_named_page_group() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 100pt; margin: 10pt }\
+         @page firstrow { margin-left: 30pt }\
+         body, table, tr, td, div { margin: 0; padding: 0; border: 0; font-size: 10pt; line-height: 10pt }\
+         table { border-collapse: collapse; width: 80pt; page: firstrow }\
+         tr { height: 80pt }\
+         </style>\
+         <table>\
+           <tr><td><div>First</div></td></tr>\
+           <tr style=\"page:auto\"><td><div>Second</div></td></tr>\
+         </table>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_lines = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| (line.text.as_str(), line.x(), line.y()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(document.pages.len(), 2, "{page_lines:?}");
+    assert_eq!(document.pages[0].lines()[0].text, "First");
+    assert_eq!(document.pages[1].lines()[0].text, "Second");
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 10.0);
 }
 
 #[tokio::test]
@@ -2563,12 +3351,12 @@ async fn empty_page_named_block_with_display_none_child_still_creates_page_group
     .unwrap();
 
     assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[0].lines[0].text, "A");
-    assert!(document.pages[1].lines.is_empty());
+    assert_eq!(document.pages[0].lines()[0].text, "A");
+    assert!(document.pages[1].lines().is_empty());
     assert_eq!(document.pages[1].width(), 140.0);
-    assert_eq!(document.pages[2].lines[0].text, "B");
-    assert_eq!(document.pages[0].lines[0].x(), 30.0);
-    assert_eq!(document.pages[2].lines[0].x(), 50.0);
+    assert_eq!(document.pages[2].lines()[0].text, "B");
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[2].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -2590,14 +3378,14 @@ async fn zero_height_named_blocks_do_not_each_force_separate_pages() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[0].lines[0].text, "A");
+    assert_eq!(document.pages[0].lines()[0].text, "A");
     let middle_page_lines = document.pages[1]
-        .lines
+        .lines()
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>();
     assert_eq!(middle_page_lines, vec!["B", "C", "D", "E"]);
-    assert_eq!(document.pages[2].lines[0].text, "F");
+    assert_eq!(document.pages[2].lines()[0].text, "F");
 }
 
 #[tokio::test]
@@ -2618,11 +3406,13 @@ async fn rtl_root_direction_makes_first_page_match_left_page_selector() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].lines[0].text, "One");
-    assert_eq!(document.pages[1].lines[0].text, "Two");
-    assert_eq!(document.pages[0].lines[0].x(), 40.0);
-    assert_eq!(document.pages[1].lines[0].x(), 0.0);
-    assert!((document.pages[1].lines[0].y() - document.pages[0].lines[0].y() - 20.0).abs() < 0.01);
+    assert_eq!(document.pages[0].lines()[0].text, "One");
+    assert_eq!(document.pages[1].lines()[0].text, "Two");
+    assert_eq!(document.pages[0].lines()[0].x(), 40.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 0.0);
+    assert!(
+        (document.pages[1].lines()[0].y() - document.pages[0].lines()[0].y() - 20.0).abs() < 0.01
+    );
 }
 
 #[tokio::test]
@@ -2642,10 +3432,10 @@ async fn rtl_forced_left_break_targets_next_left_page() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 3);
-    assert_eq!(document.pages[0].lines[0].text, "One");
-    assert!(document.pages[1].lines.is_empty());
-    assert_eq!(document.pages[2].lines[0].text, "Two");
-    assert_eq!(document.pages[2].lines[0].x(), 40.0);
+    assert_eq!(document.pages[0].lines()[0].text, "One");
+    assert!(document.pages[1].lines().is_empty());
+    assert_eq!(document.pages[2].lines()[0].text, "Two");
+    assert_eq!(document.pages[2].lines()[0].x(), 40.0);
 }
 
 #[tokio::test]
@@ -2657,7 +3447,7 @@ async fn paints_parent_block_after_child_forced_page_break() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert!(document.pages.iter().any(|page| !page.rects.is_empty()));
+    assert!(document.pages.iter().any(|page| !page.rects().is_empty()));
     let pdf = document.write_pdf_bytes().unwrap();
     assert!(String::from_utf8_lossy(&pdf).starts_with("%PDF-1.7"));
 }
@@ -2673,13 +3463,13 @@ async fn keeps_break_inside_avoid_blocks_together_when_they_fit_next_page() {
     assert_eq!(document.pages.len(), 2);
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .all(|line| !line.text.starts_with('k'))
     );
     assert_eq!(
         document.pages[1]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
@@ -2702,7 +3492,7 @@ async fn break_after_avoid_moves_sibling_run_when_it_fits_next_page() {
     assert_eq!(document.pages.len(), 2);
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
             .count(),
@@ -2710,13 +3500,13 @@ async fn break_after_avoid_moves_sibling_run_when_it_fits_next_page() {
     );
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .all(|rect| rect.fill != Some(Color::new(0, 0, 255)))
     );
     assert_eq!(
         document.pages[1]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
             .count(),
@@ -2724,7 +3514,7 @@ async fn break_after_avoid_moves_sibling_run_when_it_fits_next_page() {
     );
     assert_eq!(
         document.pages[1]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
             .count(),
@@ -2748,13 +3538,13 @@ async fn break_before_avoid_moves_previous_sibling_when_run_fits_next_page() {
     assert_eq!(document.pages.len(), 2);
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .all(|rect| rect.fill != Some(Color::new(0, 0, 255)))
     );
     assert_eq!(
         document.pages[1]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
             .count(),
@@ -2775,13 +3565,13 @@ async fn break_inside_avoid_paragraph_moves_all_lines_when_it_fits_next_page() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert!(document.pages[0].lines.iter().all(|line| !matches!(
+    assert!(document.pages[0].lines().iter().all(|line| !matches!(
         line.text.as_str(),
         "one" | "two" | "three" | "four" | "five" | "six" | "seven"
     )));
     assert_eq!(
         document.pages[1]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
@@ -2806,7 +3596,7 @@ async fn break_inside_avoid_estimate_uses_css_text_line_fitting() {
         .pages
         .iter()
         .map(|page| {
-            page.lines
+            page.lines()
                 .iter()
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>()
@@ -2816,14 +3606,14 @@ async fn break_inside_avoid_estimate_uses_css_text_line_fitting() {
     assert_eq!(document.pages.len(), 2, "{page_text:?}");
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .all(|line| !["one", "two", "three", "four"].contains(&line.text.as_str())),
         "{page_text:?}"
     );
     assert_eq!(
         document.pages[1]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
@@ -2846,7 +3636,7 @@ async fn nested_break_inside_avoid_block_moves_to_next_page_when_it_fits() {
         .pages
         .iter()
         .map(|page| {
-            page.lines
+            page.lines()
                 .iter()
                 .map(|line| (line.text.clone(), line.x(), line.y()))
                 .collect::<Vec<_>>()
@@ -2855,7 +3645,7 @@ async fn nested_break_inside_avoid_block_moves_to_next_page_when_it_fits() {
     assert_eq!(document.pages.len(), 2, "{page_lines:?}");
     assert_eq!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
@@ -2863,12 +3653,113 @@ async fn nested_break_inside_avoid_block_moves_to_next_page_when_it_fits() {
     );
     assert_eq!(
         document.pages[1]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
         vec!["2", "3"]
     );
+}
+
+#[tokio::test]
+async fn floated_break_inside_avoid_block_moves_to_next_page_when_it_fits() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <html lang=\"en-US\"><head>\
+         <title>CSS Test: CSS 2.1 page-break-inside:avoid</title>\
+         <style>\
+         @page { size: 5in 3in; margin: 0.5in }\
+         p { height: 1in; width: 1in; margin: 0; background-color: blue }\
+         .test { float: left; page-break-inside: avoid }\
+         </style></head><body>\
+         <div style=\"clear: both\"><p>1</p></div>\
+         <div class=\"test\"><p>2</p><p>3</p></div>\
+         </body></html>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_text = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(document.pages.len(), 2, "{page_text:?}");
+    assert_eq!(page_text[0], vec!["1"]);
+    assert_eq!(page_text[1], vec!["2", "3"]);
+
+    let page_two_lines = document.pages[1].lines();
+    assert!(
+        page_two_lines[0].y() > page_two_lines[1].y(),
+        "floated avoid lines should be vertically ordered: {page_two_lines:?}",
+    );
+    assert!(
+        (page_two_lines[0].y() - page_two_lines[1].y()).abs() > 0.01,
+        "floated avoid lines should occupy distinct vertical positions: {page_two_lines:?}",
+    );
+}
+
+#[tokio::test]
+async fn forced_break_before_preserves_break_inside_avoid_for_descendants() {
+    let document = Html::from_string(
+        "<style>@page { size: 5in 3in; margin: 0.5in }\
+         p { height: 1in; width: 1in; margin: 0; background-color: blue }\
+         .test { page-break-before: always; page-break-inside: avoid }</style>\
+         <p>1</p><div class=\"test\"><p>2</p><p>3</p></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_text = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(document.pages.len(), 2, "{page_text:?}");
+    assert_eq!(page_text[0], vec!["1"]);
+    assert_eq!(page_text[1], vec!["2", "3"]);
+}
+
+#[tokio::test]
+async fn forced_break_after_slices_ancestor_block_start_spacing() {
+    let document = Html::from_string(
+        "<style>@page { size: 5in 3in; margin: 0.5in }\
+         p { height: 1in; width: 1in; margin: 0; background-color: blue }\
+         .test { page-break-after: always }</style>\
+         <div class=\"test\"><p>1</p></div><p>2</p><p>3</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_text = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(document.pages.len(), 2, "{page_text:?}");
+    assert_eq!(page_text[0], vec!["1"]);
+    assert_eq!(page_text[1], vec!["2", "3"]);
 }
 
 #[tokio::test]
@@ -2882,7 +3773,7 @@ async fn widows_keeps_minimum_lines_after_text_fragment_break() {
     assert_eq!(document.pages.len(), 2);
     assert_eq!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
@@ -2890,7 +3781,7 @@ async fn widows_keeps_minimum_lines_after_text_fragment_break() {
     );
     assert_eq!(
         document.pages[1]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
@@ -2909,7 +3800,7 @@ async fn orphans_moves_text_fragment_when_too_few_lines_fit() {
     assert_eq!(document.pages.len(), 2);
     assert_eq!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
@@ -2917,7 +3808,7 @@ async fn orphans_moves_text_fragment_when_too_few_lines_fit() {
     );
     assert_eq!(
         document.pages[1]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
@@ -2934,8 +3825,8 @@ async fn widows_apply_to_styled_inline_text_fragments() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].lines.len(), 3);
-    assert_eq!(document.pages[1].lines.len(), 2);
+    assert_eq!(document.pages[0].lines().len(), 3);
+    assert_eq!(document.pages[1].lines().len(), 2);
 }
 
 #[tokio::test]
@@ -2947,8 +3838,8 @@ async fn widows_apply_to_mixed_inline_atom_fragments() {
     .unwrap();
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].lines.len(), 3);
-    assert_eq!(document.pages[1].lines.len(), 2);
+    assert_eq!(document.pages[0].lines().len(), 3);
+    assert_eq!(document.pages[1].lines().len(), 2);
 }
 
 #[tokio::test]
@@ -2962,13 +3853,13 @@ async fn keeps_break_inside_avoid_table_groups_together_when_they_fit_next_page(
     assert_eq!(document.pages.len(), 2);
     assert!(
         document.pages[0]
-            .lines
+            .lines()
             .iter()
             .all(|line| !matches!(line.text.as_str(), "A" | "B" | "C"))
     );
     assert_eq!(
         document.pages[1]
-            .lines
+            .lines()
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>(),
@@ -3112,10 +4003,10 @@ async fn fixed_position_replays_full_paint_fragment_on_each_page() {
     assert_eq!(document.pages.len(), 2);
     for page in &document.pages {
         assert_eq!(painted_blue_rect_count(page), 1);
-        assert!(page.operations.iter().any(|operation| matches!(
+        assert!(page.operations().iter().any(|operation| matches!(
             operation,
             quire::PaintOperation::Line(index)
-                if page.lines.get(*index).is_some_and(|line| line.text == "Pin")
+                if page.lines().get(*index).is_some_and(|line| line.text == "Pin")
         )));
     }
 }
@@ -3232,7 +4123,7 @@ async fn positioned_inline_z_index_offsets_split_block_segment() {
         first_rect_paint_operation_index(page, Color::new(0, 128, 0))
             > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
         "positioned inline z-index should paint split block above red: operations={:?}",
-        page.operations
+        page.operations()
     );
 }
 
@@ -3246,13 +4137,13 @@ async fn positioned_context_preserves_internal_inline_above_negative_child() {
 
     let red_index = first_rect_paint_operation_index(&document.pages[0], Color::new(255, 0, 0));
     let text_index = document.pages[0]
-        .operations
+        .operations()
         .iter()
         .position(|operation| {
             matches!(
                 operation,
                 quire::PaintOperation::Line(index)
-                    if document.pages[0].lines.get(*index).is_some_and(|line| line.text == "Text")
+                    if document.pages[0].lines().get(*index).is_some_and(|line| line.text == "Text")
             )
         })
         .unwrap();
@@ -3454,22 +4345,22 @@ async fn positioned_collapsed_table_paints_cell_text_above_late_border_rects() {
     .unwrap();
 
     let line_index = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .position(|line| line.text == "Visible")
         .unwrap();
     let line_operation = document.pages[0]
-        .operations
+        .operations()
         .iter()
         .position(|operation| *operation == quire::PaintOperation::Line(line_index))
         .unwrap();
-    let line = &document.pages[0].lines[line_index];
+    let line = &document.pages[0].lines()[line_index];
     let covering_rect_after_text = document.pages[0]
-        .operations
+        .operations()
         .iter()
         .skip(line_operation + 1)
         .filter_map(|operation| match operation {
-            quire::PaintOperation::Rect(index) => document.pages[0].rects.get(*index),
+            quire::PaintOperation::Rect(index) => document.pages[0].rects().get(*index),
             _ => None,
         })
         .any(|rect| {
@@ -3507,18 +4398,120 @@ async fn stacking_trigger_paint_order(parent_declaration: &str) -> Vec<Color> {
 }
 
 fn filled_rect(page: &quire::Page, color: Color) -> &quire::RenderedRect {
-    page.rects
+    page.rects()
         .iter()
         .find(|rect| rect.fill == Some(color))
         .expect("filled rect should be present")
 }
 
+fn emitted_rects_with_fills<'a>(
+    page: &'a quire::Page,
+    colors: &[Color],
+) -> Vec<(usize, &'a quire::RenderedRect)> {
+    page.paint_operations()
+        .iter()
+        .enumerate()
+        .filter_map(|(operation_index, operation)| {
+            let quire::PaintOperation::Rect(index) = operation else {
+                return None;
+            };
+            let rect = page.rects().get(*index)?;
+            rect.fill
+                .is_some_and(|fill| colors.contains(&fill))
+                .then_some((operation_index, rect))
+        })
+        .collect()
+}
+
+fn same_rect(left: &quire::RenderedRect, right: &quire::RenderedRect) -> bool {
+    (left.x() - right.x()).abs() < 0.01
+        && (left.y() - right.y()).abs() < 0.01
+        && (left.width() - right.width()).abs() < 0.01
+        && (left.height() - right.height()).abs() < 0.01
+}
+
+#[derive(Debug)]
+struct PdfEmittedRect {
+    fill: Color,
+    rect: (f32, f32, f32, f32),
+}
+
+fn pdf_emitted_rects_with_fills(pdf: &[u8], colors: &[Color]) -> Vec<PdfEmittedRect> {
+    let mut current_fill = None;
+    let mut rects = Vec::new();
+    let rendered = String::from_utf8_lossy(pdf);
+
+    for line in rendered.lines().map(str::trim) {
+        if let Some(fill) = parse_pdf_fill_rgb(line) {
+            current_fill = Some(fill);
+            continue;
+        }
+        let Some(rect) = parse_pdf_rect(line) else {
+            continue;
+        };
+        let Some(fill) = current_fill else {
+            continue;
+        };
+        if colors.contains(&fill) {
+            rects.push(PdfEmittedRect { fill, rect });
+        }
+    }
+
+    rects
+}
+
+fn parse_pdf_fill_rgb(line: &str) -> Option<Color> {
+    let mut parts = line.split_whitespace();
+    let red = parts.next()?.parse::<f32>().ok()?;
+    let green = parts.next()?.parse::<f32>().ok()?;
+    let blue = parts.next()?.parse::<f32>().ok()?;
+    (parts.next()? == "rg" && parts.next().is_none()).then_some(Color::new(
+        pdf_color_component(red),
+        pdf_color_component(green),
+        pdf_color_component(blue),
+    ))
+}
+
+fn pdf_color_component(component: f32) -> u8 {
+    (component * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn parse_pdf_rect(line: &str) -> Option<(f32, f32, f32, f32)> {
+    let mut parts = line.split_whitespace();
+    let x = parts.next()?.parse::<f32>().ok()?;
+    let y = parts.next()?.parse::<f32>().ok()?;
+    let width = parts.next()?.parse::<f32>().ok()?;
+    let height = parts.next()?.parse::<f32>().ok()?;
+    (parts.next()? == "re" && parts.next().is_none()).then_some((x, y, width, height))
+}
+
+fn same_pdf_rect(left: (f32, f32, f32, f32), right: (f32, f32, f32, f32)) -> bool {
+    (left.0 - right.0).abs() < 0.01
+        && (left.1 - right.1).abs() < 0.01
+        && (left.2 - right.2).abs() < 0.01
+        && (left.3 - right.3).abs() < 0.01
+}
+
+fn assert_final_rect_fill(page: &quire::Page, rect: &quire::RenderedRect, expected: Color) {
+    for x_fraction in [0.125, 0.5, 0.875] {
+        for y_fraction in [0.125, 0.5, 0.875] {
+            let x = rect.x() + rect.width() * x_fraction;
+            let y = rect.y() + rect.height() * y_fraction;
+            assert_eq!(
+                final_rect_fill_at(page, x, y),
+                Some(expected),
+                "expected final fill at ({x}, {y}) inside {rect:?}",
+            );
+        }
+    }
+}
+
 fn painted_rect_fills(page: &quire::Page, colors: &[Color]) -> Vec<Color> {
-    page.operations
+    page.operations()
         .iter()
         .filter_map(|operation| match operation {
             quire::PaintOperation::Rect(index) => page
-                .rects
+                .rects()
                 .get(*index)
                 .and_then(|rect| rect.fill.filter(|fill| colors.contains(fill))),
             _ => None,
@@ -3528,11 +4521,11 @@ fn painted_rect_fills(page: &quire::Page, colors: &[Color]) -> Vec<Color> {
 
 fn painted_blue_rect_count(page: &quire::Page) -> usize {
     let blue = Color::new(0, 0, 255);
-    page.operations
+    page.operations()
         .iter()
         .filter(|operation| match operation {
             quire::PaintOperation::Rect(index) => page
-                .rects
+                .rects()
                 .get(*index)
                 .is_some_and(|rect| rect.fill == Some(blue)),
             _ => false,

@@ -89,7 +89,7 @@ fn line_font_is_monospace(document: &quire::Document, line: &quire::RenderedLine
 
 fn horizontal_table_border_widths(document: &quire::Document) -> Vec<f32> {
     document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::BLACK) && rect.height() <= 1.01 && rect.width() > 1.01
@@ -101,7 +101,7 @@ fn horizontal_table_border_widths(document: &quire::Document) -> Vec<f32> {
 
 fn vertical_table_border_heights(document: &quire::Document) -> Vec<f32> {
     document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| {
             rect.fill == Some(Color::BLACK) && rect.width() <= 1.01 && rect.height() > 1.01
@@ -117,7 +117,7 @@ fn first_rect_paint_operation_index(page: &quire::Page, color: Color) -> usize {
             matches!(
                 operation,
                 quire::PaintOperation::Rect(index)
-                    if page.rects.get(*index).is_some_and(|rect| rect.fill == Some(color))
+                    if page.rects().get(*index).is_some_and(|rect| rect.fill == Some(color))
             )
         })
         .expect("rect with expected fill should be present in paint operations")
@@ -130,7 +130,7 @@ fn final_rect_fill_at(page: &quire::Page, x: f32, y: f32) -> Option<Color> {
             let quire::PaintOperation::Rect(index) = operation else {
                 return None;
             };
-            let rect = page.rects.get(*index)?;
+            let rect = page.rects().get(*index)?;
             (x >= rect.x()
                 && x <= rect.x() + rect.width()
                 && y >= rect.y()
@@ -186,6 +186,79 @@ fn assert_line_baseline_at_top(document: &quire::Document, line: &quire::Rendere
         expected,
         top_y,
         line.y()
+    );
+}
+
+#[tokio::test]
+async fn overflow_scroll_preserves_parent_paint_order() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <title>Overflow:scroll paint order</title>\
+         <style>\
+         @page { size: 200px 200px; margin: 0 }\
+         body { margin: 0 }\
+         #scroller {\
+           background: red;\
+           padding: 20px;\
+           box-sizing: border-box;\
+           width: 100px;\
+           height: 100px;\
+           overflow: scroll;\
+         }\
+         #negative-margin {\
+           width: 100px;\
+           height: 100px;\
+           background: green;\
+           margin-top: -100px;\
+         }\
+         #foreground1, #foreground2 {\
+           display: inline-block;\
+           width: 50px;\
+           height: 50px;\
+         }\
+         #foreground1 { background: blue }\
+         #foreground2 { background: magenta }\
+         </style>\
+         <div id=\"scroller\">\
+           <div style=\"height: 200px; background: yellow\">\
+             <div id=\"foreground1\"></div>\
+           </div>\
+         </div>\
+         <div id=\"negative-margin\">\
+           <div id=\"foreground2\"></div>\
+         </div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let red = first_rect_paint_operation_index(page, Color::new(255, 0, 0));
+    let yellow = first_rect_paint_operation_index(page, Color::new(255, 255, 0));
+    let green = first_rect_paint_operation_index(page, Color::new(0, 128, 0));
+    let blue = first_rect_paint_operation_index(page, Color::new(0, 0, 255));
+    let magenta = first_rect_paint_operation_index(page, Color::new(255, 0, 255));
+
+    assert!(red < yellow, "scroller background should paint first");
+    assert!(yellow < green, "later block background should cover yellow");
+    assert!(
+        green < blue,
+        "earlier inline foreground should paint over green"
+    );
+    assert!(blue < magenta, "later inline foreground should paint last");
+
+    let blue_rect = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .expect("blue foreground rect should render");
+    assert_eq!(
+        final_rect_fill_at(
+            page,
+            blue_rect.x() + blue_rect.width() - 1.0,
+            blue_rect.y() + blue_rect.height() / 2.0,
+        ),
+        Some(Color::new(0, 0, 255))
     );
 }
 

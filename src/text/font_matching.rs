@@ -665,44 +665,50 @@ pub(super) fn family_query(name: &str) -> FontiqueQueryFamily<'_> {
 pub(super) fn generic_query_families(
     family: &FontFamily,
     weight: FontWeight,
-) -> Option<Vec<FontiqueQueryFamily<'static>>> {
+) -> Option<&'static [FontiqueQueryFamily<'static>]> {
+    const SANS_SERIF_BOLD: &[FontiqueQueryFamily<'static>] = &[
+        FontiqueQueryFamily::Named("Arial"),
+        FontiqueQueryFamily::Named("Helvetica Neue"),
+        FontiqueQueryFamily::Named("Helvetica"),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::SansSerif),
+    ];
+    const SANS_SERIF: &[FontiqueQueryFamily<'static>] = &[
+        FontiqueQueryFamily::Named("Helvetica"),
+        FontiqueQueryFamily::Named("Helvetica Neue"),
+        FontiqueQueryFamily::Named("Arial"),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::SansSerif),
+    ];
+    const SERIF: &[FontiqueQueryFamily<'static>] = &[
+        FontiqueQueryFamily::Named("Times New Roman"),
+        FontiqueQueryFamily::Named("Times"),
+        FontiqueQueryFamily::Named("Georgia"),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::Serif),
+    ];
+    const MONOSPACE_BOLD: &[FontiqueQueryFamily<'static>] = &[
+        FontiqueQueryFamily::Named("Courier New"),
+        FontiqueQueryFamily::Named("Courier"),
+        FontiqueQueryFamily::Named("PT Mono"),
+        FontiqueQueryFamily::Named("Andale Mono"),
+        FontiqueQueryFamily::Named("Menlo"),
+        FontiqueQueryFamily::Named(".SF NS Mono"),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::Monospace),
+    ];
+    const MONOSPACE: &[FontiqueQueryFamily<'static>] = &[
+        FontiqueQueryFamily::Named("Menlo"),
+        FontiqueQueryFamily::Named("Andale Mono"),
+        FontiqueQueryFamily::Named("PT Mono"),
+        FontiqueQueryFamily::Named(".SF NS Mono"),
+        FontiqueQueryFamily::Named("Courier New"),
+        FontiqueQueryFamily::Named("Courier"),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::Monospace),
+    ];
+
     match family {
-        FontFamily::SansSerif if weight.0 >= FontWeight::BOLD.0 => Some(vec![
-            FontiqueQueryFamily::Named("Arial"),
-            FontiqueQueryFamily::Named("Helvetica Neue"),
-            FontiqueQueryFamily::Named("Helvetica"),
-            FontiqueQueryFamily::Generic(FontiqueGenericFamily::SansSerif),
-        ]),
-        FontFamily::SansSerif => Some(vec![
-            FontiqueQueryFamily::Named("Helvetica"),
-            FontiqueQueryFamily::Named("Helvetica Neue"),
-            FontiqueQueryFamily::Named("Arial"),
-            FontiqueQueryFamily::Generic(FontiqueGenericFamily::SansSerif),
-        ]),
-        FontFamily::Serif => Some(vec![
-            FontiqueQueryFamily::Named("Times New Roman"),
-            FontiqueQueryFamily::Named("Times"),
-            FontiqueQueryFamily::Named("Georgia"),
-            FontiqueQueryFamily::Generic(FontiqueGenericFamily::Serif),
-        ]),
-        FontFamily::Monospace if weight.0 >= FontWeight::BOLD.0 => Some(vec![
-            FontiqueQueryFamily::Named("Courier New"),
-            FontiqueQueryFamily::Named("Courier"),
-            FontiqueQueryFamily::Named("PT Mono"),
-            FontiqueQueryFamily::Named("Andale Mono"),
-            FontiqueQueryFamily::Named("Menlo"),
-            FontiqueQueryFamily::Named(".SF NS Mono"),
-            FontiqueQueryFamily::Generic(FontiqueGenericFamily::Monospace),
-        ]),
-        FontFamily::Monospace => Some(vec![
-            FontiqueQueryFamily::Named("Menlo"),
-            FontiqueQueryFamily::Named("Andale Mono"),
-            FontiqueQueryFamily::Named("PT Mono"),
-            FontiqueQueryFamily::Named(".SF NS Mono"),
-            FontiqueQueryFamily::Named("Courier New"),
-            FontiqueQueryFamily::Named("Courier"),
-            FontiqueQueryFamily::Generic(FontiqueGenericFamily::Monospace),
-        ]),
+        FontFamily::SansSerif if weight.0 >= FontWeight::BOLD.0 => Some(SANS_SERIF_BOLD),
+        FontFamily::SansSerif => Some(SANS_SERIF),
+        FontFamily::Serif => Some(SERIF),
+        FontFamily::Monospace if weight.0 >= FontWeight::BOLD.0 => Some(MONOSPACE_BOLD),
+        FontFamily::Monospace => Some(MONOSPACE),
         FontFamily::Names(_) => None,
     }
 }
@@ -724,29 +730,75 @@ pub(super) fn fallback_family_score(family_name: &str) -> (u32, String) {
 }
 
 impl FontRequest {
+    fn generic_family(family: &FontFamily) -> Option<GenericFontRequest> {
+        match family {
+            FontFamily::SansSerif => Some(GenericFontRequest::SansSerif),
+            FontFamily::Serif => Some(GenericFontRequest::Serif),
+            FontFamily::Monospace => Some(GenericFontRequest::Monospace),
+            FontFamily::Names(_) => None,
+        }
+    }
+
+    fn from_normalized_names(
+        names: Vec<String>,
+        weight: FontWeight,
+        style: FontStyle,
+        width: FontWidth,
+    ) -> Self {
+        let family = if names.len() == 1 {
+            FontRequestFamily::Named(names.into_iter().next().unwrap())
+        } else {
+            FontRequestFamily::Names(names)
+        };
+        Self {
+            family,
+            attributes: font_request_attributes(weight, style, width),
+        }
+    }
+
     pub(super) fn from_family(
         family: &FontFamily,
         weight: FontWeight,
         style: FontStyle,
         width: FontWidth,
     ) -> Self {
-        let family_list = match family {
-            FontFamily::SansSerif => {
-                vec![FontFamilyRequest::Generic(GenericFontRequest::SansSerif)]
-            }
-            FontFamily::Serif => vec![FontFamilyRequest::Generic(GenericFontRequest::Serif)],
-            FontFamily::Monospace => {
-                vec![FontFamilyRequest::Generic(GenericFontRequest::Monospace)]
-            }
-            FontFamily::Names(names) => names
-                .iter()
-                .map(|name| FontFamilyRequest::Named(normalize_family(name)))
-                .collect(),
-        };
-        Self {
-            family_list,
-            attributes: font_request_attributes(weight, style, width),
+        if let Some(generic) = Self::generic_family(family) {
+            return Self {
+                family: FontRequestFamily::Generic(generic),
+                attributes: font_request_attributes(weight, style, width),
+            };
         }
+
+        let FontFamily::Names(names) = family else {
+            unreachable!("generic font families returned above");
+        };
+        Self::from_normalized_names(
+            names.iter().map(|name| normalize_family(name)).collect(),
+            weight,
+            style,
+            width,
+        )
+    }
+
+    pub(super) fn from_names<I>(
+        names: I,
+        weight: FontWeight,
+        style: FontStyle,
+        width: FontWidth,
+    ) -> Self
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        Self::from_normalized_names(
+            names
+                .into_iter()
+                .map(|name| normalize_family(name.as_ref()))
+                .collect(),
+            weight,
+            style,
+            width,
+        )
     }
 
     pub(super) fn single_name(
@@ -756,7 +808,7 @@ impl FontRequest {
         width: FontWidth,
     ) -> Self {
         Self {
-            family_list: vec![FontFamilyRequest::Named(normalize_family(name))],
+            family: FontRequestFamily::Named(normalize_family(name)),
             attributes: font_request_attributes(weight, style, width),
         }
     }
@@ -767,7 +819,13 @@ impl FontRequest {
         style: FontStyle,
         width: FontWidth,
     ) -> Self {
-        Self::from_family(family, weight, style, width)
+        let Some(generic) = Self::generic_family(family) else {
+            return Self::from_family(family, weight, style, width);
+        };
+        Self {
+            family: FontRequestFamily::Generic(generic),
+            attributes: font_request_attributes(weight, style, width),
+        }
     }
 }
 

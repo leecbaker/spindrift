@@ -148,6 +148,7 @@ fn style_for_element_with_signature_inner(
     style.quotes.resolve_auto_language(quotes_auto_language);
     if matches!(style.position, Position::Absolute | Position::Fixed) {
         style.abspos_static_source_was_inline_level = style.display.is_inline_level();
+        style.abspos_static_source_was_atomic_inline = style.display.is_atomic_inline();
     }
     resolve_ua_relative_margins(&mut style);
     if apply_pseudos {
@@ -432,28 +433,28 @@ pub(super) fn resolve_ua_relative_margins(style: &mut ComputedStyle) {
     if let Some(em) = style.ua_margin_em.top.take() {
         let margin = em * style.font_size;
         style.box_values.margin.top = ComputedLengthPercentageOrAuto::LengthPercentage(
-            ComputedLengthPercentage::from_length(margin),
+            ComputedLengthPercentage::from_points(margin),
         );
         style.margin.top = margin;
     }
     if let Some(em) = style.ua_margin_em.right.take() {
         let margin = em * style.font_size;
         style.box_values.margin.right = ComputedLengthPercentageOrAuto::LengthPercentage(
-            ComputedLengthPercentage::from_length(margin),
+            ComputedLengthPercentage::from_points(margin),
         );
         style.margin.right = margin;
     }
     if let Some(em) = style.ua_margin_em.bottom.take() {
         let margin = em * style.font_size;
         style.box_values.margin.bottom = ComputedLengthPercentageOrAuto::LengthPercentage(
-            ComputedLengthPercentage::from_length(margin),
+            ComputedLengthPercentage::from_points(margin),
         );
         style.margin.bottom = margin;
     }
     if let Some(em) = style.ua_margin_em.left.take() {
         let margin = em * style.font_size;
         style.box_values.margin.left = ComputedLengthPercentageOrAuto::LengthPercentage(
-            ComputedLengthPercentage::from_length(margin),
+            ComputedLengthPercentage::from_points(margin),
         );
         style.margin.left = margin;
     }

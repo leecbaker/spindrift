@@ -48,6 +48,8 @@ pub(super) fn property_is_inherited(name: &str) -> bool {
             | "text-align-last"
             | "text-justify"
             | "text-autospace"
+            | "line-fit-edge"
+            | "text-box-edge"
             | "text-orientation"
             | "text-decoration-skip-ink"
             | "text-decoration-skip-self"
@@ -93,6 +95,25 @@ pub(super) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "order",
     "row-gap",
     "column-gap",
+    "row-rule-width",
+    "row-rule-style",
+    "row-rule-color",
+    "row-rule-break",
+    "row-rule-visibility-items",
+    "row-rule-inset-cap-start",
+    "row-rule-inset-cap-end",
+    "row-rule-inset-junction-start",
+    "row-rule-inset-junction-end",
+    "column-rule-width",
+    "column-rule-style",
+    "column-rule-color",
+    "column-rule-break",
+    "column-rule-visibility-items",
+    "column-rule-inset-cap-start",
+    "column-rule-inset-cap-end",
+    "column-rule-inset-junction-start",
+    "column-rule-inset-junction-end",
+    "rule-overlap",
     "grid-template-rows",
     "grid-template-columns",
     "grid-template-areas",
@@ -151,12 +172,16 @@ pub(super) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "background-repeat",
     "background-origin",
     "background-clip",
+    "box-decoration-break",
     "box-shadow",
     "color",
     "direction",
     "unicode-bidi",
     "writing-mode",
     "text-orientation",
+    "line-fit-edge",
+    "text-box-trim",
+    "text-box-edge",
     "font-size",
     "font-size-adjust",
     "line-height",
@@ -164,6 +189,7 @@ pub(super) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "word-spacing",
     "width",
     "height",
+    "aspect-ratio",
     "inline-size",
     "block-size",
     "min-width",
@@ -319,6 +345,45 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "order" => style.order = source.order,
         "row-gap" => style.row_gap = source.row_gap,
         "column-gap" => style.column_gap = source.column_gap,
+        "row-rule-width" => style.row_rule.widths = source.row_rule.widths.clone(),
+        "row-rule-style" => style.row_rule.styles = source.row_rule.styles.clone(),
+        "row-rule-color" => style.row_rule.colors = source.row_rule.colors.clone(),
+        "row-rule-break" => style.row_rule.rule_break = source.row_rule.rule_break,
+        "row-rule-visibility-items" => {
+            style.row_rule.visibility_items = source.row_rule.visibility_items;
+        }
+        "row-rule-inset-cap-start" => {
+            style.row_rule.inset_cap_start = source.row_rule.inset_cap_start;
+        }
+        "row-rule-inset-cap-end" => {
+            style.row_rule.inset_cap_end = source.row_rule.inset_cap_end;
+        }
+        "row-rule-inset-junction-start" => {
+            style.row_rule.inset_junction_start = source.row_rule.inset_junction_start;
+        }
+        "row-rule-inset-junction-end" => {
+            style.row_rule.inset_junction_end = source.row_rule.inset_junction_end;
+        }
+        "column-rule-width" => style.column_rule.widths = source.column_rule.widths.clone(),
+        "column-rule-style" => style.column_rule.styles = source.column_rule.styles.clone(),
+        "column-rule-color" => style.column_rule.colors = source.column_rule.colors.clone(),
+        "column-rule-break" => style.column_rule.rule_break = source.column_rule.rule_break,
+        "column-rule-visibility-items" => {
+            style.column_rule.visibility_items = source.column_rule.visibility_items;
+        }
+        "column-rule-inset-cap-start" => {
+            style.column_rule.inset_cap_start = source.column_rule.inset_cap_start;
+        }
+        "column-rule-inset-cap-end" => {
+            style.column_rule.inset_cap_end = source.column_rule.inset_cap_end;
+        }
+        "column-rule-inset-junction-start" => {
+            style.column_rule.inset_junction_start = source.column_rule.inset_junction_start;
+        }
+        "column-rule-inset-junction-end" => {
+            style.column_rule.inset_junction_end = source.column_rule.inset_junction_end;
+        }
+        "rule-overlap" => style.rule_overlap = source.rule_overlap,
         "grid-template-rows" => style.grid_template_rows = source.grid_template_rows.clone(),
         "grid-template-columns" => {
             style.grid_template_columns = source.grid_template_columns.clone();
@@ -590,6 +655,10 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "text-align-last" => style.text_align_last = source.text_align_last,
         "text-justify" => style.text_justify = source.text_justify,
         "text-autospace" => style.text_autospace = source.text_autospace,
+        "line-fit-edge" => style.line_fit_edge = source.line_fit_edge,
+        "text-box-trim" => style.text_box_trim = source.text_box_trim,
+        "text-box-edge" => style.text_box_edge = source.text_box_edge,
+        "box-decoration-break" => style.box_decoration_break = source.box_decoration_break,
         "text-indent" => style.text_indent = source.text_indent,
         "hanging-punctuation" => style.hanging_punctuation = source.hanging_punctuation,
         "vertical-align" => style.vertical_align = source.vertical_align,

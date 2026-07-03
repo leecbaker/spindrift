@@ -17,6 +17,7 @@ pub(crate) struct ComputedStyle {
     pub flex_wrap: FlexWrap,
     pub order: i32,
     pub row_gap: ComputedGap,
+    pub row_rule: GapRuleAxis,
     pub grid_template_rows: GridTrackList,
     pub grid_template_columns: GridTrackList,
     pub grid_template_areas: GridTemplateAreas,
@@ -30,7 +31,10 @@ pub(crate) struct ComputedStyle {
     pub column_count: Option<usize>,
     pub column_width: ComputedColumnWidth,
     pub column_gap: ComputedGap,
+    pub column_rule: GapRuleAxis,
+    pub rule_overlap: GapRuleOverlap,
     pub box_values: ComputedBoxValues,
+    pub aspect_ratio: AspectRatio,
     pub margin_trim: MarginTrim,
     pub margin: Edges,
     pub ua_margin_em: OptionalEdges<f32>,
@@ -63,6 +67,7 @@ pub(crate) struct ComputedStyle {
     pub background_origin: BackgroundBox,
     pub background_clip: BackgroundBox,
     pub background_layers: Vec<BackgroundLayer>,
+    pub box_decoration_break: BoxDecorationBreak,
     pub box_shadow: Vec<BoxShadow>,
     pub color: Color,
     pub font_size: f32,
@@ -82,6 +87,9 @@ pub(crate) struct ComputedStyle {
     pub text_align_last: TextAlignLast,
     pub text_justify: TextJustify,
     pub text_autospace: TextAutospace,
+    pub line_fit_edge: LineFitEdge,
+    pub text_box_trim: TextBoxTrim,
+    pub text_box_edge: TextBoxEdge,
     pub text_indent: ComputedTextIndent,
     pub hanging_punctuation: HangingPunctuation,
     pub vertical_align: VerticalAlign,
@@ -160,6 +168,7 @@ pub(crate) struct ComputedStyle {
     pub clear: Clear,
     pub running_element_name: Option<String>,
     pub abspos_static_source_was_inline_level: bool,
+    pub abspos_static_source_was_atomic_inline: bool,
     pub z_index: Option<i32>,
     pub opacity: f32,
     pub transform: TransformList,
@@ -196,6 +205,7 @@ impl ComputedStyle {
             flex_wrap: FlexWrap::NoWrap,
             order: 0,
             row_gap: ComputedGap::NORMAL,
+            row_rule: GapRuleAxis::initial(),
             grid_template_rows: GridTrackList::NONE,
             grid_template_columns: GridTrackList::NONE,
             grid_template_areas: GridTemplateAreas::NONE,
@@ -209,7 +219,10 @@ impl ComputedStyle {
             column_count: None,
             column_width: ComputedColumnWidth::AUTO,
             column_gap: ComputedGap::NORMAL,
+            column_rule: GapRuleAxis::initial(),
+            rule_overlap: GapRuleOverlap::RowOverColumn,
             box_values: ComputedBoxValues::initial(),
+            aspect_ratio: AspectRatio::AUTO,
             margin_trim: MarginTrim::NONE,
             margin: Edges::ZERO,
             ua_margin_em: OptionalEdges::NONE,
@@ -224,7 +237,7 @@ impl ComputedStyle {
             corner_shapes: CornerShapes::ROUND,
             border_image: BorderImage::initial(),
             outline_width: 3.0 * CSS_PX_TO_PT,
-            outline_width_value: ComputedLengthPercentage::from_length(3.0 * CSS_PX_TO_PT),
+            outline_width_value: ComputedLengthPercentage::from_points(3.0 * CSS_PX_TO_PT),
             outline_color: Color::BLACK,
             outline_style: BorderStyle::None,
             outline_offset: ComputedLengthPercentage::ZERO,
@@ -242,6 +255,7 @@ impl ComputedStyle {
             background_origin: BackgroundBox::Padding,
             background_clip: BackgroundBox::Border,
             background_layers: Vec::new(),
+            box_decoration_break: BoxDecorationBreak::Slice,
             box_shadow: Vec::new(),
             color: Color::BLACK,
             font_size,
@@ -261,6 +275,9 @@ impl ComputedStyle {
             text_align_last: TextAlignLast::Auto,
             text_justify: TextJustify::Auto,
             text_autospace: TextAutospace::NORMAL,
+            line_fit_edge: LineFitEdge::Leading,
+            text_box_trim: TextBoxTrim::None,
+            text_box_edge: TextBoxEdge::Auto,
             text_indent: ComputedTextIndent::ZERO,
             hanging_punctuation: HangingPunctuation::NONE,
             vertical_align: VerticalAlign::BASELINE,
@@ -344,6 +361,7 @@ impl ComputedStyle {
             clear: Clear::None,
             running_element_name: None,
             abspos_static_source_was_inline_level: false,
+            abspos_static_source_was_atomic_inline: false,
             z_index: None,
             opacity: 1.0,
             transform: Vec::new(),
@@ -379,6 +397,8 @@ impl ComputedStyle {
         self.line_height_is_normal = is_normal;
         self.row_gap.resolve_font_metric_lengths(ch_advance);
         self.column_gap.resolve_font_metric_lengths(ch_advance);
+        self.row_rule.resolve_font_metric_lengths(ch_advance);
+        self.column_rule.resolve_font_metric_lengths(ch_advance);
         self.grid_template_rows
             .resolve_font_metric_lengths(ch_advance);
         self.grid_template_columns
@@ -404,10 +424,10 @@ impl ComputedStyle {
             .left
             .resolve_font_metric_lengths(ch_advance);
         self.border_widths = Edges {
-            top: self.border_width_values.top.length.max(0.0),
-            right: self.border_width_values.right.length.max(0.0),
-            bottom: self.border_width_values.bottom.length.max(0.0),
-            left: self.border_width_values.left.length.max(0.0),
+            top: self.border_width_values.top.length_points_max_zero(),
+            right: self.border_width_values.right.length_points_max_zero(),
+            bottom: self.border_width_values.bottom.length_points_max_zero(),
+            left: self.border_width_values.left.length_points_max_zero(),
         };
         self.border_width = self
             .border_widths
@@ -417,7 +437,7 @@ impl ComputedStyle {
             .max(self.border_widths.left);
         self.outline_width_value
             .resolve_font_metric_lengths(ch_advance);
-        self.outline_width = self.outline_width_value.length.max(0.0);
+        self.outline_width = self.outline_width_value.length_points_max_zero();
         self.outline_offset.resolve_font_metric_lengths(ch_advance);
         self.flex_basis.resolve_font_metric_lengths(ch_advance);
         self.text_indent
@@ -491,6 +511,18 @@ impl ComputedStyle {
             viewport_block,
         );
         self.column_gap.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.row_rule.resolve_viewport_lengths(
+            viewport_width,
+            viewport_height,
+            viewport_inline,
+            viewport_block,
+        );
+        self.column_rule.resolve_viewport_lengths(
             viewport_width,
             viewport_height,
             viewport_inline,
@@ -575,10 +607,10 @@ impl ComputedStyle {
             viewport_block,
         );
         self.border_widths = Edges {
-            top: self.border_width_values.top.length.max(0.0),
-            right: self.border_width_values.right.length.max(0.0),
-            bottom: self.border_width_values.bottom.length.max(0.0),
-            left: self.border_width_values.left.length.max(0.0),
+            top: self.border_width_values.top.length_points_max_zero(),
+            right: self.border_width_values.right.length_points_max_zero(),
+            bottom: self.border_width_values.bottom.length_points_max_zero(),
+            left: self.border_width_values.left.length_points_max_zero(),
         };
         self.border_width = self
             .border_widths
@@ -592,7 +624,7 @@ impl ComputedStyle {
             viewport_inline,
             viewport_block,
         );
-        self.outline_width = self.outline_width_value.length.max(0.0);
+        self.outline_width = self.outline_width_value.length_points_max_zero();
         self.outline_offset.resolve_viewport_lengths(
             viewport_width,
             viewport_height,
@@ -709,7 +741,7 @@ impl ComputedStyle {
     /// <https://www.w3.org/TR/css-text-3/#letter-spacing-property> and
     /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>.
     pub(crate) fn used_letter_spacing(&self) -> f32 {
-        self.letter_spacing.length
+        self.letter_spacing.length_points()
     }
 
     /// Return the used `word-spacing` length in layout units.
@@ -719,6 +751,6 @@ impl ComputedStyle {
     /// shaping and line breaking consume the used value:
     /// <https://www.w3.org/TR/css-text-3/#word-spacing-property>.
     pub(crate) fn used_word_spacing(&self) -> f32 {
-        self.word_spacing.length
+        self.word_spacing.length_points()
     }
 }

@@ -1,8 +1,15 @@
 use std::collections::HashMap;
 
-use html5ever::parse_document;
+use html5ever::parse_document as parse_html_document;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData as RcNodeData, RcDom};
+use xml5ever::driver::parse_document as parse_xml_document;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DocumentSyntax {
+    Html,
+    Xml,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Node {
@@ -19,6 +26,7 @@ pub(crate) enum NodeKind {
 pub(crate) struct Element {
     pub tag: String,
     pub namespace_url: String,
+    pub document_syntax: DocumentSyntax,
     pub attrs: HashMap<String, String>,
     pub namespace_attrs: Vec<NamespacedAttribute>,
     pub children: Vec<Node>,
@@ -38,6 +46,7 @@ impl Node {
             kind: NodeKind::Element(Element {
                 tag: tag.into(),
                 namespace_url: String::new(),
+                document_syntax: DocumentSyntax::Html,
                 attrs: HashMap::new(),
                 namespace_attrs: Vec::new(),
                 children: Vec::new(),
@@ -60,30 +69,55 @@ impl Node {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse(source: &str) -> Node {
-    let dom = parse_document(RcDom::default(), Default::default()).one(source);
-    convert_document(&dom.document)
+    parse_with_syntax(source, DocumentSyntax::Html).expect("HTML parsing should not fail")
 }
 
-fn convert_document(handle: &Handle) -> Node {
+pub(crate) fn parse_with_syntax(source: &str, syntax: DocumentSyntax) -> crate::Result<Node> {
+    match syntax {
+        DocumentSyntax::Html => Ok(parse_html(source)),
+        DocumentSyntax::Xml => parse_xml(source),
+    }
+}
+
+fn parse_html(source: &str) -> Node {
+    let dom = parse_html_document(RcDom::default(), Default::default()).one(source);
+    convert_document(&dom.document, DocumentSyntax::Html)
+}
+
+fn parse_xml(source: &str) -> crate::Result<Node> {
+    let dom = parse_xml_document(RcDom::default(), Default::default()).one(source);
+    let errors = dom.errors.borrow();
+    if let Some(error) = errors.first() {
+        return Err(crate::Error::InvalidInput(format!(
+            "XML parse error: {error}"
+        )));
+    }
+    Ok(convert_document(&dom.document, DocumentSyntax::Xml))
+}
+
+fn convert_document(handle: &Handle, syntax: DocumentSyntax) -> Node {
     let mut root = Node::element("document");
     let element = root.as_element_mut().unwrap();
+    element.document_syntax = syntax;
     for child in handle.children.borrow().iter() {
-        if let Some(child) = convert_node(child) {
+        if let Some(child) = convert_node(child, syntax) {
             element.children.push(child);
         }
     }
     root
 }
 
-fn convert_node(handle: &Handle) -> Option<Node> {
+fn convert_node(handle: &Handle, syntax: DocumentSyntax) -> Option<Node> {
     match &handle.data {
-        RcNodeData::Document => Some(convert_document(handle)),
+        RcNodeData::Document => Some(convert_document(handle, syntax)),
         RcNodeData::Text { contents } => Some(Node::text(contents.borrow().to_string())),
         RcNodeData::Element { name, attrs, .. } => {
             let mut node = Node::element(name.local.to_string());
             let element = node.as_element_mut().unwrap();
             element.namespace_url = name.ns.to_string();
+            element.document_syntax = syntax;
             for attr in attrs.borrow().iter() {
                 element
                     .attrs
@@ -95,7 +129,7 @@ fn convert_node(handle: &Handle) -> Option<Node> {
                 });
             }
             for child in handle.children.borrow().iter() {
-                if let Some(child) = convert_node(child) {
+                if let Some(child) = convert_node(child, syntax) {
                     element.children.push(child);
                 }
             }
@@ -317,7 +351,7 @@ fn decode_numeric_entities(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeKind, parse, text_content};
+    use super::{DocumentSyntax, NodeKind, parse, parse_with_syntax, text_content};
 
     #[tokio::test]
     async fn parses_nested_elements() {
@@ -327,5 +361,38 @@ mod tests {
             panic!("expected element");
         };
         assert_eq!(root.children.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn parses_xml_with_case_and_namespace_preserved() {
+        let root = parse_with_syntax(
+            r#"<Root xmlns="urn:test"><Child id="a">Hello</Child></Root>"#,
+            DocumentSyntax::Xml,
+        )
+        .unwrap();
+        let NodeKind::Element(document) = root.kind else {
+            panic!("expected document element");
+        };
+        let NodeKind::Element(root_element) = &document.children[0].kind else {
+            panic!("expected XML root element");
+        };
+        let NodeKind::Element(child_element) = &root_element.children[0].kind else {
+            panic!("expected XML child element");
+        };
+
+        assert_eq!(root_element.tag, "Root");
+        assert_eq!(root_element.namespace_url, "urn:test");
+        assert_eq!(root_element.document_syntax, DocumentSyntax::Xml);
+        assert_eq!(child_element.tag, "Child");
+        assert_eq!(child_element.namespace_url, "urn:test");
+    }
+
+    #[tokio::test]
+    async fn reports_xml_parse_errors() {
+        let error = parse_with_syntax("<root><child></root>", DocumentSyntax::Xml)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("XML parse error"));
     }
 }

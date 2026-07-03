@@ -1,0 +1,6 @@
+{
+    "rust-analyzer.check.command": "clippy", // Replaces the default `cargo check` command with `cargo clippy` on Rust file save
+    "rust-analyzer.check.extraArgs": [
+        "--all-features"
+    ]
+}

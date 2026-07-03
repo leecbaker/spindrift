@@ -1,12 +1,33 @@
 use super::*;
+use crate::timing::DebugTimer;
+use std::time::{Duration, Instant};
 
+#[cfg(test)]
 pub(super) fn embedded_font_plans_with_profile<'a>(
     document: &'a Document,
-    shaped_document: &ShapedDocument,
     first_embedded_font_id: usize,
     profile: PdfFontValidationProfile,
 ) -> EmbeddedFontPlans<'a> {
-    let used_glyphs = used_glyphs_for_painted_text(document, shaped_document);
+    timed_embedded_font_plans_with_profile(document, first_embedded_font_id, profile).0
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct PdfFontPlanTimings {
+    pub(super) used_glyph_collection: Duration,
+    pub(super) font_resource_mapping: Duration,
+    pub(super) font_audit_subsetting: Duration,
+}
+
+pub(super) fn timed_embedded_font_plans_with_profile<'a>(
+    document: &'a Document,
+    first_embedded_font_id: usize,
+    profile: PdfFontValidationProfile,
+) -> (EmbeddedFontPlans<'a>, PdfFontPlanTimings) {
+    let timer = DebugTimer::start("collecting PDF used glyphs");
+    let used_glyphs = used_glyphs_for_painted_text(document);
+    let used_glyph_collection = timer.finish();
+
+    let timer = DebugTimer::start("deduplicating PDF document fonts and assigning resources");
     let mut pending_fonts = Vec::<PendingEmbeddedFont<'_>>::new();
     let mut document_font_to_embedded_font = vec![None; document.fonts.len()];
     let mut key_to_embedded_font = HashMap::<EmbeddedFontKey, usize>::new();
@@ -42,13 +63,25 @@ pub(super) fn embedded_font_plans_with_profile<'a>(
             used_glyphs: font_glyphs,
         });
     }
+    let font_resource_mapping = timer.finish();
 
+    let timer = DebugTimer::start(format!(
+        "auditing and subsetting {} PDF embedded font(s)",
+        pending_fonts.len()
+    ));
     let fonts = pending_fonts
         .into_iter()
         .enumerate()
         .map(|(index, pending)| {
+            let started = Instant::now();
             let base_id = first_embedded_font_id + index * profile.embedded_font_object_count();
             let audit = audit_font_program(pending.font, &pending.used_glyphs, profile);
+            log::debug!(
+                "audited and subset PDF font {} ({} used glyph(s)) in {:.3?}",
+                pending.font.post_script_name,
+                pending.used_glyphs.len(),
+                started.elapsed()
+            );
             if let Some(reason) = &audit.fallback_reason {
                 log::debug!(
                     "using full font fallback for {}: {}",
@@ -83,6 +116,7 @@ pub(super) fn embedded_font_plans_with_profile<'a>(
             }
         })
         .collect::<Vec<_>>();
+    let font_audit_subsetting = timer.finish();
 
     log::debug!(
         "planned PDF font embedding: {} original font(s), {} used font(s), {} unique embedded font(s), {} pruned, {} duplicate(s) merged",
@@ -93,10 +127,17 @@ pub(super) fn embedded_font_plans_with_profile<'a>(
         duplicate_fonts
     );
 
-    EmbeddedFontPlans {
-        fonts,
-        document_font_to_embedded_font,
-    }
+    (
+        EmbeddedFontPlans {
+            fonts,
+            document_font_to_embedded_font,
+        },
+        PdfFontPlanTimings {
+            used_glyph_collection,
+            font_resource_mapping,
+            font_audit_subsetting,
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -196,22 +237,19 @@ struct PendingEmbeddedFont<'a> {
     used_glyphs: BTreeMap<u16, String>,
 }
 
-fn used_glyphs_for_painted_text(
-    document: &Document,
-    shaped_document: &ShapedDocument,
-) -> Vec<BTreeMap<u16, String>> {
+fn used_glyphs_for_painted_text(document: &Document) -> Vec<BTreeMap<u16, String>> {
     let mut used_glyphs = vec![BTreeMap::<u16, String>::new(); document.fonts.len()];
-    for (page_index, page) in document.pages.iter().enumerate() {
-        let shaped_lines = shaped_document
-            .pages
-            .get(page_index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+    for page in &document.pages {
         if let Some(tree) = page.paint_tree() {
-            collect_context_used_glyphs(page, shaped_lines, &tree.root, &mut used_glyphs);
+            collect_context_used_glyphs(page, document.fonts.len(), &tree.root, &mut used_glyphs);
         } else {
             for operation in page.paint_operations().iter() {
-                collect_operation_used_glyphs(page, shaped_lines, operation, &mut used_glyphs);
+                collect_operation_used_glyphs(
+                    page,
+                    document.fonts.len(),
+                    operation,
+                    &mut used_glyphs,
+                );
             }
         }
     }
@@ -220,7 +258,7 @@ fn used_glyphs_for_painted_text(
 
 fn collect_context_used_glyphs(
     page: &Page,
-    shaped_lines: &[Option<ShapedLine>],
+    document_font_count: usize,
     context: &crate::document::PaintStackingContext,
     used_glyphs: &mut [BTreeMap<u16, String>],
 ) {
@@ -228,10 +266,18 @@ fn collect_context_used_glyphs(
         for item in &context.bands.bands[band.index()] {
             match item {
                 crate::document::PaintDisplayItem::Operation(operation) => {
-                    collect_operation_used_glyphs(page, shaped_lines, operation, used_glyphs);
+                    collect_operation_used_glyphs(
+                        page,
+                        document_font_count,
+                        operation,
+                        used_glyphs,
+                    );
                 }
                 crate::document::PaintDisplayItem::StackingContext(context) => {
-                    collect_context_used_glyphs(page, shaped_lines, context, used_glyphs);
+                    collect_context_used_glyphs(page, document_font_count, context, used_glyphs);
+                }
+                crate::document::PaintDisplayItem::EffectScope(scope) => {
+                    collect_effect_scope_used_glyphs(page, document_font_count, scope, used_glyphs);
                 }
                 crate::document::PaintDisplayItem::Primitive(_)
                 | crate::document::PaintDisplayItem::Link(_) => {}
@@ -240,9 +286,32 @@ fn collect_context_used_glyphs(
     }
 }
 
+fn collect_effect_scope_used_glyphs(
+    page: &Page,
+    document_font_count: usize,
+    scope: &crate::document::PaintEffectScope,
+    used_glyphs: &mut [BTreeMap<u16, String>],
+) {
+    for item in &scope.items {
+        match item {
+            crate::document::PaintDisplayItem::Operation(operation) => {
+                collect_operation_used_glyphs(page, document_font_count, operation, used_glyphs);
+            }
+            crate::document::PaintDisplayItem::StackingContext(context) => {
+                collect_context_used_glyphs(page, document_font_count, context, used_glyphs);
+            }
+            crate::document::PaintDisplayItem::EffectScope(scope) => {
+                collect_effect_scope_used_glyphs(page, document_font_count, scope, used_glyphs);
+            }
+            crate::document::PaintDisplayItem::Primitive(_)
+            | crate::document::PaintDisplayItem::Link(_) => {}
+        }
+    }
+}
+
 fn collect_operation_used_glyphs(
     page: &Page,
-    shaped_lines: &[Option<ShapedLine>],
+    document_font_count: usize,
     operation: &crate::PaintOperation,
     used_glyphs: &mut [BTreeMap<u16, String>],
 ) {
@@ -255,20 +324,13 @@ fn collect_operation_used_glyphs(
     if !line.color.is_visible() {
         return;
     }
-    let Some(shaped_line) = shaped_lines.get(*index).and_then(Option::as_ref) else {
-        if !line.text.is_empty() {
-            log::warn!(
-                "skipping unshaped text line without a resolved embedded font: {:?}",
-                line.text
-            );
-        }
-        return;
-    };
-    for run in &shaped_line.runs {
+    let mut saw_text_run = false;
+    for run in pdf_text_runs(line, document_font_count) {
+        saw_text_run = true;
         let Some(font_glyphs) = used_glyphs.get_mut(run.document_font_id) else {
             continue;
         };
-        for glyph in &run.glyphs {
+        for glyph in run.glyphs {
             font_glyphs
                 .entry(glyph.id)
                 .or_insert_with(|| glyph.unicode.clone());
@@ -276,6 +338,12 @@ fn collect_operation_used_glyphs(
         if run.glyphs.is_empty() {
             log::debug!("empty shaped text line {:?}", line.text);
         }
+    }
+    if !saw_text_run && !line.text.is_empty() {
+        log::warn!(
+            "skipping unshaped text line without a resolved embedded font: {:?}",
+            line.text
+        );
     }
 }
 

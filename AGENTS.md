@@ -32,10 +32,10 @@ Note that we aim to be much more spec compliant and performant than weasyprint. 
 ## Development guidelines
 
 * With every significant change, consider if the architecture of the components being modified is appropriate to support the full feature set. For example, when designing a module, ensure the design is appropriate for when we have the full set of features implemented.
-* Ensure that `cargo clippy` passes at the end of each change, and format with `cargo +nightly fmt`.
+* Ensure that `cargo clippy` passes with no warnings at the end of each change, and format with `cargo +nightly fmt`.
 * Before adding a crate, the user must approve. Don't avoid asking the user; if it's the best solution, recommend it to the user.
 * For functions or structs implementing a feature, cite the relevant W3C specs, or PDF specs in the Rustdoc.
-* Once a page is over about 500-1000 lines, then consider breaking it out into a module for better organization.
+* Once a file is over about 500-1000 lines of code, then consider breaking it out into a module for better organization.
 * When fixing a WPT, don't implement stopgaps; make sure to fix the underlying problem, and do it in the best way.
 * WPT fixes and regressions don't need additional smoke tests specific to the WPT test; in most cases, you can just fix the underlying concern and rely on me to run WPT in the future.
 
@@ -51,5 +51,6 @@ For all tests, the files needed to run it need to be local in the repository. Do
 
 After each change that modifies the output, let's update documents detailing (1) the current level of parity, and (2) the features needed to reach parity. We can then review that documentation for next steps.
 
-* `SPEC_DIVERGENCES.md`: This should be an exhaustive list of specifics about divergences from the spec. We will use this to guide tasks.
+* `SPEC_DIVERGENCES.md`: This should be an exhaustive list of specifics about divergences from the spec. We will use this to guide tasks. Only include details about the divergences, and the specs used; don't use it as a log of what is completed.
 * `doc/*`: Specific implemenation plans, or parity documents, can be in here (one for each specic spec being implemented), but make sure divergences are listed in the central document.
+* `doc/taffy_shortcomings.md`: This document should be a list of limitations, missing features, and bugs in Taffy.

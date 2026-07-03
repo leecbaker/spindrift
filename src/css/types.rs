@@ -1,5 +1,6 @@
 use super::selector::ReasySelectorImpl;
 use super::values::CSS_PX_TO_PT;
+pub(crate) use crate::units::{LayoutLength, layout_points, layout_pt};
 use selectors::parser::SelectorList;
 use std::collections::HashMap;
 use std::collections::HashSet;

@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser, ValueHint};
 use clap_complete::{Shell, generate};
-use quire::{Css, Html, PdfVariant, RenderOptions, file_url_to_path};
+use quire::{Css, Html, InputSyntax, PdfVariant, RenderOptions, file_url_to_path};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -37,6 +37,15 @@ struct Cli {
         value_hint = ValueHint::DirPath
     )]
     base_url: Option<String>,
+
+    /// Input syntax to use for document parsing.
+    #[arg(
+        long = "input-syntax",
+        value_name = "SYNTAX",
+        default_value = "auto",
+        value_parser = parse_input_syntax
+    )]
+    input_syntax: InputSyntax,
 
     /// PDF variant to generate.
     #[arg(
@@ -129,6 +138,7 @@ async fn run() -> quire::Result<()> {
     if let Some(base_url) = base_url {
         html = html.with_base_url(base_url);
     }
+    html = html.with_input_syntax(args.input_syntax);
     for stylesheet in stylesheets {
         html = html.with_stylesheet(stylesheet);
     }
@@ -148,6 +158,15 @@ async fn run() -> quire::Result<()> {
 
 fn looks_like_html(input: &str) -> bool {
     input.contains('<') && input.contains('>')
+}
+
+fn parse_input_syntax(value: &str) -> Result<InputSyntax, String> {
+    match value {
+        "auto" => Ok(InputSyntax::Auto),
+        "html" => Ok(InputSyntax::Html),
+        "xml" => Ok(InputSyntax::Xml),
+        _ => Err(format!("unsupported input syntax: {value}")),
+    }
 }
 
 fn canonicalize_output_path(value: &str) -> Result<PathBuf, String> {
@@ -202,6 +221,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.pdf_variant, PdfVariant::PdfA2U);
+    }
+
+    #[test]
+    fn cli_accepts_input_syntax() {
+        let cli = Cli::try_parse_from([
+            "quire",
+            "--input-syntax",
+            "xml",
+            "input.xhtml",
+            "output.pdf",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.input_syntax, InputSyntax::Xml);
     }
 
     #[test]

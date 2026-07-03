@@ -12,6 +12,7 @@ pub(crate) use cascade::apply_pseudo_rules_with_parent_ch_advance;
 pub(crate) use cascade::declarations_affect_same_property;
 pub(crate) use cascade::default_style_for_tag;
 pub(crate) use cascade::origin_importance_rank;
+pub(crate) use cascade::parse_background_image;
 pub(crate) use cascade::style_for_element_with_signature;
 pub(crate) use cascade::style_for_element_with_signature_and_parent_ch_advance;
 #[cfg(test)]

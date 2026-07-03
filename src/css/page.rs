@@ -9,7 +9,7 @@ use super::values::{
     parse_computed_length_percentage_auto, parse_computed_line_height, parse_font_size,
     parse_line_height, trim_css_value,
 };
-use crate::{PageMargins, PageSize, RenderOptions};
+use crate::{PageMargins, PageSize, RenderOptions, layout_pt};
 
 pub(crate) fn apply_stylesheet_options(css: &Css, options: &mut RenderOptions) {
     let stylesheet = parse_stylesheet(css);
@@ -29,18 +29,18 @@ pub(crate) fn apply_stylesheet_options(css: &Css, options: &mut RenderOptions) {
             .filter(|rule| rule.selector_text.eq_ignore_ascii_case(selector))
         {
             if let Some(value) = rule.declarations.get("font-size")
-                && !font_size_value_depends_on_ch(value, options.font_size)
-                && let Some(font_size) = parse_font_size(value, options.font_size)
+                && !font_size_value_depends_on_ch(value, options.font_size())
+                && let Some(font_size) = parse_font_size(value, options.font_size())
             {
-                options.font_size = font_size;
-                options.line_height = font_size * 1.2;
+                options.font_size = layout_pt(font_size);
+                options.line_height = layout_pt(font_size * 1.2);
             }
             if let Some(value) = rule.declarations.get("line-height")
-                && !line_height_value_depends_on_ch(value, options.font_size)
+                && !line_height_value_depends_on_ch(value, options.font_size())
                 && let Some(line_height) =
-                    parse_line_height(value, options.font_size).map(|item| item.0)
+                    parse_line_height(value, options.font_size()).map(|item| item.0)
             {
-                options.line_height = line_height;
+                options.line_height = layout_pt(line_height);
             }
         }
     }
@@ -98,10 +98,10 @@ fn descriptor_page_size_from_width_height(
         .filter(|value| *value >= 0.0)?;
     let margins =
         fixed_page_margin_lengths_without_size(declarations, style.font_size, ch_advance)?;
-    Some(PageSize {
-        width: width + margins.left + margins.right,
-        height: height + margins.top + margins.bottom,
-    })
+    Some(PageSize::from_points(
+        width + margins.left() + margins.right(),
+        height + margins.top() + margins.bottom(),
+    ))
 }
 
 fn fixed_page_margin_lengths_without_size(
@@ -109,7 +109,7 @@ fn fixed_page_margin_lengths_without_size(
     font_size: f32,
     ch_advance: f32,
 ) -> Option<PageMargins> {
-    let mut margins = PageMarginEdges::from_lengths(PageMargins::all(0.0));
+    let mut margins = PageMarginEdges::from_lengths(PageMargins::all_points(0.0));
     for (name, value) in declarations {
         let value = trim_css_value(value);
         match name.as_str() {
@@ -121,12 +121,12 @@ fn fixed_page_margin_lengths_without_size(
             _ => {}
         }
     }
-    Some(PageMargins {
-        top: fixed_page_margin_edge_length(margins.top, ch_advance)?,
-        right: fixed_page_margin_edge_length(margins.right, ch_advance)?,
-        bottom: fixed_page_margin_edge_length(margins.bottom, ch_advance)?,
-        left: fixed_page_margin_edge_length(margins.left, ch_advance)?,
-    })
+    Some(PageMargins::from_points(
+        fixed_page_margin_edge_length(margins.top, ch_advance)?,
+        fixed_page_margin_edge_length(margins.right, ch_advance)?,
+        fixed_page_margin_edge_length(margins.bottom, ch_advance)?,
+        fixed_page_margin_edge_length(margins.left, ch_advance)?,
+    ))
 }
 
 fn fixed_page_margin_edge_length(edge: PageMarginEdge, ch_advance: f32) -> Option<f32> {
@@ -388,48 +388,48 @@ pub(crate) fn page_margins_from_for_size_and_edges_with_ch_advance(
         }
     }
     if changed {
-        PageMargins {
-            top: resolve_page_margin_axis(
-                page_size.height,
+        PageMargins::from_points(
+            resolve_page_margin_axis(
+                page_size.height(),
                 height,
                 non_margin_edges.top + non_margin_edges.bottom,
-                page_size.height,
+                page_size.height(),
                 margins.top,
                 margins.bottom,
                 ch_advance,
             )
             .0,
-            right: resolve_page_margin_axis(
-                page_size.width,
+            resolve_page_margin_axis(
+                page_size.width(),
                 width,
                 non_margin_edges.left + non_margin_edges.right,
-                page_size.width,
+                page_size.width(),
                 margins.left,
                 margins.right,
                 ch_advance,
             )
             .1,
-            bottom: resolve_page_margin_axis(
-                page_size.height,
+            resolve_page_margin_axis(
+                page_size.height(),
                 height,
                 non_margin_edges.top + non_margin_edges.bottom,
-                page_size.height,
+                page_size.height(),
                 margins.top,
                 margins.bottom,
                 ch_advance,
             )
             .1,
-            left: resolve_page_margin_axis(
-                page_size.width,
+            resolve_page_margin_axis(
+                page_size.width(),
                 width,
                 non_margin_edges.left + non_margin_edges.right,
-                page_size.width,
+                page_size.width(),
                 margins.left,
                 margins.right,
                 ch_advance,
             )
             .0,
-        }
+        )
     } else {
         base
     }
@@ -446,17 +446,17 @@ struct PageMarginEdges {
 impl PageMarginEdges {
     fn from_lengths(margins: PageMargins) -> Self {
         Self {
-            top: PageMarginEdge::LengthPercentage(ComputedLengthPercentage::from_length(
-                margins.top,
+            top: PageMarginEdge::LengthPercentage(ComputedLengthPercentage::from_points(
+                margins.top(),
             )),
-            right: PageMarginEdge::LengthPercentage(ComputedLengthPercentage::from_length(
-                margins.right,
+            right: PageMarginEdge::LengthPercentage(ComputedLengthPercentage::from_points(
+                margins.right(),
             )),
-            bottom: PageMarginEdge::LengthPercentage(ComputedLengthPercentage::from_length(
-                margins.bottom,
+            bottom: PageMarginEdge::LengthPercentage(ComputedLengthPercentage::from_points(
+                margins.bottom(),
             )),
-            left: PageMarginEdge::LengthPercentage(ComputedLengthPercentage::from_length(
-                margins.left,
+            left: PageMarginEdge::LengthPercentage(ComputedLengthPercentage::from_points(
+                margins.left(),
             )),
         }
     }
@@ -532,7 +532,8 @@ fn parse_page_margin_edge(value: &str, font_size: f32) -> Option<PageMarginEdge>
         }
         ComputedLengthPercentageOrAuto::MinContent
         | ComputedLengthPercentageOrAuto::MaxContent
-        | ComputedLengthPercentageOrAuto::FitContent(_) => return None,
+        | ComputedLengthPercentageOrAuto::FitContent(_)
+        | ComputedLengthPercentageOrAuto::Stretch => return None,
     }
     .into()
 }
@@ -699,10 +700,7 @@ fn page_margin_edge_length(edge: PageMarginEdge, percentage_basis: f32, ch_advan
         PageMarginEdge::LengthPercentage(value) => resolve_page_length_percentage(
             value,
             PhysicalSide::Left,
-            PageSize {
-                width: percentage_basis,
-                height: percentage_basis,
-            },
+            PageSize::from_points(percentage_basis, percentage_basis),
             ch_advance,
         ),
         PageMarginEdge::Auto => 0.0,
@@ -716,13 +714,13 @@ fn resolve_page_length_percentage(
     ch_advance: f32,
 ) -> f32 {
     let basis = match side {
-        PhysicalSide::Top | PhysicalSide::Bottom => page_size.height,
-        PhysicalSide::Right | PhysicalSide::Left => page_size.width,
+        PhysicalSide::Top | PhysicalSide::Bottom => page_size.height(),
+        PhysicalSide::Right | PhysicalSide::Left => page_size.width(),
     };
     value.resolve_font_metric_lengths(ch_advance);
     value
         .used_length_with_percentage_basis(basis)
-        .unwrap_or(value.length + value.percent * basis)
+        .unwrap_or(value.length_with_percentage_basis(basis))
 }
 
 pub(crate) fn apply_page_size_to_with_metrics(
@@ -770,8 +768,8 @@ fn parse_page_size_descriptor(
     }
     if parts.is_empty() {
         let orientation = orientation?;
-        let (width, height) = oriented_page_size(base.width, base.height, orientation);
-        return Some(PageSize { width, height });
+        let (width, height) = oriented_page_size(base.width(), base.height(), orientation);
+        return Some(PageSize::from_points(width, height));
     }
     if parts == ["auto"] {
         return orientation.is_none().then_some(base);
@@ -780,7 +778,7 @@ fn parse_page_size_descriptor(
         let (width, height) = orientation
             .map(|orientation| oriented_page_size(width, height, orientation))
             .unwrap_or((width, height));
-        return Some(PageSize { width, height });
+        return Some(PageSize::from_points(width, height));
     }
     if orientation.is_some() {
         return None;
@@ -793,14 +791,8 @@ fn parse_page_size_descriptor(
         })
         .collect::<Option<Vec<_>>>()?;
     match lengths.as_slice() {
-        [side] => Some(PageSize {
-            width: *side,
-            height: *side,
-        }),
-        [width, height] => Some(PageSize {
-            width: *width,
-            height: *height,
-        }),
+        [side] => Some(PageSize::from_points(*side, *side)),
+        [width, height] => Some(PageSize::from_points(*width, *height)),
         _ => None,
     }
 }
@@ -811,7 +803,7 @@ fn parse_page_fixed_length(value: &str, font_size: f32, ch_advance: f32) -> Opti
 }
 
 fn resolve_length_with_ch(value: ComputedLengthPercentage, ch_advance: f32) -> f32 {
-    value.length + value.ch * ch_advance
+    value.length_points() + value.ch * ch_advance
 }
 
 fn oriented_page_size(width: f32, height: f32, orientation: &str) -> (f32, f32) {

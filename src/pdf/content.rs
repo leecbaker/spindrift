@@ -4,7 +4,6 @@ use pdf_writer::{Content, Name, Str};
 
 pub(super) fn page_content_render(
     page: &crate::Page,
-    shaped_lines: &[Option<ShapedLine>],
     embedded_fonts: &EmbeddedFontPlans<'_>,
     next_object_id: &mut usize,
 ) -> PageContentRender {
@@ -17,23 +16,10 @@ pub(super) fn page_content_render(
             page_width: page.width(),
             page_height: page.height(),
         };
-        write_paint_tree(
-            &mut content,
-            page,
-            tree,
-            shaped_lines,
-            embedded_fonts,
-            &mut state,
-        );
+        write_paint_tree(&mut content, page, tree, embedded_fonts, &mut state);
     } else {
         let operations = page.paint_operations();
-        write_page_operations(
-            &mut content,
-            page,
-            &operations,
-            shaped_lines,
-            embedded_fonts,
-        );
+        write_page_operations(&mut content, page, &operations, embedded_fonts);
     }
     PageContentRender {
         stream: content.finish().into_vec(),
@@ -45,18 +31,10 @@ fn write_paint_tree(
     content: &mut Content,
     page: &crate::Page,
     tree: &crate::document::PagePaintTree,
-    shaped_lines: &[Option<ShapedLine>],
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
-    write_stacking_context(
-        content,
-        page,
-        &tree.root,
-        shaped_lines,
-        embedded_fonts,
-        state,
-    );
+    write_stacking_context(content, page, &tree.root, embedded_fonts, state);
 }
 
 struct PaintTreeRenderState<'a, 'b> {
@@ -70,12 +48,11 @@ fn write_stacking_context(
     content: &mut Content,
     page: &crate::Page,
     context: &crate::document::PaintStackingContext,
-    shaped_lines: &[Option<ShapedLine>],
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
     if context.effects.needs_group() {
-        write_effect_group(content, page, context, shaped_lines, embedded_fonts, state);
+        write_effect_group(content, page, context, embedded_fonts, state);
         return;
     }
     let effect_steps = context.effects.ordered_steps();
@@ -105,10 +82,53 @@ fn write_stacking_context(
         }
     }
     for band in crate::document::PaintBand::ORDER {
-        for item in &context.bands.bands[band.index()] {
-            write_display_item(content, page, item, shaped_lines, embedded_fonts, state);
+        write_display_items(
+            content,
+            page,
+            &context.bands.bands[band.index()],
+            embedded_fonts,
+            state,
+        );
+    }
+    if scoped {
+        content.restore_state();
+    }
+}
+
+fn write_effect_scope(
+    content: &mut Content,
+    page: &crate::Page,
+    scope: &crate::document::PaintEffectScope,
+    embedded_fonts: &EmbeddedFontPlans<'_>,
+    state: &mut PaintTreeRenderState<'_, '_>,
+) {
+    let effect_steps = scope.effects.ordered_steps();
+    let scoped = !effect_steps.is_empty();
+    if scoped {
+        content.save_state();
+    }
+    for step in effect_steps {
+        match step {
+            crate::document::PaintEffectStep::Clip(clip) => write_rect_clip(content, clip),
+            crate::document::PaintEffectStep::Transform(transform) => {
+                content.transform([
+                    transform.a,
+                    transform.b,
+                    transform.c,
+                    transform.d,
+                    transform.e,
+                    transform.f,
+                ]);
+            }
+            crate::document::PaintEffectStep::ClipPath(_)
+            | crate::document::PaintEffectStep::Filter(_)
+            | crate::document::PaintEffectStep::Mask(_)
+            | crate::document::PaintEffectStep::Opacity(_)
+            | crate::document::PaintEffectStep::Blend(_)
+            | crate::document::PaintEffectStep::Isolation => {}
         }
     }
+    write_display_items(content, page, &scope.items, embedded_fonts, state);
     if scoped {
         content.restore_state();
     }
@@ -118,7 +138,6 @@ fn write_effect_group(
     content: &mut Content,
     page: &crate::Page,
     context: &crate::document::PaintStackingContext,
-    shaped_lines: &[Option<ShapedLine>],
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
@@ -138,7 +157,6 @@ fn write_effect_group(
         &mut form_content,
         page,
         &form_context,
-        shaped_lines,
         embedded_fonts,
         state,
     );
@@ -167,20 +185,70 @@ fn write_effect_group(
     content.restore_state();
 }
 
+fn write_display_items(
+    content: &mut Content,
+    page: &crate::Page,
+    items: &[crate::document::PaintDisplayItem],
+    embedded_fonts: &EmbeddedFontPlans<'_>,
+    state: &mut PaintTreeRenderState<'_, '_>,
+) {
+    let mut pending_rect = None;
+    for (item_index, item) in items.iter().enumerate() {
+        if let Some(rect) = display_item_rect(page, item) {
+            if fill_rect_is_covered_by_later_opaque_display_rects(page, items, item_index, rect) {
+                continue;
+            }
+            if let Some(pending) = pending_rect.as_mut()
+                && merge_adjacent_fill_rect(pending, rect)
+            {
+                continue;
+            }
+            flush_pending_rect(content, &mut pending_rect);
+            if is_mergeable_fill_rect(rect) {
+                pending_rect = Some(rect.clone());
+            } else {
+                write_rect(content, rect);
+            }
+            continue;
+        }
+        flush_pending_rect(content, &mut pending_rect);
+        write_display_item(content, page, item, embedded_fonts, state);
+    }
+    flush_pending_rect(content, &mut pending_rect);
+}
+
+fn display_item_rect<'a>(
+    page: &'a crate::Page,
+    item: &crate::document::PaintDisplayItem,
+) -> Option<&'a crate::RenderedRect> {
+    match item {
+        crate::document::PaintDisplayItem::Operation(crate::PaintOperation::Rect(index)) => {
+            page.rects.get(*index)
+        }
+        crate::document::PaintDisplayItem::Operation(_)
+        | crate::document::PaintDisplayItem::EffectScope(_)
+        | crate::document::PaintDisplayItem::StackingContext(_)
+        | crate::document::PaintDisplayItem::Primitive(_)
+        | crate::document::PaintDisplayItem::Link(_) => None,
+    }
+}
+
 fn write_display_item(
     content: &mut Content,
     page: &crate::Page,
     item: &crate::document::PaintDisplayItem,
-    shaped_lines: &[Option<ShapedLine>],
     embedded_fonts: &EmbeddedFontPlans<'_>,
     state: &mut PaintTreeRenderState<'_, '_>,
 ) {
     match item {
         crate::document::PaintDisplayItem::Operation(operation) => {
-            write_page_operation(content, page, operation, shaped_lines, embedded_fonts);
+            write_page_operation(content, page, operation, embedded_fonts);
         }
         crate::document::PaintDisplayItem::StackingContext(context) => {
-            write_stacking_context(content, page, context, shaped_lines, embedded_fonts, state);
+            write_stacking_context(content, page, context, embedded_fonts, state);
+        }
+        crate::document::PaintDisplayItem::EffectScope(scope) => {
+            write_effect_scope(content, page, scope, embedded_fonts, state);
         }
         crate::document::PaintDisplayItem::Primitive(_)
         | crate::document::PaintDisplayItem::Link(_) => {}
@@ -191,7 +259,6 @@ fn write_page_operation(
     content: &mut Content,
     page: &crate::Page,
     operation: &crate::PaintOperation,
-    shaped_lines: &[Option<ShapedLine>],
     embedded_fonts: &EmbeddedFontPlans<'_>,
 ) {
     match operation {
@@ -222,12 +289,7 @@ fn write_page_operation(
         }
         crate::PaintOperation::Line(index) => {
             if let Some(line) = page.lines.get(*index) {
-                write_line(
-                    content,
-                    line,
-                    shaped_lines.get(*index).and_then(Option::as_ref),
-                    embedded_fonts,
-                );
+                write_line(content, line, embedded_fonts);
             }
         }
     }
@@ -253,7 +315,6 @@ pub(super) fn write_page_operations(
     content: &mut Content,
     page: &crate::Page,
     operations: &[crate::PaintOperation],
-    shaped_lines: &[Option<ShapedLine>],
     embedded_fonts: &EmbeddedFontPlans<'_>,
 ) {
     let mut pending_rect = None;
@@ -309,12 +370,7 @@ pub(super) fn write_page_operations(
             crate::PaintOperation::Line(index) => {
                 flush_pending_rect(content, &mut pending_rect);
                 if let Some(line) = page.lines.get(*index) {
-                    write_line(
-                        content,
-                        line,
-                        shaped_lines.get(*index).and_then(Option::as_ref),
-                        embedded_fonts,
-                    );
+                    write_line(content, line, embedded_fonts);
                 }
             }
         }
@@ -334,16 +390,41 @@ fn fill_rect_is_covered_by_later_opaque_rects(
     operation_index: usize,
     rect: &crate::RenderedRect,
 ) -> bool {
+    fill_rect_is_covered_by_later_opaque_rects_from(
+        rect,
+        operations
+            .iter()
+            .skip(operation_index + 1)
+            .filter_map(|operation| match operation {
+                crate::PaintOperation::Rect(index) => page.rects.get(*index),
+                _ => None,
+            }),
+    )
+}
+
+fn fill_rect_is_covered_by_later_opaque_display_rects(
+    page: &crate::Page,
+    items: &[crate::document::PaintDisplayItem],
+    item_index: usize,
+    rect: &crate::RenderedRect,
+) -> bool {
+    fill_rect_is_covered_by_later_opaque_rects_from(
+        rect,
+        items
+            .iter()
+            .skip(item_index + 1)
+            .filter_map(|item| display_item_rect(page, item)),
+    )
+}
+
+fn fill_rect_is_covered_by_later_opaque_rects_from<'a>(
+    rect: &crate::RenderedRect,
+    later_rects: impl Iterator<Item = &'a crate::RenderedRect>,
+) -> bool {
     if !is_opaque_fill_rect(rect) {
         return false;
     }
-    let later_rects = operations
-        .iter()
-        .skip(operation_index + 1)
-        .filter_map(|operation| match operation {
-            crate::PaintOperation::Rect(index) => page.rects.get(*index),
-            _ => None,
-        })
+    let later_rects = later_rects
         .filter(|later| is_opaque_fill_rect(later) && rects_intersect(rect, later))
         .collect::<Vec<_>>();
     rect_area_is_covered_by_rects(rect, &later_rects)
@@ -602,14 +683,7 @@ pub(super) fn write_path(content: &mut Content, path: &RenderedPath) {
     if clipped {
         content.save_state();
         let clip = path.clip.as_ref().unwrap();
-        write_clip_path(content, &clip.commands, clip.fill_rule);
-        for additional_clip in &clip.additional_clips {
-            write_clip_path(
-                content,
-                &additional_clip.commands,
-                additional_clip.fill_rule,
-            );
-        }
+        write_rendered_path_clip(content, clip);
     }
     if let Some(fill) = path.fill
         && fill.is_visible()
@@ -640,6 +714,17 @@ pub(super) fn write_path(content: &mut Content, path: &RenderedPath) {
     }
     if clipped {
         content.restore_state();
+    }
+}
+
+fn write_rendered_path_clip(content: &mut Content, clip: &crate::document::RenderedPathClip) {
+    write_clip_path(content, &clip.commands, clip.fill_rule);
+    for additional_clip in &clip.additional_clips {
+        write_clip_path(
+            content,
+            &additional_clip.commands,
+            additional_clip.fill_rule,
+        );
     }
 }
 
@@ -722,8 +807,11 @@ pub(super) fn write_stroke(content: &mut Content, stroke: &crate::RenderedStroke
 
 pub(super) fn write_image(content: &mut Content, image: &crate::RenderedImage, index: usize) {
     let rect = crate::document::paint_rect_to_pdf(image.paint_rect());
+    content.save_state();
+    if let Some(clip) = image.clip() {
+        write_rendered_path_clip(content, clip);
+    }
     content
-        .save_state()
         .transform([
             rect.size.width,
             0.0,
@@ -732,19 +820,17 @@ pub(super) fn write_image(content: &mut Content, image: &crate::RenderedImage, i
             rect.origin.x,
             rect.origin.y,
         ])
-        .x_object(pdf_name(&format!("Im{}", index + 1)))
-        .restore_state();
+        .x_object(pdf_name(&format!("Im{}", index + 1)));
+    content.restore_state();
 }
 
 pub(super) fn write_line(
     content: &mut Content,
     line: &crate::RenderedLine,
-    shaped_line: Option<&ShapedLine>,
     embedded_fonts: &EmbeddedFontPlans<'_>,
 ) {
-    if let Some(shaped_line) = shaped_line {
-        write_shaped_line(content, line, shaped_line, embedded_fonts);
-    } else if !line.text.is_empty() {
+    let wrote_line = write_rendered_line(content, line, embedded_fonts);
+    if !wrote_line && !line.text.is_empty() {
         log::warn!(
             "skipping unshaped text line without a resolved embedded font: {:?}",
             line.text
@@ -752,30 +838,27 @@ pub(super) fn write_line(
     }
 }
 
-pub(super) fn write_shaped_line(
+pub(super) fn write_rendered_line(
     content: &mut Content,
     line: &crate::RenderedLine,
-    shaped_line: &ShapedLine,
     embedded_fonts: &EmbeddedFontPlans<'_>,
-) {
+) -> bool {
     if !line.color.is_visible() {
-        return;
-    }
-    if !shaped_line.runs.iter().any(|run| !run.glyphs.is_empty()) {
-        return;
+        return true;
     }
 
     // PDF 2.0 9.4.4 text matrices position each glyph stream in user space.
     // CSS inline layout stores shaped runs at visual offsets inside one line
     // box, so reset the text matrix for each run instead of assuming all
     // fallback/style runs are contiguous after the previous text operator.
-    let scoped_alpha = write_alpha_graphics_state(content, line.color);
-    content
-        .set_fill_rgb(line.color.r, line.color.g, line.color.b)
-        .begin_text();
     let line_origin = crate::document::paint_point_to_pdf(line.origin());
-    for run in &shaped_line.runs {
+    let mut text_started = false;
+    let mut scoped_alpha = false;
+    let mut saw_text_run = false;
+    for run in pdf_text_runs(line, embedded_fonts.document_font_to_embedded_font.len()) {
+        saw_text_run = true;
         if run.glyphs.is_empty() {
+            log::debug!("empty shaped text line {:?}", line.text);
             continue;
         }
         let Some(font) = embedded_fonts
@@ -790,6 +873,13 @@ pub(super) fn write_shaped_line(
             );
             continue;
         };
+        if !text_started {
+            scoped_alpha = write_alpha_graphics_state(content, line.color);
+            content
+                .set_fill_rgb(line.color.r, line.color.g, line.color.b)
+                .begin_text();
+            text_started = true;
+        }
         let pdf_font_size = quantized_pdf_font_size(run.font_size);
         let matrix = run.text_matrix;
         content
@@ -802,10 +892,13 @@ pub(super) fn write_shaped_line(
                 line_origin.y + run.y_offset,
             ])
             .set_font(pdf_name(&font.resource_name), pdf_font_size);
-        write_shaped_glyphs(content, run.font_size, &run.glyphs);
+        write_glyphs(content, run.font_size, run.glyphs);
     }
-    content.end_text();
-    close_alpha_graphics_state(content, scoped_alpha);
+    if text_started {
+        content.end_text();
+        close_alpha_graphics_state(content, scoped_alpha);
+    }
+    saw_text_run
 }
 
 /// Activate a PDF ExtGState for semi-transparent paint.
@@ -840,7 +933,7 @@ pub(super) fn quantized_pdf_font_size(font_size: f32) -> f32 {
     (css_px * 1024.0).floor() / 1024.0 * crate::css::CSS_PX_TO_PT
 }
 
-fn write_shaped_glyphs(content: &mut Content, font_size: f32, glyphs: &[ShapedGlyph]) {
+fn write_glyphs(content: &mut Content, font_size: f32, glyphs: &[RenderedGlyph]) {
     if !needs_positioned_glyphs(glyphs) {
         let glyph_bytes = glyph_bytes(glyphs);
         content.show(Str(&glyph_bytes));
@@ -862,7 +955,7 @@ fn write_shaped_glyphs(content: &mut Content, font_size: f32, glyphs: &[ShapedGl
     }
 }
 
-pub(super) fn needs_positioned_glyphs(glyphs: &[ShapedGlyph]) -> bool {
+pub(super) fn needs_positioned_glyphs(glyphs: &[RenderedGlyph]) -> bool {
     glyphs.iter().any(|glyph| {
         (glyph.x_advance - glyph.nominal_x_advance).abs() > 0.01
             || glyph.x_offset.abs() > 0.01
@@ -870,7 +963,7 @@ pub(super) fn needs_positioned_glyphs(glyphs: &[ShapedGlyph]) -> bool {
     })
 }
 
-fn glyph_bytes(glyphs: &[ShapedGlyph]) -> Vec<u8> {
+fn glyph_bytes(glyphs: &[RenderedGlyph]) -> Vec<u8> {
     glyphs
         .iter()
         .flat_map(|glyph| glyph_id_bytes(glyph.id))

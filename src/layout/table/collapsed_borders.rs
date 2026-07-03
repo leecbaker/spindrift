@@ -576,15 +576,14 @@ impl CollapsedBorderGrid {
 
     /// Return the table wrapper insets created by collapsed outer grid borders.
     ///
-    /// CSS 2.2 requires user agents to derive initial table border widths from
-    /// collapsed grid-edge borders. WeasyPrint stores half of each winning
-    /// outer border as the table's used border width; layout then positions the
-    /// grid inside those wrapper insets.
-    /// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>
-    pub(super) fn outer_insets_for_first_displayed_row(
-        &self,
-        first_displayed_row: usize,
-    ) -> css::Edges {
+    /// CSS 2.2 centers collapsed borders on grid lines, and CSS Tables 3
+    /// paints table-root backgrounds and borders around the grid plus the
+    /// collapsed border widths that occupy that visual grid area. Use the
+    /// largest half-width crossing each outer grid edge so later rows with
+    /// wider outer borders still expand the collapsed table's painted area.
+    /// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders> and
+    /// <https://drafts.csswg.org/css-tables-3/#drawing-backgrounds-and-borders>
+    pub(super) fn outer_insets(&self) -> css::Edges {
         let top = self
             .horizontal
             .first()
@@ -603,20 +602,16 @@ impl CollapsedBorderGrid {
             / 2.0;
         let left = self
             .vertical
-            .get(first_displayed_row)
-            .and_then(|row| row.first())
-            .and_then(|border| *border)
-            .map(|border| border.used_side().used_width)
-            .into_iter()
+            .iter()
+            .filter_map(|row| row.first())
+            .filter_map(|border| border.map(|border| border.used_side().used_width))
             .fold(0.0_f32, f32::max)
             / 2.0;
         let right = self
             .vertical
-            .get(first_displayed_row)
-            .and_then(|row| row.last())
-            .and_then(|border| *border)
-            .map(|border| border.used_side().used_width)
-            .into_iter()
+            .iter()
+            .filter_map(|row| row.last())
+            .filter_map(|border| border.map(|border| border.used_side().used_width))
             .fold(0.0_f32, f32::max)
             / 2.0;
 
@@ -799,8 +794,10 @@ pub(super) fn collapsed_border_wins(candidate: CollapsedBorder, current: Collaps
         return !candidate_none;
     }
 
-    if (candidate.width - current.width).abs() > 0.01 {
-        return candidate.width > current.width;
+    let candidate_width_priority = collapsed_border_width_priority(candidate.width);
+    let current_width_priority = collapsed_border_width_priority(current.width);
+    if candidate_width_priority != current_width_priority {
+        return candidate_width_priority > current_width_priority;
     }
 
     let candidate_style = collapsed_border_style_priority(candidate.style);
@@ -814,6 +811,18 @@ pub(super) fn collapsed_border_wins(candidate: CollapsedBorder, current: Collaps
     }
 
     candidate.tie_position < current.tie_position
+}
+
+/// Return the width priority key for collapsed-border conflict resolution.
+///
+/// CSS 2.2 resolves collapsed-border conflicts by preferring wider borders
+/// before style and origin specificity. CSS Tables 3 defines that comparison
+/// after converting widths into CSS pixels, and interoperable subpixel WPTs
+/// floor those CSS-pixel widths before comparing specificity.
+/// <https://www.w3.org/TR/CSS22/tables.html#border-conflict-resolution> and
+/// <https://drafts.csswg.org/css-tables-3/#border-conflict-resolution-algorithm>
+fn collapsed_border_width_priority(width: f32) -> i32 {
+    (width.max(0.0) / css::CSS_PX_TO_PT).floor() as i32
 }
 
 pub(super) fn collapsed_border_style_priority(style: BorderStyle) -> u8 {
@@ -924,5 +933,80 @@ fn collapsed_border_paint_style(style: BorderStyle) -> BorderStyle {
         BorderStyle::Inset => BorderStyle::Ridge,
         BorderStyle::Outset => BorderStyle::Groove,
         _ => style,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn style_with_solid_border(width_css_px: f32, color: Color) -> ComputedStyle {
+        let mut style = ComputedStyle::initial();
+        let width = width_css_px * css::CSS_PX_TO_PT;
+        style.border_width = width;
+        style.border_widths = css::Edges {
+            top: width,
+            right: width,
+            bottom: width,
+            left: width,
+        };
+        style.border_styles = css::BorderStyles {
+            top: BorderStyle::Solid,
+            right: BorderStyle::Solid,
+            bottom: BorderStyle::Solid,
+            left: BorderStyle::Solid,
+        };
+        style.border_colors = css::BorderColors {
+            top: color,
+            right: color,
+            bottom: color,
+            left: color,
+        };
+        style
+    }
+
+    fn solid_border(width_css_px: f32, origin: BorderOrigin) -> CollapsedBorder {
+        CollapsedBorder {
+            width: width_css_px * css::CSS_PX_TO_PT,
+            style: BorderStyle::Solid,
+            color: Color::BLACK,
+            side: BorderSide::Top,
+            origin,
+            tie_position: 0,
+        }
+    }
+
+    #[test]
+    fn collapsed_border_width_priority_floors_css_pixels_before_origin_ties() {
+        let table = solid_border(5.95, BorderOrigin::Table);
+        let cell = solid_border(5.0, BorderOrigin::Cell);
+
+        assert!(collapsed_border_wins(cell, table));
+        assert!(!collapsed_border_wins(table, cell));
+    }
+
+    #[test]
+    fn collapsed_border_width_priority_keeps_next_whole_css_pixel_wider() {
+        let table = solid_border(6.0, BorderOrigin::Table);
+        let cell = solid_border(5.0, BorderOrigin::Cell);
+
+        assert!(collapsed_border_wins(table, cell));
+    }
+
+    #[test]
+    fn equal_width_group_loser_does_not_expand_resolved_cell_insets() {
+        let mut grid = CollapsedBorderGrid::new(1, 1, TableAxes::for_direction(Direction::Ltr));
+        let loser = style_with_solid_border(25.0, Color::new(255, 0, 0));
+        let winner = style_with_solid_border(25.0, Color::new(0, 128, 0));
+
+        grid.add_cell(0, 0, 1, 1, &winner);
+        grid.add_row_group(0, 1, 1, &loser);
+
+        let insets = grid.cell_insets(0, 0, 1, 1);
+        let expected_side = 25.0 * css::CSS_PX_TO_PT / 2.0;
+        assert!((insets.left - expected_side).abs() < 0.01);
+        assert!((insets.right - expected_side).abs() < 0.01);
+        assert!((insets.top - expected_side).abs() < 0.01);
+        assert!((insets.bottom - expected_side).abs() < 0.01);
     }
 }

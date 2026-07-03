@@ -1,9 +1,25 @@
 use crate::{Css, Document, RenderOptions, Result, css, dom, layout, resource, timing::DebugTimer};
 use std::path::{Path, PathBuf};
 
+/// Input markup syntax used for document parsing.
+///
+/// Quire defaults to automatic syntax selection: HTML parsing unless the
+/// source begins with an XML declaration. This follows HTML's distinction
+/// between `text/html` parsing and XML/XHTML parsing:
+/// <https://html.spec.whatwg.org/multipage/parsing.html#the-input-byte-stream>
+/// and <https://www.w3.org/TR/xml/#NT-XMLDecl>.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputSyntax {
+    #[default]
+    Auto,
+    Html,
+    Xml,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Html {
     source: String,
+    input_syntax: InputSyntax,
     base_url: Option<PathBuf>,
     root_url: Option<PathBuf>,
     stylesheets: Vec<Css>,
@@ -13,10 +29,15 @@ impl Html {
     pub fn from_string(source: impl Into<String>) -> Self {
         Self {
             source: source.into(),
+            input_syntax: InputSyntax::Auto,
             base_url: None,
             root_url: None,
             stylesheets: Vec::new(),
         }
+    }
+
+    pub fn from_xml_string(source: impl Into<String>) -> Self {
+        Self::from_string(source).with_input_syntax(InputSyntax::Xml)
     }
 
     pub async fn from_file_async<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -25,10 +46,17 @@ impl Html {
         let source = resource::read_to_string(path).await?;
         Ok(Self {
             source,
+            input_syntax: InputSyntax::Auto,
             base_url: resource::resource_parent(path),
             root_url: None,
             stylesheets: Vec::new(),
         })
+    }
+
+    pub async fn from_xml_file_async<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Ok(Self::from_file_async(path)
+            .await?
+            .with_input_syntax(InputSyntax::Xml))
     }
 
     /// Creates an HTML document from a URL.
@@ -47,6 +75,7 @@ impl Html {
             let source = resource::read_to_string(&location).await?;
             return Ok(Self {
                 source,
+                input_syntax: InputSyntax::Auto,
                 base_url: resource::resource_parent(&location),
                 root_url: http_origin(url).map(PathBuf::from),
                 stylesheets: Vec::new(),
@@ -55,6 +84,11 @@ impl Html {
         Err(crate::Error::InvalidInput(format!(
             "unsupported URL for HTML input: {url}"
         )))
+    }
+
+    pub fn with_input_syntax(mut self, input_syntax: InputSyntax) -> Self {
+        self.input_syntax = input_syntax;
+        self
     }
 
     /// Sets the base URL used to resolve document-relative resources.
@@ -83,9 +117,10 @@ impl Html {
         let render_timer = DebugTimer::start("rendering HTML document");
         let font_system_load = layout::start_font_system_load();
         let mut options = options.clone();
+        let document_syntax = self.document_syntax();
         let mut root = {
-            let _timer = DebugTimer::start("parsing HTML document");
-            dom::parse(&self.source)
+            let _timer = DebugTimer::start(format!("parsing {document_syntax:?} document"));
+            dom::parse_with_syntax(&self.source, document_syntax)?
         };
         dom::mark_target_fragment(&mut root, options.target_fragment.as_deref());
         let mut stylesheets = {
@@ -231,6 +266,16 @@ impl Html {
         }
         Ok(styles)
     }
+
+    fn document_syntax(&self) -> dom::DocumentSyntax {
+        match self.input_syntax {
+            InputSyntax::Auto if starts_with_xml_declaration(&self.source) => {
+                dom::DocumentSyntax::Xml
+            }
+            InputSyntax::Auto | InputSyntax::Html => dom::DocumentSyntax::Html,
+            InputSyntax::Xml => dom::DocumentSyntax::Xml,
+        }
+    }
 }
 
 fn http_origin(url: &str) -> Option<String> {
@@ -318,6 +363,14 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
+fn starts_with_xml_declaration(source: &str) -> bool {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let Some(rest) = source.strip_prefix("<?xml") else {
+        return false;
+    };
+    rest.as_bytes().first().is_some_and(u8::is_ascii_whitespace)
+}
+
 /// Normalizes source text from an embedded HTML/XHTML `style` element.
 ///
 /// HTML defines `style` contents as CSS text, while XHTML-compatible WPT files
@@ -337,7 +390,7 @@ fn embedded_style_css(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dom::{parse, text_content};
+    use crate::dom::{self, parse, text_content};
 
     #[tokio::test]
     async fn extracts_basic_text() {
@@ -358,5 +411,56 @@ mod tests {
 
         assert_eq!(styles.len(), 1);
         assert_eq!(styles[0].source(), "\n  div { background: green }\n");
+    }
+
+    #[test]
+    fn auto_syntax_detects_xml_declaration() {
+        let html = Html::from_string(r#"<?xml version="1.0" encoding="UTF-8"?><html/>"#);
+
+        assert_eq!(html.document_syntax(), dom::DocumentSyntax::Xml);
+    }
+
+    #[test]
+    fn auto_syntax_detects_xml_declaration_after_utf8_bom() {
+        let html = Html::from_string("\u{feff}<?xml version=\"1.0\"?><html/>");
+
+        assert_eq!(html.document_syntax(), dom::DocumentSyntax::Xml);
+    }
+
+    #[test]
+    fn auto_syntax_ignores_xml_stylesheet_processing_instruction() {
+        let html = Html::from_string(r#"<?xml-stylesheet href="style.css"?><html></html>"#);
+
+        assert_eq!(html.document_syntax(), dom::DocumentSyntax::Html);
+    }
+
+    #[test]
+    fn explicit_html_syntax_overrides_xml_declaration_detection() {
+        let html = Html::from_string(r#"<?xml version="1.0"?><html></html>"#)
+            .with_input_syntax(InputSyntax::Html);
+
+        assert_eq!(html.document_syntax(), dom::DocumentSyntax::Html);
+    }
+
+    #[tokio::test]
+    async fn explicit_xml_render_reports_xml_parse_errors() {
+        let error = Html::from_xml_string("<html><body></html>")
+            .render_async(&RenderOptions::default())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("XML parse error"));
+    }
+
+    #[tokio::test]
+    async fn auto_xml_declaration_render_reports_xml_parse_errors() {
+        let error = Html::from_string(r#"<?xml version="1.0"?><html><body></html>"#)
+            .render_async(&RenderOptions::default())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("XML parse error"));
     }
 }

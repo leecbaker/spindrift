@@ -16,3 +16,7 @@ pub(in crate::layout) use graph::MeasuredInlineItem;
 pub(in crate::layout) use graph::{
     InlineBreakKind, InlineGraphPosition, InlineGraphRange, InlineLineFragment,
 };
+#[cfg(test)]
+pub(in crate::layout) use mixed::{
+    RangedMeasuredMixedInlineLineItem, split_mixed_inline_visual_ranges_at_box_edges,
+};

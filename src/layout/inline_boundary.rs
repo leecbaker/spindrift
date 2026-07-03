@@ -44,9 +44,9 @@ pub(in crate::layout) fn inline_item_boundary_role(item: &InlineItem) -> InlineB
             InlineBoundaryRole::TransparentTextBoundary
         }
         InlineItem::Word(_) => InlineBoundaryRole::Text,
-        InlineItem::Atom(atom) => inline_atom_boundary_role(&atom.content),
+        InlineItem::Atom(atom) => inline_atom_boundary_role(atom.content()),
         InlineItem::Float(_) => InlineBoundaryRole::Float,
-        InlineItem::Break => InlineBoundaryRole::ForcedBreak,
+        InlineItem::Break(_) => InlineBoundaryRole::ForcedBreak,
         InlineItem::PageScopeStart(_) => InlineBoundaryRole::PageScopeStart,
         InlineItem::PageScopeEnd => InlineBoundaryRole::PageScopeEnd,
     }

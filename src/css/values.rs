@@ -11,6 +11,7 @@ mod counters;
 mod display;
 mod edges;
 mod fonts;
+mod gap_decorations;
 mod lengths;
 mod urls;
 
@@ -22,5 +23,6 @@ pub(super) use counters::*;
 pub(super) use display::*;
 pub(super) use edges::*;
 pub(crate) use fonts::*;
+pub(crate) use gap_decorations::*;
 pub(crate) use lengths::*;
 pub(crate) use urls::*;

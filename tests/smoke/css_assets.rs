@@ -12,15 +12,123 @@ fn image_xobject_count_with_size(rendered: &str, width: u32, height: u32) -> usi
 }
 
 fn filled_rect(page: &quire::Page, color: Color) -> &quire::RenderedRect {
-    page.rects
+    page.rects()
         .iter()
         .find(|rect| rect.fill == Some(color))
         .unwrap_or_else(|| {
             panic!(
                 "expected filled rect with color {color:?} in {:?}",
-                page.rects
+                page.rects()
             )
         })
+}
+
+fn filled_rects(page: &quire::Page, color: Color) -> Vec<&quire::RenderedRect> {
+    page.rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(color))
+        .collect()
+}
+
+fn assert_pdf_clips_image_draw(document: &quire::Document) {
+    let pdf = document.write_pdf_bytes().unwrap();
+    let rendered = String::from_utf8_lossy(&pdf);
+    let clip_index = rendered
+        .find("W\nn")
+        .unwrap_or_else(|| panic!("expected PDF clipping operator in {rendered}"));
+    let image_index = rendered
+        .find(" Do")
+        .unwrap_or_else(|| panic!("expected PDF image draw in {rendered}"));
+    assert!(
+        clip_index < image_index,
+        "background image should be clipped before drawing"
+    );
+}
+
+#[tokio::test]
+async fn relative_positioned_inline_backgrounds_shift_without_expanding_line_box() {
+    let document = Html::from_string(
+        "<style>
+            @page { size: 260pt 180pt; margin: 0 }
+            body { margin: 0 }
+            .container {
+                margin: 30pt 0;
+                color: transparent;
+                background: blue;
+                line-height: 10pt;
+                font-size: 30pt;
+            }
+            span { background: orange }
+            .up10 { position: relative; top: -10pt }
+            .down10 { position: relative; top: 10pt }
+        </style>
+        <div class=\"container\"><span>A</span><span class=\"up10\">B</span><span class=\"down10\">C</span></div>
+        <div class=\"container\"><span>D</span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let orange = filled_rects(page, Color::new(255, 165, 0));
+    assert_eq!(orange.len(), 4, "orange rects={orange:?}");
+
+    let mut first_line = orange[..3].to_vec();
+    first_line.sort_by(|left, right| left.x().total_cmp(&right.x()));
+    let normal = first_line[0];
+    let up = first_line[1];
+    let down = first_line[2];
+    assert!(
+        (up.y() - normal.y() - 10.0).abs() < 0.01,
+        "top:-10pt should shift inline background up: normal={normal:?}, up={up:?}"
+    );
+    assert!(
+        (down.y() - normal.y() + 10.0).abs() < 0.01,
+        "top:10pt should shift inline background down: normal={normal:?}, down={down:?}"
+    );
+
+    let blue = filled_rects(page, Color::new(0, 0, 255));
+    assert_eq!(blue.len(), 2, "blue rects={blue:?}");
+    for rect in blue {
+        assert!(
+            (rect.height() - 10.0).abs() < 0.01,
+            "relative inline offsets must not expand the line box: {rect:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn relative_positioned_inline_horizontal_offset_preserves_flow_advance() {
+    let document = Html::from_string(
+        "<style>
+            @page { size: 260pt 180pt; margin: 0 }
+            body { margin: 0 }
+            div { margin: 20pt 0; font-size: 20pt; line-height: 20pt; color: transparent }
+            .first { background: orange }
+            .second { background: green }
+            .shift { position: relative; left: 10pt }
+        </style>
+        <div><span class=\"first\">A</span><span class=\"second\">B</span></div>
+        <div><span class=\"first shift\">A</span><span class=\"second\">B</span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let orange = filled_rects(page, Color::new(255, 165, 0));
+    let green = filled_rects(page, Color::new(0, 128, 0));
+    assert_eq!(orange.len(), 2, "orange rects={orange:?}");
+    assert_eq!(green.len(), 2, "green rects={green:?}");
+
+    assert!(
+        (orange[1].x() - orange[0].x() - 10.0).abs() < 0.01,
+        "left:10pt should shift the first inline background right: orange={orange:?}"
+    );
+    assert!(
+        (green[1].x() - green[0].x()).abs() < 0.01,
+        "following inline should keep normal-flow advance: green={green:?}"
+    );
 }
 
 #[tokio::test]
@@ -30,7 +138,78 @@ async fn applies_inline_text_color() {
         .await
         .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].color, Color::new(255, 0, 0));
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn inline_content_background_height_is_independent_of_line_height() {
+    let document = Html::from_string(
+        "<style>
+            @page { size: 420pt 260pt; margin: 20pt }
+            body { margin: 0 }
+            div { font-size: 50pt; display: inline-block; color: transparent }
+            span { background: rgb(0 0 255) }
+            div { line-height: 200pt }
+            div:nth-of-type(2) { line-height: 30pt }
+            div:nth-of-type(3) { line-height: normal }
+        </style>
+        <div><span>aa</span></div><div><span>aa</span></div><div><span>aa</span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let blue = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .collect::<Vec<_>>();
+    assert_eq!(blue.len(), 3, "blue rects={blue:?}");
+
+    let first = blue[0];
+    for rect in &blue[1..] {
+        assert!(
+            (rect.y() - first.y()).abs() < 0.01,
+            "inline backgrounds should share one content-area bottom: {blue:?}"
+        );
+        assert!(
+            (rect.height() - first.height()).abs() < 0.01,
+            "inline background height should ignore line-height: {blue:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inline_empty_start_edge_border_paints_without_text() {
+    let document = Html::from_string(
+        "<style>
+            @page { size: 180pt 120pt; margin: 20pt }
+            body { margin: 0 }
+            div { font-size: 50pt; display: inline-block }
+            span {
+                padding-left: 1em;
+                color: black;
+                border-top: solid 1pt;
+                border-bottom: solid 1pt;
+            }
+        </style>
+        <div><span></span></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let borders = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| {
+            rect.fill == Some(Color::BLACK)
+                && (rect.height() - 1.0).abs() < 0.01
+                && (rect.width() - 50.0).abs() < 0.01
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(borders.len(), 2, "empty inline border rects={borders:?}");
 }
 
 #[tokio::test]
@@ -41,13 +220,13 @@ async fn draws_backgrounds_and_borders() {
     let document = html.render_async(&RenderOptions::default()).await.unwrap();
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(255, 0, 0)))
     );
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
             .count(),
@@ -71,7 +250,7 @@ async fn hwb_border_color_paints_vector_border() {
     let border_color = Color::rgba(51, 51, 255, 0.75);
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(border_color))
             .count(),
@@ -95,7 +274,7 @@ async fn srgb_color_function_border_color_paints_vector_border() {
     };
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(border_color))
             .count(),
@@ -114,7 +293,7 @@ async fn logical_inline_start_border_paints_left_side_in_initial_writing_mode() 
     .unwrap();
 
     let border = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| {
             rect.fill == Some(Color::new(255, 0, 0))
@@ -135,7 +314,7 @@ async fn logical_inline_start_border_paints_right_side_in_rtl_direction() {
     .unwrap();
 
     let border = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .find(|rect| {
             rect.fill == Some(Color::new(255, 0, 0))
@@ -155,7 +334,7 @@ async fn logical_border_corner_radius_paints_initial_top_left_corner() {
     .unwrap();
 
     let rounded = document.pages[0]
-        .rounded_rects
+        .rounded_rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::BLACK))
         .unwrap();
@@ -175,7 +354,7 @@ async fn border_radius_paints_background_as_rounded_rect() {
     .unwrap();
 
     let rounded = document.pages[0]
-        .rounded_rects
+        .rounded_rects()
         .iter()
         .find(|rect| rect.fill == Some(Color::BLACK))
         .unwrap();
@@ -184,6 +363,114 @@ async fn border_radius_paints_background_as_rounded_rect() {
     assert_eq!(rounded.radii.top_left.y(), 4.0);
     assert_eq!(rounded.radii.top_right.x(), 4.0);
     assert_eq!(rounded.radii.bottom_right.y(), 4.0);
+}
+
+#[tokio::test]
+async fn corner_shape_does_not_bevel_background_fill_clip() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 120pt; margin: 0 }\
+         body { margin: 0 }\
+         .target { background: green; width: 100px; height: 100px;\
+           border-radius: 50px; border: 0px solid black; corner-shape: bevel }\
+         </style><div class=target></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let green = Color::new(0, 128, 0);
+    assert!(
+        document.pages[0]
+            .rects()
+            .iter()
+            .all(|rect| rect.fill != Some(green)),
+        "rounded background fill must not paint as a rectangle"
+    );
+
+    let path = document.pages[0]
+        .paths()
+        .iter()
+        .find(|path| path.fill == Some(green))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected green rounded background path, got {:?}",
+                document.pages[0].paths()
+            )
+        });
+    let curve_count = path
+        .commands
+        .iter()
+        .filter(|command| matches!(command, quire::RenderedPathCommand::CurveTo { .. }))
+        .count();
+
+    assert_eq!(
+        curve_count, 4,
+        "background clipping should follow border-radius curves, not bevel chords: {:?}",
+        path.commands
+    );
+}
+
+#[tokio::test]
+async fn rounded_background_color_padding_clip_uses_shaped_path() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100pt 100pt; margin: 0 }\
+         body { margin: 0 }\
+         div { box-sizing: border-box; width: 50pt; height: 50pt; border: 6pt solid rgb(255, 0, 0); padding: 6pt;\
+           border-radius: 16pt; background-color: rgb(0, 0, 0); background-clip: padding-box }\
+         </style><div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .rects()
+            .iter()
+            .all(|rect| rect.fill != Some(Color::new(0, 0, 0))),
+        "rounded padding-box background color must not paint as a rectangular fill"
+    );
+    assert!(
+        document.pages[0]
+            .paths()
+            .iter()
+            .any(|path| path.fill == Some(Color::new(0, 0, 0)) && path.commands.len() > 5),
+        "expected shaped rounded background-color path, got {:?}",
+        document.pages[0].paths()
+    );
+}
+
+#[tokio::test]
+async fn rounded_page_margin_background_color_content_clip_uses_shaped_path() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 120pt 90pt; margin: 20pt;\
+           @top-center { content: \"Header\"; width: 70pt; height: 16pt; border: 4pt solid rgb(255, 0, 0); padding: 4pt;\
+             border-radius: 12pt; background-color: rgb(0, 0, 0); background-clip: content-box; color: white; font-size: 8pt } }\
+         body { margin: 0; font-size: 10pt }\
+         </style><p>Body</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .rects()
+            .iter()
+            .all(|rect| rect.fill != Some(Color::new(0, 0, 0))),
+        "rounded page-margin content-box background color must not paint as a rectangular fill"
+    );
+    assert!(
+        document.pages[0]
+            .paths()
+            .iter()
+            .any(|path| path.fill == Some(Color::new(0, 0, 0)) && path.commands.len() > 5),
+        "expected shaped rounded page-margin background-color path, got {:?}",
+        document.pages[0].paths()
+    );
 }
 
 #[tokio::test]
@@ -199,17 +486,17 @@ async fn corner_shorthand_matches_equivalent_corner_longhands() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert_eq!(shorthand.pages[0].rounded_rects.len(), 0);
-    assert_eq!(shorthand.pages[0].paths, longhands.pages[0].paths);
+    assert_eq!(shorthand.pages[0].rounded_rects().len(), 0);
+    assert_eq!(shorthand.pages[0].paths(), longhands.pages[0].paths());
     assert!(
         shorthand.pages[0]
-            .paths
+            .paths()
             .iter()
             .any(|path| path.fill == Some(Color::new(240, 240, 240)))
     );
     assert!(
         shorthand.pages[0]
-            .paths
+            .paths()
             .iter()
             .any(|path| path.fill == Some(Color::new(0, 128, 0))
                 && path.fill_rule == quire::RenderedPathFillRule::EvenOdd)
@@ -226,14 +513,14 @@ async fn uniform_solid_rounded_border_paints_as_rounded_stroke() {
 
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
             .count(),
         0
     );
     let rounded_border = document.pages[0]
-        .rounded_rects
+        .rounded_rects()
         .iter()
         .find(|rect| rect.stroke == Some(Color::new(0, 0, 255)))
         .unwrap();
@@ -258,14 +545,14 @@ async fn mixed_width_solid_rounded_border_paints_as_even_odd_path() {
 
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
             .count(),
         0
     );
     let border_path = document.pages[0]
-        .paths
+        .paths()
         .iter()
         .find(|path| path.fill == Some(Color::new(0, 0, 255)))
         .unwrap();
@@ -288,7 +575,7 @@ async fn mixed_color_solid_rounded_border_paints_clipped_side_paths() {
     .unwrap();
 
     let border_paths = document.pages[0]
-        .paths
+        .paths()
         .iter()
         .filter(|path| path.clip.is_some())
         .collect::<Vec<_>>();
@@ -341,12 +628,12 @@ async fn rounded_inset_border_paints_clipped_shaded_side_paths() {
 
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .all(|rect| rect.fill != Some(Color::new(120, 120, 120)))
     );
     let border_paths = document.pages[0]
-        .paths
+        .paths()
         .iter()
         .filter(|path| path.clip.is_some())
         .collect::<Vec<_>>();
@@ -382,7 +669,7 @@ async fn rounded_groove_border_paints_clipped_outer_and_inner_side_paths() {
     .unwrap();
 
     let border_paths = document.pages[0]
-        .paths
+        .paths()
         .iter()
         .filter(|path| path.clip.is_some())
         .collect::<Vec<_>>();
@@ -419,14 +706,14 @@ async fn uniform_double_rounded_border_paints_as_two_path_rings() {
 
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
             .count(),
         0
     );
     let border_paths = document.pages[0]
-        .paths
+        .paths()
         .iter()
         .filter(|path| path.fill == Some(Color::new(0, 0, 255)))
         .collect::<Vec<_>>();
@@ -452,7 +739,7 @@ async fn mixed_double_rounded_border_paints_clipped_outer_and_inner_side_paths()
     .unwrap();
 
     let border_paths = document.pages[0]
-        .paths
+        .paths()
         .iter()
         .filter(|path| path.clip.is_some())
         .collect::<Vec<_>>();
@@ -504,7 +791,7 @@ async fn border_none_has_zero_used_width() {
 
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
             .count(),
@@ -512,7 +799,7 @@ async fn border_none_has_zero_used_width() {
     );
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(0, 0, 255)))
     );
@@ -528,7 +815,7 @@ async fn dashed_borders_render_as_segments() {
     .unwrap();
 
     let red_segments = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .collect::<Vec<_>>();
@@ -536,7 +823,7 @@ async fn dashed_borders_render_as_segments() {
     assert_eq!(red_segments.len(), 4);
     assert!((red_segments[0].width() - (40.0 / 7.0)).abs() < 0.001);
     assert_eq!(red_segments[0].height(), 2.0);
-    assert!(document.pages[0].strokes.is_empty());
+    assert!(document.pages[0].strokes().is_empty());
 }
 
 #[tokio::test]
@@ -550,14 +837,14 @@ async fn dotted_borders_render_as_round_dot_paths() {
 
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
             .count(),
         0
     );
     let dots = document.pages[0]
-        .paths
+        .paths()
         .iter()
         .filter(|path| path.fill == Some(Color::new(0, 0, 255)))
         .collect::<Vec<_>>();
@@ -584,14 +871,14 @@ async fn rounded_dotted_borders_clip_dots_to_side_and_border_ring() {
 
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
             .count(),
         0
     );
     let dots = document.pages[0]
-        .paths
+        .paths()
         .iter()
         .filter(|path| path.fill == Some(Color::new(0, 0, 255)))
         .collect::<Vec<_>>();
@@ -614,14 +901,14 @@ async fn rounded_dashed_borders_clip_dashes_to_side_and_border_ring() {
 
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
             .count(),
         0
     );
     let dashes = document.pages[0]
-        .paths
+        .paths()
         .iter()
         .filter(|path| path.fill == Some(Color::new(255, 0, 0)))
         .collect::<Vec<_>>();
@@ -663,14 +950,14 @@ async fn paints_stretched_border_image_slices_from_source_pixels() {
 
     assert_eq!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
             .count(),
         0
     );
     let border_images = document.pages[0]
-        .images
+        .images()
         .iter()
         .filter(|image| image.source_rect.is_some())
         .collect::<Vec<_>>();
@@ -721,7 +1008,7 @@ async fn paints_repeated_border_image_tiles() {
     .unwrap();
 
     let border_images = document.pages[0]
-        .images
+        .images()
         .iter()
         .filter(|image| image.source_rect.is_some())
         .collect::<Vec<_>>();
@@ -766,7 +1053,7 @@ async fn border_image_width_auto_uses_source_slice_size() {
     .unwrap();
 
     let border_images = document.pages[0]
-        .images
+        .images()
         .iter()
         .filter(|image| image.source_rect.is_some())
         .collect::<Vec<_>>();
@@ -811,7 +1098,7 @@ async fn border_image_widths_scale_down_before_overlapping() {
     .unwrap();
 
     let border_images = document.pages[0]
-        .images
+        .images()
         .iter()
         .filter(|image| image.source_rect.is_some())
         .collect::<Vec<_>>();
@@ -840,7 +1127,7 @@ async fn inset_and_groove_borders_use_3d_shading() {
     let light = border_light_gray();
     assert_eq!(
         inset.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(dark))
             .count(),
@@ -848,7 +1135,7 @@ async fn inset_and_groove_borders_use_3d_shading() {
     );
     assert_eq!(
         inset.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(light))
             .count(),
@@ -863,7 +1150,7 @@ async fn inset_and_groove_borders_use_3d_shading() {
 
     assert_eq!(
         groove.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(dark) || rect.fill == Some(light))
             .count(),
@@ -897,7 +1184,7 @@ async fn renders_horizontal_rules() {
             .await
             .unwrap();
 
-    assert!(document.pages[0].lines.is_empty());
+    assert!(document.pages[0].lines().is_empty());
     let red = filled_rect(&document.pages[0], Color::new(255, 0, 0));
     assert_eq!(red.width(), 100.0);
     assert_eq!(red.height(), 2.0);
@@ -912,7 +1199,7 @@ async fn horizontal_rules_use_generic_patterned_border_painting() {
             .unwrap();
 
     let red_segments = dashed.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .collect::<Vec<_>>();
@@ -929,7 +1216,7 @@ async fn horizontal_rules_use_generic_patterned_border_painting() {
 
     assert_eq!(
         dotted.pages[0]
-            .rects
+            .rects()
             .iter()
             .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
             .count(),
@@ -937,7 +1224,7 @@ async fn horizontal_rules_use_generic_patterned_border_painting() {
     );
     assert_eq!(
         dotted.pages[0]
-            .paths
+            .paths()
             .iter()
             .filter(|path| path.fill == Some(Color::new(0, 0, 255)))
             .count(),
@@ -962,11 +1249,11 @@ async fn horizontal_rules_use_generic_per_side_border_painting() {
     ] {
         assert!(
             document.pages[0]
-                .rects
+                .rects()
                 .iter()
                 .any(|rect| rect.fill == Some(color)),
             "expected hr side color {color:?} in {:?}",
-            document.pages[0].rects
+            document.pages[0].rects()
         );
     }
 }
@@ -1005,7 +1292,7 @@ async fn hr_color_and_size_presentational_hints_render_solid_red_border() {
     .unwrap();
 
     let red_borders = document.pages[0]
-        .rects
+        .rects()
         .iter()
         .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
         .collect::<Vec<_>>();
@@ -1095,7 +1382,7 @@ async fn rtl_overconstrained_fixed_width_blocks_keep_end_side() {
     .unwrap();
 
     let green = filled_rect(&document.pages[0], Color::new(0, 128, 0));
-    assert!((green.x() - 25.0).abs() < 0.01, "{green:?}");
+    assert!((green.x() - 10.0).abs() < 0.01, "{green:?}");
 }
 
 #[tokio::test]
@@ -1115,7 +1402,7 @@ async fn extracts_title_metadata() {
         .await
         .unwrap();
     assert_eq!(document.metadata.title.as_deref(), Some("Example PDF"));
-    assert_eq!(document.pages[0].lines[0].text, "Hello");
+    assert_eq!(document.pages[0].lines()[0].text, "Hello");
 
     let pdf = document.write_pdf_bytes().unwrap();
     let rendered = String::from_utf8_lossy(&pdf);
@@ -1159,7 +1446,7 @@ async fn accepts_external_stylesheet_api() {
         .await
         .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].color, Color::new(0, 255, 0));
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(0, 255, 0));
 }
 
 #[tokio::test]
@@ -1178,7 +1465,7 @@ async fn external_stylesheets_resolve_imports() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!(document.pages[0].lines[0].color, Color::new(255, 0, 0));
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -1191,7 +1478,7 @@ async fn resolves_inherited_css_custom_properties() {
         .await
         .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].color, Color::new(0, 255, 0));
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(0, 255, 0));
 }
 
 #[tokio::test]
@@ -1204,10 +1491,10 @@ async fn applies_print_media_rules() {
         .await
         .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].color, Color::new(255, 0, 0));
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(255, 0, 0));
     assert!(!line_font_contains_any(
         &document,
-        &document.pages[0].lines[0],
+        &document.pages[0].lines()[0],
         &["courier"]
     ));
 }
@@ -1233,7 +1520,7 @@ async fn loads_linked_stylesheets_relative_to_html_file() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!(document.pages[0].lines[0].color, Color::new(255, 0, 0));
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -1264,7 +1551,7 @@ async fn loads_root_relative_stylesheets_from_base_url() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!(document.pages[0].lines[0].color, Color::new(255, 0, 0));
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -1305,7 +1592,7 @@ async fn loads_root_relative_font_face_urls_from_base_url() {
 
     assert!(line_font_contains_any(
         &document,
-        &document.pages[0].lines[0],
+        &document.pages[0].lines()[0],
         &["source", "sans"]
     ));
 }
@@ -1334,9 +1621,9 @@ async fn loads_images_relative_to_html_file() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!(document.pages[0].images.len(), 1);
-    assert_eq!(document.pages[0].images[0].width(), 7.5);
-    assert_eq!(document.pages[0].images[0].height(), 15.0);
+    assert_eq!(document.pages[0].images().len(), 1);
+    assert_eq!(document.pages[0].images()[0].width(), 7.5);
+    assert_eq!(document.pages[0].images()[0].height(), 15.0);
 }
 
 #[tokio::test]
@@ -1370,9 +1657,9 @@ async fn loads_root_relative_images_from_base_url() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!(document.pages[0].images.len(), 1);
-    assert_eq!(document.pages[0].images[0].width(), 7.5);
-    assert_eq!(document.pages[0].images[0].height(), 15.0);
+    assert_eq!(document.pages[0].images().len(), 1);
+    assert_eq!(document.pages[0].images()[0].width(), 7.5);
+    assert_eq!(document.pages[0].images()[0].height(), 15.0);
 }
 
 #[tokio::test]
@@ -1408,9 +1695,77 @@ async fn paints_background_images_relative_to_stylesheet_file() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!(document.pages[0].images.len(), 1);
-    assert_eq!(document.pages[0].images[0].width(), 20.0);
-    assert_eq!(document.pages[0].images[0].height(), 10.0);
+    assert_eq!(document.pages[0].images().len(), 1);
+    assert_eq!(document.pages[0].images()[0].width(), 20.0);
+    assert_eq!(document.pages[0].images()[0].height(), 10.0);
+}
+
+#[tokio::test]
+async fn background_shorthand_url_path_slash_preserves_explicit_size() {
+    let dir = std::env::temp_dir().join(format!(
+        "reasyprint-background-url-slash-{}",
+        std::process::id()
+    ));
+    let support_dir = dir.join("support");
+    std::fs::create_dir_all(&support_dir).unwrap();
+    let html_path = dir.join("document.html");
+    let image_path = support_dir.join("1x1-green.png");
+    let image = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
+        .unwrap();
+    std::fs::write(&image_path, image).unwrap();
+    std::fs::write(
+        &html_path,
+        r#"
+        <style>
+        @page { size: 200px 160px; margin: 0 }
+        body { margin: 0 }
+        #red {
+          position: absolute;
+          background: red;
+          width: 100px;
+          height: 100px;
+        }
+        div:not(#red) {
+          position: absolute;
+          width: 50px;
+          line-height: 100px;
+          background: url("support/1x1-green.png") 0 0 / 50px 100px no-repeat, red;
+          color: transparent;
+        }
+        #test { font-size: 20px }
+        #test2 { margin-left: 50px; font-size: 150px }
+        </style>
+        <div id="red"></div>
+        <div id="test">ab</div>
+        <div id="test2">ab</div>
+        "#,
+    )
+    .unwrap();
+
+    let document = Html::from_file_async(&html_path)
+        .await
+        .unwrap()
+        .render_async(&RenderOptions::default())
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let expected_width = 50.0 * 0.75;
+    let expected_height = 100.0 * 0.75;
+    let images = document.pages[0]
+        .images()
+        .iter()
+        .filter(|image| image.background)
+        .collect::<Vec<_>>();
+    assert_eq!(images.len(), 2, "{images:?}");
+    assert!(
+        images.iter().all(|image| {
+            (image.width() - expected_width).abs() < 0.01
+                && (image.height() - expected_height).abs() < 0.01
+        }),
+        "background images should use explicit 50px by 100px size: {images:?}"
+    );
 }
 
 #[tokio::test]
@@ -1445,10 +1800,10 @@ async fn paints_first_page_background_image_from_page_rule() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(document.pages.len(), 2);
-    assert_eq!(document.pages[0].images.len(), 1);
-    assert_eq!(document.pages[0].images[0].width(), 40.0);
-    assert_eq!(document.pages[0].images[0].height(), 40.0);
-    assert!(document.pages[1].images.is_empty());
+    assert_eq!(document.pages[0].images().len(), 1);
+    assert_eq!(document.pages[0].images()[0].width(), 40.0);
+    assert_eq!(document.pages[0].images()[0].height(), 40.0);
+    assert!(document.pages[1].images().is_empty());
 }
 
 #[tokio::test]
@@ -1495,17 +1850,17 @@ async fn page_background_origin_selects_page_box_positioning_area() {
         .pages
         .iter()
         .map(|page| {
-            assert_eq!(page.images.len(), 1);
-            &page.images[0]
+            assert_eq!(page.images().len(), 1);
+            &page.images()[0]
         })
         .collect::<Vec<_>>();
 
     assert_eq!(images[0].x(), 10.0);
-    assert_eq!(images[0].y(), 69.0);
+    assert_eq!(images[0].y(), 69.25);
     assert_eq!(images[1].x(), 15.0);
-    assert_eq!(images[1].y(), 64.0);
+    assert_eq!(images[1].y(), 64.25);
     assert_eq!(images[2].x(), 22.0);
-    assert_eq!(images[2].y(), 57.0);
+    assert_eq!(images[2].y(), 57.25);
 }
 
 #[tokio::test]
@@ -1543,8 +1898,8 @@ async fn page_background_clip_crops_image_to_page_content_box() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!(document.pages[0].images.len(), 1);
-    let image = &document.pages[0].images[0];
+    assert_eq!(document.pages[0].images().len(), 1);
+    let image = &document.pages[0].images()[0];
     assert_eq!(image.x(), 22.0);
     assert_eq!(image.y(), 22.0);
     assert_eq!(image.width(), 56.0);
@@ -1586,7 +1941,7 @@ async fn page_background_repeat_y_tiles_from_positioned_image() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    let images = &document.pages[0].images;
+    let images = &document.pages[0].images();
     assert_eq!(images.len(), 4);
     assert!(images.iter().all(|image| image.x() == 0.0));
     assert_eq!(
@@ -1621,7 +1976,7 @@ async fn page_background_paints_multiple_image_layers_with_independent_geometry(
     .unwrap();
 
     let images = document.pages[0]
-        .images
+        .images()
         .iter()
         .filter(|image| image.background)
         .collect::<Vec<_>>();
@@ -1658,7 +2013,7 @@ async fn normal_box_background_layers_use_independent_origin_and_clip() {
     .unwrap();
 
     let images = document.pages[0]
-        .images
+        .images()
         .iter()
         .filter(|image| image.background)
         .collect::<Vec<_>>();
@@ -1698,7 +2053,7 @@ async fn page_margin_background_layers_use_independent_origin_and_clip() {
     .unwrap();
 
     let images = document.pages[0]
-        .images
+        .images()
         .iter()
         .filter(|image| image.background)
         .collect::<Vec<_>>();
@@ -1730,16 +2085,392 @@ async fn background_paints_multiple_linear_gradient_layers() {
 
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(255, 0, 0)))
     );
     assert!(
         document.pages[0]
-            .rects
+            .rects()
             .iter()
             .any(|rect| rect.fill == Some(Color::new(0, 0, 255)))
     );
+}
+
+#[tokio::test]
+async fn background_paints_angled_hard_stop_linear_gradient() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 80pt 80pt; margin: 0 }\
+         body { margin: 0 }\
+         div { display: block; width: 40pt; height: 40pt;\
+           background-image: linear-gradient(30deg, red 50%, blue 50%);\
+         }\
+         </style><div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .paths()
+            .iter()
+            .any(|path| path.fill == Some(Color::new(255, 0, 0)))
+    );
+    assert!(
+        document.pages[0]
+            .paths()
+            .iter()
+            .any(|path| path.fill == Some(Color::new(0, 0, 255)))
+    );
+}
+
+#[tokio::test]
+async fn background_paints_smooth_linear_gradient_as_generated_image() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 80pt 80pt; margin: 0 }\
+         body { margin: 0 }\
+         div { display: block; width: 40pt; height: 40pt;\
+           background-image: linear-gradient(red, blue);\
+         }\
+         </style><div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .images()
+            .iter()
+            .any(|image| image.background && image.width() == 40.0 && image.height() == 40.0)
+    );
+}
+
+#[tokio::test]
+async fn background_paints_smooth_radial_gradient_as_generated_image() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 80pt 80pt; margin: 0 }\
+         body { margin: 0 }\
+         div { display: block; width: 40pt; height: 30pt;\
+           background-image: radial-gradient(circle at 25% 75%, red, blue);\
+         }\
+         </style><div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .images()
+            .iter()
+            .any(|image| image.background && image.width() == 40.0 && image.height() == 30.0)
+    );
+}
+
+#[tokio::test]
+async fn background_tiles_sized_repeating_radial_gradient() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100pt 60pt; margin: 0 }\
+         body { margin: 0 }\
+         div { display: block; width: 60pt; height: 40pt;\
+           background-image: repeating-radial-gradient(circle, red 0pt, red 5pt, blue 5pt, blue 10pt);\
+           background-size: 20pt 20pt;\
+           background-repeat: repeat;\
+         }\
+         </style><div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let tiles = document.pages[0]
+        .images()
+        .iter()
+        .filter(|image| image.background && image.width() == 20.0 && image.height() == 20.0)
+        .count();
+    assert!(tiles >= 6);
+}
+
+#[tokio::test]
+async fn background_paints_transparent_linear_gradient_with_alpha() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 80pt 80pt; margin: 0 }\
+         body { margin: 0 }\
+         div { display: block; width: 40pt; height: 40pt;\
+           background-image: linear-gradient(to bottom, transparent, red);\
+         }\
+         </style><div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .images()
+            .iter()
+            .any(|image| image.background && image.alpha.is_some())
+    );
+}
+
+#[tokio::test]
+async fn page_margin_background_paints_radial_gradient_layer() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 80pt 80pt; margin: 20pt;\
+           @top-center { content: \"\"; width: 40pt; height: 20pt;\
+             background-image: radial-gradient(ellipse farthest-corner at center, red, blue);\
+           }\
+         }\
+         body { margin: 0 }\
+         </style><p>x</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .images()
+            .iter()
+            .any(|image| image.background && image.width() == 40.0 && image.height() == 20.0)
+    );
+}
+
+#[tokio::test]
+async fn page_background_paints_radial_gradient_layer() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 80pt 80pt; margin: 0;\
+           background-image: radial-gradient(circle closest-side at 50% 50%, red, blue);\
+         }\
+         body { margin: 0 }\
+         </style><p>x</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0]
+            .images()
+            .iter()
+            .any(|image| image.background && image.width() == 80.0 && image.height() == 80.0)
+    );
+}
+
+#[tokio::test]
+async fn rounded_background_linear_gradient_layers_use_clip_paths() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 80pt 80pt; margin: 0 }\
+         body { margin: 0 }\
+         div { width: 40pt; height: 40pt; border-radius: 10pt;\
+           background-image: linear-gradient(90deg, red 0pt, red 20pt, blue 20pt, blue 40pt),\
+                             linear-gradient(0deg, lime 0pt, lime 20pt, black 20pt, black 40pt);\
+         }\
+         </style><div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0].rects().iter().all(|rect| !matches!(
+            rect.fill,
+            Some(color)
+                if color == Color::new(255, 0, 0)
+                    || color == Color::new(0, 0, 255)
+                    || color == Color::new(0, 255, 0)
+                    || color == Color::new(0, 0, 0)
+        )),
+        "rounded gradient backgrounds should not paint unclipped rectangular bands"
+    );
+    let clipped_gradient_paths = document.pages[0]
+        .paths()
+        .iter()
+        .filter(|path| path.clip.is_some())
+        .collect::<Vec<_>>();
+    assert!(
+        clipped_gradient_paths.len() >= 4,
+        "expected clipped gradient bands, got {:?}",
+        document.pages[0].paths()
+    );
+    assert!(
+        clipped_gradient_paths
+            .iter()
+            .all(|path| path.clip.as_ref().unwrap().commands.len() > 5)
+    );
+}
+
+#[tokio::test]
+async fn rounded_background_url_layer_clips_image_draw() {
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let document = Html::from_string(format!(
+        "<style>\
+         @page {{ size: 80pt 80pt; margin: 0 }}\
+         body {{ margin: 0 }}\
+         div {{ width: 40pt; height: 40pt; border-radius: 10pt;\
+           background: url({png}) no-repeat 0 0 / 40pt 40pt;\
+         }}\
+         </style><div></div>",
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let images = document.pages[0]
+        .images()
+        .iter()
+        .filter(|image| image.background);
+    assert_eq!(images.count(), 1);
+    assert_pdf_clips_image_draw(&document);
+}
+
+#[tokio::test]
+async fn rounded_page_margin_linear_gradient_background_uses_clip_paths() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 80pt 80pt; margin: 20pt;\
+           @top-center { content: \"\"; width: 40pt; height: 20pt; border-radius: 8pt;\
+             background-image: linear-gradient(90deg, red 0pt, red 20pt, blue 20pt, blue 40pt);\
+           }\
+         }\
+         body { margin: 0 }\
+         </style><p>x</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0].rects().iter().all(|rect| !matches!(
+            rect.fill,
+            Some(color) if color == Color::new(255, 0, 0) || color == Color::new(0, 0, 255)
+        )),
+        "rounded page-margin gradient backgrounds should not paint unclipped rectangular bands"
+    );
+    let clipped_gradient_paths = document.pages[0]
+        .paths()
+        .iter()
+        .filter(|path| path.clip.is_some());
+    assert!(
+        clipped_gradient_paths.count() >= 2,
+        "expected clipped page-margin gradient bands, got {:?}",
+        document.pages[0].paths()
+    );
+}
+
+#[tokio::test]
+async fn rounded_page_margin_url_background_clips_image_draw() {
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let document = Html::from_string(format!(
+        "<style>\
+         @page {{ size: 80pt 80pt; margin: 20pt;\
+           @top-center {{ content: \"\"; width: 40pt; height: 20pt; border-radius: 8pt;\
+             background: url({png}) no-repeat 0 0 / 40pt 20pt;\
+           }}\
+         }}\
+         body {{ margin: 0 }}\
+         </style><p>x</p>",
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let images = document.pages[0]
+        .images()
+        .iter()
+        .filter(|image| image.background);
+    assert_eq!(images.count(), 1);
+    assert_pdf_clips_image_draw(&document);
+}
+
+#[tokio::test]
+async fn rounded_page_background_linear_gradient_uses_clip_paths() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 80pt 80pt; margin: 0; border-radius: 12pt;\
+           background-image: linear-gradient(0deg, red 0pt, red 40pt, blue 40pt, blue 80pt);\
+         }\
+         body { margin: 0 }\
+         </style><p>x</p>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert!(
+        document.pages[0].rects().iter().all(|rect| !matches!(
+            rect.fill,
+            Some(color) if color == Color::new(255, 0, 0) || color == Color::new(0, 0, 255)
+        )),
+        "rounded page gradient backgrounds should not paint unclipped rectangular bands"
+    );
+    let clipped_gradient_paths = document.pages[0]
+        .paths()
+        .iter()
+        .filter(|path| path.clip.is_some());
+    assert!(
+        clipped_gradient_paths.count() >= 2,
+        "expected clipped page gradient bands, got {:?}",
+        document.pages[0].paths()
+    );
+}
+
+#[tokio::test]
+async fn rounded_page_background_url_layer_clips_image_draw() {
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let document = Html::from_string(format!(
+        "<style>\
+         @page {{ size: 80pt 80pt; margin: 10pt; border-radius: 10pt;\
+           background: url({png}) no-repeat 0 0 / 60pt 60pt;\
+         }}\
+         body {{ margin: 0 }}\
+         </style><p>x</p>",
+    ))
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let images = document.pages[0]
+        .images()
+        .iter()
+        .filter(|image| image.background);
+    assert_eq!(images.count(), 1);
+    assert_pdf_clips_image_draw(&document);
+}
+
+#[tokio::test]
+async fn background_tiles_sized_repeating_linear_gradient() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100pt 60pt; margin: 0 }\
+         body { margin: 0 }\
+         div { display: block; width: 60pt; height: 40pt;\
+           background-image: repeating-linear-gradient(to right, red 0pt, red 10pt, blue 10pt, blue 20pt);\
+           background-size: 20pt 20pt;\
+           background-repeat: repeat;\
+         }\
+         </style><div></div>",
+    )
+    .render_async(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let tiles = document.pages[0]
+        .images()
+        .iter()
+        .filter(|image| image.background && image.width() == 20.0 && image.height() == 20.0)
+        .count();
+    assert!(tiles >= 6);
 }
 
 #[tokio::test]
@@ -1752,8 +2483,8 @@ async fn supports_class_and_id_selectors() {
         .await
         .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].color, Color::new(0, 0, 255));
-    assert_eq!(document.pages[0].lines[1].color, Color::new(255, 0, 0));
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(0, 0, 255));
+    assert_eq!(document.pages[0].lines()[1].color, Color::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -1767,10 +2498,10 @@ async fn supports_servo_attribute_and_link_selectors() {
             .await
             .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].color, Color::new(255, 0, 0));
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(255, 0, 0));
     assert!(line_font_is_monospace(
         &document,
-        &document.pages[0].lines[1]
+        &document.pages[0].lines()[1]
     ));
 }
 
@@ -1784,7 +2515,7 @@ async fn applies_simple_css_specificity() {
         .await
         .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].color, Color::new(255, 0, 0));
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -1798,16 +2529,16 @@ async fn supports_basic_descendant_and_child_selectors() {
             .await
             .unwrap();
 
-    assert_eq!(document.pages[0].lines[0].text, "Child");
+    assert_eq!(document.pages[0].lines()[0].text, "Child");
     assert!(line_font_is_monospace(
         &document,
-        &document.pages[0].lines[0]
+        &document.pages[0].lines()[0]
     ));
-    assert_eq!(document.pages[0].lines[0].color, Color::new(255, 0, 0));
-    assert_eq!(document.pages[0].lines[1].text, "Nested");
+    assert_eq!(document.pages[0].lines()[0].color, Color::new(255, 0, 0));
+    assert_eq!(document.pages[0].lines()[1].text, "Nested");
     assert!(line_font_is_monospace(
         &document,
-        &document.pages[0].lines[1]
+        &document.pages[0].lines()[1]
     ));
-    assert_eq!(document.pages[0].lines[1].color, Color::BLACK);
+    assert_eq!(document.pages[0].lines()[1].color, Color::BLACK);
 }

@@ -542,10 +542,12 @@ impl FontSystem {
 fn font_families_for_style(
     family: &FontFamily,
     weight: FontWeight,
-) -> Vec<FontiqueQueryFamily<'_>> {
+) -> Cow<'_, [FontiqueQueryFamily<'_>]> {
     match family {
-        FontFamily::Names(names) => names.iter().map(|name| family_query(name)).collect(),
-        generic => generic_query_families(generic, weight).unwrap_or_default(),
+        FontFamily::Names(names) => {
+            Cow::Owned(names.iter().map(|name| family_query(name)).collect())
+        }
+        generic => Cow::Borrowed(generic_query_families(generic, weight).unwrap_or(&[])),
     }
 }
 

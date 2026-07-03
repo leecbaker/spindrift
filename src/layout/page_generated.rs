@@ -2,7 +2,7 @@ use super::*;
 use crate::text::is_css_collapsible_whitespace;
 use crate::text::trim_css_collapsible_whitespace;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum PageContentPart {
     Text(String),
     Contents,
@@ -10,7 +10,7 @@ enum PageContentPart {
         fallback: Option<String>,
     },
     Image {
-        url: String,
+        image: BackgroundImage,
     },
     Quote(GeneratedQuote),
     Leader(String),
@@ -61,6 +61,15 @@ enum PageContentPart {
 pub(super) enum PageMarginContentItem {
     Inline(GeneratedContentPart),
     EmbeddedRunningElement(Box<RunningElementCapture>),
+    TargetCounter {
+        target: String,
+        name: String,
+        style: Option<ListStyleType>,
+    },
+    TargetText {
+        target: String,
+        keyword: css::NamedStringTargetTextKeyword,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,9 +89,13 @@ impl ResolvedPageContent {
                 | GeneratedContentPart::Attr { .. }
                 | GeneratedContentPart::Counter { .. }
                 | GeneratedContentPart::Counters { .. }
-                | GeneratedContentPart::Image { .. } => false,
+                | GeneratedContentPart::Image { .. }
+                | GeneratedContentPart::TargetCounter { .. }
+                | GeneratedContentPart::TargetText { .. } => false,
             },
             PageMarginContentItem::EmbeddedRunningElement(_) => false,
+            PageMarginContentItem::TargetCounter { .. }
+            | PageMarginContentItem::TargetText { .. } => false,
         })
     }
 }
@@ -148,11 +161,13 @@ pub(super) fn resolve_page_content_parts(
                     push_resolved_text(&mut output, &fallback);
                 }
             }
-            PageContentPart::Image { url } => {
+            PageContentPart::Image { image } => {
                 output.push(PageMarginContentItem::Inline(GeneratedContentPart::Image {
-                    url,
-                    base_url: context.base_url.map(Path::to_path_buf),
-                    root_url: context.root_url.map(Path::to_path_buf),
+                    image: page_content_image_with_context_urls(
+                        image,
+                        context.base_url,
+                        context.root_url,
+                    ),
                 }))
             }
             PageContentPart::Quote(quote) => output.push(PageMarginContentItem::Inline(
@@ -223,7 +238,7 @@ pub(super) fn resolve_page_content_parts(
                     context.page_index,
                     context.page_named_strings,
                 ) {
-                    append_assignment_generated_content(&mut output, assignment);
+                    append_assignment_generated_content(&mut output, assignment, &context);
                 }
             }
             PageContentPart::RunningElement { name, keyword } => {
@@ -233,7 +248,7 @@ pub(super) fn resolve_page_content_parts(
                     context.page_index,
                     context.page_running_elements,
                 ) {
-                    append_assignment_generated_content(&mut output, assignment);
+                    append_assignment_generated_content(&mut output, assignment, &context);
                 }
             }
         }
@@ -244,10 +259,11 @@ pub(super) fn resolve_page_content_parts(
 fn append_assignment_generated_content(
     output: &mut Vec<PageMarginContentItem>,
     assignment: &NamedStringAssignment,
+    context: &PageContentResolveContext<'_>,
 ) {
     match &assignment.value {
         PageAssignmentValue::GeneratedContent(parts) => {
-            append_resolved_items(output, parts);
+            append_resolved_items(output, parts, context);
         }
         PageAssignmentValue::RunningElement(capture) => {
             output.push(PageMarginContentItem::EmbeddedRunningElement(
@@ -257,11 +273,65 @@ fn append_assignment_generated_content(
     }
 }
 
-fn append_resolved_items(output: &mut Vec<PageMarginContentItem>, items: &[PageMarginContentItem]) {
+fn append_resolved_items(
+    output: &mut Vec<PageMarginContentItem>,
+    items: &[PageMarginContentItem],
+    context: &PageContentResolveContext<'_>,
+) {
     for item in items {
         match item {
             PageMarginContentItem::Inline(GeneratedContentPart::Text(text)) => {
                 push_resolved_text(output, text)
+            }
+            PageMarginContentItem::Inline(GeneratedContentPart::TargetCounter {
+                target,
+                name,
+                style,
+            }) => {
+                if let Some(value) = resolve_target_counter_value(
+                    target,
+                    name,
+                    style.clone(),
+                    context.page_anchors,
+                    context.total_pages,
+                    context.counter_styles,
+                ) {
+                    push_resolved_text(output, &value);
+                }
+            }
+            PageMarginContentItem::Inline(GeneratedContentPart::TargetText { target, keyword }) => {
+                if let Some(value) = resolve_named_string_target_text_value(
+                    target,
+                    *keyword,
+                    context.page_anchor_text,
+                ) {
+                    push_resolved_text(output, &value);
+                }
+            }
+            PageMarginContentItem::TargetCounter {
+                target,
+                name,
+                style,
+            } => {
+                if let Some(value) = resolve_target_counter_value(
+                    target,
+                    name,
+                    style.clone(),
+                    context.page_anchors,
+                    context.total_pages,
+                    context.counter_styles,
+                ) {
+                    push_resolved_text(output, &value);
+                }
+            }
+            PageMarginContentItem::TargetText { target, keyword } => {
+                if let Some(value) = resolve_named_string_target_text_value(
+                    target,
+                    *keyword,
+                    context.page_anchor_text,
+                ) {
+                    push_resolved_text(output, &value);
+                }
             }
             _ => output.push(item.clone()),
         }
@@ -281,6 +351,27 @@ fn push_resolved_text(output: &mut Vec<PageMarginContentItem>, value: &str) {
             text,
         ))),
     }
+}
+
+fn page_content_image_with_context_urls(
+    mut image: BackgroundImage,
+    base_url: Option<&Path>,
+    root_url: Option<&Path>,
+) -> BackgroundImage {
+    if let BackgroundImage::Url {
+        base_url: image_base_url,
+        root_url: image_root_url,
+        ..
+    } = &mut image
+    {
+        if image_base_url.is_none() {
+            *image_base_url = base_url.map(Path::to_path_buf);
+        }
+        if image_root_url.is_none() {
+            *image_root_url = root_url.map(Path::to_path_buf);
+        }
+    }
+    image
 }
 
 fn format_page_counter_value(
@@ -348,6 +439,20 @@ fn resolve_target_text_value(
     })
 }
 
+fn resolve_named_string_target_text_value(
+    target: &str,
+    keyword: css::NamedStringTargetTextKeyword,
+    page_anchor_text: &HashMap<String, AnchorText>,
+) -> Option<String> {
+    let keyword = match keyword {
+        css::NamedStringTargetTextKeyword::Content => TargetTextKeyword::Content,
+        css::NamedStringTargetTextKeyword::Before => TargetTextKeyword::Before,
+        css::NamedStringTargetTextKeyword::After => TargetTextKeyword::After,
+        css::NamedStringTargetTextKeyword::FirstLetter => TargetTextKeyword::FirstLetter,
+    };
+    resolve_target_text_value(target, keyword, page_anchor_text)
+}
+
 fn parse_page_content(value: &str) -> Option<Vec<PageContentPart>> {
     let mut rest = value.trim();
     let mut parts = Vec::new();
@@ -359,8 +464,8 @@ fn parse_page_content(value: &str) -> Option<Vec<PageContentPart>> {
         if let Some((text, tail)) = parse_css_string_token(rest) {
             parts.push(PageContentPart::Text(text));
             rest = tail;
-        } else if let Some((url, tail)) = parse_css_url_token(rest) {
-            parts.push(PageContentPart::Image { url });
+        } else if let Some((image, tail)) = parse_page_image_token(rest) {
+            parts.push(PageContentPart::Image { image });
             rest = tail;
         } else if let Some((attr, tail)) = parse_page_attr_function(rest) {
             parts.push(attr);
@@ -398,6 +503,34 @@ fn parse_page_attr_function(value: &str) -> Option<(PageContentPart, &str)> {
         .first()
         .and_then(|fallback| parse_css_string_token(fallback.trim()).map(|(text, _)| text));
     Some((PageContentPart::Attr { fallback }, tail))
+}
+
+fn parse_page_image_token(value: &str) -> Option<(BackgroundImage, &str)> {
+    if let Some((src, tail)) = parse_css_url_token(value) {
+        return Some((
+            BackgroundImage::Url {
+                src,
+                base_url: None,
+                root_url: None,
+            },
+            tail,
+        ));
+    }
+    for name in [
+        "linear-gradient",
+        "repeating-linear-gradient",
+        "radial-gradient",
+        "repeating-radial-gradient",
+    ] {
+        let Some(body) = strip_ascii_function(value, name) else {
+            continue;
+        };
+        let (argument, tail) = split_balanced_function_argument(body)?;
+        let image_text = format!("{name}({argument})");
+        let image = css::parse_background_image(&image_text, None, None)?;
+        return Some((image, tail));
+    }
+    None
 }
 
 fn starts_with_ident(value: &str, ident: &str) -> bool {

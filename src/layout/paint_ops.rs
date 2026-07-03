@@ -1,6 +1,30 @@
 use super::*;
 
 impl<'a> LayoutBuilder<'a> {
+    /// Collect positioned descendants emitted after `start_index` for one page.
+    ///
+    /// Real stacking contexts capture their positioned descendants into the
+    /// scoped paint tree, while pseudo contexts such as inline-block painting
+    /// can intentionally let those descendants escape:
+    /// <https://www.w3.org/TR/css-position-3/#painting-order> and
+    /// <https://www.w3.org/TR/CSS22/zindex.html>.
+    pub(super) fn positioned_child_contexts_since(
+        &mut self,
+        start_index: usize,
+        page_index: usize,
+        policy: StackingContextPolicy,
+    ) -> Vec<PaintStackingContext> {
+        if !policy.captures_positioned_descendants || start_index >= self.positioned_layers.len() {
+            return Vec::new();
+        }
+        self.positioned_layers
+            .split_off(start_index)
+            .into_iter()
+            .filter(|layer| layer.page_index == page_index)
+            .map(|layer| layer.context.with_links(layer.links))
+            .collect()
+    }
+
     /// Replace current-page paint emitted since `checkpoint` with one scoped
     /// paint-tree context in the requested parent band.
     ///
@@ -31,6 +55,69 @@ impl<'a> LayoutBuilder<'a> {
         true
     }
 
+    /// Replace current-page paint emitted since `checkpoint` using a full
+    /// stacking-context policy.
+    ///
+    /// Flex items and table fragments derive their parent band, stack level,
+    /// captured descendant behavior, and effects from `StackingContextPolicy`;
+    /// using this helper keeps those policy decisions applied consistently:
+    /// <https://www.w3.org/TR/css-position-3/#painting-order> and
+    /// <https://www.w3.org/TR/CSS22/zindex.html>.
+    pub(super) fn scope_current_page_paint_since_with_policy(
+        &mut self,
+        checkpoint: &PaintCheckpoint,
+        policy: StackingContextPolicy,
+        bounds: PaintClip,
+        child_contexts: Vec<PaintStackingContext>,
+    ) -> bool {
+        let Some(fragment) = self.current_page.paint_tree_fragment_since(checkpoint) else {
+            return false;
+        };
+        self.scope_current_page_fragment_with_policy(
+            checkpoint,
+            policy,
+            bounds,
+            fragment,
+            child_contexts,
+        )
+    }
+
+    /// Replace current-page paint since `checkpoint` with a prepared fragment
+    /// wrapped according to a stacking-context policy.
+    ///
+    /// Table fragmentation may need to augment the captured fragment with
+    /// collapsed borders before it can be scoped, while flex item fragments can
+    /// scope the raw checkpoint capture. Both still use the same CSS stacking
+    /// policy fields when replacing page paint:
+    /// <https://www.w3.org/TR/css-position-3/#painting-order> and
+    /// <https://www.w3.org/TR/CSS22/zindex.html>.
+    pub(super) fn scope_current_page_fragment_with_policy(
+        &mut self,
+        checkpoint: &PaintCheckpoint,
+        policy: StackingContextPolicy,
+        bounds: PaintClip,
+        fragment: PaintFragment,
+        child_contexts: Vec<PaintStackingContext>,
+    ) -> bool {
+        if fragment.is_empty() && child_contexts.is_empty() {
+            return false;
+        }
+        let context = PaintStackingContext::from_banded_fragment_with_stack_level(
+            policy.stack_level,
+            fragment,
+            child_contexts,
+        )
+        .with_source_order(self.next_paint_source_order())
+        .with_effects(policy.effects)
+        .with_bounds(bounds);
+        self.current_page.replace_paint_tree_since_with_context(
+            checkpoint,
+            policy.parent_band,
+            context,
+        );
+        true
+    }
+
     /// Scope paint emitted since `checkpoint` as an atomic/effect box.
     ///
     /// CSS Transforms, CSS Color opacity, CSS Overflow clipping, replaced
@@ -51,13 +138,7 @@ impl<'a> LayoutBuilder<'a> {
         child_contexts: Vec<PaintStackingContext>,
     ) -> bool {
         let policy = StackingContextPolicy::for_atomic(style, band, bounds);
-        self.scope_current_page_paint_since(
-            checkpoint,
-            policy.parent_band,
-            bounds,
-            child_contexts,
-            policy.effects,
-        )
+        self.scope_current_page_paint_since_with_policy(checkpoint, policy, bounds, child_contexts)
     }
 
     pub(super) fn push_rect(&mut self, rect: RenderedRect) {
@@ -147,7 +228,7 @@ impl<'a> LayoutBuilder<'a> {
             left: style.outline_width,
         };
         outline_style.border_width_values = css::CssEdges::all(
-            css::ComputedLengthPercentage::from_length(style.outline_width),
+            css::ComputedLengthPercentage::from_points(style.outline_width),
         );
         outline_style.border_color = style.outline_color;
         outline_style.border_colors = css::BorderColors {
@@ -163,7 +244,7 @@ impl<'a> LayoutBuilder<'a> {
             left: style.outline_style,
         };
 
-        let outset = style.outline_offset.length + style.outline_width;
+        let outset = style.outline_offset.length_points() + style.outline_width;
         let (rects, rounded_rects, paths, strokes) = block_paint_ops(
             outer_x - outset,
             block_bottom - outset,
@@ -299,10 +380,20 @@ impl<'a> LayoutBuilder<'a> {
 
         self.overflow_clips.iter().all(|clip| {
             let clip_rect = clip.paint_rect();
-            right > clip_rect.origin.x
+            let horizontal_intersects = right > clip_rect.origin.x
                 && left < clip_rect.origin.x + clip_rect.size.width
                 && top > clip_rect.origin.y
-                && bottom < clip_rect.origin.y + clip_rect.size.height
+                && bottom < clip_rect.origin.y + clip_rect.size.height;
+            if !horizontal_intersects {
+                return false;
+            }
+            match clip.line_mode {
+                OverflowClipLineMode::Intersect => true,
+                OverflowClipLineMode::Contain => {
+                    bottom >= clip_rect.origin.y
+                        && top <= clip_rect.origin.y + clip_rect.size.height
+                }
+            }
         })
     }
 }

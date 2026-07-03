@@ -31,7 +31,7 @@ use icu_segmenter::{GraphemeClusterSegmenter, LineSegmenter, WordSegmenter};
 use parley::setting::Tag as ParleyTag;
 use parley::style::FontFeature as ParleyFontFeature;
 use parley::{
-    BreakReason, FontContext as ParleyFontContext, FontFamily as ParleyFontFamily,
+    FontContext as ParleyFontContext, FontFamily as ParleyFontFamily,
     FontFeatures as ParleyFontFeatures, FontStyle as ParleyFontStyle,
     FontWeight as ParleyFontWeight, FontWidth as ParleyFontWidth, Language as ParleyLanguage,
     LayoutContext as ParleyLayoutContext, LineHeight as ParleyLineHeight,
@@ -207,7 +207,7 @@ impl ShapedInlineLine {
                         run_index,
                         glyph_index,
                         visual_end: run.x_offset + pen_x + glyph.rendered.x_advance,
-                        separator_count: glyph.source_text.chars().count().max(1),
+                        separator_count: glyph.source_text().chars().count().max(1),
                     });
                 }
                 pen_x += glyph.rendered.x_advance;
@@ -262,9 +262,9 @@ struct ShapedJustificationOpportunity {
 }
 
 fn shaped_glyph_is_inter_word_separator(glyph: &ShapedInlineGlyph) -> bool {
-    !glyph.source_text.is_empty()
+    !glyph.source_text().is_empty()
         && glyph
-            .source_text
+            .source_text()
             .chars()
             .all(character_is_css_word_separator)
 }
@@ -314,8 +314,13 @@ impl ShapedInlineRun {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ShapedInlineGlyph {
     pub(crate) rendered: RenderedGlyph,
-    pub(crate) source_text: String,
     pub(crate) paints: bool,
+}
+
+impl ShapedInlineGlyph {
+    pub(crate) fn source_text(&self) -> &str {
+        &self.rendered.unicode
+    }
 }
 
 /// U+FFFC OBJECT REPLACEMENT CHARACTER for atomic inline line breaking.
@@ -520,14 +525,15 @@ struct FontRequestAttributes {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct FontRequest {
-    family_list: Vec<FontFamilyRequest>,
+    family: FontRequestFamily,
     attributes: FontRequestAttributes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum FontFamilyRequest {
-    Named(String),
+enum FontRequestFamily {
     Generic(GenericFontRequest),
+    Named(String),
+    Names(Vec<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

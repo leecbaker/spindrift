@@ -18,7 +18,8 @@ pub(super) fn taffy_dimension(
     value: css::ComputedLengthPercentageOrAuto,
 ) -> taffy_layout::Dimension {
     match value {
-        css::ComputedLengthPercentageOrAuto::Auto => taffy_layout::Dimension::auto(),
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::Stretch => taffy_layout::Dimension::auto(),
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
             taffy_length_percentage(value).into()
         }
@@ -33,11 +34,12 @@ pub(super) fn taffy_dimension(
 pub(super) fn taffy_grid_item_min_dimension(
     value: css::ComputedLengthPercentageOrAuto,
     percentage_basis: Option<f32>,
-    min_content: f32,
-    max_content: f32,
+    min_content: ContentBoxLength,
+    max_content: ContentBoxLength,
 ) -> taffy_layout::Dimension {
     match value {
-        css::ComputedLengthPercentageOrAuto::Auto => taffy_layout::Dimension::auto(),
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::Stretch => taffy_layout::Dimension::auto(),
         _ => taffy_grid_item_dimension(value, percentage_basis, min_content, max_content),
     }
 }
@@ -45,13 +47,14 @@ pub(super) fn taffy_grid_item_min_dimension(
 pub(super) fn taffy_grid_item_dimension(
     value: css::ComputedLengthPercentageOrAuto,
     percentage_basis: Option<f32>,
-    min_content: f32,
-    max_content: f32,
+    min_content: ContentBoxLength,
+    max_content: ContentBoxLength,
 ) -> taffy_layout::Dimension {
-    let min_content = min_content.max(0.0);
-    let max_content = max_content.max(min_content);
+    let min_content = min_content.points().max(0.0);
+    let max_content = max_content.points().max(min_content);
     match value {
-        css::ComputedLengthPercentageOrAuto::Auto => taffy_layout::Dimension::auto(),
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::Stretch => taffy_layout::Dimension::auto(),
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
             taffy_dimension_from_length_percentage_with_basis(value, percentage_basis)
         }
@@ -75,10 +78,10 @@ pub(super) fn taffy_grid_item_dimension(
 pub(super) fn taffy_dimension_from_length_percentage(
     value: css::ComputedLengthPercentage,
 ) -> taffy_layout::Dimension {
-    if value.percent != 0.0 && value.length == 0.0 {
+    if value.percent != 0.0 && value.length_is_zero() {
         taffy_layout::Dimension::percent(value.percent)
     } else {
-        taffy_layout::Dimension::length(value.length)
+        taffy_layout::Dimension::length(value.length_points())
     }
 }
 
@@ -91,14 +94,14 @@ pub(super) fn taffy_dimension_from_length_percentage_with_basis(
     {
         return taffy_layout::Dimension::length(used_length_percentage(value, basis));
     }
-    if value.percent != 0.0 && value.length == 0.0 {
+    if value.percent != 0.0 && value.length_is_zero() {
         if let Some(basis) = percentage_basis {
             taffy_layout::Dimension::length(used_length_percentage(value, basis))
         } else {
             taffy_layout::Dimension::percent(value.percent)
         }
     } else {
-        taffy_layout::Dimension::length(value.length)
+        taffy_layout::Dimension::length(value.length_points())
     }
 }
 
@@ -138,10 +141,10 @@ pub(super) fn taffy_edges(edges: css::Edges) -> taffy_layout::Rect<taffy_layout:
 pub(super) fn taffy_length_percentage(
     value: css::ComputedLengthPercentage,
 ) -> taffy_layout::LengthPercentage {
-    if value.percent != 0.0 && value.length == 0.0 {
+    if value.percent != 0.0 && value.length_is_zero() {
         taffy_layout::LengthPercentage::percent(value.percent)
     } else {
-        taffy_layout::LengthPercentage::length(value.length)
+        taffy_layout::LengthPercentage::length(value.length_points())
     }
 }
 
@@ -149,7 +152,10 @@ pub(super) fn taffy_length_percentage_auto(
     value: css::ComputedLengthPercentageOrAuto,
 ) -> taffy_layout::LengthPercentageAuto {
     match value {
-        css::ComputedLengthPercentageOrAuto::Auto => taffy_layout::LengthPercentageAuto::auto(),
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::Stretch => {
+            taffy_layout::LengthPercentageAuto::auto()
+        }
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
             taffy_length_percentage(value).into()
         }
@@ -230,6 +236,30 @@ pub(super) fn taffy_grid_content_alignment(
 
 pub(super) fn taffy_grid_align_content(align_content: AlignContent) -> taffy_layout::AlignContent {
     taffy_grid_content_alignment(align_content.keyword, align_content.safety)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_item_dimension_extracts_typed_min_and_max_content_points() {
+        let min_content = taffy_grid_item_dimension(
+            css::ComputedLengthPercentageOrAuto::MinContent,
+            None,
+            content_box_pt(12.0),
+            content_box_pt(48.0),
+        );
+        let max_content = taffy_grid_item_dimension(
+            css::ComputedLengthPercentageOrAuto::MaxContent,
+            None,
+            content_box_pt(12.0),
+            content_box_pt(48.0),
+        );
+
+        assert_eq!(min_content, taffy_layout::Dimension::length(12.0));
+        assert_eq!(max_content, taffy_layout::Dimension::length(48.0));
+    }
 }
 
 pub(super) fn taffy_grid_justify_content(
@@ -576,10 +606,10 @@ pub(super) fn taffy_max_track_breadth(
         css::GridMaxTrackBreadth::LengthPercentage(value) => taffy_length_percentage(value).into(),
         css::GridMaxTrackBreadth::Flex(value) => taffy_layout::MaxTrackSizingFunction::fr(value),
         css::GridMaxTrackBreadth::FitContent(value) => {
-            if value.percent != 0.0 && value.length == 0.0 {
+            if value.percent != 0.0 && value.length_is_zero() {
                 taffy_layout::MaxTrackSizingFunction::fit_content_percent(value.percent)
             } else {
-                taffy_layout::MaxTrackSizingFunction::fit_content_px(value.length)
+                taffy_layout::MaxTrackSizingFunction::fit_content_px(value.length_points())
             }
         }
     }

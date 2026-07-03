@@ -63,7 +63,7 @@ impl FontSystem {
             return Some(*id);
         }
         if let Some(id) =
-            self.load_document_font_for_families(&families, weight, style, width, None, &cache_key)
+            self.load_document_font_for_families(families, weight, style, width, None, &cache_key)
         {
             let font = self.document_fonts.get(id)?;
             log::debug!(
@@ -124,14 +124,12 @@ impl FontSystem {
             return *font_id;
         }
 
-        let request = FontRequest {
-            family_list: self
-                .visible_fallback_families
-                .iter()
-                .map(|name| FontFamilyRequest::Named(normalize_family(name)))
-                .collect(),
-            attributes: font_request_attributes(weight, style, width),
-        };
+        let request = FontRequest::from_names(
+            self.visible_fallback_families.iter().map(String::as_str),
+            weight,
+            style,
+            width,
+        );
         for family_name in self.visible_fallback_families.clone() {
             for font in self.query_fonts(
                 &[FontiqueQueryFamily::Named(&family_name)],

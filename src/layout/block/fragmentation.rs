@@ -6,7 +6,9 @@ impl<'a> LayoutBuilder<'a> {
     ///
     /// CSS Fragmentation treats avoid breaks as a preference that should be
     /// honored when the box can be moved to the next fragmentainer without
-    /// producing worse overflow:
+    /// producing worse overflow. A forced break can leave the current page
+    /// empty but still below the fragmentainer top because ancestor fragment
+    /// offsets are preserved; that state must still protect descendant breaks:
     /// <https://www.w3.org/TR/css-break-3/#break-within>.
     pub(in crate::layout) fn should_try_avoid_break_inside(&self, style: &ComputedStyle) -> bool {
         style.break_inside_avoid
@@ -16,7 +18,6 @@ impl<'a> LayoutBuilder<'a> {
             && !style.display.is_none()
             && !style.display.is_inline_level()
             && !matches!(style.position, Position::Absolute | Position::Fixed)
-            && self.current_page_has_content()
             && !self.cursor_is_at_page_top()
     }
 

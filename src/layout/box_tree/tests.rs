@@ -3,7 +3,9 @@ use crate::css::{
     ComputedLengthPercentage, ComputedLengthPercentageOrAuto, ComputedLineHeight, Css, FontFamily,
     TextOrientation,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 fn parent_style() -> ComputedStyle {
     ComputedStyle {
@@ -17,7 +19,7 @@ fn parent_style() -> ComputedStyle {
 fn build_test_page<'a>(root: &'a Node, author_stylesheets: &[Stylesheet]) -> PageBox<'a> {
     let mut stylesheets = vec![css::html5_user_agent_stylesheet()];
     stylesheets.extend_from_slice(author_stylesheets);
-    build_page_box(root, &stylesheets, &parent_style())
+    freeze_page_box(build_page_box(root, &stylesheets, &parent_style()))
 }
 
 async fn build_test_page_with_font_metrics<'a>(
@@ -30,11 +32,147 @@ async fn build_test_page_with_font_metrics<'a>(
         .load_stylesheet_fonts(&stylesheets)
         .finish()
         .await;
-    build_page_box_with_font_metrics(root, &stylesheets, &parent_style(), &mut font_system)
+    freeze_page_box(build_page_box_with_font_metrics(
+        root,
+        &stylesheets,
+        &parent_style(),
+        &mut font_system,
+    ))
 }
 
-#[tokio::test]
-async fn builds_styled_formatting_box_tree() {
+fn test_signature(tag: &str) -> ElementSignature {
+    ElementSignature::new(tag, HashMap::new())
+}
+
+fn styled_text_box(text: &str, style: &ComputedStyle) -> MutableFormattingBox<'static> {
+    MutableFormattingBox::Text(MutableTextBox {
+        text: text.to_string(),
+        style: Box::new(style.clone()),
+    })
+}
+
+#[test]
+fn freeze_child_boxes_shares_equal_style_handles() {
+    let mut style = ComputedStyle::initial();
+    style.font_size = 19.0;
+
+    let frozen = freeze_child_boxes(vec![
+        styled_text_box("A", &style),
+        styled_text_box("B", &style),
+    ]);
+
+    let [FormattingBox::Text(first), FormattingBox::Text(second)] = frozen.as_slice() else {
+        panic!("expected two frozen text boxes");
+    };
+    assert_eq!(first.style.font_size, 19.0);
+    assert!(Rc::ptr_eq(&first.style, &second.style));
+}
+
+#[test]
+fn owned_style_mutation_does_not_mutate_frozen_style() {
+    let mut style = ComputedStyle::initial();
+    style.font_size = 19.0;
+
+    let frozen = freeze_child_boxes(vec![styled_text_box("A", &style)]);
+    let FormattingBox::Text(text) = &frozen[0] else {
+        panic!("expected frozen text box");
+    };
+
+    let mut derived = owned_style(&text.style);
+    derived.font_size = 23.0;
+
+    assert_eq!(text.style.font_size, 19.0);
+    assert_eq!(derived.font_size, 23.0);
+}
+
+#[test]
+fn freeze_table_fragment_preserves_and_shares_fragment_styles() {
+    let table_node = Node::element("table");
+    let NodeKind::Element(table_element) = &table_node.kind else {
+        panic!("expected element node");
+    };
+    let mut style = ComputedStyle::initial();
+    style.font_size = 21.0;
+    let table_ancestor = test_signature("table");
+
+    let fragment = MutableTableFragment {
+        rows: vec![MutableTableFragmentRow {
+            element: Some(table_element),
+            signature: test_signature("tr"),
+            ancestors: vec![table_ancestor.clone()],
+            row_groups: vec![MutableTableFragmentRowGroup {
+                element: table_element,
+                signature: test_signature("tbody"),
+                style: Some(Box::new(style.clone())),
+            }],
+            style: Some(Box::new(style.clone())),
+            cells: vec![MutableTableFragmentCell {
+                element: Some(table_element),
+                signature: test_signature("td"),
+                style: Some(Box::new(style.clone())),
+                children: vec![styled_text_box("Cell", &style)],
+                anonymous: false,
+            }],
+        }],
+        captions: vec![MutableTableFragmentCaption {
+            element: table_element,
+            signature: test_signature("caption"),
+            style: Some(Box::new(style.clone())),
+            children: Vec::new(),
+        }],
+        columns: vec![MutableTableFragmentColumn {
+            element: table_element,
+            signature: test_signature("col"),
+            style: Some(Box::new(style.clone())),
+            group: Some(MutableTableFragmentColumnGroup {
+                element: table_element,
+                signature: test_signature("colgroup"),
+                style: Some(Box::new(style.clone())),
+                span: 1,
+            }),
+            span: 1,
+        }],
+        grid: TableFragmentGrid {
+            rows: vec![vec![TableFragmentCellPlacement {
+                cell: 0,
+                column: 0,
+                colspan: 1,
+                rowspan: 1,
+            }]],
+            column_count: 1,
+        },
+    };
+
+    let frozen = freeze_table_fragment(fragment);
+    let row_style = frozen.rows[0].style.as_ref().unwrap();
+    let group_style = frozen.rows[0].row_groups[0].style.as_ref().unwrap();
+    let cell_style = frozen.rows[0].cells[0].style.as_ref().unwrap();
+    let caption_style = frozen.captions[0].style.as_ref().unwrap();
+    let column_style = frozen.columns[0].style.as_ref().unwrap();
+    let column_group_style = frozen.columns[0]
+        .group
+        .as_ref()
+        .unwrap()
+        .style
+        .as_ref()
+        .unwrap();
+    let FormattingBox::Text(text) = &frozen.rows[0].cells[0].children[0] else {
+        panic!("expected frozen table cell text");
+    };
+
+    assert_eq!(row_style.font_size, 21.0);
+    assert_eq!(frozen.rows[0].ancestors, vec![table_ancestor]);
+    assert_eq!(frozen.grid.column_count, 1);
+    assert!(Rc::ptr_eq(row_style, group_style));
+    assert!(Rc::ptr_eq(row_style, cell_style));
+    assert!(Rc::ptr_eq(row_style, caption_style));
+    assert!(Rc::ptr_eq(row_style, column_style));
+    assert!(Rc::ptr_eq(row_style, column_group_style));
+    assert!(Rc::ptr_eq(row_style, &text.style));
+}
+
+#[test]
+fn builds_styled_formatting_box_tree() {
     let root = dom::parse(
         "<html><body><div><p>Hello <em>world</em></p><table><tr><td>A</td></tr></table><img src=\"x\"></div></body></html>",
     );
@@ -84,8 +222,8 @@ async fn builds_styled_formatting_box_tree() {
     );
 }
 
-#[tokio::test]
-async fn pure_block_children_remain_block_children() {
+#[test]
+fn pure_block_children_remain_block_children() {
     let root = dom::parse("<html><body><div><p>A</p><section>B</section></div></body></html>");
     let page = build_test_page(&root, &[]);
     let div = &page.children[0].children()[0].children()[0];
@@ -99,8 +237,8 @@ async fn pure_block_children_remain_block_children() {
     );
 }
 
-#[tokio::test]
-async fn formatting_whitespace_between_block_children_is_ignored() {
+#[test]
+fn formatting_whitespace_between_block_children_is_ignored() {
     let root =
         dom::parse("<html><body><div>\n<p>A</p>\n<section>B</section>\n</div></body></html>");
     let page = build_test_page(&root, &[]);
@@ -115,8 +253,8 @@ async fn formatting_whitespace_between_block_children_is_ignored() {
     );
 }
 
-#[tokio::test]
-async fn pure_inline_content_keeps_inline_and_text_boxes() {
+#[test]
+fn pure_inline_content_keeps_inline_and_text_boxes() {
     let root = dom::parse("<html><body><p>Hello <em>world</em></p></body></html>");
     let page = build_test_page(&root, &[]);
     let paragraph = &page.children[0].children()[0].children()[0];
@@ -131,8 +269,8 @@ async fn pure_inline_content_keeps_inline_and_text_boxes() {
     );
 }
 
-#[tokio::test]
-async fn generated_fixed_pseudos_are_out_of_flow_tree_abiding_boxes() {
+#[test]
+fn generated_fixed_pseudos_are_out_of_flow_tree_abiding_boxes() {
     let root = dom::parse("<html><body><div id=\"test\"></div></body></html>");
     let stylesheet = css::parse_stylesheet(&Css::from_string(
         r#"#test::before,
@@ -170,8 +308,8 @@ async fn generated_fixed_pseudos_are_out_of_flow_tree_abiding_boxes() {
     ));
 }
 
-#[tokio::test]
-async fn box_tree_preserves_font_shorthand_unit_line_height() {
+#[test]
+fn box_tree_preserves_font_shorthand_unit_line_height() {
     let root = dom::parse(
         "<html><body><div class=\"ref\">XX<br>XX</div><div class=\"test\">&#x3000;&#x3000;XX</div></body></html>",
     );
@@ -297,8 +435,8 @@ async fn pseudo_font_size_ch_uses_measured_originating_zero_advance_during_box_t
     );
 }
 
-#[tokio::test]
-async fn mixed_inline_and_block_children_create_anonymous_blocks_in_order() {
+#[test]
+fn mixed_inline_and_block_children_create_anonymous_blocks_in_order() {
     let root = dom::parse("<html><body><div>Before<p>Block</p>After</div></body></html>");
     let page = build_test_page(&root, &[]);
     let div = &page.children[0].children()[0].children()[0];
@@ -324,8 +462,8 @@ async fn mixed_inline_and_block_children_create_anonymous_blocks_in_order() {
     );
 }
 
-#[tokio::test]
-async fn block_inside_inline_is_split_into_parent_block_flow() {
+#[test]
+fn block_inside_inline_is_split_into_parent_block_flow() {
     let root = dom::parse("<html><body><div><span><p>Block</p></span></div></body></html>");
     let page = build_test_page(&root, &[]);
     let div = &page.children[0].children()[0].children()[0];
@@ -339,8 +477,8 @@ async fn block_inside_inline_is_split_into_parent_block_flow() {
     );
 }
 
-#[tokio::test]
-async fn positioned_inline_block_split_preserves_inline_context_for_block_segment() {
+#[test]
+fn positioned_inline_block_split_preserves_inline_context_for_block_segment() {
     let root = dom::parse(
         "<html><body><span style=\"position:relative; z-index:2; top:-100px\"><div>Block</div></span></body></html>",
     );
@@ -369,8 +507,38 @@ async fn positioned_inline_block_split_preserves_inline_context_for_block_segmen
     );
 }
 
-#[tokio::test]
-async fn block_inside_inline_preserves_empty_fragment_with_owned_inline_start_edge() {
+#[test]
+fn floated_block_inside_positioned_inline_stays_in_inline_run() {
+    let root = dom::parse(
+        "<html><body><span style=\"position:relative\"><div style=\"float:left\">Float</div></span></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let body = &page.children[0].children()[0];
+
+    assert_eq!(
+        body.children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![FormattingBoxKind::Inline]
+    );
+    let FormattingBox::Inline(inline) = &body.children()[0] else {
+        panic!("floated block should remain inside the inline formatting run");
+    };
+    assert_eq!(inline.style.position, Position::Relative);
+    assert_eq!(
+        inline
+            .children
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![FormattingBoxKind::Block]
+    );
+    assert!(is_floated_box(&inline.children[0]));
+}
+
+#[test]
+fn block_inside_inline_preserves_empty_fragment_with_owned_inline_start_edge() {
     let root = dom::parse("<html><body><span><div>Block</div>X</span></body></html>");
     let stylesheet = css::parse_stylesheet(&Css::from_string(
         "body > span { margin-left: -100px; border-left: 100px solid transparent }",
@@ -402,8 +570,8 @@ async fn block_inside_inline_preserves_empty_fragment_with_owned_inline_start_ed
     );
 }
 
-#[tokio::test]
-async fn block_abspos_inside_inline_splits_static_position_fragments() {
+#[test]
+fn block_abspos_inside_inline_splits_static_position_fragments() {
     let root = dom::parse(
         "<html><body><span><div style=\"position:absolute\"></div>X</span></body></html>",
     );
@@ -448,8 +616,8 @@ async fn block_abspos_inside_inline_splits_static_position_fragments() {
     );
 }
 
-#[tokio::test]
-async fn block_inside_inline_after_fragment_owns_only_inline_end_edge() {
+#[test]
+fn block_inside_inline_after_fragment_owns_only_inline_end_edge() {
     let root = dom::parse("<html><body><span><div>One</div>Two</span></body></html>");
     let stylesheet =
         css::parse_stylesheet(&Css::from_string("body > span { border: 3px solid blue }"));
@@ -497,8 +665,8 @@ async fn block_inside_inline_after_fragment_owns_only_inline_end_edge() {
     );
 }
 
-#[tokio::test]
-async fn block_inside_inline_splits_surrounding_inline_runs() {
+#[test]
+fn block_inside_inline_splits_surrounding_inline_runs() {
     let root = dom::parse("<html><body><div>A<span>B<p>Block</p>C</span>D</div></body></html>");
     let page = build_test_page(&root, &[]);
     let div = &page.children[0].children()[0].children()[0];
@@ -552,8 +720,8 @@ async fn block_inside_inline_splits_surrounding_inline_runs() {
     );
 }
 
-#[tokio::test]
-async fn nested_block_inside_inline_preserves_each_inline_fragment_edges() {
+#[test]
+fn nested_block_inside_inline_preserves_each_inline_fragment_edges() {
     let root =
         dom::parse("<html><body><div><span>A<em>B<p>Block</p>C</em>D</span></div></body></html>");
     let page = build_test_page(&root, &[]);
@@ -612,8 +780,8 @@ async fn nested_block_inside_inline_preserves_each_inline_fragment_edges() {
     );
 }
 
-#[tokio::test]
-async fn inline_block_creates_atomic_inline_box_with_children() {
+#[test]
+fn inline_block_creates_atomic_inline_box_with_children() {
     let root = dom::parse(
         "<html><body><p>A<span style=\"display:inline-block\"><strong>B</strong></span>C</p></body></html>",
     );
@@ -642,8 +810,8 @@ async fn inline_block_creates_atomic_inline_box_with_children() {
     );
 }
 
-#[tokio::test]
-async fn orphan_table_cells_create_anonymous_table_wrapper() {
+#[test]
+fn orphan_table_cells_create_anonymous_table_wrapper() {
     let root = dom::parse(
         "<html><body><div><span style=\"display:table-cell\">A</span><span style=\"display:table-cell\">B</span></div></body></html>",
     );
@@ -672,8 +840,8 @@ async fn orphan_table_cells_create_anonymous_table_wrapper() {
     assert_eq!(table.fragment.rows[0].cells.len(), 2);
 }
 
-#[tokio::test]
-async fn orphan_table_cell_with_formatting_whitespace_keeps_fragment_rows() {
+#[test]
+fn orphan_table_cell_with_formatting_whitespace_keeps_fragment_rows() {
     let root = dom::parse(
         "<html><body><div>\n  <div style=\"display:table-cell\"><div>Cell</div></div>\n</div></body></html>",
     );
@@ -695,8 +863,8 @@ async fn orphan_table_cell_with_formatting_whitespace_keeps_fragment_rows() {
     assert_eq!(table.fragment.rows[0].cells[0].children.len(), 1);
 }
 
-#[tokio::test]
-async fn orphan_table_cells_inside_inline_create_anonymous_inline_table_wrapper() {
+#[test]
+fn orphan_table_cells_inside_inline_create_anonymous_inline_table_wrapper() {
     let root = dom::parse(
         "<html><body><p>Before <span><span style=\"display:table-cell\">Cell</span></span> After</p></body></html>",
     );
@@ -737,8 +905,71 @@ async fn orphan_table_cells_inside_inline_create_anonymous_inline_table_wrapper(
     assert_eq!(fragment.rows[0].cells.len(), 1);
 }
 
-#[tokio::test]
-async fn table_box_contains_durable_fragment_rows_columns_and_captions() {
+#[test]
+fn nested_table_row_group_anonymous_fixup_keeps_sibling_cells_in_one_row() {
+    let root = dom::parse(
+        "<html><body>\
+         <div style=\"display:table-row-group\">\
+         <div style=\"display:table-row-group\">\
+         <div style=\"display:table-cell\">a</div>\
+         <div style=\"display:table-cell\">b</div>\
+         </div>\
+         <div style=\"display:table-cell\">cccc</div>\
+         <div style=\"display:table-cell\">dddd</div>\
+         </div>\
+         </body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let table = &page.children[0].children()[0].children()[0];
+
+    let FormattingBox::Table(table) = table else {
+        panic!("expected anonymous table wrapper");
+    };
+    assert_eq!(table.fragment.rows.len(), 1);
+    let row = &table.fragment.rows[0];
+    assert_eq!(row.cells.len(), 3);
+    assert_eq!(table.fragment.grid.column_count, 3);
+
+    let first = &row.cells[0];
+    assert!(first.anonymous);
+    assert!(first.element.is_none());
+    assert_eq!(first.children.len(), 1);
+    let FormattingBox::Table(nested_table) = &first.children[0] else {
+        panic!("expected nested anonymous table in anonymous cell");
+    };
+    assert_eq!(nested_table.style.display, Display::TABLE);
+    assert_eq!(nested_table.fragment.rows.len(), 1);
+    assert_eq!(nested_table.fragment.rows[0].cells.len(), 2);
+    assert_eq!(
+        table_cell_text(&nested_table.fragment.rows[0].cells[0]),
+        "a"
+    );
+    assert_eq!(
+        table_cell_text(&nested_table.fragment.rows[0].cells[1]),
+        "b"
+    );
+
+    assert_eq!(
+        row.cells[1].element.map(|element| element.tag.as_str()),
+        Some("div")
+    );
+    assert_eq!(
+        row.cells[2].element.map(|element| element.tag.as_str()),
+        Some("div")
+    );
+    assert_eq!(table_cell_text(&row.cells[1]), "cccc");
+    assert_eq!(table_cell_text(&row.cells[2]), "dddd");
+}
+
+fn table_cell_text<'a>(cell: &'a TableFragmentCell<'_>) -> &'a str {
+    let [FormattingBox::Text(text)] = cell.children.as_slice() else {
+        panic!("expected one text child");
+    };
+    &text.text
+}
+
+#[test]
+fn table_box_contains_durable_fragment_rows_columns_and_captions() {
     let root = dom::parse(
         "<html><body><table><caption>Cap</caption><colgroup span=\"2\"></colgroup><tbody><tr><td>A</td><td>B</td></tr></tbody></table></body></html>",
     );
@@ -756,8 +987,8 @@ async fn table_box_contains_durable_fragment_rows_columns_and_captions() {
     assert_eq!(table.fragment.grid.column_count, 2);
 }
 
-#[tokio::test]
-async fn table_fragment_clamps_html_span_attributes() {
+#[test]
+fn table_fragment_clamps_html_span_attributes() {
     let root = dom::parse(
         "<html><body><table><colgroup span=\"1001px\"></colgroup><tr><td colspan=\"1001px\">A</td></tr><tr><td rowspan=\"999999999999999999999999px\">B</td><td>C</td></tr></table></body></html>",
     );
@@ -773,8 +1004,8 @@ async fn table_fragment_clamps_html_span_attributes() {
     assert_eq!(table.fragment.grid.rows[1][0].rowspan, 1);
 }
 
-#[tokio::test]
-async fn table_fragment_span_attributes_use_ascii_digits_only() {
+#[test]
+fn table_fragment_span_attributes_use_ascii_digits_only() {
     let root = dom::parse(
         "<html><body><table><col span=\"２\"></col><tr><td colspan=\"２\">A</td><td>B</td></tr></table></body></html>",
     );
@@ -789,8 +1020,8 @@ async fn table_fragment_span_attributes_use_ascii_digits_only() {
     assert_eq!(table.fragment.grid.rows[0][1].column, 1);
 }
 
-#[tokio::test]
-async fn table_fragment_wraps_text_children_in_anonymous_cells() {
+#[test]
+fn table_fragment_wraps_text_children_in_anonymous_cells() {
     let root = dom::parse(
         "<html><body><div style=\"display:table\">Lead<span style=\"display:table-cell\">Cell</span></div></body></html>",
     );
@@ -814,8 +1045,8 @@ async fn table_fragment_wraps_text_children_in_anonymous_cells() {
     );
 }
 
-#[tokio::test]
-async fn table_fragment_groups_consecutive_non_cell_children_with_whitespace() {
+#[test]
+fn table_fragment_groups_consecutive_non_cell_children_with_whitespace() {
     let root = dom::parse(
         "<html><body><div style=\"display:table\"><span style=\"display:inline-block\">A</span> <span style=\"display:inline-block\">B</span></div></body></html>",
     );
@@ -842,8 +1073,8 @@ async fn table_fragment_groups_consecutive_non_cell_children_with_whitespace() {
     );
 }
 
-#[tokio::test]
-async fn table_fragment_ignores_whitespace_between_internal_cells() {
+#[test]
+fn table_fragment_ignores_whitespace_between_internal_cells() {
     let root = dom::parse(
         "<html><body><div style=\"display:table\"><span style=\"display:table-cell\">A</span> <span style=\"display:table-cell\">B</span></div></body></html>",
     );
@@ -859,8 +1090,31 @@ async fn table_fragment_ignores_whitespace_between_internal_cells() {
     assert!(!table.fragment.rows[0].cells[1].anonymous);
 }
 
-#[tokio::test]
-async fn table_fragment_preserves_metric_dependent_row_and_cell_styles() {
+#[test]
+fn body_display_table_preserves_positioned_child_in_table_fragment() {
+    let root = dom::parse(
+        "<html><body style=\"display:table\"><div style=\"display:table-cell\">A</div><p style=\"position:absolute;top:0;left:0\">Out of flow</p></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let body = &page.children[0].children()[0];
+
+    let FormattingBox::Table(table) = body else {
+        panic!("expected body display:table to create a table formatting box");
+    };
+    assert_eq!(table.fragment.rows.len(), 1);
+    assert_eq!(table.fragment.rows[0].cells.len(), 2);
+    let positioned_cell = &table.fragment.rows[0].cells[1];
+    assert!(positioned_cell.anonymous);
+    assert_eq!(positioned_cell.children.len(), 1);
+    let FormattingBox::Block(paragraph) = &positioned_cell.children[0] else {
+        panic!("expected positioned paragraph to remain reachable");
+    };
+    assert_eq!(paragraph.element.tag, "p");
+    assert_eq!(paragraph.style.position, Position::Absolute);
+}
+
+#[test]
+fn table_fragment_preserves_metric_dependent_row_and_cell_styles() {
     let root = dom::parse(
         r#"<html><body><table><col style="writing-mode:vertical-rl;text-orientation:sideways;width:5ch"><tbody><tr style="writing-mode:vertical-rl;text-orientation:upright;line-height:5ch"><td style="height:5ch">A</td></tr></tbody></table></body></html>"#,
     );
@@ -904,8 +1158,8 @@ async fn table_fragment_preserves_metric_dependent_row_and_cell_styles() {
     );
 }
 
-#[tokio::test]
-async fn display_contents_inside_table_flattens_children_with_inherited_style() {
+#[test]
+fn display_contents_inside_table_flattens_children_with_inherited_style() {
     let root = dom::parse(
         "<html><body><div style=\"display:table;color:red\"><div style=\"display:contents;color:green\">X<div style=\"display:table-cell\">X</div>X<div style=\"display:table-row\">X</div>X</div></div></body></html>",
     );
@@ -915,8 +1169,8 @@ async fn display_contents_inside_table_flattens_children_with_inherited_style() 
     let FormattingBox::Table(table) = table else {
         panic!("expected table formatting box");
     };
-    assert_eq!(table.style.border_spacing.horizontal.length, 0.0);
-    assert_eq!(table.style.border_spacing.vertical.length, 0.0);
+    assert_eq!(table.style.border_spacing.horizontal.length_points(), 0.0);
+    assert_eq!(table.style.border_spacing.vertical.length_points(), 0.0);
     assert!(!table.style.border_spacing_explicit);
     assert_eq!(table.fragment.rows.len(), 3);
     assert_eq!(table.fragment.rows[0].cells.len(), 3);
@@ -930,8 +1184,8 @@ async fn display_contents_inside_table_flattens_children_with_inherited_style() 
     }
 }
 
-#[tokio::test]
-async fn table_fragment_grid_tracks_rowspan_and_colspan_occupancy() {
+#[test]
+fn table_fragment_grid_tracks_rowspan_and_colspan_occupancy() {
     let root = dom::parse(
         "<html><body><table><tbody><tr><td rowspan=\"2\">Span</td><td colspan=\"2\">Wide</td></tr><tr><td>A</td><td>B</td></tr></tbody></table></body></html>",
     );
@@ -951,8 +1205,8 @@ async fn table_fragment_grid_tracks_rowspan_and_colspan_occupancy() {
     assert_eq!(table.fragment.grid.rows[1][1].column, 2);
 }
 
-#[tokio::test]
-async fn table_fragment_preserves_authored_empty_rows() {
+#[test]
+fn table_fragment_preserves_authored_empty_rows() {
     let root = dom::parse(
         "<html><body><table><tbody><tr><td>A</td></tr><tr style=\"height:40px\"></tr><tr><td>B</td></tr></tbody></table></body></html>",
     );
@@ -968,8 +1222,8 @@ async fn table_fragment_preserves_authored_empty_rows() {
     assert_eq!(table.fragment.grid.rows[1].len(), 0);
 }
 
-#[tokio::test]
-async fn inline_table_creates_atomic_inline_box_with_table_children() {
+#[test]
+fn inline_table_creates_atomic_inline_box_with_table_children() {
     let root = dom::parse(
         "<html><body><p>A<table style=\"display:inline-table\"><tr><td>B</td></tr></table>C</p></body></html>",
     );
@@ -998,8 +1252,8 @@ async fn inline_table_creates_atomic_inline_box_with_table_children() {
     );
 }
 
-#[tokio::test]
-async fn inline_text_boxes_preserve_collapsed_edge_spaces() {
+#[test]
+fn inline_text_boxes_preserve_collapsed_edge_spaces() {
     let root = dom::parse(
         "<html><body><p>A <span style=\"display:inline-block\">B</span> C</p></body></html>",
     );
@@ -1015,8 +1269,8 @@ async fn inline_text_boxes_preserve_collapsed_edge_spaces() {
     }
 }
 
-#[tokio::test]
-async fn list_items_have_marker_boxes_in_formatting_tree() {
+#[test]
+fn list_items_have_marker_boxes_in_formatting_tree() {
     let root = dom::parse(
         "<html><body><section style=\"display:list-item; list-style-position: inside\">Item</section></body></html>",
     );
@@ -1032,8 +1286,8 @@ async fn list_items_have_marker_boxes_in_formatting_tree() {
     }
 }
 
-#[tokio::test]
-async fn run_in_merges_into_following_block_prelude() {
+#[test]
+fn run_in_merges_into_following_block_prelude() {
     let root = dom::parse(
         "<html><body><div><h3 style=\"display:run-in\">Term</h3><p>Definition</p></div></body></html>",
     );
@@ -1061,8 +1315,8 @@ async fn run_in_merges_into_following_block_prelude() {
     );
 }
 
-#[tokio::test]
-async fn run_in_sequence_keeps_whitespace_and_out_of_flow_boxes() {
+#[test]
+fn run_in_sequence_keeps_whitespace_and_out_of_flow_boxes() {
     let root = dom::parse(
         "<html><body><div><h3 style=\"display:run-in\">One</h3> <span style=\"position:absolute\">Abs</span><h4 style=\"display:run-in\">Two</h4><p>Definition</p></div></body></html>",
     );
@@ -1088,8 +1342,8 @@ async fn run_in_sequence_keeps_whitespace_and_out_of_flow_boxes() {
     assert!(is_out_of_flow_box(&paragraph.run_in_children[2]));
 }
 
-#[tokio::test]
-async fn run_in_falls_back_before_bfc_block() {
+#[test]
+fn run_in_falls_back_before_bfc_block() {
     let root = dom::parse(
         "<html><body><div><h3 style=\"display:run-in\">Term</h3><section style=\"display:flow-root\">Block</section></div></body></html>",
     );
@@ -1113,8 +1367,8 @@ async fn run_in_falls_back_before_bfc_block() {
     );
 }
 
-#[tokio::test]
-async fn run_in_recurses_into_deepest_following_block() {
+#[test]
+fn run_in_recurses_into_deepest_following_block() {
     let root = dom::parse(
         "<html><body><div><h3 style=\"display:run-in\">Term</h3><section><p>Definition</p></section></div></body></html>",
     );
@@ -1133,8 +1387,8 @@ async fn run_in_recurses_into_deepest_following_block() {
     );
 }
 
-#[tokio::test]
-async fn run_in_prelude_sits_after_marker_and_before_generated_before() {
+#[test]
+fn run_in_prelude_sits_after_marker_and_before_generated_before() {
     let root = dom::parse(
         "<html><body><div><h3 style=\"display:run-in\">Term</h3><p style=\"display:list-item\">Definition</p></div></body></html>",
     );

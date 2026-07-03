@@ -1,15 +1,46 @@
 use super::*;
+use crate::layout::table::layout::{
+    table_cell_child_is_in_flow_float, table_cell_style_has_parent_percentage_block_size,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct UsedTableWidth {
-    pub(super) content_width: f32,
+    pub(super) content_width: ContentBoxLength,
     pub(super) border_widths: css::Edges,
     pub(super) padding: css::Edges,
 }
 
 impl UsedTableWidth {
+    pub(super) fn content_width_points(self) -> f32 {
+        self.content_width.points()
+    }
+
     pub(super) fn content_x(self, outer_x: f32) -> f32 {
         outer_x + self.border_widths.left + self.padding.left
+    }
+
+    pub(super) fn horizontal_non_content(self, style: &ComputedStyle) -> NonContentLength {
+        let border_width = if style.border_collapse == css::BorderCollapse::Collapse {
+            0.0
+        } else {
+            self.border_widths.left + self.border_widths.right
+        };
+        non_content_pt(border_width + self.padding.left + self.padding.right)
+    }
+
+    pub(super) fn wrapper_border_box_width(
+        self,
+        content_width: ContentBoxLength,
+    ) -> BorderBoxLength {
+        content_box_to_border_box_length(
+            content_width,
+            non_content_pt(
+                self.padding.left
+                    + self.padding.right
+                    + self.border_widths.left
+                    + self.border_widths.right,
+            ),
+        )
     }
 }
 
@@ -38,21 +69,33 @@ pub(super) fn used_table_width(
     } else {
         used_padding_edges(style, available_outer_width).to_css_edges()
     };
-    let horizontal_border_non_content = if collapsed {
-        0.0
-    } else {
-        border_widths.left + border_widths.right
+    let width = UsedTableWidth {
+        content_width: content_box_pt(0.0),
+        border_widths,
+        padding,
     };
-    let horizontal_non_content = horizontal_border_non_content + padding.left + padding.right;
-    let requested_content_width =
-        used_content_width(style, available_outer_width, horizontal_non_content);
-    let content_width =
-        constrain_width(style, requested_content_width, available_outer_width).max(style.font_size);
+    let horizontal_non_content = width.horizontal_non_content(style);
+    let requested_content_width = used_content_box_size(
+        style.box_values.width,
+        style.box_sizing,
+        available_outer_width,
+        horizontal_non_content,
+    )
+    .unwrap_or_else(|| {
+        content_box_pt((available_outer_width - horizontal_non_content.points()).max(0.0))
+    });
+    let content_width = content_box_pt(
+        constrain_width(
+            style,
+            requested_content_width.points(),
+            available_outer_width,
+        )
+        .max(style.font_size),
+    );
 
     UsedTableWidth {
         content_width,
-        border_widths,
-        padding,
+        ..width
     }
 }
 
@@ -68,18 +111,23 @@ pub(super) fn used_empty_table_grid_width(
     style: &ComputedStyle,
     available_outer_width: f32,
     table_width: UsedTableWidth,
-) -> f32 {
-    let horizontal_border_non_content = if style.border_collapse == css::BorderCollapse::Collapse {
-        0.0
-    } else {
-        table_width.border_widths.left + table_width.border_widths.right
-    };
-    let horizontal_non_content =
-        horizontal_border_non_content + table_width.padding.left + table_width.padding.right;
-    let requested_content_width =
-        used_content_width_or_auto(style, available_outer_width, horizontal_non_content)
-            .unwrap_or(0.0);
-    constrain_width(style, requested_content_width, available_outer_width).max(0.0)
+) -> ContentBoxLength {
+    let horizontal_non_content = table_width.horizontal_non_content(style);
+    let requested_content_width = used_content_box_size(
+        style.box_values.width,
+        style.box_sizing,
+        available_outer_width,
+        horizontal_non_content,
+    )
+    .unwrap_or_else(|| content_box_pt(0.0));
+    content_box_pt(
+        constrain_width(
+            style,
+            requested_content_width.points(),
+            available_outer_width,
+        )
+        .max(0.0),
+    )
 }
 
 /// Resolves the row-grid content height for a table with no rows or cells.
@@ -91,14 +139,14 @@ pub(super) fn used_empty_table_grid_width(
 /// <https://drafts.csswg.org/css-tables/#computing-the-table-height>.
 pub(super) fn used_empty_table_grid_height(
     style: &ComputedStyle,
-    available_outer_height: f32,
+    percentage_height_basis: Option<f32>,
     table_width: UsedTableWidth,
 ) -> f32 {
     let vertical_non_content = table_width.border_widths.top
         + table_width.border_widths.bottom
         + table_width.padding.top
         + table_width.padding.bottom;
-    used_table_target_content_height(style, available_outer_height, vertical_non_content)
+    used_table_target_content_height(style, percentage_height_basis, vertical_non_content)
         .unwrap_or(0.0)
 }
 
@@ -115,25 +163,25 @@ pub(super) fn used_empty_table_grid_height(
 /// <https://www.w3.org/TR/css-sizing-3/#box-sizing>.
 pub(super) fn used_table_target_content_height(
     style: &ComputedStyle,
-    available_outer_height: f32,
+    percentage_height_basis: Option<f32>,
     vertical_non_content: f32,
 ) -> Option<f32> {
     let height = table_wrapper_size_to_grid_content_height(
         style.box_values.height,
         style.box_sizing,
-        available_outer_height,
+        percentage_height_basis,
         vertical_non_content,
     );
     let min_height = table_wrapper_size_to_grid_content_height(
         style.box_values.min_height,
         style.box_sizing,
-        available_outer_height,
+        percentage_height_basis,
         vertical_non_content,
     );
     let max_height = table_wrapper_size_to_grid_content_height(
         style.box_values.max_height,
         style.box_sizing,
-        available_outer_height,
+        percentage_height_basis,
         vertical_non_content,
     );
 
@@ -150,10 +198,10 @@ pub(super) fn used_table_target_content_height(
 fn table_wrapper_size_to_grid_content_height(
     value: css::ComputedLengthPercentageOrAuto,
     box_sizing: BoxSizing,
-    percentage_basis: f32,
+    percentage_basis: Option<f32>,
     vertical_non_content: f32,
 ) -> Option<f32> {
-    let specified = used_length_percentage_or_auto(value, percentage_basis)?;
+    let specified = used_length_percentage_or_auto_with_optional_basis(value, percentage_basis)?;
     Some(match box_sizing {
         BoxSizing::BorderBox => (specified - vertical_non_content).max(0.0),
         BoxSizing::ContentBox => specified.max(0.0),
@@ -169,22 +217,32 @@ pub(super) fn declared_table_cell_width(
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
             if value.math.is_some() {
                 Some(DeclaredTableWidth::LengthPercentage(value))
-            } else if value.percent != 0.0 && value.length == 0.0 {
+            } else if value.percent != 0.0 && value.length_is_zero() {
                 Some(DeclaredTableWidth::Percent(value.percent))
             } else if value.percent != 0.0 {
                 Some(DeclaredTableWidth::LengthPercentage(value))
             } else {
-                Some(DeclaredTableWidth::Fixed(value.length))
+                Some(DeclaredTableWidth::Fixed(value.length_points()))
             }
         }
         css::ComputedLengthPercentageOrAuto::MinContent
         | css::ComputedLengthPercentageOrAuto::MaxContent
-        | css::ComputedLengthPercentageOrAuto::FitContent(_) => None,
+        | css::ComputedLengthPercentageOrAuto::FitContent(_)
+        | css::ComputedLengthPercentageOrAuto::Stretch => None,
     }
 }
 
 pub(super) fn declared_table_column_width(style: &ComputedStyle) -> Option<DeclaredTableWidth> {
-    declared_table_width_from_computed(style.box_values.width)
+    let inline_size = match style.writing_mode {
+        WritingMode::HorizontalTb => style.box_values.width,
+        WritingMode::VerticalRl | WritingMode::VerticalLr
+            if style.text_orientation != css::TextOrientation::Sideways =>
+        {
+            style.box_values.height
+        }
+        WritingMode::VerticalRl | WritingMode::VerticalLr => style.box_values.width,
+    };
+    declared_table_width_from_computed(inline_size)
 }
 
 fn declared_table_width_from_computed(
@@ -195,17 +253,18 @@ fn declared_table_width_from_computed(
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
             if value.math.is_some() {
                 Some(DeclaredTableWidth::LengthPercentage(value))
-            } else if value.percent != 0.0 && value.length == 0.0 {
+            } else if value.percent != 0.0 && value.length_is_zero() {
                 Some(DeclaredTableWidth::Percent(value.percent))
             } else if value.percent != 0.0 {
                 Some(DeclaredTableWidth::LengthPercentage(value))
             } else {
-                Some(DeclaredTableWidth::Fixed(value.length))
+                Some(DeclaredTableWidth::Fixed(value.length_points()))
             }
         }
         css::ComputedLengthPercentageOrAuto::MinContent
         | css::ComputedLengthPercentageOrAuto::MaxContent
-        | css::ComputedLengthPercentageOrAuto::FitContent(_) => None,
+        | css::ComputedLengthPercentageOrAuto::FitContent(_)
+        | css::ComputedLengthPercentageOrAuto::Stretch => None,
     }
 }
 
@@ -241,12 +300,85 @@ pub(super) fn constrain_declared_table_width(
     )
 }
 
+/// Resolve a declared table-cell width to its column-space border-box width.
+///
+/// CSS Tables uses cell border boxes as column constraints, while CSS Sizing
+/// applies a table-cell `width` to the cell content box unless `box-sizing`
+/// says otherwise. Collapsed-border cells contribute the resolved half-border
+/// insets on their outside grid edges, not their authored full border widths:
+/// <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
+/// <https://www.w3.org/TR/css-sizing-3/#box-sizing>
+/// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>
+pub(super) fn declared_table_cell_border_box_width(
+    style: &ComputedStyle,
+    width: DeclaredTableWidth,
+    table_width: f32,
+    border_insets: Option<css::Edges>,
+) -> f32 {
+    let non_content = table_cell_horizontal_non_content_width(style, border_insets);
+    let specified = resolve_declared_table_width(width, table_width);
+    table_cell_border_box_width_from_declared_size(style, specified, table_width, non_content)
+        .points()
+}
+
 pub(super) fn declared_table_width_length_floor(width: DeclaredTableWidth) -> f32 {
     match width {
         DeclaredTableWidth::Fixed(width) => width,
         DeclaredTableWidth::Percent(_) => 0.0,
-        DeclaredTableWidth::LengthPercentage(value) => value.length.max(0.0),
+        DeclaredTableWidth::LengthPercentage(value) => value.length_points_max_zero(),
     }
+}
+
+pub(super) fn declared_table_cell_width_length_floor(
+    style: &ComputedStyle,
+    width: DeclaredTableWidth,
+    border_insets: Option<css::Edges>,
+) -> f32 {
+    let non_content = table_cell_horizontal_non_content_width(style, border_insets);
+    match width {
+        DeclaredTableWidth::Fixed(width) => {
+            table_cell_border_box_width_from_declared_size(style, width, 0.0, non_content).points()
+        }
+        DeclaredTableWidth::Percent(_) => 0.0,
+        DeclaredTableWidth::LengthPercentage(value) => {
+            table_cell_border_box_width_from_declared_size(
+                style,
+                value.length_points_max_zero(),
+                0.0,
+                non_content,
+            )
+            .points()
+        }
+    }
+}
+
+fn table_cell_horizontal_non_content_width(
+    style: &ComputedStyle,
+    border_insets: Option<css::Edges>,
+) -> f32 {
+    let border_width = border_insets
+        .map(|borders| borders.left + borders.right)
+        .unwrap_or_else(|| table_horizontal_borders(style));
+    style.padding.left + style.padding.right + border_width
+}
+
+fn table_cell_border_box_width_from_declared_size(
+    style: &ComputedStyle,
+    specified: f32,
+    percentage_basis: f32,
+    non_content: f32,
+) -> BorderBoxLength {
+    let non_content = non_content_pt(non_content);
+    let content_width = match style.box_sizing {
+        BoxSizing::BorderBox => {
+            border_box_to_content_box_length(border_box_pt(specified), non_content)
+        }
+        BoxSizing::ContentBox => content_box_pt(specified.max(0.0)),
+    };
+    content_box_to_border_box_length(
+        content_box_pt(constrain_width(style, content_width.points(), percentage_basis).max(0.0)),
+        non_content,
+    )
 }
 
 pub(super) fn declared_table_width_percentage(width: DeclaredTableWidth) -> f32 {
@@ -333,7 +465,8 @@ fn length_percentage_percent(value: css::ComputedLengthPercentageOrAuto) -> Opti
         css::ComputedLengthPercentageOrAuto::Auto
         | css::ComputedLengthPercentageOrAuto::MinContent
         | css::ComputedLengthPercentageOrAuto::MaxContent
-        | css::ComputedLengthPercentageOrAuto::FitContent(_) => None,
+        | css::ComputedLengthPercentageOrAuto::FitContent(_)
+        | css::ComputedLengthPercentageOrAuto::Stretch => None,
     }
 }
 
@@ -350,13 +483,15 @@ pub(super) fn constrain_table_intrinsic_width_with_floor(
 fn intrinsic_length_constraint(value: css::ComputedLengthPercentageOrAuto) -> Option<f32> {
     match value {
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) if value.math.is_none() => {
-            (value.length != 0.0 || value.percent == 0.0).then_some(value.length.max(0.0))
+            (!value.length_is_zero() || value.percent == 0.0)
+                .then_some(value.length_points_max_zero())
         }
         css::ComputedLengthPercentageOrAuto::LengthPercentage(_) => None,
         css::ComputedLengthPercentageOrAuto::Auto
         | css::ComputedLengthPercentageOrAuto::MinContent
         | css::ComputedLengthPercentageOrAuto::MaxContent
-        | css::ComputedLengthPercentageOrAuto::FitContent(_) => None,
+        | css::ComputedLengthPercentageOrAuto::FitContent(_)
+        | css::ComputedLengthPercentageOrAuto::Stretch => None,
     }
 }
 
@@ -535,11 +670,15 @@ pub(super) fn table_cell_content_min_width(
     cell: &TableCell<'_>,
     style: &ComputedStyle,
     stylesheets: &[Stylesheet],
+    border_insets: Option<css::Edges>,
 ) -> f32 {
     let inline_contribution =
         table_cell_inline_intrinsic_contribution(layout, cell, style, stylesheets);
     let replaced_width = table_cell_replaced_content_max_width(cell);
     let (block_min_width, _) = table_cell_block_child_intrinsic_widths(layout, cell, stylesheets);
+    let border_width = border_insets
+        .map(|borders| borders.left + borders.right)
+        .unwrap_or_else(|| table_horizontal_borders(style));
 
     inline_contribution
         .min_content
@@ -547,7 +686,7 @@ pub(super) fn table_cell_content_min_width(
         .max(block_min_width)
         + style.padding.left
         + style.padding.right
-        + table_horizontal_borders(style)
+        + border_width
 }
 
 pub(super) fn table_cell_content_max_width(
@@ -555,11 +694,15 @@ pub(super) fn table_cell_content_max_width(
     cell: &TableCell<'_>,
     style: &ComputedStyle,
     stylesheets: &[Stylesheet],
+    border_insets: Option<css::Edges>,
 ) -> f32 {
     let inline_contribution =
         table_cell_inline_intrinsic_contribution(layout, cell, style, stylesheets);
     let replaced_width = table_cell_replaced_content_sum_width(cell);
     let (_, block_max_width) = table_cell_block_child_intrinsic_widths(layout, cell, stylesheets);
+    let border_width = border_insets
+        .map(|borders| borders.left + borders.right)
+        .unwrap_or_else(|| table_horizontal_borders(style));
 
     inline_contribution
         .max_content
@@ -567,7 +710,7 @@ pub(super) fn table_cell_content_max_width(
         .max(replaced_width)
         + style.padding.left
         + style.padding.right
-        + table_horizontal_borders(style)
+        + border_width
 }
 
 fn table_cell_inline_intrinsic_contribution(
@@ -595,11 +738,15 @@ fn table_cell_inline_intrinsic_contribution(
     }
 }
 
-/// Return min/max-content width contributions from block-level cell children.
+/// Return min/max-content width contributions from block-level and floated cell children.
 ///
 /// CSS Tables 3 computes cell min-content and max-content measures from the
-/// contents of the table cell, including nested block formatting contexts:
-/// <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>.
+/// contents of the table cell, including nested block formatting contexts.
+/// CSS 2.2 blockifies floated boxes before layout, so direct floated inline
+/// children contribute through their own shrink-to-fit/explicit inline size
+/// rather than through an empty child list:
+/// <https://drafts.csswg.org/css-tables-3/#computing-cell-measures> and
+/// <https://www.w3.org/TR/CSS22/visuren.html#dis-pos-flo>.
 fn table_cell_block_child_intrinsic_widths(
     layout: &mut LayoutBuilder<'_>,
     cell: &TableCell<'_>,
@@ -626,6 +773,15 @@ fn table_cell_formatting_child_intrinsic_widths(
     match child {
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             table_cell_formatting_children_intrinsic_widths(layout, &box_.children, stylesheets)
+        }
+        box_tree::FormattingBox::Inline(box_) if table_cell_child_is_in_flow_float(child) => {
+            table_cell_formatting_box_intrinsic_width(
+                layout,
+                child,
+                &box_.style,
+                &box_.children,
+                stylesheets,
+            )
         }
         box_tree::FormattingBox::Inline(box_) => {
             table_cell_formatting_children_intrinsic_widths(layout, &box_.children, stylesheets)
@@ -667,12 +823,13 @@ fn table_cell_block_child_contributes_to_intrinsic_width(
     style: &ComputedStyle,
 ) -> bool {
     !matches!(style.position, Position::Absolute | Position::Fixed)
-        && matches!(
-            child,
-            box_tree::FormattingBox::Block(_)
-                | box_tree::FormattingBox::Table(_)
-                | box_tree::FormattingBox::Flex(_)
-        )
+        && (style.float != Float::None
+            || matches!(
+                child,
+                box_tree::FormattingBox::Block(_)
+                    | box_tree::FormattingBox::Table(_)
+                    | box_tree::FormattingBox::Flex(_)
+            ))
 }
 
 /// Resolve a block-level child box's intrinsic outer inline sizes.
@@ -699,22 +856,31 @@ fn table_cell_formatting_box_intrinsic_width(
     }
 
     let used_edges = used_box_edges(style, 0.0);
+    let used_padding = used_edges.padding.to_css_edges();
+    let used_margin = used_edges.margin.to_css_edges();
     let horizontal_non_content =
-        used_edges.padding.left + used_edges.padding.right + horizontal_border_width(style);
+        used_padding.left + used_padding.right + horizontal_border_width(style);
     let explicit_width = used_content_width_or_auto(style, 0.0, horizontal_non_content);
     let inline_contribution = layout.intrinsic_inline_contribution_for_boxes(children, style, &[]);
+    let (block_min_width, block_max_width) =
+        if table_cell_style_has_parent_percentage_block_size(style) {
+            table_cell_formatting_children_intrinsic_widths(layout, children, stylesheets)
+        } else {
+            (0.0, 0.0)
+        };
     let intrinsic_min = inline_contribution
         .min_content
         .min(inline_contribution.max_content)
+        .max(block_min_width)
         .max(0.0);
-    let intrinsic_max = inline_contribution.max_content;
+    let intrinsic_max = inline_contribution.max_content.max(block_max_width);
     let preferred_min = explicit_width.unwrap_or(intrinsic_min);
     let preferred = explicit_width.unwrap_or(intrinsic_max.max(preferred_min));
     let min = constrain_width(style, preferred_min, 0.0);
     let max = constrain_width(style, preferred.max(min), 0.0);
     (
-        min + horizontal_non_content + used_edges.margin.left + used_edges.margin.right,
-        max + horizontal_non_content + used_edges.margin.left + used_edges.margin.right,
+        min + horizontal_non_content + used_margin.left + used_margin.right,
+        max + horizontal_non_content + used_margin.left + used_margin.right,
     )
 }
 
@@ -766,5 +932,105 @@ fn replaced_box_svg_width(box_: &box_tree::FormattingBox<'_>) -> Option<f32> {
         .then(|| svg_rect(box_.element).map(|(width, _, _)| width))
         .flatten(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn length(value: f32) -> css::ComputedLengthPercentageOrAuto {
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(value),
+        )
+    }
+
+    fn horizontal_edges(left: f32, right: f32) -> css::Edges {
+        css::Edges {
+            top: 0.0,
+            right,
+            bottom: 0.0,
+            left,
+        }
+    }
+
+    fn style_with_width(width: css::ComputedLengthPercentageOrAuto) -> ComputedStyle {
+        let mut style = ComputedStyle::initial();
+        style.box_values.width = width;
+        style
+    }
+
+    #[test]
+    fn table_width_content_box_expands_to_wrapper_border_box() {
+        let mut style = style_with_width(length(150.0));
+        style.border_collapse = css::BorderCollapse::Separate;
+        style.box_values.padding.left = css::ComputedLengthPercentage::from_points(10.0);
+        style.box_values.padding.right = css::ComputedLengthPercentage::from_points(10.0);
+        style.padding.left = 10.0;
+        style.padding.right = 10.0;
+
+        let width = used_table_width(&style, 300.0);
+
+        assert_eq!(width.content_width.points(), 150.0);
+        assert_eq!(
+            width.wrapper_border_box_width(width.content_width).points(),
+            170.0
+        );
+    }
+
+    #[test]
+    fn empty_table_border_box_width_clamps_content_box_at_zero() {
+        let mut style = style_with_width(length(100.0));
+        style.box_sizing = BoxSizing::BorderBox;
+        let table_width = UsedTableWidth {
+            content_width: content_box_pt(0.0),
+            border_widths: css::Edges::ZERO,
+            padding: horizontal_edges(75.0, 75.0),
+        };
+
+        let content = used_empty_table_grid_width(&style, 300.0, table_width);
+
+        assert_eq!(content.points(), 0.0);
+    }
+
+    #[test]
+    fn declared_table_cell_border_box_width_counts_extras_once() {
+        let mut content_box_style = ComputedStyle::initial();
+        content_box_style.box_sizing = BoxSizing::ContentBox;
+        content_box_style.padding = horizontal_edges(10.0, 10.0);
+        let border_insets = Some(horizontal_edges(5.0, 5.0));
+
+        let content_box_width = table_cell_border_box_width_from_declared_size(
+            &content_box_style,
+            100.0,
+            300.0,
+            table_cell_horizontal_non_content_width(&content_box_style, border_insets),
+        );
+
+        let mut border_box_style = content_box_style;
+        border_box_style.box_sizing = BoxSizing::BorderBox;
+        let border_box_width = table_cell_border_box_width_from_declared_size(
+            &border_box_style,
+            100.0,
+            300.0,
+            table_cell_horizontal_non_content_width(&border_box_style, border_insets),
+        );
+
+        assert_eq!(content_box_width.points(), 130.0);
+        assert_eq!(border_box_width.points(), 100.0);
+    }
+
+    #[test]
+    fn empty_table_auto_grid_width_is_zero_content_box() {
+        let style = style_with_width(css::ComputedLengthPercentageOrAuto::Auto);
+        let table_width = UsedTableWidth {
+            content_width: content_box_pt(0.0),
+            border_widths: css::Edges::ZERO,
+            padding: css::Edges::ZERO,
+        };
+
+        let content = used_empty_table_grid_width(&style, 300.0, table_width);
+
+        assert_eq!(content.points(), 0.0);
     }
 }

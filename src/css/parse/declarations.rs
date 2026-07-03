@@ -41,7 +41,7 @@ impl<'i> cssparser::DeclarationParser<'i> for DeclarationCollector {
         let start = input.position();
         consume_remaining_input(input);
         let value = input.slice_from(start).trim().to_string();
-        Ok((name.to_ascii_lowercase().to_string(), value))
+        Ok((name.to_ascii_lowercase(), value))
     }
 }
 

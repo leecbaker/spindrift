@@ -175,7 +175,7 @@ fn parse_non_negative_length(value: &str, font_size: f32) -> Option<ComputedLeng
 
 fn length_percentage_is_definitely_negative(value: ComputedLengthPercentage) -> bool {
     let components = [
-        value.length,
+        value.length_points(),
         value.percent,
         value.ch,
         value.vw,

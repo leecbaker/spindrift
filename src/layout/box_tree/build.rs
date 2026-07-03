@@ -5,7 +5,7 @@ pub(crate) fn build_page_box<'a>(
     root: &'a Node,
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
-) -> PageBox<'a> {
+) -> MutablePageBox<'a> {
     build_page_box_inner(root, stylesheets, parent_style, None)
 }
 
@@ -14,7 +14,7 @@ pub(crate) fn build_page_box_with_font_metrics<'a>(
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
     font_system: &mut FontSystem,
-) -> PageBox<'a> {
+) -> MutablePageBox<'a> {
     build_page_box_inner(root, stylesheets, parent_style, Some(font_system))
 }
 
@@ -23,7 +23,7 @@ fn build_page_box_inner<'a>(
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
     font_system: Option<&mut FontSystem>,
-) -> PageBox<'a> {
+) -> MutablePageBox<'a> {
     let children = match &root.kind {
         NodeKind::Element(element) => {
             build_child_boxes_inner(element, stylesheets, parent_style, &[], true, font_system)
@@ -32,14 +32,14 @@ fn build_page_box_inner<'a>(
             if text.is_empty() {
                 Vec::new()
             } else {
-                vec![FormattingBox::Text(TextBox {
+                vec![MutableFormattingBox::Text(MutableTextBox {
                     text: text.clone(),
-                    style: parent_style.clone(),
+                    style: Box::new(parent_style.clone()),
                 })]
             }
         }
     };
-    PageBox { children }
+    MutablePageBox { children }
 }
 
 pub(crate) fn build_child_boxes_with_font_metrics<'a>(
@@ -48,7 +48,7 @@ pub(crate) fn build_child_boxes_with_font_metrics<'a>(
     parent_style: &ComputedStyle,
     ancestors: &[ElementSignature],
     font_system: &mut FontSystem,
-) -> Vec<FormattingBox<'a>> {
+) -> Vec<MutableFormattingBox<'a>> {
     build_child_boxes_inner(
         element,
         stylesheets,
@@ -66,13 +66,14 @@ fn build_child_boxes_inner<'a>(
     ancestors: &[ElementSignature],
     normalize_for_parent: bool,
     mut font_system: Option<&mut FontSystem>,
-) -> Vec<FormattingBox<'a>> {
-    let sibling_tags = element_sibling_tags(element);
+) -> Vec<MutableFormattingBox<'a>> {
+    let sibling_tags = element_sibling_signature_list(element);
     let mut element_index = 0usize;
     let mut raw = Vec::new();
     push_generated_pseudo_box(
         &mut raw,
         element,
+        parent_style,
         parent_style.before_style.as_deref(),
         GeneratedPseudoKind::Before,
     );
@@ -80,14 +81,14 @@ fn build_child_boxes_inner<'a>(
         match &child.kind {
             NodeKind::Text(text) => {
                 if !text.is_empty() {
-                    raw.push(FormattingBox::Text(TextBox {
+                    raw.push(MutableFormattingBox::Text(MutableTextBox {
                         text: text.clone(),
-                        style: parent_style.clone(),
+                        style: Box::new(parent_style.clone()),
                     }));
                 }
             }
             NodeKind::Element(child_element) => {
-                let signature = ElementSignature::with_siblings(
+                let signature = ElementSignature::with_sibling_list(
                     child_element.tag.clone(),
                     child_element.attrs.clone(),
                     element_index,
@@ -165,6 +166,7 @@ fn build_child_boxes_inner<'a>(
     push_generated_pseudo_box(
         &mut raw,
         element,
+        parent_style,
         parent_style.after_style.as_deref(),
         GeneratedPseudoKind::After,
     );
@@ -178,16 +180,18 @@ fn build_child_boxes_inner<'a>(
 pub(crate) fn build_element_box<'a>(
     element: &'a Element,
     signature: ElementSignature,
-    mut style: ComputedStyle,
+    style: ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
     font_system: Option<&mut FontSystem>,
-) -> Option<FormattingBox<'a>> {
+) -> Option<MutableFormattingBox<'a>> {
+    let mut style = Box::new(style);
     if style.display.is_none() {
         return None;
     }
     if matches!(style.position, Position::Absolute | Position::Fixed) {
         style.abspos_static_source_was_inline_level = style.display.is_inline_level();
+        style.abspos_static_source_was_atomic_inline = style.display.is_atomic_inline();
         style.display = style.display.blockified();
     }
 
@@ -210,7 +214,6 @@ pub(crate) fn build_element_box<'a>(
     let source = BoxSource::Principal;
 
     if content_replacement || is_replaced_element(element) {
-        let mut style = style;
         style.display = if style.display.is_block_level() {
             Display::BLOCK_REPLACED.with_list_item(style.display.is_list_item())
         } else if style.display.is_run_in() {
@@ -219,7 +222,7 @@ pub(crate) fn build_element_box<'a>(
             Display::INLINE_REPLACED.with_list_item(style.display.is_list_item())
         };
         return if style.display.is_inline_or_run_in_level() {
-            Some(FormattingBox::AtomicInline(AtomicInlineBox {
+            Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
                 element,
                 signature,
                 source,
@@ -229,7 +232,7 @@ pub(crate) fn build_element_box<'a>(
                 table_fragment: None,
             }))
         } else {
-            Some(FormattingBox::Replaced(ReplacedBox {
+            Some(MutableFormattingBox::Replaced(MutableReplacedBox {
                 element,
                 signature,
                 source,
@@ -242,7 +245,7 @@ pub(crate) fn build_element_box<'a>(
 
     if style.display.is_table() && style.display.is_inline_or_run_in_level() {
         let fragment = build_table_fragment(element, &signature, &children);
-        Some(FormattingBox::AtomicInline(AtomicInlineBox {
+        Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
             element,
             signature,
             source,
@@ -255,7 +258,7 @@ pub(crate) fn build_element_box<'a>(
         || (style.display.is_block_level() && is_html_table_element(element))
     {
         let fragment = build_table_fragment(element, &signature, &children);
-        Some(FormattingBox::Table(TableBox {
+        Some(MutableFormattingBox::Table(MutableTableBox {
             element,
             signature,
             source,
@@ -265,7 +268,7 @@ pub(crate) fn build_element_box<'a>(
             fragment,
         }))
     } else if style.display.is_flex() && style.display.is_block_level() {
-        Some(FormattingBox::Flex(FlexBox {
+        Some(MutableFormattingBox::Flex(MutableFlexBox {
             element,
             signature,
             source,
@@ -276,7 +279,7 @@ pub(crate) fn build_element_box<'a>(
     } else if style.display.is_atomic_inline()
         || (style.display.is_run_in() && !style.display.is_flow())
     {
-        Some(FormattingBox::AtomicInline(AtomicInlineBox {
+        Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
             element,
             signature,
             source,
@@ -286,7 +289,7 @@ pub(crate) fn build_element_box<'a>(
             table_fragment: None,
         }))
     } else if style.display.is_block_level() {
-        Some(FormattingBox::Block(BlockBox {
+        Some(MutableFormattingBox::Block(MutableBlockBox {
             element,
             signature,
             source,
@@ -296,7 +299,7 @@ pub(crate) fn build_element_box<'a>(
             children,
         }))
     } else {
-        Some(FormattingBox::Inline(InlineBox {
+        Some(MutableFormattingBox::Inline(MutableInlineBox {
             element,
             signature,
             source,
@@ -309,8 +312,9 @@ pub(crate) fn build_element_box<'a>(
 }
 
 fn push_generated_pseudo_box<'a>(
-    output: &mut Vec<FormattingBox<'a>>,
+    output: &mut Vec<MutableFormattingBox<'a>>,
     originating_element: &'a Element,
+    originating_style: &ComputedStyle,
     pseudo_style: Option<&ComputedStyle>,
     kind: GeneratedPseudoKind,
 ) {
@@ -324,14 +328,19 @@ fn push_generated_pseudo_box<'a>(
         originating_element.tag.clone(),
         originating_element.attrs.clone(),
     );
-    let mut style = pseudo_style.clone();
+    let mut style = Box::new(pseudo_style.clone());
     if matches!(style.position, Position::Absolute | Position::Fixed) {
         style.abspos_static_source_was_inline_level = style.display.is_inline_level();
+        style.abspos_static_source_was_atomic_inline = style.display.is_atomic_inline();
         style.display = style.display.blockified();
     }
-    if let Some(box_) =
-        build_generated_pseudo_box(originating_element, originating_signature, style, kind)
-    {
+    if let Some(box_) = build_generated_pseudo_box(
+        originating_element,
+        originating_signature,
+        originating_style.clear,
+        style,
+        kind,
+    ) {
         output.push(box_);
     }
 }
@@ -339,15 +348,17 @@ fn push_generated_pseudo_box<'a>(
 fn build_generated_pseudo_box<'a>(
     originating_element: &'a Element,
     originating_signature: ElementSignature,
-    style: ComputedStyle,
+    originating_clear: Clear,
+    style: Box<ComputedStyle>,
     kind: GeneratedPseudoKind,
-) -> Option<FormattingBox<'a>> {
+) -> Option<MutableFormattingBox<'a>> {
     if style.display.is_none() {
         return None;
     }
     let source = BoxSource::GeneratedPseudo(Box::new(GeneratedPseudoBox {
         originating_element,
         originating_signature: originating_signature.clone(),
+        originating_clear,
         kind,
     }));
     let marker = marker_box(&style);
@@ -355,7 +366,7 @@ fn build_generated_pseudo_box<'a>(
 
     if style.display.is_table() && style.display.is_inline_or_run_in_level() {
         let fragment = build_table_fragment(originating_element, &originating_signature, &children);
-        Some(FormattingBox::AtomicInline(AtomicInlineBox {
+        Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
             element: originating_element,
             signature: originating_signature,
             source,
@@ -368,7 +379,7 @@ fn build_generated_pseudo_box<'a>(
         || (style.display.is_block_level() && is_html_table_element(originating_element))
     {
         let fragment = build_table_fragment(originating_element, &originating_signature, &children);
-        Some(FormattingBox::Table(TableBox {
+        Some(MutableFormattingBox::Table(MutableTableBox {
             element: originating_element,
             signature: originating_signature,
             source,
@@ -378,7 +389,7 @@ fn build_generated_pseudo_box<'a>(
             fragment,
         }))
     } else if style.display.is_flex() && style.display.is_block_level() {
-        Some(FormattingBox::Flex(FlexBox {
+        Some(MutableFormattingBox::Flex(MutableFlexBox {
             element: originating_element,
             signature: originating_signature,
             source,
@@ -389,7 +400,7 @@ fn build_generated_pseudo_box<'a>(
     } else if style.display.is_atomic_inline()
         || (style.display.is_run_in() && !style.display.is_flow())
     {
-        Some(FormattingBox::AtomicInline(AtomicInlineBox {
+        Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
             element: originating_element,
             signature: originating_signature,
             source,
@@ -399,7 +410,7 @@ fn build_generated_pseudo_box<'a>(
             table_fragment: None,
         }))
     } else if style.display.is_block_level() {
-        Some(FormattingBox::Block(BlockBox {
+        Some(MutableFormattingBox::Block(MutableBlockBox {
             element: originating_element,
             signature: originating_signature,
             source,
@@ -409,7 +420,7 @@ fn build_generated_pseudo_box<'a>(
             children,
         }))
     } else {
-        Some(FormattingBox::Inline(InlineBox {
+        Some(MutableFormattingBox::Inline(MutableInlineBox {
             element: originating_element,
             signature: originating_signature,
             source,
@@ -437,21 +448,22 @@ fn root_display_fixed_style(mut style: ComputedStyle) -> ComputedStyle {
 
 /// Build a durable CSS table fragment from normalized child boxes.
 ///
-/// CSS 2.2 anonymous table object construction and table layout require a
-/// stable table wrapper, row-group, row, cell, column, caption, and occupancy
-/// model before layout:
+/// CSS table fixup generates missing child wrappers before missing parents,
+/// and table layout then requires a stable table wrapper, row-group, row, cell,
+/// column, caption, and occupancy model before layout:
+/// <https://drafts.csswg.org/css-tables/#fixup-algorithm> and
 /// <https://www.w3.org/TR/CSS22/tables.html#anonymous-boxes>.
 pub(crate) fn build_table_fragment<'a>(
     element: &'a Element,
     signature: &ElementSignature,
-    children: &[FormattingBox<'a>],
-) -> TableFragment<'a> {
+    children: &[MutableFormattingBox<'a>],
+) -> MutableTableFragment<'a> {
     let captions = table_fragment_captions(children);
     let columns = table_fragment_columns(children);
     let mut rows = Vec::new();
     collect_table_fragment_rows(children, &mut rows, std::slice::from_ref(signature), &[]);
     if rows.is_empty() && is_html_table_row_element(element) {
-        rows.push(TableFragmentRow {
+        rows.push(MutableTableFragmentRow {
             element: Some(element),
             signature: signature.clone(),
             ancestors: Vec::new(),
@@ -461,7 +473,7 @@ pub(crate) fn build_table_fragment<'a>(
         });
     }
     let grid = table_fragment_grid(&rows);
-    TableFragment {
+    MutableTableFragment {
         rows,
         captions,
         columns,
@@ -469,24 +481,35 @@ pub(crate) fn build_table_fragment<'a>(
     }
 }
 
-fn table_fragment_captions<'a>(children: &[FormattingBox<'a>]) -> Vec<TableFragmentCaption<'a>> {
+pub(crate) fn build_frozen_table_fragment<'a>(
+    element: &'a Element,
+    signature: &ElementSignature,
+    children: &[FrozenFormattingBox<'a>],
+) -> FrozenTableFragment<'a> {
+    let mutable_children = clone_frozen_child_boxes_as_mutable(children);
+    freeze_table_fragment(build_table_fragment(element, signature, &mutable_children))
+}
+
+fn table_fragment_captions<'a>(
+    children: &[MutableFormattingBox<'a>],
+) -> Vec<MutableTableFragmentCaption<'a>> {
     let mut captions = Vec::new();
     collect_table_fragment_captions(children, &mut captions);
     captions
 }
 
 fn collect_table_fragment_captions<'a>(
-    children: &[FormattingBox<'a>],
-    captions: &mut Vec<TableFragmentCaption<'a>>,
+    children: &[MutableFormattingBox<'a>],
+    captions: &mut Vec<MutableTableFragmentCaption<'a>>,
 ) {
     for child in children {
         if let Some((element, signature, style, descendants)) = child.element_parts()
             && is_table_caption_box(element, style)
         {
-            captions.push(TableFragmentCaption {
+            captions.push(MutableTableFragmentCaption {
                 element,
                 signature: signature.clone(),
-                style: Some(style.clone()),
+                style: Some(Box::new(style.clone())),
                 children: descendants.to_vec(),
             });
             continue;
@@ -495,25 +518,27 @@ fn collect_table_fragment_captions<'a>(
     }
 }
 
-fn table_fragment_columns<'a>(children: &[FormattingBox<'a>]) -> Vec<TableFragmentColumn<'a>> {
+fn table_fragment_columns<'a>(
+    children: &[MutableFormattingBox<'a>],
+) -> Vec<MutableTableFragmentColumn<'a>> {
     let mut columns = Vec::new();
     collect_table_fragment_columns(children, &mut columns);
     columns
 }
 
 fn collect_table_fragment_columns<'a>(
-    children: &[FormattingBox<'a>],
-    columns: &mut Vec<TableFragmentColumn<'a>>,
+    children: &[MutableFormattingBox<'a>],
+    columns: &mut Vec<MutableTableFragmentColumn<'a>>,
 ) {
     for child in children {
         let Some((element, signature, style, descendants)) = child.element_parts() else {
             continue;
         };
         if is_table_column_box(element, style) {
-            columns.push(TableFragmentColumn {
+            columns.push(MutableTableFragmentColumn {
                 element,
                 signature: signature.clone(),
-                style: Some(style.clone()),
+                style: Some(Box::new(style.clone())),
                 group: None,
                 span: html_table_column_span(element),
             });
@@ -531,13 +556,13 @@ fn collect_table_fragment_column_group<'a>(
     group_element: &'a Element,
     group_signature: &ElementSignature,
     group_style: &ComputedStyle,
-    children: &[FormattingBox<'a>],
-    columns: &mut Vec<TableFragmentColumn<'a>>,
+    children: &[MutableFormattingBox<'a>],
+    columns: &mut Vec<MutableTableFragmentColumn<'a>>,
 ) {
-    let group = TableFragmentColumnGroup {
+    let group = MutableTableFragmentColumnGroup {
         element: group_element,
         signature: group_signature.clone(),
-        style: Some(group_style.clone()),
+        style: Some(Box::new(group_style.clone())),
         span: html_table_column_span(group_element),
     };
     let mut saw_column = false;
@@ -547,20 +572,20 @@ fn collect_table_fragment_column_group<'a>(
         };
         if is_table_column_box(element, style) {
             saw_column = true;
-            columns.push(TableFragmentColumn {
+            columns.push(MutableTableFragmentColumn {
                 element,
                 signature: signature.clone(),
-                style: Some(style.clone()),
+                style: Some(Box::new(style.clone())),
                 group: Some(group.clone()),
                 span: html_table_column_span(element),
             });
         }
     }
     if !saw_column {
-        columns.push(TableFragmentColumn {
+        columns.push(MutableTableFragmentColumn {
             element: group_element,
             signature: group_signature.clone(),
-            style: Some(group_style.clone()),
+            style: Some(Box::new(group_style.clone())),
             group: Some(group.clone()),
             span: group.span,
         });
@@ -568,16 +593,16 @@ fn collect_table_fragment_column_group<'a>(
 }
 
 fn collect_table_fragment_rows<'a>(
-    children: &[FormattingBox<'a>],
-    rows: &mut Vec<TableFragmentRow<'a>>,
+    children: &[MutableFormattingBox<'a>],
+    rows: &mut Vec<MutableTableFragmentRow<'a>>,
     ancestors: &[ElementSignature],
-    row_groups: &[TableFragmentRowGroup<'a>],
+    row_groups: &[MutableTableFragmentRowGroup<'a>],
 ) {
     let mut anonymous_cells = Vec::new();
     let mut anonymous_cell_children = Vec::new();
     for (index, child) in children.iter().enumerate() {
         let Some((element, signature, style, descendants)) = child.element_parts() else {
-            if matches!(child, FormattingBox::Text(_))
+            if matches!(child, MutableFormattingBox::Text(_))
                 && !table_fragment_whitespace_is_ignorable(children, index)
             {
                 anonymous_cell_children.push(child.clone());
@@ -588,22 +613,22 @@ fn collect_table_fragment_rows<'a>(
             flush_anonymous_table_fragment_cell(&mut anonymous_cells, &mut anonymous_cell_children);
             flush_anonymous_table_fragment_row(rows, &mut anonymous_cells, ancestors, row_groups);
             let cells = table_fragment_row_child_cells(descendants);
-            rows.push(TableFragmentRow {
+            rows.push(MutableTableFragmentRow {
                 element: Some(element),
                 signature: signature.clone(),
                 ancestors: ancestors.to_vec(),
                 row_groups: row_groups.to_vec(),
-                style: Some(style.clone()),
+                style: Some(Box::new(style.clone())),
                 cells,
             });
             continue;
         }
         if is_table_cell_box(element, style) {
             flush_anonymous_table_fragment_cell(&mut anonymous_cells, &mut anonymous_cell_children);
-            anonymous_cells.push(TableFragmentCell {
+            anonymous_cells.push(MutableTableFragmentCell {
                 element: Some(element),
                 signature: signature.clone(),
-                style: Some(style.clone()),
+                style: Some(Box::new(style.clone())),
                 children: descendants.to_vec(),
                 anonymous: false,
             });
@@ -615,16 +640,16 @@ fn collect_table_fragment_rows<'a>(
         {
             continue;
         }
-        if is_table_row_group_box(element, style) {
+        if is_table_row_group_box(element, style) && row_groups.is_empty() {
             flush_anonymous_table_fragment_cell(&mut anonymous_cells, &mut anonymous_cell_children);
             flush_anonymous_table_fragment_row(rows, &mut anonymous_cells, ancestors, row_groups);
             let mut child_ancestors = ancestors.to_vec();
             child_ancestors.push(signature.clone());
             let mut child_row_groups = row_groups.to_vec();
-            child_row_groups.push(TableFragmentRowGroup {
+            child_row_groups.push(MutableTableFragmentRowGroup {
                 element,
                 signature: signature.clone(),
-                style: Some(style.clone()),
+                style: Some(Box::new(style.clone())),
             });
             collect_table_fragment_rows(descendants, rows, &child_ancestors, &child_row_groups);
             continue;
@@ -636,13 +661,13 @@ fn collect_table_fragment_rows<'a>(
 }
 
 fn table_fragment_row_child_cells<'a>(
-    children: &[FormattingBox<'a>],
-) -> Vec<TableFragmentCell<'a>> {
+    children: &[MutableFormattingBox<'a>],
+) -> Vec<MutableTableFragmentCell<'a>> {
     let mut cells = Vec::new();
     let mut anonymous_cell_children = Vec::new();
     for (index, child) in children.iter().enumerate() {
         let Some((element, signature, style, descendants)) = child.element_parts() else {
-            if matches!(child, FormattingBox::Text(_))
+            if matches!(child, MutableFormattingBox::Text(_))
                 && !table_fragment_whitespace_is_ignorable(children, index)
             {
                 anonymous_cell_children.push(child.clone());
@@ -651,10 +676,10 @@ fn table_fragment_row_child_cells<'a>(
         };
         if is_table_cell_box(element, style) {
             flush_anonymous_table_fragment_cell(&mut cells, &mut anonymous_cell_children);
-            cells.push(TableFragmentCell {
+            cells.push(MutableTableFragmentCell {
                 element: Some(element),
                 signature: signature.clone(),
-                style: Some(style.clone()),
+                style: Some(Box::new(style.clone())),
                 children: descendants.to_vec(),
                 anonymous: false,
             });
@@ -680,7 +705,10 @@ fn table_fragment_row_child_cells<'a>(
 /// table-internal boxes, but the consecutive-box rules keep whitespace between
 /// non-internal siblings so it can participate in the generated anonymous cell:
 /// <https://drafts.csswg.org/css-tables/#consecutive-boxes>.
-fn table_fragment_whitespace_is_ignorable(children: &[FormattingBox<'_>], index: usize) -> bool {
+fn table_fragment_whitespace_is_ignorable(
+    children: &[MutableFormattingBox<'_>],
+    index: usize,
+) -> bool {
     children
         .get(index)
         .is_some_and(formatting_box_is_collapsible_space)
@@ -690,7 +718,7 @@ fn table_fragment_whitespace_is_ignorable(children: &[FormattingBox<'_>], index:
             || table_fragment_box_is_internal_or_caption(&children[index + 1]))
 }
 
-fn table_fragment_box_is_internal_or_caption(box_: &FormattingBox<'_>) -> bool {
+fn table_fragment_box_is_internal_or_caption(box_: &MutableFormattingBox<'_>) -> bool {
     let Some((element, _, style, _)) = box_.element_parts() else {
         return false;
     };
@@ -711,41 +739,80 @@ fn table_fragment_box_is_internal_or_caption(box_: &FormattingBox<'_>) -> bool {
 /// <https://drafts.csswg.org/css-tables/#consecutive-boxes> and
 /// <https://www.w3.org/TR/CSS22/tables.html#anonymous-boxes>.
 fn flush_anonymous_table_fragment_cell<'a>(
-    cells: &mut Vec<TableFragmentCell<'a>>,
-    children: &mut Vec<FormattingBox<'a>>,
+    cells: &mut Vec<MutableTableFragmentCell<'a>>,
+    children: &mut Vec<MutableFormattingBox<'a>>,
 ) {
     if children.is_empty() {
         return;
     }
-    cells.push(TableFragmentCell {
+    let children = anonymous_table_fragment_cell_children(children);
+    cells.push(MutableTableFragmentCell {
         element: None,
         signature: ElementSignature::new("td", HashMap::new()),
         style: None,
-        children: std::mem::take(children),
+        children,
         anonymous: true,
     });
 }
 
+fn anonymous_table_fragment_cell_children<'a>(
+    children: &mut Vec<MutableFormattingBox<'a>>,
+) -> Vec<MutableFormattingBox<'a>> {
+    let parent_style = anonymous_table_fragment_cell_parent_style(children);
+    normalize_orphan_table_internal_boxes(std::mem::take(children), &parent_style)
+}
+
+/// Build the effective parent style used while normalizing anonymous cell content.
+///
+/// CSS Tables generates missing child wrappers before missing parents. When a
+/// table-internal box is wrapped in an anonymous table-cell, the later missing
+/// parent stage must see a table-cell parent, not the original row or row-group:
+/// <https://drafts.csswg.org/css-tables/#fixup-algorithm>.
+fn anonymous_table_fragment_cell_parent_style(
+    children: &[MutableFormattingBox<'_>],
+) -> ComputedStyle {
+    let mut style = children
+        .first()
+        .map(table_fragment_child_style)
+        .unwrap_or_else(|| css::default_style_for_tag("td"));
+    style.display = Display::TABLE_CELL;
+    style
+}
+
+fn table_fragment_child_style(child: &MutableFormattingBox<'_>) -> ComputedStyle {
+    match child {
+        MutableFormattingBox::Block(box_) => box_.style.as_ref().clone(),
+        MutableFormattingBox::Inline(box_) => box_.style.as_ref().clone(),
+        MutableFormattingBox::InlineSplitBlockContext(box_) => box_.style.as_ref().clone(),
+        MutableFormattingBox::AnonymousBlock(box_) => box_.style.as_ref().clone(),
+        MutableFormattingBox::AtomicInline(box_) => box_.style.as_ref().clone(),
+        MutableFormattingBox::Text(box_) => box_.style.as_ref().clone(),
+        MutableFormattingBox::Table(box_) => box_.style.as_ref().clone(),
+        MutableFormattingBox::Flex(box_) => box_.style.as_ref().clone(),
+        MutableFormattingBox::Replaced(box_) => box_.style.as_ref().clone(),
+    }
+}
+
 fn flush_anonymous_table_fragment_row<'a>(
-    rows: &mut Vec<TableFragmentRow<'a>>,
-    cells: &mut Vec<TableFragmentCell<'a>>,
+    rows: &mut Vec<MutableTableFragmentRow<'a>>,
+    cells: &mut Vec<MutableTableFragmentCell<'a>>,
     ancestors: &[ElementSignature],
-    row_groups: &[TableFragmentRowGroup<'a>],
+    row_groups: &[MutableTableFragmentRowGroup<'a>],
 ) {
     if cells.is_empty() {
         return;
     }
-    rows.push(TableFragmentRow {
+    rows.push(MutableTableFragmentRow {
         element: cells[0].element,
         signature: ElementSignature::new("tr", HashMap::new()),
         ancestors: ancestors.to_vec(),
         row_groups: row_groups.to_vec(),
-        style: Some(css::default_style_for_tag("tr")),
+        style: Some(Box::new(css::default_style_for_tag("tr"))),
         cells: std::mem::take(cells),
     });
 }
 
-fn table_fragment_grid(rows: &[TableFragmentRow<'_>]) -> TableFragmentGrid {
+fn table_fragment_grid(rows: &[MutableTableFragmentRow<'_>]) -> TableFragmentGrid {
     let mut grid_rows = Vec::with_capacity(rows.len());
     let mut active_rowspans: Vec<usize> = Vec::new();
     let mut column_count = 0usize;
@@ -795,7 +862,7 @@ fn table_fragment_grid(rows: &[TableFragmentRow<'_>]) -> TableFragmentGrid {
     }
 }
 
-fn table_fragment_row_group_end_indices(rows: &[TableFragmentRow<'_>]) -> Vec<usize> {
+fn table_fragment_row_group_end_indices(rows: &[MutableTableFragmentRow<'_>]) -> Vec<usize> {
     let mut ends = vec![rows.len(); rows.len()];
     let mut start = 0usize;
     let mut current_group = rows.first().and_then(|row| row.row_groups.last().cloned());
@@ -816,7 +883,7 @@ fn table_fragment_row_group_end_indices(rows: &[TableFragmentRow<'_>]) -> Vec<us
 }
 
 fn table_fragment_group_signature<'a>(
-    group: &'a Option<TableFragmentRowGroup<'_>>,
+    group: &'a Option<MutableTableFragmentRowGroup<'_>>,
 ) -> Option<&'a ElementSignature> {
     group.as_ref().map(|group| &group.signature)
 }
@@ -845,15 +912,17 @@ fn is_table_cell_box(element: &Element, style: &ComputedStyle) -> bool {
     is_html_table_cell_element(element) || style.display.is_table_cell()
 }
 
-pub(crate) fn marker_box(style: &ComputedStyle) -> Option<MarkerBox> {
+pub(crate) fn marker_box(style: &ComputedStyle) -> Option<MutableMarkerBox> {
     // CSS Lists 3: a list item generates a marker box associated with the
     // principal box. Full `::marker` styling will replace this style clone.
     // https://www.w3.org/TR/css-lists-3/#markers
-    style.display.is_list_item().then(|| MarkerBox {
-        style: style
-            .marker_style
-            .as_deref()
-            .cloned()
-            .unwrap_or_else(|| style.clone()),
+    style.display.is_list_item().then(|| MutableMarkerBox {
+        style: Box::new(
+            style
+                .marker_style
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| style.clone()),
+        ),
     })
 }

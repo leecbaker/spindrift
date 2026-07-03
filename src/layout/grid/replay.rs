@@ -14,17 +14,10 @@ impl<'a> LayoutBuilder<'a> {
         inner_x: f32,
         content_top: f32,
     ) {
-        let previous_left = self.content_left;
-        let previous_right = self.content_right;
-        let previous_cursor_y = self.cursor_y;
         let item_width = item.width.max(0.0);
         let item_height = item.height.max(0.0);
 
-        self.content_left = inner_x + item.x;
-        self.content_right = self.content_left + item_width;
-        self.cursor_y = content_top - item.y;
-
-        let mut placed_style = child.style.clone();
+        let mut placed_style = grid_item_layout_style(&child.style);
         placed_style.margin = css::Edges::ZERO;
         placed_style.page_name_specified = false;
         placed_style.page_name = None;
@@ -34,28 +27,18 @@ impl<'a> LayoutBuilder<'a> {
         set_style_used_width_bounds(&mut placed_style, item_width);
         set_style_used_height_bounds(&mut placed_style, item_height);
         placed_style.box_sizing = BoxSizing::BorderBox;
-        if placed_style.display.is_inline_level() {
-            placed_style.display = placed_style.display.blockified();
-        }
 
-        if let Some((child_element, signature, child_boxes)) = child.element_parts() {
-            self.push_ancestor_signature(signature.clone());
-            self.push_page_name_element_scope_suppression();
-            self.layout_element_with_child_boxes(
-                child_element,
-                &placed_style,
-                stylesheets,
-                child_boxes,
-            );
-            self.pop_page_name_element_scope_suppression();
-            self.ancestors.pop();
-        } else if let Some(children) = child.anonymous_content() {
-            self.layout_anonymous_block(&placed_style, children, stylesheets, None);
-        }
-
-        self.content_left = previous_left;
-        self.content_right = previous_right;
-        self.cursor_y = previous_cursor_y;
+        self.with_formatting_context_item_placement(
+            FormattingContextItemPlacement {
+                content_left: inner_x + item.x,
+                content_width: item_width,
+                cursor_y: content_top - item.y,
+                page_start_margin_policy: PageStartMarginPolicy::Suppress,
+            },
+            |layout| {
+                layout.layout_formatting_context_item_contents(child, &placed_style, stylesheets);
+            },
+        );
     }
 }
 

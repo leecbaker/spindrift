@@ -10,11 +10,11 @@ async fn visibility_hidden_preserves_layout_space() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines.len(), 1);
-    assert_eq!(document.pages[0].lines[0].text, "Visible");
+    assert_eq!(document.pages[0].lines().len(), 1);
+    assert_eq!(document.pages[0].lines()[0].text, "Visible");
     assert!(
-        document.pages[0].lines[0].y()
-            < options.page_size.height() - options.page_margins.top - options.line_height
+        document.pages[0].lines()[0].y()
+            < options.page_size.height() - options.page_margins.top() - options.line_height()
     );
 }
 
@@ -26,10 +26,16 @@ async fn supports_bold_and_italic_system_fonts() {
     .render_async(&RenderOptions::default()).await
     .unwrap();
 
-    assert!(line_font_is_bold(&document, &document.pages[0].lines[0]));
-    assert!(line_font_is_italic(&document, &document.pages[0].lines[1]));
-    assert!(line_font_is_bold(&document, &document.pages[0].lines[2]));
-    assert!(line_font_is_italic(&document, &document.pages[0].lines[2]));
+    assert!(line_font_is_bold(&document, &document.pages[0].lines()[0]));
+    assert!(line_font_is_italic(
+        &document,
+        &document.pages[0].lines()[1]
+    ));
+    assert!(line_font_is_bold(&document, &document.pages[0].lines()[2]));
+    assert!(line_font_is_italic(
+        &document,
+        &document.pages[0].lines()[2]
+    ));
 }
 
 #[tokio::test]
@@ -41,16 +47,19 @@ async fn supports_generic_system_font_families() {
     .unwrap();
 
     assert_ne!(
-        document.pages[0].lines[0].font_id,
-        document.pages[0].lines[1].font_id
+        document.pages[0].lines()[0].font_id,
+        document.pages[0].lines()[1].font_id
     );
-    assert!(line_font_is_italic(&document, &document.pages[0].lines[0]));
+    assert!(line_font_is_italic(
+        &document,
+        &document.pages[0].lines()[0]
+    ));
     assert!(
-        line_font_is_monospace(&document, &document.pages[0].lines[1]),
+        line_font_is_monospace(&document, &document.pages[0].lines()[1]),
         "resolved monospace font was {}",
-        font_label(line_font(&document, &document.pages[0].lines[1]))
+        font_label(line_font(&document, &document.pages[0].lines()[1]))
     );
-    assert!(line_font_is_bold(&document, &document.pages[0].lines[1]));
+    assert!(line_font_is_bold(&document, &document.pages[0].lines()[1]));
     let pdf = document.write_pdf_bytes().unwrap();
     let rendered = String::from_utf8_lossy(&pdf);
     assert!(rendered.contains("/Subtype /Type0"));
@@ -73,7 +82,7 @@ async fn supports_font_face_data_uri_fonts() {
 
     assert!(document.fonts.iter().any(|font| font.family == "SmokeFace"));
     assert_eq!(
-        line_font(&document, &document.pages[0].lines[0]).family,
+        line_font(&document, &document.pages[0].lines()[0]).family,
         "SmokeFace"
     );
     let pdf = document.write_pdf_bytes().unwrap();
@@ -100,7 +109,7 @@ async fn supports_font_face_data_uri_woff1_fonts() {
 
     assert!(document.fonts.iter().any(|font| font.family == "SmokeWoff"));
     assert_eq!(
-        line_font(&document, &document.pages[0].lines[0]).family,
+        line_font(&document, &document.pages[0].lines()[0]).family,
         "SmokeWoff"
     );
     let pdf = document.write_pdf_bytes().unwrap();
@@ -151,7 +160,7 @@ async fn async_font_seed_loads_local_font_face_sources() {
             .any(|font| font.family == "AsyncLocalFace")
     );
     assert_eq!(
-        line_font(&document, &document.pages[0].lines[0]).family,
+        line_font(&document, &document.pages[0].lines()[0]).family,
         "AsyncLocalFace"
     );
     let pdf = document.write_pdf_bytes().unwrap();
@@ -187,7 +196,7 @@ async fn font_size_adjust_greater_than_aspect_value_increases_rendered_size() {
 
     let document = html.render_async(&RenderOptions::default()).await.unwrap();
     let filler_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text == "FillerText")
         .collect::<Vec<_>>();
@@ -237,17 +246,17 @@ async fn font_size_adjust_greater_than_aspect_value_increases_rendered_size() {
         .await
         .unwrap();
     let reference_adjusted = reference.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text == "FillerText")
         .find(|line| line.runs.iter().any(|run| run.font_size > 30.1))
         .expect("reference adjusted line");
 
+    let adjusted_top = rendered_line_baseline_top(&document, adjusted);
+    let reference_top = rendered_line_baseline_top(&reference, reference_adjusted);
     assert!(
-        (rendered_line_baseline_top(&document, adjusted)
-            - rendered_line_baseline_top(&reference, reference_adjusted))
-        .abs()
-            < 0.01
+        (adjusted_top - reference_top).abs() < 0.01,
+        "adjusted_top={adjusted_top}, reference_top={reference_top}, adjusted={adjusted:?}, reference={reference_adjusted:?}"
     );
     assert!(
         (rendered_line_advance(adjusted) - rendered_line_advance(reference_adjusted)).abs() < 0.01
@@ -261,7 +270,7 @@ async fn async_font_seed_loads_system_font_context() {
         .await
         .unwrap();
 
-    let line = &document.pages[0].lines[0];
+    let line = &document.pages[0].lines()[0];
     let font = line_font(&document, line);
     assert!(!font.data.is_empty());
     assert!(font.units_per_em > 0);
@@ -269,20 +278,20 @@ async fn async_font_seed_loads_system_font_context() {
 
 #[tokio::test]
 async fn ttc_face_index_survives_query_shaping_and_embedding_when_available() {
-    let Some((family_name, face_index)) = system_ttc_text_face_fixture() else {
+    let Some(fixture) = system_ttc_text_face_fixture("TTC face index") else {
         eprintln!("No system TTC text face with a nonzero face index is available");
         return;
     };
-    let family_css = family_name.replace('\\', "\\\\").replace('"', "\\\"");
     let document = Html::from_string(format!(
-        "<style>p {{ font-family: \"{family_css}\" }}</style><p>TTC face index</p>"
+        "<style>p {{ font-family: \"{}\"; font-style: {}; font-weight: {}; font-width: {} }}</style><p>TTC face index</p>",
+        fixture.family_css, fixture.font_style_css, fixture.font_weight, fixture.font_width_css
     ))
     .render_async(&RenderOptions::default())
     .await
     .unwrap();
 
-    let font = line_font(&document, &document.pages[0].lines[0]);
-    assert_eq!(font.face_index, face_index);
+    let font = line_font(&document, &document.pages[0].lines()[0]);
+    assert_eq!(font.face_index, fixture.face_index);
     assert_eq!(font.data.get(..4), Some(b"ttcf".as_slice()));
     assert!(
         document
@@ -309,7 +318,7 @@ async fn ticket_airplane_fallback_prefers_visible_unicode_text_font() {
     let airplane_run_font = document
         .pages
         .iter()
-        .flat_map(|page| &page.lines)
+        .flat_map(|page| page.lines())
         .flat_map(|line| &line.runs)
         .find(|run| run.text.contains('✈'))
         .and_then(|run| run.font_id)
@@ -345,7 +354,24 @@ fn system_has_font_family(needle: &str) -> bool {
         .any(|family| family.to_ascii_lowercase().contains(needle))
 }
 
-fn system_ttc_text_face_fixture() -> Option<(String, u32)> {
+struct SystemTtcTextFaceFixture {
+    family_css: String,
+    face_index: u32,
+    font_style_css: &'static str,
+    font_weight: u16,
+    font_width_css: &'static str,
+}
+
+struct FontQueryAttributes {
+    style: fontique::FontStyle,
+    style_css: &'static str,
+    weight: f32,
+    weight_css: u16,
+    width_ratio: f32,
+    width_css: &'static str,
+}
+
+fn system_ttc_text_face_fixture(text: &str) -> Option<SystemTtcTextFaceFixture> {
     let mut collection = fontique::Collection::default();
     let mut source_cache = fontique::SourceCache::default();
     let family_names = collection
@@ -354,28 +380,84 @@ fn system_ttc_text_face_fixture() -> Option<(String, u32)> {
         .collect::<Vec<_>>();
 
     for family_name in family_names {
-        let mut query = collection.query(&mut source_cache);
-        query.set_families([fontique::QueryFamily::Named(&family_name)]);
-        let mut match_face = None;
-        query.matches_with(|font| {
-            if font.index > 0
-                && font.blob.as_ref().get(..4) == Some(b"ttcf")
-                && ttf_parser::Face::parse(font.blob.as_ref(), font.index)
-                    .ok()
-                    .is_some_and(|face| face.glyph_index('A').is_some())
+        for attributes in system_ttc_text_face_fixture_attributes() {
+            let mut query = collection.query(&mut source_cache);
+            query.set_families([fontique::QueryFamily::Named(&family_name)]);
+            query.set_attributes(fontique::Attributes::new(
+                fontique::FontWidth::from_ratio(attributes.width_ratio),
+                attributes.style,
+                fontique::FontWeight::new(attributes.weight),
+            ));
+            let mut first_usable_match = None;
+            query.matches_with(|font| {
+                if first_usable_match.is_none()
+                    && !font.synthesis.any()
+                    && ttc_text_query_font_can_shape(font, text)
+                {
+                    first_usable_match = Some((font.index, font.blob.clone()));
+                    fontique::QueryStatus::Stop
+                } else {
+                    fontique::QueryStatus::Continue
+                }
+            });
+            if let Some((face_index, blob)) = first_usable_match
+                && face_index > 0
+                && blob.as_ref().get(..4) == Some(b"ttcf")
             {
-                match_face = Some(font.index);
-                fontique::QueryStatus::Stop
-            } else {
-                fontique::QueryStatus::Continue
+                return Some(SystemTtcTextFaceFixture {
+                    family_css: css_string_escape(&family_name),
+                    face_index,
+                    font_style_css: attributes.style_css,
+                    font_weight: attributes.weight_css,
+                    font_width_css: attributes.width_css,
+                });
             }
-        });
-        if let Some(face_index) = match_face {
-            return Some((family_name, face_index));
         }
     }
 
     None
+}
+
+fn system_ttc_text_face_fixture_attributes() -> Vec<FontQueryAttributes> {
+    let mut attributes = Vec::new();
+    for (style, style_css) in [
+        (fontique::FontStyle::Normal, "normal"),
+        (fontique::FontStyle::Italic, "italic"),
+        (fontique::FontStyle::Oblique(Some(14.0)), "oblique"),
+    ] {
+        for (weight, weight_css) in [(400.0, 400), (700.0, 700), (300.0, 300), (500.0, 500)] {
+            for (width_ratio, width_css) in [
+                (1.0, "normal"),
+                (0.75, "condensed"),
+                (1.25, "expanded"),
+                (0.875, "semi-condensed"),
+                (1.125, "semi-expanded"),
+            ] {
+                attributes.push(FontQueryAttributes {
+                    style,
+                    style_css,
+                    weight,
+                    weight_css,
+                    width_ratio,
+                    width_css,
+                });
+            }
+        }
+    }
+    attributes
+}
+
+fn ttc_text_query_font_can_shape(font: &fontique::QueryFont, text: &str) -> bool {
+    let Ok(face) = ttf_parser::Face::parse(font.blob.as_ref(), font.index) else {
+        return false;
+    };
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .all(|character| face.glyph_index(character).is_some())
+}
+
+fn css_string_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[tokio::test]
@@ -406,7 +488,7 @@ async fn rendered_text_lines_preserve_shaped_glyphs_for_pdf() {
         .unwrap();
 
     let line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text.contains("KinSNP"))
         .unwrap();
@@ -430,7 +512,7 @@ async fn compatible_inline_fragments_shape_as_one_cursive_run() {
     .unwrap();
 
     let line = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .find(|line| line.text.contains("تفاحة") || line.text.contains("ةحافت"))
         .unwrap();
@@ -457,7 +539,7 @@ async fn font_style_boundary_preserves_arabic_shaping_context() {
     .unwrap();
 
     let arabic_lines = document.pages[0]
-        .lines
+        .lines()
         .iter()
         .filter(|line| line.text.contains('ع'))
         .collect::<Vec<_>>();
@@ -540,7 +622,7 @@ async fn local_alreq_text_encoding_subset_matches_presentation_forms() {
                     actual_document
                         .pages
                         .iter()
-                        .flat_map(|page| page.lines.iter())
+                        .flat_map(|page| page.lines().iter())
                         .collect::<Vec<_>>()
                 )
             });
@@ -552,7 +634,7 @@ async fn local_alreq_text_encoding_subset_matches_presentation_forms() {
                     reference_document
                         .pages
                         .iter()
-                        .flat_map(|page| page.lines.iter())
+                        .flat_map(|page| page.lines().iter())
                         .collect::<Vec<_>>()
                 )
             });
@@ -604,7 +686,7 @@ async fn uses_later_font_family_for_missing_glyph_runs() {
         .pages
         .first()
         .and_then(|page| {
-            page.lines
+            page.lines()
                 .iter()
                 .find(|line| line.text.contains('A') && line.text.contains(fallback_character))
         })
@@ -636,6 +718,204 @@ async fn uses_later_font_family_for_missing_glyph_runs() {
             .map(|unit| format!("{unit:04X}"))
             .collect::<String>()
     )));
+}
+
+#[tokio::test]
+async fn explicit_line_height_baseline_ignores_fallback_font_runs() {
+    let primary = "weasyprint-samples/invoice/SourceSans3-Regular.ttf";
+    let fallback = "weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
+    let primary_data = std::fs::read(primary).unwrap();
+    let fallback_data = std::fs::read(fallback).unwrap();
+    let primary_face = ttf_parser::Face::parse(&primary_data, 0).unwrap();
+    let fallback_face = ttf_parser::Face::parse(&fallback_data, 0).unwrap();
+    assert_ne!(
+        primary_face.ascender(),
+        fallback_face.ascender(),
+        "fixture fonts should have different ascenders"
+    );
+
+    let html = format!(
+        r#"
+        <style>
+          @page {{ size: 240pt 160pt; margin: 0 }}
+          body {{ margin: 0 }}
+          p {{ margin: 0; height: 20pt }}
+          @font-face {{
+            font-family: PrimaryAOnly;
+            src: url("{primary}") format("truetype");
+            unicode-range: U+0020, U+0061;
+          }}
+          @font-face {{
+            font-family: FallbackBOnly;
+            src: url("{fallback}") format("truetype");
+            unicode-range: U+0062;
+          }}
+          div {{
+            position: absolute;
+            top: 20pt;
+            left: 0;
+            line-height: 75pt;
+            font-size: 75pt;
+            width: 225pt;
+            text-align: right;
+            color: transparent;
+          }}
+          span {{
+            display: inline-block;
+            width: 15pt;
+            height: 15pt;
+          }}
+          #hd {{ font-family: PrimaryAOnly, FallbackBOnly; }}
+          #hd span {{ background: red; }}
+          #h {{ font-family: PrimaryAOnly; }}
+          #h span {{ background: white; }}
+        </style>
+        <p>Test passes if there is no red below.</p>
+        <div id="hd">ab<span></span></div>
+        <div id="h">aa<span></span></div>
+        "#
+    );
+    let document = Html::from_string(html)
+        .with_base_url(".")
+        .render_async(&RenderOptions::default())
+        .await
+        .unwrap();
+    let page = &document.pages[0];
+    let red = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("red fallback-baseline probe should paint");
+    let white = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::WHITE))
+        .expect("white reference probe should paint");
+
+    assert!(
+        (red.x() - white.x()).abs() < 0.01,
+        "red={red:?} white={white:?}"
+    );
+    assert!(
+        (red.y() - white.y()).abs() < 0.01,
+        "red={red:?} white={white:?}"
+    );
+    assert!(
+        (red.width() - white.width()).abs() < 0.01,
+        "red={red:?} white={white:?}"
+    );
+    assert!(
+        (red.height() - white.height()).abs() < 0.01,
+        "red={red:?} white={white:?}"
+    );
+    assert!(
+        first_rect_paint_operation_index(page, Color::WHITE)
+            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+        "white reference should paint over the red fallback-baseline probe"
+    );
+}
+
+#[tokio::test]
+async fn css2_explicit_line_height_baseline_wpt_overlay_hides_fallback_probe() {
+    let primary = "weasyprint-samples/invoice/SourceSans3-Regular.ttf";
+    let fallback = "weasyprint-samples/letter/fonts/Pacifico-Regular.ttf";
+    let primary_data = std::fs::read(primary).unwrap();
+    let fallback_data = std::fs::read(fallback).unwrap();
+    let primary_face = ttf_parser::Face::parse(&primary_data, 0).unwrap();
+    let fallback_face = ttf_parser::Face::parse(&fallback_data, 0).unwrap();
+    assert_ne!(
+        primary_face.ascender(),
+        fallback_face.ascender(),
+        "fixture fonts should have different ascenders"
+    );
+
+    let primary_woff =
+        base64::engine::general_purpose::STANDARD.encode(woff1_from_sfnt(&primary_data));
+    let fallback_woff =
+        base64::engine::general_purpose::STANDARD.encode(woff1_from_sfnt(&fallback_data));
+    let html = format!(
+        r#"
+        <!DOCTYPE html>
+        <meta charset="utf-8">
+        <style>
+        @page {{ size: 720px 400px; margin: 0 }}
+        body {{ margin: 8px }}
+        @font-face {{
+          font-family: 'high-a-only';
+          font-style: normal;
+          font-weight: 400;
+          src: url(data:font/woff;base64,{primary_woff}) format('woff');
+          unicode-range: U+0020, U+0061;
+        }}
+        @font-face {{
+          font-family: 'deep-b-only';
+          font-style: normal;
+          font-weight: 400;
+          src: url(data:font/woff;base64,{fallback_woff}) format('woff');
+          unicode-range: U+0062;
+        }}
+
+        div {{
+          position: absolute;
+          line-height: 100px;
+          font-size: 100px;
+          width: 300px;
+          text-align: right;
+          color: transparent;
+        }}
+        span {{
+          display: inline-block;
+          width: 20px;
+          height: 20px;
+        }}
+        #hd {{ font-family: high-a-only, deep-b-only; }}
+        #hd span {{ background: red; }}
+        #h {{ font-family: high-a-only; }}
+        #h span {{ background: white; }}
+        </style>
+
+        <p>Test passes if there is <strong>no red</strong> below.
+        <div id="hd">ab<span></span></div>
+        <div id="h">aa<span></span></div>
+        "#
+    );
+    let document = Html::from_string(html)
+        .render_async(&RenderOptions::default())
+        .await
+        .unwrap();
+    let page = &document.pages[0];
+    let red = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .expect("red fallback-baseline probe should paint");
+    let white = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(Color::WHITE))
+        .expect("white reference probe should paint");
+
+    assert!(
+        (red.x() - white.x()).abs() < 0.01,
+        "red={red:?} white={white:?}"
+    );
+    assert!(
+        (red.y() - white.y()).abs() < 0.01,
+        "red={red:?} white={white:?}"
+    );
+    assert!(
+        (red.width() - white.width()).abs() < 0.01,
+        "red={red:?} white={white:?}"
+    );
+    assert!(
+        (red.height() - white.height()).abs() < 0.01,
+        "red={red:?} white={white:?}"
+    );
+    assert!(
+        first_rect_paint_operation_index(page, Color::WHITE)
+            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+        "white reference should paint over the red fallback-baseline probe"
+    );
 }
 
 fn woff1_from_sfnt(sfnt: &[u8]) -> Vec<u8> {
@@ -893,7 +1173,7 @@ fn alreq_first_line_glyphs(document: &quire::Document) -> Option<AlreqLineGlyphs
     document
         .pages
         .iter()
-        .flat_map(|page| page.lines.iter())
+        .flat_map(|page| page.lines().iter())
         .filter(|line| {
             line.runs
                 .iter()

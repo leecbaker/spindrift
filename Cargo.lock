@@ -1652,6 +1652,7 @@ dependencies = [
  "tokio",
  "ttf-parser",
  "woff2-patched",
+ "xml5ever",
 ]
 
 [[package]]

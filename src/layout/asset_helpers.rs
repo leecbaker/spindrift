@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::assets::rasterize_generated_css_image;
 
 pub(super) fn load_image_source(
     src: &str,
@@ -44,10 +45,28 @@ pub(super) fn load_image_source(
 /// <https://www.w3.org/TR/css-sizing-3/#box-sizing>.
 pub(super) struct UsedImage {
     pub(super) decoded: DecodedPngImage,
-    pub(super) content_width: f32,
-    pub(super) content_height: f32,
-    pub(super) border_box_width: f32,
-    pub(super) border_box_height: f32,
+    pub(super) content_size: ContentBoxSize,
+    pub(super) border_box_size: BorderBoxSize,
+}
+
+impl UsedImage {
+    fn new(
+        decoded: DecodedPngImage,
+        content_size: ContentBoxSize,
+        horizontal_non_content: NonContentLength,
+        vertical_non_content: NonContentLength,
+    ) -> Self {
+        let border_box_size = content_box_to_border_box_size(
+            content_size,
+            horizontal_non_content,
+            vertical_non_content,
+        );
+        Self {
+            decoded,
+            content_size,
+            border_box_size,
+        }
+    }
 }
 
 /// Intrinsic dimensions and HTML presentational hints for an image element.
@@ -73,8 +92,9 @@ pub(super) fn intrinsic_image_size(
 ) -> Option<IntrinsicImageSize> {
     let src = element.attrs.get("src")?;
     let decoded = load_image_source(src, base_url, root_url, resource_cache)?;
-    let width = decoded.pixel_width as f32;
-    let height = decoded.pixel_height as f32;
+    let natural_size = decoded.natural_layout_size();
+    let width = natural_size.width;
+    let height = natural_size.height;
     if width <= 0.0 || height <= 0.0 {
         return None;
     }
@@ -102,7 +122,10 @@ pub(super) fn used_image(
     resource_cache: &ResourceCache,
 ) -> Option<UsedImage> {
     let intrinsic = intrinsic_image_size(element, base_url, root_url, resource_cache)?;
-    let aspect_ratio = intrinsic.width / intrinsic.height;
+    let natural_aspect_ratio = intrinsic.width / intrinsic.height;
+    let aspect_ratio = style
+        .aspect_ratio
+        .preferred_ratio(true, Some(natural_aspect_ratio))?;
     let borders = used_border_widths(style);
     let horizontal_non_content =
         borders.left + borders.right + style.padding.left + style.padding.right;
@@ -141,13 +164,12 @@ pub(super) fn used_image(
     if width_is_auto && !height_is_auto {
         content_height = content_width / aspect_ratio;
     }
-    Some(UsedImage {
-        decoded: intrinsic.decoded,
-        content_width,
-        content_height,
-        border_box_width: content_width + horizontal_non_content,
-        border_box_height: content_height + vertical_non_content,
-    })
+    Some(UsedImage::new(
+        intrinsic.decoded,
+        content_box_size_pt(content_width, content_height),
+        non_content_pt(horizontal_non_content),
+        non_content_pt(vertical_non_content),
+    ))
 }
 
 pub(super) fn used_generated_image(
@@ -159,12 +181,16 @@ pub(super) fn used_generated_image(
     resource_cache: &ResourceCache,
 ) -> Option<UsedImage> {
     let decoded = load_image_source(src, base_url, root_url, resource_cache)?;
-    let intrinsic_width = decoded.pixel_width as f32;
-    let intrinsic_height = decoded.pixel_height as f32;
+    let natural_size = decoded.natural_layout_size();
+    let intrinsic_width = natural_size.width;
+    let intrinsic_height = natural_size.height;
     if intrinsic_width <= 0.0 || intrinsic_height <= 0.0 {
         return None;
     }
-    let aspect_ratio = intrinsic_width / intrinsic_height;
+    let natural_aspect_ratio = intrinsic_width / intrinsic_height;
+    let aspect_ratio = style
+        .aspect_ratio
+        .preferred_ratio(true, Some(natural_aspect_ratio))?;
     let borders = used_border_widths(style);
     let horizontal_non_content =
         borders.left + borders.right + style.padding.left + style.padding.right;
@@ -201,13 +227,89 @@ pub(super) fn used_generated_image(
     if width_is_auto && !height_is_auto {
         content_height = content_width / aspect_ratio;
     }
-    Some(UsedImage {
+    Some(UsedImage::new(
         decoded,
+        content_box_size_pt(content_width, content_height),
+        non_content_pt(horizontal_non_content),
+        non_content_pt(vertical_non_content),
+    ))
+}
+
+pub(super) fn used_generated_image_value(
+    image: &BackgroundImage,
+    style: &ComputedStyle,
+    available_width: f32,
+    fallback_base_url: Option<&Path>,
+    fallback_root_url: Option<&Path>,
+    resource_cache: &ResourceCache,
+) -> Option<UsedImage> {
+    if let BackgroundImage::Url {
+        src,
+        base_url,
+        root_url,
+    } = image
+    {
+        return used_generated_image(
+            src,
+            style,
+            available_width,
+            base_url.as_deref().or(fallback_base_url),
+            root_url.as_deref().or(fallback_root_url),
+            resource_cache,
+        );
+    }
+
+    let borders = used_border_widths(style);
+    let horizontal_non_content =
+        borders.left + borders.right + style.padding.left + style.padding.right;
+    let vertical_non_content =
+        borders.top + borders.bottom + style.padding.top + style.padding.bottom;
+    let available_content_width = (available_width - horizontal_non_content).max(0.0);
+    let width = used_content_width_or_auto(style, available_width, horizontal_non_content);
+    let height = definite_image_content_height_without_percent(style, vertical_non_content);
+    let width_is_auto = width.is_none();
+    let height_is_auto = height.is_none();
+    let default_size = style.font_size.max(1.0);
+    let (mut content_width, mut content_height) = match (width, height) {
+        (Some(width_value), None) => (width_value, width_value),
+        (None, Some(height_value)) => (height_value, height_value),
+        (None, None) => (default_size, default_size),
+        (Some(width_value), Some(height_value)) => (width_value, height_value),
+    };
+    constrain_replaced_size_with_aspect_ratio(
+        &mut content_width,
+        &mut content_height,
+        1.0,
+        ReplacedAutoAxes {
+            width: width_is_auto,
+            height: height_is_auto,
+        },
+        ReplacedSizeConstraints {
+            min_width: used_min_width(style, available_width),
+            max_width: used_max_width(style, available_width)
+                .map(|width| width.min(available_content_width)),
+            min_height: used_min_height(style, available_width),
+            max_height: used_max_height(style, available_width),
+        },
+    );
+    content_width = content_width.min(available_content_width);
+    if width_is_auto && !height_is_auto {
+        content_height = content_width;
+    }
+    let decoded = rasterize_generated_css_image(
+        image,
         content_width,
         content_height,
-        border_box_width: content_width + horizontal_non_content,
-        border_box_height: content_height + vertical_non_content,
-    })
+        fallback_base_url,
+        fallback_root_url,
+        resource_cache,
+    )?;
+    Some(UsedImage::new(
+        decoded,
+        content_box_size_pt(content_width, content_height),
+        non_content_pt(horizontal_non_content),
+        non_content_pt(vertical_non_content),
+    ))
 }
 
 /// Used size for an invalid CSS `content: url(...)` replacement image.
@@ -231,18 +333,17 @@ pub(super) fn used_invalid_replacement_image(
     let content_height =
         definite_image_content_height_without_percent(style, vertical_non_content).unwrap_or(0.0);
     content_width = content_width.min(available_content_width);
-    UsedImage {
-        decoded: DecodedPngImage {
+    UsedImage::new(
+        DecodedPngImage {
             pixel_width: 1,
             pixel_height: 1,
             rgb: vec![0, 0, 0],
             alpha: Some(vec![0]),
         },
-        content_width,
-        content_height,
-        border_box_width: content_width + horizontal_non_content,
-        border_box_height: content_height + vertical_non_content,
-    }
+        content_box_size_pt(content_width, content_height),
+        non_content_pt(horizontal_non_content),
+        non_content_pt(vertical_non_content),
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -466,8 +567,9 @@ pub(super) fn used_background_size(
     area_height: f32,
     value: css::BackgroundSize,
 ) -> (f32, f32) {
-    let intrinsic_width = image.pixel_width as f32;
-    let intrinsic_height = image.pixel_height as f32;
+    let natural_size = image.natural_layout_size();
+    let intrinsic_width = natural_size.width;
+    let intrinsic_height = natural_size.height;
     if intrinsic_width <= 0.0 || intrinsic_height <= 0.0 {
         return (0.0, 0.0);
     }
@@ -697,7 +799,7 @@ pub(super) fn used_border_image_outsets(
 fn used_border_image_outset_value(value: css::BorderImageOutsetValue, border_width: f32) -> f32 {
     match value {
         css::BorderImageOutsetValue::Number(value) => value * border_width,
-        css::BorderImageOutsetValue::Length(value) => value.length,
+        css::BorderImageOutsetValue::Length(value) => value.length_points(),
     }
     .max(0.0)
 }
@@ -790,4 +892,61 @@ pub(super) fn parse_html_length(value: &str) -> Option<f32> {
         .parse::<f32>()
         .ok()
         .map(|value| value * css::CSS_PX_TO_PT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::units::{border_box_size_pt, border_box_to_content_box_size};
+
+    fn transparent_decoded_image() -> DecodedPngImage {
+        DecodedPngImage {
+            pixel_width: 1,
+            pixel_height: 1,
+            rgb: vec![0, 0, 0],
+            alpha: Some(vec![0]),
+        }
+    }
+
+    #[test]
+    fn used_image_new_expands_content_size_to_border_box_size() {
+        let image = UsedImage::new(
+            transparent_decoded_image(),
+            content_box_size_pt(150.0, 100.0),
+            non_content_pt(20.0),
+            non_content_pt(30.0),
+        );
+
+        assert_eq!(image.content_size.width, 150.0);
+        assert_eq!(image.content_size.height, 100.0);
+        assert_eq!(image.border_box_size.width, 170.0);
+        assert_eq!(image.border_box_size.height, 130.0);
+    }
+
+    #[test]
+    fn used_image_shared_border_to_content_conversion_clamps_at_zero() {
+        let content = border_box_to_content_box_size(
+            border_box_size_pt(100.0, 100.0),
+            non_content_pt(150.0),
+            non_content_pt(150.0),
+        );
+
+        assert_eq!(content.width, 0.0);
+        assert_eq!(content.height, 0.0);
+    }
+
+    #[test]
+    fn used_image_invalid_replacement_keeps_transparent_pixel_and_zero_content_size() {
+        let style = ComputedStyle::initial();
+        let image = used_invalid_replacement_image(&style, 100.0);
+
+        assert_eq!(image.decoded.pixel_width, 1);
+        assert_eq!(image.decoded.pixel_height, 1);
+        assert_eq!(image.decoded.rgb, vec![0, 0, 0]);
+        assert_eq!(image.decoded.alpha, Some(vec![0]));
+        assert_eq!(image.content_size.width, 0.0);
+        assert_eq!(image.content_size.height, 0.0);
+        assert_eq!(image.border_box_size.width, 0.0);
+        assert_eq!(image.border_box_size.height, 0.0);
+    }
 }

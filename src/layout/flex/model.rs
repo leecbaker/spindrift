@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) struct FlexLayout {
     pub(super) height: f32,
-    pub(super) first_baseline: f32,
+    pub(super) first_baseline: Option<f32>,
     pub(super) items: Vec<FlexItemLayout>,
     /// Flex line metadata recovered from the final Taffy layout.
     ///
@@ -47,16 +47,6 @@ impl FlexLineLayout {
 
     pub(super) fn cross_size(&self) -> f32 {
         (self.cross_end - self.cross_start).max(0.0)
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn main_bounds(&self) -> (f32, f32) {
-        (self.main_start, self.main_end)
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn cross_bounds(&self) -> (f32, f32) {
-        (self.cross_start, self.cross_end)
     }
 
     pub(super) fn largest_collapsed_strut(&self) -> f32 {
@@ -387,12 +377,13 @@ impl FlexItemAvailableSpace {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FlexItemEstimate {
-    pub(super) width: f32,
-    pub(super) height: f32,
-    pub(super) min_width: f32,
-    pub(super) min_height: f32,
-    pub(super) content_width: f32,
-    pub(super) content_height: f32,
+    pub(super) width: ContentBoxLength,
+    pub(super) height: ContentBoxLength,
+    pub(super) min_width: ContentBoxLength,
+    pub(super) min_height: ContentBoxLength,
+    pub(super) content_width: ContentBoxLength,
+    pub(super) content_height: ContentBoxLength,
+    pub(super) preferred_aspect_ratio: Option<f32>,
     pub(super) first_baseline: Option<f32>,
     pub(super) last_baseline: Option<f32>,
     pub(super) first_horizontal_baseline: Option<f32>,
@@ -401,6 +392,8 @@ pub(super) struct FlexItemEstimate {
 
 impl FlexItemEstimate {
     pub(super) fn fixed(width: f32, height: f32) -> Self {
+        let width = content_box_pt(width);
+        let height = content_box_pt(height);
         Self {
             width,
             height,
@@ -408,6 +401,7 @@ impl FlexItemEstimate {
             min_height: height,
             content_width: width,
             content_height: height,
+            preferred_aspect_ratio: None,
             first_baseline: None,
             last_baseline: None,
             first_horizontal_baseline: None,
@@ -459,11 +453,6 @@ impl FlexItemLayout {
             rect.size.width,
             rect.size.height,
         )
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn rect(&self) -> ContainerRect {
-        self.rect
     }
 
     pub(super) fn x(&self) -> f32 {
@@ -546,7 +535,6 @@ impl FlexItemLayout {
         }
     }
 
-    #[allow(dead_code)]
     pub(super) fn cross_size(&self, axes: FlexAxes) -> f32 {
         if axes.is_main_row_axis() {
             self.height()
@@ -555,7 +543,6 @@ impl FlexItemLayout {
         }
     }
 
-    #[allow(dead_code)]
     pub(super) fn set_cross_size(&mut self, axes: FlexAxes, size: f32) {
         if axes.is_main_row_axis() {
             self.set_height(size);
@@ -597,54 +584,7 @@ impl FlexItemLayout {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct StyledChild<'a> {
-    pub(super) kind: StyledChildKind<'a>,
-    pub(super) style: ComputedStyle,
-}
-
-/// Source kind for a flex item.
-///
-/// CSS Flexbox creates flex items from each in-flow child, and wraps each
-/// contiguous non-collapsible text run in an anonymous flex item:
-/// <https://www.w3.org/TR/css-flexbox-1/#flex-items>.
-#[derive(Debug, Clone)]
-pub(super) enum StyledChildKind<'a> {
-    Element {
-        element: &'a Element,
-        signature: Box<ElementSignature>,
-        children: Option<std::borrow::Cow<'a, [box_tree::FormattingBox<'a>]>>,
-    },
-    AnonymousContent {
-        children: Vec<box_tree::FormattingBox<'a>>,
-    },
-}
-
-impl<'a> StyledChild<'a> {
-    pub(super) fn element_parts(
-        &self,
-    ) -> Option<(
-        &'a Element,
-        &ElementSignature,
-        Option<&[box_tree::FormattingBox<'a>]>,
-    )> {
-        match &self.kind {
-            StyledChildKind::Element {
-                element,
-                signature,
-                children,
-            } => Some((*element, signature.as_ref(), children.as_deref())),
-            StyledChildKind::AnonymousContent { .. } => None,
-        }
-    }
-
-    pub(super) fn anonymous_content(&self) -> Option<&[box_tree::FormattingBox<'a>]> {
-        match &self.kind {
-            StyledChildKind::AnonymousContent { children } => Some(children),
-            StyledChildKind::Element { .. } => None,
-        }
-    }
-}
+pub(super) type StyledChild<'a> = FormattingContextChild<'a>;
 
 #[cfg(test)]
 mod tests {
@@ -673,6 +613,18 @@ mod tests {
         let (physical_x_gap, physical_y_gap) = physical_flex_gaps(&style);
         assert_eq!(physical_x_gap, style.row_gap);
         assert_eq!(physical_y_gap, style.column_gap);
+    }
+
+    #[test]
+    fn flex_item_fixed_estimate_stores_content_box_lengths() {
+        let estimate = FlexItemEstimate::fixed(24.0, 36.0);
+
+        assert_eq!(estimate.width.points(), 24.0);
+        assert_eq!(estimate.height.points(), 36.0);
+        assert_eq!(estimate.min_width.points(), 24.0);
+        assert_eq!(estimate.min_height.points(), 36.0);
+        assert_eq!(estimate.content_width.points(), 24.0);
+        assert_eq!(estimate.content_height.points(), 36.0);
     }
 
     #[test]

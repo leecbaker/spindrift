@@ -1,14 +1,12 @@
-use super::{
-    PdfFontValidationProfile, embedded_font_plans_with_profile, quantized_pdf_font_size,
-    shape_document_text,
-};
-use crate::document::{DocumentFontData, FontProgramKind};
+use std::sync::Arc;
+
+use super::{PdfFontValidationProfile, embedded_font_plans_with_profile, quantized_pdf_font_size};
+use crate::document::{DocumentFontData, FontProgramKind, PaintBand};
 use crate::{
     Color, Document, DocumentFont, DocumentMetadata, Html, Page, PdfVariant, RenderOptions,
     RenderedGlyph, RenderedLine, RenderedTextRun,
 };
 use fontique::Blob as FontiqueBlob;
-use std::sync::Arc;
 
 fn assert_alpha_ext_gstate(rendered: &str) {
     assert!(rendered.contains("/ExtGState"));
@@ -45,6 +43,272 @@ fn translate_transform_count(rendered: &str) -> usize {
 
 fn clip_scope_count(rendered: &str) -> usize {
     rendered.matches("W\nn").count()
+}
+
+fn filled_rect_count(rendered: &str) -> usize {
+    rendered.matches(" re\nf").count()
+}
+
+fn rendered_pdf_for_page(page: Page) -> String {
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: Vec::new(),
+        bookmarks: Vec::new(),
+    };
+    String::from_utf8_lossy(&document.write_pdf_bytes().unwrap()).into_owned()
+}
+
+fn green_rect(x: f32, y: f32, width: f32, height: f32) -> crate::RenderedRect {
+    crate::RenderedRect::new(x, y, width, height, Some(Color::new(0, 255, 0)), None, 0.0)
+}
+
+#[test]
+fn legacy_pages_without_operations_synthesize_paint_order() {
+    let mut page = Page::new(100.0, 100.0);
+    page.rects = vec![crate::RenderedRect::new(
+        0.0,
+        0.0,
+        10.0,
+        10.0,
+        Some(Color::BLACK),
+        None,
+        0.0,
+    )];
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: Vec::new(),
+        bookmarks: Vec::new(),
+    };
+
+    assert_eq!(
+        document.pages[0].paint_operations().as_ref(),
+        &[crate::PaintOperation::Rect(0)]
+    );
+    assert!(document.write_pdf_bytes().is_ok());
+}
+
+#[test]
+fn rounded_rects_participate_in_paint_order_and_pdf_serialization() {
+    let mut page = Page::new(100.0, 100.0);
+    page.operations = vec![crate::PaintOperation::RoundedRect(0)];
+    page.rounded_rects = vec![crate::RenderedRoundedRect::new(
+        10.0,
+        10.0,
+        30.0,
+        20.0,
+        crate::RenderedRoundedRectRadii {
+            top_left: crate::RenderedCornerRadius::new(4.0, 4.0),
+            top_right: crate::RenderedCornerRadius::new(4.0, 4.0),
+            bottom_right: crate::RenderedCornerRadius::new(4.0, 4.0),
+            bottom_left: crate::RenderedCornerRadius::new(4.0, 4.0),
+        },
+        Some(Color::BLACK),
+        None,
+        0.0,
+    )];
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: Vec::new(),
+        bookmarks: Vec::new(),
+    };
+
+    assert_eq!(
+        document.pages[0].paint_operations().as_ref(),
+        &[crate::PaintOperation::RoundedRect(0)]
+    );
+    assert!(document.write_pdf_bytes().is_ok());
+}
+
+#[test]
+fn paint_tree_coalesces_adjacent_same_fill_rectangles() {
+    let mut page = Page::new(100.0, 100.0);
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 0.0, 10.0, 10.0));
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 10.0, 10.0, 10.0));
+
+    let rendered = rendered_pdf_for_page(page);
+
+    assert_eq!(filled_rect_count(&rendered), 1);
+    assert!(rendered.contains("0 0 10 20 re\nf"));
+}
+
+#[test]
+fn paint_tree_drops_opaque_underpaint_covered_by_later_rectangles() {
+    let mut page = Page::new(100.0, 100.0);
+    page.push_rect_in_band(
+        PaintBand::InFlowBlock,
+        crate::RenderedRect::new(0.0, 0.0, 10.0, 10.0, Some(Color::new(255, 0, 0)), None, 0.0),
+    );
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 0.0, 10.0, 10.0));
+
+    let rendered = rendered_pdf_for_page(page);
+
+    assert_eq!(filled_rect_count(&rendered), 1);
+    assert!(rendered.contains("0 1 0 rg\n0 0 10 10 re\nf"));
+}
+
+#[test]
+fn paint_tree_rect_coalescing_flushes_before_lines() {
+    let mut page = Page::new(100.0, 100.0);
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 0.0, 10.0, 10.0));
+    page.push_line(RenderedLine::new(
+        "unshaped".to_string(),
+        0.0,
+        20.0,
+        10.0,
+        None,
+        Color::BLACK,
+        Vec::new(),
+    ));
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 10.0, 10.0, 10.0));
+
+    let rendered = rendered_pdf_for_page(page);
+
+    assert_eq!(filled_rect_count(&rendered), 2);
+}
+
+#[test]
+fn paint_tree_rect_coalescing_flushes_before_vector_paths() {
+    let mut page = Page::new(100.0, 100.0);
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 0.0, 10.0, 10.0));
+    page.push_path_in_band(
+        PaintBand::InFlowBlock,
+        crate::RenderedPath::new(
+            vec![
+                crate::RenderedPathCommand::move_to(crate::PaintPoint::new(20.0, 20.0)),
+                crate::RenderedPathCommand::line_to(crate::PaintPoint::new(25.0, 20.0)),
+                crate::RenderedPathCommand::line_to(crate::PaintPoint::new(20.0, 25.0)),
+                crate::RenderedPathCommand::Close,
+            ],
+            Some(Color::BLACK),
+            crate::RenderedPathFillRule::NonZero,
+            None,
+            0.0,
+            None,
+        ),
+    );
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 10.0, 10.0, 10.0));
+
+    let rendered = rendered_pdf_for_page(page);
+
+    assert_eq!(filled_rect_count(&rendered), 2);
+}
+
+#[test]
+fn paint_tree_rect_coalescing_flushes_before_rounded_rectangles() {
+    let mut page = Page::new(100.0, 100.0);
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 0.0, 10.0, 10.0));
+    page.push_rounded_rect_in_band(
+        PaintBand::InFlowBlock,
+        crate::RenderedRoundedRect::new(
+            20.0,
+            20.0,
+            10.0,
+            10.0,
+            crate::RenderedRoundedRectRadii::ZERO,
+            Some(Color::BLACK),
+            None,
+            0.0,
+        ),
+    );
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 10.0, 10.0, 10.0));
+
+    let rendered = rendered_pdf_for_page(page);
+
+    assert_eq!(filled_rect_count(&rendered), 2);
+}
+
+#[tokio::test]
+async fn paint_tree_rect_coalescing_does_not_cross_transform_contexts() {
+    let pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body { margin: 0 }\
+         div { width: 10pt; height: 10pt; background: rgb(0 255 0) }\
+         .shift { transform-origin: 0 0; transform: translate(0, 0) }</style>\
+         <div></div><div class=\"shift\"></div>",
+    )
+    .write_pdf_bytes_async(&RenderOptions::default())
+    .await
+    .unwrap();
+    let rendered = String::from_utf8_lossy(&pdf);
+
+    assert_eq!(filled_rect_count(&rendered), 2);
+}
+
+#[tokio::test]
+async fn paint_tree_rect_coalescing_does_not_cross_clip_contexts() {
+    let pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body { margin: 0 }\
+         .plain, .inner { width: 10pt; height: 10pt; background: rgb(0 255 0) }\
+         .clip { width: 10pt; height: 10pt; overflow: hidden }</style>\
+         <div class=\"plain\"></div><div class=\"clip\"><div class=\"inner\"></div></div>",
+    )
+    .write_pdf_bytes_async(&RenderOptions::default())
+    .await
+    .unwrap();
+    let rendered = String::from_utf8_lossy(&pdf);
+
+    assert_eq!(filled_rect_count(&rendered), 2);
+}
+
+#[tokio::test]
+async fn paint_tree_rect_coalescing_does_not_cross_opacity_groups() {
+    let pdf = Html::from_string(
+        "<style>@page { size: 100pt 100pt; margin: 0 } body { margin: 0 }\
+         div { width: 10pt; height: 10pt; background: rgb(0 255 0) }\
+         .faded { opacity: 0.5 }</style><div></div><div class=\"faded\"></div>",
+    )
+    .write_pdf_bytes_async(&RenderOptions::default())
+    .await
+    .unwrap();
+    let rendered = String::from_utf8_lossy(&pdf);
+
+    assert_eq!(filled_rect_count(&rendered), 2);
+    assert_transparency_group(&rendered);
+}
+
+#[test]
+fn invalid_paint_operation_indexes_fail_before_pdf_serialization() {
+    let mut page = Page::new(100.0, 100.0);
+    page.operations = vec![crate::PaintOperation::Rect(1)];
+    page.rects = vec![crate::RenderedRect::new(
+        0.0,
+        0.0,
+        10.0,
+        10.0,
+        Some(Color::BLACK),
+        None,
+        0.0,
+    )];
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: Vec::new(),
+        bookmarks: Vec::new(),
+    };
+
+    let error = document.write_pdf_bytes().unwrap_err().to_string();
+    assert!(error.contains("paint operation 0 references missing rect 1"));
+}
+
+#[test]
+fn incomplete_paint_operation_streams_fail_before_pdf_serialization() {
+    let mut page = Page::new(100.0, 100.0);
+    page.operations = vec![crate::PaintOperation::Rect(0)];
+    page.rects = vec![
+        crate::RenderedRect::new(0.0, 0.0, 10.0, 10.0, Some(Color::BLACK), None, 0.0),
+        crate::RenderedRect::new(10.0, 10.0, 10.0, 10.0, Some(Color::WHITE), None, 0.0),
+    ];
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: Vec::new(),
+        bookmarks: Vec::new(),
+    };
+
+    let error = document.write_pdf_bytes().unwrap_err().to_string();
+    assert!(error.contains("unreferenced rect 1"));
 }
 
 #[tokio::test]
@@ -149,7 +413,11 @@ fn pdf_xmp_metadata_escapes_text_values() {
         producer: "Quire & Producer <PDF>".to_string(),
     });
 
-    let pdf = document.write_pdf_bytes().unwrap();
+    let options = RenderOptions {
+        pdf_variant: PdfVariant::Pdf,
+        ..Default::default()
+    };
+    let pdf = document.write_pdf_bytes_with_options(&options).unwrap();
     let rendered = String::from_utf8_lossy(&pdf);
     let xmp = first_xml_metadata_stream(&rendered).expect("catalog XMP metadata stream");
 
@@ -778,7 +1046,11 @@ fn pdf_full_font_fallback_name_omits_subset_prefix() {
         bookmarks: Vec::new(),
     };
 
-    let pdf = document.write_pdf_bytes().unwrap();
+    let options = RenderOptions {
+        pdf_variant: PdfVariant::Pdf,
+        ..Default::default()
+    };
+    let pdf = document.write_pdf_bytes_with_options(&options).unwrap();
     let rendered = String::from_utf8_lossy(&pdf);
     let base_font = first_pdf_name_after(&rendered, "/BaseFont /").expect("BaseFont name");
 
@@ -838,13 +1110,7 @@ fn pdf_font_plan_pdfa_includes_cid_set_bits_for_used_cids() {
         fonts: vec![font],
         bookmarks: Vec::new(),
     };
-    let shaped_document = shape_document_text(&document);
-    let plans = embedded_font_plans_with_profile(
-        &document,
-        &shaped_document,
-        1,
-        PdfFontValidationProfile::PdfA,
-    );
+    let plans = embedded_font_plans_with_profile(&document, 1, PdfFontValidationProfile::PdfA);
     let cid_set = plans.fonts[0]
         .cid_set_data
         .as_ref()
@@ -871,13 +1137,7 @@ fn pdf_font_plan_strict_rejects_glyphs_without_unicode_mapping() {
         fonts: vec![font],
         bookmarks: Vec::new(),
     };
-    let shaped_document = shape_document_text(&document);
-    let plans = embedded_font_plans_with_profile(
-        &document,
-        &shaped_document,
-        1,
-        PdfFontValidationProfile::StrictPdf,
-    );
+    let plans = embedded_font_plans_with_profile(&document, 1, PdfFontValidationProfile::StrictPdf);
 
     assert!(matches!(
         plans.fonts[0].embedding_kind,

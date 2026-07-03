@@ -106,6 +106,17 @@ pub(super) fn is_document_canvas_element(element: &Element) -> bool {
     matches!(element.tag.as_str(), "html" | "body")
 }
 
+/// Return whether the element's used overflow clips its own box.
+///
+/// CSS 2.1 propagates overflow from the root element, and in HTML documents
+/// from the body element when the root is `visible`, to the viewport. The
+/// element that provides the propagated value uses `overflow: visible`, so
+/// Quire's document-canvas boxes must not establish their own overflow clips:
+/// <https://www.w3.org/TR/CSS2/visufx.html#overflow-clipping>.
+pub(super) fn used_overflow_clips_element(element: &Element, style: &ComputedStyle) -> bool {
+    style.overflow.clips_overflow() && !is_document_canvas_element(element)
+}
+
 pub(super) fn is_html_table_element(element: &Element) -> bool {
     element.tag == "table"
 }

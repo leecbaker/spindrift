@@ -85,12 +85,14 @@ fn parse_generated_content_parts(
         } else if let Some((part, tail)) = parse_generated_counters_token(rest) {
             parts.push(part);
             rest = tail;
-        } else if let Some((url, tail)) = parse_css_url_token(rest) {
-            parts.push(GeneratedContentPart::Image {
-                url,
-                base_url: base_url.map(Path::to_path_buf),
-                root_url: root_url.map(Path::to_path_buf),
-            });
+        } else if let Some((part, tail)) = parse_generated_target_counter_token(rest) {
+            parts.push(part);
+            rest = tail;
+        } else if let Some((part, tail)) = parse_generated_target_text_token(rest) {
+            parts.push(part);
+            rest = tail;
+        } else if let Some((part, tail)) = parse_generated_image_token(rest, base_url, root_url) {
+            parts.push(part);
             rest = tail;
         } else if rest
             .get(..8)
@@ -162,6 +164,8 @@ fn generated_part_to_alt(part: GeneratedContentPart) -> Option<GeneratedAltTextP
         }),
         GeneratedContentPart::Contents
         | GeneratedContentPart::Image { .. }
+        | GeneratedContentPart::TargetCounter { .. }
+        | GeneratedContentPart::TargetText { .. }
         | GeneratedContentPart::Quote(_)
         | GeneratedContentPart::Leader(_) => None,
     }
@@ -192,6 +196,12 @@ pub(crate) fn parse_named_string_sets(value: &str) -> Option<Vec<NamedStringSet>
                 if argument.is_empty() || argument == "text" {
                     parts.push(NamedStringPart::ContentText);
                     rest = tail.trim_start();
+                } else if argument == "first-letter" {
+                    parts.push(NamedStringPart::ContentFirstLetter);
+                    rest = tail.trim_start();
+                } else if argument == "marker" {
+                    parts.push(NamedStringPart::ContentMarker);
+                    rest = tail.trim_start();
                 } else if argument == "before" {
                     parts.push(NamedStringPart::BeforeContent);
                     rest = tail.trim_start();
@@ -201,20 +211,23 @@ pub(crate) fn parse_named_string_sets(value: &str) -> Option<Vec<NamedStringSet>
                 } else {
                     return None;
                 }
-            } else if let Some(tail) = strip_ascii_function(rest, "attr") {
-                let (argument, tail) = split_function_argument(tail)?;
-                let name = argument
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string();
-                if name.is_empty() || name.split_whitespace().count() != 1 {
-                    return None;
-                }
-                parts.push(NamedStringPart::Attr(name));
+            } else if let Some((attr, tail)) = parse_named_string_attr_token(rest) {
+                parts.push(attr);
                 rest = tail.trim_start();
-            } else if let Some((url, tail)) = parse_css_url_token(rest) {
-                parts.push(NamedStringPart::Image(url));
+            } else if let Some((image, tail)) = parse_named_string_image_token(rest) {
+                parts.push(image);
+                rest = tail.trim_start();
+            } else if let Some((quote, tail)) = parse_generated_quote_token(rest) {
+                parts.push(NamedStringPart::Quote(quote));
+                rest = tail.trim_start();
+            } else if let Some((leader, tail)) = parse_generated_leader_token(rest) {
+                parts.push(NamedStringPart::Leader(leader));
+                rest = tail.trim_start();
+            } else if let Some((target_counter, tail)) = parse_named_string_target_counter(rest) {
+                parts.push(target_counter);
+                rest = tail.trim_start();
+            } else if let Some((target_text, tail)) = parse_named_string_target_text(rest) {
+                parts.push(target_text);
                 rest = tail.trim_start();
             } else if let Some((counter, tail)) = parse_named_string_counter_token(rest) {
                 parts.push(counter);
@@ -271,6 +284,111 @@ pub(crate) fn parse_named_string_counters_token(value: &str) -> Option<(NamedStr
     ))
 }
 
+fn parse_named_string_attr_token(value: &str) -> Option<(NamedStringPart, &str)> {
+    let body = strip_ascii_function(value, "attr")?;
+    let (argument, tail) = split_function_argument(body)?;
+    let mut parts = split_top_level_commas(argument);
+    if parts.is_empty() || parts.len() > 2 {
+        return None;
+    }
+    let name = parse_attr_name(parts.remove(0))?;
+    let fallback = if let Some(fallback) = parts.first() {
+        let fallback = fallback.trim();
+        if fallback.is_empty() {
+            None
+        } else {
+            let (text, tail) = parse_css_string_token(fallback)?;
+            if !tail.trim().is_empty() {
+                return None;
+            }
+            Some(text)
+        }
+    } else {
+        None
+    };
+    Some((NamedStringPart::Attr { name, fallback }, tail))
+}
+
+fn parse_named_string_image_token(value: &str) -> Option<(NamedStringPart, &str)> {
+    let (part, tail) = parse_generated_image_token(value, None, None)?;
+    let GeneratedContentPart::Image { image } = part else {
+        return None;
+    };
+    Some((NamedStringPart::Image(image), tail))
+}
+
+fn parse_named_string_target_counter(value: &str) -> Option<(NamedStringPart, &str)> {
+    let body = strip_ascii_function(value, "target-counter")?;
+    let (argument, tail) = split_function_argument(body)?;
+    let arguments = split_top_level_commas(argument);
+    if !(2..=3).contains(&arguments.len()) {
+        return None;
+    }
+    let target = parse_target_reference(arguments[0].trim())?;
+    let name = arguments[1].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let style = if let Some(argument) = arguments.get(2) {
+        Some(parse_list_style_type(argument.trim())?)
+    } else {
+        None
+    };
+    Some((
+        NamedStringPart::TargetCounter {
+            target,
+            name: name.to_string(),
+            style,
+        },
+        tail,
+    ))
+}
+
+fn parse_named_string_target_text(value: &str) -> Option<(NamedStringPart, &str)> {
+    let body = strip_ascii_function(value, "target-text")?;
+    let (argument, tail) = split_function_argument(body)?;
+    let arguments = split_top_level_commas(argument);
+    if !(1..=2).contains(&arguments.len()) {
+        return None;
+    }
+    let target = parse_target_reference(arguments[0].trim())?;
+    let keyword = arguments
+        .get(1)
+        .map(|argument| parse_named_string_target_text_keyword(argument.trim()))
+        .unwrap_or(Some(NamedStringTargetTextKeyword::Content))?;
+    Some((NamedStringPart::TargetText { target, keyword }, tail))
+}
+
+fn parse_named_string_target_text_keyword(value: &str) -> Option<NamedStringTargetTextKeyword> {
+    match value.to_ascii_lowercase().as_str() {
+        "content" => Some(NamedStringTargetTextKeyword::Content),
+        "before" => Some(NamedStringTargetTextKeyword::Before),
+        "after" => Some(NamedStringTargetTextKeyword::After),
+        "first-letter" => Some(NamedStringTargetTextKeyword::FirstLetter),
+        _ => None,
+    }
+}
+
+fn parse_target_reference(value: &str) -> Option<String> {
+    if let Some((text, tail)) = parse_css_string_token(value)
+        && tail.trim().is_empty()
+    {
+        return Some(text);
+    }
+    let body = strip_ascii_function(value, "url")?;
+    let (argument, tail) = split_function_argument(body)?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    if let Some((text, tail)) = parse_css_string_token(argument.trim())
+        && tail.trim().is_empty()
+    {
+        return Some(text);
+    }
+    let target = argument.trim();
+    (!target.is_empty()).then(|| target.to_string())
+}
+
 fn parse_generated_attr_token(value: &str) -> Option<(GeneratedContentPart, &str)> {
     let body = strip_ascii_function(value, "attr")?;
     let (argument, tail) = split_function_argument(body)?;
@@ -311,6 +429,82 @@ fn parse_generated_counters_token(value: &str) -> Option<(GeneratedContentPart, 
         },
         tail,
     ))
+}
+
+fn parse_generated_image_token<'a>(
+    value: &'a str,
+    base_url: Option<&Path>,
+    root_url: Option<&Path>,
+) -> Option<(GeneratedContentPart, &'a str)> {
+    if let Some((url, tail)) = parse_css_url_token(value) {
+        return Some((
+            GeneratedContentPart::Image {
+                image: BackgroundImage::Url {
+                    src: url,
+                    base_url: base_url.map(Path::to_path_buf),
+                    root_url: root_url.map(Path::to_path_buf),
+                },
+            },
+            tail,
+        ));
+    }
+    for name in [
+        "linear-gradient",
+        "repeating-linear-gradient",
+        "radial-gradient",
+        "repeating-radial-gradient",
+    ] {
+        let Some(body) = strip_ascii_function(value, name) else {
+            continue;
+        };
+        let (argument, tail) = split_function_argument(body)?;
+        let image_text = format!("{name}({argument})");
+        let image = crate::css::parse_background_image(&image_text, base_url, root_url)?;
+        return Some((GeneratedContentPart::Image { image }, tail));
+    }
+    None
+}
+
+fn parse_generated_target_counter_token(value: &str) -> Option<(GeneratedContentPart, &str)> {
+    let body = strip_ascii_function(value, "target-counter")?;
+    let (argument, tail) = split_function_argument(body)?;
+    let arguments = split_top_level_commas(argument);
+    if !(2..=3).contains(&arguments.len()) {
+        return None;
+    }
+    let target = parse_target_reference(arguments[0].trim())?;
+    let name = arguments[1].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let style = if let Some(argument) = arguments.get(2) {
+        Some(parse_list_style_type(argument.trim())?)
+    } else {
+        None
+    };
+    Some((
+        GeneratedContentPart::TargetCounter {
+            target,
+            name: name.to_string(),
+            style,
+        },
+        tail,
+    ))
+}
+
+fn parse_generated_target_text_token(value: &str) -> Option<(GeneratedContentPart, &str)> {
+    let body = strip_ascii_function(value, "target-text")?;
+    let (argument, tail) = split_function_argument(body)?;
+    let arguments = split_top_level_commas(argument);
+    if !(1..=2).contains(&arguments.len()) {
+        return None;
+    }
+    let target = parse_target_reference(arguments[0].trim())?;
+    let keyword = arguments
+        .get(1)
+        .map(|argument| parse_named_string_target_text_keyword(argument.trim()))
+        .unwrap_or(Some(NamedStringTargetTextKeyword::Content))?;
+    Some((GeneratedContentPart::TargetText { target, keyword }, tail))
 }
 
 fn parse_generated_quote_token(value: &str) -> Option<(GeneratedQuote, &str)> {

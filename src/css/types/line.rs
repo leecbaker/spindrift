@@ -18,8 +18,8 @@ pub(crate) enum ComputedLineHeight {
 impl ComputedLineHeight {
     pub(crate) const NORMAL: Self = Self::Normal;
 
-    pub(crate) fn from_length(length: f32) -> Self {
-        Self::Length(ComputedLengthPercentage::from_length(length))
+    pub(crate) fn from_points(points: f32) -> Self {
+        Self::Length(ComputedLengthPercentage::from_points(points))
     }
 
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
@@ -35,7 +35,9 @@ impl ComputedLineHeight {
             Self::Length(length) => (
                 length
                     .used_length_with_percentage_basis(font_size)
-                    .unwrap_or(length.length + length.percent * font_size + length.ch * font_size),
+                    .unwrap_or(
+                        length.length_with_percentage_basis(font_size) + length.ch * font_size,
+                    ),
                 None,
                 false,
             ),
