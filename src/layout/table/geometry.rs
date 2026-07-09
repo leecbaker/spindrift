@@ -35,7 +35,7 @@ impl TableAxes {
     pub(super) fn for_style(style: &ComputedStyle) -> Self {
         Self {
             flow: FlowAxes::for_style(style),
-            direction: style.direction,
+            direction: style.used_direction(),
         }
     }
 
@@ -62,6 +62,46 @@ impl TableAxes {
     ) -> f32 {
         self.boundary_x(total_width, logical_start_x)
             .min(self.boundary_x(total_width, logical_end_x))
+    }
+
+    /// Projects a logical table-grid rectangle into physical table-local
+    /// coordinates.
+    ///
+    /// Table columns occupy the CSS inline axis and table rows occupy the
+    /// block axis. Column-plan `direction` reversal has already been applied
+    /// to the logical inline coordinate, so this projection deliberately uses
+    /// LTR inline progression and does not reverse it a second time.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+    /// <https://drafts.csswg.org/css-tables-3/#cell-assignment>
+    pub(super) fn physical_rect_from_logical_grid(
+        self,
+        logical_inline_start: f32,
+        logical_block_start: f32,
+        logical_inline_size: f32,
+        logical_block_size: f32,
+        logical_inline_extent: f32,
+        logical_block_extent: f32,
+    ) -> ContainerRect {
+        let axes = FlowAxes::new(self.flow.writing_mode(), Direction::Ltr);
+        axes.rect_from_logical(
+            ContainerRect::new(
+                ContainerPoint::new(0.0, 0.0),
+                axes.physical_size_from_logical(LogicalSize {
+                    inline: logical_inline_extent.max(0.0),
+                    block: logical_block_extent.max(0.0),
+                }),
+            ),
+            LogicalRect {
+                origin: LogicalPoint {
+                    inline: logical_inline_start.max(0.0),
+                    block: logical_block_start.max(0.0),
+                },
+                size: LogicalSize {
+                    inline: logical_inline_size.max(0.0),
+                    block: logical_block_size.max(0.0),
+                },
+            },
+        )
     }
 }
 
@@ -162,16 +202,17 @@ impl TableCellBorderBox {
         self.rect.size.width
     }
 
-    pub(super) fn height(self) -> f32 {
-        self.rect.size.height
-    }
-
     pub(super) fn x(self, placement: TableGridPlacement) -> f32 {
-        placement.x_for(self.rect.origin.x)
+        placement.page_top_rect_for(self.rect).x()
     }
 
     pub(super) fn top_y(self, placement: TableGridPlacement) -> f32 {
-        placement.top_y_for(self.rect.origin.y)
+        placement.page_top_rect_for(self.rect).top_y()
+    }
+
+    /// Project this logical cell border box to physical page geometry.
+    pub(super) fn page_top_rect(self, placement: TableGridPlacement) -> PageTopRect {
+        placement.page_top_rect_for(self.rect)
     }
 
     pub(super) fn content_box(
@@ -182,12 +223,14 @@ impl TableCellBorderBox {
         content_offset: f32,
         content_x_offset: f32,
     ) -> TableCellContentBox {
-        let x = self.x(placement) + borders.left + padding.left + content_x_offset;
+        let border_box = placement.page_top_rect_for(self.rect);
+        let x = border_box.x() + borders.left + padding.left + content_x_offset;
         let right =
-            self.x(placement) + self.width() - borders.right - padding.right + content_x_offset;
-        let top_y = self.top_y(placement) - borders.top - padding.top - content_offset;
+            border_box.x() + border_box.width() - borders.right - padding.right + content_x_offset;
+        let top_y = border_box.top_y() - borders.top - padding.top - content_offset;
         let height =
-            (self.height() - borders.top - borders.bottom - padding.top - padding.bottom).max(0.0);
+            (border_box.height() - borders.top - borders.bottom - padding.top - padding.bottom)
+                .max(0.0);
         TableCellContentBox {
             rect: PageTopRect::new(x, top_y, (right - x).max(0.0), height),
         }
@@ -288,28 +331,88 @@ impl TableCellContentBox {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct TableGridPlacement {
     origin: PageTopPoint,
+    axes: TableAxes,
+    logical_inline_extent: f32,
+    logical_block_extent: f32,
 }
 
 impl TableGridPlacement {
     pub(super) fn new(origin: PageTopPoint) -> Self {
-        Self { origin }
+        Self::with_axes(
+            origin,
+            TableAxes {
+                flow: FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
+                direction: Direction::Ltr,
+            },
+            0.0,
+            0.0,
+        )
+    }
+
+    /// Creates a table-grid placement whose slot geometry is projected through
+    /// the table root's logical axes.
+    ///
+    /// `origin` is the physical top-left corner of the table grid's containing
+    /// rectangle. The logical extents let right-to-left block progression in
+    /// `vertical-rl` locate rows from the opposite physical edge.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+    pub(super) fn with_axes(
+        origin: PageTopPoint,
+        axes: TableAxes,
+        logical_inline_extent: f32,
+        logical_block_extent: f32,
+    ) -> Self {
+        Self {
+            origin,
+            axes,
+            logical_inline_extent: logical_inline_extent.max(0.0),
+            logical_block_extent: logical_block_extent.max(0.0),
+        }
     }
 
     pub(super) fn x_for(self, grid_x: f32) -> f32 {
         self.origin.x() + grid_x
     }
 
-    pub(super) fn top_y_for(self, grid_y: f32) -> f32 {
-        self.origin.top_y() - grid_y
+    pub(super) fn overflow_clip_for(self, rect: TableGridRect) -> OverflowClip {
+        OverflowClip::from_page_top_rect(self.page_top_rect_for(rect))
     }
 
-    pub(super) fn overflow_clip_for(self, rect: TableGridRect) -> OverflowClip {
-        OverflowClip::from_page_top_rect(PageTopRect::new(
-            self.x_for(rect.origin.x),
-            self.top_y_for(rect.origin.y),
+    /// Projects one logical table-grid rectangle into page top-edge geometry.
+    pub(super) fn page_top_rect_for(self, rect: TableGridRect) -> PageTopRect {
+        let logical_inline_extent = self.logical_inline_extent.max(rect.max_x());
+        let logical_block_extent = self.logical_block_extent.max(rect.max_y());
+        let physical = self.axes.physical_rect_from_logical_grid(
+            rect.origin.x,
+            rect.origin.y,
             rect.size.width,
             rect.size.height,
+            logical_inline_extent,
+            logical_block_extent,
+        );
+        PageTopRect::new(
+            self.origin.x() + physical.origin.x,
+            self.origin.top_y() - physical.origin.y,
+            physical.size.width,
+            physical.size.height,
+        )
+    }
+
+    /// Returns the complete logical table-grid extent in page coordinates.
+    pub(super) fn full_page_top_rect(self) -> PageTopRect {
+        self.page_top_rect_for(TableGridRect::new(
+            TableGridPoint::new(0.0, 0.0),
+            TableGridSize::new(self.logical_inline_extent, self.logical_block_extent),
         ))
+    }
+
+    /// Return the logical table block extent carried by this placement.
+    ///
+    /// Structural table layers use the same root-grid extent as cell boxes;
+    /// keeping it on the placement prevents column backgrounds from falling
+    /// back to a fragment's physical page height in an orthogonal table.
+    pub(super) fn logical_block_extent(self) -> f32 {
+        self.logical_block_extent
     }
 
     pub(super) fn containing_block_for(
@@ -317,9 +420,10 @@ impl TableGridPlacement {
         border_box: TableCellBorderBox,
         borders: css::Edges,
     ) -> ContainingBlock {
+        let border_box = self.page_top_rect_for(border_box.rect());
         ContainingBlock::from_page_top_rect(PageTopRect::new(
-            border_box.x(self) + borders.left,
-            border_box.top_y(self) - borders.top,
+            border_box.x() + borders.left,
+            border_box.top_y() - borders.top,
             border_box.width() - borders.left - borders.right,
             border_box.height() - borders.top - borders.bottom,
         ))
@@ -346,6 +450,61 @@ mod tests {
     }
 
     #[test]
+    fn projects_vertical_rl_table_slots_from_logical_axes() {
+        let axes = TableAxes {
+            flow: FlowAxes::new(WritingMode::VerticalRl, Direction::Ltr),
+            direction: Direction::Ltr,
+        };
+        let rect = axes.physical_rect_from_logical_grid(10.0, 20.0, 30.0, 40.0, 100.0, 200.0);
+
+        assert_eq!(rect.origin, ContainerPoint::new(140.0, 10.0));
+        assert_eq!(rect.size, ContainerSize::new(40.0, 30.0));
+    }
+
+    #[test]
+    fn projects_vertical_lr_table_slots_from_logical_axes() {
+        let axes = TableAxes {
+            flow: FlowAxes::new(WritingMode::VerticalLr, Direction::Ltr),
+            direction: Direction::Ltr,
+        };
+        let rect = axes.physical_rect_from_logical_grid(10.0, 20.0, 30.0, 40.0, 100.0, 200.0);
+
+        assert_eq!(rect.origin, ContainerPoint::new(20.0, 10.0));
+        assert_eq!(rect.size, ContainerSize::new(40.0, 30.0));
+    }
+
+    #[test]
+    fn full_grid_projection_is_root_flow_owned_for_every_mode_and_direction() {
+        for writing_mode in [
+            WritingMode::HorizontalTb,
+            WritingMode::VerticalRl,
+            WritingMode::VerticalLr,
+            WritingMode::SidewaysRl,
+            WritingMode::SidewaysLr,
+        ] {
+            for direction in [Direction::Ltr, Direction::Rtl] {
+                let axes = TableAxes {
+                    flow: FlowAxes::new(writing_mode, direction),
+                    direction,
+                };
+                let rect = axes.physical_rect_from_logical_grid(0.0, 0.0, 30.0, 40.0, 30.0, 40.0);
+
+                // Direction reversal belongs to TableColumnPlan.  Projecting
+                // the complete logical grid must therefore be identical for
+                // both directions and begin at the grid placement origin.
+                assert_eq!(rect.origin, ContainerPoint::new(0.0, 0.0));
+                assert_eq!(
+                    rect.size,
+                    axes.flow.physical_size_from_logical(LogicalSize {
+                        inline: 30.0,
+                        block: 40.0,
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
     fn projects_row_bounds_to_page_coordinates() {
         let placement = TableGridPlacement::new(PageTopPoint::new(20.0, 200.0));
         let border_box = TableCellBorderBox::from_bounds(
@@ -354,7 +513,10 @@ mod tests {
         );
         assert_eq!(border_box.x(placement), 35.0);
         assert_eq!(border_box.top_y(placement), 175.0);
-        assert_eq!(border_box.top_y(placement) - border_box.height(), 145.0);
+        assert_eq!(
+            border_box.top_y(placement) - border_box.rect().size.height,
+            145.0
+        );
         assert_eq!(
             placement.overflow_clip_for(border_box.rect()),
             OverflowClip::from_paint_rect(paint_space_rect(35.0, 145.0, 60.0, 30.0))

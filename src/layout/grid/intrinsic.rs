@@ -1,31 +1,171 @@
 use super::*;
+use std::ops::{Deref, DerefMut};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct GridItemEstimate {
-    pub(super) width: ContentBoxLength,
-    pub(super) height: ContentBoxLength,
-    pub(super) min_width: ContentBoxLength,
-    pub(super) min_height: ContentBoxLength,
-    pub(super) content_width: ContentBoxLength,
-    pub(super) content_height: ContentBoxLength,
+    /// Logical inline preferred size, projected to a physical Taffy axis only
+    /// at the Grid adapter boundary.
+    pub(super) metrics: IntrinsicItemMetrics,
+    pub(super) swaps_physical_axes: bool,
+}
+
+/// Intrinsic grid-container geometry needed when Grid itself participates as
+/// a flex item. The values are content-box sizes, with percentage resolution
+/// represented separately from the numeric constraints supplied by Flexbox.
+///
+/// CSS Grid contributes its track-sized min/max content sizes to a parent
+/// formatting context; it must not be approximated as an inline text line:
+/// <https://www.w3.org/TR/css-grid-1/#intrinsic-sizes>.
+pub(in crate::layout) struct GridContainerFlexItemEstimate {
+    pub(in crate::layout) min_width: ContentBoxLength,
+    pub(in crate::layout) max_width: ContentBoxLength,
+    pub(in crate::layout) content_width: ContentBoxLength,
+    pub(in crate::layout) intrinsic_height: ContentBoxLength,
+    pub(in crate::layout) definite_content_height: Option<ContentBoxLength>,
+    pub(in crate::layout) first_baseline: Option<f32>,
+    pub(in crate::layout) last_baseline: Option<f32>,
 }
 
 impl GridItemEstimate {
     pub(super) fn fixed(width: f32, height: f32) -> Self {
-        let width = content_box_pt(width);
-        let height = content_box_pt(height);
         Self {
-            width,
-            height,
-            min_width: width,
-            min_height: height,
-            content_width: width,
-            content_height: height,
+            metrics: IntrinsicItemMetrics::fixed(width, height),
+            swaps_physical_axes: false,
+        }
+    }
+
+    /// Convert logical Grid contribution measurements to Taffy's physical x/y
+    /// coordinate order. CSS properties remain physical; this conversion is
+    /// only for automatic intrinsic measurements.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+    pub(super) fn physical_measurements(self) -> Self {
+        if !self.swaps_physical_axes {
+            return self;
+        }
+        Self {
+            metrics: self.metrics.swapped_axes(),
+            swaps_physical_axes: false,
         }
     }
 }
 
+impl Deref for GridItemEstimate {
+    type Target = IntrinsicItemMetrics;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metrics
+    }
+}
+
+impl DerefMut for GridItemEstimate {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.metrics
+    }
+}
+
 impl<'a> LayoutBuilder<'a> {
+    /// Estimate a grid container while it participates as a flex item.
+    ///
+    /// The Flexbox algorithm needs Grid's actual track sizing contributions,
+    /// including the zero block-size of an empty grid item. This is distinct
+    /// from normal-flow block estimation, whose inline-line fallback is not a
+    /// grid intrinsic contribution:
+    /// <https://drafts.csswg.org/css-flexbox/#algo-main-item> and
+    /// <https://www.w3.org/TR/css-grid-1/#algo-overview>.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layout) fn estimate_grid_container_for_flex_item(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        available_width: f32,
+        width_basis: GridPercentageBasis,
+        height_basis: GridPercentageBasis,
+        vertical_non_content: f32,
+    ) -> Option<GridContainerFlexItemEstimate> {
+        let used_style = self.grid_used_style(style);
+        let style = used_style.as_computed();
+        let built_child_boxes;
+        let child_boxes = if let Some(child_boxes) = child_boxes {
+            child_boxes
+        } else {
+            built_child_boxes =
+                self.build_frozen_child_boxes_with_current_ancestors(element, stylesheets, style);
+            &built_child_boxes
+        };
+        let (min_width, max_width) = self.estimate_grid_intrinsic_widths(
+            element,
+            style,
+            stylesheets,
+            available_width,
+            Some(child_boxes),
+        );
+        let content_width =
+            used_length_percentage_or_auto_with_basis(style.box_values.width.clone(), width_basis)
+                .map(|width| width.points())
+                .unwrap_or(max_width)
+                .max(0.0);
+        let definite_content_height = used_content_box_height_or_auto_with_basis(
+            style,
+            height_basis,
+            non_content_pt(vertical_non_content),
+        )
+        .map(SemanticLengthExt::points);
+        let (children, _) = grid_child_lists_from_boxes(child_boxes);
+        let children = self.prepare_grid_children(children);
+        let layout = self.compute_grid_layout(
+            style,
+            &children,
+            stylesheets,
+            content_width,
+            definite_content_height,
+            GridLayoutPurpose::IntrinsicProbe,
+        )?;
+        Some(GridContainerFlexItemEstimate {
+            min_width: content_box_pt(min_width.max(0.0)),
+            max_width: content_box_pt(max_width.max(min_width).max(0.0)),
+            content_width: content_box_pt(content_width),
+            intrinsic_height: content_box_pt(layout.height.max(0.0)),
+            definite_content_height: definite_content_height.map(content_box_pt),
+            first_baseline: layout.first_baseline,
+            last_baseline: layout.last_baseline,
+        })
+    }
+
+    /// Return a size-contained grid's intrinsic inline sizes.
+    ///
+    /// Size containment removes grid items from the principal box's intrinsic
+    /// sizing input, but an empty grid still has its explicit tracks and gaps.
+    /// Keeping that distinction here avoids treating `contain: size` as an
+    /// unconditional zero-size shortcut.
+    /// <https://www.w3.org/TR/css-contain-1/#containment-size>
+    /// <https://www.w3.org/TR/css-grid-1/#intrinsic-sizes>
+    pub(in crate::layout) fn size_contained_grid_intrinsic_widths(
+        &self,
+        style: &ComputedStyle,
+    ) -> (f32, f32) {
+        let mut explicit_row_count = intrinsic_explicit_grid_track_count(&style.grid_template_rows)
+            .unwrap_or(1)
+            .max(grid_template_area_row_count(&style.grid_template_areas));
+        let row_line_names =
+            intrinsic_grid_line_names(&style.grid_template_rows, &style.grid_template_areas)
+                .unwrap_or_else(|| vec![Vec::new(); explicit_row_count + 1]);
+        explicit_row_count = explicit_row_count.max(row_line_names.len().saturating_sub(1).max(1));
+        let (min_width, max_width) = grid_track_list_intrinsic_widths(GridTrackIntrinsicInputs {
+            tracks: &style.grid_template_columns,
+            auto_tracks: &style.grid_auto_columns,
+            areas: &style.grid_template_areas,
+            auto_flow: style.grid_auto_flow,
+            explicit_row_count,
+            row_line_names: &row_line_names,
+            children: &[],
+            estimates: &[],
+            gap: style.column_gap.clone(),
+        });
+        (min_width.max(0.0), max_width.max(min_width).max(0.0))
+    }
+
     /// Estimate a grid container's min-content and max-content inline widths.
     ///
     /// CSS Grid defines container intrinsic sizes from track sizing with grid
@@ -43,6 +183,8 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> (f32, f32) {
+        let used_style = self.grid_used_style(style);
+        let style = used_style.as_computed();
         let built_child_boxes;
         let child_boxes = if let Some(child_boxes) = child_boxes {
             child_boxes
@@ -51,20 +193,37 @@ impl<'a> LayoutBuilder<'a> {
                 self.build_frozen_child_boxes_with_current_ancestors(element, stylesheets, style);
             &built_child_boxes
         };
-        let (mut children, _) = grid_child_lists_from_boxes(child_boxes);
-        self.resolve_grid_children_viewport_lengths(&mut children);
+        let (children, _) = grid_child_lists_from_boxes(child_boxes);
+        let children = self.prepare_grid_children(children);
+        let mut explicit_row_count = intrinsic_explicit_grid_track_count(&style.grid_template_rows)
+            .unwrap_or(1)
+            .max(grid_template_area_row_count(&style.grid_template_areas));
+        let row_line_names =
+            intrinsic_grid_line_names(&style.grid_template_rows, &style.grid_template_areas)
+                .unwrap_or_else(|| vec![Vec::new(); explicit_row_count + 1]);
+        explicit_row_count = explicit_row_count.max(row_line_names.len().saturating_sub(1).max(1));
         let mut estimates = Vec::with_capacity(children.len());
         for child in &children {
-            let estimate = self.estimate_grid_item_size(child, stylesheets, available_width, None);
+            let estimate = self.estimate_grid_item_size(
+                child,
+                stylesheets,
+                available_width,
+                GridPercentageBasis::indefinite(),
+                GridPercentageBasis::indefinite(),
+            );
             estimates.push(estimate);
         }
-        let (min_width, max_width) = grid_track_list_intrinsic_widths(
-            &style.grid_template_columns,
-            &children,
-            &estimates,
-            style.column_gap,
-            available_width,
-        );
+        let (min_width, max_width) = grid_track_list_intrinsic_widths(GridTrackIntrinsicInputs {
+            tracks: &style.grid_template_columns,
+            auto_tracks: &style.grid_auto_columns,
+            areas: &style.grid_template_areas,
+            auto_flow: style.grid_auto_flow,
+            explicit_row_count,
+            row_line_names: &row_line_names,
+            children: &children,
+            estimates: &estimates,
+            gap: style.column_gap.clone(),
+        });
         (min_width.max(0.0), max_width.max(min_width).max(0.0))
     }
 }
@@ -83,22 +242,50 @@ impl<'a> LayoutBuilder<'a> {
         child: &GridChild<'_>,
         stylesheets: &[Stylesheet],
         available_width: f32,
-        available_height: Option<f32>,
+        available_width_basis: GridPercentageBasis,
+        available_height_basis: GridPercentageBasis,
+    ) -> GridItemEstimate {
+        let mut estimate = self.estimate_grid_item_size_with_exported_baseline(
+            child,
+            stylesheets,
+            available_width,
+            available_width_basis,
+            available_height_basis,
+        );
+        if child.style.contain.layout {
+            // Layout containment suppresses baseline export; grid alignment
+            // synthesizes the fallback from the item's border box.
+            // <https://www.w3.org/TR/css-contain-1/#containment-layout>
+            estimate.metrics.clear_block_baselines();
+        }
+        estimate
+    }
+
+    fn estimate_grid_item_size_with_exported_baseline(
+        &mut self,
+        child: &GridChild<'_>,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        available_width_basis: GridPercentageBasis,
+        available_height_basis: GridPercentageBasis,
     ) -> GridItemEstimate {
         let layout_style = grid_item_layout_style(&child.style);
         let style = &layout_style;
-        let inline_available = match style.writing_mode {
-            WritingMode::HorizontalTb => available_width,
-            WritingMode::VerticalRl | WritingMode::VerticalLr => {
-                available_height.unwrap_or(available_width)
-            }
+        let available_height = available_height_basis.points();
+        let axes = WritingModeAxes::new(style.writing_mode, style.direction);
+        let inline_available = if axes.swaps_physical_axes() {
+            available_height.unwrap_or(available_width)
+        } else {
+            available_width
         }
         .max(1.0);
-        let inline_basis = match style.writing_mode {
-            WritingMode::HorizontalTb => Some(available_width),
-            WritingMode::VerticalRl | WritingMode::VerticalLr => available_height,
+        let inline_basis = if axes.swaps_physical_axes() {
+            available_height_basis
+        } else {
+            available_width_basis
         };
-        let block_basis = available_height.unwrap_or(available_width).max(1.0);
+        let block_basis =
+            available_height_basis.map_value(|height| content_box_pt(height.points().max(1.0)));
 
         if let Some(children) = child.anonymous_content() {
             let measurement = self.intrinsic_inline_measurement_for_boxes(
@@ -107,7 +294,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 inline_available,
             );
-            return grid_item_estimate_from_intrinsic(
+            let mut estimate = grid_item_estimate_from_intrinsic(
                 style,
                 available_width,
                 inline_basis,
@@ -116,6 +303,18 @@ impl<'a> LayoutBuilder<'a> {
                 measurement.contribution.max_content,
                 measurement.height().max(style.line_height),
             );
+            set_grid_item_text_baselines(
+                &mut estimate,
+                style,
+                measurement.sequence.first_line_baseline_offset(
+                    self.inline_box_text_line_layout_baseline_offset(style),
+                ),
+                measurement.sequence.last_line_baseline_offset(
+                    self.inline_box_text_line_layout_baseline_offset(style),
+                ),
+                measurement.line_count(),
+            );
+            return estimate;
         }
 
         let Some((element, signature, child_boxes)) = child.element_parts() else {
@@ -128,6 +327,10 @@ impl<'a> LayoutBuilder<'a> {
                     element,
                     style,
                     available_width,
+                    block_size_percentage_basis_from_points(
+                        block_basis.points(),
+                        BlockSizeBasisSource::GridItem,
+                    ),
                     layout.base_url,
                     layout.root_url,
                     layout.resource_cache,
@@ -145,9 +348,41 @@ impl<'a> LayoutBuilder<'a> {
                 );
             }
 
+            if replaced_element_kind(element) == Some(ReplacedElementKind::Canvas) {
+                let canvas = used_canvas(
+                    element,
+                    style,
+                    available_width,
+                    block_size_percentage_basis_from_points(
+                        block_basis.points(),
+                        BlockSizeBasisSource::GridItem,
+                    ),
+                );
+                let content_size = canvas.content_size;
+                return grid_item_estimate_from_intrinsic(
+                    style,
+                    available_width,
+                    inline_basis,
+                    block_basis,
+                    content_size.width.max(1.0),
+                    content_size.width.max(1.0),
+                    content_size.height.max(1.0),
+                );
+            }
+
             if replaced_element_kind(element) == Some(ReplacedElementKind::Svg)
-                && let Some((width, height, _)) = svg_rect(element)
+                && let Some(svg) = used_svg(
+                    element,
+                    style,
+                    available_width,
+                    block_size_percentage_basis_from_points(
+                        block_basis.points(),
+                        BlockSizeBasisSource::GridItem,
+                    ),
+                )
             {
+                let width = svg.content_size.width;
+                let height = svg.content_size.height;
                 return grid_item_estimate_from_intrinsic(
                     style,
                     available_width,
@@ -157,6 +392,105 @@ impl<'a> LayoutBuilder<'a> {
                     width.max(1.0),
                     height.max(1.0),
                 );
+            }
+
+            if style.display.inner == DisplayInner::Grid
+                && let Some(child_boxes) = child_boxes
+            {
+                // A size-contained grid is measured as an empty grid by its
+                // parent.  Its real items are still formatted during final
+                // layout, after the principal box has received that used
+                // size.  In particular, implicit tracks must not acquire a
+                // parent-facing contribution from those real items.
+                //
+                // <https://www.w3.org/TR/css-contain-1/#containment-size>
+                let (grid_min, grid_max) = if intrinsic_physical_width_is_contained(style) {
+                    layout.size_contained_grid_intrinsic_widths(style)
+                } else {
+                    layout.estimate_grid_intrinsic_widths(
+                        element,
+                        style,
+                        stylesheets,
+                        available_width,
+                        Some(child_boxes),
+                    )
+                };
+                let intrinsic_metrics = intrinsic_box_metrics(style);
+                let horizontal_margin =
+                    layout_pt(intrinsic_metrics.margin.left + intrinsic_metrics.margin.right);
+                let horizontal_non_content = intrinsic_metrics.horizontal_non_content_length();
+                let requested_content_width =
+                    crate::layout::intrinsic::content_box_width_from_intrinsic_in_margin_box(
+                        style,
+                        layout_pt(available_width),
+                        horizontal_margin,
+                        horizontal_non_content,
+                        content_box_pt(grid_min),
+                        content_box_pt(grid_max),
+                        crate::layout::intrinsic::IntrinsicAutoWidth::ShrinkToFit,
+                    );
+                let content_width = constrain_content_width(
+                    style,
+                    requested_content_width,
+                    PercentageBasis::definite(layout_pt(available_width.max(0.0))),
+                )
+                .points();
+                let vertical_extras = intrinsic_metrics.margin.top
+                    + intrinsic_metrics.margin.bottom
+                    + intrinsic_metrics.vertical_non_content_length().points();
+                let definite_content_height = used_content_box_height_or_auto(
+                    style,
+                    layout_pt(style.line_height.max(1.0)),
+                    non_content_pt(vertical_extras),
+                )
+                .map(SemanticLengthExt::points)
+                .map(|height| {
+                    constrain_content_height(
+                        style,
+                        content_box_pt(height),
+                        PercentageBasis::definite(layout_pt(available_width)),
+                    )
+                    .points()
+                });
+                let (grid_children, _) = grid_child_lists_from_boxes(child_boxes);
+                let grid_children = layout.prepare_grid_children(grid_children);
+                // This is the parent-facing intrinsic sizing pass, so size
+                // containment must remove the same items from both grid axes.
+                // The later final-layout pass still receives `grid_children`.
+                let intrinsic_grid_children: &[GridChild<'_>] = if style.contain.size {
+                    &[] as &[GridChild<'_>]
+                } else {
+                    grid_children.as_slice()
+                };
+                if let Some(grid_layout) = layout.compute_grid_layout(
+                    style,
+                    intrinsic_grid_children,
+                    stylesheets,
+                    content_width,
+                    definite_content_height,
+                    GridLayoutPurpose::IntrinsicProbe,
+                ) {
+                    let content_height =
+                        constrain_grid_intrinsic_height(style, grid_layout.height, block_basis);
+                    let mut estimate = grid_item_estimate_from_intrinsic(
+                        style,
+                        available_width,
+                        inline_basis,
+                        block_basis,
+                        grid_min,
+                        grid_max,
+                        content_height,
+                    );
+                    let baseline_offset =
+                        intrinsic_metrics.border.top + intrinsic_metrics.padding.top;
+                    estimate.first_baseline = grid_layout
+                        .first_baseline
+                        .map(|baseline| baseline_offset + baseline);
+                    estimate.last_baseline = grid_layout
+                        .last_baseline
+                        .map(|baseline| baseline_offset + baseline);
+                    return estimate;
+                }
             }
 
             let inline_measurement = layout.intrinsic_inline_measurement_for_element(
@@ -182,16 +516,28 @@ impl<'a> LayoutBuilder<'a> {
             let content_height = layout
                 .estimate_element_height(element, style, stylesheets, available_width, child_boxes)
                 .map(|height| {
-                    let vertical_non_content = style.margin.top
-                        + style.margin.bottom
-                        + style.padding.top
-                        + style.padding.bottom
-                        + vertical_border_width(style);
+                    let intrinsic_metrics = intrinsic_box_metrics(style);
+                    let vertical_non_content = intrinsic_metrics.margin.top
+                        + intrinsic_metrics.margin.bottom
+                        + intrinsic_metrics.vertical_non_content_length().points();
                     (height - vertical_non_content).max(0.0)
                 })
                 .unwrap_or_else(|| inline_measurement.height().max(style.line_height));
+            // A tree-abiding generated pseudo can have an empty formatting
+            // child list even though its `content` produces an inline line.
+            // Its element-height probe then reports the empty principal box;
+            // retain the generated inline line for this grid's *internal*
+            // track sizing. Parent-facing size containment still uses the
+            // separate empty-grid pass.
+            // <https://www.w3.org/TR/css-pseudo-4/#generated-content>
+            // <https://www.w3.org/TR/css-grid-1/#track-sizing>
+            let content_height = if style.content.is_generated() {
+                content_height.max(inline_measurement.height().max(style.line_height))
+            } else {
+                content_height
+            };
 
-            grid_item_estimate_from_intrinsic(
+            let mut estimate = grid_item_estimate_from_intrinsic(
                 style,
                 available_width,
                 inline_basis,
@@ -199,49 +545,64 @@ impl<'a> LayoutBuilder<'a> {
                 min_content,
                 max_content,
                 content_height,
-            )
+            );
+            set_grid_item_text_baselines(
+                &mut estimate,
+                style,
+                inline_measurement.sequence.first_line_baseline_offset(
+                    layout.inline_box_text_line_layout_baseline_offset(style),
+                ),
+                inline_measurement.sequence.last_line_baseline_offset(
+                    layout.inline_box_text_line_layout_baseline_offset(style),
+                ),
+                inline_measurement.line_count(),
+            );
+            estimate
         })
     }
 }
 
-fn grid_track_list_intrinsic_widths(
-    tracks: &css::GridTrackList,
-    children: &[GridChild<'_>],
-    estimates: &[GridItemEstimate],
+struct GridTrackIntrinsicInputs<'a, 'grid> {
+    tracks: &'a css::GridTrackList,
+    auto_tracks: &'a css::GridAutoTrackList,
+    areas: &'a css::GridTemplateAreas,
+    auto_flow: css::GridAutoFlow,
+    explicit_row_count: usize,
+    row_line_names: &'a [Vec<String>],
+    children: &'a [GridChild<'grid>],
+    estimates: &'a [GridItemEstimate],
     gap: css::ComputedGap,
-    percentage_basis: f32,
-) -> (f32, f32) {
-    let fallback = grid_item_intrinsic_contribution(estimates.iter().copied());
-    let css::GridTrackList::Tracks {
-        components,
-        trailing_names,
-    } = tracks
-    else {
-        return fallback;
-    };
-    if components.is_empty() {
-        return fallback;
-    }
-    let Some(expanded) = expanded_grid_tracks(components, trailing_names) else {
+}
+
+fn grid_track_list_intrinsic_widths(inputs: GridTrackIntrinsicInputs<'_, '_>) -> (f32, f32) {
+    let fallback = grid_item_intrinsic_contribution(inputs.estimates.iter().cloned());
+    let Some(expanded) = intrinsic_grid_columns(&inputs) else {
         return fallback;
     };
     let track_sizes = &expanded.sizes;
     if track_sizes.is_empty() {
         return fallback;
     }
-    let gap_width = definite_grid_gap_size(gap, percentage_basis);
-    let contributions = grid_track_intrinsic_contributions(
-        track_sizes.len(),
-        &expanded.line_names,
-        children,
-        estimates,
+    // Track contribution distribution is scalar coordinate arithmetic; keep
+    // the CSS gap typed until it enters that algorithm.
+    let gap_width = intrinsic_grid_gap_size(inputs.gap).points();
+    let contributions = grid_track_intrinsic_contributions(GridTrackContributionInputs {
+        track_count: track_sizes.len(),
+        explicit_column_count: expanded.explicit_track_count,
+        first_line_index: expanded.first_line_index,
+        line_names: &expanded.line_names,
+        auto_flow: inputs.auto_flow,
+        explicit_row_count: inputs.explicit_row_count,
+        row_line_names: inputs.row_line_names,
+        children: inputs.children,
+        estimates: inputs.estimates,
         gap_width,
-    );
+    });
     let track_widths = track_sizes
         .iter()
         .zip(contributions)
         .map(|(size, (item_min, item_max))| {
-            grid_track_intrinsic_width(*size, item_min, item_max, percentage_basis)
+            grid_track_intrinsic_width(size.clone(), item_min, item_max)
         })
         .collect::<Vec<_>>();
     let min_width = track_widths.iter().map(|(min, _)| min).sum::<f32>();
@@ -251,15 +612,520 @@ fn grid_track_list_intrinsic_widths(
     (min_width + total_gap_width, max_width + total_gap_width)
 }
 
+fn intrinsic_grid_columns(inputs: &GridTrackIntrinsicInputs<'_, '_>) -> Option<ExpandedGridTracks> {
+    match inputs.tracks {
+        css::GridTrackList::Tracks {
+            components,
+            trailing_names,
+        } if !components.is_empty() => {
+            explicit_grid_columns_for_intrinsic_width(components, trailing_names, inputs)
+        }
+        css::GridTrackList::None => implicit_grid_columns_for_intrinsic_width(inputs),
+        _ => None,
+    }
+}
+
+/// Expand explicit column tracks for grid container intrinsic sizing.
+///
+/// CSS Grid's explicit grid is the larger of the authored track list and
+/// `grid-template-areas`. Area-created columns not sized by
+/// `grid-template-columns` take their sizes from `grid-auto-columns`:
+/// <https://www.w3.org/TR/css-grid-1/#explicit-grids>.
+fn explicit_grid_columns_for_intrinsic_width(
+    components: &[css::GridTrackListComponent],
+    trailing_names: &[String],
+    inputs: &GridTrackIntrinsicInputs<'_, '_>,
+) -> Option<ExpandedGridTracks> {
+    let mut expanded =
+        expanded_grid_tracks_for_axis(components, trailing_names, inputs.areas, GridAxis::Column)?;
+    append_area_created_grid_columns(&mut expanded, inputs.areas, inputs.auto_tracks);
+    expanded.explicit_track_count = expanded.sizes.len();
+    expand_simple_implicit_grid_columns(&mut expanded, inputs);
+    Some(expanded)
+}
+
+fn append_area_created_grid_columns(
+    expanded: &mut ExpandedGridTracks,
+    areas: &css::GridTemplateAreas,
+    auto_tracks: &css::GridAutoTrackList,
+) {
+    let area_column_count = grid_template_area_column_count(areas);
+    let authored_column_count = expanded.sizes.len();
+    if area_column_count <= authored_column_count || auto_tracks.tracks.is_empty() {
+        return;
+    }
+    expanded.sizes.extend(
+        (0..area_column_count - authored_column_count)
+            .map(|index| auto_tracks.tracks[index % auto_tracks.tracks.len()].clone()),
+    );
+    expanded
+        .line_names
+        .resize_with(expanded.sizes.len() + 1, Vec::new);
+}
+
+/// Add simple implicit columns required before or past the explicit grid.
+///
+/// CSS Grid creates implicit tracks when placement puts items outside the
+/// explicit grid, and those tracks are sized by `grid-auto-columns`:
+/// <https://www.w3.org/TR/css-grid-1/#implicit-grids>.
+fn expand_simple_implicit_grid_columns(
+    expanded: &mut ExpandedGridTracks,
+    inputs: &GridTrackIntrinsicInputs<'_, '_>,
+) {
+    let explicit_column_count = expanded.sizes.len();
+    let Some(extent) = simple_implicit_column_extent(
+        inputs.auto_flow,
+        inputs.explicit_row_count,
+        explicit_column_count,
+        &expanded.line_names,
+        inputs.row_line_names,
+        inputs.children,
+    ) else {
+        return;
+    };
+    if inputs.auto_tracks.tracks.is_empty() {
+        return;
+    }
+    prepend_implicit_grid_columns(expanded, extent.first_line, inputs.auto_tracks);
+    append_implicit_grid_columns(expanded, extent.end_line, inputs.auto_tracks);
+    expanded
+        .line_names
+        .resize_with(expanded.sizes.len() + 1, Vec::new);
+}
+
+fn prepend_implicit_grid_columns(
+    expanded: &mut ExpandedGridTracks,
+    first_line: i32,
+    auto_tracks: &css::GridAutoTrackList,
+) {
+    if first_line >= expanded.first_line_index {
+        return;
+    }
+    let before_count = usize::try_from(expanded.first_line_index - first_line).unwrap_or(0);
+    let mut sizes = (0..before_count)
+        .map(|index| {
+            let distance_from_explicit = before_count - index;
+            cycled_auto_track_size_before(auto_tracks, distance_from_explicit)
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+    sizes.extend(expanded.sizes.iter().cloned());
+    expanded.sizes = sizes;
+    let mut line_names = vec![Vec::new(); before_count];
+    line_names.extend(expanded.line_names.iter().cloned());
+    expanded.line_names = line_names;
+    expanded.first_line_index = first_line;
+}
+
+fn append_implicit_grid_columns(
+    expanded: &mut ExpandedGridTracks,
+    end_line: i32,
+    auto_tracks: &css::GridAutoTrackList,
+) {
+    let Some(current_end_line) = expanded
+        .first_line_index
+        .checked_add(i32::try_from(expanded.sizes.len()).ok().unwrap_or(0))
+    else {
+        return;
+    };
+    if end_line <= current_end_line {
+        return;
+    }
+    let Some(explicit_end_line) = i32::try_from(expanded.explicit_track_count)
+        .ok()
+        .and_then(|count| count.checked_add(1))
+    else {
+        return;
+    };
+    let after_count = usize::try_from(end_line - current_end_line).unwrap_or(0);
+    expanded.sizes.extend((0..after_count).filter_map(|index| {
+        let track_line = current_end_line.checked_add(i32::try_from(index).ok()?)?;
+        let auto_index = usize::try_from(track_line.checked_sub(explicit_end_line)?).ok()?;
+        auto_tracks
+            .tracks
+            .get(auto_index % auto_tracks.tracks.len())
+            .cloned()
+    }));
+}
+
+/// Expand simple implicit column tracks for grid container intrinsic sizing.
+///
+/// CSS Grid's explicit grid is sized by the larger of the authored track list
+/// and `grid-template-areas`; area-created columns without explicit
+/// `grid-template-columns` sizes take their sizes from `grid-auto-columns`.
+/// CSS Grid creates implicit tracks when auto-placement places items outside
+/// the explicit grid, and sizes those tracks from `grid-auto-columns`:
+/// <https://www.w3.org/TR/css-grid-1/#explicit-grids> and
+/// <https://www.w3.org/TR/css-grid-1/#implicit-grids>.
+fn implicit_grid_columns_for_intrinsic_width(
+    inputs: &GridTrackIntrinsicInputs<'_, '_>,
+) -> Option<ExpandedGridTracks> {
+    let area_column_count = grid_template_area_column_count(inputs.areas);
+    let mut line_names = vec![Vec::new(); area_column_count + 1];
+    add_generated_area_line_names(&mut line_names, inputs.areas, GridAxis::Column);
+    let extent = simple_implicit_column_extent(
+        inputs.auto_flow,
+        inputs.explicit_row_count,
+        area_column_count,
+        &line_names,
+        inputs.row_line_names,
+        inputs.children,
+    )?;
+    if extent.track_count() == 0 || inputs.auto_tracks.tracks.is_empty() {
+        return None;
+    }
+    let sizes = (0..area_column_count)
+        .map(|index| inputs.auto_tracks.tracks[index % inputs.auto_tracks.tracks.len()].clone())
+        .collect::<Vec<_>>();
+    let mut expanded = ExpandedGridTracks {
+        explicit_track_count: area_column_count,
+        sizes,
+        line_names,
+        first_line_index: 1,
+    };
+    prepend_implicit_grid_columns(&mut expanded, extent.first_line, inputs.auto_tracks);
+    append_implicit_grid_columns(&mut expanded, extent.end_line, inputs.auto_tracks);
+    expanded
+        .line_names
+        .resize_with(expanded.sizes.len() + 1, Vec::new);
+    Some(expanded)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IntrinsicColumnExtent {
+    first_line: i32,
+    end_line: i32,
+}
+
+impl IntrinsicColumnExtent {
+    fn track_count(self) -> usize {
+        usize::try_from(self.end_line.saturating_sub(self.first_line)).unwrap_or(0)
+    }
+}
+
+/// Count implicit columns for simple grid item placement.
+///
+/// This intentionally handles template-area explicit columns, all-auto
+/// placement, positive numeric column lines, positive named column lines, and
+/// named spans that search past the end of the explicit grid. Negative and
+/// more complex implicit-line cases still fall back to the conservative aggregate
+/// intrinsic contribution until Quire has a fuller implicit-grid placement
+/// model:
+/// <https://www.w3.org/TR/css-grid-1/#explicit-grids> and
+/// <https://www.w3.org/TR/css-grid-1/#auto-placement-algo>.
+#[cfg(test)]
+fn simple_implicit_column_count(
+    auto_flow: css::GridAutoFlow,
+    explicit_row_count: usize,
+    explicit_column_count: usize,
+    column_line_names: &[Vec<String>],
+    row_line_names: &[Vec<String>],
+    children: &[GridChild<'_>],
+) -> Option<usize> {
+    simple_implicit_column_extent(
+        auto_flow,
+        explicit_row_count,
+        explicit_column_count,
+        column_line_names,
+        row_line_names,
+        children,
+    )
+    .map(IntrinsicColumnExtent::track_count)
+}
+
+fn simple_implicit_column_extent(
+    auto_flow: css::GridAutoFlow,
+    explicit_row_count: usize,
+    explicit_column_count: usize,
+    column_line_names: &[Vec<String>],
+    row_line_names: &[Vec<String>],
+    children: &[GridChild<'_>],
+) -> Option<IntrinsicColumnExtent> {
+    let mut span_sum = 0_usize;
+    let mut max_auto_span = 0_usize;
+    let mut constrained_row_spans = vec![0_usize; explicit_row_count.max(1)];
+    let mut definite_track_count = 0_usize;
+    let mut first_line = 1_i32;
+    let mut end_line = i32::try_from(explicit_column_count).ok()?.checked_add(1)?;
+    for child in children {
+        if let Some(span) = simple_grid_child_auto_column_span(&child.style) {
+            let row_constraint =
+                simple_grid_child_row_constraint(&child.style, explicit_row_count, row_line_names)?;
+            if let Some(rows) = row_constraint {
+                for row in rows {
+                    constrained_row_spans[row] = constrained_row_spans[row].checked_add(span)?;
+                }
+            }
+            span_sum = span_sum.checked_add(span)?;
+            max_auto_span = max_auto_span.max(span);
+            continue;
+        }
+        if let Some(count) = simple_positive_numeric_implicit_column_count(&child.style) {
+            definite_track_count = definite_track_count.max(count);
+        } else if let Some(count) = simple_positive_named_implicit_column_count(
+            &child.style,
+            explicit_column_count,
+            column_line_names,
+        ) {
+            definite_track_count = definite_track_count.max(count);
+        } else if let Some(count) = simple_forward_named_span_implicit_column_count(
+            &child.style,
+            explicit_column_count,
+            column_line_names,
+        ) {
+            definite_track_count = definite_track_count.max(count);
+        } else if let Some(range) = simple_grid_child_column_line_range(
+            &child.style,
+            explicit_column_count,
+            column_line_names,
+        ) {
+            first_line = first_line.min(range.start);
+            end_line = end_line.max(range.end);
+        } else if explicit_column_count == 0 {
+            return None;
+        }
+    }
+    let auto_track_count = match auto_flow {
+        css::GridAutoFlow::Row | css::GridAutoFlow::RowDense => {
+            let constrained_count = constrained_row_spans.iter().cloned().max().unwrap_or(0);
+            Some(if explicit_column_count > 0 {
+                explicit_column_count
+                    .max(max_auto_span)
+                    .max(constrained_count)
+            } else {
+                span_sum
+            })
+        }
+        css::GridAutoFlow::Column | css::GridAutoFlow::ColumnDense => {
+            if span_sum == 0 {
+                let auto_end_line = i32::try_from(definite_track_count.max(explicit_column_count))
+                    .ok()?
+                    .checked_add(1)?;
+                end_line = end_line.max(auto_end_line);
+                return (first_line <= end_line).then_some(IntrinsicColumnExtent {
+                    first_line,
+                    end_line,
+                });
+            }
+            let row_count = explicit_row_count.max(1);
+            let unconstrained_count = span_sum.div_ceil(row_count).max(1);
+            let constrained_count = constrained_row_spans.into_iter().max().unwrap_or(0);
+            Some(
+                explicit_column_count
+                    .max(unconstrained_count)
+                    .max(constrained_count),
+            )
+        }
+    }?;
+    let auto_end_line = i32::try_from(definite_track_count.max(auto_track_count))
+        .ok()?
+        .checked_add(1)?;
+    end_line = end_line.max(auto_end_line);
+    (first_line <= end_line).then_some(IntrinsicColumnExtent {
+        first_line,
+        end_line,
+    })
+}
+
+/// Return the `grid-auto-columns` size for a startward implicit track.
+///
+/// CSS Grid applies the auto-track list backward before the explicit grid, so
+/// the first implicit track before the explicit grid receives the last
+/// `grid-auto-columns` size:
+/// <https://www.w3.org/TR/css-grid-1/#auto-tracks>.
+fn cycled_auto_track_size_before(
+    auto_tracks: &css::GridAutoTrackList,
+    distance_from_explicit: usize,
+) -> Option<css::GridTrackSize> {
+    let len = auto_tracks.tracks.len();
+    if len == 0 {
+        return None;
+    }
+    let offset = distance_from_explicit % len;
+    let index = (len - offset) % len;
+    auto_tracks.tracks.get(index).cloned()
+}
+
+fn simple_positive_numeric_implicit_column_count(style: &ComputedStyle) -> Option<usize> {
+    if let Some(count) = simple_positive_numeric_forward_column_count(style) {
+        return Some(count);
+    }
+    simple_positive_numeric_backward_column_count(style)
+}
+
+fn simple_positive_named_implicit_column_count(
+    style: &ComputedStyle,
+    explicit_column_count: usize,
+    line_names: &[Vec<String>],
+) -> Option<usize> {
+    if let Some(count) =
+        simple_positive_named_forward_column_count(style, explicit_column_count, line_names)
+    {
+        return Some(count);
+    }
+    simple_positive_named_backward_column_count(style, explicit_column_count, line_names)
+}
+
+fn simple_positive_named_forward_column_count(
+    style: &ComputedStyle,
+    explicit_column_count: usize,
+    line_names: &[Vec<String>],
+) -> Option<usize> {
+    let explicit_line_count = explicit_column_count.checked_add(1)?;
+    let start =
+        positive_named_grid_line_index(&style.grid_column_start, line_names, explicit_line_count)?;
+    let span = match &style.grid_column_end {
+        css::GridPlacement::Auto => 1,
+        css::GridPlacement::Span(span) if span.name.is_none() => {
+            span.span.map(usize::from).filter(|span| *span > 0)?
+        }
+        css::GridPlacement::Line(_) => {
+            let end = positive_named_grid_line_index(
+                &style.grid_column_end,
+                line_names,
+                explicit_line_count,
+            )?;
+            return (end > start).then_some(end - 1);
+        }
+        css::GridPlacement::Span(_) => return None,
+    };
+    start.checked_add(span)?.checked_sub(1)
+}
+
+fn simple_positive_named_backward_column_count(
+    style: &ComputedStyle,
+    explicit_column_count: usize,
+    line_names: &[Vec<String>],
+) -> Option<usize> {
+    let explicit_line_count = explicit_column_count.checked_add(1)?;
+    let end =
+        positive_named_grid_line_index(&style.grid_column_end, line_names, explicit_line_count)?;
+    match &style.grid_column_start {
+        css::GridPlacement::Auto => Some(end.checked_sub(1)?),
+        css::GridPlacement::Span(span) if span.name.is_none() => {
+            let span = span.span.map(usize::from).filter(|span| *span > 0)?;
+            (end > span).then_some(end - 1)
+        }
+        css::GridPlacement::Span(_) | css::GridPlacement::Line(_) => None,
+    }
+}
+
+fn simple_forward_named_span_implicit_column_count(
+    style: &ComputedStyle,
+    explicit_column_count: usize,
+    line_names: &[Vec<String>],
+) -> Option<usize> {
+    let start = intrinsic_column_line_index(
+        &style.grid_column_start,
+        line_names,
+        explicit_column_count,
+        1,
+    )?;
+    let css::GridPlacement::Span(span) = &style.grid_column_end else {
+        return None;
+    };
+    span.name.as_ref()?;
+    let span =
+        simple_grid_named_column_span_after(span, start, line_names, explicit_column_count, 1)?;
+    usize::try_from(start)
+        .ok()?
+        .checked_add(span)?
+        .checked_sub(1)
+}
+
+/// Resolve a positive named line for intrinsic implicit-column sizing.
+///
+/// CSS Grid treats implicit lines after the explicit grid as having the
+/// requested name when there are not enough matching explicit lines:
+/// <https://www.w3.org/TR/css-grid-1/#grid-placement-errors>.
+fn positive_named_grid_line_index(
+    placement: &css::GridPlacement,
+    line_names: &[Vec<String>],
+    explicit_line_count: usize,
+) -> Option<usize> {
+    let css::GridPlacement::Line(line) = placement else {
+        return None;
+    };
+    let name = line.name.as_ref()?;
+    let occurrence = line.index.unwrap_or(1);
+    if occurrence <= 0 {
+        return None;
+    }
+    let target = u32::try_from(occurrence).ok()?;
+    let mut matches_seen = 0_u32;
+    for (index, names) in line_names.iter().take(explicit_line_count).enumerate() {
+        if names.iter().any(|line_name| line_name == name) {
+            matches_seen += 1;
+            if matches_seen == target {
+                return Some(index + 1);
+            }
+        }
+    }
+    let remaining = usize::try_from(target - matches_seen).ok()?;
+    explicit_line_count.checked_add(remaining)
+}
+
+fn simple_positive_numeric_forward_column_count(style: &ComputedStyle) -> Option<usize> {
+    let start = positive_numeric_grid_line(&style.grid_column_start)?;
+    let span = match &style.grid_column_end {
+        css::GridPlacement::Auto => 1,
+        css::GridPlacement::Span(span) if span.name.is_none() => {
+            span.span.map(usize::from).filter(|span| *span > 0)?
+        }
+        css::GridPlacement::Line(_) => {
+            let end = positive_numeric_grid_line(&style.grid_column_end)?;
+            return (end > start).then_some(end - 1);
+        }
+        css::GridPlacement::Span(_) => return None,
+    };
+    start.checked_add(span)?.checked_sub(1)
+}
+
+fn simple_positive_numeric_backward_column_count(style: &ComputedStyle) -> Option<usize> {
+    let end = positive_numeric_grid_line(&style.grid_column_end)?;
+    match &style.grid_column_start {
+        css::GridPlacement::Auto => Some(end.checked_sub(1)?),
+        css::GridPlacement::Span(span) if span.name.is_none() => {
+            let span = span.span.map(usize::from).filter(|span| *span > 0)?;
+            (end > span).then_some(end - 1)
+        }
+        css::GridPlacement::Span(_) | css::GridPlacement::Line(_) => None,
+    }
+}
+
+fn positive_numeric_grid_line(placement: &css::GridPlacement) -> Option<usize> {
+    let css::GridPlacement::Line(line) = placement else {
+        return None;
+    };
+    if line.name.is_some() {
+        return None;
+    }
+    line.index
+        .filter(|index| *index > 0)
+        .and_then(|index| usize::try_from(index).ok())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct ExpandedGridTracks {
     sizes: Vec<css::GridTrackSize>,
     line_names: Vec<Vec<String>>,
+    explicit_track_count: usize,
+    first_line_index: i32,
 }
 
 fn expanded_grid_tracks(
     components: &[css::GridTrackListComponent],
     trailing_names: &[String],
+    areas: &css::GridTemplateAreas,
+) -> Option<ExpandedGridTracks> {
+    expanded_grid_tracks_for_axis(components, trailing_names, areas, GridAxis::Column)
+}
+
+fn expanded_grid_tracks_for_axis(
+    components: &[css::GridTrackListComponent],
+    trailing_names: &[String],
+    areas: &css::GridTemplateAreas,
+    axis: GridAxis,
 ) -> Option<ExpandedGridTracks> {
     let mut sizes = Vec::new();
     let mut line_names = Vec::new();
@@ -272,7 +1138,35 @@ fn expanded_grid_tracks(
     )?;
     current_line_names.extend(trailing_names.iter().cloned());
     line_names.push(current_line_names);
-    Some(ExpandedGridTracks { sizes, line_names })
+    add_generated_area_line_names(&mut line_names, areas, axis);
+    Some(ExpandedGridTracks {
+        explicit_track_count: sizes.len(),
+        sizes,
+        line_names,
+        first_line_index: 1,
+    })
+}
+
+fn intrinsic_grid_line_names(
+    tracks: &css::GridTrackList,
+    areas: &css::GridTemplateAreas,
+) -> Option<Vec<Vec<String>>> {
+    match tracks {
+        css::GridTrackList::Tracks {
+            components,
+            trailing_names,
+        } if !components.is_empty() => {
+            expanded_grid_tracks_for_axis(components, trailing_names, areas, GridAxis::Row)
+                .map(|expanded| expanded.line_names)
+        }
+        css::GridTrackList::None => {
+            let row_count = grid_template_area_row_count(areas).max(1);
+            let mut line_names = vec![Vec::new(); row_count + 1];
+            add_generated_area_line_names(&mut line_names, areas, GridAxis::Row);
+            Some(line_names)
+        }
+        _ => None,
+    }
 }
 
 fn collect_expanded_grid_tracks(
@@ -286,7 +1180,7 @@ fn collect_expanded_grid_tracks(
             css::GridTrackListComponent::Track(names, size) => {
                 current_line_names.extend(names.iter().cloned());
                 line_names.push(std::mem::take(current_line_names));
-                sizes.push(*size);
+                sizes.push(size.clone());
             }
             css::GridTrackListComponent::Repeat(names, repeat) => {
                 let count = intrinsic_grid_repeat_count(repeat.count);
@@ -306,30 +1200,83 @@ fn collect_expanded_grid_tracks(
     Some(())
 }
 
-fn grid_track_intrinsic_contributions(
-    track_count: usize,
-    line_names: &[Vec<String>],
-    children: &[GridChild<'_>],
-    estimates: &[GridItemEstimate],
-    gap_width: f32,
-) -> Vec<(f32, f32)> {
-    let mut contributions = vec![(0.0_f32, 0.0_f32); track_count];
-    let mut complex = (0.0_f32, 0.0_f32);
-    let allow_simple_auto_placement = children
-        .iter()
-        .all(|child| grid_child_column_is_auto(&child.style));
-    let mut auto_cursor = 0_usize;
+fn intrinsic_explicit_grid_track_count(tracks: &css::GridTrackList) -> Option<usize> {
+    let css::GridTrackList::Tracks {
+        components,
+        trailing_names,
+    } = tracks
+    else {
+        return Some(1);
+    };
+    if components.is_empty() {
+        return Some(1);
+    }
+    expanded_grid_tracks(components, trailing_names, &css::GridTemplateAreas::None)
+        .map(|expanded| expanded.sizes.len().max(1))
+}
 
-    for (child, estimate) in children.iter().zip(estimates) {
+fn grid_template_area_column_count(areas: &css::GridTemplateAreas) -> usize {
+    let css::GridTemplateAreas::Areas(rows) = areas else {
+        return 0;
+    };
+    rows.iter().map(|row| row.cells.len()).max().unwrap_or(0)
+}
+
+fn grid_template_area_row_count(areas: &css::GridTemplateAreas) -> usize {
+    let css::GridTemplateAreas::Areas(rows) = areas else {
+        return 0;
+    };
+    rows.len()
+}
+
+struct GridTrackContributionInputs<'a, 'grid> {
+    track_count: usize,
+    explicit_column_count: usize,
+    first_line_index: i32,
+    line_names: &'a [Vec<String>],
+    auto_flow: css::GridAutoFlow,
+    explicit_row_count: usize,
+    row_line_names: &'a [Vec<String>],
+    children: &'a [GridChild<'grid>],
+    estimates: &'a [GridItemEstimate],
+    gap_width: f32,
+}
+
+fn grid_track_intrinsic_contributions(
+    inputs: GridTrackContributionInputs<'_, '_>,
+) -> Vec<(f32, f32)> {
+    let mut contributions = vec![(0.0_f32, 0.0_f32); inputs.track_count];
+    let mut complex = (0.0_f32, 0.0_f32);
+    let mut placer = SimpleGridColumnPlacer::new(
+        inputs.track_count,
+        inputs.explicit_row_count,
+        inputs.auto_flow,
+    );
+
+    for (child, estimate) in inputs.children.iter().zip(inputs.estimates) {
         let contribution = (estimate.min_width.points(), estimate.content_width.points());
-        if let Some(range) = simple_grid_child_column_range(
+        let range = match simple_grid_child_column_placement(
             &child.style,
-            track_count,
-            line_names,
-            allow_simple_auto_placement,
-            &mut auto_cursor,
+            inputs.track_count,
+            inputs.explicit_column_count,
+            inputs.first_line_index,
+            inputs.line_names,
+            inputs.explicit_row_count,
+            inputs.row_line_names,
         ) {
-            distribute_grid_item_contribution(&mut contributions, range, contribution, gap_width);
+            Some(SimpleGridColumnPlacement::Definite { columns, rows }) => {
+                placer.place_definite(columns, rows)
+            }
+            Some(SimpleGridColumnPlacement::Auto { span, rows }) => placer.place_auto(span, rows),
+            None => None,
+        };
+        if let Some(range) = range {
+            distribute_grid_item_contribution(
+                &mut contributions,
+                range,
+                contribution,
+                inputs.gap_width,
+            );
         } else {
             complex.0 = complex.0.max(contribution.0);
             complex.1 = complex.1.max(contribution.1);
@@ -362,56 +1309,695 @@ fn grid_child_column_is_auto(style: &ComputedStyle) -> bool {
         && matches!(style.grid_column_end, css::GridPlacement::Auto)
 }
 
-fn simple_grid_child_column_range(
+enum SimpleGridColumnPlacement {
+    Definite {
+        columns: std::ops::Range<usize>,
+        rows: Option<std::ops::Range<usize>>,
+    },
+    Auto {
+        span: usize,
+        rows: Option<std::ops::Range<usize>>,
+    },
+}
+
+fn simple_grid_child_column_placement(
     style: &ComputedStyle,
     track_count: usize,
+    explicit_column_count: usize,
+    first_line_index: i32,
     line_names: &[Vec<String>],
-    allow_auto_placement: bool,
-    auto_cursor: &mut usize,
-) -> Option<std::ops::Range<usize>> {
+    explicit_row_count: usize,
+    row_line_names: &[Vec<String>],
+) -> Option<SimpleGridColumnPlacement> {
     if track_count == 0 {
         return None;
     }
-    if grid_child_column_is_auto(style) {
-        if !allow_auto_placement {
-            return None;
-        }
-        let index = *auto_cursor % track_count;
-        *auto_cursor += 1;
-        return Some(index..index + 1);
+    let rows = simple_grid_child_row_constraint(style, explicit_row_count, row_line_names)?;
+    if let Some(span) = simple_grid_child_auto_column_span(style) {
+        return Some(SimpleGridColumnPlacement::Auto { span, rows });
     }
-    let start = grid_line_index(&style.grid_column_start, line_names)?;
-    let track_index = usize::try_from(start - 1).ok()?;
-    if track_index >= track_count {
+    if let Some(range) = simple_grid_child_forward_column_range(
+        style,
+        track_count,
+        explicit_column_count,
+        first_line_index,
+        line_names,
+    ) {
+        return Some(SimpleGridColumnPlacement::Definite {
+            columns: range,
+            rows,
+        });
+    }
+    simple_grid_child_backward_column_range(
+        style,
+        track_count,
+        explicit_column_count,
+        first_line_index,
+        line_names,
+    )
+    .map(|range| SimpleGridColumnPlacement::Definite {
+        columns: range,
+        rows,
+    })
+}
+
+fn simple_grid_child_auto_column_span(style: &ComputedStyle) -> Option<usize> {
+    if grid_child_column_is_auto(style) {
+        return Some(1);
+    }
+    if matches!(style.grid_column_end, css::GridPlacement::Auto)
+        && let css::GridPlacement::Span(span) = &style.grid_column_start
+        && span.name.is_none()
+    {
+        return span.span.map(usize::from).filter(|span| *span > 0);
+    }
+    if matches!(style.grid_column_start, css::GridPlacement::Auto)
+        && let css::GridPlacement::Span(span) = &style.grid_column_end
+        && span.name.is_none()
+    {
+        return span.span.map(usize::from).filter(|span| *span > 0);
+    }
+    None
+}
+
+/// Resolve simple definite row placement constraints for intrinsic placement.
+///
+/// CSS Grid auto-placement honors definite row positions before assigning an
+/// auto column. This estimator supports positive numeric row lines within the
+/// explicit row grid so column intrinsic sizing can count same-row column-flow
+/// items correctly:
+/// <https://www.w3.org/TR/css-grid-1/#auto-placement-algo>.
+fn simple_grid_child_row_constraint(
+    style: &ComputedStyle,
+    explicit_row_count: usize,
+    row_line_names: &[Vec<String>],
+) -> Option<Option<std::ops::Range<usize>>> {
+    if matches!(style.grid_row_start, css::GridPlacement::Auto)
+        && matches!(style.grid_row_end, css::GridPlacement::Auto)
+    {
+        return Some(None);
+    }
+    if let Some(range) =
+        simple_grid_child_forward_row_range(style, explicit_row_count, row_line_names)
+    {
+        return Some(Some(range));
+    }
+    simple_grid_child_backward_row_range(style, explicit_row_count, row_line_names).map(Some)
+}
+
+fn simple_grid_child_forward_row_range(
+    style: &ComputedStyle,
+    explicit_row_count: usize,
+    row_line_names: &[Vec<String>],
+) -> Option<std::ops::Range<usize>> {
+    let start = grid_line_index(&style.grid_row_start, row_line_names)?;
+    let row_index = usize::try_from(start - 1).ok()?;
+    if row_index >= explicit_row_count {
         return None;
     }
-    let span = simple_grid_child_column_span(&style.grid_column_end, start, line_names)?;
-    let end = track_index.checked_add(span)?;
-    if end <= track_count {
-        Some(track_index..end)
-    } else {
+    let span = simple_grid_child_column_span_after(
+        &style.grid_row_end,
+        start,
+        row_line_names,
+        explicit_row_count,
+        1,
+    )?;
+    let end = row_index.checked_add(span)?;
+    (end <= explicit_row_count).then_some(row_index..end)
+}
+
+fn simple_grid_child_backward_row_range(
+    style: &ComputedStyle,
+    explicit_row_count: usize,
+    row_line_names: &[Vec<String>],
+) -> Option<std::ops::Range<usize>> {
+    let end = grid_line_index(&style.grid_row_end, row_line_names)?;
+    let end_row_index = usize::try_from(end - 1).ok()?;
+    if end_row_index > explicit_row_count {
+        return None;
+    }
+    let span = simple_grid_child_column_span_before(
+        &style.grid_row_start,
+        end,
+        row_line_names,
+        explicit_row_count,
+        1,
+    )?;
+    let start = end_row_index.checked_sub(span)?;
+    (start < end_row_index).then_some(start..end_row_index)
+}
+
+struct SimpleGridColumnPlacer {
+    track_count: usize,
+    explicit_row_count: usize,
+    auto_flow: css::GridAutoFlow,
+    rows: Vec<Vec<bool>>,
+    cursor_row: usize,
+    cursor_column: usize,
+}
+
+impl SimpleGridColumnPlacer {
+    fn new(track_count: usize, explicit_row_count: usize, auto_flow: css::GridAutoFlow) -> Self {
+        Self {
+            track_count,
+            explicit_row_count: explicit_row_count.max(1),
+            auto_flow,
+            rows: vec![vec![false; track_count]],
+            cursor_row: 0,
+            cursor_column: 0,
+        }
+    }
+
+    fn place_definite(
+        &mut self,
+        columns: std::ops::Range<usize>,
+        rows: Option<std::ops::Range<usize>>,
+    ) -> Option<std::ops::Range<usize>> {
+        if columns.is_empty() || columns.end > self.track_count {
+            return None;
+        }
+        if let Some(rows) = rows {
+            self.mark_rows(rows, columns.clone());
+            return Some(columns);
+        }
+        let mut row = 0;
+        loop {
+            if self.can_place(row, columns.clone()) {
+                self.mark(row, columns.clone());
+                return Some(columns);
+            }
+            row += 1;
+        }
+    }
+
+    /// Place a simple auto-positioned grid item in sparse or dense order.
+    ///
+    /// CSS Grid's auto-placement cursor advances through columns or rows
+    /// depending on `grid-auto-flow`; this intrinsic estimator only tracks the
+    /// explicit-grid occupancy needed to assign column track contributions:
+    /// <https://www.w3.org/TR/css-grid-1/#auto-placement-algo>.
+    fn place_auto(
+        &mut self,
+        span: usize,
+        rows: Option<std::ops::Range<usize>>,
+    ) -> Option<std::ops::Range<usize>> {
+        if span == 0 || span > self.track_count {
+            return None;
+        }
+        match self.auto_flow {
+            css::GridAutoFlow::Row => self.place_auto_row_sparse(span, rows),
+            css::GridAutoFlow::RowDense => self.place_auto_row_dense(span, rows),
+            css::GridAutoFlow::Column => self.place_auto_column_sparse(span, rows),
+            css::GridAutoFlow::ColumnDense => self.place_auto_column_dense(span, rows),
+        }
+    }
+
+    fn place_auto_row_sparse(
+        &mut self,
+        span: usize,
+        rows: Option<std::ops::Range<usize>>,
+    ) -> Option<std::ops::Range<usize>> {
+        if let Some(rows) = rows {
+            while self.cursor_column + span <= self.track_count {
+                let range = self.cursor_column..self.cursor_column + span;
+                if self.can_place_rows(rows.clone(), range.clone()) {
+                    self.mark_rows(rows, range.clone());
+                    self.cursor_column = range.end;
+                    return Some(range);
+                }
+                self.cursor_column += 1;
+            }
+            return None;
+        }
+        loop {
+            if self.cursor_column + span > self.track_count {
+                self.cursor_row += 1;
+                self.cursor_column = 0;
+                continue;
+            }
+            let range = self.cursor_column..self.cursor_column + span;
+            if self.can_place(self.cursor_row, range.clone()) {
+                self.mark(self.cursor_row, range.clone());
+                self.cursor_column = range.end;
+                return Some(range);
+            }
+            self.cursor_column += 1;
+        }
+    }
+
+    fn place_auto_row_dense(
+        &mut self,
+        span: usize,
+        rows: Option<std::ops::Range<usize>>,
+    ) -> Option<std::ops::Range<usize>> {
+        if let Some(rows) = rows {
+            for column in 0..=self.track_count - span {
+                let range = column..column + span;
+                if self.can_place_rows(rows.clone(), range.clone()) {
+                    self.mark_rows(rows, range.clone());
+                    return Some(range);
+                }
+            }
+            return None;
+        }
+        for row in 0.. {
+            for column in 0..=self.track_count - span {
+                let range = column..column + span;
+                if self.can_place(row, range.clone()) {
+                    self.mark(row, range.clone());
+                    return Some(range);
+                }
+            }
+        }
         None
+    }
+
+    fn place_auto_column_sparse(
+        &mut self,
+        span: usize,
+        rows: Option<std::ops::Range<usize>>,
+    ) -> Option<std::ops::Range<usize>> {
+        if let Some(rows) = rows {
+            loop {
+                if self.cursor_column + span > self.track_count {
+                    return None;
+                }
+                let range = self.cursor_column..self.cursor_column + span;
+                if self.can_place_rows(rows.clone(), range.clone()) {
+                    self.mark_rows(rows, range.clone());
+                    self.cursor_column = range.end;
+                    return Some(range);
+                }
+                self.cursor_column += 1;
+            }
+        }
+        loop {
+            if self.cursor_column + span > self.track_count {
+                return None;
+            }
+            if self.cursor_row >= self.explicit_row_count {
+                self.cursor_column += 1;
+                self.cursor_row = 0;
+                continue;
+            }
+            let range = self.cursor_column..self.cursor_column + span;
+            if self.can_place(self.cursor_row, range.clone()) {
+                self.mark(self.cursor_row, range.clone());
+                self.cursor_row += 1;
+                return Some(range);
+            }
+            self.cursor_row += 1;
+        }
+    }
+
+    fn place_auto_column_dense(
+        &mut self,
+        span: usize,
+        rows: Option<std::ops::Range<usize>>,
+    ) -> Option<std::ops::Range<usize>> {
+        if let Some(rows) = rows {
+            for column in 0..=self.track_count - span {
+                let range = column..column + span;
+                if self.can_place_rows(rows.clone(), range.clone()) {
+                    self.mark_rows(rows, range.clone());
+                    return Some(range);
+                }
+            }
+            return None;
+        }
+        for column in 0..=self.track_count - span {
+            for row in 0..self.explicit_row_count {
+                let range = column..column + span;
+                if self.can_place(row, range.clone()) {
+                    self.mark(row, range.clone());
+                    return Some(range);
+                }
+            }
+        }
+        None
+    }
+
+    fn can_place(&mut self, row: usize, range: std::ops::Range<usize>) -> bool {
+        self.ensure_row(row);
+        range.end <= self.track_count && self.rows[row][range].iter().all(|occupied| !occupied)
+    }
+
+    fn can_place_rows(
+        &mut self,
+        rows: std::ops::Range<usize>,
+        columns: std::ops::Range<usize>,
+    ) -> bool {
+        rows.into_iter()
+            .all(|row| self.can_place(row, columns.clone()))
+    }
+
+    fn mark(&mut self, row: usize, range: std::ops::Range<usize>) {
+        self.ensure_row(row);
+        for occupied in &mut self.rows[row][range] {
+            *occupied = true;
+        }
+    }
+
+    fn mark_rows(&mut self, rows: std::ops::Range<usize>, columns: std::ops::Range<usize>) {
+        for row in rows {
+            self.mark(row, columns.clone());
+        }
+    }
+
+    fn ensure_row(&mut self, row: usize) {
+        while row >= self.rows.len() {
+            self.rows.push(vec![false; self.track_count]);
+        }
     }
 }
 
-fn simple_grid_child_column_span(
+fn simple_grid_child_forward_column_range(
+    style: &ComputedStyle,
+    track_count: usize,
+    explicit_column_count: usize,
+    first_line_index: i32,
+    line_names: &[Vec<String>],
+) -> Option<std::ops::Range<usize>> {
+    let range = simple_grid_child_forward_column_line_range(
+        style,
+        explicit_column_count,
+        first_line_index,
+        line_names,
+    )?;
+    line_range_to_track_range(range, first_line_index, track_count)
+}
+
+fn simple_grid_child_forward_column_line_range(
+    style: &ComputedStyle,
+    explicit_column_count: usize,
+    first_line_index: i32,
+    line_names: &[Vec<String>],
+) -> Option<std::ops::Range<i32>> {
+    let start = intrinsic_column_line_index(
+        &style.grid_column_start,
+        line_names,
+        explicit_column_count,
+        first_line_index,
+    )?;
+    let span = simple_grid_child_column_span_after(
+        &style.grid_column_end,
+        start,
+        line_names,
+        explicit_column_count,
+        first_line_index,
+    )?;
+    let end = start.checked_add(i32::try_from(span).ok()?)?;
+    (start < end).then_some(start..end)
+}
+
+fn simple_grid_child_backward_column_range(
+    style: &ComputedStyle,
+    track_count: usize,
+    explicit_column_count: usize,
+    first_line_index: i32,
+    line_names: &[Vec<String>],
+) -> Option<std::ops::Range<usize>> {
+    let range = simple_grid_child_backward_column_line_range(
+        style,
+        explicit_column_count,
+        first_line_index,
+        line_names,
+    )?;
+    line_range_to_track_range(range, first_line_index, track_count)
+}
+
+fn simple_grid_child_column_line_range(
+    style: &ComputedStyle,
+    explicit_column_count: usize,
+    line_names: &[Vec<String>],
+) -> Option<std::ops::Range<i32>> {
+    simple_grid_child_forward_column_line_range(style, explicit_column_count, 1, line_names)
+        .or_else(|| {
+            simple_grid_child_backward_column_line_range(
+                style,
+                explicit_column_count,
+                1,
+                line_names,
+            )
+        })
+}
+
+fn simple_grid_child_backward_column_line_range(
+    style: &ComputedStyle,
+    explicit_column_count: usize,
+    first_line_index: i32,
+    line_names: &[Vec<String>],
+) -> Option<std::ops::Range<i32>> {
+    let end = intrinsic_column_line_index(
+        &style.grid_column_end,
+        line_names,
+        explicit_column_count,
+        first_line_index,
+    )?;
+    let span = simple_grid_child_column_span_before(
+        &style.grid_column_start,
+        end,
+        line_names,
+        explicit_column_count,
+        first_line_index,
+    )?;
+    let start = end.checked_sub(i32::try_from(span).ok()?)?;
+    (start < end).then_some(start..end)
+}
+
+fn line_range_to_track_range(
+    range: std::ops::Range<i32>,
+    first_line_index: i32,
+    track_count: usize,
+) -> Option<std::ops::Range<usize>> {
+    let start = usize::try_from(range.start.checked_sub(first_line_index)?).ok()?;
+    let end = usize::try_from(range.end.checked_sub(first_line_index)?).ok()?;
+    (start < end && end <= track_count).then_some(start..end)
+}
+
+fn simple_grid_child_column_span_after(
     end: &css::GridPlacement,
     start: i32,
     line_names: &[Vec<String>],
+    explicit_column_count: usize,
+    first_line_index: i32,
 ) -> Option<usize> {
     match end {
         css::GridPlacement::Auto => Some(1),
         css::GridPlacement::Span(span) if span.name.is_none() => {
             span.span.map(usize::from).filter(|span| *span > 0)
         }
+        css::GridPlacement::Span(span) => simple_grid_named_column_span_after(
+            span,
+            start,
+            line_names,
+            explicit_column_count,
+            first_line_index,
+        ),
         css::GridPlacement::Line(_) => {
-            let end = grid_line_index(end, line_names)?;
+            let end = intrinsic_column_line_index(
+                end,
+                line_names,
+                explicit_column_count,
+                first_line_index,
+            )?;
             (end > start)
                 .then_some(end - start)
                 .and_then(|span| usize::try_from(span).ok())
         }
-        css::GridPlacement::Span(_) => None,
     }
+}
+
+fn simple_grid_child_column_span_before(
+    start: &css::GridPlacement,
+    end: i32,
+    line_names: &[Vec<String>],
+    explicit_column_count: usize,
+    first_line_index: i32,
+) -> Option<usize> {
+    match start {
+        css::GridPlacement::Auto => Some(1),
+        css::GridPlacement::Span(span) if span.name.is_none() => {
+            span.span.map(usize::from).filter(|span| *span > 0)
+        }
+        css::GridPlacement::Span(span) => simple_grid_named_column_span_before(
+            span,
+            end,
+            line_names,
+            explicit_column_count,
+            first_line_index,
+        ),
+        css::GridPlacement::Line(_) => None,
+    }
+}
+
+/// Resolve a simple forward named column span from a definite start line.
+///
+/// CSS Grid resolves a named span from the opposite definite edge by counting
+/// matching named lines in the span direction:
+/// <https://www.w3.org/TR/css-grid-1/#grid-placement-span-int>.
+fn simple_grid_named_column_span_after(
+    span: &css::GridSpanPlacement,
+    start: i32,
+    line_names: &[Vec<String>],
+    explicit_track_count: usize,
+    first_line_index: i32,
+) -> Option<usize> {
+    let name = span.name.as_ref()?;
+    let target = span.span.unwrap_or(1);
+    if target == 0 {
+        return None;
+    }
+    let mut matches_seen = 0_u16;
+    let explicit_line_count = explicit_track_count.checked_add(1)?;
+    for (line_index, names) in line_names
+        .iter()
+        .enumerate()
+        .skip(explicit_line_vector_start(first_line_index)?)
+        .take(explicit_line_count)
+    {
+        let css_line = first_line_index.checked_add(i32::try_from(line_index).ok()?)?;
+        if css_line <= start {
+            continue;
+        }
+        if names.iter().any(|line_name| line_name == name) {
+            matches_seen += 1;
+            if matches_seen == target {
+                return usize::try_from(css_line.checked_sub(start)?).ok();
+            }
+        }
+    }
+    let explicit_line_count = i32::try_from(explicit_line_count).ok()?;
+    if start < explicit_line_count {
+        let missing = usize::from(target - matches_seen);
+        i32::try_from(missing)
+            .ok()
+            .and_then(|missing| explicit_line_count.checked_add(missing))
+            .and_then(|line| line.checked_sub(start))
+            .and_then(|span| usize::try_from(span).ok())
+    } else {
+        Some(usize::from(target - matches_seen))
+    }
+}
+
+/// Resolve a simple backward named column span from a definite end line.
+///
+/// CSS Grid resolves a named span from the opposite definite edge by counting
+/// matching named lines in the span direction:
+/// <https://www.w3.org/TR/css-grid-1/#grid-placement-span-int>.
+fn simple_grid_named_column_span_before(
+    span: &css::GridSpanPlacement,
+    end: i32,
+    line_names: &[Vec<String>],
+    explicit_track_count: usize,
+    first_line_index: i32,
+) -> Option<usize> {
+    let name = span.name.as_ref()?;
+    let target = span.span.unwrap_or(1);
+    if target == 0 {
+        return None;
+    }
+    let mut matches_seen = 0_u16;
+    let explicit_line_count = explicit_track_count.checked_add(1)?;
+    for (line_index, names) in line_names
+        .iter()
+        .enumerate()
+        .skip(explicit_line_vector_start(first_line_index)?)
+        .take(explicit_line_count)
+        .rev()
+    {
+        let css_line = first_line_index.checked_add(i32::try_from(line_index).ok()?)?;
+        if css_line >= end {
+            continue;
+        }
+        if names.iter().any(|line_name| line_name == name) {
+            matches_seen += 1;
+            if matches_seen == target {
+                return usize::try_from(end.checked_sub(css_line)?).ok();
+            }
+        }
+    }
+    let missing = usize::from(target - matches_seen);
+    let start_line = 1_i32.checked_sub(i32::try_from(missing).ok()?)?;
+    end.checked_sub(start_line)
+        .and_then(|span| usize::try_from(span).ok())
+}
+
+fn intrinsic_column_line_index(
+    placement: &css::GridPlacement,
+    line_names: &[Vec<String>],
+    explicit_track_count: usize,
+    first_line_index: i32,
+) -> Option<i32> {
+    let css::GridPlacement::Line(line) = placement else {
+        return None;
+    };
+    let explicit_line_count = i32::try_from(explicit_track_count).ok()?.checked_add(1)?;
+    if line.name.is_none() {
+        let index = line.index?;
+        if index > 0 {
+            return Some(index);
+        }
+        return (index < 0).then(|| explicit_line_count + index + 1);
+    }
+    let name = line.name.as_ref()?;
+    let occurrence = line.index.unwrap_or(1);
+    named_intrinsic_column_line_index(
+        line_names,
+        name,
+        occurrence,
+        explicit_track_count,
+        first_line_index,
+    )
+}
+
+fn named_intrinsic_column_line_index(
+    line_names: &[Vec<String>],
+    name: &str,
+    occurrence: i32,
+    explicit_track_count: usize,
+    first_line_index: i32,
+) -> Option<i32> {
+    if occurrence == 0 {
+        return None;
+    }
+    let target = occurrence.unsigned_abs();
+    let explicit_line_count = explicit_track_count.checked_add(1)?;
+    let explicit_start = explicit_line_vector_start(first_line_index)?;
+    let mut matches_seen = 0_u32;
+    let explicit_lines = line_names
+        .iter()
+        .enumerate()
+        .skip(explicit_start)
+        .take(explicit_line_count);
+    if occurrence > 0 {
+        for (line_index, names) in explicit_lines {
+            if names.iter().any(|line_name| line_name == name) {
+                matches_seen += 1;
+                if matches_seen == target {
+                    return first_line_index.checked_add(i32::try_from(line_index).ok()?);
+                }
+            }
+        }
+        let missing = i32::try_from(target.checked_sub(matches_seen)?).ok()?;
+        return i32::try_from(explicit_line_count)
+            .ok()?
+            .checked_add(missing);
+    }
+    for (line_index, names) in explicit_lines.rev() {
+        if names.iter().any(|line_name| line_name == name) {
+            matches_seen += 1;
+            if matches_seen == target {
+                return first_line_index.checked_add(i32::try_from(line_index).ok()?);
+            }
+        }
+    }
+    let missing = i32::try_from(target.checked_sub(matches_seen)?).ok()?;
+    1_i32.checked_sub(missing)
+}
+
+fn explicit_line_vector_start(first_line_index: i32) -> Option<usize> {
+    usize::try_from(1_i32.checked_sub(first_line_index)?).ok()
 }
 
 fn distribute_grid_item_contribution(
@@ -433,6 +2019,19 @@ fn distribute_grid_item_contribution(
     }
 }
 
+/// Return the grid gap contribution for intrinsic container width estimates.
+///
+/// CSS Box Alignment resolves cyclic percentage gaps against zero for
+/// intrinsic size contributions, while preserving non-percentage length
+/// components:
+/// <https://www.w3.org/TR/css-align-3/#gaps>.
+fn intrinsic_grid_gap_size(gap: css::ComputedGap) -> LayoutLength {
+    match gap {
+        css::ComputedGap::Normal => layout_pt(0.0),
+        css::ComputedGap::LengthPercentage(value) => value.length_max_zero(),
+    }
+}
+
 /// Resolve repeat count for grid container intrinsic width estimates.
 ///
 /// CSS Grid's auto-repeat expansion uses the available definite container size
@@ -451,10 +2050,9 @@ fn grid_track_intrinsic_width(
     size: css::GridTrackSize,
     item_min: f32,
     item_max: f32,
-    percentage_basis: f32,
 ) -> (f32, f32) {
-    let min = grid_min_track_intrinsic_width(size.min, item_min, item_max, percentage_basis);
-    let max = grid_max_track_intrinsic_width(size.max, item_min, item_max, percentage_basis);
+    let min = grid_min_track_intrinsic_width(size.min, item_min, item_max);
+    let max = grid_max_track_intrinsic_width(size.max, item_min, item_max);
     (min.min(max).max(0.0), max.max(min).max(0.0))
 }
 
@@ -462,13 +2060,12 @@ fn grid_min_track_intrinsic_width(
     breadth: css::GridMinTrackBreadth,
     item_min: f32,
     item_max: f32,
-    percentage_basis: f32,
 ) -> f32 {
     match breadth {
         css::GridMinTrackBreadth::Auto | css::GridMinTrackBreadth::MinContent => item_min,
         css::GridMinTrackBreadth::MaxContent => item_max,
         css::GridMinTrackBreadth::LengthPercentage(value) => {
-            used_length_percentage(value, percentage_basis).max(0.0)
+            intrinsic_grid_min_track_breadth_length(value, layout_pt(item_min)).points()
         }
     }
 }
@@ -477,25 +2074,76 @@ fn grid_max_track_intrinsic_width(
     breadth: css::GridMaxTrackBreadth,
     item_min: f32,
     item_max: f32,
-    percentage_basis: f32,
 ) -> f32 {
     match breadth {
         css::GridMaxTrackBreadth::Auto
         | css::GridMaxTrackBreadth::MaxContent
         | css::GridMaxTrackBreadth::Flex(_) => item_max,
         css::GridMaxTrackBreadth::MinContent => item_min,
-        css::GridMaxTrackBreadth::LengthPercentage(value)
-        | css::GridMaxTrackBreadth::FitContent(value) => {
-            used_length_percentage(value, percentage_basis).max(0.0)
+        css::GridMaxTrackBreadth::LengthPercentage(value) => {
+            intrinsic_grid_max_track_breadth_length(value, layout_pt(item_max)).points()
         }
+        css::GridMaxTrackBreadth::FitContent(value) => {
+            let limit = intrinsic_grid_fit_content_limit(value, layout_pt(item_max)).points();
+            item_max.min(item_min.max(limit)).max(0.0)
+        }
+    }
+}
+
+/// Return a min track breadth for intrinsic grid container sizing.
+///
+/// CSS Grid treats percentage track sizes as `auto` for intrinsic size
+/// calculations when the grid container's size depends on its tracks:
+/// <https://www.w3.org/TR/css-grid-1/#valdef-grid-template-columns-percentage>.
+fn intrinsic_grid_min_track_breadth_length(
+    value: css::ComputedLengthPercentage,
+    item_min: LayoutLength,
+) -> LayoutLength {
+    if value.contains_percentage() {
+        item_min
+    } else {
+        value.length_max_zero()
+    }
+}
+
+/// Return a max track breadth for intrinsic grid container sizing.
+///
+/// CSS Grid treats percentage track sizes as `auto` for intrinsic size
+/// calculations when the grid container's size depends on its tracks:
+/// <https://www.w3.org/TR/css-grid-1/#valdef-grid-template-columns-percentage>.
+fn intrinsic_grid_max_track_breadth_length(
+    value: css::ComputedLengthPercentage,
+    item_max: LayoutLength,
+) -> LayoutLength {
+    if value.contains_percentage() {
+        item_max
+    } else {
+        value.length_max_zero()
+    }
+}
+
+/// Return the `fit-content()` limit for intrinsic grid container sizing.
+///
+/// CSS Grid defines `fit-content()` as `minmax(auto, max-content)` capped by
+/// the argument, and percentage track sizes behave as `auto` during intrinsic
+/// container sizing:
+/// <https://www.w3.org/TR/css-grid-1/#valdef-grid-template-columns-fit-content>.
+fn intrinsic_grid_fit_content_limit(
+    value: css::ComputedLengthPercentage,
+    item_max: LayoutLength,
+) -> LayoutLength {
+    if value.contains_percentage() {
+        item_max
+    } else {
+        value.length_max_zero()
     }
 }
 
 fn grid_item_estimate_from_intrinsic(
     style: &ComputedStyle,
     available_width: f32,
-    inline_basis: Option<f32>,
-    block_basis: f32,
+    inline_basis: GridPercentageBasis,
+    block_basis: GridPercentageBasis,
     min_content: f32,
     max_content: f32,
     content_height: f32,
@@ -503,23 +2151,120 @@ fn grid_item_estimate_from_intrinsic(
     let max_content = max_content.max(min_content).max(0.0);
     let min_content = min_content.max(0.0);
     let content_height = content_height.max(0.0);
-    let content_width =
-        used_length_percentage_or_auto_with_optional_basis(style.box_values.width, inline_basis)
-            .unwrap_or(max_content);
-    let content_height = used_length_percentage_or_auto(style.box_values.height, block_basis)
-        .unwrap_or(content_height);
+    let specified_width =
+        used_length_percentage_or_auto_with_basis(style.box_values.width.clone(), inline_basis)
+            .map(|width| width.points());
+    let content_width = specified_width.unwrap_or(max_content);
+    // A definite or intrinsic preferred inline size constrains the item's
+    // min-content contribution. For example, `width: max-content` makes the
+    // item's min-content contribution its max-content size, rather than the
+    // width of its narrowest word. An unresolved percentage remains automatic
+    // for this intrinsic probe.
+    // <https://www.w3.org/TR/css-grid-1/#min-size-auto>
+    // <https://www.w3.org/TR/css-grid-1/#intrinsic-sizes>
+    let min_width_contribution = match style.box_values.width.clone() {
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::Stretch => min_content,
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(_) => {
+            specified_width.map_or(min_content, |_| content_width)
+        }
+        css::ComputedLengthPercentageOrAuto::MinContent
+        | css::ComputedLengthPercentageOrAuto::MaxContent
+        | css::ComputedLengthPercentageOrAuto::FitContent(_)
+        | css::ComputedLengthPercentageOrAuto::CalcSize(_) => content_width,
+    };
+    let content_height =
+        used_length_percentage_or_auto_with_basis(style.box_values.height.clone(), block_basis)
+            .map(|height| height.points())
+            .unwrap_or(content_height);
     GridItemEstimate {
-        width: content_box_pt(constrain_width(style, content_width, available_width)),
-        height: content_box_pt(constrain_height(style, content_height, block_basis)),
-        min_width: content_box_pt(constrain_width(style, min_content, available_width)),
-        min_height: content_box_pt(constrain_height(
-            style,
-            content_height.min(style.line_height),
-            block_basis,
-        )),
-        content_width: content_box_pt(max_content),
-        content_height: content_box_pt(content_height),
+        metrics: IntrinsicItemMetrics {
+            width: constrain_content_width(
+                style,
+                content_box_pt(content_width),
+                PercentageBasis::definite(layout_pt(available_width)),
+            ),
+            height: content_box_pt(constrain_grid_intrinsic_height(
+                style,
+                content_height,
+                block_basis,
+            )),
+            min_width: constrain_content_width(
+                style,
+                content_box_pt(min_width_contribution),
+                PercentageBasis::definite(layout_pt(available_width)),
+            ),
+            min_height: content_box_pt(constrain_grid_intrinsic_height(
+                style,
+                content_height,
+                block_basis,
+            )),
+            content_width: content_box_pt(max_content),
+            content_height: content_box_pt(content_height),
+            preferred_aspect_ratio: style.aspect_ratio.preferred_ratio_for_non_replaced(false),
+            first_baseline: None,
+            last_baseline: None,
+        },
+        swaps_physical_axes: WritingModeAxes::new(style.writing_mode, style.direction)
+            .swaps_physical_axes(),
     }
+}
+
+/// Store horizontal text baselines for grid item baseline self-alignment.
+///
+/// CSS Grid participates in CSS Box Alignment baseline sharing. For the
+/// same-page path covered here, inline text baselines are measured from the
+/// grid item's border-box block-start edge, matching the baseline coordinate
+/// used when the item is replayed:
+/// <https://www.w3.org/TR/css-grid-1/#grid-baselines> and
+/// <https://www.w3.org/TR/css-align-3/#baseline-align-self>.
+fn set_grid_item_text_baselines(
+    estimate: &mut GridItemEstimate,
+    style: &ComputedStyle,
+    first_line_baseline: f32,
+    last_line_baseline: f32,
+    line_count: usize,
+) {
+    if line_count == 0 || style.writing_mode != WritingMode::HorizontalTb {
+        return;
+    }
+    let borders = used_border_widths(style);
+    let baseline_edge = borders.top + style.padding.top;
+    estimate.first_baseline = Some(baseline_edge + first_line_baseline);
+    estimate.last_baseline = Some(baseline_edge + last_line_baseline);
+}
+
+/// Apply grid item intrinsic min/max height constraints with an optional basis.
+///
+/// CSS Sizing resolves percentages only against definite containing-block
+/// sizes. Grid row intrinsic sizing can query an item while the grid
+/// container's block size is indefinite, so percentage heights and percentage
+/// min/max-height constraints must behave as unresolved rather than using the
+/// grid inline size as a fallback:
+/// <https://www.w3.org/TR/css-sizing-3/#percentage-sizing> and
+/// <https://www.w3.org/TR/css-grid-1/#algo-overview>.
+fn constrain_grid_intrinsic_height(
+    style: &ComputedStyle,
+    mut value: f32,
+    percentage_basis: GridPercentageBasis,
+) -> f32 {
+    if let Some(min) = used_length_percentage_or_auto_with_basis(
+        style.box_values.min_height.clone(),
+        percentage_basis,
+    )
+    .map(|height| height.points().max(0.0))
+    {
+        value = value.max(min);
+    }
+    if let Some(max) = used_length_percentage_or_auto_with_basis(
+        style.box_values.max_height.clone(),
+        percentage_basis,
+    )
+    .map(|height| height.points().max(0.0))
+    {
+        value = value.min(max);
+    }
+    value
 }
 
 /// Measures a leaf grid item for Taffy's Grid track-sizing algorithm.
@@ -533,38 +2278,29 @@ pub(super) fn measure_grid_item(
     available_space: taffy_layout::Size<taffy_layout::AvailableSpace>,
     estimate: Option<&mut GridItemEstimate>,
 ) -> taffy_layout::Size<f32> {
-    let estimate = estimate.copied().unwrap_or(GridItemEstimate {
-        width: content_box_pt(0.0),
-        height: content_box_pt(0.0),
-        min_width: content_box_pt(0.0),
-        min_height: content_box_pt(0.0),
-        content_width: content_box_pt(0.0),
-        content_height: content_box_pt(0.0),
+    let estimate = estimate.cloned().unwrap_or(GridItemEstimate {
+        metrics: IntrinsicItemMetrics::zero(),
+        swaps_physical_axes: false,
     });
-    taffy_layout::Size {
-        width: known_dimensions
-            .width
-            .unwrap_or_else(|| {
-                grid_item_measured_size(
-                    available_space.width,
-                    estimate.width,
-                    estimate.min_width,
-                    estimate.content_width,
-                )
-            })
-            .max(0.0),
-        height: known_dimensions
-            .height
-            .unwrap_or_else(|| {
-                grid_item_measured_size(
-                    available_space.height,
-                    estimate.height,
-                    estimate.min_height,
-                    estimate.content_height,
-                )
-            })
-            .max(0.0),
-    }
+    let estimate = estimate.physical_measurements();
+    measure_intrinsic_item_leaf(
+        known_dimensions,
+        estimate.preferred_aspect_ratio,
+        taffy_layout::Size {
+            width: grid_item_measured_size(
+                available_space.width,
+                estimate.width,
+                estimate.min_width,
+                estimate.content_width,
+            ),
+            height: grid_item_measured_size(
+                available_space.height,
+                estimate.height,
+                estimate.min_height,
+                estimate.content_height,
+            ),
+        },
+    )
 }
 
 fn grid_item_measured_size(
@@ -584,6 +2320,16 @@ fn grid_item_measured_size(
 mod tests {
     use super::*;
 
+    #[test]
+    fn intrinsic_gap_preserves_a_typed_fixed_component() {
+        let value = css::ComputedLengthPercentage::from_affine(layout_pt(12.0), 0.5, true);
+
+        let gap: LayoutLength = intrinsic_grid_gap_size(css::ComputedGap::LengthPercentage(value));
+
+        // Intrinsic sizing resolves the cyclic percentage component to zero.
+        assert_eq!(gap, layout_pt(12.0));
+    }
+
     fn fixed_track(size: f32) -> css::GridTrackSize {
         css::GridTrackSize {
             min: css::GridMinTrackBreadth::LengthPercentage(
@@ -593,6 +2339,36 @@ mod tests {
                 css::ComputedLengthPercentage::from_points(size),
             ),
         }
+    }
+
+    fn anonymous_grid_child_with_style(style: ComputedStyle) -> GridChild<'static> {
+        let source = FormattingContextChild {
+            kind: FormattingContextChildKind::AnonymousContent {
+                children: Vec::new(),
+            },
+            style: style.clone(),
+        };
+        let mut used_style = style;
+        used_style.apply_effective_zoom();
+        GridUsedItem::from_source(source, used_style)
+    }
+
+    fn grid_line(index: i32) -> css::GridPlacement {
+        css::GridPlacement::Line(css::GridLinePlacement {
+            name: None,
+            index: Some(index),
+        })
+    }
+
+    fn named_grid_line(name: &str) -> css::GridPlacement {
+        css::GridPlacement::Line(css::GridLinePlacement {
+            name: Some(name.to_string()),
+            index: None,
+        })
+    }
+
+    fn row_lines(row_count: usize) -> Vec<Vec<String>> {
+        vec![Vec::new(); row_count + 1]
     }
 
     #[test]
@@ -608,14 +2384,314 @@ mod tests {
     }
 
     #[test]
+    fn max_content_item_uses_its_max_content_width_for_min_content_measurement() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.width = css::ComputedLengthPercentageOrAuto::MaxContent;
+
+        let estimate = grid_item_estimate_from_intrinsic(
+            &style,
+            300.0,
+            GridPercentageBasis::indefinite(),
+            GridPercentageBasis::indefinite(),
+            20.0,
+            100.0,
+            20.0,
+        );
+
+        assert_eq!(estimate.min_width.points(), 100.0);
+        assert_eq!(estimate.content_width.points(), 100.0);
+    }
+
+    #[test]
+    fn implicit_column_count_does_not_synthesize_empty_column_flow_track() {
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Column,
+                2,
+                0,
+                &row_lines(0),
+                &row_lines(2),
+                &[]
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn implicit_column_count_includes_positive_numeric_lines() {
+        let mut second_column = ComputedStyle::initial();
+        second_column.grid_column_start = grid_line(2);
+        let mut third_column = ComputedStyle::initial();
+        third_column.grid_column_start = grid_line(3);
+        let children = [
+            anonymous_grid_child_with_style(second_column),
+            anonymous_grid_child_with_style(third_column),
+        ];
+
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Row,
+                1,
+                0,
+                &row_lines(0),
+                &row_lines(1),
+                &children
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn implicit_column_count_includes_positive_named_implicit_lines() {
+        let mut named_start = ComputedStyle::initial();
+        named_start.grid_column_start = named_grid_line("slot");
+        let mut named_end = ComputedStyle::initial();
+        named_end.grid_column_start = css::GridPlacement::Auto;
+        named_end.grid_column_end = named_grid_line("slot");
+        let children = [
+            anonymous_grid_child_with_style(named_start),
+            anonymous_grid_child_with_style(named_end),
+        ];
+
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Row,
+                1,
+                1,
+                &row_lines(1),
+                &row_lines(1),
+                &children
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn implicit_column_count_includes_forward_named_implicit_spans() {
+        let mut named_span = ComputedStyle::initial();
+        named_span.grid_column_start = grid_line(1);
+        named_span.grid_column_end = css::GridPlacement::Span(css::GridSpanPlacement {
+            name: Some("slot".to_string()),
+            span: None,
+        });
+        let children = [anonymous_grid_child_with_style(named_span)];
+
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Row,
+                1,
+                1,
+                &row_lines(1),
+                &row_lines(1),
+                &children
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn backward_named_implicit_span_resolves_startward() {
+        let mut named_span = ComputedStyle::initial();
+        named_span.grid_column_start = css::GridPlacement::Span(css::GridSpanPlacement {
+            name: Some("slot".to_string()),
+            span: None,
+        });
+        named_span.grid_column_end = grid_line(3);
+
+        let placement = simple_grid_child_column_placement(
+            &named_span,
+            3,
+            1,
+            0,
+            &row_lines(3),
+            1,
+            &row_lines(1),
+        );
+        match placement {
+            Some(SimpleGridColumnPlacement::Definite { columns, rows }) => {
+                assert_eq!(columns, 0..3);
+                assert!(rows.is_none());
+            }
+            _ => panic!("backward named implicit span should resolve to startward columns"),
+        }
+    }
+
+    #[test]
+    fn implicit_column_count_uses_template_area_explicit_columns() {
+        let children = [
+            anonymous_grid_child_with_style(ComputedStyle::initial()),
+            anonymous_grid_child_with_style(ComputedStyle::initial()),
+            anonymous_grid_child_with_style(ComputedStyle::initial()),
+        ];
+
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Row,
+                1,
+                2,
+                &row_lines(2),
+                &row_lines(1),
+                &children
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Column,
+                2,
+                2,
+                &row_lines(2),
+                &row_lines(2),
+                &children
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn implicit_column_count_honors_definite_rows_in_column_auto_flow() {
+        let mut first = ComputedStyle::initial();
+        first.grid_row_start = grid_line(2);
+        let mut second = ComputedStyle::initial();
+        second.grid_row_start = grid_line(2);
+        let mut third = ComputedStyle::initial();
+        third.grid_row_start = grid_line(2);
+        let children = [
+            anonymous_grid_child_with_style(first),
+            anonymous_grid_child_with_style(second),
+            anonymous_grid_child_with_style(third),
+        ];
+
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Column,
+                2,
+                0,
+                &row_lines(0),
+                &row_lines(2),
+                &children
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Column,
+                2,
+                1,
+                &row_lines(1),
+                &row_lines(2),
+                &children
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn implicit_column_count_honors_definite_rows_in_row_auto_flow() {
+        let mut first = ComputedStyle::initial();
+        first.grid_row_start = grid_line(2);
+        let mut second = ComputedStyle::initial();
+        second.grid_row_start = grid_line(2);
+        let mut third = ComputedStyle::initial();
+        third.grid_row_start = grid_line(2);
+        let children = [
+            anonymous_grid_child_with_style(first),
+            anonymous_grid_child_with_style(second),
+            anonymous_grid_child_with_style(third),
+        ];
+
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Row,
+                2,
+                0,
+                &row_lines(0),
+                &row_lines(2),
+                &children
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Row,
+                2,
+                1,
+                &row_lines(1),
+                &row_lines(2),
+                &children
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn implicit_column_count_honors_generated_named_row_constraints() {
+        let mut first = ComputedStyle::initial();
+        first.grid_row_start = named_grid_line("slot-start");
+        first.grid_row_end = named_grid_line("slot-end");
+        let mut second = first.clone();
+        let mut third = first.clone();
+        second.grid_column_start = css::GridPlacement::Auto;
+        third.grid_column_start = css::GridPlacement::Auto;
+        let children = [
+            anonymous_grid_child_with_style(first),
+            anonymous_grid_child_with_style(second),
+            anonymous_grid_child_with_style(third),
+        ];
+        let named_row_lines = vec![
+            Vec::new(),
+            vec!["slot-start".to_string()],
+            vec!["slot-end".to_string()],
+        ];
+
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Row,
+                2,
+                1,
+                &row_lines(1),
+                &named_row_lines,
+                &children
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn implicit_column_count_accepts_template_area_named_lines() {
+        let mut named_area = ComputedStyle::initial();
+        named_area.grid_column_start = named_grid_line("main-start");
+        named_area.grid_column_end = named_grid_line("main-end");
+        let children = [anonymous_grid_child_with_style(named_area)];
+
+        assert_eq!(
+            simple_implicit_column_count(
+                css::GridAutoFlow::Row,
+                1,
+                2,
+                &row_lines(2),
+                &row_lines(1),
+                &children
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn grid_item_measurement_extracts_typed_content_box_lengths() {
         let mut estimate = GridItemEstimate {
-            width: content_box_pt(40.0),
-            height: content_box_pt(50.0),
-            min_width: content_box_pt(10.0),
-            min_height: content_box_pt(20.0),
-            content_width: content_box_pt(90.0),
-            content_height: content_box_pt(100.0),
+            metrics: IntrinsicItemMetrics {
+                width: content_box_pt(40.0),
+                height: content_box_pt(50.0),
+                min_width: content_box_pt(10.0),
+                min_height: content_box_pt(20.0),
+                content_width: content_box_pt(90.0),
+                content_height: content_box_pt(100.0),
+                preferred_aspect_ratio: None,
+                first_baseline: None,
+                last_baseline: None,
+            },
+            swaps_physical_axes: false,
         };
 
         let min_content = measure_grid_item(
@@ -662,6 +2738,39 @@ mod tests {
     }
 
     #[test]
+    fn vertical_grid_item_measurement_projects_logical_contributions_to_physical_axes() {
+        let mut estimate = GridItemEstimate {
+            metrics: IntrinsicItemMetrics {
+                width: content_box_pt(40.0),
+                height: content_box_pt(50.0),
+                min_width: content_box_pt(10.0),
+                min_height: content_box_pt(20.0),
+                content_width: content_box_pt(90.0),
+                content_height: content_box_pt(100.0),
+                preferred_aspect_ratio: None,
+                first_baseline: None,
+                last_baseline: None,
+            },
+            swaps_physical_axes: true,
+        };
+
+        let max_content = measure_grid_item(
+            taffy_layout::Size {
+                width: None,
+                height: None,
+            },
+            taffy_layout::Size {
+                width: taffy_layout::AvailableSpace::MaxContent,
+                height: taffy_layout::AvailableSpace::MaxContent,
+            },
+            Some(&mut estimate),
+        );
+
+        assert_eq!(max_content.width, 100.0);
+        assert_eq!(max_content.height, 90.0);
+    }
+
+    #[test]
     fn intrinsic_auto_repeat_expands_once_for_indefinite_queries() {
         let components = [css::GridTrackListComponent::Repeat(
             Vec::new(),
@@ -675,8 +2784,12 @@ mod tests {
             },
         )];
 
-        let expanded = expanded_grid_tracks(&components, &["end".to_string()])
-            .expect("auto-repeat should expand for intrinsic sizing");
+        let expanded = expanded_grid_tracks(
+            &components,
+            &["end".to_string()],
+            &css::GridTemplateAreas::None,
+        )
+        .expect("auto-repeat should expand for intrinsic sizing");
         assert_eq!(expanded.sizes, vec![fixed_track(20.0)]);
         assert_eq!(
             expanded.line_names,

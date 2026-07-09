@@ -15,13 +15,16 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
     ) -> (f32, f32) {
-        let measurement = self.intrinsic_inline_measurement_for_element(
-            element,
-            style,
-            stylesheets,
-            None,
-            f32::MAX,
-        );
+        let measurement =
+            self.with_intrinsic_inline_percentage_basis(PercentageBasis::indefinite(), |layout| {
+                layout.intrinsic_inline_measurement_for_element(
+                    element,
+                    style,
+                    stylesheets,
+                    None,
+                    f32::MAX,
+                )
+            });
         (measurement.contribution.max_content, measurement.height())
     }
 

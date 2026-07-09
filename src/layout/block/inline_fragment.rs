@@ -16,6 +16,7 @@ impl<'a> LayoutBuilder<'a> {
             .flatten();
         let style = suppressed_style.as_ref().unwrap_or(style);
         let element = Element {
+            id: crate::dom::ElementId::next(),
             tag: "span".to_string(),
             namespace_url: String::new(),
             document_syntax: dom::DocumentSyntax::Html,

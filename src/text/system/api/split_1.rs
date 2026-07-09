@@ -1,5 +1,7 @@
 use super::*;
+use crate::units::{LayoutLength, SemanticLengthExt, layout_pt};
 use std::borrow::Cow;
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub(in crate::text) struct FontSizeAdjustmentRange {
@@ -13,6 +15,24 @@ pub(in crate::text) struct RenderedRunTabContext<'a> {
 }
 
 impl FontSystem {
+    /// Run one Parley shaping pass with layout storage retained for the next
+    /// pass in this document.
+    ///
+    /// Parley lines borrow their layout, while Quire converts them into owned
+    /// glyph runs before this closure returns. Taking the scratch out of
+    /// [`FontSystem`] keeps those borrows separate from the mutable font
+    /// system needed during conversion and guarantees restoration on every
+    /// normal closure return, including its early returns.
+    pub(in crate::text) fn with_reusable_parley_layout<T>(
+        &mut self,
+        shape: impl FnOnce(&mut Self, &mut ParleyLayout<[u8; 4]>) -> T,
+    ) -> T {
+        let mut layout = std::mem::take(&mut self.parley_layout_scratch);
+        let result = shape(self, &mut layout);
+        self.parley_layout_scratch = layout;
+        result
+    }
+
     #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::from_seed(Self::sync_seed())
@@ -53,8 +73,8 @@ impl FontSystem {
         ) {
             return Some(id);
         }
-        self.resolve_generic_family(
-            &FontFamily::SansSerif,
+        self.resolve_system_fallback_for_character(
+            'M',
             style.font_weight,
             style.font_style,
             style.font_width,
@@ -91,6 +111,24 @@ impl FontSystem {
             return None;
         }
         let adjusted = style.font_size * target_ratio / selected_ratio;
+        adjusted.is_finite().then_some(adjusted)
+    }
+
+    /// Resolve the face's used shaping size. An element-level
+    /// `font-size-adjust` takes precedence over the `@font-face size-adjust`
+    /// descriptor; otherwise the descriptor scales this face alone.
+    /// <https://www.w3.org/TR/css-fonts-5/#font-size-adjust-prop>
+    /// <https://www.w3.org/TR/css-fonts-5/#descdef-font-face-size-adjust>
+    pub(in crate::text) fn used_font_size_for_font(
+        &mut self,
+        style: &ComputedStyle,
+        font_id: usize,
+    ) -> Option<f32> {
+        if !matches!(style.font_size_adjust, FontSizeAdjust::None) {
+            return self.adjusted_font_size_for_font(style, font_id);
+        }
+        let factor = self.document_fonts.font_size_adjust(font_id)?;
+        let adjusted = style.font_size * factor;
         adjusted.is_finite().then_some(adjusted)
     }
 
@@ -150,42 +188,56 @@ impl FontSystem {
         &mut self,
         text: &str,
         style: &ComputedStyle,
-    ) -> Vec<Range<usize>> {
+    ) -> Vec<BidiVisualRange> {
         if text.is_empty() {
             return Vec::new();
         }
         let emoji_text = text_with_font_variant_emoji(text, style);
         let bidi_text = text_with_css_bidi_controls(emoji_text.as_ref(), style);
         let shaped_text = bidi_text.as_str();
-        let feature_context = self.font_feature_context_for_style(style);
-        let mut builder = self.parley_layout_context.ranged_builder(
-            &mut self.parley_font_context,
-            shaped_text,
-            1.0,
-            false,
-        );
-        push_parley_default_style(&mut builder, style);
-        push_parley_text_spacing_default_with_context(
-            &mut builder,
-            shaped_text,
-            style,
-            feature_context.as_ref(),
-        );
-        let mut layout = builder.build(shaped_text);
-        layout.break_all_lines(None);
-        layout
-            .lines()
-            .next()
-            .map(|line| {
-                let mut ranges = visual_ranges_for_line(line)
-                    .into_iter()
-                    .filter_map(|range| bidi_text.original_range(range))
-                    .collect::<Vec<_>>();
-                merge_join_control_visual_ranges(text, &mut ranges);
-                ranges
-            })
-            .filter(|ranges| !ranges.is_empty())
-            .unwrap_or_else(|| std::iter::once(0..text.len()).collect())
+        self.with_reusable_parley_layout(|this, layout| {
+            let feature_context = this.font_feature_context_for_style(style);
+            let font_family_source = this.resolved_parley_font_family_source(style);
+            let mut builder = this.parley_layout_context.ranged_builder(
+                &mut this.parley_font_context,
+                shaped_text,
+                1.0,
+                false,
+            );
+            push_parley_default_style(&mut builder, style, &font_family_source);
+            push_parley_text_spacing_default_with_context(
+                &mut builder,
+                shaped_text,
+                style,
+                feature_context.as_ref(),
+            );
+            builder.build_into(layout, shaped_text);
+            layout.break_all_lines(None);
+            layout
+                .lines()
+                .next()
+                .map(|line| {
+                    visual_ranges_for_line(line)
+                        .into_iter()
+                        .filter_map(|visual_range| {
+                            bidi_text.original_range(visual_range.range).map(|range| {
+                                BidiVisualRange {
+                                    range,
+                                    direction: visual_range.direction,
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .filter(|ranges| !ranges.is_empty())
+                .unwrap_or_else(|| {
+                    std::iter::once(BidiVisualRange {
+                        range: 0..text.len(),
+                        direction: ResolvedBidiDirection::Ltr,
+                    })
+                    .collect()
+                })
+        })
     }
 
     /// Returns the used CSS `ch` advance for a style's selected font.
@@ -196,31 +248,145 @@ impl FontSystem {
     /// the selected face has no vertical metric for "0". Otherwise it falls
     /// back to 0.5em when measuring that glyph is not possible:
     /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>.
-    pub(crate) fn ch_advance(&mut self, style: &ComputedStyle) -> f32 {
-        if style.writing_mode != WritingMode::HorizontalTb
-            && style.text_orientation == TextOrientation::Upright
-        {
+    pub(crate) fn ch_advance(&mut self, style: &ComputedStyle) -> LayoutLength {
+        if matches!(
+            style.text_layout_policy(),
+            TextLayoutPolicy::Vertical(TextOrientation::Upright)
+        ) {
             if let Some(advance) = self.vertical_upright_ch_advance(style) {
-                return advance;
+                return layout_pt(advance);
             }
-            return style.font_size;
+            return layout_pt(style.font_size);
         }
 
-        let mut metric_style = style.clone();
-        metric_style.letter_spacing = ComputedLengthPercentage::ZERO;
-        let advance = self.measure_text("0", &metric_style);
-        if advance > 0.0 {
-            advance
-        } else {
-            style.font_size * 0.5
+        layout_pt(
+            self.font_glyph_advance_for_style(style, '0')
+                .unwrap_or(style.font_size * 0.5),
+        )
+    }
+
+    /// Returns a representative glyph's horizontal advance through the same
+    /// font-selection and shaping path used for inline text.
+    ///
+    /// CSS font-relative units must agree with the actual shaped text run.
+    /// In particular, a generic family may be resolved by the shaping engine
+    /// through a platform alias, so consulting the document-font fallback
+    /// registry directly can give `1ch` a different face from the one that
+    /// paints a table cell. A present zero-advance glyph remains distinct from
+    /// a missing glyph because a successful shaping run still contains it.
+    /// <https://www.w3.org/TR/css-values-4/#ch>
+    fn font_glyph_advance_for_style(
+        &mut self,
+        style: &ComputedStyle,
+        character: char,
+    ) -> Option<f32> {
+        let mut glyphs = self
+            .shape_text_runs_with_parley(&character.to_string(), style)
+            .into_iter()
+            .flat_map(|run| run.glyphs);
+        let first = glyphs.next()?;
+        Some(
+            std::iter::once(first)
+                .chain(glyphs)
+                .map(|glyph| glyph.x_advance)
+                .sum(),
+        )
+    }
+
+    /// Returns the CSS `ic` basis: the selected font's U+6C34 WATER advance,
+    /// with the specification's one-em fallback when no such glyph is usable.
+    /// <https://www.w3.org/TR/css-values-4/#ic>
+    /// Return the used CSS `ic` advance as a semantic layout length.
+    ///
+    /// CSS Values defines `ic` from the selected font's U+6C34 advance, with
+    /// a one-em fallback. The font parser uses scalar units internally, but
+    /// callers resolve a CSS length and should retain its unit identity:
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>.
+    pub(crate) fn ic_advance_for_style(&mut self, style: &ComputedStyle) -> LayoutLength {
+        if matches!(style.text_layout_policy(), TextLayoutPolicy::Vertical(_)) {
+            return layout_pt(
+                self.vertical_glyph_advance_for_style(style, '水')
+                    .unwrap_or(style.font_size),
+            );
         }
+        layout_pt(
+            self.font_glyph_advance_for_style(style, '水')
+                .unwrap_or(style.font_size),
+        )
+    }
+
+    /// Returns the horizontal U+6C34 advance irrespective of writing mode.
+    /// <https://www.w3.org/TR/css-values-4/#ic>
+    pub(crate) fn horizontal_ic_advance_for_style(
+        &mut self,
+        style: &ComputedStyle,
+    ) -> LayoutLength {
+        layout_pt(
+            self.font_glyph_advance_for_style(style, '水')
+                .unwrap_or(style.font_size),
+        )
+    }
+
+    /// Finds the first CSS font-stack face that is eligible to render one
+    /// character, including `unicode-range` restrictions.
+    pub(in crate::text) fn font_for_character(
+        &mut self,
+        style: &ComputedStyle,
+        character: char,
+    ) -> Option<usize> {
+        let families = match &style.font_family {
+            FontFamily::List(families) => families.as_slice(),
+            family => std::slice::from_ref(family),
+        };
+        for family in families {
+            let font_id = match family {
+                FontFamily::Names(names) => names.iter().find_map(|name| {
+                    self.resolve_single_family(
+                        name,
+                        style.font_weight,
+                        style.font_style,
+                        style.font_width,
+                    )
+                    .filter(|font_id| self.document_fonts.font_has_character(*font_id, character))
+                }),
+                _ => self
+                    .resolve_font_family(
+                        family,
+                        style.font_weight,
+                        style.font_style,
+                        style.font_width,
+                    )
+                    .filter(|font_id| self.document_fonts.font_has_character(*font_id, character)),
+            };
+            if font_id.is_some() {
+                return font_id;
+            }
+        }
+        self.resolve_system_fallback_for_character(
+            character,
+            style.font_weight,
+            style.font_style,
+            style.font_width,
+        )
     }
 
     pub(in crate::text) fn vertical_upright_ch_advance(
         &mut self,
         style: &ComputedStyle,
     ) -> Option<f32> {
-        let font_id = self.resolve_metric_font_for_style(style)?;
+        self.vertical_glyph_advance_for_style(style, '0')
+    }
+
+    /// Returns a selected glyph's vertical advance for vertical CSS layout.
+    /// `ic` uses this for U+6C34 and `ch` uses it for upright U+0030.
+    /// <https://www.w3.org/TR/css-values-4/#ch>
+    /// <https://www.w3.org/TR/css-values-4/#ic>
+    fn vertical_glyph_advance_for_style(
+        &mut self,
+        style: &ComputedStyle,
+        character: char,
+    ) -> Option<f32> {
+        let font_id = self.font_for_character(style, character)?;
         let used_font_size = self
             .font_size_adjusted_size_for_font_id(style, font_id)
             .unwrap_or(style.font_size);
@@ -228,7 +394,7 @@ impl FontSystem {
         let face = ttf_parser::Face::parse(&font.data, font.face_index).ok()?;
         let units_per_em = font.units_per_em.max(1) as f32;
         let advance = face
-            .glyph_index('0')
+            .glyph_index(character)
             .and_then(|glyph| face.glyph_ver_advance(glyph))
             .map(|advance| advance as f32)
             .filter(|advance| *advance > 0.0)
@@ -236,9 +402,15 @@ impl FontSystem {
         Some(advance * used_font_size / units_per_em)
     }
 
-    pub(crate) fn used_line_height(&mut self, style: &ComputedStyle) -> f32 {
+    /// Return the used line height as a semantic layout length.
+    ///
+    /// CSS Inline defines the used line-height as a length, including the
+    /// font-metric-derived `normal` value. Keep that identity until text
+    /// shaping or coordinate placement needs raw layout points:
+    /// <https://www.w3.org/TR/css-inline-3/#line-height-property>.
+    pub(crate) fn used_line_height(&mut self, style: &ComputedStyle) -> LayoutLength {
         if !style.line_height_is_normal {
-            return style.line_height;
+            return layout_pt(style.line_height);
         }
         let font_id = self.resolve_metric_font_for_style(style);
         self.line_height_for_font(font_id, style)
@@ -248,16 +420,145 @@ impl FontSystem {
         &self,
         font_id: Option<usize>,
         style: &ComputedStyle,
-    ) -> f32 {
+    ) -> LayoutLength {
         if !style.line_height_is_normal {
-            return style.line_height;
+            return layout_pt(style.line_height);
         }
         let Some(font) = font_id.and_then(|id| self.document_fonts.get(id)) else {
-            return style.line_height;
+            return layout_pt(style.line_height);
         };
         let font_height = (font.ascender as f32 - font.descender as f32).max(0.0) * style.font_size
             / font.units_per_em.max(1) as f32;
-        font_height.max(style.font_size)
+        layout_pt(font_height.max(style.font_size))
+    }
+
+    /// Resolve scaled vertical metrics for a CSS inline text box.
+    ///
+    /// CSS 2.2 defines `line-height: normal` from font metrics, while CSS Fonts
+    /// lets `unicode-range` and fallback matching choose different fonts for
+    /// individual glyph runs. The baseline remains anchored to the style's
+    /// first available font, but the normal inline box must enclose the union
+    /// of participating fallback-font line boxes:
+    /// <https://www.w3.org/TR/CSS22/visudet.html#line-height> and
+    /// <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>.
+    pub(crate) fn resolved_inline_text_metrics(
+        &mut self,
+        style: &ComputedStyle,
+        shaped: Option<&ShapedInlineLine>,
+    ) -> ResolvedInlineTextMetrics {
+        let selected_font_id = self.resolve_metric_font_for_style(style);
+        let mut content = self
+            .content_extents_for_style_font(selected_font_id, style)
+            .unwrap_or_else(|| FontRunVerticalExtents::from_points(style.font_size, 0.0));
+        let mut line = self.line_extents_for_style_font(selected_font_id, style, content);
+
+        if !style.line_height_is_normal {
+            return ResolvedInlineTextMetrics { content, line };
+        }
+
+        let Some(shaped) = shaped else {
+            return ResolvedInlineTextMetrics { content, line };
+        };
+
+        for run in shaped.runs.iter().filter(|run| run.font_id.is_some()) {
+            let Some(run_content) = self.content_extents_for_font(run.font_id, run.font_size)
+            else {
+                continue;
+            };
+            content = content.union(run_content);
+            let run_line =
+                self.normal_line_extents_for_font(run.font_id, run.font_size, run_content);
+            line = line.union(run_line);
+        }
+
+        // Parley's shaped runs normally retain the selected document font, but
+        // an `@font-face unicode-range` split can be flattened before its
+        // fallback run reaches this metric pass. Resolve the source characters
+        // through the CSS Fonts stack as well, so `line-height: normal`
+        // encloses every eligible face rather than only the first face in the
+        // family list.
+        // <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>
+        for character in shaped.text.chars() {
+            let Some(font_id) = self.font_for_character(style, character) else {
+                continue;
+            };
+            let Some(run_content) = self.content_extents_for_font(Some(font_id), style.font_size)
+            else {
+                continue;
+            };
+            content = content.union(run_content);
+            line = line.union(self.normal_line_extents_for_font(
+                Some(font_id),
+                style.font_size,
+                run_content,
+            ));
+        }
+
+        ResolvedInlineTextMetrics { content, line }
+    }
+
+    fn content_extents_for_style_font(
+        &self,
+        font_id: Option<usize>,
+        style: &ComputedStyle,
+    ) -> Option<FontRunVerticalExtents> {
+        let used_font_size = font_id
+            .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
+            .unwrap_or(style.font_size);
+        self.content_extents_for_font(font_id, used_font_size)
+    }
+
+    fn content_extents_for_font(
+        &self,
+        font_id: Option<usize>,
+        font_size: f32,
+    ) -> Option<FontRunVerticalExtents> {
+        let font = font_id.and_then(|id| self.document_fonts.get(id))?;
+        let units_per_em = font.units_per_em.max(1) as f32;
+        let ascent = font.ascender as f32 * font_size / units_per_em;
+        Some(FontRunVerticalExtents::from_points(
+            ascent,
+            font_size - ascent,
+        ))
+    }
+
+    fn line_extents_for_style_font(
+        &self,
+        font_id: Option<usize>,
+        style: &ComputedStyle,
+        content: FontRunVerticalExtents,
+    ) -> FontRunVerticalExtents {
+        if style.line_height_is_normal {
+            self.normal_line_extents_for_font(font_id, style.font_size, content)
+        } else {
+            self.explicit_line_extents_for_content(style.line_height, content)
+        }
+    }
+
+    fn normal_line_extents_for_font(
+        &self,
+        font_id: Option<usize>,
+        font_size: f32,
+        content: FontRunVerticalExtents,
+    ) -> FontRunVerticalExtents {
+        let line_height = font_id
+            .and_then(|id| self.document_fonts.get(id))
+            .map(|font| {
+                (font.ascender as f32 - font.descender as f32).max(0.0) * font_size
+                    / font.units_per_em.max(1) as f32
+            })
+            .unwrap_or(font_size)
+            .max(font_size);
+        self.explicit_line_extents_for_content(line_height, content)
+    }
+
+    fn explicit_line_extents_for_content(
+        &self,
+        line_height: f32,
+        content: FontRunVerticalExtents,
+    ) -> FontRunVerticalExtents {
+        let leading = (line_height - layout_points(content.block_size())) / 2.0;
+        content.with_symmetric_leading(layout_pt(leading))
     }
 
     /// Resolve font metrics used by CSS text-decoration painting.
@@ -360,12 +661,11 @@ impl FontSystem {
                     let mut y_min = f32::INFINITY;
                     let mut y_max = f32::NEG_INFINITY;
                     for (x, y) in corners {
-                        let transformed_x =
-                            run.x_offset + run.text_matrix.a * x + run.text_matrix.c * y;
-                        let transformed_y = baseline_y
-                            + run.y_offset
-                            + run.text_matrix.b * x
-                            + run.text_matrix.d * y;
+                        let transformed = run
+                            .text_matrix
+                            .transform_local_point(crate::document::TextRunPoint::new(x, y));
+                        let transformed_x = run.x_offset + transformed.x;
+                        let transformed_y = baseline_y + run.y_offset + transformed.y;
                         x_min = x_min.min(transformed_x);
                         x_max = x_max.max(transformed_x);
                         y_min = y_min.min(transformed_y);
@@ -388,13 +688,19 @@ impl FontSystem {
         &mut self,
         text: &str,
         style: &ComputedStyle,
-    ) -> Vec<RenderedTextRun> {
+    ) -> Vec<ShapedGlyphRun> {
         let emoji_text = text_with_font_variant_emoji(text, style);
         let text = text_without_font_neutral_default_ignorables(emoji_text.as_ref());
         let text = text.as_ref();
         if text.is_empty() {
             return Vec::new();
         }
+        // Keep source text for CSS Text processing and ToUnicode extraction,
+        // but give the shaping engine its compatibility-normalized glyph
+        // selection input. This preserves byte ranges for the line returned by
+        // Parley.
+        let shaping_text = text_with_shaping_compatibility_normalization(text);
+        let shaping_text = shaping_text.as_ref();
         if let Some(resolved_spans) = self.unicode_range_resolved_text_spans(text, style) {
             let spans = resolved_spans
                 .iter()
@@ -412,72 +718,77 @@ impl FontSystem {
         if text_needs_edge_join_context(text) {
             return self.shape_styled_text_runs_with_parley(&[StyledTextSpan { text, style }]);
         }
-        let feature_context = self.font_feature_context_for_style(style);
-        let mut builder = self.parley_layout_context.ranged_builder(
-            &mut self.parley_font_context,
-            text,
-            1.0,
-            false,
-        );
-        push_parley_default_style(&mut builder, style);
-        push_parley_text_spacing_default_with_context(
-            &mut builder,
-            text,
-            style,
-            feature_context.as_ref(),
-        );
-        let mut layout = builder.build(text);
-        layout.break_all_lines(None);
-        let Some(line) = layout.lines().next() else {
-            return Vec::new();
-        };
-        let adjustment_ranges = self.font_size_adjustment_ranges_for_line(&line, style);
-        if !adjustment_ranges.is_empty() {
-            let mut builder = self.parley_layout_context.ranged_builder(
-                &mut self.parley_font_context,
-                text,
+        self.with_reusable_parley_layout(|this, layout| {
+            let feature_context = this.font_feature_context_for_style(style);
+            let font_family_source = this.resolved_parley_font_family_source(style);
+            let mut builder = this.parley_layout_context.ranged_builder(
+                &mut this.parley_font_context,
+                shaping_text,
                 1.0,
                 false,
             );
-            push_parley_default_style(&mut builder, style);
+            push_parley_default_style(&mut builder, style, &font_family_source);
             push_parley_text_spacing_default_with_context(
                 &mut builder,
-                text,
+                shaping_text,
                 style,
                 feature_context.as_ref(),
             );
-            for adjustment in &adjustment_ranges {
-                builder.push(
-                    StyleProperty::FontSize(adjustment.font_size),
-                    adjustment.range.clone(),
-                );
-            }
-            let mut layout = builder.build(text);
+            builder.build_into(layout, shaping_text);
             layout.break_all_lines(None);
             let Some(line) = layout.lines().next() else {
                 return Vec::new();
             };
-            return self.rendered_text_runs_for_parley_line(text, line, style);
-        }
-        self.rendered_text_runs_for_parley_line(text, line, style)
+            let adjustment_ranges =
+                this.font_size_adjustment_ranges_for_line(&line, shaping_text, style);
+            if !adjustment_ranges.is_empty() {
+                let mut builder = this.parley_layout_context.ranged_builder(
+                    &mut this.parley_font_context,
+                    shaping_text,
+                    1.0,
+                    false,
+                );
+                push_parley_default_style(&mut builder, style, &font_family_source);
+                push_parley_text_spacing_default_with_context(
+                    &mut builder,
+                    shaping_text,
+                    style,
+                    feature_context.as_ref(),
+                );
+                for adjustment in &adjustment_ranges {
+                    builder.push(
+                        StyleProperty::FontSize(adjustment.font_size),
+                        adjustment.range.clone(),
+                    );
+                }
+                builder.build_into(layout, shaping_text);
+                layout.break_all_lines(None);
+                let Some(line) = layout.lines().next() else {
+                    return Vec::new();
+                };
+                return this.rendered_text_runs_for_parley_line(text, line, style);
+            }
+            this.rendered_text_runs_for_parley_line(text, line, style)
+        })
     }
 
     pub(in crate::text) fn font_size_adjustment_ranges_for_line<B: parley::style::Brush>(
         &mut self,
         line: &parley::Line<'_, B>,
+        text: &str,
         style: &ComputedStyle,
     ) -> Vec<FontSizeAdjustmentRange> {
-        if matches!(style.font_size_adjust, FontSizeAdjust::None) {
-            return Vec::new();
-        }
         let mut ranges = Vec::new();
         for run in line.runs() {
-            let Some(font_id) =
-                self.document_font_from_parley_font_data_for_style(run.font(), style)
-            else {
+            let fallback_character = parley_run_fallback_character(text, run.text_range());
+            let Some(font_id) = self.document_font_from_parley_font_data_for_style(
+                run.font(),
+                style,
+                fallback_character,
+            ) else {
                 continue;
             };
-            let Some(font_size) = self.adjusted_font_size_for_font(style, font_id) else {
+            let Some(font_size) = self.used_font_size_for_font(style, font_id) else {
                 continue;
             };
             if (font_size - style.font_size).abs() > 0.01 {
@@ -493,6 +804,7 @@ impl FontSystem {
     pub(in crate::text) fn styled_font_size_adjustment_ranges_for_line<B: parley::style::Brush>(
         &mut self,
         line: &parley::Line<'_, B>,
+        text: &str,
         ranges: &[(Range<usize>, &ComputedStyle)],
         default_style: &ComputedStyle,
     ) -> Vec<FontSizeAdjustmentRange> {
@@ -501,15 +813,15 @@ impl FontSystem {
             let run_range = run.text_range();
             let run_style =
                 style_for_text_range(ranges, run_range.clone()).unwrap_or(default_style);
-            if matches!(run_style.font_size_adjust, FontSizeAdjust::None) {
-                continue;
-            }
-            let Some(font_id) =
-                self.document_font_from_parley_font_data_for_style(run.font(), run_style)
-            else {
+            let fallback_character = parley_run_fallback_character(text, run_range.clone());
+            let Some(font_id) = self.document_font_from_parley_font_data_for_style(
+                run.font(),
+                run_style,
+                fallback_character,
+            ) else {
                 continue;
             };
-            let Some(font_size) = self.adjusted_font_size_for_font(run_style, font_id) else {
+            let Some(font_size) = self.used_font_size_for_font(run_style, font_id) else {
                 continue;
             };
             if (font_size - run_style.font_size).abs() > 0.01 {
@@ -522,18 +834,67 @@ impl FontSystem {
         adjustments
     }
 
+    /// Re-shape a provably simple visible fallback fragment with the CSS face
+    /// selected for that scalar, retaining its control-bearing source text for
+    /// PDF extraction and reporting the omitted fallback advance separately.
+    pub(in crate::text) fn rehome_control_fallback_run(
+        &mut self,
+        style: &ComputedStyle,
+        request: ControlFallbackRehomeRequest,
+    ) -> Option<(ShapedGlyphRun, f32)> {
+        let selected_font_id = self.font_for_character(style, request.character)?;
+        (selected_font_id != request.fallback_font_id).then_some(())?;
+        let selected_font = self.document_fonts.get(selected_font_id)?;
+        let mut glyphs = shape_text_with_document_font(
+            selected_font,
+            &request.character.to_string(),
+            request.font_size,
+            0.0,
+            0.0,
+        )?;
+        if glyphs.len() != 1 {
+            return None;
+        }
+        glyphs[0].x_advance += style.used_letter_spacing().points();
+        let dropped_advance = (request.parley_advance - glyphs[0].x_advance).max(0.0);
+        Some((
+            ShapedGlyphRun {
+                text: request.text,
+                x_offset: request.x_offset,
+                y_offset: 0.0,
+                text_matrix: crate::RenderedTextMatrix::IDENTITY,
+                font_size: request.font_size,
+                font_id: Some(selected_font_id),
+                font_palette: style.font_palette.clone(),
+                glyphs,
+                glyph_source_ranges: vec![request.source_range],
+            },
+            dropped_advance,
+        ))
+    }
+
     pub(in crate::text) fn rendered_text_runs_for_parley_line<B: parley::style::Brush>(
         &mut self,
         text: &str,
         line: parley::Line<'_, B>,
         style: &ComputedStyle,
-    ) -> Vec<RenderedTextRun> {
+    ) -> Vec<ShapedGlyphRun> {
         let run_count = line.runs().size_hint().0;
         let mut rendered_runs = Vec::with_capacity(run_count);
         let mut tab_contexts = Vec::with_capacity(run_count);
+        let mut dropped_default_ignorable_runs = Vec::new();
+        let mut rehomed_control_fallback_runs = Vec::new();
         for run in line.runs() {
+            let run_range = run.text_range();
+            let raw_run_text = text.get(run_range.clone()).unwrap_or_default();
+            let control_fallback_cluster = classify_control_fallback_cluster(
+                raw_run_text,
+                run.visual_clusters()
+                    .flat_map(|cluster| cluster.glyphs())
+                    .any(|glyph| glyph.x != 0.0 || glyph.y != 0.0),
+            );
             let run_text = text
-                .get(run.text_range())
+                .get(run_range.clone())
                 .map(text_without_variation_selectors)
                 .unwrap_or_else(|| Cow::Borrowed(""));
             let x_offset = run
@@ -541,15 +902,54 @@ impl FontSystem {
                 .next()
                 .and_then(|cluster| cluster.visual_offset())
                 .unwrap_or(0.0);
-            let Some(font_id) =
-                self.document_font_from_parley_font_data_for_style(run.font(), style)
-            else {
+            if control_fallback_cluster == ControlFallbackCluster::DropControlOnly {
+                dropped_default_ignorable_runs.push(DroppedDefaultIgnorableRun {
+                    x_offset,
+                    advance: run.advance(),
+                });
+                continue;
+            }
+            let fallback_character = parley_run_fallback_character(text, run_range.clone());
+            let Some(font_id) = self.document_font_from_parley_font_data_for_style(
+                run.font(),
+                style,
+                fallback_character,
+            ) else {
                 continue;
             };
+            if let ControlFallbackCluster::RehomeSimpleVisibleFragment { character } =
+                control_fallback_cluster
+                && let Some((rehomed_run, dropped_advance)) = self.rehome_control_fallback_run(
+                    style,
+                    ControlFallbackRehomeRequest {
+                        character,
+                        fallback_font_id: font_id,
+                        text: run_text.clone().into_owned().into(),
+                        font_size: run.font_size(),
+                        x_offset,
+                        parley_advance: run.advance(),
+                        source_range: Some(run_range.clone()),
+                    },
+                )
+            {
+                if dropped_advance != 0.0 {
+                    dropped_default_ignorable_runs.push(DroppedDefaultIgnorableRun {
+                        x_offset,
+                        advance: dropped_advance,
+                    });
+                }
+                rehomed_control_fallback_runs.push(rendered_runs.len());
+                rendered_runs.push(rehomed_run);
+                tab_contexts.push(RenderedRunTabContext { style });
+                continue;
+            }
             if self
                 .document_fonts
                 .support_kind_for_run(font_id, run_text.as_ref())
                 == FontSupportKind::ColorOrEmojiOnlyFallback
+                && !self
+                    .document_fonts
+                    .run_has_color_glyph(font_id, run_text.as_ref())
                 && let Some(fallback_font_id) =
                     self.visible_text_fallback_for_run(run_text.as_ref(), style, font_id)
                 && let Some(fallback_font) = self.document_fonts.get(fallback_font_id)
@@ -557,19 +957,22 @@ impl FontSystem {
                     fallback_font,
                     run_text.as_ref(),
                     run.font_size(),
-                    style.used_letter_spacing(),
-                    style.used_word_spacing(),
+                    style.used_letter_spacing().points(),
+                    style.used_word_spacing().points(),
                 )
                 && !glyphs.is_empty()
             {
-                rendered_runs.push(RenderedTextRun {
-                    text: run_text.into_owned(),
+                let glyph_source_ranges = vec![None; glyphs.len()];
+                rendered_runs.push(ShapedGlyphRun {
+                    text: run_text.into_owned().into(),
                     x_offset,
                     y_offset: 0.0,
                     text_matrix: crate::RenderedTextMatrix::IDENTITY,
                     font_size: run.font_size(),
                     font_id: Some(fallback_font_id),
-                    glyphs: Some(glyphs),
+                    font_palette: style.font_palette.clone(),
+                    glyphs,
+                    glyph_source_ranges,
                 });
                 tab_contexts.push(RenderedRunTabContext { style });
                 continue;
@@ -577,14 +980,42 @@ impl FontSystem {
             let Some(font) = self.document_fonts.get(font_id) else {
                 continue;
             };
+            if ((!style.font_synthesis.weight && style.font_weight.0 >= FontWeight::BOLD.0)
+                || (!style.font_synthesis.style && style.font_style != FontStyle::Normal))
+                && let Some(glyphs) = shape_text_with_document_font(
+                    font,
+                    run_text.as_ref(),
+                    run.font_size(),
+                    style.used_letter_spacing().points(),
+                    style.used_word_spacing().points(),
+                )
+                && !glyphs.is_empty()
+            {
+                let glyph_source_ranges = vec![None; glyphs.len()];
+                rendered_runs.push(ShapedGlyphRun {
+                    text: run_text.into_owned().into(),
+                    x_offset,
+                    y_offset: 0.0,
+                    text_matrix: crate::RenderedTextMatrix::IDENTITY,
+                    font_size: run.font_size(),
+                    font_id: Some(font_id),
+                    font_palette: style.font_palette.clone(),
+                    glyphs,
+                    glyph_source_ranges,
+                });
+                tab_contexts.push(RenderedRunTabContext { style });
+                continue;
+            }
             let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
                 continue;
             };
             let units_per_em = font.units_per_em.max(1) as f32;
             let scale = run.font_size() / units_per_em;
             let mut glyphs = Vec::new();
+            let mut glyph_source_ranges = Vec::new();
             for cluster in run.visual_clusters() {
-                let cluster_text = text.get(cluster.text_range()).unwrap_or_default();
+                let cluster_range = cluster.text_range();
+                let cluster_text = text.get(cluster_range.clone()).unwrap_or_default();
                 let emitted_cluster_text = text_without_glyph_output_controls(cluster_text);
                 let default_ignorable_only =
                     cluster_is_default_ignorable_only(cluster_text, emitted_cluster_text.as_ref());
@@ -604,6 +1035,7 @@ impl FontSystem {
                 }
                 if emitted_cluster_text.as_ref() == "\t" {
                     glyphs.push(synthesized_tab_glyph(&face, scale));
+                    glyph_source_ranges.push(Some(cluster_range));
                     continue;
                 }
                 let mut first_cluster_glyph = true;
@@ -620,6 +1052,15 @@ impl FontSystem {
                     } else {
                         String::new()
                     };
+                    if glyph_is_non_painting_shaping_artifact(
+                        &face,
+                        glyph_id,
+                        glyph.advance,
+                        &unicode,
+                    ) {
+                        first_cluster_glyph = false;
+                        continue;
+                    }
                     let emitted_glyph_id = unicode
                         .chars()
                         .next()
@@ -639,6 +1080,7 @@ impl FontSystem {
                         y_offset: -glyph.y,
                         unicode,
                     });
+                    glyph_source_ranges.push(Some(cluster_range.clone()));
                 }
             }
             if glyphs.is_empty() {
@@ -652,18 +1094,29 @@ impl FontSystem {
                 &face,
                 run_text.as_ref(),
             );
-            rendered_runs.push(RenderedTextRun {
-                text: run_text.into_owned(),
+            rendered_runs.push(ShapedGlyphRun {
+                text: run_text.into_owned().into(),
                 x_offset,
                 y_offset: 0.0,
                 text_matrix: crate::RenderedTextMatrix::IDENTITY,
                 font_size,
                 font_id: Some(font_id),
-                glyphs: Some(glyphs),
+                font_palette: style.font_palette.clone(),
+                glyphs,
+                glyph_source_ranges,
             });
             tab_contexts.push(RenderedRunTabContext { style });
         }
-        self.apply_css_tab_stops(&mut rendered_runs, &tab_contexts);
+        for run in &mut rendered_runs {
+            run.x_offset =
+                corrected_visual_run_x_offset(run.x_offset, &dropped_default_ignorable_runs);
+        }
+        for index in rehomed_control_fallback_runs.into_iter().rev() {
+            if stitch_rehomed_control_fallback_run(&mut rendered_runs, index) {
+                tab_contexts.remove(index + 1);
+            }
+        }
+        self.apply_css_tab_stops(&mut rendered_runs, &tab_contexts, 0.0);
         rendered_runs
     }
 
@@ -798,9 +1251,11 @@ impl FontSystem {
     ) -> Option<ShapedInlineLine> {
         let mut runs = position_shaped_runs(self.shape_text_runs_with_parley(text, style));
         self.apply_vertical_upright_advances(&mut runs, style);
-        let baseline_adjustment = self.shaped_runs_baseline_adjustment(&runs, style, line_height);
+        let baseline_adjustment = self
+            .shaped_runs_baseline_adjustment(&runs, style, line_height)
+            .points();
         let mut shaped = ShapedInlineLine {
-            text: text.to_string(),
+            text: Rc::from(text),
             width: 0.0,
             offset: 0.0,
             aligned_by_parley: false,
@@ -813,6 +1268,53 @@ impl FontSystem {
         }
         shaped.width = shaped.advance_width();
         Some(shaped)
+    }
+
+    /// Shape text whose UAX #9 visual order has already been resolved.
+    ///
+    /// Mixed inline layout first resolves one complete line, including the
+    /// formatting controls contributed by CSS `unicode-bidi` scopes. Its
+    /// resulting visual slices must not establish a second paragraph base
+    /// direction or a second embedding/isolate/override scope while they are
+    /// measured for painting. Re-running the bidi algorithm on such a slice
+    /// changes the resolution of neutral characters at the slice edges.
+    ///
+    /// The caller supplies visual clusters in CSS logical-text order only
+    /// where that order is already their display order. An LTR override keeps
+    /// the sequence from being reordered again; RTL slices then receive UAX #9
+    /// L4 glyph mirroring directly on their selected font glyphs:
+    /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-algo> and
+    /// <https://www.unicode.org/reports/tr9/#Reordering_Resolved_Levels>.
+    pub(crate) fn shape_visual_ordered_line(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        line_height: f32,
+        resolved_direction: ResolvedBidiDirection,
+    ) -> Option<ShapedInlineLine> {
+        // UAX #9 visual reordering and OpenType's cursive shaping direction
+        // are separate inputs. An LTR override preserves the already-resolved
+        // order of neutral punctuation, but would make HarfBuzz shape Arabic
+        // and other joining scripts left-to-right. Those scripts must retain
+        // their logical CSS direction while shaping:
+        // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
+        // <https://www.unicode.org/reports/tr9/#reordering-resolved-levels>.
+        if text.chars().any(character_has_joining_behavior) {
+            return self.shape_unwrapped_line(text, style, line_height);
+        }
+        let mut guarded_text = String::with_capacity(text.len() + 2 * '\u{202d}'.len_utf8());
+        guarded_text.push('\u{202d}');
+        guarded_text.push_str(text);
+        guarded_text.push('\u{202c}');
+        self.shape_unwrapped_line(&guarded_text, style, line_height)
+            .map(|mut shaped| {
+                shaped.text = Rc::from(text);
+                strip_bidi_format_controls_from_shaped_runs(&mut shaped.runs);
+                if resolved_direction == ResolvedBidiDirection::Rtl {
+                    self.apply_resolved_bidi_glyph_mirroring(&mut shaped.runs);
+                }
+                shaped
+            })
     }
 
     #[cfg(test)]
@@ -844,17 +1346,21 @@ impl FontSystem {
         text_summary: String,
         width: f32,
         line_height: f32,
+        tab_origin: f32,
     ) -> Option<ShapedInlineLine> {
         if spans.is_empty() {
             return None;
         }
         let first_style = spans.first().map(|span| span.style)?;
-        let mut runs = position_shaped_runs(self.shape_styled_text_runs_with_parley(spans));
+        let mut runs = position_shaped_runs(
+            self.shape_styled_text_runs_with_parley_at_tab_origin(spans, tab_origin),
+        );
         self.apply_vertical_upright_advances(&mut runs, first_style);
-        let baseline_adjustment =
-            self.shaped_runs_baseline_adjustment(&runs, first_style, line_height);
+        let baseline_adjustment = self
+            .shaped_runs_baseline_adjustment(&runs, first_style, line_height)
+            .points();
         (!runs.is_empty()).then_some(ShapedInlineLine {
-            text: text_summary,
+            text: text_summary.into(),
             width,
             offset: 0.0,
             aligned_by_parley: false,
@@ -862,5 +1368,120 @@ impl FontSystem {
             baseline_adjustment,
             runs,
         })
+    }
+
+    /// Shape styled text whose visual bidi order has already been resolved.
+    ///
+    /// The original styles remain the source of every font, OpenType, spacing,
+    /// and metric property. An explicit LTR override prevents a second UAX #9
+    /// reordering pass, while RTL slices receive L4 glyph mirroring after
+    /// shaping because the caller already supplied the final visual order:
+    /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-algo>.
+    pub(crate) fn shape_visually_ordered_inline_fragments(
+        &mut self,
+        spans: &[StyledTextSpan<'_>],
+        text_summary: String,
+        width: f32,
+        line_height: f32,
+        tab_origin: f32,
+        resolved_direction: ResolvedBidiDirection,
+    ) -> Option<ShapedInlineLine> {
+        let first_style = spans.first()?.style;
+        if spans
+            .iter()
+            .flat_map(|span| span.text.chars())
+            .any(character_has_joining_behavior)
+        {
+            return self.shape_styled_inline_fragments(
+                spans,
+                text_summary,
+                width,
+                line_height,
+                tab_origin,
+            );
+        }
+        let mut guarded_spans = Vec::with_capacity(spans.len() + 2);
+        guarded_spans.push(StyledTextSpan {
+            text: "\u{202d}",
+            style: first_style,
+        });
+        guarded_spans.extend_from_slice(spans);
+        guarded_spans.push(StyledTextSpan {
+            text: "\u{202c}",
+            style: first_style,
+        });
+        let mut shaped = self.shape_styled_inline_fragments(
+            &guarded_spans,
+            text_summary,
+            width,
+            line_height,
+            tab_origin,
+        )?;
+        strip_bidi_format_controls_from_shaped_runs(&mut shaped.runs);
+        if resolved_direction == ResolvedBidiDirection::Rtl {
+            self.apply_resolved_bidi_glyph_mirroring(&mut shaped.runs);
+        }
+        Some(shaped)
+    }
+
+    /// Apply UAX #9 L4 to a visually ordered RTL slice without changing its
+    /// Unicode source text or running UAX #9 a second time.
+    fn apply_resolved_bidi_glyph_mirroring(&self, runs: &mut [ShapedInlineRun]) {
+        for run in runs {
+            let Some(font_id) = run.font_id else {
+                continue;
+            };
+            let Some(font) = self.document_fonts.get(font_id) else {
+                continue;
+            };
+            let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
+                continue;
+            };
+            let scale = run.font_size / font.units_per_em.max(1) as f32;
+            for glyph in &mut run.glyphs {
+                let mut characters = glyph.rendered.unicode.chars();
+                let Some(character) = characters.next() else {
+                    continue;
+                };
+                if characters.next().is_some() {
+                    continue;
+                }
+                let Some(mirrored) = bidi_mirroring_glyph(character) else {
+                    continue;
+                };
+                let Some(mirrored_id) = face.glyph_index(mirrored) else {
+                    continue;
+                };
+                let old_nominal = glyph.rendered.nominal_x_advance;
+                let extra_advance = glyph.rendered.x_advance - old_nominal;
+                let mirrored_nominal = face
+                    .glyph_hor_advance(mirrored_id)
+                    .map(|advance| advance as f32 * scale)
+                    .unwrap_or(old_nominal);
+                glyph.rendered.id = mirrored_id.0;
+                glyph.rendered.nominal_x_advance = mirrored_nominal;
+                glyph.rendered.x_advance = mirrored_nominal + extra_advance;
+            }
+        }
+    }
+}
+
+pub(super) fn parley_run_fallback_character(text: &str, range: Range<usize>) -> char {
+    text.get(range)
+        .and_then(|text| text.chars().find(|character| !character.is_control()))
+        .unwrap_or(' ')
+}
+
+/// Remove UAX #9 formatting controls from paint and extraction summaries.
+///
+/// The controls remain in the Parley input while visual order is resolved, but
+/// CSS never paints them and PDF text extraction must not expose the synthetic
+/// guard used by already-visual text groups:
+/// <https://www.unicode.org/reports/tr9/#Directional_Formatting_Characters>.
+fn strip_bidi_format_controls_from_shaped_runs(runs: &mut [ShapedInlineRun]) {
+    for run in runs {
+        run.text = text_without_bidi_format_controls(&run.text)
+            .into_owned()
+            .into();
     }
 }

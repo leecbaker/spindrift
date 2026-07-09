@@ -139,7 +139,7 @@ pub(in crate::layout) fn nearest_crossing_gap(
     crossing_gaps: &[GapBand],
     position: f32,
 ) -> Option<GapBand> {
-    crossing_gaps.iter().copied().find(|gap| {
+    crossing_gaps.iter().cloned().find(|gap| {
         gap.start <= position + GAP_RULE_EPSILON && gap.end >= position - GAP_RULE_EPSILON
     })
 }
@@ -161,7 +161,9 @@ pub(in crate::layout) fn crossing_width_for_gap(
                 .crossing_rule
                 .widths
                 .value_for_index(index, crossing_gap_count)
-                .map(|width| used_gap_rule_length(width, gap.size()))
+                .map(|width| {
+                    used_gap_rule_length(width, PercentageBasis::definite(layout_pt(gap.size())))
+                })
         })
 }
 
@@ -183,7 +185,12 @@ pub(in crate::layout) fn crossing_can_paint_for_gap(
                     .crossing_rule
                     .widths
                     .value_for_index(index, crossing_gap_count)
-                    .map(|width| used_gap_rule_length(width, gap.size()))
+                    .map(|width| {
+                        used_gap_rule_length(
+                            width,
+                            PercentageBasis::definite(layout_pt(gap.size())),
+                        )
+                    })
                     .unwrap_or(0.0),
                 context
                     .crossing_rule
@@ -203,15 +210,15 @@ pub(in crate::layout) fn offset_gap_rule_segment(
 ) -> GapDecorationSegment {
     let start_inset = used_gap_rule_endpoint_inset(
         match segment.start.kind {
-            GapRuleEndpointKind::Cap => rule.inset_cap_start,
-            GapRuleEndpointKind::Junction => rule.inset_junction_start,
+            GapRuleEndpointKind::Cap => rule.inset_cap_start.clone(),
+            GapRuleEndpointKind::Junction => rule.inset_junction_start.clone(),
         },
         segment.start,
     );
     let end_inset = used_gap_rule_endpoint_inset(
         match segment.end.kind {
-            GapRuleEndpointKind::Cap => rule.inset_cap_end,
-            GapRuleEndpointKind::Junction => rule.inset_junction_end,
+            GapRuleEndpointKind::Cap => rule.inset_cap_end.clone(),
+            GapRuleEndpointKind::Junction => rule.inset_junction_end.clone(),
         },
         segment.end,
     );
@@ -232,14 +239,59 @@ pub(in crate::layout) fn used_gap_rule_endpoint_inset(
     endpoint: GapRuleEndpoint,
 ) -> f32 {
     match value {
-        css::GapRuleInsetValue::LengthPercentage(value) => {
-            used_gap_rule_length(value, endpoint.crossing_gap_width)
-        }
+        css::GapRuleInsetValue::LengthPercentage(value) => value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                endpoint.crossing_gap_width,
+            )))
+            .map(layout_points)
+            .unwrap_or_else(|| value.length_points()),
         css::GapRuleInsetValue::OverlapJoin if endpoint.kind == GapRuleEndpointKind::Junction => {
             -(endpoint.crossing_gap_width + endpoint.crossing_rule_width) * 0.5
         }
         css::GapRuleInsetValue::OverlapJoin => 0.0,
     }
+}
+
+/// Converts the filled rectangles used for solid gap rules to the centerline
+/// geometry asserted by layout tests. Solid rules deliberately paint as areas,
+/// rather than strokes, so cap geometry is independent of backend stroke
+/// rasterization.
+#[cfg(test)]
+pub(in crate::layout) fn solid_gap_rule_centerlines(
+    primitives: &[PaintPrimitive],
+) -> Vec<RenderedStroke> {
+    primitives
+        .iter()
+        .filter_map(|primitive| {
+            let PaintPrimitive::Rect(rect) = primitive else {
+                return None;
+            };
+            let color = rect.fill?;
+            if rect.width() < rect.height() {
+                Some(RenderedStroke::new(
+                    rect.x() + rect.width() / 2.0,
+                    rect.y() + rect.height(),
+                    rect.x() + rect.width() / 2.0,
+                    rect.y(),
+                    rect.width(),
+                    color,
+                    None,
+                ))
+            } else if rect.height() < rect.width() {
+                Some(RenderedStroke::new(
+                    rect.x(),
+                    rect.y() + rect.height() / 2.0,
+                    rect.x() + rect.width(),
+                    rect.y() + rect.height() / 2.0,
+                    rect.height(),
+                    color,
+                    None,
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 pub(in crate::layout) fn segment_is_visible(
@@ -269,6 +321,15 @@ pub(in crate::layout) fn effective_visibility_items(
         context.kind,
         context.rule.visibility_items,
     ) {
+        // `*-rule-visibility-items` does not apply to flex containers, so
+        // its initial `normal` value must not make flex decoration painting
+        // depend on incidental item-rectangle metadata. Flex layout has
+        // already materialized only resolved gutters between flex items or
+        // lines at this boundary.
+        // <https://drafts.csswg.org/css-gaps-1/#gap-rule-visibility>
+        (GapContainerKind::Flex, _, css::GapRuleVisibilityItems::Normal) => {
+            css::GapRuleVisibilityItems::All
+        }
         (_, _, css::GapRuleVisibilityItems::Normal)
             if context.container_kind == GapContainerKind::Grid =>
         {
@@ -278,7 +339,13 @@ pub(in crate::layout) fn effective_visibility_items(
             GapContainerKind::Multicol,
             GapRuleAxisKind::Column,
             css::GapRuleVisibilityItems::Normal,
-        ) => css::GapRuleVisibilityItems::Between,
+        ) => {
+            // Multicol callers materialize only gutters whose adjacent
+            // anonymous columns both received content. Unlike grid/flex they
+            // do not have item rectangles to re-derive that fact here.
+            // <https://www.w3.org/TR/css-multicol-1/#column-gaps-and-rules>
+            css::GapRuleVisibilityItems::All
+        }
         (GapContainerKind::Multicol, GapRuleAxisKind::Row, css::GapRuleVisibilityItems::Normal) => {
             css::GapRuleVisibilityItems::All
         }
@@ -300,23 +367,23 @@ pub(in crate::layout) fn segment_has_adjacent_item(
         GapRuleAxisKind::Column => grid_item_has_adjacent_area(context, *item, gap, segment, after)
             .unwrap_or_else(|| {
                 let adjacent = if after {
-                    item.x >= gap.end - GAP_RULE_EPSILON
+                    item.rect.origin.x >= gap.end - GAP_RULE_EPSILON
                 } else {
                     item.x_end() <= gap.start + GAP_RULE_EPSILON
                 };
                 adjacent
-                    && item.y < segment.end.position - GAP_RULE_EPSILON
+                    && item.rect.origin.y < segment.end.position - GAP_RULE_EPSILON
                     && item.y_end() > segment.start.position + GAP_RULE_EPSILON
             }),
         GapRuleAxisKind::Row => grid_item_has_adjacent_area(context, *item, gap, segment, after)
             .unwrap_or_else(|| {
                 let adjacent = if after {
-                    item.y >= gap.end - GAP_RULE_EPSILON
+                    item.rect.origin.y >= gap.end - GAP_RULE_EPSILON
                 } else {
                     item.y_end() <= gap.start + GAP_RULE_EPSILON
                 };
                 adjacent
-                    && item.x < segment.end.position - GAP_RULE_EPSILON
+                    && item.rect.origin.x < segment.end.position - GAP_RULE_EPSILON
                     && item.x_end() > segment.start.position + GAP_RULE_EPSILON
             }),
     })
@@ -421,39 +488,77 @@ pub(in crate::layout) fn gap_rule_segment_primitives(
         BorderStyle::Groove | BorderStyle::Ridge => {
             groove_ridge_gap_rule_primitives(context, gap, segment, width, style, color)
         }
-        BorderStyle::Inset | BorderStyle::Outset => {
-            let edge = gap_rule_border_edge(context.kind, true);
-            vec![solid_gap_rule_primitive(
-                context,
-                gap,
-                segment,
-                width,
-                inset_outset_border_color(style, edge, color),
-                None,
-            )]
+        BorderStyle::Inset | BorderStyle::Outset => groove_ridge_gap_rule_primitives(
+            context,
+            gap,
+            segment,
+            width,
+            if style == BorderStyle::Inset {
+                BorderStyle::Ridge
+            } else {
+                BorderStyle::Groove
+            },
+            color,
+        ),
+        BorderStyle::Dotted | BorderStyle::Dashed => {
+            patterned_gap_rule_primitives(context, gap, segment, width, style, color)
         }
-        BorderStyle::Dotted => vec![solid_gap_rule_primitive(
-            context,
-            gap,
-            segment,
-            width,
-            color,
-            Some((width, width)),
-        )],
-        BorderStyle::Dashed => vec![solid_gap_rule_primitive(
-            context,
-            gap,
-            segment,
-            width,
-            color,
-            Some((width * 3.0, width * 3.0)),
-        )],
         BorderStyle::Solid | BorderStyle::Double => {
             vec![solid_gap_rule_primitive(
                 context, gap, segment, width, color, None,
             )]
         }
         BorderStyle::None | BorderStyle::Hidden => Vec::new(),
+    }
+}
+
+fn patterned_gap_rule_primitives(
+    context: AxisRuleContext<'_>,
+    gap: GapBand,
+    segment: GapDecorationSegment,
+    width: f32,
+    style: BorderStyle,
+    color: Color,
+) -> Vec<PaintPrimitive> {
+    let (axis_start, axis_length, cross_start, horizontal) = match context.kind {
+        GapRuleAxisKind::Column => (
+            context.container.page_rect.top_y() - segment.end.position,
+            segment.end.position - segment.start.position,
+            context.container.page_rect.x() + gap.center() - width / 2.0,
+            false,
+        ),
+        GapRuleAxisKind::Row => (
+            context.container.page_rect.x() + segment.start.position,
+            segment.end.position - segment.start.position,
+            context.container.page_rect.top_y() - gap.center() - width / 2.0,
+            true,
+        ),
+    };
+    if style == BorderStyle::Dotted {
+        let mut paths = Vec::new();
+        paint_dotted_border_side(
+            &mut paths,
+            axis_start,
+            axis_length,
+            cross_start,
+            width,
+            horizontal,
+            color,
+        );
+        paths.into_iter().map(PaintPrimitive::Path).collect()
+    } else {
+        let mut rects = Vec::new();
+        paint_dashed_border_side(
+            &mut rects,
+            axis_start,
+            axis_length,
+            cross_start,
+            width,
+            horizontal,
+            width,
+            color,
+        );
+        rects.into_iter().map(PaintPrimitive::Rect).collect()
     }
 }
 
@@ -464,8 +569,13 @@ pub(in crate::layout) fn double_gap_rule_primitives(
     width: f32,
     color: Color,
 ) -> Vec<PaintPrimitive> {
+    // A gap rule has a centerline, unlike a particular side of a border box.
+    // Reusing `paint_border_side` here puts the second `double` stripe on the
+    // outside of its selected box side, which can move it out of the gap.
+    // Keep both stripes symmetric around the rule centerline instead.
+    // <https://drafts.csswg.org/css-gaps-1/#gap-rule-painting>
     let stripe = (width / 3.0).max(1.0);
-    let offset = width / 3.0;
+    let offset = (width - stripe) / 2.0;
     vec![
         solid_gap_rule_primitive_with_cross_offset(context, gap, segment, stripe, color, -offset),
         solid_gap_rule_primitive_with_cross_offset(context, gap, segment, stripe, color, offset),
@@ -537,25 +647,60 @@ pub(in crate::layout) fn solid_gap_rule_primitive_with_cross_offset_and_dash(
     cross_offset: f32,
     dash: Option<(f32, f32)>,
 ) -> PaintPrimitive {
+    // A solid gap rule is an opaque rectangular rule area. Representing it as
+    // a stroked centerline makes cap rasterization and coincident endpoints
+    // renderer-dependent, especially after negative insets join segments.
+    // Patterned rules remain strokes because dash phase is part of their
+    // painting model.
+    // <https://drafts.csswg.org/css-gaps-1/#gap-rule-painting>
+    if dash.is_none() {
+        return match context.kind {
+            GapRuleAxisKind::Column => {
+                let x = context.container.page_rect.x() + gap.center() + cross_offset - width / 2.0;
+                PaintPrimitive::Rect(RenderedRect::new(
+                    x,
+                    context.container.page_rect.top_y() - segment.end.position,
+                    width,
+                    (segment.end.position - segment.start.position).max(0.0),
+                    Some(color),
+                    None,
+                    0.0,
+                ))
+            }
+            GapRuleAxisKind::Row => {
+                let y =
+                    context.container.page_rect.top_y() - gap.center() - cross_offset - width / 2.0;
+                PaintPrimitive::Rect(RenderedRect::new(
+                    context.container.page_rect.x() + segment.start.position,
+                    y,
+                    (segment.end.position - segment.start.position).max(0.0),
+                    width,
+                    Some(color),
+                    None,
+                    0.0,
+                ))
+            }
+        };
+    }
     match context.kind {
         GapRuleAxisKind::Column => {
-            let x = context.origin_x + gap.center() + cross_offset;
+            let x = context.container.page_rect.x() + gap.center() + cross_offset;
             PaintPrimitive::Stroke(RenderedStroke::new(
                 x,
-                context.content_top - segment.start.position,
+                context.container.page_rect.top_y() - segment.start.position,
                 x,
-                context.content_top - segment.end.position,
+                context.container.page_rect.top_y() - segment.end.position,
                 width,
                 color,
                 dash,
             ))
         }
         GapRuleAxisKind::Row => {
-            let y = context.content_top - gap.center() - cross_offset;
+            let y = context.container.page_rect.top_y() - gap.center() - cross_offset;
             PaintPrimitive::Stroke(RenderedStroke::new(
-                context.origin_x + segment.start.position,
+                context.container.page_rect.x() + segment.start.position,
                 y,
-                context.origin_x + segment.end.position,
+                context.container.page_rect.x() + segment.end.position,
                 y,
                 width,
                 color,
@@ -580,18 +725,22 @@ pub(in crate::layout) fn gap_rule_border_edge(
 impl AxisRuleContext<'_> {
     pub(in crate::layout) fn axis_size(&self) -> f32 {
         match self.kind {
-            GapRuleAxisKind::Column => self.block_size,
-            GapRuleAxisKind::Row => self.inline_size,
+            GapRuleAxisKind::Column => self.container.local_size.height,
+            GapRuleAxisKind::Row => self.container.local_size.width,
         }
     }
 }
 
-pub(in crate::layout) fn used_gap_rule_length(
+pub(in crate::layout) fn used_gap_rule_length<T, Source>(
     value: css::ComputedLengthPercentage,
-    percentage_basis: f32,
-) -> f32 {
+    percentage_basis: PercentageBasis<T, Source>,
+) -> f32
+where
+    T: SemanticLengthExt,
+{
     value
         .used_length_with_percentage_basis(percentage_basis)
-        .unwrap_or(value.length_with_percentage_basis(percentage_basis))
+        .map(layout_points)
+        .unwrap_or(value.length_points())
         .max(0.0)
 }

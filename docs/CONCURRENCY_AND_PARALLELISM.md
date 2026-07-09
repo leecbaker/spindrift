@@ -16,8 +16,8 @@ orchestration, font loading, and one layout worker thread.
   `src/html.rs`.
 - CSS file and `@import` loading are async in `src/css/types/source.rs`, but
   imports are resolved depth-first and sequentially.
-- Resource reads use `reqwest` for HTTP URLs and `tokio::fs::read` for local
-  files in `src/resource.rs`.
+- Resource reads use `reqwest` for HTTP(S) URLs and `tokio::fs::read` for
+  local `file:` URLs in `src/resource.rs`.
 - Font loading starts the Parley/fontique context on `spawn_blocking`, loads
   `@font-face` rules with Tokio tasks, and registers loaded font faces on
   `spawn_blocking` in `src/text/system/font_loading.rs`.
@@ -67,7 +67,7 @@ flowchart TD
   FLOW --> DOC["Document"]
 
   DOC --> META["Extract metadata"]
-  META --> PDF["write_pdf_bytes_with_options synchronously"]
+  META --> PDF["write_pdf_bytes with PdfOptions synchronously"]
   PDF --> V["Validate paint operations"]
   V --> SH["Shape document text for PDF"]
   SH --> FP["Plan font embedding"]

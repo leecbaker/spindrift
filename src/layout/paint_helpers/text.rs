@@ -34,28 +34,3 @@ pub(crate) fn is_css_collapsible_whitespace(character: char) -> bool {
 pub(crate) fn text_is_css_collapsible_space(text: &str, style: &ComputedStyle) -> bool {
     style.white_space.collapses_spaces() && crate::text::text_is_css_collapsible_whitespace(text)
 }
-
-pub(crate) fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
-    let mut output = Vec::new();
-    for paragraph in text.split('\n') {
-        let mut current = String::new();
-        for word in paragraph
-            .split(is_css_collapsible_whitespace)
-            .filter(|word| !word.is_empty())
-        {
-            if current.is_empty() {
-                current.push_str(word);
-            } else if current.len() + 1 + word.len() <= max_chars {
-                current.push(' ');
-                current.push_str(word);
-            } else {
-                output.push(current);
-                current = word.to_string();
-            }
-        }
-        if !current.is_empty() {
-            output.push(current);
-        }
-    }
-    output
-}

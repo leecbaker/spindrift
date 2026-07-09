@@ -1,6 +1,67 @@
 use super::*;
+use std::ops::{Deref, DerefMut};
 
-#[derive(Debug, Clone, Copy)]
+/// A table-part style after the table used-value boundary.
+///
+/// Table fragments retain their raw computed styles for durable structure and
+/// cascade reconstruction. Table layout, sizing, and painting consume this
+/// marker after effective CSS `zoom` has been applied exactly once.
+/// <https://drafts.csswg.org/css-viewport/#zoom-property>
+/// <https://drafts.csswg.org/css-tables-3/#table-layout>
+#[derive(Debug, Clone)]
+pub(super) struct TableUsedStyle {
+    source: ComputedStyle,
+    used: ComputedStyle,
+}
+
+pub(super) trait TableStyleSource {
+    fn table_source(&self) -> &ComputedStyle;
+}
+
+impl TableStyleSource for ComputedStyle {
+    fn table_source(&self) -> &ComputedStyle {
+        self
+    }
+}
+
+impl TableStyleSource for TableUsedStyle {
+    fn table_source(&self) -> &ComputedStyle {
+        self.source()
+    }
+}
+
+impl TableUsedStyle {
+    pub(super) fn from_source_and_normalized(source: ComputedStyle, used: ComputedStyle) -> Self {
+        debug_assert!(used.zoom_applied);
+        Self { source, used }
+    }
+
+    /// The frozen computed style used exclusively as the cascade parent when
+    /// reconstructing an anonymous or deferred table part.
+    pub(super) fn source(&self) -> &ComputedStyle {
+        &self.source
+    }
+
+    pub(super) fn as_computed(&self) -> &ComputedStyle {
+        &self.used
+    }
+}
+
+impl Deref for TableUsedStyle {
+    type Target = ComputedStyle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.used
+    }
+}
+
+impl DerefMut for TableUsedStyle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.used
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum DeclaredTableWidth {
     Fixed(f32),
     Percent(f32),
@@ -171,6 +232,18 @@ impl TableColumnPlan {
         self.widths.len()
     }
 
+    /// Whether a logical cell span crosses a collapsed column track.
+    ///
+    /// CSS Tables clips a spanning cell's content to its displayed cell area
+    /// when a covered column is removed by `visibility: collapse`:
+    /// <https://drafts.csswg.org/css-tables-3/#visibility-collapse-cell-rendering>.
+    pub(super) fn span_contains_collapsed_column(&self, column: usize, colspan: usize) -> bool {
+        let end = (column + colspan.max(1)).min(self.collapsed.len());
+        self.collapsed[column.min(end)..end]
+            .iter()
+            .any(|collapsed| *collapsed)
+    }
+
     /// Return physical inline bounds for a logical column span.
     ///
     /// CSS Tables assigns cells to logical grid slots, with separated
@@ -222,7 +295,7 @@ impl TableColumnPlan {
     }
 
     fn logical_offset_for_column(&self, column: usize) -> f32 {
-        self.offsets.get(column).copied().unwrap_or(0.0)
+        self.offsets.get(column).cloned().unwrap_or(0.0)
     }
 
     fn logical_boundary_offset(&self, boundary: usize) -> f32 {
@@ -233,7 +306,7 @@ impl TableColumnPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct TableMetrics {
     pub(super) border_collapse: css::BorderCollapse,
     pub(super) spacing: css::BorderSpacing,
@@ -336,8 +409,11 @@ mod tests {
         let border_box = plan.cell_border_box(area, TableRowBounds::new(40.0, 25.0));
         assert_eq!(border_box.x(placement), 120.0);
         assert_eq!(border_box.top_y(placement), 260.0);
-        assert_eq!(border_box.top_y(placement) - border_box.height(), 235.0);
+        assert_eq!(
+            border_box.top_y(placement) - border_box.rect().size.height,
+            235.0
+        );
         assert_eq!(border_box.width(), 55.0);
-        assert_eq!(border_box.height(), 25.0);
+        assert_eq!(border_box.rect().size.height, 25.0);
     }
 }

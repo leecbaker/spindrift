@@ -84,11 +84,10 @@ pub(crate) fn keep_all_suppresses_break_between(previous: char, next: char) -> b
 
 /// Return whether an intra-text break contributes to min-content sizing.
 ///
-/// CSS Sizing min-content uses soft wrap opportunities, but CSS Text tailors
-/// which emergency and CJK unit breaks are considered. `overflow-wrap:anywhere`,
-/// `word-break:break-all`, and `line-break:anywhere` contribute to min-content;
-/// `overflow-wrap:break-word` emergency opportunities are intentionally handled
-/// by graph metadata and do not call this predicate:
+/// CSS Sizing min-content uses ordinary CSS Text soft wrap opportunities,
+/// including normal UAX #14 ideographic boundaries. `keep-all` may suppress
+/// such a boundary; `overflow-wrap:break-word` emergency opportunities are
+/// intentionally handled by graph metadata and do not call this predicate:
 /// <https://www.w3.org/TR/css-sizing-3/#min-content> and
 /// <https://www.w3.org/TR/css-text-3/#overflow-wrap-property>.
 pub(crate) fn text_break_is_min_content_eligible(
@@ -102,41 +101,17 @@ pub(crate) fn text_break_is_min_content_eligible(
     let previous = text[..byte_offset].chars().next_back();
     let next = text[byte_offset..].chars().next();
     if let (Some(previous), Some(next)) = (previous, next) {
-        if matches!(style.word_break, CssWordBreak::KeepAll)
-            && keep_all_suppresses_break_between(previous, next)
-        {
-            return false;
-        }
-        if text_break_is_cjk_ideographic_unit_boundary(text, style, byte_offset) {
-            return false;
+        match style.word_break {
+            CssWordBreak::KeepAll if keep_all_suppresses_break_between(previous, next) => {
+                return false;
+            }
+            CssWordBreak::Manual if manual_suppresses_break_between(previous, next) => {
+                return false;
+            }
+            _ => {}
         }
     }
     true
-}
-
-pub(crate) fn text_break_is_cjk_ideographic_unit_boundary(
-    text: &str,
-    style: &ComputedStyle,
-    byte_offset: usize,
-) -> bool {
-    if text_break_policy_forces_unit_min_content(style) {
-        return false;
-    }
-    matches!(
-        (
-            text[..byte_offset].chars().next_back(),
-            text[byte_offset..].chars().next()
-        ),
-        (Some(previous), Some(next))
-            if character_is_autospace_ideograph(previous)
-                && character_is_autospace_ideograph(next)
-    )
-}
-
-fn text_break_policy_forces_unit_min_content(style: &ComputedStyle) -> bool {
-    matches!(style.word_break, CssWordBreak::BreakAll)
-        || matches!(style.line_break, CssLineBreak::Anywhere)
-        || matches!(style.overflow_wrap, CssOverflowWrap::Anywhere)
 }
 
 fn keep_all_unbreakable_unit(character: char) -> bool {
@@ -206,23 +181,24 @@ mod tests {
     }
 
     #[test]
-    fn min_content_policy_distinguishes_anywhere_from_break_word() {
+    fn min_content_uses_ordinary_ideographic_soft_wraps() {
         let mut style = ComputedStyle::initial();
         let text = "中文";
-        assert!(!text_break_is_min_content_eligible(
-            text,
-            &style,
-            "中".len()
-        ));
-
-        style.overflow_wrap = CssOverflowWrap::Anywhere;
         assert!(text_break_is_min_content_eligible(text, &style, "中".len()));
 
-        style.overflow_wrap = CssOverflowWrap::BreakWord;
+        style.word_break = CssWordBreak::KeepAll;
         assert!(!text_break_is_min_content_eligible(
             text,
             &style,
             "中".len()
         ));
+    }
+
+    #[test]
+    fn min_content_manual_excludes_complex_context_dictionary_breaks() {
+        let mut style = ComputedStyle::initial();
+        style.word_break = CssWordBreak::Manual;
+        let text = "กรุงเทพ";
+        assert!(!text_break_is_min_content_eligible(text, &style, "ก".len()));
     }
 }

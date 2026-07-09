@@ -1,13 +1,15 @@
 use super::*;
+use crate::Color;
 use crate::css::values::{
     parse_font_feature_settings, parse_font_variant, parse_font_variant_alternates,
     parse_font_variant_caps, parse_font_variant_east_asian, parse_font_variant_ligatures,
     parse_font_variant_numeric, parse_font_variant_position,
 };
 use crate::css::{
-    FontFeatureSettings, FontFeatureValue, FontFeatureValues, FontFeatureValuesBlock,
-    FontVariantAlternates, FontVariantCaps, FontVariantEastAsian, FontVariantLigatures,
-    FontVariantNumeric, FontVariantPosition,
+    FontFeatureSettings, FontFeatureValue, FontFeatureValues, FontFeatureValuesBlock, FontPalette,
+    FontPaletteDefinition, FontPaletteValues, FontVariantAlternates, FontVariantCaps,
+    FontVariantEastAsian, FontVariantLigatures, FontVariantNumeric, FontVariantPosition,
+    parse_font_palette,
 };
 
 pub(super) fn parse_font_faces(css: &Css) -> Vec<CssFontFace> {
@@ -23,9 +25,14 @@ pub(super) fn parse_font_faces(css: &Css) -> Vec<CssFontFace> {
             break;
         };
         let declarations = parse_declarations(&rest[open + 1..close]);
-        if let Some(family) = declarations
-            .get("font-family")
-            .and_then(|value| parse_font_family_names(value).into_iter().next())
+        // `@font-face` descriptors do not participate in the element cascade,
+        // so no custom-property environment exists for `var()` substitution.
+        // A variable reference therefore invalidates the descriptor and the
+        // face is not usable.
+        // <https://www.w3.org/TR/css-variables-1/#using-variables>
+        if let Some(family_value) = declarations.get("font-family")
+            && !family_value.to_ascii_lowercase().contains("var(")
+            && let Some(family) = parse_font_family_names(family_value).into_iter().next()
         {
             let sources = declarations
                 .get("src")
@@ -38,10 +45,16 @@ pub(super) fn parse_font_faces(css: &Css) -> Vec<CssFontFace> {
                     unicode_range: declarations
                         .get("unicode-range")
                         .and_then(|value| parse_unicode_range(value)),
+                    size_adjust: declarations
+                        .get("size-adjust")
+                        .and_then(|value| parse_font_face_size_adjust(value)),
                     weight: declarations
                         .get("font-weight")
                         .and_then(|value| parse_font_weight(value, FontWeight::NORMAL))
                         .unwrap_or(FontWeight::NORMAL),
+                    weight_is_variable: font_face_axis_is_variable(
+                        declarations.get("font-weight").map(String::as_str),
+                    ),
                     style: declarations
                         .get("font-style")
                         .and_then(|value| parse_font_style(value))
@@ -51,6 +64,12 @@ pub(super) fn parse_font_faces(css: &Css) -> Vec<CssFontFace> {
                         .or_else(|| declarations.get("font-stretch"))
                         .and_then(|value| parse_font_width(value))
                         .unwrap_or(FontWidth::NORMAL),
+                    width_is_variable: font_face_axis_is_variable(
+                        declarations
+                            .get("font-width")
+                            .or_else(|| declarations.get("font-stretch"))
+                            .map(String::as_str),
+                    ),
                     font_feature_settings: declarations
                         .get("font-feature-settings")
                         .and_then(|value| parse_font_feature_settings(value))
@@ -70,6 +89,30 @@ pub(super) fn parse_font_faces(css: &Css) -> Vec<CssFontFace> {
         rest = &rest[close + 1..];
     }
     faces
+}
+
+/// CSS Fonts Level 4 makes `auto` the descriptor initial value for variable
+/// axes. A two-value descriptor denotes a range, which must likewise retain
+/// the font's intrinsic axis rather than pinning registration to one value.
+/// <https://www.w3.org/TR/css-fonts-4/#font-prop-desc>
+fn font_face_axis_is_variable(value: Option<&str>) -> bool {
+    value.is_none_or(|value| {
+        let tokens = split_css_component_values(trim_css_value(value));
+        tokens.len() != 1 || tokens[0].eq_ignore_ascii_case("auto")
+    })
+}
+
+/// Parse the `@font-face size-adjust` percentage descriptor.
+///
+/// <https://www.w3.org/TR/css-fonts-5/#descdef-font-face-size-adjust>
+fn parse_font_face_size_adjust(value: &str) -> Option<u32> {
+    let percent = trim_css_value(value)
+        .strip_suffix('%')?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
+    let factor = percent / 100.0;
+    (factor.is_finite() && factor >= 0.0).then_some(factor.to_bits())
 }
 
 /// Parse CSS Fonts' `unicode-range` descriptor.
@@ -189,8 +232,8 @@ fn css_wide_keyword(value: &str) -> bool {
 
 pub(super) fn parse_font_face_sources(
     value: &str,
-    base_url: Option<&Path>,
-    root_url: Option<&Path>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
 ) -> Vec<FontFaceSource> {
     let mut sources = Vec::new();
     let mut input = ParserInput::new(trim_css_value(value));
@@ -199,8 +242,8 @@ pub(super) fn parse_font_face_sources(
         if let Ok(value) = parser.try_parse(|input| input.expect_url()) {
             sources.push(FontFaceSource::Url {
                 value: value.to_string(),
-                base_url: base_url.map(Path::to_path_buf),
-                root_url: root_url.map(Path::to_path_buf),
+                base_url: base_url.cloned(),
+                root_url: root_url.cloned(),
             });
         } else if parser.next_including_whitespace_and_comments().is_err() {
             break;
@@ -230,6 +273,70 @@ pub(super) fn parse_font_feature_values(css: &Css) -> FontFeatureValues {
         rest = &rest[close + 1..];
     }
     values
+}
+
+/// Parse named palette definitions from CSS Fonts Level 4.
+///
+/// The rules are deliberately collected alongside `@font-feature-values`:
+/// both are stylesheet-scoped resources consumed later by text painting rather
+/// than selector-matched declarations.
+/// <https://www.w3.org/TR/css-fonts-4/#font-palette-values>
+pub(super) fn parse_font_palette_values(css: &Css) -> FontPaletteValues {
+    let mut values = FontPaletteValues::default();
+    let mut rest = css.source();
+    while let Some(rule_start) = find_ascii_case_insensitive(rest, "@font-palette-values") {
+        let after_name = &rest[rule_start + "@font-palette-values".len()..];
+        let Some(open_offset) = after_name.find('{') else {
+            break;
+        };
+        let open = rule_start + "@font-palette-values".len() + open_offset;
+        let Some(close) = find_matching_brace(rest, open) else {
+            break;
+        };
+        let name = after_name[..open_offset].trim();
+        if name.starts_with("--") && name.len() > 2 {
+            let declarations = parse_declarations(&rest[open + 1..close]);
+            let families = declarations
+                .get("font-family")
+                .map(|value| parse_font_family_names(value))
+                .unwrap_or_default();
+            let base = declarations
+                .get("base-palette")
+                .and_then(|value| parse_base_palette(value))
+                .unwrap_or(FontPalette::Normal);
+            let overrides = declarations
+                .get("override-colors")
+                .map(|value| parse_palette_overrides(value))
+                .unwrap_or_default();
+            values.insert(
+                name.to_string(),
+                FontPaletteDefinition {
+                    families,
+                    base,
+                    overrides,
+                },
+            );
+        }
+        rest = &rest[close + 1..];
+    }
+    values
+}
+
+fn parse_base_palette(value: &str) -> Option<FontPalette> {
+    let value = trim_css_value(value);
+    parse_font_palette(value).or_else(|| value.parse::<u16>().ok().map(FontPalette::Index))
+}
+
+fn parse_palette_overrides(value: &str) -> HashMap<u16, Color> {
+    value
+        .split(',')
+        .filter_map(|entry| {
+            let mut values = entry.split_ascii_whitespace();
+            let index = values.next()?.parse::<u16>().ok()?;
+            let color = parse_color(values.next()?)?;
+            values.next().is_none().then_some((index, color))
+        })
+        .collect()
 }
 
 fn parse_font_feature_values_block(values: &mut FontFeatureValues, family: &str, mut source: &str) {

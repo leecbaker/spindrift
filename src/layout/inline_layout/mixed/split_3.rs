@@ -153,43 +153,168 @@ pub(in crate::layout) fn mixed_measured_inline_line_bidi_text(
     (text, ranged)
 }
 
+/// Expand a visual text slice to retain authored join controls at its owned
+/// inline-fragment edges.
+///
+/// UAX #9 removes `BN` characters such as ZWJ and ZWNJ from the resolved
+/// visual clusters, but CSS Text still requires them to remain in the shaping
+/// input. Mixed inline layout records transparent box edges at the same byte
+/// boundaries as text fragments, so recovering an omitted join control from a
+/// paragraph-wide visual range can accidentally move it across an inline-box
+/// edge. Keep leading and trailing controls with the fragment that authored
+/// them instead:
+/// <https://www.w3.org/TR/css-text-3/#text-encoding>,
+/// <https://www.w3.org/TR/css-text-3/#boundary-shaping>, and
+/// <https://www.unicode.org/reports/tr9/#X9>.
+pub(in crate::layout) fn expand_visual_slice_with_owned_join_controls(
+    fragment_text: &str,
+    fragment_range: std::ops::Range<usize>,
+    visual_slice: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    if visual_slice.start < fragment_range.start
+        || visual_slice.end > fragment_range.end
+        || visual_slice.start >= visual_slice.end
+    {
+        return visual_slice;
+    }
+    let relative_start = visual_slice.start - fragment_range.start;
+    let relative_end = visual_slice.end - fragment_range.start;
+    let Some(prefix) = fragment_text.get(..relative_start) else {
+        return visual_slice;
+    };
+    let Some(suffix) = fragment_text.get(relative_end..) else {
+        return visual_slice;
+    };
+
+    let start = if prefix.chars().all(character_is_join_control) {
+        fragment_range.start
+    } else {
+        visual_slice.start
+    };
+    let end = if suffix.chars().all(character_is_join_control) {
+        fragment_range.end
+    } else {
+        visual_slice.end
+    };
+    start..end
+}
+
+/// Fold visual ranges containing only join controls into their source fragment.
+///
+/// A bidi shaper may return ZWJ/ZWNJ as standalone visual ranges even though
+/// UAX #9 gives the controls no visual position of their own. Emitting such a
+/// range independently lets it cross transparent inline-edge atoms before the
+/// visible character from the same source fragment is emitted. Keep the range
+/// at the position of its source fragment's visible text instead:
+/// <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
+/// <https://www.unicode.org/reports/tr9/#X9>.
+pub(in crate::layout) fn merge_owned_join_control_visual_ranges(
+    text: &str,
+    ranges: &mut Vec<BidiVisualRange>,
+    ranged_items: &[RangedMeasuredMixedInlineLineItem],
+) {
+    let mut index = 0;
+    while index < ranges.len() {
+        let control_range = ranges[index].range.clone();
+        let join_controls_only = text
+            .get(control_range.clone())
+            .is_some_and(|slice| !slice.is_empty() && slice.chars().all(character_is_join_control));
+        if !join_controls_only {
+            index += 1;
+            continue;
+        }
+        let Some(owner) = ranged_items.iter().find(|ranged| {
+            matches!(ranged.item.item, InlineLineItem::Fragment(_))
+                && ranged.range.start <= control_range.start
+                && control_range.end <= ranged.range.end
+        }) else {
+            index += 1;
+            continue;
+        };
+        let is_visible_owner_range = |candidate: &BidiVisualRange| {
+            candidate.range.start >= owner.range.start
+                && candidate.range.end <= owner.range.end
+                && text.get(candidate.range.clone()).is_some_and(|slice| {
+                    slice
+                        .chars()
+                        .any(|character| !character_is_join_control(character))
+                })
+        };
+        // Use logical adjacency within the owner, not the order in which the
+        // bidi shaper happened to return the ranges. A trailing control belongs
+        // to the preceding text in this fragment; a leading one belongs to the
+        // following text when there is no preceding text in that fragment.
+        let owner_range_index = ranges
+            .iter()
+            .enumerate()
+            .find_map(|(candidate_index, candidate)| {
+                (candidate_index != index
+                    && candidate.range.end == control_range.start
+                    && is_visible_owner_range(candidate))
+                .then_some(candidate_index)
+            })
+            .or_else(|| {
+                ranges
+                    .iter()
+                    .enumerate()
+                    .find_map(|(candidate_index, candidate)| {
+                        (candidate_index != index
+                            && candidate.range.start == control_range.end
+                            && is_visible_owner_range(candidate))
+                        .then_some(candidate_index)
+                    })
+            });
+        let Some(owner_range_index) = owner_range_index else {
+            index += 1;
+            continue;
+        };
+        let owner_range = &mut ranges[owner_range_index];
+        owner_range.range.start = owner_range.range.start.min(control_range.start);
+        owner_range.range.end = owner_range.range.end.max(control_range.end);
+        ranges.remove(index);
+        if owner_range_index < index {
+            index -= 1;
+        }
+    }
+}
+
 pub(in crate::layout) fn mixed_inline_atom_participates_in_bidi_ordering(
     atom: &InlineAtom,
 ) -> bool {
     !matches!(
         atom.content(),
-        InlineAtomContent::Leader(_) | InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
+        InlineAtomContent::Leader(_) | InlineAtomContent::InlineEdge(_)
     )
 }
 
-pub(in crate::layout) fn measured_item_is_transparent_mixed_inline_box_edge(
+pub(in crate::layout) fn measured_item_is_transparent_mixed_inline_edge(
     item: &MeasuredInlineItem,
 ) -> bool {
     matches!(
         &item.item,
-        InlineLineItem::Atom(atom)
-            if matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_)))
+        InlineLineItem::Atom(atom) if matches!(atom.content(), InlineAtomContent::InlineEdge(_))
     )
 }
 
-/// Split UBA visual ranges at transparent inline box edge boundaries.
+/// Split UBA visual ranges at transparent inline-edge boundaries.
 ///
 /// CSS Writing Modes applies bidi reordering to inline text, while CSS 2.2
 /// keeps non-replaced inline box start/end margin, padding, and border at the
-/// inline box's own edges. Quire models those edges as transparent atoms so
-/// they do not become UAX #9 object replacements, then reinserts them around
-/// visual text slices. A single UBA visual run can still contain multiple
-/// sibling inline boxes, so split at owned zero-width box-edge boundaries
-/// before edge reinsertion; `box-decoration-break: slice` then leaves start
+/// inline box's own edges. CSS Text `text-autospace` similarly creates a
+/// non-text spacing boundary. Quire models both as transparent atoms so they
+/// do not become UAX #9 object replacements, then reinserts them around visual
+/// text slices. A single UBA visual run can still contain multiple sibling
+/// inline boxes or autospace boundaries, so split at each owned zero-width
+/// edge before reinsertion; `box-decoration-break: slice` then leaves start
 /// and end decoration ownership on the adjacent generated inline box fragment.
 /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-algo>,
 /// <https://www.w3.org/TR/CSS22/visuren.html#inline-boxes>, and
 /// <https://www.w3.org/TR/css-break-3/#break-decoration>.
-pub(in crate::layout) fn split_mixed_inline_visual_ranges_at_box_edges(
-    visual_ranges: Vec<std::ops::Range<usize>>,
+pub(in crate::layout) fn split_mixed_inline_visual_ranges_at_transparent_inline_edges(
+    visual_ranges: Vec<BidiVisualRange>,
     ranged_items: &[RangedMeasuredMixedInlineLineItem],
     text: &str,
-) -> Vec<std::ops::Range<usize>> {
+) -> Vec<BidiVisualRange> {
     if visual_ranges.is_empty() {
         return visual_ranges;
     }
@@ -198,7 +323,7 @@ pub(in crate::layout) fn split_mixed_inline_visual_ranges_at_box_edges(
         .iter()
         .filter(|ranged| {
             ranged.range.start == ranged.range.end
-                && measured_item_is_transparent_mixed_inline_box_edge(&ranged.item)
+                && measured_item_is_transparent_mixed_inline_edge(&ranged.item)
                 && text.is_char_boundary(ranged.range.start)
         })
         .map(|ranged| ranged.range.start)
@@ -212,36 +337,54 @@ pub(in crate::layout) fn split_mixed_inline_visual_ranges_at_box_edges(
 
     let mut split_ranges = Vec::with_capacity(visual_ranges.len());
     for visual_range in visual_ranges {
-        let mut start = visual_range.start;
-        for boundary in edge_boundaries
-            .iter()
-            .copied()
-            .filter(|boundary| visual_range.start < *boundary && *boundary < visual_range.end)
-        {
-            split_ranges.push(start..boundary);
+        let mut start = visual_range.range.start;
+        for boundary in edge_boundaries.iter().cloned().filter(|boundary| {
+            visual_range.range.start < *boundary && *boundary < visual_range.range.end
+        }) {
+            split_ranges.push(BidiVisualRange {
+                range: start..boundary,
+                direction: visual_range.direction,
+            });
             start = boundary;
         }
-        split_ranges.push(start..visual_range.end);
+        split_ranges.push(BidiVisualRange {
+            range: start..visual_range.range.end,
+            direction: visual_range.direction,
+        });
     }
     split_ranges
 }
 
-pub(in crate::layout) fn mixed_inline_box_edge_precedes_visual_content(
+pub(in crate::layout) fn transparent_inline_edge_precedes_visual_content(
     item: &MeasuredInlineItem,
 ) -> Option<bool> {
     let InlineLineItem::Atom(atom) = &item.item else {
         return None;
     };
-    let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) = atom.content() else {
-        return None;
-    };
-    Some(match edge.physical_side {
-        PhysicalSide::Left => true,
-        PhysicalSide::Right => false,
-        PhysicalSide::Top | PhysicalSide::Bottom => {
-            matches!(edge.logical_edge, InlineLogicalEdge::Start)
+    match atom.content() {
+        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) => {
+            Some(match edge.physical_side {
+                PhysicalSide::Left => true,
+                PhysicalSide::Right => false,
+                PhysicalSide::Top | PhysicalSide::Bottom => {
+                    matches!(edge.logical_edge, InlineLogicalEdge::Start)
+                }
+            })
         }
-    })
+        // Autospace belongs after the preceding selected typographic unit.
+        // Keeping it on that visual edge lets UAX #9 resolve the surrounding
+        // text without promoting the spacing itself to an atomic object.
+        InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace) => Some(false),
+        InlineAtomContent::Canvas
+        | InlineAtomContent::Iframe(_)
+        | InlineAtomContent::Image(_)
+        | InlineAtomContent::Svg { .. }
+        | InlineAtomContent::StaticPositionPlaceholder
+        | InlineAtomContent::InlineBox { .. }
+        | InlineAtomContent::TextCombineUpright { .. }
+        | InlineAtomContent::InlineFragment(_)
+        | InlineAtomContent::Leader(_) => None,
+    }
 }
 
 pub(in crate::layout) fn reconcile_mixed_inline_fragment_edge_ownership(
@@ -351,33 +494,37 @@ pub(in crate::layout) fn adjacent_fragment_index_in_visual_edge_candidates<'a>(
 
 pub(in crate::layout) fn normalize_mixed_inline_visual_ranges(
     text: &str,
-    visual_ranges: Vec<std::ops::Range<usize>>,
-) -> Vec<std::ops::Range<usize>> {
+    visual_ranges: Vec<BidiVisualRange>,
+    fallback_direction: ResolvedBidiDirection,
+) -> Vec<BidiVisualRange> {
     if text.is_empty() {
         return Vec::new();
     }
     let mut ranges = visual_ranges
         .into_iter()
-        .filter(|range| {
-            range.start < range.end
-                && range.end <= text.len()
-                && text.is_char_boundary(range.start)
-                && text.is_char_boundary(range.end)
+        .filter(|visual_range| {
+            visual_range.range.start < visual_range.range.end
+                && visual_range.range.end <= text.len()
+                && text.is_char_boundary(visual_range.range.start)
+                && text.is_char_boundary(visual_range.range.end)
         })
         .collect::<Vec<_>>();
     if ranges.is_empty() {
-        ranges.push(0..text.len());
+        ranges.push(BidiVisualRange {
+            range: 0..text.len(),
+            direction: fallback_direction,
+        });
     }
 
     for gap in uncovered_non_bidi_control_text_ranges(text, &ranges) {
-        attach_uncovered_visual_range(&mut ranges, gap);
+        attach_uncovered_visual_range(&mut ranges, gap, fallback_direction);
     }
     ranges
 }
 
 pub(in crate::layout) fn uncovered_non_bidi_control_text_ranges(
     text: &str,
-    ranges: &[std::ops::Range<usize>],
+    ranges: &[BidiVisualRange],
 ) -> Vec<std::ops::Range<usize>> {
     let mut gaps = Vec::new();
     let mut current_start = None;
@@ -387,7 +534,7 @@ pub(in crate::layout) fn uncovered_non_bidi_control_text_ranges(
         let covered = character_is_bidi_format_control(character)
             || ranges
                 .iter()
-                .any(|range| range.start <= start && end <= range.end);
+                .any(|range| range.range.start <= start && end <= range.range.end);
         if covered {
             if let Some(gap_start) = current_start.take() {
                 gaps.push(gap_start..current_end);
@@ -404,38 +551,55 @@ pub(in crate::layout) fn uncovered_non_bidi_control_text_ranges(
 }
 
 pub(in crate::layout) fn attach_uncovered_visual_range(
-    ranges: &mut Vec<std::ops::Range<usize>>,
+    ranges: &mut Vec<BidiVisualRange>,
     gap: std::ops::Range<usize>,
+    fallback_direction: ResolvedBidiDirection,
 ) {
-    if let Some(range) = ranges.iter_mut().find(|range| range.start == gap.end) {
-        range.start = gap.start;
+    if let Some(range) = ranges.iter_mut().find(|range| range.range.start == gap.end) {
+        range.range.start = gap.start;
         return;
     }
-    if let Some(range) = ranges.iter_mut().find(|range| range.end == gap.start) {
-        range.end = gap.end;
+    if let Some(range) = ranges.iter_mut().find(|range| range.range.end == gap.start) {
+        range.range.end = gap.end;
         return;
     }
     let Some((index, before)) = nearest_visual_range_for_gap(ranges, &gap) else {
-        ranges.push(gap);
+        ranges.push(BidiVisualRange {
+            range: gap,
+            direction: fallback_direction,
+        });
         return;
     };
+    let direction = ranges[index].direction;
     if before {
-        ranges.insert(index, gap);
+        ranges.insert(
+            index,
+            BidiVisualRange {
+                range: gap,
+                direction,
+            },
+        );
     } else {
-        ranges.insert(index + 1, gap);
+        ranges.insert(
+            index + 1,
+            BidiVisualRange {
+                range: gap,
+                direction,
+            },
+        );
     }
 }
 
 pub(in crate::layout) fn nearest_visual_range_for_gap(
-    ranges: &[std::ops::Range<usize>],
+    ranges: &[BidiVisualRange],
     gap: &std::ops::Range<usize>,
 ) -> Option<(usize, bool)> {
     ranges
         .iter()
         .enumerate()
         .map(|(index, range)| {
-            let before_distance = range.start.abs_diff(gap.end);
-            let after_distance = range.end.abs_diff(gap.start);
+            let before_distance = range.range.start.abs_diff(gap.end);
+            let after_distance = range.range.end.abs_diff(gap.start);
             if before_distance <= after_distance {
                 (index, true, before_distance)
             } else {
@@ -469,4 +633,38 @@ pub(in crate::layout) fn mixed_inline_item_starts_with_suppressed_line_start_pun
     };
     character_is_hangable_stop_or_comma(character)
         || character_is_last_hangable_punctuation(character)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visual_slice_retains_join_controls_owned_by_its_fragment() {
+        let text = "\u{200c}ع\u{200c}";
+        let owner = 20..(20 + text.len());
+        let letter_start = owner.start + '\u{200c}'.len_utf8();
+        let letter_end = letter_start + 'ع'.len_utf8();
+
+        assert_eq!(
+            expand_visual_slice_with_owned_join_controls(
+                text,
+                owner.clone(),
+                letter_start..letter_end,
+            ),
+            owner
+        );
+    }
+
+    #[test]
+    fn visual_slice_does_not_cross_its_fragment_for_join_controls() {
+        let text = "ع\u{200c}";
+        let owner = 8..(8 + text.len());
+        let letter_end = owner.start + 'ع'.len_utf8();
+
+        assert_eq!(
+            expand_visual_slice_with_owned_join_controls(text, owner, 8..letter_end),
+            8..(8 + text.len())
+        );
+    }
 }

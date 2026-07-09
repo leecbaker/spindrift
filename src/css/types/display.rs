@@ -20,6 +20,10 @@ pub(crate) enum DisplayInner {
     FlowRoot,
     Flex,
     Grid,
+    /// CSS Grid Level 3's one-dimensional masonry/grid-lanes formatting
+    /// context.
+    /// <https://drafts.csswg.org/css-grid-3/#establishing-grid-lanes-layout>
+    GridLanes,
     Table,
     TableCaption,
     TableColumnGroup,
@@ -85,6 +89,16 @@ impl Display {
     pub const INLINE_GRID: Self = Self {
         outer: DisplayOuter::Inline,
         inner: DisplayInner::Grid,
+        list_item: false,
+    };
+    pub const GRID_LANES: Self = Self {
+        outer: DisplayOuter::Block,
+        inner: DisplayInner::GridLanes,
+        list_item: false,
+    };
+    pub const INLINE_GRID_LANES: Self = Self {
+        outer: DisplayOuter::Inline,
+        inner: DisplayInner::GridLanes,
         list_item: false,
     };
     pub const TABLE: Self = Self {
@@ -205,7 +219,11 @@ impl Display {
     }
 
     pub fn is_grid(self) -> bool {
-        self.inner == DisplayInner::Grid
+        matches!(self.inner, DisplayInner::Grid | DisplayInner::GridLanes)
+    }
+
+    pub fn is_grid_lanes(self) -> bool {
+        self.inner == DisplayInner::GridLanes
     }
 
     pub fn is_table(self) -> bool {
@@ -271,6 +289,7 @@ impl Display {
             DisplayInner::FlowRoot
                 | DisplayInner::Flex
                 | DisplayInner::Grid
+                | DisplayInner::GridLanes
                 | DisplayInner::Table
                 | DisplayInner::TableCaption
                 | DisplayInner::TableColumnGroup

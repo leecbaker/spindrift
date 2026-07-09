@@ -119,7 +119,8 @@ pub(in crate::css) fn is_css_identifier_character(character: char) -> bool {
 /// can consume the typed value directly:
 /// <https://www.w3.org/TR/css-cascade-5/#computed>.
 pub(crate) fn project_line_height(style: &mut ComputedStyle) {
-    let (line_height, multiplier, is_normal) = style.line_height_value.projected(style.font_size);
+    let (line_height, multiplier, is_normal) =
+        style.line_height_value.clone().projected(style.font_size);
     style.line_height = line_height;
     style.line_height_multiplier = multiplier;
     style.line_height_is_normal = is_normal;

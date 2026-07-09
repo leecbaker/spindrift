@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct PdfTextRun<'a> {
     pub(super) document_font_id: usize,
+    pub(super) actual_text: Option<&'a str>,
     pub(super) x_offset: f32,
     pub(super) y_offset: f32,
     pub(super) text_matrix: RenderedTextMatrix,
@@ -20,6 +21,7 @@ pub(super) fn pdf_text_runs(
         }
         Some(PdfTextRun {
             document_font_id,
+            actual_text: run.actual_text.as_deref(),
             x_offset: run.x_offset,
             y_offset: run.y_offset,
             text_matrix: run.text_matrix,

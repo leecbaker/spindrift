@@ -51,6 +51,16 @@ impl AspectRatio {
         }
     }
 
+    /// Whether a non-replaced preferred ratio operates on content-box sizes.
+    ///
+    /// `auto && <ratio>` uses the specified ratio for a non-replaced box, but
+    /// CSS Sizing defines its calculations in the content box. A bare ratio,
+    /// by contrast, uses the box selected by `box-sizing`.
+    /// <https://drafts.csswg.org/css-sizing-4/#aspect-ratio>
+    pub(crate) const fn uses_content_box_for_non_replaced(self) -> bool {
+        self.auto && self.ratio.is_some()
+    }
+
     /// Returns the preferred ratio after resolving replaced-element fallback.
     ///
     /// CSS Sizing Level 4 defines `aspect-ratio:auto` on replaced elements as
@@ -81,6 +91,7 @@ pub(crate) struct TextTransform {
     pub(crate) case: TextTransformCase,
     pub(crate) full_width: bool,
     pub(crate) full_size_kana: bool,
+    pub(crate) math_auto: bool,
 }
 
 impl TextTransform {
@@ -88,6 +99,7 @@ impl TextTransform {
         case: TextTransformCase::None,
         full_width: false,
         full_size_kana: false,
+        math_auto: false,
     };
 }
 
@@ -191,6 +203,7 @@ pub(crate) enum MarkerContent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MarkerContentPart {
     Text(String),
+    Quote(GeneratedQuote),
     Counter {
         name: String,
         style: Option<ListStyleType>,
@@ -441,7 +454,29 @@ pub(crate) struct Contain {
     pub(crate) layout: bool,
     pub(crate) paint: bool,
     pub(crate) style: bool,
+    /// Suppress intrinsic contributions only on the element's logical inline
+    /// axis. This remains distinct from `size`, which suppresses both axes.
+    /// <https://drafts.csswg.org/css-contain-3/#valdef-contain-inline-size>
+    pub(crate) inline_size: bool,
     pub(crate) size: bool,
+}
+
+/// Computed physical fallback sizes supplied to a size-contained box.
+///
+/// CSS Sizing treats these as intrinsic contributions only while size
+/// containment suppresses real descendants.
+/// <https://drafts.csswg.org/css-sizing-4/#intrinsic-size-override>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ContainIntrinsicSize {
+    pub(crate) width: Option<ComputedLengthPercentage>,
+    pub(crate) height: Option<ComputedLengthPercentage>,
+}
+
+impl ContainIntrinsicSize {
+    pub(crate) const NONE: Self = Self {
+        width: None,
+        height: None,
+    };
 }
 
 impl Contain {
@@ -449,9 +484,33 @@ impl Contain {
         layout: false,
         paint: false,
         style: false,
+        inline_size: false,
         size: false,
     };
 }
+
+/// Computed CSS Containment query-container capability.
+///
+/// `inline-size` containers expose only their logical inline axis; `size`
+/// containers expose both axes. The layout pass additionally verifies that the
+/// element generates an eligible principal box before using this declaration
+/// as a query container.
+/// <https://www.w3.org/TR/css-contain-3/#container-type>
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ContainerType {
+    #[default]
+    Normal,
+    InlineSize,
+    Size,
+}
+
+/// Validated list of names advertised by a CSS query container.
+///
+/// The CSS-wide and `none` keywords do not name a container; parsing rejects
+/// them rather than carrying an invalid identifier into container selection.
+/// <https://www.w3.org/TR/css-contain-3/#container-name>
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ContainerNames(pub(crate) Vec<String>);
 
 /// Computed `content-visibility`.
 ///
@@ -502,114 +561,455 @@ pub(crate) struct WillChange {
 /// CSS Transforms Level 1 defines the 2D transform function list and applies it
 /// to transformable elements as a matrix at used-value time:
 /// <https://www.w3.org/TR/css-transforms-1/#transform-functions>.
+/// The coordinate system used by numeric CSS `matrix()` values.
+///
+/// `matrix()` has unitless linear terms and translations in the CSS transform
+/// coordinate system.  It must be projected explicitly into page paint or
+/// SVG source coordinates before applying it to geometry:
+/// <https://www.w3.org/TR/css-transforms-1/#two-d-transform-functions>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CssTransformSpace {}
+
+pub(crate) type CssTransform = euclid::Transform2D<f32, CssTransformSpace, CssTransformSpace>;
+/// The typed homogeneous matrix representation used by CSS 3D transforms.
+///
+/// Keeping the source and destination CSS coordinate spaces equal prevents a
+/// 3D transform from being accidentally applied to page paint coordinates
+/// before its CSS length units and y-axis convention are resolved.
+pub(crate) type CssTransform3D = euclid::Transform3D<f32, CssTransformSpace, CssTransformSpace>;
+
+/// A CSS `matrix(a, b, c, d, e, f)` function before its target coordinate
+/// system has been selected.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct CssAffineMatrix(CssTransform);
+
+impl CssAffineMatrix {
+    pub(crate) const fn new(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> Self {
+        Self(CssTransform::new(a, b, c, d, e, f))
+    }
+
+    /// Project this CSS matrix into `Space` using an explicit CSS-unit basis.
+    ///
+    /// Uniformly changing the coordinate unit leaves the linear coefficients
+    /// unchanged but scales the translation components. In matrix notation,
+    /// this is `S · M · S⁻¹`, where `S` is `css_unit_to_target`.
+    pub(crate) fn into_space<Space>(
+        self,
+        css_unit_to_target: euclid::Scale<f32, CssTransformSpace, Space>,
+    ) -> euclid::Transform2D<f32, Space, Space> {
+        euclid::Transform2D::new(
+            self.0.m11,
+            self.0.m12,
+            self.0.m21,
+            self.0.m22,
+            self.0.m31 * css_unit_to_target.0,
+            self.0.m32 * css_unit_to_target.0,
+        )
+    }
+}
+
+/// A CSS `matrix3d()` value before it is resolved into a paint-space matrix.
+///
+/// CSS serializes 4×4 matrices in column-major order, which is also the
+/// field order used by Euclid's homogeneous transform constructor:
+/// <https://drafts.csswg.org/css-transforms-2/#funcdef-transform-matrix3d>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct CssMatrix3D(pub(crate) CssTransform3D);
+
+impl CssMatrix3D {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new(
+        m11: f32,
+        m12: f32,
+        m13: f32,
+        m14: f32,
+        m21: f32,
+        m22: f32,
+        m23: f32,
+        m24: f32,
+        m31: f32,
+        m32: f32,
+        m33: f32,
+        m34: f32,
+        m41: f32,
+        m42: f32,
+        m43: f32,
+        m44: f32,
+    ) -> Self {
+        Self(CssTransform3D::new(
+            m11, m12, m13, m14, m21, m22, m23, m24, m31, m32, m33, m34, m41, m42, m43, m44,
+        ))
+    }
+}
+
+/// A two-dimensional CSS translation. Its components are lengths or
+/// percentages, rather than a paint vector, until the reference box is known.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CssTransformTranslation {
+    pub(crate) x: ComputedLengthPercentage,
+    pub(crate) y: ComputedLengthPercentage,
+}
+
+/// A three-dimensional translation. CSS forbids percentages in the z
+/// component, but retaining the computed length representation lets font and
+/// viewport units resolve at the same used-value boundary as x and y.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CssTransformTranslation3D {
+    pub(crate) x: ComputedLengthPercentage,
+    pub(crate) y: ComputedLengthPercentage,
+    pub(crate) z: ComputedLengthPercentage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CssScaleFactors {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CssScaleFactors3D {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) z: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CssRotate3D {
+    pub(crate) axis_x: f32,
+    pub(crate) axis_y: f32,
+    pub(crate) axis_z: f32,
+    pub(crate) angle: euclid::Angle<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CssSkewAngles {
+    pub(crate) x: euclid::Angle<f32>,
+    pub(crate) y: euclid::Angle<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TransformFunction {
-    Matrix(f32, f32, f32, f32, f32, f32),
-    Translate(ComputedLengthPercentage, ComputedLengthPercentage),
-    Scale(f32, f32),
-    Rotate(f32),
-    Skew(f32, f32),
+    Matrix(CssAffineMatrix),
+    Matrix3D(CssMatrix3D),
+    Translate(CssTransformTranslation),
+    Translate3D(CssTransformTranslation3D),
+    Scale(CssScaleFactors),
+    Scale3D(CssScaleFactors3D),
+    Rotate(euclid::Angle<f32>),
+    Rotate3D(CssRotate3D),
+    Skew(CssSkewAngles),
+    Perspective(ComputedLengthPercentage),
 }
 
 impl TransformFunction {
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
-        if let Self::Translate(x, y) = self {
-            x.resolve_font_metric_lengths(ch_advance);
-            y.resolve_font_metric_lengths(ch_advance);
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
+        match self {
+            Self::Translate(translation) => {
+                translation.x.resolve_font_metric_lengths(ch_advance);
+                translation.y.resolve_font_metric_lengths(ch_advance);
+            }
+            Self::Translate3D(translation) => {
+                translation.x.resolve_font_metric_lengths(ch_advance);
+                translation.y.resolve_font_metric_lengths(ch_advance);
+                translation.z.resolve_font_metric_lengths(ch_advance);
+            }
+            Self::Perspective(length) => length.resolve_font_metric_lengths(ch_advance),
+            _ => {}
         }
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        if let Self::Translate(x, y) = self {
-            x.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
-            y.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        match self {
+            Self::Translate(translation) => {
+                translation.x.requires_ch_advance() || translation.y.requires_ch_advance()
+            }
+            Self::Translate3D(translation) => {
+                translation.x.requires_ch_advance()
+                    || translation.y.requires_ch_advance()
+                    || translation.z.requires_ch_advance()
+            }
+            Self::Perspective(length) => length.requires_ch_advance(),
+            _ => false,
         }
     }
 }
 
 pub(crate) type TransformList = Vec<TransformFunction>;
 
-/// Computed `transform-origin` for the supported 2D transform model.
+/// Computed independent 2D transform properties.
 ///
-/// The third component is intentionally omitted until 3D transforms are
-/// modeled. Percentages resolve against the border box:
+/// CSS Transforms Level 2 composes these properties before the legacy
+/// `transform` list, in translate/rotate/scale order. Keeping the values
+/// distinct preserves that order through cascade and used-value resolution:
+/// <https://drafts.csswg.org/css-transforms-2/#individual-transforms>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct IndividualTransforms {
+    pub(crate) translate: Option<CssTransformTranslation>,
+    pub(crate) rotate: Option<euclid::Angle<f32>>,
+    pub(crate) scale: Option<CssScaleFactors>,
+}
+
+impl IndividualTransforms {
+    pub(crate) const NONE: Self = Self {
+        translate: None,
+        rotate: None,
+        scale: None,
+    };
+
+    pub(crate) fn is_none(&self) -> bool {
+        self.translate.is_none() && self.rotate.is_none() && self.scale.is_none()
+    }
+
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.translate.as_ref().is_some_and(|translation| {
+            translation.x.requires_ch_advance() || translation.y.requires_ch_advance()
+        })
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
+        if let Some(translation) = &mut self.translate {
+            translation.x.resolve_font_metric_lengths(ch_advance);
+            translation.y.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+}
+
+/// Computed `transform-origin`, including its absolute z component.
+///
+/// Percentages resolve against the selected two-dimensional reference box;
+/// CSS Transforms forbids percentages for the z component:
 /// <https://www.w3.org/TR/css-transforms-1/#transform-origin-property>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TransformOrigin {
     pub(crate) x: ComputedLengthPercentage,
     pub(crate) y: ComputedLengthPercentage,
+    pub(crate) z: ComputedLengthPercentage,
+}
+
+/// Whether the back-facing side of a flattened 3D transform is painted.
+/// <https://drafts.csswg.org/css-transforms-2/#backface-visibility-property>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackfaceVisibility {
+    Visible,
+    Hidden,
+}
+
+/// Reference box selected for CSS transform percentages and `transform-origin`.
+///
+/// HTML boxes use their border box unless `content-box` is explicitly selected.
+/// SVG-specific boxes are retained in the computed value so the SVG scene
+/// adapter can resolve them from its own geometry.
+/// <https://drafts.csswg.org/css-transforms-1/#transform-box-property>
+#[allow(
+    clippy::enum_variant_names,
+    reason = "CSS syntax defines each transform-box keyword with the `-box` suffix."
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransformBox {
+    ContentBox,
+    BorderBox,
+    FillBox,
+    StrokeBox,
+    ViewBox,
+}
+
+impl TransformBox {
+    /// CSS Transforms' initial `view-box` behaves as `border-box` for an HTML
+    /// layout box, which has no SVG viewport.
+    pub(crate) const INITIAL: Self = Self::ViewBox;
+
+    pub(crate) const fn html_reference_is_content_box(self) -> bool {
+        matches!(self, Self::ContentBox)
+    }
+}
+
+/// Computed CSS Images view box for a replaced object. The rectangle remains
+/// source-relative until it is resolved against an image's natural size.
+/// <https://drafts.csswg.org/css-images-5/#the-object-view-box-property>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ObjectViewBox {
+    None,
+    Inset {
+        top: ComputedLengthPercentage,
+        right: ComputedLengthPercentage,
+        bottom: ComputedLengthPercentage,
+        left: ComputedLengthPercentage,
+        radii: Option<BorderRadius>,
+    },
+    Xywh {
+        x: ComputedLengthPercentage,
+        y: ComputedLengthPercentage,
+        width: ComputedLengthPercentage,
+        height: ComputedLengthPercentage,
+        radii: Option<BorderRadius>,
+    },
+    Rect {
+        top: ComputedLengthPercentage,
+        right: ComputedLengthPercentage,
+        bottom: ComputedLengthPercentage,
+        left: ComputedLengthPercentage,
+    },
+}
+
+impl ObjectViewBox {
+    pub(crate) const NONE: Self = Self::None;
+
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        let requires = |value: &ComputedLengthPercentage| value.requires_ch_advance();
+        match self {
+            Self::None => false,
+            Self::Inset {
+                top,
+                right,
+                bottom,
+                left,
+                radii,
+            } => {
+                requires(top)
+                    || requires(right)
+                    || requires(bottom)
+                    || requires(left)
+                    || radii
+                        .as_ref()
+                        .is_some_and(BorderRadius::requires_ch_advance)
+            }
+            Self::Rect {
+                top,
+                right,
+                bottom,
+                left,
+            } => requires(top) || requires(right) || requires(bottom) || requires(left),
+            Self::Xywh {
+                x,
+                y,
+                width,
+                height,
+                radii,
+            } => {
+                requires(x)
+                    || requires(y)
+                    || requires(width)
+                    || requires(height)
+                    || radii
+                        .as_ref()
+                        .is_some_and(BorderRadius::requires_ch_advance)
+            }
+        }
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
+        let resolve =
+            |value: &mut ComputedLengthPercentage| value.resolve_font_metric_lengths(ch_advance);
+        match self {
+            Self::None => {}
+            Self::Inset {
+                top,
+                right,
+                bottom,
+                left,
+                radii,
+            } => {
+                resolve(top);
+                resolve(right);
+                resolve(bottom);
+                resolve(left);
+                if let Some(radii) = radii {
+                    radii.resolve_font_metric_lengths(ch_advance);
+                }
+            }
+            Self::Rect {
+                top,
+                right,
+                bottom,
+                left,
+            } => {
+                resolve(top);
+                resolve(right);
+                resolve(bottom);
+                resolve(left);
+            }
+            Self::Xywh {
+                x,
+                y,
+                width,
+                height,
+                radii,
+            } => {
+                resolve(x);
+                resolve(y);
+                resolve(width);
+                resolve(height);
+                if let Some(radii) = radii {
+                    radii.resolve_font_metric_lengths(ch_advance);
+                }
+            }
+        }
+    }
 }
 
 impl TransformOrigin {
     pub(crate) const INITIAL: Self = Self {
-        x: ComputedLengthPercentage {
-            length: layout_pt(0.0),
-            percent: 0.5,
-            has_percentage: true,
-            ch: 0.0,
-            vw: 0.0,
-            vh: 0.0,
-            vmin: 0.0,
-            vmax: 0.0,
-            vi: 0.0,
-            vb: 0.0,
-            math: None,
-        },
-        y: ComputedLengthPercentage {
-            length: layout_pt(0.0),
-            percent: 0.5,
-            has_percentage: true,
-            ch: 0.0,
-            vw: 0.0,
-            vh: 0.0,
-            vmin: 0.0,
-            vmax: 0.0,
-            vi: 0.0,
-            vb: 0.0,
-            math: None,
-        },
+        x: ComputedLengthPercentage::from_percent(0.5),
+        y: ComputedLengthPercentage::from_percent(0.5),
+        z: ComputedLengthPercentage::ZERO,
     };
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.x.resolve_font_metric_lengths(ch_advance);
         self.y.resolve_font_metric_lengths(ch_advance);
+        self.z.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.x.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.y.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.x.requires_ch_advance() || self.y.requires_ch_advance() || self.z.requires_ch_advance()
+    }
+
+    /// Resolve this CSS transform origin against a page-local transform
+    /// reference box.
+    ///
+    /// CSS physical y coordinates start at the top edge, while `PaintPoint`
+    /// uses PDF's bottom-left coordinate system.  The conversion belongs at
+    /// this boundary so every transform function receives a paint-space
+    /// origin.
+    /// <https://www.w3.org/TR/css-transforms-1/#transform-origin-property>
+    pub(crate) fn resolve_against_paint_rect(
+        self,
+        border_box: crate::PaintRect,
+    ) -> crate::PaintPoint {
+        crate::PaintPoint::new(
+            border_box.origin.x
+                + self
+                    .x
+                    .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                        border_box.size.width,
+                    )))
+                    .map(layout_points)
+                    .unwrap_or(0.0),
+            border_box.origin.y + border_box.size.height
+                - self
+                    .y
+                    .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                        border_box.size.height,
+                    )))
+                    .map(layout_points)
+                    .unwrap_or(0.0),
+        )
+    }
+
+    /// Resolve the complete three-dimensional origin in paint coordinates.
+    pub(crate) fn resolve_3d_against_paint_rect(
+        self,
+        border_box: crate::PaintRect,
+    ) -> euclid::Point3D<f32, crate::document::PaintSpace> {
+        let z = self
+            .z
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(0.0)))
+            .map(layout_points)
+            .unwrap_or(0.0);
+        let xy = self.resolve_against_paint_rect(border_box);
+        euclid::Point3D::new(xy.x, xy.y, z)
     }
 }
 
@@ -645,8 +1045,20 @@ pub(crate) enum Clear {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PageBreak {
     Auto,
+    /// Generic `avoid` value from CSS Break, applying to every fragmentation context.
+    ///
+    /// <https://www.w3.org/TR/css-break-3/#valdef-break-before-avoid>.
     Avoid,
+    /// Page-specific `avoid-page` value, including legacy `page-break-*` avoids.
+    ///
+    /// <https://www.w3.org/TR/css-break-3/#valdef-break-before-avoid-page>.
+    AvoidPage,
+    /// Column-specific `avoid-column` value.
+    ///
+    /// <https://www.w3.org/TR/css-break-3/#valdef-break-before-avoid-column>.
+    AvoidColumn,
     Page,
+    Column,
     Left,
     Right,
     Recto,
@@ -654,6 +1066,12 @@ pub(crate) enum PageBreak {
 }
 
 impl PageBreak {
+    /// Return whether this value forces a page fragmentainer break.
+    ///
+    /// CSS Break has forced break values for multiple fragmentation contexts.
+    /// Quire's paged-media callers use this page-specific predicate so
+    /// `break-before: column` does not accidentally become a page break:
+    /// <https://www.w3.org/TR/css-break-3/#forced-breaks>.
     pub(crate) fn is_forced(self) -> bool {
         matches!(
             self,
@@ -661,8 +1079,17 @@ impl PageBreak {
         )
     }
 
+    /// Return whether this value avoids page fragmentation.
+    ///
+    /// `avoid-column` is intentionally excluded so page layout does not keep
+    /// content together for a column-only constraint:
+    /// <https://www.w3.org/TR/css-break-3/#break-between>.
     pub(crate) fn avoids_page(self) -> bool {
-        matches!(self, Self::Avoid)
+        matches!(self, Self::Avoid | Self::AvoidPage)
+    }
+
+    pub(crate) fn avoids_column(self) -> bool {
+        matches!(self, Self::Avoid | Self::AvoidColumn)
     }
 }
 
@@ -981,4 +1408,89 @@ pub(crate) struct ElementSignature {
     pub html_direction: Option<Direction>,
     pub resolved_direction: Option<Direction>,
     pub resolved_language: ResolvedLanguage,
+}
+
+impl ResolveViewportLengths for TransformFunction {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        match self {
+            Self::Translate(translation) => {
+                translation.x.resolve_viewport_lengths(basis);
+                translation.y.resolve_viewport_lengths(basis);
+            }
+            Self::Translate3D(translation) => {
+                translation.x.resolve_viewport_lengths(basis);
+                translation.y.resolve_viewport_lengths(basis);
+                translation.z.resolve_viewport_lengths(basis);
+            }
+            Self::Perspective(length) => length.resolve_viewport_lengths(basis),
+            _ => {}
+        }
+    }
+}
+
+impl ResolveViewportLengths for IndividualTransforms {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        if let Some(translation) = &mut self.translate {
+            translation.x.resolve_viewport_lengths(basis);
+            translation.y.resolve_viewport_lengths(basis);
+        }
+    }
+}
+
+impl ResolveViewportLengths for ObjectViewBox {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        let resolve = |value: &mut ComputedLengthPercentage| value.resolve_viewport_lengths(basis);
+        match self {
+            Self::None => {}
+            Self::Inset {
+                top,
+                right,
+                bottom,
+                left,
+                radii,
+            } => {
+                resolve(top);
+                resolve(right);
+                resolve(bottom);
+                resolve(left);
+                if let Some(radii) = radii {
+                    radii.resolve_viewport_lengths(basis);
+                }
+            }
+            Self::Rect {
+                top,
+                right,
+                bottom,
+                left,
+            } => {
+                resolve(top);
+                resolve(right);
+                resolve(bottom);
+                resolve(left);
+            }
+            Self::Xywh {
+                x,
+                y,
+                width,
+                height,
+                radii,
+            } => {
+                resolve(x);
+                resolve(y);
+                resolve(width);
+                resolve(height);
+                if let Some(radii) = radii {
+                    radii.resolve_viewport_lengths(basis);
+                }
+            }
+        }
+    }
+}
+
+impl ResolveViewportLengths for TransformOrigin {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.x.resolve_viewport_lengths(basis);
+        self.y.resolve_viewport_lengths(basis);
+        self.z.resolve_viewport_lengths(basis);
+    }
 }

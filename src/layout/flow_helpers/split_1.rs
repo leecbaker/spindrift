@@ -89,7 +89,7 @@ impl<'a> DomStyleResolver<'a> {
         ancestors: &[ElementSignature],
     ) -> ComputedStyle {
         let inheritance_source = parent.cloned().unwrap_or_else(ComputedStyle::initial);
-        let parent_ch_advance = self.font_system.ch_advance(&inheritance_source);
+        let mut parent_ch_advance = css::fallback_ch_advance_for_style(&inheritance_source);
         let mut style = style_for_layout_element_with_parent_ch_advance(
             element,
             signature.clone(),
@@ -98,8 +98,22 @@ impl<'a> DomStyleResolver<'a> {
             ancestors,
             parent_ch_advance,
         );
-        let pseudo_parent_ch_advance = self.font_system.ch_advance(&style);
+        if style
+            .deferred_font_size
+            .requires_parent_ch_advance(inheritance_source.font_size)
+        {
+            parent_ch_advance = self.font_system.ch_advance(&inheritance_source);
+            style = style_for_layout_element_with_parent_ch_advance(
+                element,
+                signature.clone(),
+                stylesheets,
+                parent,
+                ancestors,
+                parent_ch_advance,
+            );
+        }
         let signature = layout_element_signature(element, signature, parent);
+        let pseudo_parent_ch_advance = css::fallback_ch_advance_for_style(&style);
         css::apply_pseudo_rules_with_parent_ch_advance(
             &mut style,
             &signature,
@@ -107,6 +121,16 @@ impl<'a> DomStyleResolver<'a> {
             ancestors,
             pseudo_parent_ch_advance,
         );
+        if style.pseudo_styles_require_parent_ch_advance() {
+            let pseudo_parent_ch_advance = self.font_system.ch_advance(&style);
+            css::apply_pseudo_rules_with_parent_ch_advance(
+                &mut style,
+                &signature,
+                stylesheets,
+                ancestors,
+                pseudo_parent_ch_advance,
+            );
+        }
         style
     }
 }
@@ -276,21 +300,6 @@ pub(in crate::layout) fn inline_text_from_formatting_boxes(
     text
 }
 
-/// Returns the first and last effective CSS `page` values for a box subtree.
-///
-/// CSS Paged Media defines named page groups from the `page` property at class
-/// A break boundaries. WeasyPrint models this with start/end page values for
-/// each formatting box; this helper mirrors that approach for our normalized
-/// box tree:
-/// <https://www.w3.org/TR/css-page-3/#using-named-pages>.
-pub(in crate::layout) fn page_values_from_style_and_children(
-    style: &ComputedStyle,
-    child_boxes: &[box_tree::FormattingBox<'_>],
-) -> (Option<String>, Option<String>) {
-    let ((start, _), (end, _)) = page_value_sources_from_style_and_children(style, child_boxes);
-    (start, end)
-}
-
 /// Returns first/last CSS `page` values with whether the value was specified.
 ///
 /// CSS Paged Media's `auto` page value can explicitly end an ancestor named
@@ -311,43 +320,31 @@ pub(in crate::layout) fn page_value_sources_from_style_and_children(
     if style.display.is_flex() {
         return (start, end);
     }
-    let normal_flow_children = child_boxes
+    // Only child boxes to which `page` applies can propagate start/end page
+    // values. Formatting whitespace can generate a normal-flow anonymous
+    // box, but it does not create a class-A break point and must not mask the
+    // first block-level child's page value.
+    // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+    let mut normal_flow_children = child_boxes
         .iter()
-        .filter(|child| formatting_box_is_in_normal_flow(child))
-        .collect::<Vec<_>>();
-    if let Some(first) = normal_flow_children.first() {
-        let child_start = formatting_box_page_value_sources(first).0;
-        if child_start.1 {
-            start = child_start;
-        }
+        .filter(|child| formatting_box_is_page_value_participant(child));
+    let Some(first) = normal_flow_children.next() else {
+        return (start, end);
+    };
+    let first_sources = formatting_box_page_value_sources(first);
+    if first_sources.0.1 {
+        start = first_sources.0.clone();
     }
-    if let Some(last) = normal_flow_children.last() {
-        let child_end = formatting_box_page_value_sources(last).1;
-        if child_end.1 {
-            end = child_end;
-        }
+    // A single normal-flow child supplies both boundaries. Compute its paired
+    // summary once: recursively querying it separately for start and end
+    // would revisit the same sole-child chain twice at every depth.
+    let last_sources = normal_flow_children
+        .next_back()
+        .map(formatting_box_page_value_sources)
+        .unwrap_or(first_sources);
+    if last_sources.1.1 {
+        end = last_sources.1;
     }
-    (start, end)
-}
-
-/// Returns the first and last effective CSS `page` values for formatting boxes.
-///
-/// Parent boxes use the first and last in-flow child values to decide whether
-/// a class A page boundary is needed between siblings:
-/// <https://www.w3.org/TR/css-page-3/#using-named-pages>.
-pub(in crate::layout) fn formatting_boxes_page_values(
-    child_boxes: &[box_tree::FormattingBox<'_>],
-) -> (Option<String>, Option<String>) {
-    let normal_flow_children = child_boxes
-        .iter()
-        .filter(|child| formatting_box_is_in_normal_flow(child))
-        .collect::<Vec<_>>();
-    let start = normal_flow_children
-        .first()
-        .and_then(|child| formatting_box_page_values(child).0);
-    let end = normal_flow_children
-        .last()
-        .and_then(|child| formatting_box_page_values(child).1);
     (start, end)
 }
 
@@ -398,18 +395,53 @@ pub(in crate::layout) fn formatting_box_page_value_sources(
     }
 }
 
+/// Whether a formatting box can contribute a propagated start/end `page`
+/// value to its parent.
+///
+/// CSS Paged Media propagates values only from child boxes to which `page`
+/// applies. Anonymous wrappers generated solely around formatting whitespace or
+/// out-of-flow descendants create no class-A boundary, so they are transparent
+/// for this purpose:
+/// <https://www.w3.org/TR/css-page-3/#using-named-pages>.
+pub(in crate::layout) fn formatting_box_is_page_value_participant(
+    box_: &box_tree::FormattingBox<'_>,
+) -> bool {
+    if !formatting_box_is_in_normal_flow(box_) {
+        return false;
+    }
+    match box_ {
+        box_tree::FormattingBox::Text(box_) => {
+            !(box_.text.is_empty()
+                || (box_.style.white_space.collapses_spaces()
+                    && box_.text.chars().all(is_css_collapsible_whitespace)))
+        }
+        box_tree::FormattingBox::AnonymousBlock(box_) => box_
+            .children
+            .iter()
+            .any(formatting_box_is_page_value_participant),
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
+            .children
+            .iter()
+            .any(formatting_box_is_page_value_participant),
+        _ => !formatting_box_can_only_create_phantom_line_boxes(box_),
+    }
+}
+
 /// Resolves a child boundary page value in its parent page scope.
 ///
 /// At CSS Paged Media class-A sibling boundaries, an explicitly specified
-/// child `page` value wins. If the child omitted `page`, it remains in the
-/// parent's named page group; if it specified `page:auto`, the source flag is
-/// true and the returned value stays `None`:
+/// child `page` value wins. An explicit `page:auto` resolves to the nearest
+/// non-auto ancestor, which is the immediate parent when it has a named page;
+/// an omitted value follows that same parent page group:
 /// <https://www.w3.org/TR/css-page-3/#using-named-pages>.
 pub(in crate::layout) fn page_boundary_name_in_parent_scope(
     source: (Option<String>, bool),
     parent_style: &ComputedStyle,
 ) -> Option<String> {
     if source.1 {
+        // Preserve explicit `page:auto`: it clears the parent group instead
+        // of falling back to the parent's named page value.
+        // <https://www.w3.org/TR/css-page-3/#using-named-pages>
         source.0
     } else if parent_style.page_name_specified {
         parent_style.page_name.clone()
@@ -504,7 +536,7 @@ pub(in crate::layout) fn formatting_box_has_inline_content(
     child_boxes.iter().any(|child| match child {
         _ if box_tree::is_out_of_flow_box(child) => true,
         box_tree::FormattingBox::Text(box_) => {
-            !normalized_text_for_style(&box_.text, &box_.style).is_empty()
+            inline_text_has_non_phantom_content(&box_.text, &box_.style)
         }
         box_tree::FormattingBox::Inline(box_) => {
             // Inline boxes with generated pseudo content must keep the rich
@@ -514,8 +546,15 @@ pub(in crate::layout) fn formatting_box_has_inline_content(
             // with owned inline-axis margin, border, or padding still generate
             // inline boxes whose decorations and advance must be preserved:
             // <https://www.w3.org/TR/CSS22/box.html#inline-boxes>.
-            box_.style.before_style.is_some()
-                || box_.style.after_style.is_some()
+            box_.style
+                .before_style
+                .as_deref()
+                .is_some_and(|style| style.content.is_generated())
+                || box_
+                    .style
+                    .after_style
+                    .as_deref()
+                    .is_some_and(|style| style.content.is_generated())
                 || box_.style.content.is_generated()
                 || box_.style.float != Float::None
                 || inline_box_fragment_has_owned_inline_edge(&box_.style, box_.fragment_edges)
@@ -530,6 +569,25 @@ pub(in crate::layout) fn formatting_box_has_inline_content(
         | box_tree::FormattingBox::Table(_)
         | box_tree::FormattingBox::Flex(_) => false,
     })
+}
+
+/// Return whether text contributes a line box after CSS white-space trimming.
+///
+/// A run made solely of collapsible space at an otherwise empty block edge
+/// does not create a line box. Keeping that distinction here lets margin
+/// adjacency use the same content test as inline collection without hiding
+/// preserved whitespace or non-space inline content.
+/// <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
+pub(in crate::layout) fn inline_text_has_non_phantom_content(
+    text: &str,
+    style: &ComputedStyle,
+) -> bool {
+    let text = normalized_text_for_style(text, style);
+    if style.white_space.collapses_spaces() {
+        !crate::text::trim_css_collapsible_whitespace(&text).is_empty()
+    } else {
+        !text.is_empty()
+    }
 }
 
 fn inline_box_fragment_has_owned_inline_edge(
@@ -791,25 +849,33 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
 /// Returns whether a block container's start edge can adjoin child margins.
 ///
 /// CSS 2.2 allows parent/child vertical margin collapse through ordinary flow
-/// block boxes without border, padding, inline content, or fixed height. A
-/// non-auto `min-height` only prevents a last child's bottom margin from
-/// collapsing through when that margin also adjoins the parent's top edge; the
-/// final used min/max-height constraint is applied after child layout.
+/// block boxes without border, padding, or inline content. A specified
+/// `height` does not prevent the block-start margins from adjoining; it only
+/// prevents a last child's block-end margin from collapsing through the
+/// parent. A non-auto `min-height` similarly matters to the block-end case.
+/// Layout and paint containment establish independent formatting contexts, so
+/// their principal boxes never adjoin descendant margins.
 ///
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
 /// <https://www.w3.org/TR/CSS22/visudet.html#min-max-heights>
 /// <https://www.w3.org/TR/css-display-3/#valdef-display-flow-root>
+/// <https://www.w3.org/TR/css-contain-1/#containment-layout>
 pub(in crate::layout) fn can_collapse_block_start_margin(
     style: &ComputedStyle,
     border_widths: css::Edges,
     has_direct_inline_content: bool,
+    used_overflow: css::Overflow,
 ) -> bool {
     style.display.is_flow()
+        && !style.display.establishes_block_formatting_context()
+        && !style_establishes_multicol_formatting_context(style)
+        && !style.contain.layout
+        && !style.contain.paint
+        && style.float == Float::None
         && !has_direct_inline_content
-        && style.overflow == css::Overflow::Visible
+        && used_overflow == css::Overflow::Visible
         && style.padding.top == 0.0
         && border_widths.top == 0.0
-        && has_auto_height(style)
 }
 
 /// Returns whether a block container's end edge can adjoin child margins.
@@ -821,17 +887,39 @@ pub(in crate::layout) fn can_collapse_block_start_margin(
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
 /// <https://www.w3.org/TR/CSS22/visudet.html#min-max-heights>
 /// <https://www.w3.org/TR/css-display-3/#valdef-display-flow-root>
+/// <https://www.w3.org/TR/css-contain-1/#containment-layout>
 pub(in crate::layout) fn can_collapse_block_end_margin(
     style: &ComputedStyle,
     border_widths: css::Edges,
     has_direct_inline_content: bool,
+    used_overflow: css::Overflow,
 ) -> bool {
     style.display.is_flow()
+        && !style.display.establishes_block_formatting_context()
+        && !style_establishes_multicol_formatting_context(style)
+        && !style.contain.layout
+        && !style.contain.paint
+        && style.float == Float::None
         && !has_direct_inline_content
-        && style.overflow == css::Overflow::Visible
+        && used_overflow == css::Overflow::Visible
         && style.padding.bottom == 0.0
         && border_widths.bottom == 0.0
         && has_auto_height(style)
+}
+
+/// Returns whether the computed column properties establish a multi-column
+/// formatting context.
+///
+/// A multicol container establishes an independent formatting context, so its
+/// contents do not participate in margin collapsing with the container even
+/// when its inner display type is ordinary `flow`.
+/// <https://www.w3.org/TR/css-multicol-1/#multicol-container>
+pub(in crate::layout) fn style_establishes_multicol_formatting_context(
+    style: &ComputedStyle,
+) -> bool {
+    style.column_count.is_some()
+        || matches!(style.column_width, css::ComputedColumnWidth::Length(_))
+        || matches!(style.column_height, css::ComputedColumnHeight::Length(_))
 }
 
 /// Returns whether a child participates in normal block flow for margin collapse.
@@ -860,23 +948,41 @@ pub(in crate::layout) fn is_collapsible_block_child(
 
 /// Returns whether a normal-flow block-level child's outer margins can adjoin siblings.
 ///
-/// CSS 2.2 collapses adjoining vertical margins between in-flow block-level
-/// siblings. A flex container establishes its own formatting context, so its
-/// margins do not collapse with its contents, but its outer margins still
-/// participate as a normal-flow block-level sibling:
+/// CSS margin collapse applies only to adjoining block-flow boxes. Grid
+/// containers establish an independent formatting context, so their outer
+/// block margins remain separate from adjacent normal-flow siblings. This is
+/// also what keeps a sequence of scrollable Grid containers from losing each
+/// later block-start margin during parent-flow preprocessing:
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins> and
-/// <https://www.w3.org/TR/css-flexbox-1/#flex-containers>.
+/// <https://www.w3.org/TR/css-grid-1/#grid-containers>.
 pub(in crate::layout) fn is_sibling_margin_collapsible_block_child(
     element: &Element,
     style: &ComputedStyle,
 ) -> bool {
-    is_normal_block_flow_child(element, style) && !is_replaced_element(element)
+    is_normal_block_flow_child(element, style)
+        && !style.display.is_grid()
+        && !is_replaced_element(element)
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct RelativeOffset {
-    pub(in crate::layout) x: f32,
-    pub(in crate::layout) y: f32,
+    pub(in crate::layout) vector: ContainerVector,
+}
+
+impl RelativeOffset {
+    pub(in crate::layout) fn zero() -> Self {
+        Self {
+            vector: ContainerVector::zero(),
+        }
+    }
+
+    pub(in crate::layout) fn x(self) -> f32 {
+        self.vector.x
+    }
+
+    pub(in crate::layout) fn y(self) -> f32 {
+        self.vector.y
+    }
 }
 
 pub(in crate::layout) fn relative_position_offset(
@@ -884,7 +990,7 @@ pub(in crate::layout) fn relative_position_offset(
     containing_block: ContainingBlock,
 ) -> RelativeOffset {
     if !matches!(style.position, Position::Relative | Position::Sticky) {
-        return RelativeOffset { x: 0.0, y: 0.0 };
+        return RelativeOffset::zero();
     }
     let left = used_inset_left(style, containing_block);
     let right = used_inset_right(style, containing_block);
@@ -896,7 +1002,63 @@ pub(in crate::layout) fn relative_position_offset(
     // vertically.
     let x = left.unwrap_or_else(|| -right.unwrap_or(0.0));
     let y = bottom.unwrap_or_else(|| -top.unwrap_or(0.0));
-    RelativeOffset { x, y }
+    RelativeOffset {
+        vector: ContainerVector::new(x, y),
+    }
+}
+
+impl<'a> LayoutBuilder<'a> {
+    /// Resolve a normal-flow box's relative-positioning offset.
+    ///
+    /// A flex or grid item's replayed formatting context has an already used
+    /// physical content box. Descendants in normal flow use that box for their
+    /// relative-position percentage bases, without treating it as an absolute
+    /// positioning containing block:
+    /// <https://www.w3.org/TR/css-position-3/#relative-positioning>.
+    pub(in crate::layout) fn normal_flow_relative_position_offset(
+        &self,
+        style: &ComputedStyle,
+    ) -> RelativeOffset {
+        let Some(containing_block) = self.normal_flow_relative_containing_blocks.last() else {
+            return relative_position_offset(style, self.current_containing_block());
+        };
+        if !matches!(style.position, Position::Relative | Position::Sticky) {
+            return RelativeOffset::zero();
+        }
+
+        let width_basis =
+            PercentageBasis::definite(containing_block.physical_content_width.content_box_length());
+        let height_basis = containing_block
+            .physical_content_height
+            .map(|height| PercentageBasis::definite(height.content_box_length()))
+            .unwrap_or_else(PercentageBasis::indefinite);
+        let left = used_length_percentage_or_auto_with_basis(
+            style.box_values.inset_left.clone(),
+            width_basis,
+        )
+        .map(|length| length.points());
+        let right = used_length_percentage_or_auto_with_basis(
+            style.box_values.inset_right.clone(),
+            width_basis,
+        )
+        .map(|length| length.points());
+        let top = used_length_percentage_or_auto_with_basis(
+            style.box_values.inset_top.clone(),
+            height_basis,
+        )
+        .map(|length| length.points());
+        let bottom = used_length_percentage_or_auto_with_basis(
+            style.box_values.inset_bottom.clone(),
+            height_basis,
+        )
+        .map(|length| length.points());
+        RelativeOffset {
+            vector: ContainerVector::new(
+                left.unwrap_or_else(|| -right.unwrap_or(0.0)),
+                bottom.unwrap_or_else(|| -top.unwrap_or(0.0)),
+            ),
+        }
+    }
 }
 
 pub(in crate::layout) fn has_later_normal_block_flow_child_with_font_metrics(

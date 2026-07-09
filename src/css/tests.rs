@@ -1,25 +1,49 @@
 use super::values::edge_all;
 use super::*;
-use crate::{PageMargins, PageSize, RenderOptions, layout_pt};
+use crate::css::page::page_style_for_declarations;
+use crate::{
+    LayoutSize, PageMargins, PageSize, RenderOptions,
+    units::{LayoutLength, layout_pt},
+};
 use std::collections::HashMap;
 
 fn flex_basis_length(value: ComputedLengthPercentage) -> ComputedFlexBasis {
-    ComputedFlexBasis::LengthPercentage(ComputedFlexBasisLength::new(value, false))
+    ComputedFlexBasis::LengthPercentage(ComputedFlexBasisLength::new(value))
 }
 
 fn flex_basis_percentage(value: ComputedLengthPercentage) -> ComputedFlexBasis {
-    ComputedFlexBasis::LengthPercentage(ComputedFlexBasisLength::new(value, true))
+    ComputedFlexBasis::LengthPercentage(ComputedFlexBasisLength::new(value))
+}
+
+#[test]
+fn nonnegative_fixed_length_clamp_preserves_layout_length_type() {
+    let clamped: LayoutLength = ComputedLengthPercentage::from_points(-3.0).length_max_zero();
+
+    assert_eq!(clamped, layout_pt(0.0));
+}
+
+#[test]
+fn baseline_shift_used_value_preserves_layout_length_type() {
+    let shift: LayoutLength =
+        BaselineShift::LengthPercentage(ComputedLengthPercentage::from_percent(0.5))
+            .length_percentage_shift(layout_pt(20.0));
+
+    assert_eq!(shift, layout_pt(10.0));
 }
 
 #[tokio::test]
-async fn applies_page_options() {
-    let css = Css::from_string("@page { size: 200px 100px; margin: 10px } p { font-size: 20px }");
+async fn stylesheet_options_do_not_eagerly_apply_page_rules() {
+    let css = Css::from_string("@page { size: 200vh 100vw; margin: 10vw } p { font-size: 20px }");
     let mut options = RenderOptions::default();
+    let initial_page_size = options.page_size;
+    let initial_page_margins = options.page_margins;
     apply_stylesheet_options(&css, &mut options);
-    assert_eq!(options.page_size.width(), 150.0);
-    assert_eq!(options.page_size.height(), 75.0);
-    assert_eq!(options.margin(), 7.5);
-    assert_eq!(options.page_margins, PageMargins::all_points(7.5));
+
+    // Page rules are page-context inputs, not global render options. Keeping
+    // the initial page box intact lets a viewport-based `@page` descriptor be
+    // resolved exactly once during layout.
+    assert_eq!(options.page_size, initial_page_size);
+    assert_eq!(options.page_margins, initial_page_margins);
     assert_eq!(options.font_size(), 15.0);
 }
 
@@ -49,12 +73,44 @@ async fn stylesheet_options_keep_metric_independent_font_defaults() {
 
 #[tokio::test]
 async fn page_size_one_length_creates_square_page() {
-    let css = Css::from_string("@page { size: 5in }");
-    let mut options = RenderOptions::default();
-    apply_stylesheet_options(&css, &mut options);
+    let stylesheet = parse_stylesheet(&Css::from_string("@page { size: 5in }"));
+    let size = page_size_from(&stylesheet.page_declarations, PageSize::A4_POINTS);
 
-    assert_eq!(options.page_size.width(), 360.0);
-    assert_eq!(options.page_size.height(), 360.0);
+    assert_eq!(size.width(), 360.0);
+    assert_eq!(size.height(), 360.0);
+}
+
+#[tokio::test]
+async fn page_size_viewport_units_use_the_initial_page_box() {
+    let base = PageSize::from_points(360.0, 216.0);
+    let stylesheet = parse_stylesheet(&Css::from_string("@page { size: 200vh 100vw }"));
+
+    // CSS Paged Media resolves viewport units in page descriptors before the
+    // authored page size replaces the default page box. WPT:
+    // css/css-page/page-size-017-print.tentative.html.
+    assert_eq!(
+        page_size_from(&stylesheet.page_declarations, base),
+        PageSize::from_points(432.0, 360.0)
+    );
+}
+
+#[tokio::test]
+async fn page_margin_viewport_units_use_the_initial_page_box() {
+    let initial = PageSize::from_points(360.0, 216.0);
+    let authored = PageSize::from_points(540.0, 432.0);
+    let stylesheet = parse_stylesheet(&Css::from_string("@page { margin: 0; margin-top: 20vw }"));
+    let style = page_style_for_declarations(&stylesheet.page_declarations);
+    let margins = page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style(
+        &stylesheet.page_declarations,
+        PageMargins::all_points(0.0),
+        authored,
+        initial,
+        Edges::ZERO,
+        layout_pt(6.0),
+        &style,
+    );
+
+    assert_eq!(margins.top(), 72.0);
 }
 
 #[tokio::test]
@@ -63,6 +119,15 @@ async fn page_size_auto_preserves_existing_page_size() {
     let base = PageSize::from_points(240.0, 120.0);
 
     assert_eq!(page_size_from(&stylesheet.page_declarations, base), base);
+}
+
+#[tokio::test]
+async fn zero_sized_page_descriptors_fall_back_to_the_initial_page_size() {
+    let base = PageSize::from_points(240.0, 120.0);
+    for value in ["0", "4in 0", "0 4in"] {
+        let stylesheet = parse_stylesheet(&Css::from_string(format!("@page {{ size: {value} }}")));
+        assert_eq!(page_size_from(&stylesheet.page_declarations, base), base);
+    }
 }
 
 #[tokio::test]
@@ -186,6 +251,28 @@ async fn page_margin_auto_resolves_against_page_width_and_height_descriptors() {
 }
 
 #[tokio::test]
+async fn percentage_page_area_resizes_an_overconstrained_size_descriptor() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@page { size: 500px; width: 40%; height: 60%; margin: 10%; }",
+    ));
+    let initial_page = PageSize::from_points(360.0, 216.0);
+    let page_size = page_size_from(&stylesheet.page_declarations, initial_page);
+    let page_style = page_style_for_declarations(&stylesheet.page_declarations);
+    let margins = page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style(
+        &stylesheet.page_declarations,
+        PageMargins::all_points(0.0),
+        page_size,
+        initial_page,
+        Edges::ZERO,
+        layout_pt(6.0),
+        &page_style,
+    );
+
+    assert_eq!(page_size, PageSize::from_points(225.0, 300.0));
+    assert_eq!(margins, PageMargins::all_points(37.5));
+}
+
+#[tokio::test]
 async fn page_margin_auto_edges_pin_specified_page_area() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "@page { size: 240pt 84pt; width: 144pt; height: 36pt; margin: auto; margin-top: 0; margin-left: 0 }",
@@ -229,6 +316,27 @@ async fn page_margins_can_resolve_to_negative_lengths() {
 }
 
 #[tokio::test]
+async fn page_margin_inherit_uses_document_root_margin() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@page { size: 6in; margin: 13px; margin: inherit }",
+    ));
+    let mut page_style = ComputedStyle::initial();
+    page_style.margin = edge_all(36.0);
+    apply_declarations(&mut page_style, &stylesheet.page_declarations);
+    let margins = page_margins_from_for_size_and_edges_with_ch_advance_and_page_context_style(
+        &stylesheet.page_declarations,
+        PageMargins::all_points(0.0),
+        PageSize::from_points(432.0, 432.0),
+        PageSize::from_points(360.0, 216.0),
+        Edges::ZERO,
+        layout_pt(6.0),
+        &page_style,
+    );
+
+    assert_eq!(margins, PageMargins::all_points(36.0));
+}
+
+#[tokio::test]
 async fn page_auto_margins_can_resolve_negative_for_oversized_page_area() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "@page { size: 225pt; width: 255pt; height: 255pt; margin: auto }",
@@ -264,6 +372,15 @@ async fn page_auto_margins_include_border_and_padding_in_width_equation() {
     assert_eq!(margins.right(), 20.0);
     assert_eq!(margins.top(), 20.0);
     assert_eq!(margins.bottom(), 20.0);
+}
+
+#[tokio::test]
+async fn page_border_shorthand_uses_medium_width_when_omitted() {
+    let stylesheet = parse_stylesheet(&Css::from_string("@page { border: solid }"));
+    let style = page_style_for_declarations(&stylesheet.page_declarations);
+
+    assert_eq!(style.border_styles.top, BorderStyle::Solid);
+    assert_eq!(style.border_widths, edge_all(2.25));
 }
 
 #[tokio::test]
@@ -312,18 +429,20 @@ async fn logical_page_margin_and_padding_map_through_vertical_writing_mode() {
 
 #[tokio::test]
 async fn applies_page_edge_margins_in_source_order() {
-    let css = Css::from_string(
+    let stylesheet = parse_stylesheet(&Css::from_string(
         "@page { size: letter; margin: .5in 1in .75in .25in; margin-left: .125in }",
+    ));
+    let size = page_size_from(&stylesheet.page_declarations, PageSize::A4_POINTS);
+    let margins = page_margins_from_for_size(
+        &stylesheet.page_declarations,
+        PageMargins::all_points(0.0),
+        size,
     );
-    let mut options = RenderOptions::default();
 
-    apply_stylesheet_options(&css, &mut options);
-
-    assert_eq!(options.page_margins.top(), 36.0);
-    assert_eq!(options.page_margins.right(), 72.0);
-    assert_eq!(options.page_margins.bottom(), 54.0);
-    assert_eq!(options.page_margins.left(), 9.0);
-    assert_eq!(options.margin(), 36.0);
+    assert_eq!(margins.top(), 36.0);
+    assert_eq!(margins.right(), 72.0);
+    assert_eq!(margins.bottom(), 54.0);
+    assert_eq!(margins.left(), 9.0);
 }
 
 #[tokio::test]
@@ -332,7 +451,10 @@ async fn parses_page_margin_boxes() {
         "@page { @bottom-right { content: \"Page \" counter(page); background-color: black } }",
     ));
 
-    let bottom_right = stylesheet.page_margin_boxes.get("bottom-right").unwrap();
+    let bottom_right = stylesheet.page_rules[0]
+        .margin_boxes
+        .get("bottom-right")
+        .unwrap();
     assert_eq!(
         bottom_right.get("content").map(String::as_str),
         Some("\"Page \" counter(page)")
@@ -375,9 +497,12 @@ async fn page_margin_at_rules_match_exact_names() {
          }",
     ));
 
-    let bottom_right = stylesheet.page_margin_boxes.get("bottom-right").unwrap();
-    let corner = stylesheet
-        .page_margin_boxes
+    let bottom_right = stylesheet.page_rules[0]
+        .margin_boxes
+        .get("bottom-right")
+        .unwrap();
+    let corner = stylesheet.page_rules[0]
+        .margin_boxes
         .get("bottom-right-corner")
         .unwrap();
     assert_eq!(
@@ -398,7 +523,7 @@ async fn page_margin_at_rules_match_exact_names() {
 #[tokio::test]
 async fn parses_invoice_page_margin_boxes_through_main_at_rule_parser() {
     let stylesheet = parse_stylesheet(
-        &Css::from_file_async("weasyprint-samples/invoice/invoice.css")
+        &Css::from_file("weasyprint-samples/invoice/invoice.css")
             .await
             .unwrap(),
     );
@@ -406,16 +531,16 @@ async fn parses_invoice_page_margin_boxes_through_main_at_rule_parser() {
     assert_eq!(stylesheet.page_rules.len(), 1);
     assert_eq!(stylesheet.page_rules[0].margin_boxes.len(), 2);
     assert_eq!(
-        stylesheet
-            .page_margin_boxes
+        stylesheet.page_rules[0]
+            .margin_boxes
             .get("bottom-left")
             .and_then(|declarations| declarations.get("content"))
             .map(String::as_str),
         Some("'♥ Thank you!'")
     );
     assert_eq!(
-        stylesheet
-            .page_margin_boxes
+        stylesheet.page_rules[0]
+            .margin_boxes
             .get("bottom-right")
             .and_then(|declarations| declarations.get("font-size"))
             .map(String::as_str),
@@ -424,19 +549,28 @@ async fn parses_invoice_page_margin_boxes_through_main_at_rule_parser() {
 }
 
 #[tokio::test]
-async fn cascades_page_margin_boxes_by_page_selector_specificity() {
+async fn parses_page_margin_box_page_selectors() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "@page { @top-left { content: \"base\"; color: red } }\
          @page :right { @top-left { content: \"right\" } }\
          @page :first { @top-left { content: \"first\"; color: blue } }",
     ));
 
-    let top_left = stylesheet.page_margin_boxes.get("top-left").unwrap();
-    assert_eq!(
-        top_left.get("content").map(String::as_str),
-        Some("\"first\"")
-    );
-    assert_eq!(top_left.get("color").map(String::as_str), Some("blue"));
+    let base = stylesheet.page_rules[0]
+        .margin_boxes
+        .get("top-left")
+        .unwrap();
+    let right = stylesheet.page_rules[1]
+        .margin_boxes
+        .get("top-left")
+        .unwrap();
+    let first = stylesheet.page_rules[2]
+        .margin_boxes
+        .get("top-left")
+        .unwrap();
+    assert_eq!(base.get("content").map(String::as_str), Some("\"base\""));
+    assert_eq!(right.get("content").map(String::as_str), Some("\"right\""));
+    assert_eq!(first.get("color").map(String::as_str), Some("blue"));
     assert_eq!(stylesheet.page_rules.len(), 3);
     assert_eq!(
         stylesheet.page_rules[1].selectors[0]
@@ -603,19 +737,16 @@ async fn important_page_context_layers_reverse_layer_order() {
 }
 
 #[tokio::test]
-async fn cascade_layers_apply_to_page_margin_boxes() {
+async fn parses_page_margin_box_layers() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "@layer base, theme;\
          @layer theme { @page { @top-left { content: \"theme\" } } }\
          @layer base { @page :first { @top-left { content: \"base\" } } }",
     ));
 
-    let top_left = stylesheet.page_margin_boxes.get("top-left").unwrap();
-
-    assert_eq!(
-        top_left.get("content").map(String::as_str),
-        Some("\"theme\"")
-    );
+    assert_eq!(stylesheet.page_rules.len(), 2);
+    assert_eq!(stylesheet.page_rules[0].layer_order, Some(1));
+    assert_eq!(stylesheet.page_rules[1].layer_order, Some(0));
 }
 
 #[tokio::test]
@@ -675,6 +806,190 @@ async fn media_comma_list_applies_when_one_query_matches() {
     );
 
     assert_eq!(style.color, Color::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn invalid_media_query_syntax_does_not_apply_when_negated() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { color: green } \
+         @media not and { p { color: red } } \
+         @media and { p { color: red } } \
+         @media not only { p { color: red } }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.color, Color::new(0, 128, 0));
+}
+
+#[tokio::test]
+async fn media_conditions_combine_boolean_features_and_general_enclosed_syntax() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { color: red } \
+         @media (width 500px) or (min-width: 0) { p { color: green } } \
+         @media ((not (monochrome)) and (color)) { p { color: blue } }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.color, Color::new(0, 0, 255));
+}
+
+#[test]
+fn media_or_condition_uses_the_valid_range_when_a_general_enclosed_term_is_false() {
+    let environment = MediaEnvironment::new(MediaType::Screen, CssViewportSize::new(800.0, 600.0));
+
+    assert!(crate::css::media_rule_applies_in_environment(
+        "(width 500px) or (min-width: 0)",
+        &environment,
+    ));
+}
+
+#[test]
+fn print_media_dimensions_match_the_renderer_viewport() {
+    let environment = MediaEnvironment::new(MediaType::Print, CssViewportSize::new(480.0, 288.0));
+
+    assert!(crate::css::media_rule_applies_in_environment(
+        "(min-width: 4in) and (max-width: 5in) and (min-height: 2in) and (max-height: 3in)",
+        &environment,
+    ));
+}
+
+#[tokio::test]
+async fn matching_print_media_rule_overrides_earlier_background_shorthand() {
+    let environment = MediaEnvironment::new(MediaType::Print, CssViewportSize::new(480.0, 288.0));
+    let stylesheet = parse_stylesheet_with_media_environment(
+        &Css::from_string(
+            "body { background: red; } \
+             /* An explanatory comment; its semicolon is not a rule delimiter. */ \
+             @media (min-width: 4in) and (max-width: 5in) and \
+                    (min-height: 2in) and (max-height: 3in) { \
+               body { background: green; } \
+             }",
+        ),
+        &environment,
+    );
+    let style = style_for_element_with_signature(
+        ElementSignature::new("body", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.background_color, Some(Color::new(0, 128, 0)));
+}
+
+#[tokio::test]
+async fn screen_media_environment_applies_a_valid_or_condition() {
+    let environment = MediaEnvironment::new(MediaType::Screen, CssViewportSize::new(800.0, 600.0));
+    let stylesheet = parse_stylesheet_with_media_environment(
+        &Css::from_string(
+            "p { color: red } @media (width 500px) or (min-width: 0) { p { color: green } }",
+        ),
+        &environment,
+    );
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.color, Color::new(0, 128, 0));
+}
+
+#[test]
+fn empty_media_query_list_applies_to_all_media() {
+    assert!(crate::css::media_rule_applies_in_environment(
+        "",
+        &MediaEnvironment::default(),
+    ));
+}
+
+#[tokio::test]
+async fn invalid_known_media_feature_values_do_not_become_true_through_not() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { color: green } \
+         @media (color-gamut: dci-p3), not (color-gamut: rec-2020) { p { color: red } }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.color, Color::new(0, 128, 0));
+}
+
+#[tokio::test]
+async fn inherited_background_origin_preserves_the_child_image_layers() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "#parent { background-origin: content-box } \
+         #child { background-image: url(image.png); background-origin: inherit }",
+    ));
+    let parent_signature =
+        ElementSignature::new("div", HashMap::from([("id".into(), "parent".into())]));
+    let parent = style_for_element_with_signature(
+        parent_signature.clone(),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let child = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::from([("id".into(), "child".into())])),
+        None,
+        &[stylesheet],
+        Some(&parent),
+        &[parent_signature],
+    );
+
+    assert_eq!(child.background_origin, BackgroundBox::Content);
+    assert!(child.background_image.is_some());
+    assert!(child.background_layers[0].image.is_some());
+    assert_eq!(child.background_layers[0].origin, BackgroundBox::Content);
+}
+
+#[tokio::test]
+async fn inherited_background_clip_applies_to_a_color_only_child() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "#parent { background-clip: content-box } \
+         #child { background-clip: inherit; background-color: red }",
+    ));
+    let parent_signature =
+        ElementSignature::new("div", HashMap::from([("id".into(), "parent".into())]));
+    let parent = style_for_element_with_signature(
+        parent_signature.clone(),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let child = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::from([("id".into(), "child".into())])),
+        None,
+        &[stylesheet],
+        Some(&parent),
+        &[parent_signature],
+    );
+
+    assert_eq!(parent.background_clip, BackgroundBox::Content);
+    assert_eq!(child.background_clip, BackgroundBox::Content);
+    assert_eq!(child.background_color_clip(), BackgroundBox::Content);
 }
 
 #[tokio::test]
@@ -1767,7 +2082,7 @@ async fn form_state_pseudo_classes_use_html_disabled_and_local_constraint_state(
 async fn typographic_pseudo_element_rules_create_computed_style_slots() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "p::first-line { color: red; display: none }\
-         p::first-letter { color: blue; display: none; margin-left: 10px }",
+         p::first-letter { color: blue; display: none; margin-left: 10px; initial-letter: 2 }",
     ));
     let style = style_for_element_with_signature(
         ElementSignature::new("p", HashMap::new()),
@@ -1794,6 +2109,10 @@ async fn typographic_pseudo_element_rules_create_computed_style_slots() {
         style.display
     );
     assert_eq!(style.first_letter_style.as_ref().unwrap().margin.left, 7.5);
+    assert_eq!(
+        style.first_letter_style.as_ref().unwrap().initial_letter,
+        InitialLetter::Specified { size: 2.0, sink: 2 }
+    );
 }
 
 #[tokio::test]
@@ -1830,6 +2149,39 @@ async fn generated_pseudo_style_inherits_without_cloning_non_inherited_propertie
 }
 
 #[tokio::test]
+async fn nested_generated_pseudo_declarations_do_not_style_the_originating_element() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"#skills {
+             section#target::before {
+               content: "";
+               float: left;
+               height: 2cm;
+               width: 2cm;
+             }
+           }"#,
+    ));
+    let mut attrs = HashMap::new();
+    attrs.insert("id".to_string(), "target".to_string());
+    let style = style_for_element_with_signature(
+        ElementSignature::new("section", attrs),
+        None,
+        &[stylesheet],
+        None,
+        &[ElementSignature::new("article", {
+            let mut attrs = HashMap::new();
+            attrs.insert("id".to_string(), "skills".to_string());
+            attrs
+        })],
+    );
+    let before = style.before_style.as_ref().expect("before style");
+
+    assert_eq!(style.float, Float::None);
+    assert_eq!(style.content, Content::Normal);
+    assert_eq!(before.float, Float::Left);
+    assert!(!before.box_values.width.is_auto());
+}
+
+#[tokio::test]
 async fn marker_style_inherits_without_cloning_non_inherited_properties() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         r#"li {
@@ -1855,6 +2207,71 @@ async fn marker_style_inherits_without_cloning_non_inherited_properties() {
     assert_eq!(marker.margin.left, 0.0);
     assert_eq!(marker.background_color, None);
     assert_eq!(marker.position, Position::Static);
+}
+
+#[test]
+fn anonymous_block_style_inherits_only_inherited_properties() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"div {
+             --accent: blue;
+             color: red;
+             direction: rtl;
+             writing-mode: vertical-rl;
+             font-size: 18pt;
+             white-space: pre-wrap;
+             text-decoration: underline;
+             margin: 20pt;
+             padding: 10pt;
+             border: 3pt solid green;
+             background-color: blue;
+             width: 40pt;
+             position: relative;
+             float: left;
+           }
+           div::before { content: "before" }
+           div::after { content: "after" }
+           div::first-line { color: blue }
+           div::first-letter { color: green }"#,
+    ));
+    let parent = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    let anonymous = anonymous_block_style(&parent);
+
+    assert_eq!(anonymous.display, Display::BLOCK);
+    assert_eq!(anonymous.color, parent.color);
+    assert_eq!(anonymous.direction, parent.direction);
+    assert_eq!(anonymous.writing_mode, parent.writing_mode);
+    assert_eq!(anonymous.font_size, parent.font_size);
+    assert_eq!(anonymous.white_space, parent.white_space);
+    assert_eq!(
+        anonymous.text_decoration_layers,
+        parent.text_decoration_layers
+    );
+    assert_eq!(
+        anonymous
+            .custom_properties
+            .get("--accent")
+            .map(String::as_str),
+        Some("blue")
+    );
+
+    assert_eq!(anonymous.margin, Edges::ZERO);
+    assert_eq!(anonymous.padding, Edges::ZERO);
+    assert_eq!(anonymous.border_widths, Edges::ZERO);
+    assert_eq!(anonymous.background_color, None);
+    assert!(anonymous.box_values.width.is_auto());
+    assert_eq!(anonymous.position, Position::Static);
+    assert_eq!(anonymous.float, Float::None);
+    assert!(anonymous.before_style.is_none());
+    assert!(anonymous.after_style.is_none());
+    assert!(anonymous.first_line_style.is_none());
+    assert!(anonymous.first_letter_style.is_none());
 }
 
 #[tokio::test]
@@ -1906,7 +2323,44 @@ async fn parses_avoid_page_break_values() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(style.break_before, PageBreak::Avoid);
-    assert_eq!(style.break_after, PageBreak::Avoid);
+    assert!(style.break_before.avoids_page());
+    assert!(style.break_before.avoids_column());
+    assert_eq!(style.break_after, PageBreak::AvoidPage);
+    assert!(style.break_after.avoids_page());
+    assert!(!style.break_after.avoids_column());
+}
+
+#[tokio::test]
+async fn parses_column_break_values_without_page_forcing() {
+    let declarations = parse_declarations(
+        "page-break-before: column; break-before: column; break-after: avoid-column; break-inside: avoid-column",
+    );
+    let mut style = ComputedStyle::initial();
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.break_before, PageBreak::Column);
+    assert_eq!(style.break_after, PageBreak::AvoidColumn);
+    assert!(!style.break_before.is_forced());
+    assert!(!style.break_after.avoids_page());
+    assert!(style.break_after.avoids_column());
+    assert!(!style.break_inside_avoid);
+    assert!(style.break_inside_avoid_column);
+}
+
+#[tokio::test]
+async fn legacy_page_break_properties_reject_column_values() {
+    let declarations = parse_declarations(
+        "page-break-before: column; page-break-after: avoid-column; page-break-inside: avoid-column",
+    );
+    let mut style = ComputedStyle::initial();
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.break_before, PageBreak::Auto);
+    assert_eq!(style.break_after, PageBreak::Auto);
+    assert!(!style.break_inside_avoid);
+    assert!(!style.break_inside_avoid_column);
 }
 
 #[tokio::test]
@@ -1974,11 +2428,123 @@ async fn parses_axis_aligned_linear_gradient_background_image() {
     assert!(!gradient.repeating);
     assert_eq!(gradient.stops.len(), 4);
     assert_eq!(gradient.stops[0].color, Color::new(255, 0, 0));
-    assert_eq!(gradient.stops[0].position.unwrap().length_points(), 0.0);
-    assert_eq!(gradient.stops[1].position.unwrap().length_points(), 37.5);
+    assert_eq!(
+        gradient.stops[0].position.clone().unwrap().length_points(),
+        0.0
+    );
+    assert_eq!(
+        gradient.stops[1].position.clone().unwrap().length_points(),
+        37.5
+    );
     assert_eq!(gradient.stops[2].color, Color::new(0, 128, 0));
-    assert_eq!(gradient.stops[2].position.unwrap().length_points(), 37.5);
-    assert_eq!(gradient.stops[3].position.unwrap().length_points(), 75.0);
+    assert_eq!(
+        gradient.stops[2].position.clone().unwrap().length_points(),
+        37.5
+    );
+    assert_eq!(
+        gradient.stops[3].position.clone().unwrap().length_points(),
+        75.0
+    );
+}
+
+#[tokio::test]
+async fn parses_color_image_background_image() {
+    let declarations = parse_declarations("background-image: image(green)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    assert!(
+        matches!(style.background_image, Some(BackgroundImage::Color(ColorImageColor::Color(color))) if color == Color::new(0, 128, 0))
+    );
+}
+
+#[tokio::test]
+async fn image_set_keeps_the_selected_candidate_resolution() {
+    let declarations = parse_declarations("background-image: image-set(url(green.png) 0.5x)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert!(matches!(
+        style.background_image,
+        Some(BackgroundImage::ImageSet { image, resolution })
+            if resolution == 0.5
+                && matches!(*image, BackgroundImage::Url { ref src, .. } if src == "green.png")
+    ));
+}
+
+#[tokio::test]
+async fn invalid_image_set_does_not_replace_the_cascaded_background_image() {
+    let declarations = parse_declarations(
+        "background-image: url(green.png); background-image: image-set(url(red.png) -1x)",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert!(matches!(
+        style.background_image,
+        Some(BackgroundImage::Url { ref src, .. }) if src == "green.png"
+    ));
+}
+
+#[tokio::test]
+async fn calculated_invalid_image_set_candidate_computes_to_no_image() {
+    let declarations = parse_declarations(
+        "background-image: url(red.png); background-image: image-set(url(red.png) calc(-1 * 1x))",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.background_image, None);
+}
+
+#[tokio::test]
+async fn zero_resolution_image_set_candidate_computes_to_no_image() {
+    let declarations = parse_declarations(
+        "background-image: url(red.png); background-image: image-set(url(red.png) 0x)",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.background_image, None);
+}
+
+#[tokio::test]
+async fn css_color_4_gradient_stops_retain_their_computed_color_spaces() {
+    let declarations = parse_declarations(
+        "background-image: \
+         linear-gradient(color(display-p3 1.2 -.1 .3), color(rec2020 1.1 .2 .3)), \
+         radial-gradient(lab(50% 120 -110), oklab(.7 .3 -.2)), \
+         conic-gradient(color(display-p3 .8 .2 .1), color(display-p3 .1 .2 .8))",
+    );
+    let mut style = default_style_for_tag("div");
+
+    apply_declarations(&mut style, &declarations);
+
+    let Some(BackgroundImage::LinearGradient(linear)) = &style.background_layers[0].image else {
+        panic!("expected linear gradient");
+    };
+    assert_eq!(linear.stops[0].color.space(), ColorSpace::DisplayP3);
+    assert!(linear.stops[0].color.r > 1.0);
+    assert_eq!(linear.stops[1].color.space(), ColorSpace::Rec2020);
+
+    let Some(BackgroundImage::RadialGradient(radial)) = &style.background_layers[1].image else {
+        panic!("expected radial gradient");
+    };
+    assert!(
+        radial
+            .stops
+            .iter()
+            .all(|stop| stop.color.space() == ColorSpace::XyzD50)
+    );
+
+    let Some(BackgroundImage::ConicGradient(conic)) = &style.background_layers[2].image else {
+        panic!("expected conic gradient");
+    };
+    assert!(
+        conic
+            .stops
+            .iter()
+            .all(|stop| stop.color.space() == ColorSpace::DisplayP3)
+    );
 }
 
 #[tokio::test]
@@ -2024,11 +2590,28 @@ async fn parses_repeating_linear_gradient_stops_and_hints() {
     assert!(gradient.repeating);
     assert_eq!(gradient.stops.len(), 3);
     assert_eq!(gradient.stops[0].position, None);
-    assert_eq!(gradient.stops[1].position.unwrap().percent, 0.5);
-    assert_eq!(gradient.stops[2].position.unwrap().percent, 0.75);
+    assert_eq!(
+        gradient.stops[1]
+            .position
+            .as_ref()
+            .unwrap()
+            .percentage_coefficient_or_zero(),
+        0.5
+    );
+    assert_eq!(
+        gradient.stops[2]
+            .position
+            .as_ref()
+            .unwrap()
+            .percentage_coefficient_or_zero(),
+        0.75
+    );
     assert_eq!(gradient.hints.len(), 1);
     assert_eq!(gradient.hints[0].after_stop, 0);
-    assert_eq!(gradient.hints[0].position.percent, 0.25);
+    assert_eq!(
+        gradient.hints[0].position.percentage_coefficient_or_zero(),
+        0.25
+    );
 }
 
 #[tokio::test]
@@ -2048,16 +2631,32 @@ async fn parses_radial_gradient_shape_size_position_and_stops() {
         gradient.size,
         RadialGradientSize::Extent(RadialGradientExtent::ClosestSide)
     );
-    assert_eq!(gradient.position.x.offset.percent, 0.25);
-    assert_eq!(gradient.position.y.offset.percent, 0.75);
+    assert_eq!(
+        gradient.position.x.offset.percentage_coefficient_or_zero(),
+        0.25
+    );
+    assert_eq!(
+        gradient.position.y.offset.percentage_coefficient_or_zero(),
+        0.75
+    );
     assert!(!gradient.repeating);
     assert_eq!(gradient.stops.len(), 2);
     assert_eq!(gradient.stops[0].color, Color::new(255, 0, 0));
     assert_eq!(gradient.stops[1].color, Color::new(0, 0, 255));
-    assert_eq!(gradient.stops[1].position.unwrap().percent, 1.0);
+    assert_eq!(
+        gradient.stops[1]
+            .position
+            .as_ref()
+            .unwrap()
+            .percentage_coefficient_or_zero(),
+        1.0
+    );
     assert_eq!(gradient.hints.len(), 1);
     assert_eq!(gradient.hints[0].after_stop, 0);
-    assert_eq!(gradient.hints[0].position.percent, 0.3);
+    assert_eq!(
+        gradient.hints[0].position.percentage_coefficient_or_zero(),
+        0.3
+    );
 }
 
 #[tokio::test]
@@ -2125,9 +2724,23 @@ async fn parses_linear_gradient_percentage_color_stops() {
     };
     assert_eq!(gradient.stops.len(), 2);
     assert_eq!(gradient.stops[0].color, Color::new(255, 0, 0));
-    assert_eq!(gradient.stops[0].position.unwrap().percent, 0.5);
+    assert_eq!(
+        gradient.stops[0]
+            .position
+            .as_ref()
+            .unwrap()
+            .percentage_coefficient_or_zero(),
+        0.5
+    );
     assert_eq!(gradient.stops[1].color, Color::new(0, 128, 0));
-    assert_eq!(gradient.stops[1].position.unwrap().percent, 0.5);
+    assert_eq!(
+        gradient.stops[1]
+            .position
+            .as_ref()
+            .unwrap()
+            .percentage_coefficient_or_zero(),
+        0.5
+    );
 }
 
 #[tokio::test]
@@ -2146,7 +2759,7 @@ async fn ch_linear_gradient_color_stops_resolve_before_paint() {
         Some(ComputedLengthPercentage::from_ch(2.0))
     );
 
-    style.resolve_font_metric_lengths(6.0);
+    style.resolve_font_metric_lengths(layout_pt(6.0));
 
     let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_image else {
         panic!("expected linear gradient background image");
@@ -2164,7 +2777,7 @@ async fn ch_linear_gradient_color_stops_resolve_before_paint() {
         Some(ComputedLengthPercentage::from_points(12.0))
     );
 
-    style.resolve_viewport_lengths(200.0, 100.0);
+    style.resolve_viewport_lengths_for_viewport(LayoutSize::new(200.0, 100.0));
 
     let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_image else {
         panic!("expected linear gradient background image");
@@ -2172,6 +2785,60 @@ async fn ch_linear_gradient_color_stops_resolve_before_paint() {
     assert_eq!(
         gradient.stops[1].position,
         Some(ComputedLengthPercentage::from_points(20.0))
+    );
+}
+
+#[tokio::test]
+async fn gradient_stops_resolve_em_against_the_element_font_size() {
+    let declarations =
+        parse_declarations("background: linear-gradient(to right, red 4em, blue 3rem)");
+    let mut style = default_style_for_tag("div");
+    style.font_size = 18.75;
+    style.root_font_size = 12.0;
+
+    apply_declarations(&mut style, &declarations);
+    style.finalize_computed_font_relative_lengths();
+
+    let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_image else {
+        panic!("expected linear gradient background image");
+    };
+    assert_eq!(
+        gradient.stops[0].position,
+        Some(ComputedLengthPercentage::from_points(75.0))
+    );
+    assert_eq!(
+        gradient.stops[1].position,
+        Some(ComputedLengthPercentage::from_points(36.0))
+    );
+
+    let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_layers[0].image else {
+        panic!("expected linear gradient background layer");
+    };
+    assert_eq!(
+        gradient.stops[0].position,
+        Some(ComputedLengthPercentage::from_points(75.0))
+    );
+    assert_eq!(
+        gradient.stops[1].position,
+        Some(ComputedLengthPercentage::from_points(36.0))
+    );
+}
+
+#[tokio::test]
+async fn resolves_viewport_math_against_vertical_writing_mode() {
+    let declarations = parse_declarations(
+        "writing-mode: vertical-rl; width: min(calc(10vw + 20vh + 30vmin), calc(40vmax + 50vi + 60vb))",
+    );
+    let mut style = default_style_for_tag("div");
+
+    apply_declarations(&mut style, &declarations);
+    style.resolve_viewport_lengths_for_viewport(LayoutSize::new(200.0, 100.0));
+
+    assert_eq!(
+        style.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
+            70.0
+        ))
     );
 }
 
@@ -2222,6 +2889,19 @@ async fn parses_comma_separated_background_layers() {
 }
 
 #[tokio::test]
+async fn background_color_uses_the_bottom_most_layer_clip() {
+    let declarations = parse_declarations(
+        "background-clip: border-box, content-box, border-box; background-image: none, none",
+    );
+    let mut style = default_style_for_tag("div");
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.background_layers.len(), 2);
+    assert_eq!(style.background_color_clip(), BackgroundBox::Content);
+}
+
+#[tokio::test]
 async fn background_shorthand_sets_origin_then_clip_boxes() {
     let declarations = parse_declarations("background: red content-box border-box");
     let mut style = default_style_for_tag("div");
@@ -2259,6 +2939,21 @@ async fn parses_background_repeat_aliases_and_two_axis_values() {
         &parse_declarations("background: url(bg.png) repeat no-repeat"),
     );
     assert_eq!(style.background_repeat, BackgroundRepeat::RepeatX);
+
+    apply_declarations(&mut style, &parse_declarations("background-repeat: space"));
+    assert_eq!(
+        style.background_repeat,
+        BackgroundRepeat::new(BackgroundRepeatAxis::Space, BackgroundRepeatAxis::Space)
+    );
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("background-repeat: round no-repeat"),
+    );
+    assert_eq!(
+        style.background_repeat,
+        BackgroundRepeat::new(BackgroundRepeatAxis::Round, BackgroundRepeatAxis::NoRepeat)
+    );
 }
 
 #[tokio::test]
@@ -2325,6 +3020,7 @@ async fn parses_mixed_generated_content_parts() {
                         src: "icon.png".to_string(),
                         base_url: None,
                         root_url: None,
+                        request_modifiers: RequestUrlModifiers::default(),
                     },
                 },
             ],
@@ -2457,6 +3153,7 @@ async fn parses_content_replacement_and_quotes_property() {
                     src: "icon.png".to_string(),
                     base_url: None,
                     root_url: None,
+                    request_modifiers: RequestUrlModifiers::default(),
                 },
             },
             alt: Some(vec![GeneratedAltTextPart::Text("Icon".to_string())]),
@@ -2996,7 +3693,7 @@ async fn page_size_in_size_dependent_media_query_is_ignored() {
 #[tokio::test]
 async fn parses_css_text_breaking_controls() {
     let declarations = parse_declarations(
-        "word-break: break-all; overflow: hidden; overflow-x: clip; overflow-y: auto; overflow-wrap: anywhere; word-wrap: break-word; line-break: anywhere; hyphens: none; hyphenate-limit-chars: auto 3 4",
+        "word-break: break-all; overflow: hidden; overflow-x: clip; overflow-y: overlay; overflow-wrap: anywhere; word-wrap: break-word; line-break: anywhere; hyphens: none; hyphenate-character: \"\\00a0\\0640\"; hyphenate-limit-chars: auto 3 4",
     );
     let mut style = default_style_for_tag("p");
 
@@ -3004,11 +3701,15 @@ async fn parses_css_text_breaking_controls() {
 
     assert_eq!(style.word_break, WordBreak::BreakAll);
     assert_eq!(style.overflow, Overflow::Hidden);
-    assert_eq!(style.overflow_x, Overflow::Clip);
+    assert_eq!(style.overflow_x, Overflow::Hidden);
     assert_eq!(style.overflow_y, Overflow::Auto);
     assert_eq!(style.overflow_wrap, OverflowWrap::BreakWord);
     assert_eq!(style.line_break, LineBreak::Anywhere);
     assert_eq!(style.hyphens, Hyphens::None);
+    assert_eq!(
+        style.hyphenate_character,
+        HyphenateCharacter::String("\u{a0}\u{640}".to_string())
+    );
     assert_eq!(
         style.hyphenate_limit_chars,
         HyphenateLimitChars {
@@ -3016,6 +3717,62 @@ async fn parses_css_text_breaking_controls() {
             before: 3,
             after: 4,
         }
+    );
+}
+
+#[test]
+fn parses_css_scroll_snap_longhands_shorthands_and_logical_edges() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "scroll-snap-type: block mandatory; scroll-snap-align: start end; \
+             scroll-snap-stop: always; scroll-padding: auto 10px 20%; \
+             scroll-padding-inline-start: 5px; scroll-margin: 1px 2px 3px 4px",
+        ),
+    );
+
+    assert_eq!(
+        style.scroll_snap_type,
+        ScrollSnapType::Block(ScrollSnapStrictness::Mandatory)
+    );
+    assert_eq!(
+        style.scroll_snap_align,
+        ScrollSnapAlign {
+            block: ScrollSnapAlignment::Start,
+            inline: ScrollSnapAlignment::End,
+        }
+    );
+    assert_eq!(style.scroll_snap_stop, ScrollSnapStop::Always);
+    assert_eq!(style.direction, Direction::Ltr);
+    assert_eq!(style.scroll_padding.top, ScrollPadding::Auto);
+    assert_eq!(
+        style.scroll_padding.right,
+        ScrollPadding::LengthPercentage(ComputedLengthPercentage::from_points(7.5))
+    );
+    assert_eq!(
+        style.scroll_padding.bottom,
+        ScrollPadding::LengthPercentage(ComputedLengthPercentage::from_percent(0.2))
+    );
+    assert_eq!(
+        style.scroll_padding.left,
+        ScrollPadding::LengthPercentage(ComputedLengthPercentage::from_points(3.75))
+    );
+    assert_eq!(
+        style.scroll_margin.top,
+        ComputedLengthPercentage::from_points(0.75)
+    );
+    assert_eq!(
+        style.scroll_margin.right,
+        ComputedLengthPercentage::from_points(1.5)
+    );
+    assert_eq!(
+        style.scroll_margin.bottom,
+        ComputedLengthPercentage::from_points(2.25)
+    );
+    assert_eq!(
+        style.scroll_margin.left,
+        ComputedLengthPercentage::from_points(3.0)
     );
 }
 
@@ -3033,6 +3790,7 @@ async fn parses_css_text_transform_full_width_and_kana_values() {
             case: TextTransformCase::None,
             full_width: true,
             full_size_kana: false,
+            math_auto: false,
         }
     );
 
@@ -3046,6 +3804,7 @@ async fn parses_css_text_transform_full_width_and_kana_values() {
             case: TextTransformCase::None,
             full_width: false,
             full_size_kana: true,
+            math_auto: false,
         }
     );
 
@@ -3059,6 +3818,21 @@ async fn parses_css_text_transform_full_width_and_kana_values() {
             case: TextTransformCase::Uppercase,
             full_width: true,
             full_size_kana: true,
+            math_auto: false,
+        }
+    );
+}
+
+#[tokio::test]
+async fn parses_css_text_transform_math_auto() {
+    let mut style = default_style_for_tag("p");
+    apply_declarations(&mut style, &parse_declarations("text-transform: math-auto"));
+
+    assert_eq!(
+        style.text_transform,
+        TextTransform {
+            math_auto: true,
+            ..TextTransform::NONE
         }
     );
 }
@@ -3092,8 +3866,18 @@ async fn legacy_word_break_break_word_enables_emergency_wrap() {
 
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.word_break, WordBreak::Normal);
-    assert_eq!(style.overflow_wrap, OverflowWrap::BreakWord);
+    assert_eq!(style.word_break, WordBreak::BreakWord);
+    assert_eq!(style.overflow_wrap, OverflowWrap::Normal);
+}
+
+#[tokio::test]
+async fn parses_css_text_level_four_word_break_manual() {
+    let declarations = parse_declarations("word-break: manual");
+    let mut style = default_style_for_tag("p");
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.word_break, WordBreak::Manual);
 }
 
 #[tokio::test]
@@ -3109,12 +3893,10 @@ async fn parses_ch_lengths_in_box_sizes_and_math() {
     );
     assert_eq!(
         style.box_values.height,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(1.0),
-            percent: 0.0,
-            ch: 2.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::sum(
+            ComputedLengthPercentage::from_points(1.0),
+            ComputedLengthPercentage::from_ch(2.0),
+        ))
     );
 }
 
@@ -3132,14 +3914,19 @@ async fn parses_viewport_lengths_in_box_sizes_and_math() {
     );
     assert_eq!(
         style.box_values.height,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            vh: 50.0,
-            vmin: -2.0,
-            vmax: 1.0,
-            vi: 3.0,
-            vb: -4.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::sum(
+            ComputedLengthPercentage::sum(
+                ComputedLengthPercentage::sum(
+                    ComputedLengthPercentage::sum(
+                        ComputedLengthPercentage::from_vh(50.0),
+                        ComputedLengthPercentage::from_vmin(-2.0)
+                    ),
+                    ComputedLengthPercentage::from_vmax(1.0),
+                ),
+                ComputedLengthPercentage::from_vi(3.0),
+            ),
+            ComputedLengthPercentage::from_vb(-4.0),
+        ))
     );
 }
 
@@ -3234,6 +4021,15 @@ async fn parses_ch_length_letter_spacing() {
 }
 
 #[tokio::test]
+async fn parses_percentage_letter_spacing() {
+    let declarations = parse_declarations("font-size: 20pt; letter-spacing: 10%");
+    let mut style = default_style_for_tag("p");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.used_letter_spacing().points(), 2.0);
+}
+
+#[tokio::test]
 async fn parses_ch_length_word_spacing() {
     let declarations = parse_declarations("font-size: 20pt; word-spacing: 2ch");
     let mut style = default_style_for_tag("span");
@@ -3241,6 +4037,46 @@ async fn parses_ch_length_word_spacing() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(style.word_spacing, ComputedLengthPercentage::from_ch(2.0));
+}
+
+#[tokio::test]
+async fn parses_percentage_word_spacing() {
+    let declarations = parse_declarations("font-size: 20pt; word-spacing: 100%");
+    let mut style = default_style_for_tag("span");
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.word_spacing,
+        ComputedLengthPercentage::from_percent(1.0)
+    );
+}
+
+#[tokio::test]
+async fn parses_mixed_percentage_word_spacing_calc() {
+    let declarations = parse_declarations("font-size: 20pt; word-spacing: calc(0.5em + 50%)");
+    let mut style = default_style_for_tag("span");
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.word_spacing,
+        ComputedLengthPercentage::from_affine(layout_pt(10.0), 0.5, true)
+    );
+}
+
+#[tokio::test]
+async fn inherited_percentage_word_spacing_resolves_against_current_font_size() {
+    let parent_declarations = parse_declarations("font-size: 2pt; word-spacing: 100%");
+    let mut parent = default_style_for_tag("div");
+    apply_declarations(&mut parent, &parent_declarations);
+
+    let child_declarations = parse_declarations("font-size: 20pt");
+    let mut child = default_style_for_tag("span");
+    child.word_spacing = parent.word_spacing;
+    apply_declarations(&mut child, &child_declarations);
+
+    assert_eq!(child.used_word_spacing(), layout_pt(20.0));
 }
 
 #[tokio::test]
@@ -3271,11 +4107,11 @@ async fn parses_inline_vertical_align_subset() {
     let declarations = parse_declarations("vertical-align: calc(3pt + 25%)");
     apply_declarations(&mut style, &declarations);
 
-    let BaselineShift::LengthPercentage(value) = style.vertical_align.baseline_shift else {
+    let BaselineShift::LengthPercentage(ref value) = style.vertical_align.baseline_shift else {
         panic!("vertical-align length/percentage should parse as a typed shift");
     };
     assert!((value.length_points() - 3.0).abs() < 0.001);
-    assert!((value.percent - 0.25).abs() < 0.001);
+    assert!((value.percentage_coefficient_or_zero() - 0.25).abs() < 0.001);
 
     let declarations = parse_declarations(
         "dominant-baseline: central; alignment-baseline: baseline; baseline-source: last; baseline-shift: 10%",
@@ -3290,10 +4126,10 @@ async fn parses_inline_vertical_align_subset() {
         AlignmentBaseline::Baseline
     );
     assert_eq!(style.vertical_align.baseline_source, BaselineSource::Last);
-    let BaselineShift::LengthPercentage(value) = style.vertical_align.baseline_shift else {
+    let BaselineShift::LengthPercentage(ref value) = style.vertical_align.baseline_shift else {
         panic!("baseline-shift percentage should parse as a typed shift");
     };
-    assert!((value.percent - 0.1).abs() < 0.001);
+    assert!((value.percentage_coefficient_or_zero() - 0.1).abs() < 0.001);
 
     let declarations = parse_declarations("vertical-align: last text-top");
     apply_declarations(&mut style, &declarations);
@@ -3328,7 +4164,7 @@ async fn ch_baseline_shift_resolves_before_inline_layout() {
         BaselineShift::LengthPercentage(ComputedLengthPercentage::from_ch(2.0))
     );
 
-    style.resolve_font_metric_lengths(6.0);
+    style.resolve_font_metric_lengths(layout_pt(6.0));
 
     assert_eq!(
         style.vertical_align.baseline_shift,
@@ -3343,7 +4179,7 @@ async fn ch_baseline_shift_resolves_before_inline_layout() {
         BaselineShift::LengthPercentage(ComputedLengthPercentage::from_ch(3.0))
     );
 
-    style.resolve_font_metric_lengths(5.0);
+    style.resolve_font_metric_lengths(layout_pt(5.0));
 
     assert_eq!(
         style.vertical_align.baseline_shift,
@@ -3445,6 +4281,149 @@ async fn parses_multicolumn_declarations() {
 }
 
 #[tokio::test]
+async fn parses_column_fill_span_and_containment() {
+    let declarations = parse_declarations(
+        "column-fill: balance-all; column-span: all; contain: paint size layout",
+    );
+    let mut style = ComputedStyle::initial();
+
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.column_fill, ColumnFill::BalanceAll);
+    assert_eq!(style.column_span, ColumnSpan::All);
+    assert!(style.contain.size);
+    assert!(style.contain.layout);
+    assert!(!style.contain.style);
+    assert!(style.contain.paint);
+}
+
+#[tokio::test]
+async fn containment_aliases_compute_to_canonical_effects() {
+    let mut strict = ComputedStyle::initial();
+    apply_declarations(&mut strict, &parse_declarations("contain: strict"));
+    assert!(strict.contain.size);
+    assert!(strict.contain.layout);
+    assert!(strict.contain.paint);
+    assert!(strict.contain.style);
+
+    let mut content = ComputedStyle::initial();
+    apply_declarations(&mut content, &parse_declarations("contain: content"));
+    assert!(!content.contain.size);
+    assert!(content.contain.layout);
+    assert!(content.contain.paint);
+    assert!(content.contain.style);
+
+    let mut style = ComputedStyle::initial();
+    apply_declarations(&mut style, &parse_declarations("contain: style"));
+    assert_eq!(
+        style.contain,
+        Contain {
+            size: false,
+            layout: false,
+            style: true,
+            paint: false,
+            inline_size: false,
+        }
+    );
+
+    let mut none = ComputedStyle::initial();
+    apply_declarations(&mut none, &parse_declarations("contain: none"));
+    assert_eq!(none.contain, Contain::NONE);
+}
+
+#[tokio::test]
+async fn parses_inline_size_containment_and_content_visibility() {
+    let mut style = ComputedStyle::initial();
+    apply_declarations(
+        &mut style,
+        &parse_declarations("contain: inline-size layout; content-visibility: hidden"),
+    );
+    assert!(style.contain.inline_size);
+    assert!(style.contain.layout);
+    assert!(!style.contain.size);
+    assert_eq!(style.content_visibility, ContentVisibility::Hidden);
+
+    apply_declarations(&mut style, &parse_declarations("content-visibility: auto"));
+    assert_eq!(style.content_visibility, ContentVisibility::Auto);
+}
+
+#[tokio::test]
+async fn parses_subgrid_track_lists_for_containment_used_value_resolution() {
+    let mut style = ComputedStyle::initial();
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-columns: subgrid [start] [end]; grid-template-rows: subgrid",
+        ),
+    );
+
+    assert!(matches!(
+        style.grid_template_columns,
+        GridTrackList::Subgrid { ref line_names } if line_names == &["start", "end"]
+    ));
+    assert!(matches!(
+        style.grid_template_rows,
+        GridTrackList::Subgrid { .. }
+    ));
+
+    apply_declarations(&mut style, &parse_declarations("grid: subgrid"));
+    assert!(matches!(
+        style.grid_template_columns,
+        GridTrackList::Subgrid { .. }
+    ));
+    assert!(matches!(
+        style.grid_template_rows,
+        GridTrackList::Subgrid { .. }
+    ));
+
+    style.grid_template_columns.resolve_contained_subgrid();
+    style.grid_template_rows.resolve_contained_subgrid();
+    assert_eq!(style.grid_template_columns, GridTrackList::None);
+    assert_eq!(style.grid_template_rows, GridTrackList::None);
+}
+
+#[tokio::test]
+async fn parses_container_longhands_and_container_units_use_viewport_fallback() {
+    let mut style = ComputedStyle::initial();
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "container: card sidebar / inline-size; width: calc(10cqw + 5cqh); height: 1cqmin",
+        ),
+    );
+
+    assert_eq!(style.container_type, ContainerType::InlineSize);
+    assert_eq!(style.container_names.0, ["card", "sidebar"]);
+    style.resolve_viewport_lengths_for_viewport(LayoutSize::new(200.0, 100.0));
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
+        panic!("expected width");
+    };
+    let ComputedLengthPercentageOrAuto::LengthPercentage(ref height) = style.box_values.height
+    else {
+        panic!("expected height");
+    };
+    assert_eq!(width.length_points(), 25.0);
+    assert_eq!(height.length_points(), 1.0);
+}
+
+#[tokio::test]
+async fn invalid_multicol_and_containment_values_leave_initial_values() {
+    let mut style = ComputedStyle::initial();
+    apply_declarations(
+        &mut style,
+        &parse_declarations("column-fill: backwards; column-span: two; contain: size size"),
+    );
+
+    assert_eq!(style.column_fill, ColumnFill::Balance);
+    assert_eq!(style.column_span, ColumnSpan::None);
+    assert_eq!(style.contain, Contain::NONE);
+
+    apply_declarations(&mut style, &parse_declarations("contain: inline-size"));
+    assert!(style.contain.inline_size);
+    assert!(!style.contain.size);
+}
+
+#[tokio::test]
 async fn parses_column_width_longhand() {
     let declarations = parse_declarations("column-width: 30%; column-width: 12pt");
     let mut style = default_style_for_tag("dl");
@@ -3467,7 +4446,7 @@ async fn ch_column_width_preserves_font_metric_component_until_used_resolution()
         ComputedColumnWidth::Length(ComputedLengthPercentage::from_ch(5.0))
     );
 
-    style.resolve_font_metric_lengths(7.0);
+    style.resolve_font_metric_lengths(layout_pt(7.0));
 
     assert_eq!(
         style.column_width,
@@ -3573,6 +4552,114 @@ async fn parses_background_size_and_position_as_computed_values() {
 }
 
 #[tokio::test]
+async fn parses_numeric_background_position_axes() {
+    let declarations = parse_declarations("background-position: -27px 0");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.background_position.x.origin,
+        BackgroundPositionOrigin::Start
+    );
+    assert_eq!(
+        style.background_position.x.offset,
+        ComputedLengthPercentage::from_points(-27.0 * CSS_PX_TO_PT)
+    );
+    assert_eq!(
+        style.background_position.y.origin,
+        BackgroundPositionOrigin::Start
+    );
+    assert_eq!(
+        style.background_position.y.offset,
+        ComputedLengthPercentage::ZERO
+    );
+}
+
+#[tokio::test]
+async fn background_position_defers_min_max_percentages_until_the_free_space_is_known() {
+    let declarations = parse_declarations("background-position: min(0%, 100%) max(0%, 100%)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    style.resolve_font_metric_lengths(layout_pt(6.0));
+
+    assert_eq!(
+        style
+            .background_position
+            .x
+            .offset
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(-50.0)))
+            .map(layout_points),
+        Some(-50.0)
+    );
+    assert_eq!(
+        style
+            .background_position
+            .y
+            .offset
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(-50.0)))
+            .map(layout_points),
+        Some(0.0)
+    );
+}
+
+#[tokio::test]
+async fn background_position_axis_longhands_replace_only_their_axis() {
+    let declarations = parse_declarations(
+        "background-position: right top; \
+         background-position-x: min(0%, 100%); \
+         background-position-y: max(0%, 100%)",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.background_position.x.origin,
+        BackgroundPositionOrigin::Start
+    );
+    assert_eq!(
+        style.background_position.y.origin,
+        BackgroundPositionOrigin::Start
+    );
+    assert_eq!(
+        style
+            .background_position
+            .x
+            .offset
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(-50.0)))
+            .map(layout_points),
+        Some(-50.0)
+    );
+    assert_eq!(
+        style
+            .background_position
+            .y
+            .offset
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(-50.0)))
+            .map(layout_points),
+        Some(0.0)
+    );
+}
+
+#[tokio::test]
+async fn rejects_invalid_background_size_values_without_discarding_the_cascade() {
+    let declarations = parse_declarations(
+        "background-size: 50px auto; background-size: -1px -1px; background-size: 1px 2px 3px",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.background_size,
+        BackgroundSize::Explicit {
+            width: BackgroundSizeAxis::LengthPercentage(ComputedLengthPercentage::from_points(
+                50.0 * CSS_PX_TO_PT
+            )),
+            height: BackgroundSizeAxis::Auto,
+        }
+    );
+}
+
+#[tokio::test]
 async fn background_shorthand_size_split_ignores_url_slashes() {
     let declarations = parse_declarations(
         r#"background: url("support/1x1-green.png") 0 0 / 50px 100px no-repeat, red"#,
@@ -3598,6 +4685,31 @@ async fn background_shorthand_size_split_ignores_url_slashes() {
         }
     );
     assert_eq!(style.background_layers[1].image, None);
+}
+
+#[tokio::test]
+async fn background_shorthand_extracts_position_after_a_spaced_gradient_function() {
+    let declarations =
+        parse_declarations("background: linear-gradient(red, red) 1ch 0 / 4ch 1ch no-repeat");
+    let mut style = default_style_for_tag("div");
+    style.font_size = 18.75;
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.background_position.x.offset,
+        ComputedLengthPercentage::from_ch(1.0)
+    );
+    assert_eq!(
+        style.background_position.y.offset,
+        ComputedLengthPercentage::ZERO
+    );
+    assert_eq!(
+        style.background_size,
+        BackgroundSize::Explicit {
+            width: BackgroundSizeAxis::LengthPercentage(ComputedLengthPercentage::from_ch(4.0)),
+            height: BackgroundSizeAxis::LengthPercentage(ComputedLengthPercentage::from_ch(1.0)),
+        }
+    );
 }
 
 #[tokio::test]
@@ -3886,6 +4998,103 @@ async fn parses_text_box_trim_and_edge_longhands() {
 }
 
 #[tokio::test]
+async fn parses_initial_letter_properties() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "initial-letter: 3 drop; initial-letter-align: border-box ideographic; initial-letter-wrap: 25%",
+        ),
+    );
+
+    assert_eq!(
+        style.initial_letter,
+        InitialLetter::Specified { size: 3.0, sink: 3 }
+    );
+    assert_eq!(
+        style.initial_letter_align,
+        InitialLetterAlign {
+            border_box: true,
+            keyword: InitialLetterAlignKeyword::Ideographic
+        }
+    );
+    assert_eq!(
+        style.initial_letter_wrap,
+        InitialLetterWrap::Offset(ComputedLengthPercentage::from_percent(0.25))
+    );
+
+    apply_declarations(&mut style, &parse_declarations("initial-letter: raise 2.5"));
+    assert_eq!(
+        style.initial_letter,
+        InitialLetter::Specified { size: 2.5, sink: 1 }
+    );
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("initial-letter: 0; initial-letter-wrap: banana"),
+    );
+    assert_eq!(
+        style.initial_letter,
+        InitialLetter::Specified { size: 2.5, sink: 1 }
+    );
+    assert_eq!(
+        style.initial_letter_wrap,
+        InitialLetterWrap::Offset(ComputedLengthPercentage::from_percent(0.25))
+    );
+}
+
+#[tokio::test]
+async fn initial_letter_align_and_wrap_inherit() {
+    let mut parent = default_style_for_tag("div");
+    apply_declarations(
+        &mut parent,
+        &parse_declarations("initial-letter-align: hanging; initial-letter-wrap: first"),
+    );
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "span { initial-letter-align: inherit; initial-letter-wrap: inherit }",
+    ));
+    let child = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        Some(&parent),
+        &[],
+    );
+
+    assert_eq!(
+        child.initial_letter_align,
+        InitialLetterAlign {
+            border_box: false,
+            keyword: InitialLetterAlignKeyword::Hanging
+        }
+    );
+    assert_eq!(child.initial_letter_wrap, InitialLetterWrap::First);
+    assert_eq!(child.initial_letter, InitialLetter::Normal);
+}
+
+#[tokio::test]
+async fn supports_rule_recognizes_initial_letter_properties() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@supports (initial-letter: 3 drop) { p { color: blue } }\
+         @supports (initial-letter-align: hanging) { p { border-top-color: green } }\
+         @supports (initial-letter-wrap: grid) { p { border-bottom-color: blue } }\
+         @supports (initial-letter: 0) { p { background-color: red } }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.border_colors.top, Color::new(0, 128, 0));
+    assert_eq!(style.border_colors.bottom, Color::new(0, 0, 255));
+    assert_eq!(style.background_color, None);
+}
+
+#[tokio::test]
 async fn parses_text_box_shorthand() {
     let mut normal = default_style_for_tag("div");
     normal.text_box_trim = TextBoxTrim::TrimEnd;
@@ -4033,6 +5242,58 @@ async fn parses_display_outer_inner_model() {
 }
 
 #[tokio::test]
+async fn display_contents_computes_to_none_for_unusual_html_elements() {
+    for tag in [
+        "br", "wbr", "meter", "progress", "canvas", "embed", "object", "audio", "iframe", "img",
+        "video", "frame", "frameset", "input", "textarea", "select",
+    ] {
+        let style = style_for_element_with_signature(
+            ElementSignature::new(tag, HashMap::new()),
+            Some("display: contents"),
+            &[],
+            None,
+            &[],
+        );
+
+        assert_eq!(style.display, Display::NONE, "{tag}");
+    }
+}
+
+#[tokio::test]
+async fn display_contents_remains_contents_for_ordinary_html_elements() {
+    for tag in ["div", "legend", "button", "details", "fieldset"] {
+        let style = style_for_element_with_signature(
+            ElementSignature::new(tag, HashMap::new()),
+            Some("display: contents"),
+            &[],
+            None,
+            &[],
+        );
+
+        assert_eq!(style.display, Display::CONTENTS, "{tag}");
+    }
+}
+
+#[tokio::test]
+async fn class_selectors_match_whitespace_separated_tokens_for_display() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        ".none { display:none } .green { color: green }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new(
+            "optgroup",
+            HashMap::from([("class".to_string(), "none green".to_string())]),
+        ),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.display, Display::NONE);
+}
+
+#[tokio::test]
 async fn rejects_invalid_display_outer_inner_grammar() {
     for value in [
         "block inline",
@@ -4176,6 +5437,49 @@ async fn ua_marker_default_is_bidi_isolated() {
 }
 
 #[tokio::test]
+async fn ua_marker_defaults_apply_to_nested_generated_markers() {
+    let ua = html5_user_agent_stylesheet();
+    let author = parse_stylesheet(&Css::from_string(
+        r#"li::before, li::after { content: "x"; display: list-item }"#,
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("li", HashMap::new()),
+        None,
+        &[ua, author],
+        None,
+        &[],
+    );
+    let expected = FontVariantNumeric::Values(vec![FontVariantNumericValue::TabularNums]);
+
+    assert_eq!(
+        style
+            .marker_style
+            .as_deref()
+            .expect("principal marker style")
+            .font_variant_numeric,
+        expected
+    );
+    assert_eq!(
+        style
+            .before_style
+            .as_deref()
+            .and_then(|pseudo| pseudo.marker_style.as_deref())
+            .expect("before marker style")
+            .font_variant_numeric,
+        expected
+    );
+    assert_eq!(
+        style
+            .after_style
+            .as_deref()
+            .and_then(|pseudo| pseudo.marker_style.as_deref())
+            .expect("after marker style")
+            .font_variant_numeric,
+        expected
+    );
+}
+
+#[tokio::test]
 async fn parses_list_style_image_longhand_and_shorthand() {
     let declarations = parse_declarations(
         "list-style-image: url(marker.png); list-style: square inside url(other.png)",
@@ -4268,6 +5572,59 @@ async fn parses_counter_style_rules() {
 }
 
 #[tokio::test]
+async fn counter_style_strings_decode_css_escapes_like_symbols_function() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"@counter-style escaped { system: numeric; symbols: '\2020' '\2021' '\A7' '\26AA'; prefix: '\2020'; suffix: '\2021'; negative: '\A7' '\26AA'; pad: 2 '\2020' }"#,
+    ));
+    let rule = &stylesheet.counter_styles[0];
+
+    assert_eq!(rule.symbols, ["†", "‡", "§", "⚪"]);
+    assert_eq!(rule.prefix.as_deref(), Some("†"));
+    assert_eq!(rule.suffix.as_deref(), Some("‡"));
+    assert_eq!(
+        rule.negative
+            .as_ref()
+            .map(|(prefix, suffix)| (prefix.as_str(), suffix.as_str())),
+        Some(("§", "⚪"))
+    );
+    assert_eq!(
+        rule.pad
+            .as_ref()
+            .map(|(width, symbol)| (*width, symbol.as_str())),
+        Some((2, "†"))
+    );
+
+    let declarations =
+        parse_declarations(r#"list-style-type: symbols(numeric '\2020' '\2021' '\A7' '\26AA')"#);
+    let mut style = default_style_for_tag("li");
+    apply_declarations(&mut style, &declarations);
+    let ListStyleType::Anonymous(rule) = style.list_style_type else {
+        panic!("symbols() should produce an anonymous counter style");
+    };
+    assert_eq!(rule.symbols, ["†", "‡", "§", "⚪"]);
+}
+
+#[tokio::test]
+async fn symbols_function_rejects_unquoted_symbols_but_counter_styles_accept_idents() {
+    for value in [
+        "symbols(a b c)",
+        "symbols(alphabetic a b c)",
+        "symbols(numeric 0 1 2)",
+        "symbols(additive 'a' 'b')",
+        "symbols(fixed)",
+        "symbols(alphabetic 'a')",
+        "symbols(numeric '0')",
+    ] {
+        assert!(parse_list_style_type(value).is_none(), "{value}");
+    }
+
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@counter-style identifiers { system: cyclic; symbols: first second }",
+    ));
+    assert_eq!(stylesheet.counter_styles[0].symbols, ["first", "second"]);
+}
+
+#[tokio::test]
 async fn parses_counter_style_range_intervals_and_auto() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "@counter-style split { system: numeric; symbols: 0 1; range: 1 10, 20 infinite }\
@@ -4329,6 +5686,55 @@ async fn parses_marker_pseudo_element_rules() {
             .map(String::as_str),
         Some("counter(list-item, lower-alpha) \") \"")
     );
+}
+
+#[tokio::test]
+async fn parses_markers_of_before_and_after_pseudo_elements() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "div::before, div::after { content: \"x\"; display: list-item }\
+         div::before::marker { content: \"before-marker\" }\
+         div::after::marker { content: \"after-marker\" }",
+    ));
+    assert_eq!(stylesheet.before_marker_rules.len(), 1);
+    assert_eq!(stylesheet.after_marker_rules.len(), 1);
+    assert_eq!(stylesheet.before_marker_rules[0].selector_text, "div");
+    assert_eq!(stylesheet.after_marker_rules[0].selector_text, "div");
+    let style = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    assert_eq!(
+        style
+            .before_style
+            .as_deref()
+            .and_then(|style| style.marker_style.as_deref())
+            .map(|style| &style.marker_content),
+        Some(&MarkerContent::Parts(vec![MarkerContentPart::Text(
+            "before-marker".to_string()
+        )]))
+    );
+    assert_eq!(
+        style
+            .after_style
+            .as_deref()
+            .and_then(|style| style.marker_style.as_deref())
+            .map(|style| &style.marker_content),
+        Some(&MarkerContent::Parts(vec![MarkerContentPart::Text(
+            "after-marker".to_string()
+        )]))
+    );
+}
+
+#[tokio::test]
+async fn pseudo_after_combinator_uses_implicit_universal_selector() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        ".list > ::before { content: \"x\"; unicode-bidi: isolate; display: inline-flex }",
+    ));
+    assert_eq!(stylesheet.before_rules.len(), 1);
+    assert_eq!(stylesheet.before_rules[0].selector_text, ".list > *");
 }
 
 #[tokio::test]
@@ -4435,13 +5841,37 @@ async fn parses_list_item_counter_properties() {
 
     assert_eq!(
         style.counter_resets,
-        vec![("section".to_string(), 2), ("list-item".to_string(), 4)]
+        vec![
+            CounterReset {
+                name: "section".to_string(),
+                kind: CounterResetKind::Forward(CounterValue::new(2)),
+            },
+            CounterReset {
+                name: "list-item".to_string(),
+                kind: CounterResetKind::Forward(CounterValue::new(4)),
+            },
+        ]
     );
     assert_eq!(
         style.counter_increments,
-        vec![("other".to_string(), 1), ("list-item".to_string(), 2)]
+        vec![
+            CounterChange {
+                name: "other".to_string(),
+                value: CounterValue::new(1),
+            },
+            CounterChange {
+                name: "list-item".to_string(),
+                value: CounterValue::new(2),
+            },
+        ]
     );
-    assert_eq!(style.counter_sets, vec![("list-item".to_string(), 9)]);
+    assert_eq!(
+        style.counter_sets,
+        vec![CounterChange {
+            name: "list-item".to_string(),
+            value: CounterValue::new(9),
+        }]
+    );
 }
 
 #[tokio::test]
@@ -4454,13 +5884,37 @@ async fn parses_counter_properties_with_spec_duplicate_and_invalid_handling() {
 
     assert_eq!(
         style.counter_resets,
-        vec![("section".to_string(), 2), ("chapter".to_string(), 3)]
+        vec![
+            CounterReset {
+                name: "section".to_string(),
+                kind: CounterResetKind::Forward(CounterValue::new(2)),
+            },
+            CounterReset {
+                name: "chapter".to_string(),
+                kind: CounterResetKind::Forward(CounterValue::new(3)),
+            },
+        ]
     );
     assert_eq!(
         style.counter_increments,
-        vec![("item".to_string(), 1), ("item".to_string(), 2)]
+        vec![
+            CounterChange {
+                name: "item".to_string(),
+                value: CounterValue::new(1),
+            },
+            CounterChange {
+                name: "item".to_string(),
+                value: CounterValue::new(2),
+            },
+        ]
     );
-    assert_eq!(style.counter_sets, vec![("page".to_string(), 5)]);
+    assert_eq!(
+        style.counter_sets,
+        vec![CounterChange {
+            name: "page".to_string(),
+            value: CounterValue::new(5),
+        }]
+    );
 
     let invalid = parse_declarations(
         "counter-reset: none chapter; counter-increment: none 1; counter-set: item 1.5",
@@ -4468,13 +5922,67 @@ async fn parses_counter_properties_with_spec_duplicate_and_invalid_handling() {
     apply_declarations(&mut style, &invalid);
     assert_eq!(
         style.counter_resets,
-        vec![("section".to_string(), 2), ("chapter".to_string(), 3)]
+        vec![
+            CounterReset {
+                name: "section".to_string(),
+                kind: CounterResetKind::Forward(CounterValue::new(2)),
+            },
+            CounterReset {
+                name: "chapter".to_string(),
+                kind: CounterResetKind::Forward(CounterValue::new(3)),
+            },
+        ]
     );
     assert_eq!(
         style.counter_increments,
-        vec![("item".to_string(), 1), ("item".to_string(), 2)]
+        vec![
+            CounterChange {
+                name: "item".to_string(),
+                value: CounterValue::new(1),
+            },
+            CounterChange {
+                name: "item".to_string(),
+                value: CounterValue::new(2),
+            },
+        ]
     );
-    assert_eq!(style.counter_sets, vec![("page".to_string(), 5)]);
+    assert_eq!(
+        style.counter_sets,
+        vec![CounterChange {
+            name: "page".to_string(),
+            value: CounterValue::new(5),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn parses_reversed_counter_resets_and_rejects_malformed_functions() {
+    let mut style = default_style_for_tag("div");
+    let declarations = parse_declarations(
+        "counter-reset: chapter 2 reversed(section) reversed(item) -4 chapter 7",
+    );
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(
+        style.counter_resets,
+        vec![
+            CounterReset {
+                name: "section".to_string(),
+                kind: CounterResetKind::Reversed(None),
+            },
+            CounterReset {
+                name: "item".to_string(),
+                kind: CounterResetKind::Reversed(Some(CounterValue::new(-4))),
+            },
+            CounterReset {
+                name: "chapter".to_string(),
+                kind: CounterResetKind::Forward(CounterValue::new(7)),
+            },
+        ]
+    );
+
+    let malformed = parse_declarations("counter-reset: reversed(item extra)");
+    apply_declarations(&mut style, &malformed);
+    assert_eq!(style.counter_resets.len(), 3);
 }
 
 #[tokio::test]
@@ -4533,7 +6041,8 @@ async fn parses_named_string_sets() {
             NamedStringPart::Image(BackgroundImage::Url {
                 src: "icon.png".to_string(),
                 base_url: None,
-                root_url: None
+                root_url: None,
+                request_modifiers: RequestUrlModifiers::default(),
             })
         ]
     );
@@ -4689,6 +6198,96 @@ async fn parses_grid_display_and_core_longhands() {
 }
 
 #[tokio::test]
+async fn parses_escaped_grid_custom_idents() {
+    let declarations = parse_declarations(
+        r#"grid-template-columns: [\31st-start] 10pt [\31st-end];
+           grid-template-areas: "\31st \32nd";
+           grid-column-start: \31st-start;
+           grid-column-end: span \32nd-end 1"#,
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let GridTrackList::Tracks {
+        components: columns,
+        trailing_names,
+    } = &style.grid_template_columns
+    else {
+        panic!("escaped grid-template-columns line names should parse");
+    };
+    let GridTrackListComponent::Track(names, _) = &columns[0] else {
+        panic!("expected escaped named track");
+    };
+    assert_eq!(names, &["1st-start".to_string()]);
+    assert_eq!(trailing_names, &["1st-end".to_string()]);
+
+    let GridTemplateAreas::Areas(rows) = &style.grid_template_areas else {
+        panic!("digit-starting grid-template-areas should parse");
+    };
+    assert_eq!(
+        rows[0].cells,
+        [Some("1st".to_string()), Some("2nd".to_string())]
+    );
+    assert_eq!(
+        style.grid_column_start,
+        GridPlacement::Line(GridLinePlacement {
+            name: Some("1st-start".to_string()),
+            index: None
+        })
+    );
+    assert_eq!(
+        style.grid_column_end,
+        GridPlacement::Span(GridSpanPlacement {
+            name: Some("2nd-end".to_string()),
+            span: Some(1)
+        })
+    );
+}
+
+#[tokio::test]
+async fn parses_bracketed_grid_line_names_with_escape_terminator_whitespace() {
+    let declarations = parse_declarations(r#"grid-template-columns: [\31 a alpha] 10pt [\32 b];"#);
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let GridTrackList::Tracks {
+        components: columns,
+        trailing_names,
+    } = &style.grid_template_columns
+    else {
+        panic!("escaped bracketed grid line names should parse");
+    };
+    let GridTrackListComponent::Track(names, _) = &columns[0] else {
+        panic!("expected named track");
+    };
+    assert_eq!(names, &["1a".to_string(), "alpha".to_string()]);
+    assert_eq!(trailing_names, &["2b".to_string()]);
+}
+
+#[tokio::test]
+async fn grid_template_shorthand_decodes_escaped_area_strings() {
+    let declarations = parse_declarations(r#"grid-template: "\31st \32nd" 10pt / 20pt 30pt"#);
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let GridTemplateAreas::Areas(rows) = &style.grid_template_areas else {
+        panic!("escaped shorthand grid-template-areas should parse");
+    };
+    assert_eq!(
+        rows[0].cells,
+        [Some("1st".to_string()), Some("2nd".to_string())]
+    );
+    let GridTrackList::Tracks {
+        components: columns,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("grid-template columns should parse");
+    };
+    assert_eq!(columns.len(), 2);
+}
+
+#[tokio::test]
 async fn invalid_grid_longhands_do_not_partially_apply() {
     let mut style = default_style_for_tag("div");
     apply_declarations(
@@ -4809,6 +6408,68 @@ async fn invalid_grid_auto_repeat_forms_do_not_apply() {
 }
 
 #[tokio::test]
+async fn invalid_negative_grid_track_breadths_do_not_apply() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-columns: 20pt;\
+             grid-template-rows: minmax(auto, 30pt)",
+        ),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-columns: -10pt;\
+             grid-template-rows: minmax(-1pt, 10pt)",
+        ),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-columns: fit-content(-5pt);\
+             grid-template-rows: minmax(auto, -10pt)",
+        ),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations("grid-template-columns: repeat(auto-fill, -10pt)"),
+    );
+
+    let GridTrackList::Tracks {
+        components: columns,
+        ..
+    } = &style.grid_template_columns
+    else {
+        panic!("valid initial grid-template-columns should remain");
+    };
+    assert_eq!(columns.len(), 1);
+    let GridTrackListComponent::Track(_, ref column_size) = columns[0] else {
+        panic!("valid initial column track should remain");
+    };
+    assert_eq!(
+        column_size.min,
+        GridMinTrackBreadth::LengthPercentage(ComputedLengthPercentage::from_points(20.0))
+    );
+
+    let GridTrackList::Tracks {
+        components: rows, ..
+    } = &style.grid_template_rows
+    else {
+        panic!("valid initial grid-template-rows should remain");
+    };
+    assert_eq!(rows.len(), 1);
+    let GridTrackListComponent::Track(_, ref row_size) = rows[0] else {
+        panic!("valid initial row track should remain");
+    };
+    assert_eq!(row_size.min, GridMinTrackBreadth::Auto);
+    assert_eq!(
+        row_size.max,
+        GridMaxTrackBreadth::LengthPercentage(ComputedLengthPercentage::from_points(30.0))
+    );
+}
+
+#[tokio::test]
 async fn invalid_grid_track_line_names_do_not_apply() {
     let mut style = default_style_for_tag("div");
     apply_declarations(
@@ -4828,6 +6489,10 @@ async fn invalid_grid_track_line_names_do_not_apply() {
     apply_declarations(
         &mut style,
         &parse_declarations("grid-template-columns: [initial] 40pt"),
+    );
+    apply_declarations(
+        &mut style,
+        &parse_declarations("grid-template-columns: [] 50pt"),
     );
 
     let GridTrackList::Tracks {
@@ -5812,6 +7477,25 @@ async fn parses_text_orientation_keywords() {
 }
 
 #[tokio::test]
+async fn parses_text_combine_upright_values() {
+    let mut style = default_style_for_tag("span");
+    apply_declarations(
+        &mut style,
+        &parse_declarations("text-combine-upright: digits 3"),
+    );
+    assert_eq!(style.text_combine_upright, TextCombineUpright::Digits(3));
+
+    apply_declarations(&mut style, &parse_declarations("text-combine-upright: all"));
+    assert_eq!(style.text_combine_upright, TextCombineUpright::All);
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("text-combine-upright: digits 5"),
+    );
+    assert_eq!(style.text_combine_upright, TextCombineUpright::All);
+}
+
+#[tokio::test]
 async fn parses_text_autospace_keyword_set() {
     let declarations =
         parse_declarations("text-autospace: ideograph-alpha ideograph-numeric insert");
@@ -5827,6 +7511,25 @@ async fn parses_text_autospace_keyword_set() {
         &parse_declarations("text-autospace: no-autospace"),
     );
     assert_eq!(style.text_autospace, TextAutospace::NONE);
+}
+
+#[tokio::test]
+async fn parses_inherited_word_space_transform_keyword_set() {
+    let declarations = parse_declarations("word-space-transform: auto-phrase ideographic-space");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.word_space_transform.replacement,
+        Some(WordSpaceReplacement::IdeographicSpace)
+    );
+    assert!(style.word_space_transform.auto_phrase);
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("word-space-transform: none"),
+    );
+    assert_eq!(style.word_space_transform, WordSpaceTransform::NONE);
 }
 
 #[tokio::test]
@@ -5867,7 +7570,7 @@ async fn parses_text_indent_length_percentage_and_modifiers() {
     apply_declarations(&mut style, &declarations);
 
     assert!((style.text_indent.amount.length_points() - 3.0).abs() < 0.001);
-    assert!((style.text_indent.amount.percent - 0.25).abs() < 0.001);
+    assert!((style.text_indent.amount.percentage_coefficient_or_zero() - 0.25).abs() < 0.001);
     assert!(style.text_indent.hanging);
     assert!(style.text_indent.each_line);
 }
@@ -6068,6 +7771,23 @@ async fn parses_reverse_flex_direction_and_wrap_values() {
 }
 
 #[tokio::test]
+async fn parses_balanced_flex_wrap_with_cross_axis_direction() {
+    let declarations = parse_declarations("flex-wrap: balance wrap-reverse");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.flex_wrap, FlexWrap::BalanceReverse);
+    assert!(style.flex_wrap.wraps());
+    assert!(style.flex_wrap.reverses_cross_axis());
+    assert!(style.flex_wrap.balances_lines());
+
+    let declarations = parse_declarations("flex-flow: column balance");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(style.flex_direction, FlexDirection::Column);
+    assert_eq!(style.flex_wrap, FlexWrap::Balance);
+}
+
+#[tokio::test]
 async fn parses_flex_order_property() {
     let declarations = parse_declarations("order: -2");
     let mut style = default_style_for_tag("div");
@@ -6252,6 +7972,16 @@ async fn parses_flex_shrink_and_shorthand() {
         flex_basis_percentage(ComputedLengthPercentage::from_percent(0.0))
     );
 
+    let mut webkit_alias = default_style_for_tag("div");
+    apply_declarations(
+        &mut webkit_alias,
+        &parse_declarations("-webkit-flex-basis: 50pt"),
+    );
+    assert_eq!(
+        webkit_alias.flex_basis,
+        flex_basis_length(ComputedLengthPercentage::from_points(50.0))
+    );
+
     let mut none = default_style_for_tag("div");
     apply_declarations(&mut none, &parse_declarations("flex: none"));
     assert_eq!(none.flex_grow, 0.0);
@@ -6431,6 +8161,49 @@ async fn embedded_html5_ua_stylesheet_matches_weasyprint_defaults() {
 }
 
 #[tokio::test]
+async fn css_text_ua_preformatted_elements_disable_autospace() {
+    let ua = html5_user_agent_stylesheet();
+    let parent = default_style_for_tag("body");
+
+    for tag in [
+        "code",
+        "kbd",
+        "listing",
+        "plaintext",
+        "pre",
+        "samp",
+        "tt",
+        "xmp",
+    ] {
+        let style = style_for_element_with_signature(
+            ElementSignature::new(tag, HashMap::new()),
+            None,
+            std::slice::from_ref(&ua),
+            Some(&parent),
+            &[],
+        );
+        assert_eq!(style.text_autospace, TextAutospace::NONE, "{tag}");
+    }
+}
+
+#[tokio::test]
+async fn html5_ua_pre_dir_auto_uses_plaintext_bidi() {
+    let ua = html5_user_agent_stylesheet();
+    let mut attributes = HashMap::new();
+    attributes.insert("dir".to_string(), "auto".to_string());
+    let parent = default_style_for_tag("body");
+    let style = style_for_element_with_signature(
+        ElementSignature::new("pre", attributes),
+        None,
+        std::slice::from_ref(&ua),
+        Some(&parent),
+        &[],
+    );
+
+    assert_eq!(style.unicode_bidi, UnicodeBidi::Plaintext);
+}
+
+#[tokio::test]
 async fn author_rules_override_user_agent_stylesheet_at_equal_specificity() {
     let ua = html5_user_agent_stylesheet();
     let author = parse_stylesheet(&Css::from_string("p { margin: 0; font-size: 10pt }"));
@@ -6578,14 +8351,14 @@ async fn hr_width_presentational_hint_maps_html_dimensions() {
         panic!("width=100 should map to a length");
     };
     assert!((px_width.length_points() - 100.0 * CSS_PX_TO_PT).abs() < 0.001);
-    assert_eq!(px_width.percent, 0.0);
+    assert_eq!(px_width.percentage_coefficient_or_zero(), 0.0);
 
     let ComputedLengthPercentageOrAuto::LengthPercentage(percent_width) = percent.box_values.width
     else {
         panic!("width=50% should map to a percentage");
     };
     assert_eq!(percent_width.length_points(), 0.0);
-    assert!((percent_width.percent - 0.5).abs() < 0.001);
+    assert!((percent_width.percentage_coefficient_or_zero() - 0.5).abs() < 0.001);
 
     assert!(invalid.box_values.width.is_auto());
 }
@@ -6723,6 +8496,57 @@ async fn ua_stylesheet_applies_inherited_semantic_font_defaults_once() {
     assert_eq!(pre.white_space, WhiteSpace::Pre);
 }
 
+#[test]
+fn text_wrap_longhands_override_the_legacy_white_space_wrap_component() {
+    let mut style = default_style_for_tag("div");
+    let declarations = parse_declarations(
+        "white-space: pre; text-wrap: wrap balance; text-wrap-mode: nowrap; text-wrap-style: auto",
+    );
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.white_space, WhiteSpace::Pre);
+    assert_eq!(style.text_wrap_mode, TextWrapMode::NoWrap);
+    assert_eq!(style.text_wrap_style, TextWrapStyle::Auto);
+    assert!(!style.allows_soft_wrap());
+
+    let declarations = parse_declarations("text-wrap: wrap balance");
+    apply_declarations(&mut style, &declarations);
+    assert!(style.allows_soft_wrap());
+    assert_eq!(style.text_wrap_style, TextWrapStyle::Balance);
+
+    let declarations = parse_declarations("text-wrap-style: stable");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(style.text_wrap_style, TextWrapStyle::Stable);
+
+    let declarations = parse_declarations("line-clamp: 2; -webkit-line-clamp: 3");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(style.line_clamp, Some(LineClamp::new(3, true)));
+}
+
+#[test]
+fn overflow_clip_margin_parses_visual_box_and_nonnegative_length_in_any_order() {
+    let mut style = ComputedStyle::initial();
+    let declarations = parse_declarations("overflow-clip-margin: 10px content-box");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(
+        style.overflow_clip_margin,
+        OverflowClipMargin {
+            reference_box: OverflowClipMarginBox::Content,
+            length: 7.5,
+        }
+    );
+
+    let declarations = parse_declarations("overflow-clip-margin: border-box -1px");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(
+        style.overflow_clip_margin,
+        OverflowClipMargin {
+            reference_box: OverflowClipMarginBox::Content,
+            length: 7.5,
+        }
+    );
+}
+
 #[tokio::test]
 async fn list_item_ua_default_has_no_margin() {
     let style = default_style_for_tag("li");
@@ -6782,7 +8606,7 @@ async fn ch_border_width_preserves_font_metric_component_until_used_resolution()
     assert_eq!(style.border_widths.top, 0.0);
     assert_eq!(style.border_widths.right, 1.0);
 
-    style.resolve_font_metric_lengths(5.0);
+    style.resolve_font_metric_lengths(layout_pt(5.0));
 
     assert_eq!(
         style.border_width_values.top,
@@ -6939,6 +8763,110 @@ async fn maps_logical_border_properties_through_vertical_writing_mode() {
 }
 
 #[tokio::test]
+async fn maps_logical_borders_through_sideways_lr_inline_reversal() {
+    let declarations = parse_declarations(
+        "writing-mode: sideways-lr; direction: ltr; \
+         border-block-start: 2pt solid red; \
+         border-inline-start: 3pt dashed blue",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.writing_mode, WritingMode::SidewaysLr);
+    assert_eq!(style.border_widths.left, 2.0);
+    assert_eq!(style.border_styles.left, BorderStyle::Solid);
+    assert_eq!(style.border_colors.left, Color::new(255, 0, 0));
+    assert_eq!(style.border_widths.bottom, 3.0);
+    assert_eq!(style.border_styles.bottom, BorderStyle::Dashed);
+    assert_eq!(style.border_colors.bottom, Color::new(0, 0, 255));
+}
+
+#[tokio::test]
+async fn writing_mode_preserves_each_modern_keyword() {
+    let mut style = default_style_for_tag("div");
+    for (keyword, expected) in [
+        ("horizontal-tb", WritingMode::HorizontalTb),
+        ("vertical-rl", WritingMode::VerticalRl),
+        ("vertical-lr", WritingMode::VerticalLr),
+        ("sideways-rl", WritingMode::SidewaysRl),
+        ("sideways-lr", WritingMode::SidewaysLr),
+    ] {
+        apply_declarations(
+            &mut style,
+            &parse_declarations(&format!("writing-mode: {keyword}")),
+        );
+        assert_eq!(style.writing_mode, expected, "{keyword}");
+    }
+}
+
+#[tokio::test]
+async fn writing_mode_css_wide_keywords_restore_the_inherited_value_or_initial_value() {
+    assert_eq!(
+        ComputedStyle::initial().writing_mode,
+        WritingMode::HorizontalTb
+    );
+
+    let parent = style_for_element_with_signature(
+        ElementSignature::new("section", HashMap::new()),
+        Some("writing-mode: sideways-lr"),
+        &[],
+        None,
+        &[],
+    );
+    for keyword in ["inherit", "unset"] {
+        let stylesheet = parse_stylesheet(&Css::from_string(format!(
+            "p {{ writing-mode: {keyword} }}"
+        )));
+        let child = style_for_element_with_signature(
+            ElementSignature::new("p", HashMap::new()),
+            None,
+            &[stylesheet],
+            Some(&parent),
+            &[],
+        );
+        assert_eq!(child.writing_mode, WritingMode::SidewaysLr, "{keyword}");
+    }
+
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { writing-mode: sideways-rl; writing-mode: initial }",
+    ));
+    let child = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        Some(&parent),
+        &[],
+    );
+    assert_eq!(child.writing_mode, WritingMode::HorizontalTb);
+
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@layer base, theme; \
+         @layer base { p { writing-mode: sideways-rl } } \
+         @layer theme { p { writing-mode: sideways-lr; writing-mode: revert-layer } }",
+    ));
+    let child = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    assert_eq!(child.writing_mode, WritingMode::SidewaysRl);
+
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { writing-mode: sideways-lr; writing-mode: revert }",
+    ));
+    let child = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    assert_eq!(child.writing_mode, WritingMode::HorizontalTb);
+}
+
+#[tokio::test]
 async fn logical_border_revert_layer_rolls_back_physical_longhand() {
     let css = Css::from_string(
         "@layer base { p { border-inline: 2pt solid red; } }\
@@ -7062,7 +8990,14 @@ async fn parses_border_image_longhands() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.border_image.source.as_deref(),
+        style
+            .border_image
+            .source
+            .as_ref()
+            .and_then(|source| match source.selected_image() {
+                BackgroundImage::Url { src, .. } => Some(src.as_str()),
+                _ => None,
+            }),
         Some("images/border.png")
     );
     assert_eq!(
@@ -7106,6 +9041,19 @@ async fn parses_border_image_longhands() {
 }
 
 #[tokio::test]
+async fn border_image_source_accepts_generated_images() {
+    let declarations =
+        parse_declarations("border-image-source: linear-gradient(to top, blue, orange)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert!(matches!(
+        style.border_image.source,
+        Some(BackgroundImage::LinearGradient(_))
+    ));
+}
+
+#[tokio::test]
 async fn parses_border_image_shorthand_and_resets_omitted_longhands() {
     let declarations = parse_declarations(
         "border-image-width: 4; border-image-outset: 2; border-image: url(\"images/border.png\") 1 20% 3 40% fill / 2 auto 4pt 25% / 1 2pt stretch round",
@@ -7114,7 +9062,14 @@ async fn parses_border_image_shorthand_and_resets_omitted_longhands() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(
-        style.border_image.source.as_deref(),
+        style
+            .border_image
+            .source
+            .as_ref()
+            .and_then(|source| match source.selected_image() {
+                BackgroundImage::Url { src, .. } => Some(src.as_str()),
+                _ => None,
+            }),
         Some("images/border.png")
     );
     assert_eq!(
@@ -7172,7 +9127,7 @@ async fn ch_border_image_outset_preserves_font_metric_component_until_used_resol
         BorderImageOutsetValue::Length(ComputedLengthPercentage::from_points(1.0))
     );
 
-    style.resolve_font_metric_lengths(5.0);
+    style.resolve_font_metric_lengths(layout_pt(5.0));
 
     assert_eq!(
         style.border_image.outset.top,
@@ -7218,10 +9173,42 @@ async fn parses_border_radius_shorthand_lengths_and_percentages() {
         4.0
     );
     assert_eq!(style.border_radius.bottom_left.x.value.length_points(), 8.0);
-    assert_eq!(style.border_radius.top_left.y.value.percent, 0.1);
-    assert_eq!(style.border_radius.top_right.y.value.percent, 0.2);
-    assert_eq!(style.border_radius.bottom_right.y.value.percent, 0.1);
-    assert_eq!(style.border_radius.bottom_left.y.value.percent, 0.2);
+    assert_eq!(
+        style
+            .border_radius
+            .top_left
+            .y
+            .value
+            .percentage_coefficient_or_zero(),
+        0.1
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .top_right
+            .y
+            .value
+            .percentage_coefficient_or_zero(),
+        0.2
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_right
+            .y
+            .value
+            .percentage_coefficient_or_zero(),
+        0.1
+    );
+    assert_eq!(
+        style
+            .border_radius
+            .bottom_left
+            .y
+            .value
+            .percentage_coefficient_or_zero(),
+        0.2
+    );
 }
 
 #[tokio::test]
@@ -7239,13 +9226,20 @@ async fn ch_border_radius_preserves_font_metric_component_until_used_resolution(
         ComputedLengthPercentage::from_points(1.0)
     );
 
-    style.resolve_font_metric_lengths(6.0);
+    style.resolve_font_metric_lengths(layout_pt(6.0));
 
     assert_eq!(
         style.border_radius.top_left.x.value,
         ComputedLengthPercentage::from_points(12.0)
     );
-    assert_eq!(style.border_radius.top_left.x.resolve(100.0), 12.0);
+    assert_eq!(
+        style
+            .border_radius
+            .top_left
+            .x
+            .resolve(PercentageBasis::definite(layout_pt(100.0))),
+        layout_pt(12.0)
+    );
 }
 
 #[tokio::test]
@@ -7256,7 +9250,15 @@ async fn parses_border_radius_corner_longhands() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(style.border_radius.top_left.x.value.length_points(), 4.0);
-    assert_eq!(style.border_radius.top_left.y.value.percent, 0.1);
+    assert_eq!(
+        style
+            .border_radius
+            .top_left
+            .y
+            .value
+            .percentage_coefficient_or_zero(),
+        0.1
+    );
     assert_eq!(
         style.border_radius.bottom_right.x.value.length_points(),
         8.0
@@ -7414,7 +9416,7 @@ async fn ch_border_spacing_preserves_font_metric_component_until_used_resolution
         ComputedLengthPercentage::from_points(1.0)
     );
 
-    style.resolve_font_metric_lengths(5.0);
+    style.resolve_font_metric_lengths(layout_pt(5.0));
 
     assert_eq!(
         style.border_spacing.horizontal,
@@ -7467,7 +9469,7 @@ async fn parses_text_decoration_longhands_and_shorthand_components() {
     assert!(matches!(
         style.text_decoration.thickness,
         TextDecorationThickness::LengthPercentage(value)
-            if (value.length_points() - 2.25).abs() < 0.01 && value.percent == 0.0
+            if (value.length_points() - 2.25).abs() < 0.01 && value.percentage_coefficient_or_zero() == 0.0
     ));
     assert_eq!(style.text_decoration.skip_ink, TextDecorationSkipInk::None);
     assert!(style.text_decoration.skip_spaces.start);
@@ -7476,7 +9478,7 @@ async fn parses_text_decoration_longhands_and_shorthand_components() {
     assert!(matches!(
         style.text_decoration.underline_offset,
         TextUnderlineOffset::LengthPercentage(value)
-            if (value.length_points() - 1.5).abs() < 0.01 && value.percent == 0.0
+            if (value.length_points() - 1.5).abs() < 0.01 && value.percentage_coefficient_or_zero() == 0.0
     ));
     assert!(style.text_decoration.underline_position.under);
 }
@@ -7499,9 +9501,9 @@ async fn parses_css_text_decoration_level_four_properties() {
         style.text_decoration.inset,
         TextDecorationInset::Lengths { start, end }
             if (start.length_points() - 1.5).abs() < 0.01
-                && start.percent == 0.0
+                && start.percentage_coefficient_or_zero() == 0.0
                 && (end.length_points() + 0.75).abs() < 0.01
-                && end.percent == 0.0
+                && end.percentage_coefficient_or_zero() == 0.0
     ));
     assert!(matches!(
         style.text_decoration.skip_self,
@@ -7559,12 +9561,12 @@ async fn ch_text_decoration_inset_preserves_font_metric_component_until_used_res
 
     assert!(matches!(
         style.text_decoration.inset,
-        TextDecorationInset::Lengths { start, end }
-            if start == ComputedLengthPercentage::from_ch(2.0)
-                && end == ComputedLengthPercentage::from_points(1.0)
+        TextDecorationInset::Lengths { ref start, ref end }
+            if *start == ComputedLengthPercentage::from_ch(2.0)
+                && *end == ComputedLengthPercentage::from_points(1.0)
     ));
 
-    style.resolve_font_metric_lengths(6.0);
+    style.resolve_font_metric_lengths(layout_pt(6.0));
 
     assert!(matches!(
         style.text_decoration.inset,
@@ -7609,7 +9611,7 @@ async fn ch_shadow_lengths_preserve_font_metric_component_until_used_resolution(
         ComputedLengthPercentage::from_ch(2.0)
     );
 
-    style.resolve_font_metric_lengths(5.0);
+    style.resolve_font_metric_lengths(layout_pt(5.0));
 
     assert_eq!(
         style.text_shadow[0].offset_x,
@@ -7858,6 +9860,17 @@ async fn parses_text_emphasis_style_keywords_and_strings() {
 
     apply_declarations(
         &mut style,
+        &parse_declarations("writing-mode: sideways-lr; text-emphasis-style: filled"),
+    );
+    assert_eq!(
+        style
+            .text_emphasis_style
+            .mark_for_writing_mode(style.writing_mode),
+        Some("\u{25CF}")
+    );
+
+    apply_declarations(
+        &mut style,
         &parse_declarations("text-emphasis-style: open dot"),
     );
     assert_eq!(
@@ -8007,7 +10020,10 @@ async fn parses_srgb_color_function_border_colors() {
     assert_eq!(style.border_colors.top, Color::srgb(1.0, 0.0, 0.0, 1.0));
     assert_eq!(style.border_colors.right, Color::srgb(0.0, 0.5, 0.0, 0.25));
     assert_eq!(style.border_colors.bottom, Color::srgb(0.2, 0.2, 1.0, 1.0));
-    assert_eq!(style.border_colors.left, Color::srgb(0.0, 1.0, 0.0, 0.5));
+    assert_eq!(
+        style.border_colors.left,
+        Color::in_space(ColorSpace::Srgb, 0.0, 1.5, -1.0, 0.5)
+    );
 }
 
 #[tokio::test]
@@ -8031,35 +10047,32 @@ async fn parses_dimensions() {
     apply_declarations(&mut style, &declarations);
     assert_eq!(
         style.box_values.width,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(0.0),
-            percent: 0.5,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_percent(
+            0.5
+        ))
     );
     assert_eq!(
         style.box_values.height,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(36.0),
-            percent: 0.0,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
+            36.0
+        ))
     );
-    let ComputedLengthPercentageOrAuto::LengthPercentage(min_width) = style.box_values.min_width
+    let ComputedLengthPercentageOrAuto::LengthPercentage(ref min_width) =
+        style.box_values.min_width
     else {
         panic!("min-width should compute to a length");
     };
     assert!((min_width.length_points() - 56.692913).abs() < 0.001);
     assert_eq!(
         style.box_values.max_height,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(36.0),
-            percent: 0.0,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_rem(3.0))
+    );
+    style.finalize_computed_font_relative_lengths();
+    assert_eq!(
+        style.box_values.max_height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
+            36.0
+        ))
     );
     assert_eq!(style.line_height, 15.0);
 }
@@ -8112,42 +10125,209 @@ async fn parses_css_math_length_percentage_values() {
 
     assert_eq!(
         style.box_values.width,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(-24.0),
-            percent: 0.5,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_affine(
+            layout_pt(-24.0),
+            0.5,
+            true
+        ))
     );
     assert_eq!(
         style.box_values.height,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(144.0),
-            percent: 0.0,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
+            144.0
+        ))
+    );
+    let ComputedLengthPercentageOrAuto::LengthPercentage(min_width) = style.box_values.min_width
+    else {
+        panic!("expected deferred min-width");
+    };
+    assert_eq!(
+        min_width
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(100.0)))
+            .map(layout_points),
+        Some(25.0)
     );
     assert_eq!(
-        style.box_values.min_width,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(0.0),
-            percent: 0.25,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        min_width
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(-100.0)))
+            .map(layout_points),
+        Some(-10.0)
     );
     assert_eq!(
         style.box_values.max_height,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(60.0),
-            percent: 0.0,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
+            60.0
+        ))
     );
     assert_eq!(style.font_size, 12.0);
     assert_eq!(style.line_height, 14.0);
+}
+
+#[tokio::test]
+async fn parses_interpolated_percentage_and_viewport_lengths() {
+    let declarations = parse_declarations(
+        "width: calc((0%) * 0.5 + (200vw) * 0.5); height: calc((0%) * 0.5 + (200vh) * 0.5)",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
+        panic!("expected an interpolated width");
+    };
+    let ComputedLengthPercentageOrAuto::LengthPercentage(height) = style.box_values.height else {
+        panic!("expected an interpolated height");
+    };
+    assert_eq!(
+        width,
+        ComputedLengthPercentage::sum(
+            ComputedLengthPercentage::from_neutralized_affine(layout_pt(0.0), 0.0),
+            ComputedLengthPercentage::from_vw(100.0)
+        )
+    );
+    assert!(width.contains_percentage());
+    assert!(!width.needs_percentage_basis());
+    assert_eq!(
+        height,
+        ComputedLengthPercentage::sum(
+            ComputedLengthPercentage::from_neutralized_affine(layout_pt(0.0), 0.0),
+            ComputedLengthPercentage::from_vh(100.0)
+        )
+    );
+    assert!(height.contains_percentage());
+    assert!(!height.needs_percentage_basis());
+}
+
+#[tokio::test]
+async fn preserves_authored_zero_percentage_in_calc_sizing() {
+    let declarations = parse_declarations("width: calc(5em - 0%)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
+        panic!("expected a calculated width");
+    };
+
+    assert!(width.contains_percentage());
+    assert!(width.needs_percentage_basis(), "{width:#?}");
+}
+
+#[tokio::test]
+async fn parses_interpolated_comparison_functions() {
+    let declarations = parse_declarations(
+        "width: calc((min(50px, 30%)) * 0.5 + (max(75%, 100px)) * 0.5); height: calc((min(75%, 160px)) * 0.5 + (max(50px, 20%)) * 0.5)",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
+        panic!("expected an interpolated width");
+    };
+    let ComputedLengthPercentageOrAuto::LengthPercentage(height) = style.box_values.height else {
+        panic!("expected an interpolated height");
+    };
+    // A 200 CSS-pixel containing block is 150 PDF points. The midpoint is a
+    // 100 CSS-pixel square, i.e. 75 PDF points.
+    assert_eq!(
+        width
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(150.0)))
+            .map(layout_points),
+        Some(75.0)
+    );
+    assert_eq!(
+        height
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(150.0)))
+            .map(layout_points),
+        Some(75.0)
+    );
+}
+
+#[tokio::test]
+async fn calc_size_any_without_size_keyword_is_a_definite_length() {
+    let declarations = parse_declarations("width: calc-size(any, calc(20px + 30px))");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(
+        style.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
+            37.5
+        ))
+    );
+}
+
+#[tokio::test]
+async fn calc_size_retains_an_auto_basis_and_affine_calculation() {
+    let declarations = parse_declarations("width: calc-size(auto, size * 0.6 + 23px)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    let ComputedLengthPercentageOrAuto::CalcSize(value) = style.box_values.width else {
+        panic!("expected a retained calc-size value");
+    };
+    assert_eq!(value.basis, CalcSizeBasis::Auto);
+    assert!((value.size_multiplier - 0.6).abs() < 0.000_01);
+    assert_eq!(value.additive.length_points(), 17.25);
+}
+
+#[test]
+fn root_font_size_calc_uses_the_initial_rem_basis() {
+    let value = crate::css::values::parse_deferred_font_size("calc(1rem + 1em)")
+        .expect("calc font-size should parse");
+    let resolved: LayoutLength = value.resolve(FontRelativeLengthBasis::new(
+        layout_pt(ROOT_FONT_SIZE_PT),
+        layout_pt(ROOT_FONT_SIZE_PT * 0.5),
+    ));
+    assert_eq!(resolved, layout_pt(24.0));
+}
+
+#[test]
+fn deferred_font_size_resolves_parent_ex_ch_and_em() {
+    let value = crate::css::values::parse_deferred_font_size("calc(1ex + 1ch + 1em)")
+        .expect("calc font-size should parse");
+    let resolved: LayoutLength = value.resolve(FontRelativeLengthBasis::new(
+        layout_pt(ROOT_FONT_SIZE_PT),
+        layout_pt(ROOT_FONT_SIZE_PT * 0.5),
+    ));
+    assert_eq!(resolved, layout_pt(ROOT_FONT_SIZE_PT * 2.0));
+}
+
+#[tokio::test]
+async fn root_font_size_expression_is_not_reapplied_by_descendants() {
+    let stylesheet = parse_stylesheet(&Css::from_string("html { font-size: calc(1rem + 1em) }"));
+    let html_signature = ElementSignature::new("html", HashMap::new());
+    let html = style_for_element_with_signature(
+        html_signature.clone(),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let body_signature = ElementSignature::new("body", HashMap::new());
+    let body = style_for_element_with_signature(
+        body_signature.clone(),
+        None,
+        std::slice::from_ref(&stylesheet),
+        Some(&html),
+        std::slice::from_ref(&html_signature),
+    );
+    let mut div = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        Some("width: 1em"),
+        std::slice::from_ref(&stylesheet),
+        Some(&body),
+        &[html_signature, body_signature],
+    );
+
+    assert_eq!(html.font_size, ROOT_FONT_SIZE_PT * 2.0);
+    assert_eq!(body.font_size, ROOT_FONT_SIZE_PT * 2.0);
+    assert_eq!(div.font_size, ROOT_FONT_SIZE_PT * 2.0);
+    assert_eq!(div.deferred_font_size, DeferredFontSize::Inherit);
+    assert_eq!(
+        div.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_em(1.0))
+    );
+    div.finalize_computed_font_relative_lengths();
+    assert_eq!(
+        div.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
+            ROOT_FONT_SIZE_PT * 2.0,
+        ))
+    );
 }
 
 #[tokio::test]
@@ -8160,25 +10340,27 @@ async fn length_percentages_preserve_authored_percentage_presence() {
     let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
         panic!("expected length width");
     };
-    assert!(!width.has_percentage);
+    assert!(!width.contains_percentage());
     assert_eq!(width.length_if_no_percent(), Some(40.0));
 
     let ComputedLengthPercentageOrAuto::LengthPercentage(min_width) = style.box_values.min_width
     else {
         panic!("expected percentage min-width");
     };
-    assert!(min_width.has_percentage);
+    assert!(min_width.contains_percentage());
     assert!(min_width.length_if_no_percent().is_none());
 
     let ComputedLengthPercentageOrAuto::LengthPercentage(max_width) = style.box_values.max_width
     else {
         panic!("expected calc max-width");
     };
-    assert!(max_width.has_percentage);
-    assert_eq!(max_width.percent, 0.0);
+    assert!(max_width.contains_percentage());
+    assert_eq!(max_width.percentage_coefficient_or_zero(), 0.0);
     assert!(max_width.length_if_no_percent().is_none());
     assert_eq!(
-        max_width.used_length_with_percentage_basis(200.0),
+        max_width
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(200.0)))
+            .map(layout_points),
         Some(40.0)
     );
 
@@ -8189,8 +10371,26 @@ async fn length_percentages_preserve_authored_percentage_presence() {
     else {
         panic!("expected length max-width");
     };
-    assert!(!max_width.has_percentage);
+    assert!(!max_width.contains_percentage());
     assert_eq!(max_width.length_if_no_percent(), Some(40.0));
+
+    let declarations = parse_declarations("max-width: none; max-height: none");
+    let mut style = default_style_for_tag("div");
+    style.box_values.max_width = ComputedLengthPercentageOrAuto::LengthPercentage(
+        ComputedLengthPercentage::from_points(40.0),
+    );
+    style.box_values.max_height = ComputedLengthPercentageOrAuto::LengthPercentage(
+        ComputedLengthPercentage::from_points(60.0),
+    );
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(
+        style.box_values.max_width,
+        ComputedLengthPercentageOrAuto::Auto
+    );
+    assert_eq!(
+        style.box_values.max_height,
+        ComputedLengthPercentageOrAuto::Auto
+    );
 }
 
 #[tokio::test]
@@ -8201,12 +10401,9 @@ async fn rejects_incomparable_css_math_number_length_values() {
 
     assert_eq!(
         style.box_values.width,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(20.0),
-            percent: 0.0,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
+            20.0
+        ))
     );
 }
 
@@ -8218,15 +10415,16 @@ async fn css_math_defers_ch_comparisons_until_font_metric_resolution() {
     let mut small_ch = default_style_for_tag("div");
     apply_declarations(&mut small_ch, &declarations);
 
-    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = small_ch.box_values.width else {
+    let ComputedLengthPercentageOrAuto::LengthPercentage(ref width) = small_ch.box_values.width
+    else {
         panic!("expected deferred width");
     };
     assert!(width.length_if_no_percent().is_none());
 
     let mut large_ch = small_ch.clone();
 
-    small_ch.resolve_font_metric_lengths(4.0);
-    large_ch.resolve_font_metric_lengths(6.0);
+    small_ch.resolve_font_metric_lengths(layout_pt(4.0));
+    large_ch.resolve_font_metric_lengths(layout_pt(6.0));
 
     assert_eq!(
         small_ch.box_values.width,
@@ -8289,31 +10487,56 @@ async fn css_math_defers_length_percentage_comparisons_until_used_basis_resoluti
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
+    let ComputedLengthPercentageOrAuto::LengthPercentage(ref width) = style.box_values.width else {
         panic!("expected deferred width");
     };
     assert!(width.length_if_no_percent().is_none());
-    assert_eq!(width.used_length_with_percentage_basis(12.0), Some(6.0));
-    assert_eq!(width.used_length_with_percentage_basis(40.0), Some(10.0));
+    assert_eq!(
+        width
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(12.0)))
+            .map(layout_points),
+        Some(6.0)
+    );
+    assert_eq!(
+        width
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(40.0)))
+            .map(layout_points),
+        Some(10.0)
+    );
 
-    let ComputedLengthPercentageOrAuto::LengthPercentage(height) = style.box_values.height else {
+    let ComputedLengthPercentageOrAuto::LengthPercentage(ref height) = style.box_values.height
+    else {
         panic!("expected deferred height");
     };
-    assert_eq!(height.used_length_with_percentage_basis(12.0), Some(10.0));
-    assert_eq!(height.used_length_with_percentage_basis(40.0), Some(20.0));
+    assert_eq!(
+        height
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(12.0)))
+            .map(layout_points),
+        Some(10.0)
+    );
+    assert_eq!(
+        height
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(40.0)))
+            .map(layout_points),
+        Some(20.0)
+    );
 
-    style.resolve_font_metric_lengths(4.0);
+    style.resolve_font_metric_lengths(layout_pt(4.0));
 
     let ComputedLengthPercentageOrAuto::LengthPercentage(min_width) = style.box_values.min_width
     else {
         panic!("expected deferred min-width");
     };
     assert_eq!(
-        min_width.used_length_with_percentage_basis(100.0),
+        min_width
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(100.0)))
+            .map(layout_points),
         Some(41.0)
     );
     assert_eq!(
-        min_width.used_length_with_percentage_basis(60.0),
+        min_width
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(60.0)))
+            .map(layout_points),
         Some(31.0)
     );
 
@@ -8322,16 +10545,45 @@ async fn css_math_defers_length_percentage_comparisons_until_used_basis_resoluti
         panic!("expected deferred max-width");
     };
     assert_eq!(
-        max_width.used_length_with_percentage_basis(12.0),
+        max_width
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(12.0)))
+            .map(layout_points),
         Some(10.0)
     );
     assert_eq!(
-        max_width.used_length_with_percentage_basis(100.0),
+        max_width
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(100.0)))
+            .map(layout_points),
         Some(50.0)
     );
     assert_eq!(
-        max_width.used_length_with_percentage_basis(200.0),
+        max_width
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(200.0)))
+            .map(layout_points),
         Some(80.0)
+    );
+}
+
+#[tokio::test]
+async fn indefinite_percentage_bases_leave_percentage_math_unresolved() {
+    let declarations = parse_declarations("width: 40pt; height: min(10pt, 50%)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = style.box_values.width else {
+        panic!("expected a fixed width");
+    };
+    assert_eq!(
+        width.used_length_with_percentage_basis(PercentageBasis::<LayoutLength>::indefinite()),
+        Some(layout_pt(40.0))
+    );
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(height) = style.box_values.height else {
+        panic!("expected deferred percentage math");
+    };
+    assert_eq!(
+        height.used_length_with_percentage_basis(PercentageBasis::<LayoutLength>::indefinite()),
+        None
     );
 }
 
@@ -8360,7 +10612,7 @@ async fn css_math_same_unit_ch_values_preserve_font_metric_component() {
         ComputedLineHeight::Length(ComputedLengthPercentage::from_ch(2.0))
     );
 
-    style.resolve_font_metric_lengths(5.0);
+    style.resolve_font_metric_lengths(layout_pt(5.0));
 
     assert_eq!(
         style.box_values.width,
@@ -8393,38 +10645,34 @@ async fn css_math_affine_ch_values_reduce_when_unknown_components_cancel() {
 
     assert_eq!(
         style.box_values.width,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(1.0),
-            ch: 2.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::sum(
+            ComputedLengthPercentage::from_points(1.0),
+            ComputedLengthPercentage::from_ch(2.0)
+        ))
     );
     assert_eq!(
         style.box_values.height,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(5.0),
-            ch: 2.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::sum(
+            ComputedLengthPercentage::from_points(5.0),
+            ComputedLengthPercentage::from_ch(2.0)
+        ))
     );
     assert_eq!(
         style.box_values.min_width,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            percent: 0.1,
-            ch: 1.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::sum(
+            ComputedLengthPercentage::from_percent(0.1),
+            ComputedLengthPercentage::from_ch(1.0)
+        ))
     );
     assert_eq!(
         style.line_height_value,
-        ComputedLineHeight::Length(ComputedLengthPercentage {
-            length: layout_pt(3.0),
-            ch: 2.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLineHeight::Length(ComputedLengthPercentage::sum(
+            ComputedLengthPercentage::from_points(3.0),
+            ComputedLengthPercentage::from_ch(2.0)
+        ))
     );
 
-    style.resolve_font_metric_lengths(5.0);
+    style.resolve_font_metric_lengths(layout_pt(5.0));
 
     assert_eq!(
         style.box_values.width,
@@ -8440,11 +10688,11 @@ async fn css_math_affine_ch_values_reduce_when_unknown_components_cancel() {
     );
     assert_eq!(
         style.box_values.min_width,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(5.0),
-            percent: 0.1,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_affine(
+            layout_pt(5.0),
+            0.1,
+            true
+        ))
     );
     assert_eq!(style.line_height, 13.0);
 }
@@ -8462,39 +10710,23 @@ async fn computed_box_values_keep_typed_percentages_and_auto() {
     assert_eq!(style.margin.bottom, 15.0);
     assert_eq!(
         style.box_values.margin.right,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(0.0),
-            percent: 0.1,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_percent(
+            0.1
+        ))
     );
     assert_eq!(
         style.box_values.padding.left,
-        ComputedLengthPercentage {
-            length: layout_pt(7.5),
-            percent: 0.0,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        }
+        ComputedLengthPercentage::from_points(7.5)
     );
     assert_eq!(
         style.box_values.padding.top,
-        ComputedLengthPercentage {
-            length: layout_pt(0.0),
-            percent: 0.05,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        }
+        ComputedLengthPercentage::from_percent(0.05)
     );
     assert_eq!(
         style.box_values.inset_left,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(0.0),
-            percent: 0.25,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_percent(
+            0.25
+        ))
     );
     assert_eq!(style.box_values.width, ComputedLengthPercentageOrAuto::Auto);
 }
@@ -8511,12 +10743,14 @@ async fn em_lengths_use_computed_element_font_size() {
     assert_eq!(style.padding.left, 15.0);
     assert_eq!(
         style.box_values.width,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(75.0),
-            percent: 0.0,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_em(10.0))
+    );
+    style.finalize_computed_font_relative_lengths();
+    assert_eq!(
+        style.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
+            75.0
+        ))
     );
 }
 
@@ -8739,6 +10973,18 @@ async fn ch_font_size_uses_vertical_upright_parent_fallback() {
 
     assert_eq!(child.font_size, 40.0);
     assert_eq!(child.line_height, 48.0);
+
+    parent.writing_mode = WritingMode::SidewaysLr;
+    let child = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        Some("font-size: 2ch"),
+        &[],
+        Some(&parent),
+        &[ElementSignature::new("div", HashMap::new())],
+    );
+
+    assert_eq!(child.font_size, 20.0);
+    assert_eq!(child.line_height, 24.0);
 }
 
 #[tokio::test]
@@ -8754,7 +11000,7 @@ async fn ch_line_height_preserves_font_metric_component_until_used_resolution() 
         ComputedLineHeight::Length(ComputedLengthPercentage::from_ch(5.0))
     );
 
-    style.resolve_font_metric_lengths(8.0);
+    style.resolve_font_metric_lengths(layout_pt(8.0));
 
     assert_eq!(style.line_height, 40.0);
     assert_eq!(
@@ -8787,7 +11033,7 @@ async fn font_shorthand_ch_size_uses_parent_metric_fallback() {
     let mut parent = default_style_for_tag("div");
     parent.font_size = 20.0;
 
-    let child = style_for_element_with_signature(
+    let mut child = style_for_element_with_signature(
         ElementSignature::new("span", HashMap::new()),
         Some("font: 2ch/1 Ahem; width: 1em"),
         &[],
@@ -8797,6 +11043,11 @@ async fn font_shorthand_ch_size_uses_parent_metric_fallback() {
 
     assert_eq!(child.font_size, 20.0);
     assert_eq!(child.line_height, 20.0);
+    assert_eq!(
+        child.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_em(1.0))
+    );
+    child.finalize_computed_font_relative_lengths();
     assert_eq!(
         child.box_values.width,
         ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
@@ -8843,14 +11094,14 @@ async fn authored_font_family_names_are_preserved_for_system_resolution() {
 
     assert_eq!(
         style.font_family,
-        FontFamily::Names(vec![
-            "-apple-system".to_string(),
-            "BlinkMacSystemFont".to_string(),
-            "Segoe UI".to_string(),
-            "Roboto".to_string(),
-            "Helvetica Neue".to_string(),
-            "Arial".to_string(),
-            "sans-serif".to_string(),
+        FontFamily::List(vec![
+            FontFamily::Names(vec!["-apple-system".to_string()]),
+            FontFamily::Names(vec!["BlinkMacSystemFont".to_string()]),
+            FontFamily::Names(vec!["Segoe UI".to_string()]),
+            FontFamily::Names(vec!["Roboto".to_string()]),
+            FontFamily::Names(vec!["Helvetica Neue".to_string()]),
+            FontFamily::Names(vec!["Arial".to_string()]),
+            FontFamily::SansSerif,
         ])
     );
 }
@@ -8886,15 +11137,15 @@ async fn body_font_stack_survives_stylesheet_cascade() {
 
     assert_eq!(
         body.font_family,
-        FontFamily::Names(vec![
-            "-apple-system".to_string(),
-            "BlinkMacSystemFont".to_string(),
-            "Segoe UI".to_string(),
-            "Roboto".to_string(),
-            "Helvetica Neue".to_string(),
-            "Arial".to_string(),
-            "sans-serif".to_string(),
-            "Segoe UI Symbol".to_string(),
+        FontFamily::List(vec![
+            FontFamily::Names(vec!["-apple-system".to_string()]),
+            FontFamily::Names(vec!["BlinkMacSystemFont".to_string()]),
+            FontFamily::Names(vec!["Segoe UI".to_string()]),
+            FontFamily::Names(vec!["Roboto".to_string()]),
+            FontFamily::Names(vec!["Helvetica Neue".to_string()]),
+            FontFamily::Names(vec!["Arial".to_string()]),
+            FontFamily::SansSerif,
+            FontFamily::Names(vec!["Segoe UI Symbol".to_string()]),
         ])
     );
 }
@@ -9439,7 +11690,7 @@ async fn supports_rule_recognizes_text_transform_full_width() {
 
     assert_eq!(style.color, Color::new(0, 0, 255));
     assert_eq!(style.border_colors.top, Color::new(0, 128, 0));
-    assert_eq!(style.background_color, None);
+    assert_eq!(style.background_color, Some(Color::new(255, 0, 0)));
 }
 
 #[tokio::test]
@@ -9476,7 +11727,7 @@ async fn supports_rule_recognizes_css_text_decoration_level_three_values() {
 #[tokio::test]
 async fn supports_rule_ignores_unsupported_declaration_conditions() {
     let stylesheet = parse_stylesheet(&Css::from_string(
-        "@supports (unsupported-reasyprint-feature: true) { p { color: blue } } p { color: red }",
+        "@supports (unsupported-quire-feature: true) { p { color: blue } } p { color: red }",
     ));
     let style = style_for_element_with_signature(
         ElementSignature::new("p", HashMap::new()),
@@ -9514,7 +11765,7 @@ async fn supports_rule_evaluates_selector_conditions_with_selector_parser() {
          @supports selector(p:has(> span)) { p { border-top-color: lime } }\
          @supports selector(p:hover) { p { border-right-color: blue } }\
          @supports selector(p::first-line) { p { border-bottom-color: red } }\
-         @supports selector(p::unsupported-reasyprint-pseudo) { p { background-color: red } }",
+         @supports selector(p::unsupported-quire-pseudo) { p { background-color: red } }",
     ));
     let style = style_for_element_with_signature(
         ElementSignature::new("p", HashMap::new()),
@@ -9576,10 +11827,7 @@ async fn supports_rule_preserves_nested_layer_order() {
 
 #[tokio::test]
 async fn import_layer_places_imported_rules_in_named_layer() {
-    let dir = std::env::temp_dir().join(format!(
-        "reasyprint-import-layer-named-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("quire-import-layer-named-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let imported_path = dir.join("imported.css");
     let main_path = dir.join("main.css");
@@ -9592,9 +11840,9 @@ async fn import_layer_places_imported_rules_in_named_layer() {
     )
     .unwrap();
 
-    let css = Css::from_file_async(&main_path).await.unwrap();
+    let css = Css::from_file(&main_path).await.unwrap();
     let parsed_stylesheets = css
-        .with_imports_async()
+        .with_imports()
         .await
         .unwrap()
         .into_iter()
@@ -9615,7 +11863,7 @@ async fn import_layer_places_imported_rules_in_named_layer() {
 #[tokio::test]
 async fn import_media_not_print_keeps_import_out_of_cascade() {
     let dir = std::env::temp_dir().join(format!(
-        "reasyprint-import-media-not-print-{}",
+        "quire-import-media-not-print-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -9628,9 +11876,9 @@ async fn import_media_not_print_keeps_import_out_of_cascade() {
     )
     .unwrap();
 
-    let css = Css::from_file_async(&main_path).await.unwrap();
+    let css = Css::from_file(&main_path).await.unwrap();
     let parsed_stylesheets = css
-        .with_imports_async()
+        .with_imports()
         .await
         .unwrap()
         .into_iter()
@@ -9651,7 +11899,7 @@ async fn import_media_not_print_keeps_import_out_of_cascade() {
 #[tokio::test]
 async fn import_media_not_screen_loads_import_in_print_context() {
     let dir = std::env::temp_dir().join(format!(
-        "reasyprint-import-media-not-screen-{}",
+        "quire-import-media-not-screen-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -9664,9 +11912,9 @@ async fn import_media_not_screen_loads_import_in_print_context() {
     )
     .unwrap();
 
-    let css = Css::from_file_async(&main_path).await.unwrap();
+    let css = Css::from_file(&main_path).await.unwrap();
     let parsed_stylesheets = css
-        .with_imports_async()
+        .with_imports()
         .await
         .unwrap()
         .into_iter()
@@ -9687,7 +11935,7 @@ async fn import_media_not_screen_loads_import_in_print_context() {
 #[tokio::test]
 async fn anonymous_import_layer_important_beats_unlayered_important() {
     let dir = std::env::temp_dir().join(format!(
-        "reasyprint-import-layer-anonymous-{}",
+        "quire-import-layer-anonymous-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -9700,9 +11948,9 @@ async fn anonymous_import_layer_important_beats_unlayered_important() {
     )
     .unwrap();
 
-    let css = Css::from_file_async(&main_path).await.unwrap();
+    let css = Css::from_file(&main_path).await.unwrap();
     let parsed_stylesheets = css
-        .with_imports_async()
+        .with_imports()
         .await
         .unwrap()
         .into_iter()
@@ -10016,6 +12264,7 @@ async fn normal_inheritance_uses_modeled_inherited_property_metadata() {
     );
 
     assert_eq!(child.letter_spacing, parent.letter_spacing);
+    assert_eq!(child.writing_mode, WritingMode::VerticalRl);
     assert_eq!(child.text_orientation, TextOrientation::Upright);
 }
 
@@ -10175,27 +12424,8 @@ async fn page_margin_longhand_override_survives_cascade_output() {
 }
 
 #[tokio::test]
-async fn revert_layer_applies_to_page_margin_box_declarations() {
-    let stylesheet = parse_stylesheet(&Css::from_string(
-        "@layer base, theme;\
-         @layer base { @page { @top-left { content: \"base\" } } }\
-         @layer theme { @page { @top-left { content: \"theme\"; content: revert-layer } } }",
-    ));
-
-    let top_left = stylesheet.page_margin_boxes.get("top-left").unwrap();
-
-    assert_eq!(
-        top_left.get("content").map(String::as_str),
-        Some("\"base\"")
-    );
-}
-
-#[tokio::test]
 async fn import_layer_applies_to_imported_page_context() {
-    let dir = std::env::temp_dir().join(format!(
-        "reasyprint-import-layer-page-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("quire-import-layer-page-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let imported_path = dir.join("imported.css");
     let main_path = dir.join("main.css");
@@ -10208,9 +12438,9 @@ async fn import_layer_applies_to_imported_page_context() {
     )
     .unwrap();
 
-    let css = Css::from_file_async(&main_path).await.unwrap();
+    let css = Css::from_file(&main_path).await.unwrap();
     let parsed_stylesheets = css
-        .with_imports_async()
+        .with_imports()
         .await
         .unwrap()
         .into_iter()
@@ -10265,12 +12495,9 @@ async fn expands_nested_ampersand_id_rules_with_unitless_zero_offsets() {
     );
     assert_eq!(
         style.box_values.width,
-        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage {
-            length: layout_pt(18.0 * 28.346_457),
-            percent: 0.0,
-            ch: 0.0,
-            ..ComputedLengthPercentage::ZERO
-        })
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
+            18.0 * 28.346_457
+        ))
     );
 }
 
@@ -10361,6 +12588,7 @@ async fn expands_nested_id_descendant_heading_rules() {
             case: TextTransformCase::Uppercase,
             full_width: false,
             full_size_kana: false,
+            math_auto: false,
         }
     );
 }
@@ -10415,6 +12643,7 @@ async fn expands_nested_information_heading_rules() {
             case: TextTransformCase::Uppercase,
             full_width: false,
             full_size_kana: false,
+            math_auto: false,
         }
     );
     assert!(
@@ -10467,7 +12696,7 @@ async fn expands_deep_nested_invoice_table_cell_selectors() {
 
 #[tokio::test]
 async fn invoice_nested_aside_margin_uses_three_value_shorthand() {
-    let css = Css::from_file_async("weasyprint-samples/invoice/invoice.css")
+    let css = Css::from_file("weasyprint-samples/invoice/invoice.css")
         .await
         .unwrap();
     let stylesheet = parse_stylesheet(&css);
@@ -10507,6 +12736,17 @@ async fn parses_break_inside_avoid() {
     apply_declarations(&mut style, &declarations);
 
     assert!(style.break_inside_avoid);
+    assert!(!style.break_inside_avoid_column);
+}
+
+#[tokio::test]
+async fn parses_modern_break_inside_avoid_for_all_fragmentainers() {
+    let declarations = parse_declarations("break-inside: avoid");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert!(style.break_inside_avoid);
+    assert!(style.break_inside_avoid_column);
 }
 
 #[tokio::test]
@@ -10595,14 +12835,17 @@ async fn parses_transform_functions_and_origin() {
     assert_eq!(
         style.transform,
         vec![
-            TransformFunction::Translate(
-                ComputedLengthPercentage::from_points(10.0),
-                ComputedLengthPercentage::from_percent(0.25),
-            ),
-            TransformFunction::Scale(2.0, 1.0),
-            TransformFunction::Rotate(std::f32::consts::FRAC_PI_2),
-            TransformFunction::Skew(0.0, std::f32::consts::FRAC_PI_2),
-            TransformFunction::Matrix(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+            TransformFunction::Translate(CssTransformTranslation {
+                x: ComputedLengthPercentage::from_points(10.0),
+                y: ComputedLengthPercentage::from_percent(0.25),
+            }),
+            TransformFunction::Scale(CssScaleFactors { x: 2.0, y: 1.0 }),
+            TransformFunction::Rotate(euclid::Angle::radians(std::f32::consts::FRAC_PI_2)),
+            TransformFunction::Skew(CssSkewAngles {
+                x: euclid::Angle::radians(0.0),
+                y: euclid::Angle::radians(std::f32::consts::FRAC_PI_2)
+            }),
+            TransformFunction::Matrix(CssAffineMatrix::new(1.0, 2.0, 3.0, 4.0, 5.0, 6.0)),
         ]
     );
     assert_eq!(
@@ -10610,8 +12853,117 @@ async fn parses_transform_functions_and_origin() {
         TransformOrigin {
             x: ComputedLengthPercentage::from_percent(1.0),
             y: ComputedLengthPercentage::from_points(20.0),
+            z: ComputedLengthPercentage::ZERO,
         }
     );
+}
+
+#[tokio::test]
+async fn parses_percentage_scale_factors() {
+    let declarations = parse_declarations("transform: scale(50%, 75%) scaleX(25%) scaleY(125%)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.transform,
+        vec![
+            TransformFunction::Scale(CssScaleFactors { x: 0.5, y: 0.75 }),
+            TransformFunction::Scale(CssScaleFactors { x: 0.25, y: 1.0 }),
+            TransformFunction::Scale(CssScaleFactors { x: 1.0, y: 1.25 }),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn parses_individual_2d_transforms_and_none() {
+    let declarations = parse_declarations(
+        "translate: 2ch 25%; rotate: 90deg; scale: 50% 2; transform: translateX(3pt)",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.individual_transforms,
+        IndividualTransforms {
+            translate: Some(CssTransformTranslation {
+                x: ComputedLengthPercentage::from_ch(2.0),
+                y: ComputedLengthPercentage::from_percent(0.25),
+            }),
+            rotate: Some(euclid::Angle::radians(std::f32::consts::FRAC_PI_2)),
+            scale: Some(CssScaleFactors { x: 0.5, y: 2.0 }),
+        }
+    );
+    assert!(style.has_transform());
+
+    style.resolve_font_metric_lengths(layout_pt(5.0));
+    assert_eq!(
+        style.individual_transforms.translate,
+        Some(CssTransformTranslation {
+            x: ComputedLengthPercentage::from_points(10.0),
+            y: ComputedLengthPercentage::from_percent(0.25),
+        })
+    );
+
+    let declarations =
+        parse_declarations("translate: none; rotate: none; scale: none; transform: none");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(style.individual_transforms, IndividualTransforms::NONE);
+    assert!(!style.has_transform());
+}
+
+#[test]
+fn parses_object_view_box_rectangles() {
+    let mut style = default_style_for_tag("img");
+    apply_declarations(
+        &mut style,
+        &parse_declarations("object-view-box: xywh(10px 20% 30px 40%)"),
+    );
+    assert!(matches!(
+        &style.object_view_box,
+        ObjectViewBox::Xywh { x, y, width, height, radii: None }
+            if (x.length_points() - 7.5).abs() < 0.01
+                && y.percentage_coefficient_or_zero() == 0.2
+                && (width.length_points() - 22.5).abs() < 0.01
+                && height.percentage_coefficient_or_zero() == 0.4
+    ));
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("object-view-box: inset(10% 2pt 30% 4pt round 5pt)"),
+    );
+    assert!(matches!(
+        &style.object_view_box,
+        ObjectViewBox::Inset { top, right, bottom, left, radii: Some(_) }
+            if top.percentage_coefficient_or_zero() == 0.1
+                && (right.length_points() - 2.0).abs() < 0.01
+                && bottom.percentage_coefficient_or_zero() == 0.3
+                && (left.length_points() - 4.0).abs() < 0.01
+    ));
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("object-view-box: rect(1pt, 20pt, 30pt, 4pt)"),
+    );
+    assert!(matches!(&style.object_view_box, ObjectViewBox::Rect { .. }));
+
+    apply_declarations(&mut style, &parse_declarations("object-view-box: none"));
+    assert_eq!(style.object_view_box, ObjectViewBox::None);
+
+    let before = style.object_view_box.clone();
+    apply_declarations(
+        &mut style,
+        &parse_declarations("object-view-box: xywh(1pt 2pt 3pt);"),
+    );
+    assert_eq!(style.object_view_box, before);
+}
+
+#[tokio::test]
+async fn rejects_3d_individual_transform_values() {
+    let declarations = parse_declarations("translate: 1pt 2pt 3pt; rotate: x 90deg; scale: 1 2 3");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.individual_transforms, IndividualTransforms::NONE);
 }
 
 #[tokio::test]
@@ -10623,33 +12975,35 @@ async fn ch_transform_lengths_preserve_font_metric_component_until_used_resoluti
 
     assert_eq!(
         style.transform,
-        vec![TransformFunction::Translate(
-            ComputedLengthPercentage::from_ch(2.0),
-            ComputedLengthPercentage::from_percent(0.25),
-        )]
+        vec![TransformFunction::Translate(CssTransformTranslation {
+            x: ComputedLengthPercentage::from_ch(2.0),
+            y: ComputedLengthPercentage::from_percent(0.25),
+        })]
     );
     assert_eq!(
         style.transform_origin,
         TransformOrigin {
             x: ComputedLengthPercentage::from_ch(3.0),
             y: ComputedLengthPercentage::from_ch(4.0),
+            z: ComputedLengthPercentage::ZERO,
         }
     );
 
-    style.resolve_font_metric_lengths(5.0);
+    style.resolve_font_metric_lengths(layout_pt(5.0));
 
     assert_eq!(
         style.transform,
-        vec![TransformFunction::Translate(
-            ComputedLengthPercentage::from_points(10.0),
-            ComputedLengthPercentage::from_percent(0.25),
-        )]
+        vec![TransformFunction::Translate(CssTransformTranslation {
+            x: ComputedLengthPercentage::from_points(10.0),
+            y: ComputedLengthPercentage::from_percent(0.25),
+        })]
     );
     assert_eq!(
         style.transform_origin,
         TransformOrigin {
             x: ComputedLengthPercentage::from_points(15.0),
             y: ComputedLengthPercentage::from_points(20.0),
+            z: ComputedLengthPercentage::ZERO,
         }
     );
 }
@@ -10679,7 +13033,7 @@ async fn ch_outline_offset_preserves_font_metric_component_until_used_resolution
 
     assert_eq!(style.outline_offset, ComputedLengthPercentage::from_ch(2.0));
 
-    style.resolve_font_metric_lengths(4.0);
+    style.resolve_font_metric_lengths(layout_pt(4.0));
 
     assert_eq!(
         style.outline_offset,
@@ -10699,7 +13053,7 @@ async fn ch_outline_width_preserves_font_metric_component_until_used_resolution(
     );
     assert_eq!(style.outline_width, 0.0);
 
-    style.resolve_font_metric_lengths(4.0);
+    style.resolve_font_metric_lengths(layout_pt(4.0));
 
     assert_eq!(
         style.outline_width_value,
@@ -10760,6 +13114,48 @@ async fn parses_gap_decoration_rule_properties() {
 }
 
 #[tokio::test]
+async fn gap_rule_auto_repeater_truncates_trailing_colors_widths_and_styles_in_authored_order() {
+    let declarations = parse_declarations(
+        "column-rule-color: teal, indigo, violet, repeat(auto, red, green), blue, purple, coral;\
+         column-rule-width: 2px, 5px, 2px, repeat(auto, 4px), 10px, 11px, 12px;\
+         column-rule-style: solid, dashed, dotted, repeat(auto, double), groove, ridge, inset",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(
+        style.column_rule.colors.values_for_count(5),
+        [
+            Color::new(0, 128, 128),
+            Color::new(75, 0, 130),
+            Color::new(238, 130, 238),
+            Color::new(0, 0, 255),
+            Color::new(128, 0, 128),
+        ]
+    );
+    assert_eq!(
+        style.column_rule.widths.values_for_count(5),
+        [
+            ComputedLengthPercentage::from_points(1.5),
+            ComputedLengthPercentage::from_points(3.75),
+            ComputedLengthPercentage::from_points(1.5),
+            ComputedLengthPercentage::from_points(7.5),
+            ComputedLengthPercentage::from_points(8.25),
+        ]
+    );
+    assert_eq!(
+        style.column_rule.styles.values_for_count(5),
+        [
+            BorderStyle::Solid,
+            BorderStyle::Dashed,
+            BorderStyle::Dotted,
+            BorderStyle::Groove,
+            BorderStyle::Ridge,
+        ]
+    );
+}
+
+#[tokio::test]
 async fn parses_gap_rule_inset_shorthand_sides() {
     let declarations = parse_declarations("rule-inset: 1pt 2pt / 3pt 4pt");
     let mut style = default_style_for_tag("div");
@@ -10797,4 +13193,99 @@ async fn parses_gap_rule_inset_shorthand_sides() {
         style.row_rule.inset_junction_end,
         style.column_rule.inset_junction_end
     );
+}
+
+#[test]
+fn deferred_font_size_detects_only_parent_ch_dependencies() {
+    let parent_size = 12.0;
+
+    assert!(!DeferredFontSize::Absolute(18.0).requires_parent_ch_advance(parent_size));
+    assert!(!DeferredFontSize::Inherit.requires_parent_ch_advance(parent_size));
+    assert!(
+        DeferredFontSize::RelativeToParent(ComputedLengthPercentage::from_ch(2.0))
+            .requires_parent_ch_advance(parent_size)
+    );
+}
+
+#[test]
+fn object_fit_parses_and_cascades() {
+    let mut style = ComputedStyle::initial();
+    apply_declarations(
+        &mut style,
+        &parse_declarations("object-fit: contain; object-fit: cover"),
+    );
+    assert_eq!(style.object_fit, ObjectFit::Cover);
+}
+
+#[test]
+fn computed_style_ch_advance_query_matches_font_metric_projection() {
+    fn projected_requires_ch_advance(style: &ComputedStyle) -> bool {
+        let mut projected = style.clone();
+        projected.resolve_font_metric_lengths(layout_pt(0.0));
+        style != &projected
+    }
+
+    for (declarations, expected) in [
+        ("", false),
+        (
+            "line-height: 2ch; row-gap: 3ch; column-gap: 4ch; column-width: 5ch; column-height: 6ch; letter-spacing: 7ch; word-spacing: 8ch; width: 9ch; border-radius: 10ch; border-width: 11ch; outline-width: 12ch; outline-offset: 13ch; flex-basis: 14ch; text-indent: 15ch; vertical-align: 16ch; tab-size: 17ch",
+            true,
+        ),
+        (
+            "grid-template-columns: minmax(1ch, fit-content(2ch)) repeat(2, 3ch); grid-auto-rows: minmax(4ch, 5ch); grid-auto-columns: 6ch",
+            true,
+        ),
+        (
+            "background: linear-gradient(to right, red 2ch, blue 10vw); background-size: 3ch 4ch; background-position: 5ch 6ch",
+            true,
+        ),
+        (
+            "background: radial-gradient(circle 2ch at 3ch 4ch, red 5ch, 6ch, blue)",
+            true,
+        ),
+        (
+            "transform: translate(2ch, 25%); transform-origin: 3ch 4ch; border-image-width: 2ch; border-image-outset: 3ch; text-decoration-thickness: 4ch; text-decoration-inset: 5ch 6ch; text-underline-offset: 7ch; text-shadow: 8ch 9ch; box-shadow: 10ch 11ch black; border-spacing: 12ch",
+            true,
+        ),
+        (
+            "row-rule-width: 2ch; column-rule-width: 3ch; rule-inset-start: 4ch",
+            true,
+        ),
+        ("width: calc(1ch + 2pt)", true),
+        ("width: 2em; height: 10vw", false),
+    ] {
+        let mut style = ComputedStyle::initial();
+        apply_declarations(&mut style, &parse_declarations(declarations));
+
+        assert_eq!(
+            style.requires_ch_advance(),
+            expected,
+            "declarations: {declarations}",
+        );
+        assert_eq!(
+            style.requires_ch_advance(),
+            projected_requires_ch_advance(&style),
+            "declarations: {declarations}",
+        );
+    }
+
+    let mut style = ComputedStyle::initial();
+    style.box_values.width =
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_ch(2.0));
+    assert!(style.requires_ch_advance());
+    style.resolve_font_metric_lengths(layout_pt(5.0));
+    assert!(!style.requires_ch_advance());
+}
+
+#[test]
+fn computed_style_selected_font_metrics_include_ic_ex_and_cap() {
+    for declaration in ["width: 2ic", "width: 2ex", "width: 2cap"] {
+        let mut style = ComputedStyle::initial();
+        apply_declarations(&mut style, &parse_declarations(declaration));
+
+        assert!(style.requires_selected_font_metrics(), "{declaration}");
+    }
+
+    let style = ComputedStyle::initial();
+    assert!(!style.requires_selected_font_metrics());
 }

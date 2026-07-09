@@ -1,6 +1,6 @@
 # CSS Box Alignment Parity
 
-Last updated: 2026-07-06
+Last updated: 2026-07-08
 
 This document tracks Quire's implementation status for CSS Box Alignment
 features that are shared across layout modes. The normative reference is CSS
@@ -84,8 +84,19 @@ Fragmentation Level 3.
 - Same-page grid layout maps common CSS Box Alignment values for
   `align-content`, `justify-content`, `align-items`, `justify-items`,
   `align-self`, and `justify-self` through Taffy's grid alignment model.
-  Baseline alignment and writing-mode-sensitive `self-start`/`self-end`
-  details still need Quire-owned follow-up handling.
+  Simple horizontal first- and last-baseline self-alignment between measured
+  text items in the same row is corrected with a Quire-owned post-layout pass;
+  horizontal `justify-self`/`justify-items` `self-start`/`self-end` placement
+  also uses a post-layout correction so LTR/RTL grid items align the edge
+  defined by their own inline direction; horizontal `align-self`/`align-items`
+  `self-start`/`self-end` uses the same correction layer for block-axis
+  placement. Horizontal
+  `justify-self`/`justify-items` `left`/`right` uses the same correction layer
+  so those keywords remain physical in LTR and RTL grids. Same-page horizontal
+  grid container first/last exported baselines come from occupied grid rows for
+  inline-grid and nested grid baseline-sharing cases.
+  Broader baseline alignment and orthogonal writing-mode-sensitive
+  `self-start`/`self-end` details still need follow-up handling.
 - Existing smoke coverage checks flex line stretch/end/baseline behavior,
   `place-content` expansion, block-container centering, min-height-constrained
   block-container centering, default/safe/unsafe
@@ -104,15 +115,27 @@ Fragmentation Level 3.
   auto-width and definite-parent percentage nested vertical row flex first/last
   baseline exports,
   column flex first/last-baseline self-alignment fallback, basic same-page grid
-  `justify-items` placement,
+  `justify-items` placement, horizontal `justify-self`/`justify-items`
+  `self-start`/`self-end` direction-sensitive placement, horizontal
+  `align-self`/`align-items` `self-start`/`self-end` direction-sensitive
+  placement, RTL
+  `justify-self`/`justify-items` `left`/`right` physical placement, horizontal
+  first-/last-baseline same-row text alignment, simple spanning grid baseline
+  groups, plus nested grid last exported baseline alignment,
   and the parser's valid/invalid overflow-position combinations.
 
 ## Remaining Gaps
 
 - Grid alignment is partial. Common same-page self/content alignment keywords
-  are passed to Taffy, but baseline alignment, writing-mode-specific
-  `self-start`/`self-end`, page fragmentation, and broader WPT coverage remain
-  incomplete.
+  are passed to Taffy, and simple horizontal first-/last-baseline same-row
+  text alignment plus occupied-row first/last exported grid container
+  baselines are corrected with Quire-measured item baselines. Horizontal
+  grid `justify-self`/`justify-items` and `align-self`/`align-items`
+  `self-start`/`self-end`, plus `justify-self`/`justify-items` `left`/`right`,
+  placement is covered for LTR/RTL grids. Simple spanning items share baselines
+  with same-start-row or same-end-row peers, but full exported baseline
+  synthesis, broader spanning baseline groups, broader writing-mode-specific
+  self-alignment, page fragmentation, and broader WPT coverage remain incomplete.
 - General multi-column `align-content` behavior needs a dedicated conformance
   pass once column balancing and fragmentation are represented as durable
   alignment subjects.

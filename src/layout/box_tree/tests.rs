@@ -1,10 +1,9 @@
 use super::*;
 use crate::css::{
-    ComputedLengthPercentage, ComputedLengthPercentageOrAuto, ComputedLineHeight, Css, FontFamily,
-    TextOrientation,
+    ComputedLengthPercentage, ComputedLengthPercentageOrAuto, ComputedLineHeight, Css, Edges,
+    FontFamily, TextOrientation,
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
 
 fn parent_style() -> ComputedStyle {
@@ -51,6 +50,16 @@ fn styled_text_box(text: &str, style: &ComputedStyle) -> MutableFormattingBox<'s
     })
 }
 
+fn formatting_box_contains_text(box_: &FormattingBox<'_>, text: &str) -> bool {
+    match box_ {
+        FormattingBox::Text(text_box) => text_box.text.contains(text),
+        _ => box_
+            .children()
+            .iter()
+            .any(|child| formatting_box_contains_text(child, text)),
+    }
+}
+
 #[test]
 fn freeze_child_boxes_shares_equal_style_handles() {
     let mut style = ComputedStyle::initial();
@@ -83,6 +92,79 @@ fn owned_style_mutation_does_not_mutate_frozen_style() {
 
     assert_eq!(text.style.font_size, 19.0);
     assert_eq!(derived.font_size, 23.0);
+}
+
+#[test]
+fn hidden_optgroup_suppresses_option_boxes() {
+    let root = dom::parse(
+        r#"<body><select size="4" class="red"><optgroup class="none green"><option>option</option></optgroup></select></body>"#,
+    );
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        ".none { display: none } .red { color: red } .green { color: green }",
+    ));
+    let page = build_test_page(&root, &[stylesheet]);
+    let body = &page.children[0].children()[0];
+    let select = &body.children()[0];
+
+    assert!(
+        !formatting_box_contains_text(select, "option"),
+        "hidden optgroup should suppress descendant option boxes: {select:#?}"
+    );
+}
+
+#[test]
+fn hidden_option_inside_visible_optgroup_is_not_boxed() {
+    let root = dom::parse(
+        r#"<body><select size="4" class="red"><optgroup><option class="none">option</select></body>"#,
+    );
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        ".none { display: none } .red { color: red }",
+    ));
+    let page = build_test_page(&root, &[stylesheet]);
+    let body = &page.children[0].children()[0];
+    let select = &body.children()[0];
+
+    assert!(
+        !formatting_box_contains_text(select, "option"),
+        "hidden option should not create descendant text boxes: {select:#?}"
+    );
+}
+
+#[test]
+fn select_display_none_wpt_fixture_has_no_option_text_boxes() {
+    let root = dom::parse(
+        r#"<body>
+<option class="none red">text</option>
+<optgroup class="none red">text</optgroup>
+<optgroup class="none red"><option>option</option></optgroup>
+<optgroup><option class="none red">option</option></optgroup>
+<optgroup class="contents red"><option class="none">option</option></optgroup>
+<optgroup class="contents green" label="optgroup"><option class="none red">option</option></optgroup>
+<optgroup class="none red" label="optgroup"><option class="red">option</option></optgroup>
+<br>
+<select class="red" size="4">select</select>
+<select size="4" class="red"><optgroup class="none" label="optgroup"></select>
+<select size="4" class="red"><option class="none">option</select>
+<select size="4" class="red"><optgroup><option class="none">option</select>
+<select size="4"><optgroup class="none"><option class="green">option</select>
+<select size="4" class="red"><optgroup class="none green" label="optgroup"><option>option</select>
+<select size="4" class="red"><optgroup class="none"><option class="none">option</select>
+<select size="4" class="red"><optgroup class="none green" label="optgroup"><option class="none">option</select>
+</body>"#,
+    );
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        ".none { display: none } .contents { display: contents } .red { color: red } .green { color: green }",
+    ));
+    let page = build_test_page(&root, &[stylesheet]);
+
+    assert!(
+        !page
+            .children
+            .iter()
+            .any(|child| formatting_box_contains_text(child, "option")),
+        "fixture should not create option text boxes: {:#?}",
+        page.children
+    );
 }
 
 #[test]
@@ -309,6 +391,42 @@ fn generated_fixed_pseudos_are_out_of_flow_tree_abiding_boxes() {
 }
 
 #[test]
+fn floated_generated_pseudos_do_not_own_originating_element_children() {
+    let root = dom::parse(
+        "<html><body><section id=\"target\"><h4>Heading</h4><p>Body</p></section></body></html>",
+    );
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        "#target::before { content: ''; display: inline-block; float: left; height: 20pt; width: 20pt }",
+    ));
+    let page = build_test_page(&root, &[stylesheet]);
+    let section = &page.children[0].children()[0].children()[0];
+    assert_eq!(
+        section
+            .children()
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![
+            FormattingBoxKind::AnonymousBlock,
+            FormattingBoxKind::Block,
+            FormattingBoxKind::Block,
+        ]
+    );
+    let FormattingBox::AnonymousBlock(anonymous) = &section.children()[0] else {
+        panic!("expected an anonymous wrapper for the inline floated pseudo");
+    };
+    let before = &anonymous.children[0];
+
+    assert!(matches!(
+        before,
+        FormattingBox::AtomicInline(box_)
+            if matches!(&box_.source, BoxSource::GeneratedPseudo(pseudo)
+                if pseudo.kind == GeneratedPseudoKind::Before)
+    ));
+    assert!(before.children().is_empty());
+}
+
+#[test]
 fn box_tree_preserves_font_shorthand_unit_line_height() {
     let root = dom::parse(
         "<html><body><div class=\"ref\">XX<br>XX</div><div class=\"test\">&#x3000;&#x3000;XX</div></body></html>",
@@ -345,7 +463,8 @@ async fn font_size_ch_uses_measured_parent_zero_advance_during_box_tree_build() 
                 font-size: 40pt;
             }"#,
         )
-        .with_base_url(Some(PathBuf::from("."))),
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
     );
     let mut metric_style = ComputedStyle {
         font_family: FontFamily::Names(vec!["MetricProbe".to_string()]),
@@ -359,7 +478,7 @@ async fn font_size_ch_uses_measured_parent_zero_advance_during_box_tree_build() 
         .await;
     let parent_ch_advance = font_system.ch_advance(&metric_style);
     assert!(
-        (parent_ch_advance - metric_style.font_size * 0.5).abs() > 0.01,
+        (parent_ch_advance.points() - metric_style.font_size * 0.5).abs() > 0.01,
         "fixture must differ from the generic 0.5em ch fallback"
     );
 
@@ -367,9 +486,27 @@ async fn font_size_ch_uses_measured_parent_zero_advance_during_box_tree_build() 
     let span = &page.children[0].children()[0].children()[0].children()[0];
 
     assert!(
-        (span.style().font_size - parent_ch_advance * 2.0).abs() < 0.01,
+        (span.style().font_size - parent_ch_advance.points() * 2.0).abs() < 0.01,
         "font-size: 2ch should resolve against the measured parent zero advance"
     );
+}
+
+#[test]
+fn mutable_tree_defers_parent_ch_font_size_without_a_font_system() {
+    let root = dom::parse(
+        "<html><body><div><span style=\"font-size: 2ch\">probe</span></div></body></html>",
+    );
+    let page = build_page_box(
+        &root,
+        &[css::html5_user_agent_stylesheet()],
+        &parent_style(),
+    );
+    let span = &page.children[0].children()[0].children()[0].children()[0];
+
+    assert!(matches!(
+        &span.style().deferred_font_size,
+        css::DeferredFontSize::RelativeToParent(value) if *value == css::ComputedLengthPercentage::from_ch(2.0)
+    ));
 }
 
 #[tokio::test]
@@ -396,7 +533,8 @@ async fn pseudo_font_size_ch_uses_measured_originating_zero_advance_during_box_t
                 font-size: 4ch;
             }"#,
         )
-        .with_base_url(Some(PathBuf::from("."))),
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
     );
     let mut metric_style = ComputedStyle {
         font_family: FontFamily::Names(vec!["MetricProbe".to_string()]),
@@ -410,7 +548,7 @@ async fn pseudo_font_size_ch_uses_measured_originating_zero_advance_during_box_t
         .await;
     let originating_ch_advance = font_system.ch_advance(&metric_style);
     assert!(
-        (originating_ch_advance - metric_style.font_size * 0.5).abs() > 0.01,
+        (originating_ch_advance.points() - metric_style.font_size * 0.5).abs() > 0.01,
         "fixture must differ from the generic 0.5em ch fallback"
     );
 
@@ -419,17 +557,22 @@ async fn pseudo_font_size_ch_uses_measured_originating_zero_advance_during_box_t
     let style = paragraph.style();
 
     assert!(
-        (style.before_style.as_ref().unwrap().font_size - originating_ch_advance * 2.0).abs()
+        (style.before_style.as_ref().unwrap().font_size - originating_ch_advance.points() * 2.0)
+            .abs()
             < 0.01,
         "::before font-size: 2ch should use the measured originating zero advance"
     );
     assert!(
-        (style.first_line_style.as_ref().unwrap().font_size - originating_ch_advance * 3.0).abs()
+        (style.first_line_style.as_ref().unwrap().font_size
+            - originating_ch_advance.points() * 3.0)
+            .abs()
             < 0.01,
         "::first-line font-size: 3ch should use the measured originating zero advance"
     );
     assert!(
-        (style.first_letter_style.as_ref().unwrap().font_size - originating_ch_advance * 4.0).abs()
+        (style.first_letter_style.as_ref().unwrap().font_size
+            - originating_ch_advance.points() * 4.0)
+            .abs()
             < 0.01,
         "::first-letter font-size: 4ch should use the measured originating zero advance"
     );
@@ -460,6 +603,34 @@ fn mixed_inline_and_block_children_create_anonymous_blocks_in_order() {
             .collect::<Vec<_>>(),
         vec![FormattingBoxKind::Text]
     );
+}
+
+#[test]
+fn anonymous_blocks_reset_non_inherited_parent_properties() {
+    let stylesheet = css::parse_stylesheet(&Css::from_string(
+        ".parent { color: red; writing-mode: vertical-rl; margin: 20pt; padding: 10pt; border: 3pt solid green; background: blue; width: 40pt; position: relative; float: left }",
+    ));
+    let root =
+        dom::parse("<html><body><div class=\"parent\">Before<p>Block</p>After</div></body></html>");
+    let page = build_test_page(&root, &[stylesheet]);
+    let div = &page.children[0].children()[0].children()[0];
+
+    for anonymous in [&div.children()[0], &div.children()[2]] {
+        let FormattingBox::AnonymousBlock(anonymous) = anonymous else {
+            panic!("expected anonymous block");
+        };
+        let style = &anonymous.style;
+        assert_eq!(style.display, Display::BLOCK);
+        assert_eq!(style.color, Color::new(255, 0, 0));
+        assert_eq!(style.writing_mode, WritingMode::VerticalRl);
+        assert_eq!(style.margin, Edges::ZERO);
+        assert_eq!(style.padding, Edges::ZERO);
+        assert_eq!(style.border_widths, Edges::ZERO);
+        assert_eq!(style.background_color, None);
+        assert!(style.box_values.width.is_auto());
+        assert_eq!(style.position, Position::Static);
+        assert_eq!(style.float, Float::None);
+    }
 }
 
 #[test]
@@ -1091,6 +1262,22 @@ fn table_fragment_ignores_whitespace_between_internal_cells() {
 }
 
 #[test]
+fn table_fragment_ignores_preserved_whitespace_adjacent_to_internal_children() {
+    let root = dom::parse(
+        "<html><body><div style=\"display:table; white-space:break-spaces\">\n  <span style=\"display:table-row\">\n    <span style=\"display:table-cell\">A</span>\n    <!-- split indentation -->\n  </span>\n</div></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let table = &page.children[0].children()[0].children()[0];
+
+    let FormattingBox::Table(table) = table else {
+        panic!("expected table formatting box");
+    };
+    assert_eq!(table.fragment.rows.len(), 1);
+    assert_eq!(table.fragment.rows[0].cells.len(), 1);
+    assert!(!table.fragment.rows[0].cells[0].anonymous);
+}
+
+#[test]
 fn body_display_table_preserves_positioned_child_in_table_fragment() {
     let root = dom::parse(
         "<html><body style=\"display:table\"><div style=\"display:table-cell\">A</div><p style=\"position:absolute;top:0;left:0\">Out of flow</p></body></html>",
@@ -1180,6 +1367,80 @@ fn display_contents_inside_table_flattens_children_with_inherited_style() {
     for row in &table.fragment.rows {
         for cell in &row.cells {
             assert_eq!(cell.children[0].style().color, Color::new(0, 128, 0));
+        }
+    }
+}
+
+#[test]
+fn display_contents_inside_table_row_wraps_misparented_row_in_anonymous_cell() {
+    let root = dom::parse(
+        "<html><body><div style=\"display:table;color:red\"><div style=\"display:table-row\"><div style=\"display:contents;color:green\">X<div style=\"display:table-cell\">X</div>X<div style=\"display:table-row\">X</div>X</div></div></div></body></html>",
+    );
+    let page = build_test_page(&root, &[]);
+    let table = &page.children[0].children()[0].children()[0];
+
+    let FormattingBox::Table(table) = table else {
+        panic!("expected table formatting box");
+    };
+    assert_eq!(table.fragment.rows.len(), 1);
+    let row = &table.fragment.rows[0];
+    assert_eq!(row.cells.len(), 3);
+
+    assert!(row.cells[0].anonymous);
+    assert_eq!(table_cell_text(&row.cells[0]), "X");
+    assert_eq!(
+        row.cells[1].element.map(|element| element.tag.as_str()),
+        Some("div")
+    );
+    assert_eq!(table_cell_text(&row.cells[1]), "X");
+    assert!(row.cells[2].anonymous);
+    assert_eq!(
+        row.cells[2]
+            .children
+            .iter()
+            .map(FormattingBox::kind)
+            .collect::<Vec<_>>(),
+        vec![
+            FormattingBoxKind::Text,
+            FormattingBoxKind::Table,
+            FormattingBoxKind::Text
+        ]
+    );
+
+    let FormattingBox::Table(nested_table) = &row.cells[2].children[1] else {
+        panic!("expected nested anonymous table in trailing anonymous cell");
+    };
+    assert_eq!(nested_table.style.display, Display::TABLE);
+    assert_eq!(nested_table.fragment.rows.len(), 1);
+    assert_eq!(nested_table.fragment.rows[0].cells.len(), 1);
+    assert_eq!(
+        table_cell_text(&nested_table.fragment.rows[0].cells[0]),
+        "X"
+    );
+
+    for cell in &row.cells {
+        assert_table_cell_text_color(cell, Color::new(0, 128, 0));
+    }
+}
+
+fn assert_table_cell_text_color(cell: &TableFragmentCell<'_>, color: Color) {
+    for child in &cell.children {
+        assert_formatting_box_text_color(child, color);
+    }
+}
+
+fn assert_formatting_box_text_color(box_: &FormattingBox<'_>, color: Color) {
+    if let FormattingBox::Text(text) = box_ {
+        assert_eq!(text.style.color, color);
+    }
+    for child in box_.children() {
+        assert_formatting_box_text_color(child, color);
+    }
+    if let FormattingBox::Table(table) = box_ {
+        for row in &table.fragment.rows {
+            for cell in &row.cells {
+                assert_table_cell_text_color(cell, color);
+            }
         }
     }
 }

@@ -1,10 +1,11 @@
 use super::font_registry::FontSupportKind;
 use super::*;
-use crate::css::{
-    BaselineShift, ComputedLengthPercentage, FontSizeAdjust, FontSizeAdjustMetric,
-    FontSizeAdjustValue,
+use crate::css::{BaselineShift, FontSizeAdjust, FontSizeAdjustMetric, FontSizeAdjustValue};
+use crate::document::{PaintSize, PaintTransform};
+use crate::{
+    Color, PaintPoint, PaintRect, RenderedImage, RenderedLine, RenderedPath, RenderedPathCommand,
+    RenderedPathFillRule, RenderedTextRun,
 };
-use crate::{RenderedLine, RenderedTextRun};
 
 mod split_1;
 pub(in crate::text) use self::split_1::*;

@@ -1,4 +1,7 @@
 use super::*;
+use crate::css::cascade::{
+    parse_initial_letter, parse_initial_letter_align, parse_initial_letter_wrap,
+};
 use crate::css::types::Color;
 use crate::css::values::{
     parse_alignment_baseline, parse_baseline_shift, parse_baseline_source, parse_border_spacing,

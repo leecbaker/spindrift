@@ -23,15 +23,19 @@ pub(crate) enum PdfUserSpace {}
 
 /// A point in page-local paint coordinates.
 pub type PaintPoint = euclid::Point2D<f32, PaintSpace>;
-/// A page-local paint-space translation vector.
+/// A local physical displacement in page-local paint coordinates.
 ///
-/// This represents movement within the already resolved CSS painting plane:
 /// `x` moves right and `y` moves upward from the physical bottom-left of the
-/// page. Use this for translating captured paint fragments and display-list
-/// primitives; layout top-edge coordinates should be converted before creating
-/// a paint-space vector:
+/// page. Use this for relative geometry such as shadow and box offsets; whole
+/// paint-object relocation uses [`PaintTranslation`] instead:
 /// <https://www.w3.org/TR/css2/visuren.html#painting-order>.
-pub(crate) type PaintVector = euclid::Vector2D<f32, PaintSpace>;
+pub(crate) type PaintDisplacement = euclid::Vector2D<f32, PaintSpace>;
+/// A same-space translation of a complete page-local paint object.
+///
+/// The source and destination markers make this an operation on paint
+/// geometry, rather than a local distance vector:
+/// <https://www.w3.org/TR/css2/visuren.html#painting-order>.
+pub(crate) type PaintTranslation = euclid::Translation2D<f32, PaintSpace, PaintSpace>;
 /// A size in page-local paint coordinates.
 pub type PaintSize = euclid::Size2D<f32, PaintSpace>;
 /// A bottom-left-origin rectangle in page-local paint coordinates.
@@ -64,15 +68,81 @@ pub(crate) fn paint_point_to_pdf(point: PaintPoint) -> PdfPoint {
 }
 
 impl Page {
+    /// Paint a document-canvas rectangle beneath every document stacking
+    /// context band.
+    ///
+    /// The propagated root/body background is canvas paint, rather than a
+    /// background of the root element's ordinary box. Keep it in the page
+    /// paint tree even when a later opaque primitive covers it: layout tests,
+    /// accessibility inspection, and alternative backends observe this tree
+    /// as the CSS paint model, not as a PDF-only optimization:
+    /// <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds> and
+    /// <https://www.w3.org/TR/CSS22/zindex.html>.
+    pub(crate) fn push_document_canvas_rect(&mut self, rect: RenderedRect) {
+        // A propagated root/body background is the document canvas, below
+        // ordinary root descendants and their backgrounds. PageBackground is
+        // the first document paint band, so adding it after layout cannot
+        // accidentally cover already-recorded in-flow content.
+        // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
+        self.push_rect_in_band(PaintBand::PageBackground, rect);
+    }
+
+    /// Capture a stable insertion position in one root paint band.
+    ///
+    /// Some non-stacking boxes own paint that belongs between their own
+    /// decoration and descendant content. In particular, CSS Multicol says a
+    /// column rule is painted just above its multicol container's border while
+    /// column boxes remain in the same stacking context. Capturing the current
+    /// band length lets layout insert that local paint after descendants have
+    /// been laid out, without manufacturing a stacking context or moving the
+    /// descendants into an atomic subtree:
+    /// <https://www.w3.org/TR/css-multicol-1/#column-gaps-and-rules> and
+    /// <https://www.w3.org/TR/css-multicol-1/#stacking-context>.
+    pub(crate) fn paint_band_insertion_point(&self, band: PaintBand) -> PaintBandInsertionPoint {
+        PaintBandInsertionPoint {
+            band,
+            item_index: self.paint_tree.root.bands.bands[band.index()].len(),
+        }
+    }
+
+    /// Insert page-local primitives at a previously captured paint position.
+    ///
+    /// Primitive arrays remain append-only; only their operation nodes move in
+    /// paint order.
+    pub(crate) fn insert_primitives_at_paint_band_point(
+        &mut self,
+        point: PaintBandInsertionPoint,
+        primitives: impl IntoIterator<Item = PaintPrimitive>,
+    ) {
+        let operations = primitives
+            .into_iter()
+            .map(|primitive| self.record_paint_primitive(primitive))
+            .collect::<Vec<_>>();
+        if operations.is_empty() {
+            return;
+        }
+        let band = &mut self.paint_tree.root.bands.bands[point.band.index()];
+        debug_assert!(
+            point.item_index <= band.len(),
+            "paint insertion point must belong to the active page"
+        );
+        band.splice(
+            point.item_index.min(band.len())..point.item_index.min(band.len()),
+            operations.into_iter().map(PaintDisplayItem::Operation),
+        );
+    }
+
     pub(crate) fn paint_checkpoint(&self) -> PaintCheckpoint {
         PaintCheckpoint {
-            operations: self.operations.clone(),
             paint_tree: self.paint_tree.clone(),
             rects: self.rects.clone(),
             rounded_rects: self.rounded_rects.clone(),
             paths: self.paths.clone(),
             strokes: self.strokes.clone(),
             images: self.images.clone(),
+            image_patterns: self.image_patterns.clone(),
+            gradient_patterns: self.gradient_patterns.clone(),
+            svg_patterns: self.svg_patterns.clone(),
             lines: self.lines.clone(),
             links: self.links.clone(),
         }
@@ -82,78 +152,30 @@ impl Page {
         &mut self,
         checkpoint: PaintCheckpoint,
     ) -> PaintFragment {
-        if let (Some(current_tree), Some(checkpoint_tree)) =
-            (&self.paint_tree, &checkpoint.paint_tree)
-        {
-            let fragment = current_tree.fragment_since(checkpoint_tree, self);
-            self.operations = checkpoint.operations;
-            self.paint_tree = checkpoint.paint_tree;
-            self.rects = checkpoint.rects;
-            self.rounded_rects = checkpoint.rounded_rects;
-            self.paths = checkpoint.paths;
-            self.strokes = checkpoint.strokes;
-            self.images = checkpoint.images;
-            self.lines = checkpoint.lines;
-            self.links = checkpoint.links;
-            return fragment;
-        }
-
-        // CSS positioned/fixed layout first lays out an independent box, then
-        // paints it into the stacking context slot selected by CSS 2.2 Appendix
-        // E. Capture by primitive identity rather than operation index: block
-        // backgrounds may be inserted earlier in paint order and shift indexes
-        // for primitives that existed before the checkpoint.
-        let mut checkpoint_primitives = checkpoint
-            .paint_primitives_for_operations(&checkpoint.operations)
-            .into_iter()
-            .map(Some)
-            .collect::<Vec<_>>();
-        let primitives = self
-            .paint_primitives_for_operations(&self.operations)
-            .into_iter()
-            .filter(|primitive| {
-                let Some(position) =
-                    checkpoint_primitives
-                        .iter()
-                        .position(|checkpoint_primitive| {
-                            checkpoint_primitive.as_ref() == Some(primitive)
-                        })
-                else {
-                    return true;
-                };
-                checkpoint_primitives[position] = None;
-                false
-            })
-            .collect();
-        let links = self.links[checkpoint.links.len()..].to_vec();
-
-        self.operations = checkpoint.operations;
+        let fragment = self.paint_tree.fragment_since(&checkpoint.paint_tree, self);
         self.paint_tree = checkpoint.paint_tree;
         self.rects = checkpoint.rects;
         self.rounded_rects = checkpoint.rounded_rects;
         self.paths = checkpoint.paths;
         self.strokes = checkpoint.strokes;
         self.images = checkpoint.images;
+        self.image_patterns = checkpoint.image_patterns;
+        self.gradient_patterns = checkpoint.gradient_patterns;
+        self.svg_patterns = checkpoint.svg_patterns;
         self.lines = checkpoint.lines;
         self.links = checkpoint.links;
-        PaintFragment::from_primitives(primitives, links)
+        fragment
     }
 
-    pub(crate) fn paint_tree_fragment_since(
-        &self,
-        checkpoint: &PaintCheckpoint,
-    ) -> Option<PaintFragment> {
-        let (Some(current_tree), Some(checkpoint_tree)) =
-            (&self.paint_tree, &checkpoint.paint_tree)
-        else {
-            return None;
-        };
-        Some(PaintFragment {
+    pub(crate) fn paint_tree_fragment_since(&self, checkpoint: &PaintCheckpoint) -> PaintFragment {
+        PaintFragment {
             display_list: PaintDisplayList {
-                bands: current_tree.operation_node_fragment_since(checkpoint_tree),
+                bands: self
+                    .paint_tree
+                    .operation_node_fragment_since(&checkpoint.paint_tree),
             },
             links: Vec::new(),
-        })
+        }
     }
 
     pub(crate) fn replace_paint_tree_since_with_context(
@@ -162,16 +184,12 @@ impl Page {
         band: PaintBand,
         context: PaintStackingContext,
     ) {
-        let Some(checkpoint_tree) = &checkpoint.paint_tree else {
-            return;
-        };
-        let Some(tree) = &mut self.paint_tree else {
-            return;
-        };
-        tree.root.bands = checkpoint_tree.root.bands.clone();
-        tree.root.bands.push_context_in_band(band, context);
-        self.operations = tree.flattened_operations();
-        self.links = tree.transformed_links();
+        self.paint_tree.root.bands = checkpoint.paint_tree.root.bands.clone();
+        self.paint_tree
+            .root
+            .bands
+            .push_context_in_band(band, context);
+        self.links = self.paint_tree.transformed_links();
     }
 
     pub(crate) fn replace_paint_tree_since_with_fragment(
@@ -179,16 +197,12 @@ impl Page {
         checkpoint: &PaintCheckpoint,
         fragment: PaintFragment,
     ) {
-        let Some(checkpoint_tree) = &checkpoint.paint_tree else {
-            return;
-        };
-        let Some(tree) = &mut self.paint_tree else {
-            return;
-        };
-        tree.root.bands = checkpoint_tree.root.bands.clone();
-        tree.root.bands.append_bands(fragment.display_list.bands);
-        self.operations = tree.flattened_operations();
-        self.links = tree.transformed_links();
+        self.paint_tree.root.bands = checkpoint.paint_tree.root.bands.clone();
+        self.paint_tree
+            .root
+            .bands
+            .append_bands(fragment.display_list.bands);
+        self.links = self.paint_tree.transformed_links();
     }
 
     pub(crate) fn prepend_recorded_primitives_to_fragment(
@@ -229,15 +243,15 @@ impl Page {
     /// <https://www.w3.org/TR/CSS22/zindex.html>.
     pub(crate) fn take_paint_fragment(&mut self) -> PaintFragment {
         let fragment = self.paint_fragment();
-        self.operations.clear();
-        if let Some(tree) = &mut self.paint_tree {
-            tree.clear();
-        }
+        self.paint_tree.clear();
         self.rects.clear();
         self.rounded_rects.clear();
         self.paths.clear();
         self.strokes.clear();
         self.images.clear();
+        self.image_patterns.clear();
+        self.gradient_patterns.clear();
+        self.svg_patterns.clear();
         self.lines.clear();
         self.links.clear();
         fragment
@@ -245,7 +259,6 @@ impl Page {
 
     pub(crate) fn push_rect_in_band(&mut self, band: PaintBand, rect: RenderedRect) -> usize {
         let (index, operation) = self.record_rect(rect);
-        self.operations.push(operation);
         self.push_paint_tree_operation_in_band(band, operation);
         index
     }
@@ -256,21 +269,57 @@ impl Page {
         rect: RenderedRoundedRect,
     ) -> usize {
         let (index, operation) = self.record_rounded_rect(rect);
-        self.operations.push(operation);
         self.push_paint_tree_operation_in_band(band, operation);
         index
     }
 
     pub(crate) fn push_path_in_band(&mut self, band: PaintBand, path: RenderedPath) -> usize {
         let (index, operation) = self.record_path(path);
-        self.operations.push(operation);
         self.push_paint_tree_operation_in_band(band, operation);
         index
     }
 
+    /// Record an SVG compositing subtree without flattening its opacity or
+    /// blend boundaries into individual paths.
+    pub(crate) fn push_svg_group_in_band(
+        &mut self,
+        band: PaintBand,
+        group: crate::svg::SvgPaintGroup,
+    ) {
+        let scope = self.record_svg_group(group);
+        self.paint_tree
+            .root
+            .bands
+            .push_effect_scope_in_band(band, scope);
+    }
+
+    fn record_svg_group(&mut self, group: crate::svg::SvgPaintGroup) -> PaintEffectScope {
+        let mut items = Vec::new();
+        for item in group.items {
+            match item {
+                crate::svg::SvgPaintItem::Path(path) => {
+                    let operation = self.record_path(*path).1;
+                    items.push(PaintDisplayItem::Operation(operation));
+                }
+                crate::svg::SvgPaintItem::Group(group) => {
+                    items.push(PaintDisplayItem::EffectScope(self.record_svg_group(*group)));
+                }
+            }
+        }
+        PaintEffectScope::new(
+            PaintEffects {
+                opacity: group.opacity,
+                blend_mode: group.blend_mode,
+                isolation: group.isolation,
+                ..PaintEffects::default()
+            },
+            group.bounds,
+            items,
+        )
+    }
+
     pub(crate) fn push_stroke_in_band(&mut self, band: PaintBand, stroke: RenderedStroke) -> usize {
         let (index, operation) = self.record_stroke(stroke);
-        self.operations.push(operation);
         self.push_paint_tree_operation_in_band(band, operation);
         index
     }
@@ -282,13 +331,45 @@ impl Page {
     pub(crate) fn push_line_in_band(&mut self, band: PaintBand, line: RenderedLine) -> usize {
         let mut last_index = None;
         for line in split_rendered_line_at_font_run_boundaries(line) {
-            if let Some(index) = self.try_merge_with_previous_line(&line) {
+            if let Some(index) = self.try_merge_with_previous_line(band, &line) {
                 last_index = Some(index);
                 continue;
             }
             let (index, operation) = self.record_line(line);
-            self.operations.push(operation);
             self.push_paint_tree_operation_in_band(band, operation);
+            last_index = Some(index);
+        }
+        last_index.expect("at least one rendered line segment")
+    }
+
+    /// Record a shaped line inside a rectangular overflow clip scope.
+    ///
+    /// Text operators paint whole glyph runs, so a partially visible line
+    /// must retain its original shaping and be clipped by the PDF graphics
+    /// state rather than being discarded by layout. Keeping the scope in the
+    /// original paint band preserves CSS 2.2 Appendix E ordering:
+    /// <https://www.w3.org/TR/css-overflow-3/#overflow-clip-edge> and
+    /// <https://www.w3.org/TR/CSS22/zindex.html>.
+    pub(crate) fn push_line_clipped_in_band(
+        &mut self,
+        band: PaintBand,
+        line: RenderedLine,
+        clip: PaintClip,
+    ) -> usize {
+        let mut last_index = None;
+        for line in split_rendered_line_at_font_run_boundaries(line) {
+            let (index, operation) = self.record_line(line);
+            self.paint_tree.root.bands.push_effect_scope_in_band(
+                band,
+                PaintEffectScope::new(
+                    PaintEffects {
+                        overflow_clip: Some(clip),
+                        ..PaintEffects::default()
+                    },
+                    Some(clip),
+                    vec![PaintDisplayItem::Operation(operation)],
+                ),
+            );
             last_index = Some(index);
         }
         last_index.expect("at least one rendered line segment")
@@ -296,89 +377,89 @@ impl Page {
 
     pub(in crate::document) fn try_merge_with_previous_line(
         &mut self,
+        band: PaintBand,
         line: &RenderedLine,
     ) -> Option<usize> {
-        let Some(PaintOperation::Line(index)) = self.operations.last().copied() else {
+        let Some(PaintDisplayItem::Operation(PaintOperation::Line(index))) =
+            self.paint_tree.root.bands.bands[band.index()].last()
+        else {
             return None;
         };
-        let previous = self.lines.get_mut(index)?;
+        let previous = self.lines.get_mut(*index)?;
         if rendered_lines_can_merge_as_inline_continuation(previous, line) {
             previous.append_same_line_continuation(line);
-            return Some(index);
+            return Some(*index);
         }
         if !rendered_lines_can_merge_with_word_gap(previous, line) {
             return None;
         }
         previous.append_same_line_with_gap(line);
-        Some(index)
+        Some(*index)
     }
 
     pub(crate) fn push_image_in_band(&mut self, band: PaintBand, image: RenderedImage) -> usize {
         let (index, operation) = self.record_image(image);
-        self.operations.push(operation);
+        self.push_paint_tree_operation_in_band(band, operation);
+        index
+    }
+
+    pub(crate) fn push_image_pattern_in_band(
+        &mut self,
+        band: PaintBand,
+        pattern: RenderedImagePattern,
+    ) -> usize {
+        let (index, operation) = self.record_image_pattern(pattern);
+        self.push_paint_tree_operation_in_band(band, operation);
+        index
+    }
+
+    pub(crate) fn push_gradient_pattern_in_band(
+        &mut self,
+        band: PaintBand,
+        pattern: RenderedGradientPattern,
+    ) -> usize {
+        let (index, operation) = self.record_gradient_pattern(pattern);
+        self.push_paint_tree_operation_in_band(band, operation);
+        index
+    }
+
+    pub(crate) fn push_svg_pattern_in_band(
+        &mut self,
+        band: PaintBand,
+        pattern: RenderedSvgPattern,
+    ) -> usize {
+        let (index, operation) = self.record_svg_pattern(pattern);
         self.push_paint_tree_operation_in_band(band, operation);
         index
     }
 
     pub(crate) fn push_link(&mut self, link: RenderedLink) {
         self.links.push(link.clone());
-        if let Some(tree) = &mut self.paint_tree {
-            tree.push_link(PaintBand::Inline, link);
-        }
+        self.paint_tree.push_link(PaintBand::Inline, link);
     }
 
-    /// Return the CSS painting order used for PDF content stream emission.
+    /// Return a flattened inspection view of the CSS paint tree.
     ///
     /// CSS 2.2 Appendix E defines painting as an ordered sequence, and PDF content
     /// streams preserve visible stacking by serializing drawing operators in that
-    /// order. New layout code records this order explicitly in `operations`; the
-    /// synthesized fallback keeps older externally-built pages renderable.
-    pub fn paint_operations(&self) -> Cow<'_, [PaintOperation]> {
-        if let Some(tree) = &self.paint_tree
-            && !tree.is_empty()
-        {
-            return Cow::Owned(tree.flattened_operations());
-        }
-        if !self.operations.is_empty() {
-            return Cow::Borrowed(&self.operations);
-        }
-
-        let mut operations = Vec::new();
-        operations.extend(
-            self.images
-                .iter()
-                .enumerate()
-                .filter(|(_, image)| image.background)
-                .map(|(index, _)| PaintOperation::Image(index)),
-        );
-        operations.extend((0..self.rects.len()).map(PaintOperation::Rect));
-        operations.extend((0..self.rounded_rects.len()).map(PaintOperation::RoundedRect));
-        operations.extend((0..self.paths.len()).map(PaintOperation::Path));
-        operations.extend((0..self.strokes.len()).map(PaintOperation::Stroke));
-        operations.extend(
-            self.images
-                .iter()
-                .enumerate()
-                .filter(|(_, image)| !image.background)
-                .map(|(index, _)| PaintOperation::Image(index)),
-        );
-        operations.extend((0..self.lines.len()).map(PaintOperation::Line));
-        Cow::Owned(operations)
+    /// order. The retained tree is authoritative; this projection intentionally
+    /// does not provide an alternative serialization path.
+    pub(crate) fn paint_operations(&self) -> Cow<'_, [PaintOperation]> {
+        Cow::Owned(self.paint_tree.flattened_operations())
     }
 
     pub(crate) fn validate_paint_operations(&self, page_index: usize) -> Result<()> {
-        if self.operations.is_empty() {
-            return Ok(());
-        }
-
         let mut rects_seen = vec![false; self.rects.len()];
         let mut rounded_rects_seen = vec![false; self.rounded_rects.len()];
         let mut paths_seen = vec![false; self.paths.len()];
         let mut strokes_seen = vec![false; self.strokes.len()];
         let mut images_seen = vec![false; self.images.len()];
+        let mut image_patterns_seen = vec![false; self.image_patterns.len()];
+        let mut gradient_patterns_seen = vec![false; self.gradient_patterns.len()];
+        let mut svg_patterns_seen = vec![false; self.svg_patterns.len()];
         let mut lines_seen = vec![false; self.lines.len()];
 
-        for (operation_index, operation) in self.operations.iter().enumerate() {
+        for (operation_index, operation) in self.paint_operations().iter().enumerate() {
             match operation {
                 PaintOperation::Rect(index) => mark_operation_index(
                     &mut rects_seen,
@@ -420,6 +501,30 @@ impl Page {
                     operation_index,
                     "image",
                 )?,
+                PaintOperation::ImagePattern(index) => mark_operation_index(
+                    &mut image_patterns_seen,
+                    *index,
+                    self.image_patterns.len(),
+                    page_index,
+                    operation_index,
+                    "image pattern",
+                )?,
+                PaintOperation::GradientPattern(index) => mark_operation_index(
+                    &mut gradient_patterns_seen,
+                    *index,
+                    self.gradient_patterns.len(),
+                    page_index,
+                    operation_index,
+                    "gradient pattern",
+                )?,
+                PaintOperation::SvgPattern(index) => mark_operation_index(
+                    &mut svg_patterns_seen,
+                    *index,
+                    self.svg_patterns.len(),
+                    page_index,
+                    operation_index,
+                    "SVG pattern",
+                )?,
                 PaintOperation::Line(index) => mark_operation_index(
                     &mut lines_seen,
                     *index,
@@ -436,23 +541,19 @@ impl Page {
         ensure_all_operations_referenced(&paths_seen, page_index, "path")?;
         ensure_all_operations_referenced(&strokes_seen, page_index, "stroke")?;
         ensure_all_operations_referenced(&images_seen, page_index, "image")?;
+        ensure_all_operations_referenced(&image_patterns_seen, page_index, "image pattern")?;
+        ensure_all_operations_referenced(&gradient_patterns_seen, page_index, "gradient pattern")?;
+        ensure_all_operations_referenced(&svg_patterns_seen, page_index, "SVG pattern")?;
         ensure_all_operations_referenced(&lines_seen, page_index, "line")?;
         Ok(())
     }
 
-    pub(crate) fn paint_tree(&self) -> Option<&PagePaintTree> {
-        self.paint_tree.as_ref().filter(|tree| !tree.is_empty())
+    pub(crate) fn paint_tree(&self) -> &PagePaintTree {
+        &self.paint_tree
     }
 
     pub(crate) fn finalize_paint_tree_for_public_view(&mut self) {
-        let Some(tree) = &self.paint_tree else {
-            return;
-        };
-        if tree.is_empty() {
-            return;
-        }
-        self.operations = tree.flattened_operations();
-        self.links = tree.transformed_links();
+        self.links = self.paint_tree.transformed_links();
     }
 
     pub(crate) fn record_rect(&mut self, rect: RenderedRect) -> (usize, PaintOperation) {
@@ -494,29 +595,40 @@ impl Page {
         (index, PaintOperation::Image(index))
     }
 
-    pub(crate) fn paint_primitives_for_operations(
-        &self,
-        operations: &[PaintOperation],
-    ) -> Vec<PaintPrimitive> {
-        operations
-            .iter()
-            .filter_map(|operation| self.paint_primitive(operation))
-            .collect()
+    pub(crate) fn record_image_pattern(
+        &mut self,
+        pattern: RenderedImagePattern,
+    ) -> (usize, PaintOperation) {
+        let index = self.image_patterns.len();
+        self.image_patterns.push(pattern);
+        (index, PaintOperation::ImagePattern(index))
+    }
+
+    pub(crate) fn record_gradient_pattern(
+        &mut self,
+        pattern: RenderedGradientPattern,
+    ) -> (usize, PaintOperation) {
+        let index = self.gradient_patterns.len();
+        self.gradient_patterns.push(pattern);
+        (index, PaintOperation::GradientPattern(index))
+    }
+
+    pub(crate) fn record_svg_pattern(
+        &mut self,
+        pattern: RenderedSvgPattern,
+    ) -> (usize, PaintOperation) {
+        let index = self.svg_patterns.len();
+        self.svg_patterns.push(pattern);
+        (index, PaintOperation::SvgPattern(index))
     }
 
     pub(crate) fn paint_fragment(&self) -> PaintFragment {
-        if let Some(tree) = &self.paint_tree {
-            return PaintFragment {
-                display_list: PaintDisplayList {
-                    bands: tree.root.bands.primitive_node_copy(self),
-                },
-                links: Vec::new(),
-            };
+        PaintFragment {
+            display_list: PaintDisplayList {
+                bands: self.paint_tree.root.bands.primitive_node_copy(self),
+            },
+            links: Vec::new(),
         }
-        PaintFragment::from_primitives(
-            self.paint_primitives_for_operations(&self.paint_operations()),
-            self.links.clone(),
-        )
     }
 
     pub(crate) fn record_paint_primitive(&mut self, primitive: PaintPrimitive) -> PaintOperation {
@@ -529,6 +641,9 @@ impl Page {
             PaintPrimitive::Path(path) => self.record_path(path).1,
             PaintPrimitive::Stroke(stroke) => self.record_stroke(stroke).1,
             PaintPrimitive::Image(image) => self.record_image(image).1,
+            PaintPrimitive::ImagePattern(pattern) => self.record_image_pattern(pattern).1,
+            PaintPrimitive::GradientPattern(pattern) => self.record_gradient_pattern(pattern).1,
+            PaintPrimitive::SvgPattern(pattern) => self.record_svg_pattern(pattern).1,
             PaintPrimitive::Line(line) => self.record_line(line).1,
         }
     }
@@ -536,46 +651,67 @@ impl Page {
     pub(crate) fn record_paint_fragment(
         &mut self,
         fragment: &PaintFragment,
-        offset: PaintVector,
+        offset: PaintTranslation,
     ) -> RecordedPaintFragment {
-        let translated = fragment.clone().translated(offset);
-        let operations = translated
-            .flattened_primitives()
-            .into_iter()
-            .map(|primitive| self.record_paint_primitive(primitive))
-            .collect::<Vec<_>>();
-        let mut operation_iter = operations.iter().copied();
+        self.record_paint_fragment_owned(fragment.clone(), offset)
+    }
+
+    pub(crate) fn record_paint_fragment_owned(
+        &mut self,
+        fragment: PaintFragment,
+        offset: PaintTranslation,
+    ) -> RecordedPaintFragment {
+        let translated = fragment.translated(offset);
         let display_list = translated
             .display_list
-            .into_operation_nodes(&mut operation_iter)
+            .into_recorded_nodes(self)
             .with_links(PaintBand::Inline, translated.links);
         let mut links = Vec::new();
         display_list
             .bands
             .push_transformed_links(PaintTransform::identity(), &mut links);
         self.links.extend(links);
-        RecordedPaintFragment {
-            operations,
-            display_list,
-        }
+        RecordedPaintFragment { display_list }
     }
 
-    pub(crate) fn append_paint_fragment(&mut self, fragment: &PaintFragment, offset: PaintVector) {
+    pub(crate) fn append_paint_fragment(
+        &mut self,
+        fragment: &PaintFragment,
+        offset: PaintTranslation,
+    ) {
         let recorded = self.record_paint_fragment(fragment, offset);
         self.append_recorded_paint_fragment(recorded);
     }
 
+    pub(crate) fn append_paint_fragment_owned(
+        &mut self,
+        fragment: PaintFragment,
+        offset: PaintTranslation,
+    ) {
+        let recorded = self.record_paint_fragment_owned(fragment, offset);
+        self.append_recorded_paint_fragment(recorded);
+    }
+
+    /// Replay a fragment below all existing page paint in each CSS paint band.
+    ///
+    /// Negative-z generated page-margin boxes are discovered after normal
+    /// document layout, but CSS Paged Media paints them below the page canvas.
+    /// <https://www.w3.org/TR/css-page-3/#painting>
+    pub(crate) fn prepend_paint_fragment_owned(
+        &mut self,
+        fragment: PaintFragment,
+        offset: PaintTranslation,
+    ) {
+        let recorded = self.record_paint_fragment_owned(fragment, offset);
+        self.paint_tree.prepend_display_list(recorded.display_list);
+    }
+
     pub(crate) fn append_recorded_paint_fragment(&mut self, recorded: RecordedPaintFragment) {
-        if let Some(tree) = &mut self.paint_tree {
-            tree.append_display_list(recorded.display_list);
-        }
-        self.operations.extend(recorded.operations);
+        self.paint_tree.append_display_list(recorded.display_list);
     }
 
     pub(crate) fn sort_paint_tree_stacking_contexts(&mut self) {
-        if let Some(tree) = &mut self.paint_tree {
-            tree.sort_stacking_contexts();
-        }
+        self.paint_tree.sort_stacking_contexts();
     }
 
     pub(in crate::document) fn paint_primitive(
@@ -589,7 +725,7 @@ impl Page {
             PaintOperation::RoundedRect(index) => self
                 .rounded_rects
                 .get(*index)
-                .copied()
+                .cloned()
                 .map(PaintPrimitive::RoundedRect),
             PaintOperation::Path(index) => {
                 self.paths.get(*index).cloned().map(PaintPrimitive::Path)
@@ -597,11 +733,26 @@ impl Page {
             PaintOperation::Stroke(index) => self
                 .strokes
                 .get(*index)
-                .copied()
+                .cloned()
                 .map(PaintPrimitive::Stroke),
             PaintOperation::Image(index) => {
                 self.images.get(*index).cloned().map(PaintPrimitive::Image)
             }
+            PaintOperation::ImagePattern(index) => self
+                .image_patterns
+                .get(*index)
+                .cloned()
+                .map(PaintPrimitive::ImagePattern),
+            PaintOperation::GradientPattern(index) => self
+                .gradient_patterns
+                .get(*index)
+                .cloned()
+                .map(PaintPrimitive::GradientPattern),
+            PaintOperation::SvgPattern(index) => self
+                .svg_patterns
+                .get(*index)
+                .cloned()
+                .map(PaintPrimitive::SvgPattern),
             PaintOperation::Line(index) => {
                 self.lines.get(*index).cloned().map(PaintPrimitive::Line)
             }
@@ -613,10 +764,19 @@ impl Page {
         band: PaintBand,
         operation: PaintOperation,
     ) {
-        if let Some(tree) = &mut self.paint_tree {
-            tree.push_operation(band, operation);
-        }
+        self.paint_tree.push_operation(band, operation);
     }
+}
+
+/// A consumed, page-local cursor into a CSS paint-order band.
+///
+/// The fields stay private so layout cannot accidentally confuse primitive
+/// array indexes with display-list positions. Consuming the value on insertion
+/// also prevents reusing a cursor after the band has changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaintBandInsertionPoint {
+    band: PaintBand,
+    item_index: usize,
 }
 
 pub(in crate::document) fn mark_operation_index(
@@ -673,62 +833,25 @@ pub enum PaintOperation {
     Path(usize),
     Stroke(usize),
     Image(usize),
+    ImagePattern(usize),
+    GradientPattern(usize),
+    SvgPattern(usize),
     Line(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PaintCheckpoint {
-    pub(in crate::document) operations: Vec<PaintOperation>,
-    pub(in crate::document) paint_tree: Option<PagePaintTree>,
+    pub(in crate::document) paint_tree: PagePaintTree,
     pub(in crate::document) rects: Vec<RenderedRect>,
     pub(in crate::document) rounded_rects: Vec<RenderedRoundedRect>,
     pub(in crate::document) paths: Vec<RenderedPath>,
     pub(in crate::document) strokes: Vec<RenderedStroke>,
     pub(in crate::document) images: Vec<RenderedImage>,
+    pub(in crate::document) image_patterns: Vec<RenderedImagePattern>,
+    pub(in crate::document) gradient_patterns: Vec<RenderedGradientPattern>,
+    pub(in crate::document) svg_patterns: Vec<RenderedSvgPattern>,
     pub(in crate::document) lines: Vec<RenderedLine>,
     pub(in crate::document) links: Vec<RenderedLink>,
-}
-
-impl PaintCheckpoint {
-    pub(in crate::document) fn paint_primitives_for_operations(
-        &self,
-        operations: &[PaintOperation],
-    ) -> Vec<PaintPrimitive> {
-        operations
-            .iter()
-            .filter_map(|operation| self.paint_primitive(operation))
-            .collect()
-    }
-
-    pub(in crate::document) fn paint_primitive(
-        &self,
-        operation: &PaintOperation,
-    ) -> Option<PaintPrimitive> {
-        match operation {
-            PaintOperation::Rect(index) => {
-                self.rects.get(*index).cloned().map(PaintPrimitive::Rect)
-            }
-            PaintOperation::RoundedRect(index) => self
-                .rounded_rects
-                .get(*index)
-                .copied()
-                .map(PaintPrimitive::RoundedRect),
-            PaintOperation::Path(index) => {
-                self.paths.get(*index).cloned().map(PaintPrimitive::Path)
-            }
-            PaintOperation::Stroke(index) => self
-                .strokes
-                .get(*index)
-                .copied()
-                .map(PaintPrimitive::Stroke),
-            PaintOperation::Image(index) => {
-                self.images.get(*index).cloned().map(PaintPrimitive::Image)
-            }
-            PaintOperation::Line(index) => {
-                self.lines.get(*index).cloned().map(PaintPrimitive::Line)
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -738,22 +861,28 @@ pub(crate) enum PaintPrimitive {
     Path(RenderedPath),
     Stroke(RenderedStroke),
     Image(RenderedImage),
+    ImagePattern(RenderedImagePattern),
+    GradientPattern(RenderedGradientPattern),
+    SvgPattern(RenderedSvgPattern),
     Line(RenderedLine),
 }
 
 impl PaintPrimitive {
-    pub(crate) fn translated(self, offset: PaintVector) -> Self {
+    pub(crate) fn translated(self, offset: PaintTranslation) -> Self {
         match self {
             Self::Rect(rect) => Self::Rect(rect.translated(offset)),
             Self::RoundedRect(rect) => Self::RoundedRect(rect.translated(offset)),
             Self::Path(path) => Self::Path(path.translated(offset)),
             Self::Stroke(stroke) => Self::Stroke(stroke.translated(offset)),
             Self::Image(image) => Self::Image(image.translated(offset)),
+            Self::ImagePattern(pattern) => Self::ImagePattern(pattern.translated(offset)),
+            Self::GradientPattern(pattern) => Self::GradientPattern(pattern.translated(offset)),
+            Self::SvgPattern(pattern) => Self::SvgPattern(pattern.translated(offset)),
             Self::Line(line) => Self::Line(line.translated(offset)),
         }
     }
 
-    pub(in crate::document) fn clipped_to_rect(self, clip: PaintClip) -> Option<Self> {
+    pub(crate) fn clipped_to_rect(self, clip: PaintClip) -> Option<Self> {
         match self {
             Self::Rect(mut rect) => {
                 let clipped = PaintClip::from_paint_rect(rect.paint_rect()).intersect(clip)?;
@@ -768,6 +897,15 @@ impl PaintPrimitive {
             Self::Image(image) => rect_bounds(image.paint_rect())
                 .and_then(|bounds| bounds.intersect(clip))
                 .map(|_| Self::Image(image)),
+            Self::ImagePattern(pattern) => rect_bounds(pattern.paint_rect())
+                .and_then(|bounds| bounds.intersect(clip))
+                .map(|_| Self::ImagePattern(pattern)),
+            Self::GradientPattern(pattern) => rect_bounds(pattern.paint_rect())
+                .and_then(|bounds| bounds.intersect(clip))
+                .map(|_| Self::GradientPattern(pattern)),
+            Self::SvgPattern(pattern) => rect_bounds(pattern.paint_rect())
+                .and_then(|bounds| bounds.intersect(clip))
+                .map(|_| Self::SvgPattern(pattern)),
             Self::Path(path) => path_bounds(&path)
                 .and_then(|bounds| bounds.intersect(clip))
                 .map(|_| Self::Path(path)),
@@ -787,6 +925,9 @@ impl PaintPrimitive {
             Self::Rect(rect) => rect_bounds(rect.paint_rect()),
             Self::RoundedRect(rect) => rect_bounds(rect.paint_rect()),
             Self::Image(image) => rect_bounds(image.paint_rect()),
+            Self::ImagePattern(pattern) => rect_bounds(pattern.paint_rect()),
+            Self::GradientPattern(pattern) => rect_bounds(pattern.paint_rect()),
+            Self::SvgPattern(pattern) => rect_bounds(pattern.paint_rect()),
             Self::Stroke(stroke) => Some(stroke.paint_bounds()),
             Self::Line(line) => Some(line.paint_bounds()),
             Self::Path(path) => path_bounds(path),
@@ -798,7 +939,7 @@ impl PaintPrimitive {
 ///
 /// CSS painting order is a tree of stacking contexts, not just a page-wide
 /// sequence. CSS 2.2 Appendix E defines the recursive stacking order, and CSS
-/// Positioned Layout defines positioned boxes with stack levels. Reasyprint
+/// Positioned Layout defines positioned boxes with stack levels. Quire
 /// stores that recursive structure in captured fragments, then flattens it to
 /// PDF drawing operators because PDF content streams paint sequentially
 /// (ISO 32000-1:2008, §8.2).
@@ -838,18 +979,22 @@ impl PaintDisplayList {
         self.bands.push_flattened_primitives(primitives);
     }
 
-    pub(crate) fn translated(self, offset: PaintVector) -> Self {
+    pub(in crate::document) fn for_each_flattened_primitive<'a>(
+        &'a self,
+        f: &mut impl FnMut(&'a PaintPrimitive),
+    ) {
+        self.bands.for_each_flattened_primitive(f);
+    }
+
+    pub(crate) fn translated(self, offset: PaintTranslation) -> Self {
         Self {
             bands: self.bands.translated(offset),
         }
     }
 
-    pub(in crate::document) fn into_operation_nodes(
-        self,
-        operations: &mut impl Iterator<Item = PaintOperation>,
-    ) -> Self {
+    pub(in crate::document) fn into_recorded_nodes(self, page: &mut Page) -> Self {
         Self {
-            bands: self.bands.into_operation_nodes(operations),
+            bands: self.bands.into_recorded_nodes(page),
         }
     }
 
@@ -868,4 +1013,35 @@ impl PaintDisplayList {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PagePaintTree {
     pub(crate) root: PaintStackingContext,
+}
+
+#[cfg(test)]
+mod paint_tree_validation_tests {
+    use super::*;
+
+    fn black_rect(x: f32) -> RenderedRect {
+        RenderedRect::new(x, 0.0, 10.0, 10.0, Some(Color::BLACK), None, 0.0)
+    }
+
+    #[test]
+    fn validation_rejects_a_tree_operation_with_a_missing_primitive() {
+        let mut page = Page::new(100.0, 100.0);
+        page.rects.push(black_rect(0.0));
+        page.paint_tree
+            .push_operation(PaintBand::InFlowBlock, PaintOperation::Rect(1));
+
+        let error = page.validate_paint_operations(0).unwrap_err().to_string();
+        assert!(error.contains("paint operation 0 references missing rect 1"));
+    }
+
+    #[test]
+    fn validation_rejects_unreferenced_primitive_storage() {
+        let mut page = Page::new(100.0, 100.0);
+        page.rects.extend([black_rect(0.0), black_rect(10.0)]);
+        page.paint_tree
+            .push_operation(PaintBand::InFlowBlock, PaintOperation::Rect(0));
+
+        let error = page.validate_paint_operations(0).unwrap_err().to_string();
+        assert!(error.contains("unreferenced rect 1"));
+    }
 }

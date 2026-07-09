@@ -1,6 +1,6 @@
 # CSS Positioning Parity
 
-Last updated: 2026-07-08
+Last updated: 2026-07-18
 
 This document tracks current CSS positioning and stacking behavior in Quire.
 Known unresolved divergences belong in `SPEC_DIVERGENCES.md`; this file is a
@@ -15,6 +15,11 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   inset pair or explicit width fills the containing block.
 - Auto-sized absolutely positioned replaced images use their intrinsic
   dimensions and aspect ratio before resolving absolute insets.
+- Positioned layout prepares a zoom-normalized used style exactly once for
+  relative, absolute, and fixed boxes. Fixed inset terms scale with the
+  effective zoom, while percentages resolve against the zoomed containing
+  block; transformed containing-block translations are carried into captured
+  positioned descendants in PDF paint coordinates.
 - Relative and sticky normal-flow blocks preserve their flow position while
   translating their visual paint by the resolved inset offsets.
 - Relative normal inline boxes preserve line metrics and inline advance while
@@ -25,7 +30,28 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   paint contexts before PDF emission.
 - Transform translations and transform origins keep typed length components
   until used-value preparation, including `ch` resolved through the selected
-  font metric and viewport units resolved against the page area.
+  font metric and viewport units resolved against the immutable initial page
+  viewport rather than a later named page's used area.
+- CSS Transforms Level 2's independent 2D `translate`, `rotate`, and `scale`
+  properties compose before the legacy `transform` list, establish the same
+  stacking-context and containing-block effects, and preserve typed
+  translate-length components through used-value resolution. Scale factors
+  accept numbers and percentages in both independent and legacy syntax.
+- Legacy `matrix()` values retain a dedicated CSS transform coordinate space.
+  Their numeric translation is projected from CSS pixels to PDF-point paint
+  coordinates only at the normal-box paint boundary; inline SVG transforms
+  instead remain in SVG source space until SVG parsing.
+- HTML `transform-box: border-box` and `content-box` select the 2D reference
+  rectangle for transform origins and percentage translations. The
+  content-box path uses the laid-out border geometry to retain percentage
+  padding where that basis is reconstructible.
+- Non-invertible 2D transform matrices suppress the transformed subtree and
+  its link annotations, as required by CSS Transforms rendering.
+- Legacy 3D transform functions are represented with typed Euclid homogeneous
+  matrices. Affine projections of `matrix3d`, three-axis translate/scale, and
+  axis-angle rotation feed the existing PDF CTM; singular matrices and hidden
+  backfaces suppress their subtree. Projective perspective and preserve-3D
+  scene composition remain deliberately unsupported.
 - Inline boxes split around in-flow block descendants preserve positioned
   inline visual effects for the split block segment, including relative offsets
   and integer `z-index` stacking.
@@ -45,10 +71,40 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 - Block-level absolutely positioned descendants with auto horizontal insets
   honor the static-position containing block's direction, including RTL cases
   that seed `right` from the hypothetical normal-flow static position.
+- Block-level absolutely positioned descendants with orthogonal writing modes,
+  auto physical vertical insets, and both physical horizontal insets set
+  preserve their resolved physical static top edge instead of translating by
+  their own content height.
+- Nested absolutely positioned boxes that overflow page areas extend the final
+  page sequence from their resolved absolute offsets without leaking temporary
+  positioned-subtree pagination into normal flow; fixed descendants discovered
+  inside those subtrees still replay on every generated page. Nested absolute
+  layers retain their independently resolved destination-page ownership rather
+  than being remapped again by an ancestor, and the final page-span requirement
+  is merged across the nested subtree.
+- Fixed descendants replay after the final page sequence is known. Their
+  initial containing-block geometry is retained while each output page supplies
+  its own media clip, including later named pages with a different used page
+  box.
+- When an absolutely positioned box prebreaks its first in-flow child, a
+  background-only source slice is discarded before page ownership is remapped;
+  later child fragments therefore begin on the intended destination page
+  without materializing an empty intermediate page.
+- Absolute-position fragment remapping moves the principal scratch fragments
+  to their destination page while nested positioned stacking contexts retain
+  their independently resolved destination ownership. Page-local paint
+  fragments drain image patterns with their other resources, so negative-z
+  backgrounds and replaced images cannot remain as orphaned source-page
+  resources.
+- Auto-height absolutely positioned boxes measure descendant forced page breaks
+  as continuous crossed page areas, so their page span and page-margin counters
+  reflect the actual fragment sequence rather than a synthetic measurement
+  cursor.
 - Absolutely positioned descendants inside inline floats under a single-line
-  positioned inline ancestor resolve explicit insets against that inline
-  ancestor's generated padding-box containing block instead of the outer block
-  or page.
+  positioned or transformed inline ancestor resolve explicit insets against
+  that inline ancestor's generated padding-box containing block instead of the
+  outer block or page, including edge-only inline fragments and nested
+  positioned inline ancestors with identical styles.
 - Inline-block pseudo stacking contexts paint their own background/border
   before atom-owned block content, and non-stacking inline-blocks let
   absolutely positioned descendants escape to the parent stacking context at
@@ -65,6 +121,9 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 
 - Broaden WPT coverage for positioned inline ancestors combined with nested
   absolute descendants, transforms, opacity, and fragmentation.
+- Implement projective perspective, preserve-3D depth ordering, SVG
+  stroke/view transform boxes, and transform animations before treating the
+  CSS Transforms WPT directory as broadly covered.
 - Audit sticky positioning beyond current static-page behavior once scrolling
   and viewport-relative sticky constraints are represented more fully.
 - Continue expanding CSS Positioned Layout Level 3 coverage for edge cases in

@@ -6,12 +6,12 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
     value: &str,
     declaration: &CascadedDeclaration<'_>,
     inheritance_source: &ComputedStyle,
-    parent_ch_advance: f32,
+    parent_ch_advance: LayoutLength,
 ) -> bool {
     match name {
         "outline-offset" => {
             if let Some(length) = parse_computed_length_percentage(value, style.font_size)
-                && length.percent == 0.0
+                && !length.contains_percentage()
             {
                 style.outline_offset = length;
             }
@@ -157,7 +157,19 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
             apply_background_shorthand(style, value, declaration.base_url, declaration.root_url)
         }
         "background-color" => {
-            style.background_color = parse_color(value);
+            style.background_color_is_current_color = value.eq_ignore_ascii_case("currentcolor");
+            style.background_color_current_color_expression =
+                parse_color_from_currentcolor(value, style.color).map(|_| value.to_string());
+            style.background_color_is_current_color |=
+                style.background_color_current_color_expression.is_some();
+            style.background_color =
+                if let Some(color) = parse_color_from_currentcolor(value, style.color) {
+                    Some(color)
+                } else if style.background_color_is_current_color {
+                    Some(style.color)
+                } else {
+                    parse_color(value)
+                };
         }
         "background-image" => {
             apply_background_image_list(style, value, declaration.base_url, declaration.root_url);
@@ -165,11 +177,45 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
         "background-size" => {
             apply_background_size_list(style, value);
         }
+        "object-fit" => {
+            if let Some(object_fit) = parse_object_fit(value) {
+                style.object_fit = object_fit;
+            }
+        }
+        "object-view-box" => {
+            if let Some(view_box) = parse_object_view_box(value, style.font_size) {
+                style.object_view_box = view_box;
+            }
+        }
+        "object-position" => {
+            if let Some(object_position) = parse_background_position(value, style.font_size) {
+                style.object_position = object_position;
+            }
+        }
+        "image-orientation" => {
+            if let Some(image_orientation) = parse_image_orientation(value) {
+                style.image_orientation = image_orientation;
+            }
+        }
+        "image-rendering" => {
+            if let Some(image_rendering) = parse_image_rendering(value) {
+                style.image_rendering = image_rendering;
+            }
+        }
         "background-position" => {
             apply_background_position_list(style, value);
         }
+        "background-position-x" => {
+            apply_background_position_axis_list(style, value, true);
+        }
+        "background-position-y" => {
+            apply_background_position_axis_list(style, value, false);
+        }
         "background-repeat" => {
             apply_background_repeat_list(style, value);
+        }
+        "background-attachment" => {
+            apply_background_attachment_list(style, value);
         }
         "background-origin" => {
             apply_background_origin_list(style, value);
@@ -182,11 +228,11 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
                 border_image.source_base_url = border_image
                     .source
                     .as_ref()
-                    .and_then(|_| declaration.base_url.map(std::path::Path::to_path_buf));
+                    .and_then(|_| declaration.base_url.cloned());
                 border_image.source_root_url = border_image
                     .source
                     .as_ref()
-                    .and_then(|_| declaration.root_url.map(std::path::Path::to_path_buf));
+                    .and_then(|_| declaration.root_url.cloned());
                 style.border_image = border_image;
             }
         }
@@ -197,12 +243,12 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
                     .border_image
                     .source
                     .as_ref()
-                    .and_then(|_| declaration.base_url.map(std::path::Path::to_path_buf));
+                    .and_then(|_| declaration.base_url.cloned());
                 style.border_image.source_root_url = style
                     .border_image
                     .source
                     .as_ref()
-                    .and_then(|_| declaration.root_url.map(std::path::Path::to_path_buf));
+                    .and_then(|_| declaration.root_url.cloned());
             }
         }
         "border-image-slice" => {
@@ -228,6 +274,18 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
         "color" => {
             if let Some(color) = parse_color(value) {
                 style.color = color;
+            }
+        }
+        "-webkit-text-fill-color" => {
+            if value.eq_ignore_ascii_case("currentcolor") {
+                style.text_fill_color = None;
+            } else if let Some(color) = parse_color(value) {
+                style.text_fill_color = Some(color);
+            }
+        }
+        "zoom" => {
+            if let Some(zoom) = CssZoom::parse(value) {
+                style.zoom = zoom;
             }
         }
         "font-size" => {
@@ -259,7 +317,20 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
             }
         }
         "line-height" => {
-            if let Some(line_height) = parse_computed_line_height(value, style.font_size) {
+            // CSS Values resolves `lh` in the `line-height` property against
+            // the inherited line height, not the value being established by
+            // this declaration.
+            // <https://www.w3.org/TR/css-values-4/#lh>
+            let line_height = value
+                .trim()
+                .to_ascii_lowercase()
+                .strip_suffix("lh")
+                .and_then(|multiplier| multiplier.trim().parse::<f32>().ok())
+                .map(|multiplier| {
+                    ComputedLineHeight::from_points(multiplier * inheritance_source.line_height)
+                })
+                .or_else(|| parse_computed_line_height(value, style.font_size));
+            if let Some(line_height) = line_height {
                 style.line_height_value = line_height;
                 project_line_height(style);
             }
@@ -276,32 +347,63 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
         }
         "width" => {
             style.box_values.width =
-                parse_computed_box_size(value, style.font_size).unwrap_or(style.box_values.width);
+                parse_computed_box_size(value, style.font_size, style.root_font_size)
+                    .unwrap_or(style.box_values.width.clone());
         }
         "height" => {
             style.box_values.height =
-                parse_computed_box_size(value, style.font_size).unwrap_or(style.box_values.height);
+                parse_computed_box_size(value, style.font_size, style.root_font_size)
+                    .unwrap_or(style.box_values.height.clone());
         }
         "aspect-ratio" => {
             if let Some(aspect_ratio) = parse_aspect_ratio(value) {
                 style.aspect_ratio = aspect_ratio;
             }
         }
+        "contain-intrinsic-size" => {
+            if let Some(size) = parse_contain_intrinsic_size(value, style.font_size) {
+                style.contain_intrinsic_size = size;
+            }
+        }
+        "contain-intrinsic-width" => {
+            if let Some(width) = parse_contain_intrinsic_size_component(value, style.font_size) {
+                style.contain_intrinsic_size.width = width;
+            }
+        }
+        "contain-intrinsic-height" => {
+            if let Some(height) = parse_contain_intrinsic_size_component(value, style.font_size) {
+                style.contain_intrinsic_size.height = height;
+            }
+        }
         "min-width" => {
-            style.box_values.min_width = parse_computed_box_size(value, style.font_size)
-                .unwrap_or(style.box_values.min_width);
+            style.box_values.min_width =
+                parse_computed_box_size(value, style.font_size, style.root_font_size)
+                    .unwrap_or(style.box_values.min_width.clone());
         }
         "max-width" => {
-            style.box_values.max_width = parse_computed_box_size(value, style.font_size)
-                .unwrap_or(style.box_values.max_width);
+            style.box_values.max_width = if value.trim().eq_ignore_ascii_case("none") {
+                // `none` is the initial max-size value and removes the
+                // constraint rather than preserving an inherited maximum.
+                // <https://www.w3.org/TR/css-sizing-3/#preferred-size-properties>
+                ComputedLengthPercentageOrAuto::Auto
+            } else {
+                parse_computed_box_size(value, style.font_size, style.root_font_size)
+                    .unwrap_or(style.box_values.max_width.clone())
+            };
         }
         "min-height" => {
-            style.box_values.min_height = parse_computed_box_size(value, style.font_size)
-                .unwrap_or(style.box_values.min_height);
+            style.box_values.min_height =
+                parse_computed_box_size(value, style.font_size, style.root_font_size)
+                    .unwrap_or(style.box_values.min_height.clone());
         }
         "max-height" => {
-            style.box_values.max_height = parse_computed_box_size(value, style.font_size)
-                .unwrap_or(style.box_values.max_height);
+            style.box_values.max_height = if value.trim().eq_ignore_ascii_case("none") {
+                // See the matching `max-width` handling above.
+                ComputedLengthPercentageOrAuto::Auto
+            } else {
+                parse_computed_box_size(value, style.font_size, style.root_font_size)
+                    .unwrap_or(style.box_values.max_height.clone())
+            };
         }
         "box-sizing" => {
             style.box_sizing = match value.to_ascii_lowercase().as_str() {
@@ -313,22 +415,22 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
         "left" => {
             style.box_values.inset_left =
                 parse_computed_length_percentage_auto(value, style.font_size)
-                    .unwrap_or(style.box_values.inset_left);
+                    .unwrap_or(style.box_values.inset_left.clone());
         }
         "top" => {
             style.box_values.inset_top =
                 parse_computed_length_percentage_auto(value, style.font_size)
-                    .unwrap_or(style.box_values.inset_top);
+                    .unwrap_or(style.box_values.inset_top.clone());
         }
         "right" => {
             style.box_values.inset_right =
                 parse_computed_length_percentage_auto(value, style.font_size)
-                    .unwrap_or(style.box_values.inset_right);
+                    .unwrap_or(style.box_values.inset_right.clone());
         }
         "bottom" => {
             style.box_values.inset_bottom =
                 parse_computed_length_percentage_auto(value, style.font_size)
-                    .unwrap_or(style.box_values.inset_bottom);
+                    .unwrap_or(style.box_values.inset_bottom.clone());
         }
         "position" => {
             if let Some(name) = parse_running_position(value) {
@@ -375,7 +477,7 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
             style.z_index = if value.eq_ignore_ascii_case("auto") {
                 None
             } else {
-                value.parse::<i32>().ok().or(style.z_index)
+                parse_z_index(value).or(style.z_index)
             };
         }
         "opacity" => {
@@ -388,10 +490,37 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
                 style.transform = transform;
             }
         }
+        "translate" => {
+            if let Some(translate) = parse_individual_translate(value, style.font_size) {
+                style.individual_transforms.translate = translate;
+            }
+        }
+        "rotate" => {
+            if let Some(rotate) = parse_individual_rotate(value) {
+                style.individual_transforms.rotate = rotate;
+            }
+        }
+        "scale" => {
+            if let Some(scale) = parse_individual_scale(value) {
+                style.individual_transforms.scale = scale;
+            }
+        }
         "transform-origin" => {
             if let Some(origin) = parse_transform_origin(value, style.font_size) {
                 style.transform_origin = origin;
             }
+        }
+        "transform-box" => {
+            if let Some(transform_box) = parse_transform_box(value) {
+                style.transform_box = transform_box;
+            }
+        }
+        "backface-visibility" => {
+            style.backface_visibility = match value.to_ascii_lowercase().as_str() {
+                "visible" => BackfaceVisibility::Visible,
+                "hidden" => BackfaceVisibility::Hidden,
+                _ => style.backface_visibility,
+            };
         }
         "isolation" => {
             style.isolation = match value.to_ascii_lowercase().as_str() {
@@ -429,6 +558,22 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
         "contain" => {
             if let Some(contain) = parse_contain(value) {
                 style.contain = contain;
+            }
+        }
+        "container-type" => {
+            if let Some(container_type) = parse_container_type(value) {
+                style.container_type = container_type;
+            }
+        }
+        "container-name" => {
+            if let Some(names) = parse_container_names(value) {
+                style.container_names = names;
+            }
+        }
+        "container" => {
+            if let Some((names, container_type)) = parse_container_shorthand(value) {
+                style.container_names = names;
+                style.container_type = container_type;
             }
         }
         "content-visibility" => {
@@ -475,6 +620,11 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
         "text-autospace" => {
             if let Some(text_autospace) = parse_text_autospace(value) {
                 style.text_autospace = text_autospace;
+            }
+        }
+        "word-space-transform" => {
+            if let Some(word_space_transform) = parse_word_space_transform(value) {
+                style.word_space_transform = word_space_transform;
             }
         }
         "text-indent" => {
@@ -532,12 +682,139 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
     true
 }
 
+/// Parses a `z-index` integer, including CSS math expressions.
+///
+/// A literal `z-index` value must be an `<integer>`. CSS math functions may
+/// instead compute a `<number>`; CSS Values then rounds it to the nearest
+/// integer, with ties toward positive infinity:
+/// <https://drafts.csswg.org/css-position-3/#propdef-z-index> and
+/// <https://drafts.csswg.org/css-values-4/#combine-integers>.
+fn parse_z_index(value: &str) -> Option<i32> {
+    if let Ok(value) = value.parse::<i32>() {
+        return Some(value);
+    }
+    let lower = value.to_ascii_lowercase();
+    if !["calc(", "min(", "max(", "clamp("]
+        .iter()
+        .any(|function| lower.starts_with(function))
+    {
+        return None;
+    }
+    let MathValue::Number(value) = parse_math_value(value, ROOT_FONT_SIZE_PT)? else {
+        return None;
+    };
+    if !value.is_finite() || value < i32::MIN as f32 || value > i32::MAX as f32 {
+        return None;
+    }
+    let lower_integer = value.floor();
+    let rounded = if value - lower_integer < 0.5 {
+        lower_integer
+    } else {
+        lower_integer + 1.0
+    };
+    Some(rounded as i32)
+}
+
 /// Parses CSS Sizing `aspect-ratio`.
 ///
 /// The computed value preserves whether `auto` was supplied so replaced
 /// elements can continue to use their natural ratio, while non-replaced boxes
 /// can expose the authored preferred ratio:
 /// <https://www.w3.org/TR/css-sizing-4/#aspect-ratio>.
+fn parse_contain_intrinsic_size(value: &str, font_size: f32) -> Option<ContainIntrinsicSize> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("none") {
+        return Some(ContainIntrinsicSize::NONE);
+    }
+    let values = value.split_ascii_whitespace().collect::<Vec<_>>();
+    let (width, height) = match values.as_slice() {
+        [size] => (*size, *size),
+        [width, height] => (*width, *height),
+        _ => return None,
+    };
+    Some(ContainIntrinsicSize {
+        width: Some(parse_computed_length_percentage(width, font_size)?),
+        height: Some(parse_computed_length_percentage(height, font_size)?),
+    })
+}
+
+/// Parse one physical component of `contain-intrinsic-size`.
+///
+/// `none` removes the fallback on that axis; a length-percentage provides the
+/// substituted intrinsic size.
+/// <https://drafts.csswg.org/css-sizing-4/#intrinsic-size-override>.
+fn parse_contain_intrinsic_size_component(
+    value: &str,
+    font_size: f32,
+) -> Option<Option<ComputedLengthPercentage>> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    parse_computed_length_percentage(value, font_size).map(Some)
+}
+
+/// Parses the size-query subset of CSS `container-type`.
+///
+/// Style and scroll-state containers are intentionally not represented here:
+/// they select a different condition grammar and are outside Quire's current
+/// containment-query surface.
+/// <https://www.w3.org/TR/css-contain-3/#container-type>
+fn parse_container_type(value: &str) -> Option<ContainerType> {
+    match trim_css_value(value).to_ascii_lowercase().as_str() {
+        "normal" => Some(ContainerType::Normal),
+        "inline-size" => Some(ContainerType::InlineSize),
+        "size" => Some(ContainerType::Size),
+        _ => None,
+    }
+}
+
+/// Parses a container-name list, excluding CSS-wide and reserved keywords.
+/// <https://www.w3.org/TR/css-contain-3/#container-name>
+fn parse_container_names(value: &str) -> Option<ContainerNames> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("none") {
+        return Some(ContainerNames::default());
+    }
+    let mut input = cssparser::ParserInput::new(value);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let mut names = Vec::new();
+    while !parser.is_exhausted() {
+        names.push(parser.expect_ident_cloned().ok()?.to_string());
+    }
+    (!names.is_empty()
+        && names.iter().all(|name| {
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "none" | "default" | "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+            )
+        }))
+    .then_some(ContainerNames(names))
+}
+
+/// Parses `container: <name>? [ / <type> ]?` without accepting an invalid
+/// partial shorthand.
+/// <https://www.w3.org/TR/css-contain-3/#container-shorthand>
+fn parse_container_shorthand(value: &str) -> Option<(ContainerNames, ContainerType)> {
+    let value = trim_css_value(value);
+    let mut pieces = value.split('/');
+    let names = pieces.next()?.trim();
+    let type_part = pieces.next().map(str::trim);
+    if pieces.next().is_some() {
+        return None;
+    }
+    match type_part {
+        Some(type_part) if !type_part.is_empty() => Some((
+            parse_container_names(names)?,
+            parse_container_type(type_part)?,
+        )),
+        Some(_) => None,
+        None => parse_container_type(names)
+            .map(|container_type| (ContainerNames::default(), container_type))
+            .or_else(|| parse_container_names(names).map(|names| (names, ContainerType::Normal))),
+    }
+}
+
 fn parse_aspect_ratio(value: &str) -> Option<AspectRatio> {
     let value = trim_css_value(value);
     if value.eq_ignore_ascii_case("auto") {

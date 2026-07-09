@@ -13,13 +13,10 @@ use super::*;
 /// <https://www.w3.org/TR/css-backgrounds-3/#corner-shaping>.
 pub(crate) fn paint_clipped_rounded_border_sides(
     paths: &mut Vec<RenderedPath>,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
 ) -> bool {
-    if style.border_radius.is_zero() {
+    if style.border_radius.clone().is_zero() {
         return false;
     }
 
@@ -39,7 +36,7 @@ pub(crate) fn paint_clipped_rounded_border_sides(
     {
         return false;
     }
-    if width <= 0.0 || height <= 0.0 {
+    if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
         return true;
     }
 
@@ -47,13 +44,10 @@ pub(crate) fn paint_clipped_rounded_border_sides(
         if !side.is_visible() {
             continue;
         }
-        let clip = Some(rounded_border_side_clip(edge, x, y, width, height, borders));
+        let clip = Some(rounded_border_side_clip(edge, rect, borders));
         match side.style {
             BorderStyle::Inset | BorderStyle::Outset => paths.push(solid_rounded_border_ring_path(
-                x,
-                y,
-                width,
-                height,
+                rect,
                 style,
                 inset_outset_border_color(side.style, edge, side.color),
                 clip,
@@ -64,10 +58,7 @@ pub(crate) fn paint_clipped_rounded_border_sides(
                 let half = scaled_border_insets(borders, 0.5);
                 let full = border_insets(borders);
                 paths.push(rounded_border_ring_between_path(
-                    x,
-                    y,
-                    width,
-                    height,
+                    rect,
                     style,
                     outer_color,
                     clip.clone(),
@@ -75,10 +66,7 @@ pub(crate) fn paint_clipped_rounded_border_sides(
                     half,
                 ));
                 paths.push(rounded_border_ring_between_path(
-                    x,
-                    y,
-                    width,
-                    height,
+                    rect,
                     style,
                     inner_color,
                     clip,
@@ -89,17 +77,14 @@ pub(crate) fn paint_clipped_rounded_border_sides(
             BorderStyle::Double => {
                 if side.used_width < 3.0 {
                     paths.push(solid_rounded_border_ring_path(
-                        x, y, width, height, style, side.color, clip,
+                        rect, style, side.color, clip,
                     ));
                 } else {
                     let stripe = double_stripe_insets(borders);
                     let inner_outer = double_inner_outer_insets(borders);
                     let full = border_insets(borders);
                     paths.push(rounded_border_ring_between_path(
-                        x,
-                        y,
-                        width,
-                        height,
+                        rect,
                         style,
                         side.color,
                         clip.clone(),
@@ -107,10 +92,7 @@ pub(crate) fn paint_clipped_rounded_border_sides(
                         stripe,
                     ));
                     paths.push(rounded_border_ring_between_path(
-                        x,
-                        y,
-                        width,
-                        height,
+                        rect,
                         style,
                         side.color,
                         clip,
@@ -120,7 +102,7 @@ pub(crate) fn paint_clipped_rounded_border_sides(
                 }
             }
             _ => paths.push(solid_rounded_border_ring_path(
-                x, y, width, height, style, side.color, clip,
+                rect, style, side.color, clip,
             )),
         }
     }
@@ -128,26 +110,26 @@ pub(crate) fn paint_clipped_rounded_border_sides(
 }
 
 pub(in crate::layout) fn uniform_rounded_ring_path(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     outer_radii: RenderedRoundedRectRadii,
     inset: f32,
     color: Color,
 ) -> RenderedPath {
-    let inner_width = (width - 2.0 * inset).max(0.0);
-    let inner_height = (height - 2.0 * inset).max(0.0);
-    let mut commands =
-        shaped_rect_path_commands(x, y, width, height, outer_radii, css::CornerShapes::ROUND);
-    if inner_width > 0.0 && inner_height > 0.0 {
+    let inner = inset_paint_rect(
+        rect,
+        css::Edges {
+            top: inset,
+            right: inset,
+            bottom: inset,
+            left: inset,
+        },
+    );
+    let mut commands = shaped_rect_path_commands(rect, outer_radii, css::CornerShapes::ROUND);
+    if inner.size.width > 0.0 && inner.size.height > 0.0 {
         let mut inner_radii = outer_radii;
         inset_rounded_rect_radii(&mut inner_radii, inset);
         commands.extend(shaped_rect_path_commands(
-            x + inset,
-            y + inset,
-            inner_width,
-            inner_height,
+            inner,
             inner_radii,
             css::CornerShapes::ROUND,
         ));
@@ -163,19 +145,13 @@ pub(in crate::layout) fn uniform_rounded_ring_path(
 }
 
 pub(in crate::layout) fn solid_rounded_border_ring_path(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     color: Color,
     clip: Option<RenderedPathClip>,
 ) -> RenderedPath {
     rounded_border_ring_between_path(
-        x,
-        y,
-        width,
-        height,
+        rect,
         style,
         color,
         clip,
@@ -184,28 +160,19 @@ pub(in crate::layout) fn solid_rounded_border_ring_path(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(in crate::layout) fn rounded_border_ring_between_path(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     color: Color,
     clip: Option<RenderedPathClip>,
     outer_inset: css::Edges,
     inner_inset: css::Edges,
 ) -> RenderedPath {
-    let mut commands =
-        rounded_box_path_commands_for_insets(x, y, width, height, style, outer_inset);
-    let inner_width = (width - inner_inset.left - inner_inset.right).max(0.0);
-    let inner_height = (height - inner_inset.top - inner_inset.bottom).max(0.0);
-    if inner_width > 0.0 && inner_height > 0.0 {
+    let mut commands = rounded_box_path_commands_for_insets(rect, style, outer_inset);
+    let inner = inset_paint_rect(rect, inner_inset);
+    if inner.size.width > 0.0 && inner.size.height > 0.0 {
         commands.extend(rounded_box_path_commands_for_insets(
-            x,
-            y,
-            width,
-            height,
+            rect,
             style,
             inner_inset,
         ));
@@ -221,16 +188,12 @@ pub(in crate::layout) fn rounded_border_ring_between_path(
 }
 
 pub(in crate::layout) fn rounded_box_path_commands_for_insets(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     inset: css::Edges,
 ) -> Vec<RenderedPathCommand> {
-    let inset_width = (width - inset.left - inset.right).max(0.0);
-    let inset_height = (height - inset.top - inset.bottom).max(0.0);
-    let outer_radii = used_rounded_rect_radii(style.border_radius, width, height);
+    let inset_rect = inset_paint_rect(rect, inset);
+    let outer_radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
     let radii = RenderedRoundedRectRadii {
         top_left: RenderedCornerRadius::new(
             outer_radii.top_left.x() - inset.left,
@@ -249,28 +212,18 @@ pub(in crate::layout) fn rounded_box_path_commands_for_insets(
             outer_radii.bottom_left.y() - inset.bottom,
         ),
     };
-    shaped_rect_path_commands(
-        x + inset.left,
-        y + inset.bottom,
-        inset_width,
-        inset_height,
-        radii,
-        style.corner_shapes,
-    )
+    shaped_rect_path_commands(inset_rect, radii, style.corner_shapes)
 }
 
 pub(in crate::layout) fn rounded_border_side_clip(
     edge: BorderEdge,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     borders: UsedBorder,
 ) -> RenderedPathClip {
-    let x0 = x;
-    let x1 = x + width;
-    let y0 = y;
-    let y1 = y + height;
+    let x0 = rect.origin.x;
+    let x1 = rect.max_x();
+    let y0 = rect.origin.y;
+    let y1 = rect.max_y();
     let inner_left = x0 + borders.left.used_width;
     let inner_right = x1 - borders.right.used_width;
     let inner_bottom = y0 + borders.bottom.used_width;
@@ -316,35 +269,24 @@ pub(in crate::layout) fn rounded_border_side_clip(
 
 pub(in crate::layout) fn rounded_border_pattern_clip(
     edge: BorderEdge,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     borders: UsedBorder,
 ) -> RenderedPathClip {
-    let mut clip = rounded_border_side_clip(edge, x, y, width, height, borders);
-    clip.additional_clips.push(rounded_border_ring_clip_path(
-        x, y, width, height, style, borders,
-    ));
+    let mut clip = rounded_border_side_clip(edge, rect, borders);
+    clip.additional_clips
+        .push(rounded_border_ring_clip_path(rect, style, borders));
     clip
 }
 
 pub(in crate::layout) fn rounded_border_ring_clip_path(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     borders: UsedBorder,
 ) -> RenderedPathClipPath {
-    let mut commands =
-        rounded_box_path_commands_for_insets(x, y, width, height, style, css::Edges::ZERO);
+    let mut commands = rounded_box_path_commands_for_insets(rect, style, css::Edges::ZERO);
     commands.extend(rounded_box_path_commands_for_insets(
-        x,
-        y,
-        width,
-        height,
+        rect,
         style,
         border_insets(borders),
     ));
@@ -419,17 +361,14 @@ pub(in crate::layout) fn double_stripe_width(border_width: f32) -> f32 {
 /// corners; PDF paths approximate those arcs with cubic Bezier segments:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-radius>.
 pub(crate) fn rounded_rect_path_commands(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     radii: RenderedRoundedRectRadii,
 ) -> Vec<RenderedPathCommand> {
     const KAPPA: f32 = 0.552_284_8;
-    let x0 = x;
-    let y0 = y;
-    let x1 = x + width;
-    let y1 = y + height;
+    let x0 = rect.origin.x;
+    let y0 = rect.origin.y;
+    let x1 = rect.max_x();
+    let y1 = rect.max_y();
     let tl = radii.top_left;
     let tr = radii.top_right;
     let br = radii.bottom_right;
@@ -497,21 +436,18 @@ pub(crate) fn rounded_rect_path_commands(
 /// <https://drafts.csswg.org/css-borders-4/#corner-shape> and
 /// <https://drafts.csswg.org/css-borders-4/#corner-rendering>.
 pub(crate) fn shaped_rect_path_commands(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     radii: RenderedRoundedRectRadii,
     shapes: css::CornerShapes,
 ) -> Vec<RenderedPathCommand> {
     if shapes.all_round() {
-        return rounded_rect_path_commands(x, y, width, height, radii);
+        return rounded_rect_path_commands(rect, radii);
     }
 
-    let x0 = x;
-    let y0 = y;
-    let x1 = x + width;
-    let y1 = y + height;
+    let x0 = rect.origin.x;
+    let y0 = rect.origin.y;
+    let x1 = rect.max_x();
+    let y1 = rect.max_y();
     let tl = radii.top_left;
     let tr = radii.top_right;
     let br = radii.bottom_right;
@@ -529,9 +465,9 @@ pub(crate) fn shaped_rect_path_commands(
     append_corner_shape(
         &mut commands,
         shapes.bottom_right,
-        (x1 - br.x(), y0),
-        (x1, y0 + br.y()),
-        (x1 - br.x(), y0 + br.y()),
+        paint_space_point(x1 - br.x(), y0),
+        paint_space_point(x1, y0 + br.y()),
+        paint_space_point(x1 - br.x(), y0 + br.y()),
         br,
         CornerPathKind::BottomRight,
     );
@@ -542,9 +478,9 @@ pub(crate) fn shaped_rect_path_commands(
     append_corner_shape(
         &mut commands,
         shapes.top_right,
-        (x1, y1 - tr.y()),
-        (x1 - tr.x(), y1),
-        (x1 - tr.x(), y1 - tr.y()),
+        paint_space_point(x1, y1 - tr.y()),
+        paint_space_point(x1 - tr.x(), y1),
+        paint_space_point(x1 - tr.x(), y1 - tr.y()),
         tr,
         CornerPathKind::TopRight,
     );
@@ -555,9 +491,9 @@ pub(crate) fn shaped_rect_path_commands(
     append_corner_shape(
         &mut commands,
         shapes.top_left,
-        (x0 + tl.x(), y1),
-        (x0, y1 - tl.y()),
-        (x0 + tl.x(), y1 - tl.y()),
+        paint_space_point(x0 + tl.x(), y1),
+        paint_space_point(x0, y1 - tl.y()),
+        paint_space_point(x0 + tl.x(), y1 - tl.y()),
         tl,
         CornerPathKind::TopLeft,
     );
@@ -568,9 +504,9 @@ pub(crate) fn shaped_rect_path_commands(
     append_corner_shape(
         &mut commands,
         shapes.bottom_left,
-        (x0, y0 + bl.y()),
-        (x0 + bl.x(), y0),
-        (x0 + bl.x(), y0 + bl.y()),
+        paint_space_point(x0, y0 + bl.y()),
+        paint_space_point(x0 + bl.x(), y0),
+        paint_space_point(x0 + bl.x(), y0 + bl.y()),
         bl,
         CornerPathKind::BottomLeft,
     );
@@ -589,31 +525,31 @@ pub(in crate::layout) enum CornerPathKind {
 pub(in crate::layout) fn append_corner_shape(
     commands: &mut Vec<RenderedPathCommand>,
     shape: css::CornerShape,
-    start: (f32, f32),
-    end: (f32, f32),
-    inner: (f32, f32),
+    start: PaintPoint,
+    end: PaintPoint,
+    inner: PaintPoint,
     radius: RenderedCornerRadius,
     kind: CornerPathKind,
 ) {
     if radius.x() <= 0.0 && radius.y() <= 0.0 {
-        commands.push(RenderedPathCommand::line_to(paint_tuple_point(end)));
+        commands.push(RenderedPathCommand::line_to(end));
         return;
     }
     match shape.superellipse {
         css::SuperellipseParameter::Infinity => {
             let outer = corner_outer_point(start, end, kind);
-            commands.push(RenderedPathCommand::line_to(paint_tuple_point(outer)));
-            commands.push(RenderedPathCommand::line_to(paint_tuple_point(end)));
+            commands.push(RenderedPathCommand::line_to(outer));
+            commands.push(RenderedPathCommand::line_to(end));
         }
         css::SuperellipseParameter::NegativeInfinity => {
-            commands.push(RenderedPathCommand::line_to(paint_tuple_point(inner)));
-            commands.push(RenderedPathCommand::line_to(paint_tuple_point(end)));
+            commands.push(RenderedPathCommand::line_to(inner));
+            commands.push(RenderedPathCommand::line_to(end));
         }
         css::SuperellipseParameter::Number(1.0) => {
             append_round_corner(commands, start, end, radius, kind);
         }
         css::SuperellipseParameter::Number(0.0) => {
-            commands.push(RenderedPathCommand::line_to(paint_tuple_point(end)));
+            commands.push(RenderedPathCommand::line_to(end));
         }
         css::SuperellipseParameter::Number(-1.0) => {
             append_scoop_corner(commands, start, end, radius, kind);
@@ -626,41 +562,37 @@ pub(in crate::layout) fn append_corner_shape(
 
 pub(in crate::layout) fn append_scoop_corner(
     commands: &mut Vec<RenderedPathCommand>,
-    start: (f32, f32),
-    end: (f32, f32),
+    start: PaintPoint,
+    end: PaintPoint,
     radius: RenderedCornerRadius,
     kind: CornerPathKind,
 ) {
     const KAPPA: f32 = 0.552_284_8;
     let (c1, c2) = match kind {
         CornerPathKind::BottomRight => (
-            (start.0, start.1 + radius.y() * KAPPA),
-            (end.0 - radius.x() * KAPPA, end.1),
+            paint_space_point(start.x, start.y + radius.y() * KAPPA),
+            paint_space_point(end.x - radius.x() * KAPPA, end.y),
         ),
         CornerPathKind::TopRight => (
-            (start.0 - radius.x() * KAPPA, start.1),
-            (end.0, end.1 - radius.y() * KAPPA),
+            paint_space_point(start.x - radius.x() * KAPPA, start.y),
+            paint_space_point(end.x, end.y - radius.y() * KAPPA),
         ),
         CornerPathKind::TopLeft => (
-            (start.0, start.1 - radius.y() * KAPPA),
-            (end.0 + radius.x() * KAPPA, end.1),
+            paint_space_point(start.x, start.y - radius.y() * KAPPA),
+            paint_space_point(end.x + radius.x() * KAPPA, end.y),
         ),
         CornerPathKind::BottomLeft => (
-            (start.0 + radius.x() * KAPPA, start.1),
-            (end.0, end.1 + radius.y() * KAPPA),
+            paint_space_point(start.x + radius.x() * KAPPA, start.y),
+            paint_space_point(end.x, end.y + radius.y() * KAPPA),
         ),
     };
-    commands.push(RenderedPathCommand::curve_to(
-        paint_tuple_point(c1),
-        paint_tuple_point(c2),
-        paint_tuple_point(end),
-    ));
+    commands.push(RenderedPathCommand::curve_to(c1, c2, end));
 }
 
 fn append_sampled_superellipse_corner(
     commands: &mut Vec<RenderedPathCommand>,
-    start: (f32, f32),
-    end: (f32, f32),
+    start: PaintPoint,
+    end: PaintPoint,
     value: f32,
     kind: CornerPathKind,
 ) {
@@ -668,14 +600,14 @@ fn append_sampled_superellipse_corner(
     const EXTREME: f32 = 20.0;
     let outer = corner_outer_point(start, end, kind);
     if value >= EXTREME {
-        commands.push(RenderedPathCommand::line_to(paint_tuple_point(outer)));
-        commands.push(RenderedPathCommand::line_to(paint_tuple_point(end)));
+        commands.push(RenderedPathCommand::line_to(outer));
+        commands.push(RenderedPathCommand::line_to(end));
         return;
     }
     if value <= -EXTREME {
         let inner = corner_inner_point(start, end, outer);
-        commands.push(RenderedPathCommand::line_to(paint_tuple_point(inner)));
-        commands.push(RenderedPathCommand::line_to(paint_tuple_point(end)));
+        commands.push(RenderedPathCommand::line_to(inner));
+        commands.push(RenderedPathCommand::line_to(end));
         return;
     }
 
@@ -683,7 +615,7 @@ fn append_sampled_superellipse_corner(
         let theta = std::f32::consts::FRAC_PI_2 * segment as f32 / SEGMENTS as f32;
         let (u, v) = sampled_superellipse_unit_point(theta, value);
         let point = corner_point_from_unit(start, end, outer, u, v);
-        commands.push(RenderedPathCommand::line_to(paint_tuple_point(point)));
+        commands.push(RenderedPathCommand::line_to(point));
     }
 }
 
@@ -701,63 +633,59 @@ fn sampled_superellipse_unit_point(theta: f32, value: f32) -> (f32, f32) {
     }
 }
 
-fn corner_outer_point(start: (f32, f32), end: (f32, f32), kind: CornerPathKind) -> (f32, f32) {
+fn corner_outer_point(start: PaintPoint, end: PaintPoint, kind: CornerPathKind) -> PaintPoint {
     match kind {
-        CornerPathKind::BottomRight => (end.0, start.1),
-        CornerPathKind::TopRight => (start.0, end.1),
-        CornerPathKind::TopLeft => (end.0, start.1),
-        CornerPathKind::BottomLeft => (start.0, end.1),
+        CornerPathKind::BottomRight => paint_space_point(end.x, start.y),
+        CornerPathKind::TopRight => paint_space_point(start.x, end.y),
+        CornerPathKind::TopLeft => paint_space_point(end.x, start.y),
+        CornerPathKind::BottomLeft => paint_space_point(start.x, end.y),
     }
 }
 
-fn corner_inner_point(start: (f32, f32), end: (f32, f32), outer: (f32, f32)) -> (f32, f32) {
-    (start.0 + end.0 - outer.0, start.1 + end.1 - outer.1)
+fn corner_inner_point(start: PaintPoint, end: PaintPoint, outer: PaintPoint) -> PaintPoint {
+    paint_space_point(start.x + end.x - outer.x, start.y + end.y - outer.y)
 }
 
 fn corner_point_from_unit(
-    start: (f32, f32),
-    end: (f32, f32),
-    outer: (f32, f32),
+    start: PaintPoint,
+    end: PaintPoint,
+    outer: PaintPoint,
     u: f32,
     v: f32,
-) -> (f32, f32) {
-    (
-        outer.0 + (start.0 - outer.0) * u + (end.0 - outer.0) * v,
-        outer.1 + (start.1 - outer.1) * u + (end.1 - outer.1) * v,
+) -> PaintPoint {
+    paint_space_point(
+        outer.x + (start.x - outer.x) * u + (end.x - outer.x) * v,
+        outer.y + (start.y - outer.y) * u + (end.y - outer.y) * v,
     )
 }
 
 pub(in crate::layout) fn append_round_corner(
     commands: &mut Vec<RenderedPathCommand>,
-    start: (f32, f32),
-    end: (f32, f32),
+    start: PaintPoint,
+    end: PaintPoint,
     radius: RenderedCornerRadius,
     kind: CornerPathKind,
 ) {
     const KAPPA: f32 = 0.552_284_8;
     let (c1, c2) = match kind {
         CornerPathKind::BottomRight => (
-            (start.0 + radius.x() * KAPPA, start.1),
-            (end.0, end.1 - radius.y() * KAPPA),
+            paint_space_point(start.x + radius.x() * KAPPA, start.y),
+            paint_space_point(end.x, end.y - radius.y() * KAPPA),
         ),
         CornerPathKind::TopRight => (
-            (start.0, start.1 + radius.y() * KAPPA),
-            (end.0 + radius.x() * KAPPA, end.1),
+            paint_space_point(start.x, start.y + radius.y() * KAPPA),
+            paint_space_point(end.x + radius.x() * KAPPA, end.y),
         ),
         CornerPathKind::TopLeft => (
-            (start.0 - radius.x() * KAPPA, start.1),
-            (end.0, end.1 + radius.y() * KAPPA),
+            paint_space_point(start.x - radius.x() * KAPPA, start.y),
+            paint_space_point(end.x, end.y + radius.y() * KAPPA),
         ),
         CornerPathKind::BottomLeft => (
-            (start.0, start.1 - radius.y() * KAPPA),
-            (end.0 - radius.x() * KAPPA, end.1),
+            paint_space_point(start.x, start.y - radius.y() * KAPPA),
+            paint_space_point(end.x - radius.x() * KAPPA, end.y),
         ),
     };
-    commands.push(RenderedPathCommand::curve_to(
-        paint_tuple_point(c1),
-        paint_tuple_point(c2),
-        paint_tuple_point(end),
-    ));
+    commands.push(RenderedPathCommand::curve_to(c1, c2, end));
 }
 
 pub(in crate::layout) fn paint_tuple_point(point: (f32, f32)) -> PaintPoint {
@@ -782,27 +710,60 @@ pub(in crate::layout) fn inset_rounded_rect_radii(
 ///
 /// CSS Backgrounds and Borders Level 3 §5.1 defines percent resolution and the
 /// proportional reduction used when corner curves overlap along an edge.
-pub(crate) fn used_rounded_rect_radii(
+pub(crate) fn used_rounded_rect_radii<Space>(
     radius: css::BorderRadius,
-    width: f32,
-    height: f32,
+    size: euclid::Size2D<f32, Space>,
 ) -> RenderedRoundedRectRadii {
+    let width = size.width;
+    let height = size.height;
     let mut radii = RenderedRoundedRectRadii {
         top_left: RenderedCornerRadius::new(
-            radius.top_left.x.resolve(width),
-            radius.top_left.y.resolve(height),
+            radius
+                .top_left
+                .x
+                .resolve(PercentageBasis::definite(layout_pt(width)))
+                .points(),
+            radius
+                .top_left
+                .y
+                .resolve(PercentageBasis::definite(layout_pt(height)))
+                .points(),
         ),
         top_right: RenderedCornerRadius::new(
-            radius.top_right.x.resolve(width),
-            radius.top_right.y.resolve(height),
+            radius
+                .top_right
+                .x
+                .resolve(PercentageBasis::definite(layout_pt(width)))
+                .points(),
+            radius
+                .top_right
+                .y
+                .resolve(PercentageBasis::definite(layout_pt(height)))
+                .points(),
         ),
         bottom_right: RenderedCornerRadius::new(
-            radius.bottom_right.x.resolve(width),
-            radius.bottom_right.y.resolve(height),
+            radius
+                .bottom_right
+                .x
+                .resolve(PercentageBasis::definite(layout_pt(width)))
+                .points(),
+            radius
+                .bottom_right
+                .y
+                .resolve(PercentageBasis::definite(layout_pt(height)))
+                .points(),
         ),
         bottom_left: RenderedCornerRadius::new(
-            radius.bottom_left.x.resolve(width),
-            radius.bottom_left.y.resolve(height),
+            radius
+                .bottom_left
+                .x
+                .resolve(PercentageBasis::definite(layout_pt(width)))
+                .points(),
+            radius
+                .bottom_left
+                .y
+                .resolve(PercentageBasis::definite(layout_pt(height)))
+                .points(),
         ),
     };
     let scale = [
@@ -853,13 +814,14 @@ mod tests {
         }
     }
 
+    fn test_rect() -> PaintRect {
+        paint_space_rect(0.0, 0.0, 10.0, 10.0)
+    }
+
     #[test]
     fn notch_corner_path_visits_inner_corner() {
         let commands = shaped_rect_path_commands(
-            0.0,
-            0.0,
-            10.0,
-            10.0,
+            test_rect(),
             test_radii(),
             top_left_shape(css::CornerShape::NOTCH),
         );
@@ -870,18 +832,12 @@ mod tests {
     #[test]
     fn negative_infinite_superellipse_matches_notch_path() {
         let notch = shaped_rect_path_commands(
-            0.0,
-            0.0,
-            10.0,
-            10.0,
+            test_rect(),
             test_radii(),
             top_left_shape(css::CornerShape::NOTCH),
         );
         let superellipse = shaped_rect_path_commands(
-            0.0,
-            0.0,
-            10.0,
-            10.0,
+            test_rect(),
             test_radii(),
             top_left_shape(css::CornerShape::superellipse(
                 css::SuperellipseParameter::NegativeInfinity,
@@ -894,18 +850,12 @@ mod tests {
     #[test]
     fn positive_infinite_superellipse_matches_square_path() {
         let square = shaped_rect_path_commands(
-            0.0,
-            0.0,
-            10.0,
-            10.0,
+            test_rect(),
             test_radii(),
             top_left_shape(css::CornerShape::SQUARE),
         );
         let superellipse = shaped_rect_path_commands(
-            0.0,
-            0.0,
-            10.0,
-            10.0,
+            test_rect(),
             test_radii(),
             top_left_shape(css::CornerShape::superellipse(
                 css::SuperellipseParameter::Infinity,
@@ -920,8 +870,61 @@ mod tests {
         let radii = test_radii();
 
         assert_eq!(
-            shaped_rect_path_commands(0.0, 0.0, 10.0, 10.0, radii, css::CornerShapes::ROUND),
-            rounded_rect_path_commands(0.0, 0.0, 10.0, 10.0, radii)
+            shaped_rect_path_commands(test_rect(), radii, css::CornerShapes::ROUND),
+            rounded_rect_path_commands(test_rect(), radii)
+        );
+    }
+
+    #[test]
+    fn shaped_corner_path_preserves_nonzero_paint_rect_origin() {
+        let commands = shaped_rect_path_commands(
+            paint_space_rect(10.0, 20.0, 10.0, 10.0),
+            test_radii(),
+            top_left_shape(css::CornerShape::NOTCH),
+        );
+
+        assert!(commands.contains(&RenderedPathCommand::line_to(paint_space_point(12.0, 28.0))));
+    }
+
+    #[test]
+    fn border_side_clip_uses_the_paint_rect_edges() {
+        let side = UsedBorderSide::new(2.0, BorderStyle::Solid, Color::new(0, 0, 0));
+        let borders = UsedBorder {
+            top: side,
+            right: side,
+            bottom: side,
+            left: side,
+        };
+        let clip = rounded_border_side_clip(
+            BorderEdge::Top,
+            paint_space_rect(10.0, 20.0, 30.0, 40.0),
+            borders,
+        );
+
+        assert_eq!(
+            clip.commands,
+            vec![
+                RenderedPathCommand::move_to(paint_space_point(10.0, 60.0)),
+                RenderedPathCommand::line_to(paint_space_point(40.0, 60.0)),
+                RenderedPathCommand::line_to(paint_space_point(38.0, 58.0)),
+                RenderedPathCommand::line_to(paint_space_point(12.0, 58.0)),
+                RenderedPathCommand::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn uniform_ring_insets_a_nonzero_paint_rect() {
+        let path = uniform_rounded_ring_path(
+            paint_space_rect(10.0, 20.0, 30.0, 40.0),
+            test_radii(),
+            2.0,
+            Color::new(0, 0, 0),
+        );
+
+        assert!(
+            path.commands
+                .contains(&RenderedPathCommand::move_to(paint_space_point(12.0, 22.0)))
         );
     }
 }

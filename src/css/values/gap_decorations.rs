@@ -85,6 +85,7 @@ pub(crate) fn parse_gap_rule_shorthand(
     })?;
     let widths = map_gap_rule_list(&rule_components, |rule| {
         rule.width
+            .clone()
             .unwrap_or_else(|| ComputedLengthPercentage::from_points(3.0 * CSS_PX_TO_PT))
     });
     let styles = map_gap_rule_list(&rule_components, |rule| {

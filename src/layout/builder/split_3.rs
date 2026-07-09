@@ -16,13 +16,6 @@ pub(in crate::layout) fn canvas_background_style(style: &ComputedStyle) -> Compu
     style
 }
 
-pub(in crate::layout) fn page_style_has_visible_paint(style: &ComputedStyle) -> bool {
-    style.background_color.is_some_and(Color::is_visible)
-        || style.background_image.is_some()
-        || used_border_width(style) > 0.0
-        || style.border_image.source.is_some()
-}
-
 pub(in crate::layout) fn target_element_text(element: &Element) -> String {
     let mut output = String::new();
     for child in &element.children {
@@ -55,7 +48,7 @@ pub(in crate::layout) fn collect_target_element_text(node: &Node, output: &mut S
 pub(in crate::layout) fn page_box_edges_from_declarations_with_ch_advance(
     declarations: &Declarations,
     page_size: PageSize,
-    ch_advance: f32,
+    ch_advance: LayoutLength,
 ) -> PageBoxEdges {
     if declarations.is_empty() {
         return PageBoxEdges::ZERO;
@@ -73,32 +66,6 @@ pub(in crate::layout) fn page_box_edges_from_declarations_with_ch_advance(
     }
 }
 
-/// Used page background positioning area.
-///
-/// CSS Backgrounds and Borders defines `background-origin` as selecting the
-/// border, padding, or content box used for background image positioning. CSS
-/// Paged Media applies that box model to page boxes:
-/// <https://www.w3.org/TR/css-backgrounds-3/#the-background-origin> and
-/// <https://www.w3.org/TR/css-page-3/#page-model>.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct PageBackgroundArea {
-    pub(in crate::layout) x: f32,
-    pub(in crate::layout) y: f32,
-    pub(in crate::layout) width: f32,
-    pub(in crate::layout) height: f32,
-}
-
-impl PageBackgroundArea {
-    pub(in crate::layout) fn inset(self, edges: css::Edges) -> Self {
-        Self {
-            x: self.x + edges.left,
-            y: self.y + edges.bottom,
-            width: (self.width - edges.left - edges.right).max(0.0),
-            height: (self.height - edges.top - edges.bottom).max(0.0),
-        }
-    }
-}
-
 /// Resolves the page background positioning area selected by `background-origin`.
 ///
 /// For a page box, the border box starts inside the page margins, the padding
@@ -111,8 +78,8 @@ pub(in crate::layout) fn page_background_positioning_area(
     base_margins: PageMargins,
     page_size: PageSize,
     origin: css::BackgroundBox,
-    ch_advance: f32,
-) -> PageBackgroundArea {
+    ch_advance: LayoutLength,
+) -> PaintRect {
     let edges =
         page_box_edges_from_declarations_with_ch_advance(declarations, page_size, ch_advance);
     let margins = css::page_margins_from_for_size_and_edges_with_ch_advance(
@@ -122,17 +89,19 @@ pub(in crate::layout) fn page_background_positioning_area(
         edges.total(),
         ch_advance,
     );
-    let border_box = PageBackgroundArea {
-        x: margins.left(),
-        y: margins.bottom(),
-        width: (page_size.width() - margins.left() - margins.right()).max(0.0),
-        height: (page_size.height() - margins.top() - margins.bottom()).max(0.0),
-    };
+    let border_box = paint_space_rect(
+        margins.left(),
+        margins.bottom(),
+        (page_size.width() - margins.left() - margins.right()).max(0.0),
+        (page_size.height() - margins.top() - margins.bottom()).max(0.0),
+    );
 
     match origin {
-        css::BackgroundBox::Border => border_box,
-        css::BackgroundBox::Padding => border_box.inset(edges.border),
-        css::BackgroundBox::Content => border_box.inset(edges.border).inset(edges.padding),
+        css::BackgroundBox::Border | css::BackgroundBox::BorderArea => border_box,
+        css::BackgroundBox::Padding => inset_paint_rect(border_box, edges.border),
+        css::BackgroundBox::Content => {
+            inset_paint_rect(inset_paint_rect(border_box, edges.border), edges.padding)
+        }
     }
 }
 
@@ -144,65 +113,13 @@ pub(in crate::layout) fn page_background_layers_for_paint(
     }
     vec![css::BackgroundLayer {
         image: style.background_image.clone(),
-        position: style.background_position,
-        size: style.background_size,
+        position: style.background_position.clone(),
+        size: style.background_size.clone(),
         repeat: style.background_repeat,
+        attachment: style.background_attachment,
         origin: style.background_origin,
         clip: style.background_clip,
     }]
-}
-
-/// Clips page background image tiles to the selected background painting area.
-///
-/// CSS Backgrounds separates `background-origin`, which positions the image,
-/// from `background-clip`, which clips painting:
-/// <https://www.w3.org/TR/css-backgrounds-3/#the-background-origin> and
-/// <https://www.w3.org/TR/css-backgrounds-3/#the-background-clip>. Page boxes
-/// use the same border/padding/content boxes through CSS Paged Media:
-/// <https://www.w3.org/TR/css-page-3/#page-model>.
-pub(in crate::layout) fn clip_background_images_to_area(
-    images: Vec<RenderedImage>,
-    clip: PageBackgroundArea,
-) -> Vec<RenderedImage> {
-    images
-        .into_iter()
-        .filter_map(|image| clip_background_image_to_area(image, clip))
-        .collect()
-}
-
-pub(in crate::layout) fn clip_background_image_to_area(
-    mut image: RenderedImage,
-    clip: PageBackgroundArea,
-) -> Option<RenderedImage> {
-    let image_x = image.x();
-    let image_y = image.y();
-    let image_width = image.width();
-    let image_height = image.height();
-    let x1 = image_x.max(clip.x);
-    let y1 = image_y.max(clip.y);
-    let x2 = (image_x + image_width).min(clip.x + clip.width);
-    let y2 = (image_y + image_height).min(clip.y + clip.height);
-    if x2 <= x1 || y2 <= y1 || image_width <= 0.0 || image_height <= 0.0 {
-        return None;
-    }
-    let source = image.source_rect.unwrap_or(RenderedImageSourceRect {
-        x: 0,
-        y: 0,
-        width: image.pixel_width,
-        height: image.pixel_height,
-    });
-    let source_x = source.x as f32 + ((x1 - image_x) / image_width) * source.width as f32;
-    let source_y = source.y as f32 + ((y1 - image_y) / image_height) * source.height as f32;
-    let source_width = ((x2 - x1) / image_width) * source.width as f32;
-    let source_height = ((y2 - y1) / image_height) * source.height as f32;
-    image.set_paint_rect(paint_space_rect(x1, y1, x2 - x1, y2 - y1));
-    image.source_rect = Some(RenderedImageSourceRect {
-        x: source_x.floor().max(0.0) as u32,
-        y: source_y.floor().max(0.0) as u32,
-        width: source_width.ceil().max(1.0) as u32,
-        height: source_height.ceil().max(1.0) as u32,
-    });
-    Some(image)
 }
 
 /// Returns whether a forced break target is satisfied by the next page number.
@@ -218,7 +135,12 @@ pub(in crate::layout) fn forced_break_satisfied(
 ) -> bool {
     let is_left = page_is_left(next_page_number, page_progression_direction);
     match forced_break {
-        PageBreak::Auto | PageBreak::Avoid | PageBreak::Page => true,
+        PageBreak::Auto
+        | PageBreak::Avoid
+        | PageBreak::AvoidPage
+        | PageBreak::AvoidColumn
+        | PageBreak::Page
+        | PageBreak::Column => true,
         PageBreak::Left => is_left,
         PageBreak::Right => !is_left,
         PageBreak::Recto => is_recto_page(next_page_number, page_progression_direction),
@@ -266,7 +188,7 @@ pub(in crate::layout) fn is_recto_page(
 
 pub(in crate::layout) fn append_fixed_layer_to_page(page: &mut Page, layer: &FixedPaintLayer) {
     let fragment = fixed_layer_fragment(layer);
-    let recorded = page.record_paint_fragment(&fragment, PaintVector::new(0.0, 0.0));
+    let recorded = page.record_paint_fragment_owned(fragment, PaintTranslation::identity());
     page.append_recorded_paint_fragment(recorded);
     page.sort_paint_tree_stacking_contexts();
 }
@@ -282,6 +204,7 @@ pub(in crate::layout) fn fixed_layer_fragment(layer: &FixedPaintLayer) -> PaintF
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Css;
     use crate::css::{
         ComputedBoxValues, ComputedLengthPercentage, ComputedLengthPercentageOrAuto,
         ComputedLineHeight, CssEdges,
@@ -298,6 +221,10 @@ mod tests {
             base_url: None,
             root_url: None,
             resource_cache,
+            // The builder retains this reference for its lifetime; tests that do
+            // not exercise iframes use one immutable empty fixture.
+            iframe_documents: Box::leak(Box::new(HashMap::new())),
+            iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
             font_system: FontSystem::new(),
@@ -334,19 +261,162 @@ mod tests {
         builder.resolve_style_font_metric_lengths(&mut style);
 
         let first_line = style.first_line_style.as_ref().unwrap();
-        let ComputedLineHeight::Length(line_height) = first_line.line_height_value else {
+        let ComputedLineHeight::Length(line_height) = &first_line.line_height_value else {
             panic!("expected first-line length line-height");
         };
-        assert_eq!(line_height.ch, 0.0);
+        assert!(!line_height.requires_ch_advance());
         assert!(line_height.length_points() > 0.0);
 
         let first_letter = style.first_letter_style.as_ref().unwrap();
         let ComputedLengthPercentageOrAuto::LengthPercentage(margin_left) =
-            first_letter.box_values.margin.left
+            &first_letter.box_values.margin.left
         else {
             panic!("expected first-letter length margin");
         };
-        assert_eq!(margin_left.ch, 0.0);
+        assert!(!margin_left.requires_ch_advance());
         assert!(margin_left.length_points() > 0.0);
+    }
+
+    #[test]
+    fn page_background_positioning_uses_typed_paint_rects_for_each_box() {
+        let declarations = Declarations::from_iter([
+            ("border-top-width".to_string(), "7pt".to_string()),
+            ("border-right-width".to_string(), "11pt".to_string()),
+            ("border-bottom-width".to_string(), "13pt".to_string()),
+            ("border-left-width".to_string(), "17pt".to_string()),
+            ("border-top-style".to_string(), "solid".to_string()),
+            ("border-right-style".to_string(), "solid".to_string()),
+            ("border-bottom-style".to_string(), "solid".to_string()),
+            ("border-left-style".to_string(), "solid".to_string()),
+            ("padding-top".to_string(), "2pt".to_string()),
+            ("padding-right".to_string(), "3pt".to_string()),
+            ("padding-bottom".to_string(), "5pt".to_string()),
+            ("padding-left".to_string(), "7pt".to_string()),
+        ]);
+        let margins = PageMargins::from_points(11.0, 13.0, 17.0, 19.0);
+        let size = PageSize::from_points(200.0, 180.0);
+
+        assert_eq!(
+            page_background_positioning_area(
+                &declarations,
+                margins,
+                size,
+                css::BackgroundBox::Border,
+                layout_pt(0.0),
+            ),
+            paint_space_rect(19.0, 17.0, 168.0, 152.0),
+        );
+        assert_eq!(
+            page_background_positioning_area(
+                &declarations,
+                margins,
+                size,
+                css::BackgroundBox::Padding,
+                layout_pt(0.0),
+            ),
+            paint_space_rect(36.0, 30.0, 140.0, 132.0),
+        );
+        assert_eq!(
+            page_background_positioning_area(
+                &declarations,
+                margins,
+                size,
+                css::BackgroundBox::Content,
+                layout_pt(0.0),
+            ),
+            paint_space_rect(43.0, 35.0, 130.0, 125.0),
+        );
+    }
+
+    #[test]
+    fn first_named_page_establishes_the_viewport_once() {
+        let options = RenderOptions::default();
+        let stylesheets = vec![css::parse_stylesheet(&Css::from_string(
+            "@page { size: 300pt 400pt } @page chapter { size: 200pt 200pt }",
+        ))];
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        builder.current_page_name = Some("chapter".to_string());
+        builder.rebuild_empty_current_page_context();
+        let initial = builder.initial_viewport_context;
+
+        builder.current_page_has_flow_content = true;
+        builder.push_page();
+        builder.current_page_name = None;
+        builder.rebuild_empty_current_page_context();
+
+        assert_eq!(builder.initial_viewport_context, initial);
+        assert_eq!(initial.size, PageSize::from_points(200.0, 200.0));
+        assert_eq!(
+            builder.current_page_context.size,
+            PageSize::from_points(300.0, 400.0)
+        );
+    }
+
+    #[test]
+    fn named_page_boundary_requires_in_flow_predecessor() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        builder.current_page_name = Some("float-page".to_string());
+
+        // A preceding float has paint and pagination occupancy, but it is
+        // out of normal flow and cannot form a class-A boundary for the next
+        // page-name group.
+        builder.current_page_has_flow_content = true;
+        let scope = builder.enter_page_name_scope_for_value(Some("article"));
+        assert_eq!(builder.pages.len(), 0);
+        assert_eq!(builder.current_page_name.as_deref(), Some("article"));
+        builder.exit_page_name_scope(
+            scope.map(|previous| builder.page_name_scope_checkpoint(previous)),
+        );
+
+        builder.mark_current_page_flow_content();
+        builder.enter_page_name_scope_for_value(Some("appendix"));
+        assert_eq!(builder.pages.len(), 1);
+        assert_eq!(builder.current_page_name.as_deref(), Some("appendix"));
+    }
+
+    #[test]
+    fn viewport_units_keep_the_initial_page_context_after_a_named_transition() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let initial = PageContext {
+            size: PageSize::from_points(200.0, 200.0),
+            ..PageContext::from_options(&options)
+        };
+        let destination = PageContext {
+            size: PageSize::from_points(300.0, 400.0),
+            ..PageContext::from_options(&options)
+        };
+        builder.initial_viewport_context = initial;
+        builder.current_page_context = destination;
+        let style = ComputedStyle {
+            box_values: ComputedBoxValues {
+                width: ComputedLengthPercentageOrAuto::LengthPercentage(
+                    ComputedLengthPercentage::from_vw(100.0),
+                ),
+                height: ComputedLengthPercentageOrAuto::LengthPercentage(
+                    ComputedLengthPercentage::from_vh(100.0),
+                ),
+                ..ComputedBoxValues::initial()
+            },
+            ..ComputedStyle::initial()
+        };
+
+        let resolved = builder.style_with_current_viewport_lengths(&style);
+        let ComputedLengthPercentageOrAuto::LengthPercentage(width) = resolved.box_values.width
+        else {
+            panic!("expected viewport-resolved width");
+        };
+        let ComputedLengthPercentageOrAuto::LengthPercentage(height) = resolved.box_values.height
+        else {
+            panic!("expected viewport-resolved height");
+        };
+        assert_eq!(width.length_points(), destination.area_width());
+        assert_eq!(height.length_points(), destination.area_height());
     }
 }

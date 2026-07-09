@@ -1,0 +1,62 @@
+# CSS Page Test Parity
+
+This note tracks renderer parity for the CSS Page WPT reftests. It records
+current behavior rather than treating harness thresholds as renderer support.
+
+## Current baseline
+
+On 2026-07-18, the local `quire-wpt` raw run of `css/css-page/` rendered 226
+reftests with the development binary and `--page-margin=0px`:
+
+- 175 passed;
+- 51 failed.
+
+The run artifacts are kept under
+`/private/tmp/quire-css-page-logical-page-basis/` for this working session.
+This is three renderer matches above the preceding 172/226 baseline:
+`monolithic-overflow-012-print.html` now retains the final fragmented float
+slice, and `monolithic-overflow-013-print.html` now retains background-only
+absolute-positioned fragments before its first text line.
+`margin-boxes/alignment-001-print.html` also now matches after the current
+margin-box alignment work.
+
+## Implemented foundations
+
+- Page-name scopes retain their lexical specified value independently from the
+  currently selected page, so nested and flex-item page groups do not leak
+  into their parent scope.
+- Page-local canvas insets are tracked while root/body fragments are laid out,
+  preventing a page transition from carrying the first page's canvas offset
+  into later named pages.
+- Page contexts distinguish physical area dimensions from the logical inline
+  and block extents of the active writing mode. Child available-space setup
+  now takes its fallback block basis from that logical page extent.
+- Deferred float paint materializes every destination page and marks a page
+  containing deferred paint as a real fragmentainer.
+- Absolutely positioned replay retains every captured painted fragment. A
+  background-only slice must not be discarded merely because it contains no
+  text baseline.
+
+## Remaining renderer clusters
+
+The outstanding raw failures are architectural clusters, not per-test
+exceptions:
+
+- Vertical and sideways root flows still paginate through the physical Y axis.
+  Their logical block progression must select a new physical page fragment,
+  which affects the four body-background writing-mode cases and orthogonal
+  named-page cases.
+- Page geometry is not yet fully staged as immutable initial viewport geometry
+  followed by each destination page's used box. This affects page size,
+  orientation, page-rule specificity, logical page margins, and print media
+  queries.
+- Canvas/page background propagation still needs page-fragment-local image
+  positioning and physical writing-mode mapping.
+- Monolithic table, inline, and positioned/fixed overflow need the common
+  page-fragment disposition model. The positioned cases must preserve the
+  renderer's A4 default while their WPT viewport assumptions remain explicit
+  harness policy, rather than adding test-specific renderer behavior.
+
+The three documented CSS Page margin-box `writing-mode` compatibility ratios
+remain runner-only reporting. They are not renderer parity and no additional
+thresholds should be added.

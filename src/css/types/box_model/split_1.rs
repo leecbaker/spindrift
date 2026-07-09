@@ -1,30 +1,68 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundRepeatAxis {
+    Repeat,
+    Space,
+    Round,
+    NoRepeat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackgroundRepeat {
     Repeat,
     NoRepeat,
     RepeatX,
     RepeatY,
+    Axes {
+        x: BackgroundRepeatAxis,
+        y: BackgroundRepeatAxis,
+    },
 }
 
 impl BackgroundRepeat {
+    pub(crate) fn new(x: BackgroundRepeatAxis, y: BackgroundRepeatAxis) -> Self {
+        match (x, y) {
+            (BackgroundRepeatAxis::Repeat, BackgroundRepeatAxis::Repeat) => Self::Repeat,
+            (BackgroundRepeatAxis::NoRepeat, BackgroundRepeatAxis::NoRepeat) => Self::NoRepeat,
+            (BackgroundRepeatAxis::Repeat, BackgroundRepeatAxis::NoRepeat) => Self::RepeatX,
+            (BackgroundRepeatAxis::NoRepeat, BackgroundRepeatAxis::Repeat) => Self::RepeatY,
+            (x, y) => Self::Axes { x, y },
+        }
+    }
+
+    pub(crate) fn x_axis(self) -> BackgroundRepeatAxis {
+        match self {
+            Self::Repeat | Self::RepeatX => BackgroundRepeatAxis::Repeat,
+            Self::NoRepeat | Self::RepeatY => BackgroundRepeatAxis::NoRepeat,
+            Self::Axes { x, .. } => x,
+        }
+    }
+
+    pub(crate) fn y_axis(self) -> BackgroundRepeatAxis {
+        match self {
+            Self::Repeat | Self::RepeatY => BackgroundRepeatAxis::Repeat,
+            Self::NoRepeat | Self::RepeatX => BackgroundRepeatAxis::NoRepeat,
+            Self::Axes { y, .. } => y,
+        }
+    }
+
     /// Returns whether the background image repeats on the physical x axis.
     ///
-    /// CSS Backgrounds and Borders defines `repeat-x` as `repeat no-repeat`
-    /// and `repeat-y` as `no-repeat repeat`:
+    /// CSS Backgrounds and Borders defines `repeat`, `space`, and `round` as
+    /// repeated styles; only `no-repeat` suppresses additional tiles:
     /// <https://www.w3.org/TR/css-backgrounds-3/#the-background-repeat>.
     pub(crate) fn repeats_x(self) -> bool {
-        matches!(self, Self::Repeat | Self::RepeatX)
+        self.x_axis() != BackgroundRepeatAxis::NoRepeat
     }
 
     /// Returns whether the background image repeats on the physical y axis.
     ///
-    /// CSS Backgrounds and Borders defines the two-axis repeat model used by
-    /// `background-repeat`:
+    /// CSS Backgrounds and Borders defines `repeat`, `space`, and `round` as
+    /// repeated styles; only `no-repeat` suppresses additional tiles:
     /// <https://www.w3.org/TR/css-backgrounds-3/#the-background-repeat>.
     pub(crate) fn repeats_y(self) -> bool {
-        matches!(self, Self::Repeat | Self::RepeatY)
+        self.y_axis() != BackgroundRepeatAxis::NoRepeat
     }
 }
 
@@ -178,15 +216,141 @@ pub(crate) enum UnicodeBidi {
 
 /// Computed CSS `writing-mode`.
 ///
-/// CSS Writing Modes maps block and inline axes to physical axes through
-/// `writing-mode`; Reasyprint currently uses this for logical border
-/// resolution before broader vertical layout support exists:
-/// <https://www.w3.org/TR/css-writing-modes-4/#writing-mode>.
+/// This deliberately preserves every modern CSS Writing Modes keyword. The
+/// physical geometry and typographic behavior derived from a value are related
+/// but not interchangeable: sideways modes have vertical line geometry and
+/// horizontal typographic mode.
+///
+/// <https://www.w3.org/TR/css-writing-modes-4/#block-flow> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#typographic-mode>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WritingMode {
     HorizontalTb,
     VerticalRl,
     VerticalLr,
+    SidewaysRl,
+    SidewaysLr,
+}
+
+/// The typographic mode selected by a CSS writing mode.
+///
+/// `text-orientation` only affects vertical typographic mode. Sideways modes
+/// use horizontal metrics and composition even though their line geometry is
+/// vertical:
+/// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypographicMode {
+    Horizontal,
+    Vertical,
+}
+
+/// The direction in which a sideways writing mode rotates horizontal text.
+///
+/// <https://www.w3.org/TR/css-writing-modes-4/#valdef-writing-mode-sideways-rl>
+/// and
+/// <https://www.w3.org/TR/css-writing-modes-4/#valdef-writing-mode-sideways-lr>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidewaysOrientation {
+    Right,
+    Left,
+}
+
+/// The text shaping and placement policy selected by computed writing values.
+///
+/// This is the used-value boundary between writing-mode geometry and text
+/// layout. In particular, a sideways writing mode selects a forced horizontal
+/// run rotation and suppresses `text-orientation`; it is not a vertical mode
+/// with `text-orientation: sideways`.
+///
+/// <https://www.w3.org/TR/css-writing-modes-4/#typographic-mode> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextLayoutPolicy {
+    Horizontal,
+    Vertical(TextOrientation),
+    Sideways(SidewaysOrientation),
+}
+
+impl WritingMode {
+    /// Whether line and block geometry use vertical writing axes.
+    ///
+    /// This is distinct from [`Self::typographic_mode`]: sideways modes have
+    /// vertical geometry, but horizontal typography.
+    pub(crate) const fn has_vertical_lines(self) -> bool {
+        !matches!(self, Self::HorizontalTb)
+    }
+
+    /// Return the typographic mode used for shaping, metrics, and baselines.
+    pub(crate) const fn typographic_mode(self) -> TypographicMode {
+        match self {
+            Self::HorizontalTb | Self::SidewaysRl | Self::SidewaysLr => TypographicMode::Horizontal,
+            Self::VerticalRl | Self::VerticalLr => TypographicMode::Vertical,
+        }
+    }
+
+    /// Return the forced sideways orientation, if this is a sideways mode.
+    pub(crate) const fn sideways_orientation(self) -> Option<SidewaysOrientation> {
+        match self {
+            Self::SidewaysRl => Some(SidewaysOrientation::Right),
+            Self::SidewaysLr => Some(SidewaysOrientation::Left),
+            Self::HorizontalTb | Self::VerticalRl | Self::VerticalLr => None,
+        }
+    }
+
+    /// Derive the text-layout policy for this writing mode and computed
+    /// `text-orientation`.
+    ///
+    /// `text-orientation` applies only in vertical typographic mode. The two
+    /// sideways values instead force all typographic units into horizontally
+    /// shaped runs rotated toward their specified line-right direction.
+    pub(crate) const fn text_layout_policy(
+        self,
+        text_orientation: TextOrientation,
+    ) -> TextLayoutPolicy {
+        if let Some(sideways_orientation) = self.sideways_orientation() {
+            return TextLayoutPolicy::Sideways(sideways_orientation);
+        }
+        match self {
+            Self::HorizontalTb => TextLayoutPolicy::Horizontal,
+            Self::VerticalRl | Self::VerticalLr => TextLayoutPolicy::Vertical(text_orientation),
+            Self::SidewaysRl | Self::SidewaysLr => unreachable!(),
+        }
+    }
+
+    /// Whether the LTR physical inline progression starts at the bottom of a
+    /// vertical line rather than its top.
+    pub(crate) const fn ltr_inline_progresses_upward(self) -> bool {
+        matches!(self, Self::SidewaysLr)
+    }
+}
+
+#[cfg(test)]
+mod writing_mode_tests {
+    use super::*;
+
+    #[test]
+    fn text_layout_policy_ignores_text_orientation_for_sideways_modes() {
+        assert_eq!(
+            WritingMode::HorizontalTb.text_layout_policy(TextOrientation::Upright),
+            TextLayoutPolicy::Horizontal
+        );
+        assert_eq!(
+            WritingMode::VerticalRl.text_layout_policy(TextOrientation::Mixed),
+            TextLayoutPolicy::Vertical(TextOrientation::Mixed)
+        );
+        assert_eq!(
+            WritingMode::VerticalLr.text_layout_policy(TextOrientation::Upright),
+            TextLayoutPolicy::Vertical(TextOrientation::Upright)
+        );
+        assert_eq!(
+            WritingMode::SidewaysRl.text_layout_policy(TextOrientation::Upright),
+            TextLayoutPolicy::Sideways(SidewaysOrientation::Right)
+        );
+        assert_eq!(
+            WritingMode::SidewaysLr.text_layout_policy(TextOrientation::Mixed),
+            TextLayoutPolicy::Sideways(SidewaysOrientation::Left)
+        );
+    }
 }
 
 /// Computed CSS `text-orientation`.
@@ -202,7 +366,21 @@ pub(crate) enum TextOrientation {
     Sideways,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Computed CSS `text-combine-upright`.
+///
+/// The property requests a tate-chu-yoko atomic inline in vertical typographic
+/// modes. `Digits` retains its author-selected maximum run length so inline
+/// collection can form the atom before shaping and line breaking.
+/// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-upright>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TextCombineUpright {
+    #[default]
+    None,
+    All,
+    Digits(u8),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BorderSpacing {
     pub horizontal: ComputedLengthPercentage,
     pub vertical: ComputedLengthPercentage,
@@ -221,34 +399,29 @@ impl BorderSpacing {
         }
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.horizontal.resolve_font_metric_lengths(ch_advance);
         self.vertical.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.horizontal.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.vertical.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.horizontal.requires_ch_advance() || self.vertical.requires_ch_advance()
+    }
+
+    /// Scale fixed border-spacing components at the CSS `zoom` used-value
+    /// boundary.
+    ///
+    /// Percentage components remain relative to the table's already zoomed
+    /// used geometry.
+    /// <https://drafts.csswg.org/css-viewport/#zoom-property>
+    /// <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
+    pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
+        self.horizontal.scale_fixed_length_components(factor);
+        self.vertical.scale_fixed_length_components(factor);
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BorderRadius {
     pub top_left: CornerRadius,
     pub top_right: CornerRadius,
@@ -264,51 +437,25 @@ impl BorderRadius {
         bottom_left: CornerRadius::ZERO,
     };
 
-    pub(crate) fn is_zero(self) -> bool {
+    pub(crate) fn is_zero(&self) -> bool {
         self.top_left.is_zero()
             && self.top_right.is_zero()
             && self.bottom_right.is_zero()
             && self.bottom_left.is_zero()
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.top_left.resolve_font_metric_lengths(ch_advance);
         self.top_right.resolve_font_metric_lengths(ch_advance);
         self.bottom_right.resolve_font_metric_lengths(ch_advance);
         self.bottom_left.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.top_left.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.top_right.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.bottom_right.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.bottom_left.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.top_left.requires_ch_advance()
+            || self.top_right.requires_ch_advance()
+            || self.bottom_right.requires_ch_advance()
+            || self.bottom_left.requires_ch_advance()
     }
 }
 
@@ -397,7 +544,7 @@ impl CornerShapes {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CornerRadius {
     pub x: CssRadius,
     pub y: CssRadius,
@@ -409,38 +556,21 @@ impl CornerRadius {
         y: CssRadius::ZERO,
     };
 
-    pub(crate) fn is_zero(self) -> bool {
+    pub(crate) fn is_zero(&self) -> bool {
         self.x.is_zero() && self.y.is_zero()
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.x.resolve_font_metric_lengths(ch_advance);
         self.y.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.x.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.y.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.x.requires_ch_advance() || self.y.requires_ch_advance()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CssRadius {
     pub value: ComputedLengthPercentage,
 }
@@ -450,34 +580,23 @@ impl CssRadius {
         value: ComputedLengthPercentage::ZERO,
     };
 
-    pub(crate) fn is_zero(self) -> bool {
+    pub(crate) fn is_zero(&self) -> bool {
         self.value == ComputedLengthPercentage::ZERO
     }
 
-    pub(crate) fn resolve(self, basis: f32) -> f32 {
+    pub(crate) fn resolve(self, basis: PercentageBasis<LayoutLength>) -> LayoutLength {
         self.value
             .used_length_with_percentage_basis(basis)
-            .unwrap_or(self.value.length_with_percentage_basis(basis))
-            .max(0.0)
+            .unwrap_or_else(|| layout_pt(self.value.length_points()))
+            .max(layout_pt(0.0))
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.value.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.value.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.value.requires_ch_advance()
     }
 }
 
@@ -667,6 +786,27 @@ pub(crate) enum FlexWrap {
     NoWrap,
     Wrap,
     WrapReverse,
+    /// CSS Flexbox Level 2 balanced wrapping.
+    ///
+    /// `balance` is a wrapping mode, rather than an alignment distribution:
+    /// <https://drafts.csswg.org/css-flexbox-2/#flex-wrap-property>.
+    Balance,
+    /// Balanced wrapping with cross-axis reversal.
+    BalanceReverse,
+}
+
+impl FlexWrap {
+    pub(crate) const fn wraps(self) -> bool {
+        !matches!(self, Self::NoWrap)
+    }
+
+    pub(crate) const fn reverses_cross_axis(self) -> bool {
+        matches!(self, Self::WrapReverse | Self::BalanceReverse)
+    }
+
+    pub(crate) const fn balances_lines(self) -> bool {
+        matches!(self, Self::Balance | Self::BalanceReverse)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -712,7 +852,7 @@ impl TextAlign {
 /// font's U+0020 advance, while length values are already computed CSS layout
 /// lengths:
 /// <https://www.w3.org/TR/css-text-3/#tab-size-property>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TabSize {
     Spaces(f32),
     Length(ComputedLengthPercentage),
@@ -721,35 +861,22 @@ pub(crate) enum TabSize {
 impl TabSize {
     pub(crate) const INITIAL: Self = Self::Spaces(8.0);
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Self::Length(length) = self {
             length.resolve_font_metric_lengths(ch_advance);
         }
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        if let Self::Length(length) = self {
-            length.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
-        }
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        matches!(self, Self::Length(length) if length.requires_ch_advance())
     }
 
-    pub(crate) fn used_tab_stop_advance(self, space_advance: f32) -> f32 {
+    pub(crate) fn used_tab_stop_advance(&self, space_advance: f32) -> LayoutLength {
         match self {
-            Self::Spaces(columns) => columns * space_advance,
-            Self::Length(length) => length.length_points(),
+            Self::Spaces(columns) => layout_pt(*columns * space_advance),
+            Self::Length(length) => length.fixed_component(),
         }
-        .max(0.0)
+        .max(layout_pt(0.0))
     }
 }
 
@@ -811,6 +938,32 @@ impl TextAutospace {
     }
 }
 
+/// Computed CSS `word-space-transform`.
+///
+/// CSS Text Level 4 can replace explicit virtual word separators (`<wbr>` and
+/// U+200B) with layout-only spaces. `auto-phrase` additionally introduces
+/// virtual separators from language-sensitive phrase segmentation; that
+/// source is kept distinct from explicit separators in inline collection:
+/// <https://drafts.csswg.org/css-text-4/#word-space-transform>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WordSpaceTransform {
+    pub(crate) replacement: Option<WordSpaceReplacement>,
+    pub(crate) auto_phrase: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WordSpaceReplacement {
+    Space,
+    IdeographicSpace,
+}
+
+impl WordSpaceTransform {
+    pub(crate) const NONE: Self = Self {
+        replacement: None,
+        auto_phrase: false,
+    };
+}
+
 pub(crate) fn logical_start_align(direction: Direction) -> TextAlign {
     match direction {
         Direction::Ltr => TextAlign::Left,
@@ -841,4 +994,41 @@ pub(crate) enum BaselineMetric {
 pub(crate) enum DominantBaseline {
     Auto,
     Metric(BaselineMetric),
+}
+
+impl ResolveViewportLengths for BorderSpacing {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.horizontal.resolve_viewport_lengths(basis);
+        self.vertical.resolve_viewport_lengths(basis);
+    }
+}
+
+impl ResolveViewportLengths for BorderRadius {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.top_left.resolve_viewport_lengths(basis);
+        self.top_right.resolve_viewport_lengths(basis);
+        self.bottom_right.resolve_viewport_lengths(basis);
+        self.bottom_left.resolve_viewport_lengths(basis);
+    }
+}
+
+impl ResolveViewportLengths for CornerRadius {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.x.resolve_viewport_lengths(basis);
+        self.y.resolve_viewport_lengths(basis);
+    }
+}
+
+impl ResolveViewportLengths for CssRadius {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.value.resolve_viewport_lengths(basis);
+    }
+}
+
+impl ResolveViewportLengths for TabSize {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        if let Self::Length(length) = self {
+            length.resolve_viewport_lengths(basis);
+        }
+    }
 }

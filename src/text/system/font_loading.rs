@@ -1,4 +1,76 @@
 use super::*;
+use sha2::{Digest, Sha256};
+use std::future::Future;
+use std::sync::Mutex;
+use tokio::sync::OnceCell;
+
+type SharedFontSourceCache =
+    Arc<tokio::sync::Mutex<HashMap<FontSourceCacheKey, Arc<OnceCell<FontiqueBlob<u8>>>>>>;
+type SharedFontProgramCache = Arc<Mutex<HashMap<[u8; 32], Vec<FontiqueBlob<u8>>>>>;
+
+#[derive(Clone)]
+struct FontProgramCache {
+    sources: SharedFontSourceCache,
+    programs: SharedFontProgramCache,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FontSourceCacheKey {
+    Data(String),
+    Url(url::Url),
+}
+
+impl FontProgramCache {
+    fn new() -> Self {
+        Self {
+            sources: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            programs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn load_source<F, Fut>(
+        &self,
+        key: FontSourceCacheKey,
+        load: F,
+    ) -> crate::Result<FontiqueBlob<u8>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = crate::Result<Vec<u8>>>,
+    {
+        let cell = {
+            let mut sources = self.sources.lock().await;
+            Arc::clone(
+                sources
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        };
+        cell.get_or_try_init(|| async {
+            let data = woff::decode_if_woff(load().await?);
+            Ok::<_, crate::Error>(self.intern_program(data))
+        })
+        .await
+        .cloned()
+    }
+
+    fn intern_program(&self, data: Vec<u8>) -> FontiqueBlob<u8> {
+        let digest: [u8; 32] = Sha256::digest(&data).into();
+        let mut programs = self
+            .programs
+            .lock()
+            .expect("font program cache mutex must not be poisoned");
+        let candidates = programs.entry(digest).or_default();
+        if let Some(existing) = candidates
+            .iter()
+            .find(|existing| existing.as_ref() == data.as_slice())
+        {
+            return existing.clone();
+        }
+        let blob = FontiqueBlob::new(Arc::new(data));
+        candidates.push(blob.clone());
+        blob
+    }
+}
 
 impl FontSystem {
     pub(crate) fn start_loading() -> FontSystemLoad {
@@ -14,8 +86,8 @@ impl FontSystem {
             parley_font_context: loaded.parley_font_context,
             registered_font_faces: HashMap::new(),
             font_feature_values: FontFeatureValues::default(),
+            font_palette_values: FontPaletteValues::default(),
             font_feature_defaults_by_family: HashMap::new(),
-            visible_fallback_families: loaded.visible_fallback_families,
         }
     }
 
@@ -23,18 +95,30 @@ impl FontSystem {
         Self {
             parley_font_context: seed.parley_font_context,
             parley_layout_context: ParleyLayoutContext::new(),
+            parley_layout_scratch: ParleyLayout::default(),
             document_fonts: DocumentFontRegistry::new(seed.registered_font_faces),
             family_cache: HashMap::new(),
             fallback_cache: HashMap::new(),
             font_feature_values: seed.font_feature_values,
+            font_palette_values: seed.font_palette_values,
             font_feature_defaults_by_family: seed.font_feature_defaults_by_family,
-            visible_fallback_families: seed.visible_fallback_families,
         }
     }
 }
 
 impl FontSystemLoad {
+    #[cfg(test)]
     pub(crate) fn load_stylesheet_fonts(self, stylesheets: &[Stylesheet]) -> FontSystemSeedLoad {
+        let fetcher = crate::resource::ResourceFetcher::new(crate::ResourcePolicy::default())
+            .expect("default resource policy must create an HTTP client");
+        self.load_stylesheet_fonts_with_fetcher(stylesheets, fetcher)
+    }
+
+    pub(crate) fn load_stylesheet_fonts_with_fetcher(
+        self,
+        stylesheets: &[Stylesheet],
+        resource_fetcher: crate::resource::ResourceFetcher,
+    ) -> FontSystemSeedLoad {
         let font_faces = stylesheets
             .iter()
             .flat_map(|stylesheet| stylesheet.font_faces.iter().cloned())
@@ -45,22 +129,48 @@ impl FontSystemLoad {
             stylesheets.len()
         );
         let mut font_feature_values = FontFeatureValues::default();
+        let mut font_palette_values = FontPaletteValues::default();
         for stylesheet in stylesheets {
             font_feature_values.extend(stylesheet.font_feature_values.clone());
+            font_palette_values.extend(stylesheet.font_palette_values.clone());
         }
         FontSystemSeedLoad {
             parley_font_context: self.parley_font_context,
-            font_faces: tokio::spawn(load_font_faces(font_faces)),
+            font_faces: tokio::spawn(load_font_faces(font_faces, resource_fetcher)),
             font_feature_values,
+            font_palette_values,
         }
     }
 }
 
 impl FontSystemSeedLoad {
+    #[cfg(test)]
     pub(crate) async fn finish(self) -> FontSystem {
+        self.finish_inner(false).await.unwrap_or_else(|error| {
+            log::warn!("@font-face loading failed: {error}");
+            FontSystem::from_seed(FontSystemSeed {
+                parley_font_context: load_parley_font_context().parley_font_context,
+                registered_font_faces: HashMap::new(),
+                font_feature_values: FontFeatureValues::default(),
+                font_palette_values: FontPaletteValues::default(),
+                font_feature_defaults_by_family: HashMap::new(),
+            })
+        })
+    }
+
+    pub(crate) async fn finish_checked(self) -> crate::Result<FontSystem> {
+        self.finish_inner(true).await
+    }
+
+    async fn finish_inner(self, fail_on_font_error: bool) -> crate::Result<FontSystem> {
         let (loaded_context, font_faces) = tokio::join!(self.parley_font_context, self.font_faces);
         let font_faces = match font_faces {
-            Ok(font_faces) => font_faces,
+            Ok(Ok(font_faces)) => font_faces,
+            Ok(Err(error)) if fail_on_font_error => return Err(error),
+            Ok(Err(error)) => {
+                log::warn!("@font-face loading failed: {error}");
+                Vec::new()
+            }
             Err(error) => {
                 log::warn!("@font-face loading task failed: {error}");
                 Vec::new()
@@ -74,41 +184,43 @@ impl FontSystemSeedLoad {
             }
         };
         if font_faces.is_empty() {
-            return FontSystem::from_seed(FontSystemSeed {
+            return Ok(FontSystem::from_seed(FontSystemSeed {
                 parley_font_context: loaded_context.parley_font_context,
                 registered_font_faces: HashMap::new(),
                 font_feature_values: self.font_feature_values,
+                font_palette_values: self.font_palette_values,
                 font_feature_defaults_by_family: HashMap::new(),
-                visible_fallback_families: loaded_context.visible_fallback_families,
-            });
+            }));
         }
 
         let seed =
             tokio::task::spawn_blocking(|| register_loaded_font_faces(loaded_context, font_faces))
                 .await;
         match seed {
-            Ok((loaded_context, registered_font_faces)) => FontSystem::from_seed(FontSystemSeed {
-                parley_font_context: loaded_context.parley_font_context,
-                font_feature_defaults_by_family: registered_font_face_defaults_by_family(
-                    &registered_font_faces,
-                ),
-                registered_font_faces: registered_font_faces
-                    .into_iter()
-                    .map(|face| (face.key, face.metadata))
-                    .collect(),
-                font_feature_values: self.font_feature_values,
-                visible_fallback_families: loaded_context.visible_fallback_families,
-            }),
+            Ok((loaded_context, registered_font_faces)) => {
+                Ok(FontSystem::from_seed(FontSystemSeed {
+                    parley_font_context: loaded_context.parley_font_context,
+                    font_feature_defaults_by_family: registered_font_face_defaults_by_family(
+                        &registered_font_faces,
+                    ),
+                    registered_font_faces: registered_font_faces
+                        .into_iter()
+                        .map(|face| (face.key, face.metadata))
+                        .collect(),
+                    font_feature_values: self.font_feature_values,
+                    font_palette_values: self.font_palette_values,
+                }))
+            }
             Err(error) => {
                 log::warn!("@font-face registration task failed: {error}");
                 let loaded_context = load_parley_font_context();
-                FontSystem::from_seed(FontSystemSeed {
+                Ok(FontSystem::from_seed(FontSystemSeed {
                     parley_font_context: loaded_context.parley_font_context,
                     registered_font_faces: HashMap::new(),
                     font_feature_values: self.font_feature_values,
+                    font_palette_values: self.font_palette_values,
                     font_feature_defaults_by_family: HashMap::new(),
-                    visible_fallback_families: loaded_context.visible_fallback_families,
-                })
+                }))
             }
         }
     }
@@ -117,8 +229,6 @@ impl FontSystemSeedLoad {
 fn load_parley_font_context() -> LoadedParleyFontContext {
     let started = std::time::Instant::now();
     let mut context = ParleyFontContext::new();
-    let visible_fallback_families = visible_fallback_family_names(&mut context.collection);
-    install_visible_common_script_fallbacks(&mut context, &visible_fallback_families);
     let family_count = context.collection.family_names().count();
     log::debug!(
         "loaded Parley/fontique font context with {} family name(s) in {:.3?}",
@@ -127,68 +237,53 @@ fn load_parley_font_context() -> LoadedParleyFontContext {
     );
     LoadedParleyFontContext {
         parley_font_context: context,
-        visible_fallback_families,
     }
 }
 
-fn visible_fallback_family_names(collection: &mut fontique::Collection) -> Vec<String> {
-    let mut families = collection
-        .family_names()
-        .map(|name| (fallback_family_score(name), name.to_string()))
-        .collect::<Vec<_>>();
-    families.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    families.into_iter().map(|(_, name)| name).collect()
-}
-
-fn install_visible_common_script_fallbacks(context: &mut ParleyFontContext, families: &[String]) {
-    let family_ids = families
-        .iter()
-        .filter_map(|name| context.collection.family_id(name))
-        .collect::<Vec<_>>();
-    if family_ids.is_empty() {
-        return;
-    }
-
-    for script in [
-        FontiqueScript::COMMON,
-        FontiqueScript::INHERITED,
-        FontiqueScript::UNKNOWN,
-        FontiqueScript::from_bytes(*b"Latn"),
-    ] {
-        context.collection.set_fallbacks(
-            FontiqueFallbackKey::new(script, None),
-            family_ids.iter().copied(),
-        );
-    }
-}
-
-async fn load_font_faces(font_faces: Vec<CssFontFace>) -> Vec<LoadedFontFace> {
+async fn load_font_faces(
+    font_faces: Vec<CssFontFace>,
+    resource_fetcher: crate::resource::ResourceFetcher,
+) -> crate::Result<Vec<LoadedFontFace>> {
     log::trace!(
         "starting async load of {} @font-face rule(s)",
         font_faces.len()
     );
+    let cache = FontProgramCache::new();
     let mut handles = Vec::with_capacity(font_faces.len());
     for font_face in font_faces {
-        handles.push(tokio::spawn(load_font_face(font_face)));
+        handles.push(tokio::spawn(load_font_face(
+            font_face,
+            resource_fetcher.clone(),
+            cache.clone(),
+        )));
     }
 
     let mut loaded = Vec::with_capacity(handles.len());
     for handle in handles {
         match handle.await {
-            Ok(font_face) => loaded.push(font_face),
-            Err(error) => log::warn!("@font-face source loading task failed: {error}"),
+            Ok(Ok(font_face)) => loaded.push(font_face),
+            Ok(Err(error)) => return Err(error),
+            Err(error) => {
+                return Err(crate::Error::InvalidInput(format!(
+                    "@font-face source loading task failed: {error}"
+                )));
+            }
         }
     }
-    loaded
+    Ok(loaded)
 }
 
-async fn load_font_face(font_face: CssFontFace) -> LoadedFontFace {
+async fn load_font_face(
+    font_face: CssFontFace,
+    resource_fetcher: crate::resource::ResourceFetcher,
+    cache: FontProgramCache,
+) -> crate::Result<LoadedFontFace> {
     log::trace!(
         "loading @font-face family {} with {} source(s)",
         font_face.family,
         font_face.sources.len()
     );
-    let data = load_first_font_face_source(&font_face).await;
+    let data = load_first_font_face_source(&font_face, &resource_fetcher, &cache).await?;
     match &data {
         Some(data) => log::trace!(
             "loaded @font-face family {} source data ({} byte(s))",
@@ -200,24 +295,43 @@ async fn load_font_face(font_face: CssFontFace) -> LoadedFontFace {
             font_face.family
         ),
     }
-    LoadedFontFace { font_face, data }
+    Ok(LoadedFontFace { font_face, data })
 }
 
-async fn load_first_font_face_source(font_face: &CssFontFace) -> Option<Vec<u8>> {
+async fn load_first_font_face_source(
+    font_face: &CssFontFace,
+    resource_fetcher: &crate::resource::ResourceFetcher,
+    cache: &FontProgramCache,
+) -> crate::Result<Option<FontiqueBlob<u8>>> {
     for source in &font_face.sources {
         log::trace!(
             "trying @font-face family {} source {:?}",
             font_face.family,
             source
         );
-        if let Some(data) = load_font_source_async(source).await {
-            log::trace!(
-                "@font-face family {} source {:?} loaded before WOFF decode ({} byte(s))",
-                font_face.family,
-                source,
-                data.len()
-            );
-            return Some(woff::decode_if_woff(data));
+        match load_font_source_async(source, resource_fetcher, cache).await {
+            Ok(Some(data)) => {
+                log::trace!(
+                    "@font-face family {} source {:?} loaded and decoded ({} byte(s))",
+                    font_face.family,
+                    source,
+                    data.len()
+                );
+                return Ok(Some(data));
+            }
+            Ok(None) => {}
+            // CSS Fonts makes a failed source fail this face, not the document
+            // or any sibling face.  In particular, the fallback list must be
+            // tried even when the document's primary-resource policy is
+            // otherwise strict.
+            // <https://drafts.csswg.org/css-fonts-4/#font-face-loading>
+            Err(error) => {
+                log::debug!(
+                    "failed to load @font-face family {} source {:?}: {error}",
+                    font_face.family,
+                    source
+                );
+            }
         }
         log::trace!(
             "@font-face family {} source {:?} did not load",
@@ -225,10 +339,14 @@ async fn load_first_font_face_source(font_face: &CssFontFace) -> Option<Vec<u8>>
             source
         );
     }
-    None
+    Ok(None)
 }
 
-async fn load_font_source_async(source: &FontFaceSource) -> Option<Vec<u8>> {
+async fn load_font_source_async(
+    source: &FontFaceSource,
+    resource_fetcher: &crate::resource::ResourceFetcher,
+    cache: &FontProgramCache,
+) -> crate::Result<Option<FontiqueBlob<u8>>> {
     match source {
         FontFaceSource::Url {
             value,
@@ -237,63 +355,71 @@ async fn load_font_source_async(source: &FontFaceSource) -> Option<Vec<u8>> {
         } => {
             log::trace!(
                 "loading @font-face URL source value={value:?} base_url={} root_url={}",
-                display_optional_path(base_url.as_deref()),
-                display_optional_path(root_url.as_deref())
+                display_optional_url(base_url.as_ref()),
+                display_optional_url(root_url.as_ref())
             );
-            load_font_url_async(value, base_url.as_deref(), root_url.as_deref()).await
+            load_font_url_async(
+                value,
+                base_url.as_ref(),
+                root_url.as_ref(),
+                resource_fetcher,
+                cache,
+            )
+            .await
         }
     }
 }
 
 async fn load_font_url_async(
     value: &str,
-    base_url: Option<&Path>,
-    root_url: Option<&Path>,
-) -> Option<Vec<u8>> {
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+    resource_fetcher: &crate::resource::ResourceFetcher,
+    cache: &FontProgramCache,
+) -> crate::Result<Option<FontiqueBlob<u8>>> {
     if value.starts_with("data:") {
-        let decoded = decode_data_url(value);
-        if let Some(data) = &decoded {
-            log::trace!("decoded @font-face data URL ({} byte(s))", data.len());
-        } else {
-            log::trace!("failed to decode @font-face data URL");
-        }
-        return decoded;
+        let value = value.to_string();
+        let blob = cache
+            .load_source(
+                FontSourceCacheKey::Data(value.clone()),
+                move || async move {
+                    decode_data_url(&value).ok_or_else(|| {
+                        crate::Error::InvalidInput(format!(
+                            "failed to decode @font-face data URL {value:?}"
+                        ))
+                    })
+                },
+            )
+            .await?;
+        log::trace!("decoded @font-face data URL ({} byte(s))", blob.len());
+        return Ok(Some(blob));
     }
-    let Some(path) = crate::resource::resolve_url_path(value, base_url, root_url) else {
-        log::trace!(
-            "could not resolve @font-face URL source value={value:?} base_url={} root_url={}",
-            display_optional_path(base_url),
-            display_optional_path(root_url)
-        );
-        return None;
-    };
-    log::trace!(
-        "resolved @font-face URL source value={value:?} to {}",
-        path.display()
-    );
-    match crate::resource::read_bytes(&path).await {
-        Ok(data) => {
+    let url =
+        crate::resource::resolve_fetchable_url(value, base_url, root_url).ok_or_else(|| {
+            crate::Error::InvalidInput(format!(
+                "could not resolve @font-face URL source value={value:?} base_url={} root_url={}",
+                display_optional_url(base_url),
+                display_optional_url(root_url)
+            ))
+        })?;
+    log::trace!("resolved @font-face URL source value={value:?} to {}", url);
+    let fetcher = resource_fetcher.clone();
+    let blob = cache
+        .load_source(FontSourceCacheKey::Url(url.clone()), move || async move {
+            let fetched = fetcher.fetch(&url).await?;
             log::trace!(
                 "loaded @font-face resource {} ({} byte(s))",
-                path.display(),
-                data.len()
+                fetched.final_url,
+                fetched.bytes.len()
             );
-            Some(data)
-        }
-        Err(error) => {
-            log::debug!("failed to read font {}: {}", path.display(), error);
-            log::trace!(
-                "failed to load @font-face resource {}: {}",
-                path.display(),
-                error
-            );
-            None
-        }
-    }
+            Ok(fetched.bytes)
+        })
+        .await?;
+    Ok(Some(blob))
 }
 
-fn display_optional_path(path: Option<&Path>) -> String {
-    path.map(|path| path.display().to_string())
+fn display_optional_url(url: Option<&url::Url>) -> String {
+    url.map(ToString::to_string)
         .unwrap_or_else(|| "<none>".to_string())
 }
 
@@ -315,25 +441,24 @@ fn register_loaded_font_faces(
 fn register_loaded_font_face(
     parley_font_context: &mut ParleyFontContext,
     font_face: &CssFontFace,
-    data: Option<Vec<u8>>,
+    data: Option<FontiqueBlob<u8>>,
 ) -> Vec<RegisteredFontFace> {
-    let Some(data) = data else {
+    let Some(blob) = data else {
         log::warn!("unable to load @font-face family {}", font_face.family);
         return Vec::new();
     };
     log::trace!(
         "registering @font-face family {} with {} byte(s)",
         font_face.family,
-        data.len()
+        blob.len()
     );
-    let blob = FontiqueBlob::new(Arc::new(data));
     let registered = parley_font_context.collection.register_fonts(
-        blob.clone(),
+        blob,
         Some(FontInfoOverride {
             family_name: Some(&font_face.family),
-            width: Some(fontique_width(font_face.width)),
+            width: (!font_face.width_is_variable).then(|| fontique_width(font_face.width)),
             style: Some(fontique_style(font_face.style)),
-            weight: Some(fontique_weight(font_face.weight)),
+            weight: (!font_face.weight_is_variable).then(|| fontique_weight(font_face.weight)),
             axes: None,
         }),
     );
@@ -357,17 +482,26 @@ fn register_loaded_font_face(
     );
     registered
         .into_iter()
-        .flat_map(|(_, fonts)| fonts)
-        .map(|font| RegisteredFontFace {
-            key: FontBlobFaceKey {
-                blob_id: blob.id(),
-                face_index: font.index(),
-            },
-            metadata: RegisteredFontFaceMetadata {
-                family: font_face.family.clone(),
-                feature_defaults: FontFaceFeatureDefaults::from_font_face(font_face),
-                unicode_range: font_face.unicode_range.clone(),
-            },
+        .flat_map(|(family_id, fonts)| {
+            let family = parley_font_context.collection.family(family_id);
+            fonts.into_iter().filter_map(move |font| {
+                let family_index = family.as_ref()?.fonts().iter().position(|candidate| {
+                    candidate.source().id() == font.source().id()
+                        && candidate.index() == font.index()
+                })?;
+                Some(RegisteredFontFace {
+                    key: RegisteredFontFaceKey {
+                        family_id: family_id.to_u64(),
+                        family_index,
+                    },
+                    metadata: RegisteredFontFaceMetadata {
+                        family: font_face.family.clone(),
+                        feature_defaults: FontFaceFeatureDefaults::from_font_face(font_face),
+                        unicode_range: font_face.unicode_range.clone(),
+                        size_adjust: font_face.size_adjust,
+                    },
+                })
+            })
         })
         .collect()
 }
@@ -424,6 +558,41 @@ impl FontSystem {
         None
     }
 
+    /// Resolve a CSS generic-family candidate that can be represented by
+    /// Quire's PDF Type 0 outline-font output. Explicit named-family and
+    /// `@font-face` selection deliberately use the unrestricted loader above:
+    /// those authorship choices must surface an embedding error rather than be
+    /// silently replaced.
+    pub(super) fn load_outline_embeddable_document_font_for_families(
+        &mut self,
+        families: &[FontiqueQueryFamily<'_>],
+        weight: FontWeight,
+        style: FontStyle,
+        width: FontWidth,
+        request: &FontRequest,
+    ) -> Option<usize> {
+        let fonts = self.query_fonts(families, weight, style, width);
+        for font in fonts
+            .iter()
+            .filter(|font| !font.synthesis.any())
+            .filter(|font| DocumentFontRegistry::font_query_allows_outline_embedding(font))
+            .cloned()
+        {
+            if let Some(id) = self.document_font_from_query_font(font, None, request) {
+                return Some(id);
+            }
+        }
+        for font in fonts
+            .into_iter()
+            .filter(DocumentFontRegistry::font_query_allows_outline_embedding)
+        {
+            if let Some(id) = self.document_font_from_query_font(font, None, request) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     pub(crate) fn query_fonts(
         &mut self,
         families: &[FontiqueQueryFamily<'_>],
@@ -436,8 +605,44 @@ impl FontSystem {
             .parley_font_context
             .collection
             .query(&mut self.parley_font_context.source_cache);
-        query.set_families(families.iter().copied());
+        query.set_families(families.iter().cloned());
         query.set_attributes(fontique_attributes(weight, style, width));
+        query.matches_with(|font| {
+            fonts.push(font.clone());
+            FontiqueQueryStatus::Continue
+        });
+        fonts
+    }
+
+    /// Query the platform's installed-font fallback for a character.
+    ///
+    /// CSS Fonts leaves the installed fallback procedure to the user agent
+    /// after the authored family list has been exhausted. Fontique delegates
+    /// that procedure to the platform backend, which uses CoreText on macOS.
+    /// <https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm>
+    pub(super) fn query_platform_fallback_fonts(
+        &mut self,
+        character: char,
+        weight: FontWeight,
+        style: FontStyle,
+        width: FontWidth,
+    ) -> Vec<FontiqueQueryFont> {
+        let mut fonts = Vec::new();
+        let mut query = self
+            .parley_font_context
+            .collection
+            .query(&mut self.parley_font_context.source_cache);
+        query.set_attributes(fontique_attributes(weight, style, width));
+        if character_is_emoji(character) {
+            // Fontique's script fallback intentionally has no Common-script
+            // sample for CoreText to pass to CTFontCreateForString. Its
+            // platform `emoji` generic provides that native selection path.
+            query.set_families([FontiqueQueryFamily::Generic(FontiqueGenericFamily::Emoji)]);
+        }
+        query.set_fallbacks(FontiqueFallbackKey::new(
+            fontique_script_for_character(character),
+            None,
+        ));
         query.matches_with(|font| {
             fonts.push(font.clone());
             FontiqueQueryStatus::Continue
@@ -470,6 +675,7 @@ impl FontSystem {
         &mut self,
         font_data: &parley::FontData,
         style: &ComputedStyle,
+        fallback_character: char,
     ) -> Option<usize> {
         let request = FontRequest::from_family(
             &style.font_family,
@@ -495,22 +701,22 @@ impl FontSystem {
             return Some(font_id);
         }
 
-        for family_name in self.visible_fallback_families.clone() {
-            let families = [family_query(&family_name)];
-            if let Some(font) = self.match_parley_font_data(
-                font_data,
-                &families,
-                style.font_weight,
-                style.font_style,
-                style.font_width,
-            ) {
-                let font_id = self.document_font_from_query_font(font, None, &request)?;
-                self.document_fonts
-                    .cache_parley_font(font_data, &request, font_id);
-                return Some(font_id);
-            }
+        if let Some(font) = self.match_platform_fallback_parley_font_data(
+            font_data,
+            fallback_character,
+            style.font_weight,
+            style.font_style,
+            style.font_width,
+        ) {
+            let font_id = self.document_font_from_query_font(font, None, &request)?;
+            self.document_fonts
+                .cache_parley_font(font_data, &request, font_id);
+            return Some(font_id);
         }
 
+        // Preserve an unknown platform fallback rather than scanning every
+        // installed family. This is only reached when the backend did not
+        // expose a matching fallback face for the run's script.
         let font_id = self.document_font_from_parley_font_data(font_data)?;
         self.document_fonts
             .cache_parley_font(font_data, &request, font_id);
@@ -537,6 +743,36 @@ impl FontSystem {
                     .find(|font| font_matches_parley_font_data(font, font_data))
             })
     }
+
+    fn match_platform_fallback_parley_font_data(
+        &mut self,
+        font_data: &parley::FontData,
+        character: char,
+        weight: FontWeight,
+        style: FontStyle,
+        width: FontWidth,
+    ) -> Option<FontiqueQueryFont> {
+        let fonts = self.query_platform_fallback_fonts(character, weight, style, width);
+        fonts
+            .iter()
+            .filter(|font| !font.synthesis.any())
+            .find(|font| font_matches_parley_font_data(font, font_data))
+            .cloned()
+            .or_else(|| {
+                fonts
+                    .into_iter()
+                    .find(|font| font_matches_parley_font_data(font, font_data))
+            })
+    }
+}
+
+fn fontique_script_for_character(character: char) -> FontiqueScript {
+    let script = CodePointMapData::<IcuScript>::new().get(character);
+    let tag = PropertyNamesShort::<IcuScript>::new()
+        .get_locale_script(script)
+        .map(|script| script.into_raw())
+        .unwrap_or_else(|| FontiqueScript::UNKNOWN.to_bytes());
+    FontiqueScript::from_bytes(tag)
 }
 
 fn font_families_for_style(
@@ -545,8 +781,30 @@ fn font_families_for_style(
 ) -> Cow<'_, [FontiqueQueryFamily<'_>]> {
     match family {
         FontFamily::Names(names) => {
-            Cow::Owned(names.iter().map(|name| family_query(name)).collect())
+            // A quoted generic-looking name is still a named family in CSS.
+            // Do not turn `"serif"` or `"fantasy"` back into a generic while
+            // matching the concrete font selected by Parley.
+            Cow::Owned(
+                names
+                    .iter()
+                    .map(|name| FontiqueQueryFamily::Named(name))
+                    .collect(),
+            )
         }
+        FontFamily::List(families) => Cow::Owned(
+            families
+                .iter()
+                .flat_map(|family| match family {
+                    FontFamily::Names(names) => names
+                        .iter()
+                        .map(|name| FontiqueQueryFamily::Named(name))
+                        .collect::<Vec<_>>(),
+                    generic => generic_query_families(generic, weight)
+                        .unwrap_or(&[])
+                        .to_vec(),
+                })
+                .collect(),
+        ),
         generic => Cow::Borrowed(generic_query_families(generic, weight).unwrap_or(&[])),
     }
 }
@@ -585,4 +843,18 @@ fn font_label_has_bold(label: &str) -> bool {
 
 fn font_label_has_italic(label: &str) -> bool {
     label.contains("italic") || label.contains("oblique")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn font_program_cache_reuses_byte_identical_programs() {
+        let cache = FontProgramCache::new();
+        let first = cache.intern_program(vec![0, 1, 2, 3]);
+        let second = cache.intern_program(vec![0, 1, 2, 3]);
+
+        assert_eq!(first.id(), second.id());
+    }
 }

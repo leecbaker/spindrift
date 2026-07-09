@@ -124,7 +124,7 @@ impl<'a> LayoutBuilder<'a> {
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         columns: &[TableColumn<'_>],
-        table_width: f32,
+        _table_width: f32,
         table_cellpadding: Option<f32>,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
@@ -137,8 +137,7 @@ impl<'a> LayoutBuilder<'a> {
             .filter(|collapsed| !**collapsed)
             .count();
         let total_horizontal_spacing =
-            table_displayed_horizontal_spacing(visible_columns, table_metrics);
-        let padding_basis = (table_width - total_horizontal_spacing).max(table_style.font_size);
+            table_displayed_horizontal_spacing(visible_columns, table_metrics.clone());
         let mut measures = TableColumnMeasures {
             min_content_widths: vec![0.0_f32; column_count],
             max_content_widths: vec![0.0_f32; column_count],
@@ -157,10 +156,22 @@ impl<'a> LayoutBuilder<'a> {
             if let Some(group) = &column.group {
                 let group_style =
                     self.style_for_table_column_group(group, table_style, stylesheets);
-                apply_table_column_style_measures(&mut measures, column_index, span, &group_style);
+                let group_flow_style = table_internal_flow_style(&group_style, table_style);
+                apply_table_column_style_measures(
+                    &mut measures,
+                    column_index,
+                    span,
+                    &group_flow_style,
+                );
             }
             let column_style = self.style_for_table_column(column, table_style, stylesheets);
-            apply_table_column_style_measures(&mut measures, column_index, span, &column_style);
+            let column_flow_style = table_internal_flow_style(&column_style, table_style);
+            apply_table_column_style_measures(
+                &mut measures,
+                column_index,
+                span,
+                &column_flow_style,
+            );
             column_index += span;
         }
 
@@ -178,38 +189,54 @@ impl<'a> LayoutBuilder<'a> {
                     .max(1);
                 let end = placement.column + colspan;
                 let mut cell_style = self.style_for_table_cell(cell, row, &row_style, stylesheets);
-                apply_table_cell_used_padding(&mut cell_style, table_cellpadding, padding_basis);
+                apply_table_cell_used_padding(
+                    &mut cell_style,
+                    table_cellpadding,
+                    // Intrinsic table measures cannot depend on the table's
+                    // eventual inline size. CSS Tables resolves percentage
+                    // cell padding as zero at this stage, then resolves it
+                    // after the track widths have been finalized.
+                    // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
+                    PercentageBasis::definite(layout_pt(0.0)),
+                );
 
-                let explicit_width = cell
-                    .element
-                    .and_then(|element| declared_table_cell_width(element, &cell_style));
+                // A cell's physical width only constrains a table column when
+                // the table root inline axis is physical horizontal. For an
+                // orthogonal table it contributes to the row/block track.
+                let table_inline_is_physical_width =
+                    !WritingModeAxes::new(table_style.writing_mode, table_style.direction)
+                        .swaps_physical_axes();
+                let explicit_width = table_inline_is_physical_width
+                    .then(|| {
+                        cell.element
+                            .and_then(|element| declared_table_cell_width(element, &cell_style))
+                    })
+                    .flatten();
                 let border_insets =
                     (table_metrics.border_collapse == css::BorderCollapse::Collapse).then(|| {
                         table_cell_border_insets(
                             &cell_style,
                             placement,
                             row_index,
-                            table_metrics,
+                            table_metrics.clone(),
                             collapsed_geometry,
                         )
                     });
-                let min_content_width = table_cell_content_min_width(
+                let track_inline_size = table_cell_content_table_inline_size(
                     self,
                     cell,
                     &cell_style,
+                    table_style,
                     stylesheets,
                     border_insets,
                 );
-                let max_content_width = table_cell_content_max_width(
-                    self,
-                    cell,
-                    &cell_style,
-                    stylesheets,
-                    border_insets,
-                );
+                let min_content_width = track_inline_size.min_content;
+                let max_content_width = track_inline_size.max_content;
                 let width_floor = explicit_width
+                    .clone()
                     .map(|width| {
                         declared_table_cell_width_length_floor(&cell_style, width, border_insets)
+                            .points()
                     })
                     .unwrap_or(0.0);
                 let min_target_width = constrain_table_intrinsic_width_with_floor(
@@ -217,13 +244,27 @@ impl<'a> LayoutBuilder<'a> {
                     min_content_width,
                     width_floor,
                 );
-                let max_target_width = constrain_table_intrinsic_width_with_floor(
-                    &cell_style,
-                    max_content_width.max(min_target_width),
-                    width_floor,
-                );
+                // A non-percentage specified cell width constrains an auto
+                // table's preferred track width. Its min-content contribution
+                // can still exceed that width for unbreakable content, but
+                // optional CSS Text breaks (including `break-spaces`) must not
+                // make the table choose the cell's unwrapped max-content size.
+                // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
+                let max_target_width = if explicit_width
+                    .as_ref()
+                    .is_some_and(|width| declared_table_width_is_non_percentage(width.clone()))
+                {
+                    min_target_width
+                } else {
+                    constrain_table_intrinsic_width_with_floor(
+                        &cell_style,
+                        max_content_width.max(min_target_width),
+                        width_floor,
+                    )
+                };
                 let percentage = intrinsic_percentage_contribution(&cell_style).max(
                     explicit_width
+                        .clone()
                         .map(declared_table_width_percentage)
                         .unwrap_or(0.0),
                 );
@@ -236,7 +277,7 @@ impl<'a> LayoutBuilder<'a> {
                         placement.column,
                         end,
                         &collapsed_columns,
-                        table_metrics,
+                        table_metrics.clone(),
                     )
                 } else {
                     0.0
@@ -273,7 +314,7 @@ impl<'a> LayoutBuilder<'a> {
         let mut spanning_contributions = cell_contributions
             .iter()
             .filter(|contribution| contribution.colspan > 1)
-            .copied()
+            .cloned()
             .collect::<Vec<_>>();
         spanning_contributions.sort_by_key(|contribution| contribution.colspan);
         for contribution in spanning_contributions {
@@ -329,7 +370,7 @@ impl<'a> LayoutBuilder<'a> {
             table_style,
             stylesheets,
             columns,
-            table_width.content_width_points(),
+            table_width.content_width.points(),
             table_cellpadding,
             table_metrics,
             collapsed_geometry,
@@ -344,16 +385,21 @@ impl<'a> LayoutBuilder<'a> {
             };
         let horizontal_non_content =
             horizontal_border_non_content + table_width.padding.left + table_width.padding.right;
-        let mut content_width = table_width.content_width_points();
-        if let Some(width) = intrinsic::intrinsic_width_keyword(
-            table_style.box_values.width,
-            min_content,
-            max_content,
-            available_outer_width,
-            horizontal_non_content,
+        let mut content_width = table_width.content_width.points();
+        if let Some(width) = intrinsic::intrinsic_content_box_width_keyword(
+            table_root_inline_size(table_style),
+            content_box_pt(min_content),
+            content_box_pt(max_content),
+            layout_pt(available_outer_width),
+            non_content_pt(horizontal_non_content),
         ) {
-            content_width = constrain_width(table_style, width, available_outer_width)
-                .max(table_style.font_size);
+            content_width = constrain_content_width(
+                table_style,
+                width,
+                PercentageBasis::definite(layout_pt(available_outer_width)),
+            )
+            .points()
+            .max(table_style.font_size);
         }
         content_width =
             table_content_width_clamped_to_min_content(table_style, content_width, min_content);
@@ -399,7 +445,7 @@ impl<'a> LayoutBuilder<'a> {
             columns,
             table_width,
             table_cellpadding,
-            table_metrics,
+            table_metrics.clone(),
             collapsed_geometry,
         );
         let table_min_content_width = measures.table_min_content_width();
@@ -452,7 +498,7 @@ impl<'a> LayoutBuilder<'a> {
             .filter(|collapsed| !**collapsed)
             .count();
         let total_horizontal_spacing =
-            table_displayed_horizontal_spacing(visible_columns, table_metrics);
+            table_displayed_horizontal_spacing(visible_columns, table_metrics.clone());
         let content_table_width =
             (table_width - total_horizontal_spacing).max(table_style.font_size);
         let mut widths = vec![0.0_f32; column_count];
@@ -464,10 +510,22 @@ impl<'a> LayoutBuilder<'a> {
             }
             let span = column.span.min(column_count - column_index).max(1);
             let column_style = self.style_for_table_column(column, table_style, stylesheets);
-            if let Some(width) = declared_table_column_width(&column_style) {
-                let width =
-                    constrain_declared_table_width(&column_style, width, content_table_width);
-                distribute_fixed_width(&mut widths, &mut declared, column_index, span, width);
+            let column_flow_style = table_internal_flow_style(&column_style, table_style);
+            if let Some(width) = declared_table_column_width(&column_flow_style) {
+                let width = constrain_declared_table_width(
+                    &column_flow_style,
+                    width,
+                    content_box_pt(content_table_width),
+                );
+                // Fixed-table column distribution is scalar coordinate
+                // arithmetic over the table grid.
+                distribute_fixed_width(
+                    &mut widths,
+                    &mut declared,
+                    column_index,
+                    span,
+                    width.points(),
+                );
             }
             column_index += span;
         }
@@ -488,7 +546,7 @@ impl<'a> LayoutBuilder<'a> {
                 apply_table_cell_used_padding(
                     &mut cell_style,
                     table_cellpadding,
-                    content_table_width,
+                    PercentageBasis::definite(layout_pt(content_table_width)),
                 );
                 if let Some(explicit_width) = cell
                     .element
@@ -501,7 +559,7 @@ impl<'a> LayoutBuilder<'a> {
                                 &cell_style,
                                 placement,
                                 0,
-                                table_metrics,
+                                table_metrics.clone(),
                                 collapsed_geometry,
                             )
                         });
@@ -510,14 +568,15 @@ impl<'a> LayoutBuilder<'a> {
                         explicit_width,
                         content_table_width,
                         border_insets,
-                    );
+                    )
+                    .points();
                     let width = if colspan > 1 {
                         let end = (placement.column + colspan).min(collapsed_columns.len());
                         let internal_spacing = table_internal_horizontal_spacing(
                             placement.column,
                             end,
                             &collapsed_columns,
-                            table_metrics,
+                            table_metrics.clone(),
                         );
                         (width - internal_spacing).max(0.0)
                     } else {
@@ -597,14 +656,28 @@ impl<'a> LayoutBuilder<'a> {
         collapsed
     }
 
+    /// Cross the table used-value boundary without changing the style retained
+    /// by the table fragment for later cascade reconstruction.
+    pub(in crate::layout::table) fn table_used_style(
+        &self,
+        source: &ComputedStyle,
+    ) -> TableUsedStyle {
+        let used = if source.zoom_applied {
+            source.clone()
+        } else {
+            self.style_with_current_viewport_lengths(source)
+        };
+        TableUsedStyle::from_source_and_normalized(source.clone(), used)
+    }
+
     pub(in crate::layout::table) fn style_for_table_row(
         &mut self,
         row: &TableRow<'_>,
-        table_style: &ComputedStyle,
+        table_style: &(impl TableStyleSource + ?Sized),
         stylesheets: &[Stylesheet],
-    ) -> ComputedStyle {
+    ) -> TableUsedStyle {
         if let Some(style) = &row.style {
-            return style.as_ref().clone();
+            return self.table_used_style(style.as_ref());
         }
         let mut ancestors = self.ancestors.clone();
         ancestors.extend(row.ancestors.iter().cloned());
@@ -612,13 +685,13 @@ impl<'a> LayoutBuilder<'a> {
             .row_groups
             .last()
             .map(|group| self.style_for_table_row_group(group, table_style, stylesheets))
-            .unwrap_or_else(|| table_style.clone());
-        if let Some(element) = row.element {
+            .unwrap_or_else(|| self.table_used_style(table_style.table_source()));
+        let source = if let Some(element) = row.element {
             self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
                 element,
                 row.signature.clone(),
                 stylesheets,
-                Some(&parent_style),
+                Some(parent_style.source()),
                 &ancestors,
             )
         } else {
@@ -626,39 +699,41 @@ impl<'a> LayoutBuilder<'a> {
                 row.signature.clone(),
                 None,
                 stylesheets,
-                Some(&parent_style),
+                Some(parent_style.source()),
                 &ancestors,
             )
-        }
+        };
+        self.table_used_style(&source)
     }
 
     pub(in crate::layout::table) fn style_for_table_row_group(
         &mut self,
         row_group: &TableRowGroup<'_>,
-        table_style: &ComputedStyle,
+        table_style: &(impl TableStyleSource + ?Sized),
         stylesheets: &[Stylesheet],
-    ) -> ComputedStyle {
+    ) -> TableUsedStyle {
         if let Some(style) = &row_group.style {
-            return style.as_ref().clone();
+            return self.table_used_style(style.as_ref());
         }
         let ancestors = self.ancestors.clone();
-        self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
+        let source = self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
             row_group.element,
             row_group.signature.clone(),
             stylesheets,
-            Some(table_style),
+            Some(table_style.table_source()),
             &ancestors,
-        )
+        );
+        self.table_used_style(&source)
     }
 
     pub(in crate::layout::table) fn style_for_table_column(
         &mut self,
         column: &TableColumn<'_>,
-        table_style: &ComputedStyle,
+        table_style: &(impl TableStyleSource + ?Sized),
         stylesheets: &[Stylesheet],
-    ) -> ComputedStyle {
+    ) -> TableUsedStyle {
         if let Some(style) = &column.style {
-            return style.as_ref().clone();
+            return self.table_used_style(style.as_ref());
         }
         let mut ancestors = self.ancestors.clone();
         let parent_style = if let Some(group) = &column.group {
@@ -666,45 +741,51 @@ impl<'a> LayoutBuilder<'a> {
             ancestors.push(group.signature.clone());
             group_style
         } else {
-            table_style.clone()
+            self.table_used_style(table_style.table_source())
         };
-        self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
+        let source = self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
             column.element,
             column.signature.clone(),
             stylesheets,
-            Some(&parent_style),
+            Some(parent_style.source()),
             &ancestors,
-        )
+        );
+        self.table_used_style(&source)
     }
 
     pub(in crate::layout::table) fn style_for_table_column_group(
         &mut self,
         group: &TableColumnGroup<'_>,
-        table_style: &ComputedStyle,
+        table_style: &(impl TableStyleSource + ?Sized),
         stylesheets: &[Stylesheet],
-    ) -> ComputedStyle {
+    ) -> TableUsedStyle {
         if let Some(style) = &group.style {
-            return style.as_ref().clone();
+            return self.table_used_style(style.as_ref());
         }
         let ancestors = self.ancestors.clone();
-        self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
+        let source = self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
             group.element,
             group.signature.clone(),
             stylesheets,
-            Some(table_style),
+            Some(table_style.table_source()),
             &ancestors,
-        )
+        );
+        self.table_used_style(&source)
     }
 
     pub(in crate::layout::table) fn style_for_table_cell(
         &mut self,
         cell: &TableCell<'_>,
         row: &TableRow<'_>,
-        row_style: &ComputedStyle,
+        row_style: &(impl TableStyleSource + ?Sized),
         stylesheets: &[Stylesheet],
-    ) -> ComputedStyle {
+    ) -> TableUsedStyle {
         if cell.anonymous {
-            let mut style = row_style.clone();
+            let mut style = cell
+                .style
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| row_style.table_source().clone());
             style.display = Display::TABLE_CELL;
             style.margin = css::Edges::ZERO;
             style.padding = css::Edges::ZERO;
@@ -719,20 +800,20 @@ impl<'a> LayoutBuilder<'a> {
             style.box_values.max_width = css::ComputedLengthPercentageOrAuto::Auto;
             style.box_values.min_height = css::ComputedLengthPercentageOrAuto::Auto;
             style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
-            return style;
+            return self.table_used_style(&style);
         }
         if let Some(style) = &cell.style {
-            return style.as_ref().clone();
+            return self.table_used_style(style.as_ref());
         }
         let mut ancestors = self.ancestors.clone();
         ancestors.extend(row.ancestors.iter().cloned());
         ancestors.push(row.signature.clone());
-        if let Some(element) = cell.element {
+        let source = if let Some(element) = cell.element {
             self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
                 element,
                 cell.signature.clone(),
                 stylesheets,
-                Some(row_style),
+                Some(row_style.table_source()),
                 &ancestors,
             )
         } else {
@@ -740,29 +821,31 @@ impl<'a> LayoutBuilder<'a> {
                 cell.signature.clone(),
                 None,
                 stylesheets,
-                Some(row_style),
+                Some(row_style.table_source()),
                 &ancestors,
             )
-        }
+        };
+        self.table_used_style(&source)
     }
 
     pub(in crate::layout::table) fn style_for_table_caption(
         &mut self,
         caption: &TableCaption<'_>,
-        table_style: &ComputedStyle,
+        table_style: &(impl TableStyleSource + ?Sized),
         stylesheets: &[Stylesheet],
-    ) -> ComputedStyle {
+    ) -> TableUsedStyle {
         if let Some(style) = &caption.style {
-            return style.as_ref().clone();
+            return self.table_used_style(style.as_ref());
         }
         let ancestors = self.ancestors.clone();
-        self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
+        let source = self.style_for_layout_element_with_parent_font_metrics_and_ancestors(
             caption.element,
             caption.signature.clone(),
             stylesheets,
-            Some(table_style),
+            Some(table_style.table_source()),
             &ancestors,
-        )
+        );
+        self.table_used_style(&source)
     }
 
     pub(in crate::layout::table) fn enter_table_cell_content_scope(
@@ -770,7 +853,7 @@ impl<'a> LayoutBuilder<'a> {
         cell_style: &ComputedStyle,
         content_box: TableCellContentBox,
         ancestors: Vec<ElementSignature>,
-        definite_block_size: Option<f32>,
+        definite_block_size: BlockSizePercentageBasis,
     ) -> TableCellContentScope {
         let scope = TableCellContentScope {
             content_left: self.content_left,
@@ -785,10 +868,14 @@ impl<'a> LayoutBuilder<'a> {
         };
         let content_width = content_box.width().max(0.0);
         let content_height = content_box.height().max(0.0);
-        let content_logical_inline_size = match cell_style.writing_mode {
-            WritingMode::HorizontalTb => content_width,
-            WritingMode::VerticalRl | WritingMode::VerticalLr => content_height,
-        };
+        let content_logical_inline_size =
+            if WritingModeAxes::new(cell_style.writing_mode, cell_style.direction)
+                .swaps_physical_axes()
+            {
+                content_height
+            } else {
+                content_width
+            };
 
         self.content_left = content_box.left();
         self.content_right = content_box.right();
@@ -801,9 +888,9 @@ impl<'a> LayoutBuilder<'a> {
         self.child_available_space_stack
             .push(ChildAvailableSpace::new(
                 cell_style.writing_mode,
-                content_width,
-                Some(content_height),
-                content_height,
+                PhysicalContentWidth::new(content_box_pt(content_width)),
+                Some(PhysicalContentHeight::new(content_box_pt(content_height))),
+                PhysicalContentHeight::new(content_box_pt(content_height)),
             ));
         self.definite_block_size_stack.push(definite_block_size);
         scope
@@ -820,7 +907,10 @@ impl<'a> LayoutBuilder<'a> {
             cell_style,
             TableCellContentBox::from_page_top_rect(content_rect),
             ancestors,
-            definite_block_size,
+            block_size_percentage_basis_from_points(
+                definite_block_size,
+                BlockSizeBasisSource::TableCell,
+            ),
         )
     }
 
@@ -847,7 +937,8 @@ impl<'a> LayoutBuilder<'a> {
         cell_width: f32,
         border_insets: css::Edges,
     ) -> f32 {
-        if cell_style.writing_mode == WritingMode::HorizontalTb
+        if !WritingModeAxes::new(cell_style.writing_mode, cell_style.direction)
+            .swaps_physical_axes()
             || cell_style.align_content.keyword == ContentAlignmentKeyword::Normal
         {
             return 0.0;
@@ -898,7 +989,9 @@ impl<'a> LayoutBuilder<'a> {
             Some(border_insets),
         ) - non_content)
             .max(0.0);
-        if cell_style.writing_mode == WritingMode::HorizontalTb {
+        if !WritingModeAxes::new(cell_style.writing_mode, cell_style.direction)
+            .swaps_physical_axes()
+        {
             return fallback_width;
         }
 
@@ -945,22 +1038,24 @@ impl<'a> LayoutBuilder<'a> {
             content_x_offset,
         );
         let content_bounds = content_box.page_top_rect();
-        let mut x = content_bounds.x;
-        let y_top = content_bounds.top_y;
+        let mut x = content_bounds.x();
+        let y_top = content_bounds.top_y();
         if let Some(children) = cell.children.as_deref() {
             for child_box in children {
                 let Some((child, _, _, _)) = child_box.element_parts() else {
                     continue;
                 };
                 if replaced_element_kind(child) == Some(ReplacedElementKind::Svg)
-                    && let Some((width, height, fill)) = svg_rect(child)
+                    && let Some(asset) = self.resource_cache.inline_svg_asset(child)
                 {
+                    let size = asset.intrinsic_size();
                     if cell_style.visibility == Visibility::Visible {
-                        self.push_rect(
-                            PageTopRect::new(x, y_top, width, height).rendered_rect(Some(fill)),
-                        );
+                        let rect = PageTopRect::new(x, y_top, size.width, size.height).paint_rect();
+                        for path in asset.paint_paths(rect) {
+                            self.push_path_in_band(PaintBand::InFlowBlock, path);
+                        }
                     }
-                    x += width;
+                    x += size.width;
                 }
             }
             return;
@@ -974,11 +1069,33 @@ impl<'a> LayoutBuilder<'a> {
                 continue;
             };
             if replaced_element_kind(child) == Some(ReplacedElementKind::Svg)
-                && let Some((width, height, fill)) = svg_rect(child)
+                && let Some(asset) = self.resource_cache.inline_svg_asset(child)
             {
-                self.push_rect(PageTopRect::new(x, y_top, width, height).rendered_rect(Some(fill)));
-                x += width;
+                let size = asset.intrinsic_size();
+                let rect = PageTopRect::new(x, y_top, size.width, size.height).paint_rect();
+                for path in asset.paint_paths(rect) {
+                    self.push_path_in_band(PaintBand::InFlowBlock, path);
+                }
+                x += size.width;
             }
         }
     }
+}
+
+/// Return the style values used for table-internal track geometry.
+///
+/// Columns and column groups do not establish independent writing-mode flows:
+/// their track direction and the physical property selected for a declared
+/// size come from the table root.  Preserve all other column styling (notably
+/// width, visibility, borders, and backgrounds), while making this boundary
+/// explicit so a `writing-mode` or `direction` declaration on `<col>` cannot
+/// alter track measurement.
+/// <https://drafts.csswg.org/css-writing-modes-4/#writing-mode>
+/// <https://drafts.csswg.org/css-tables-3/#table-layout>
+fn table_internal_flow_style(style: &ComputedStyle, table_style: &ComputedStyle) -> ComputedStyle {
+    let mut flow_style = style.clone();
+    flow_style.writing_mode = table_style.writing_mode;
+    flow_style.direction = table_style.direction;
+    flow_style.text_orientation = table_style.text_orientation;
+    flow_style
 }

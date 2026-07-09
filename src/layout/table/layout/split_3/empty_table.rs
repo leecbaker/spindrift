@@ -19,9 +19,15 @@ impl<'a> LayoutBuilder<'a> {
         let content_width_points = content_width.points();
         let content_height = used_empty_table_grid_height(
             style,
-            self.definite_block_size_stack.last().copied().flatten(),
+            self.definite_block_size_stack
+                .last()
+                .cloned()
+                .unwrap_or_else(PercentageBasis::indefinite),
             table_width,
-        );
+            None,
+            layout_pt(0.0),
+        )
+        .points();
         style.margin.top
             + self.estimate_table_captions_height(
                 captions,
@@ -45,6 +51,7 @@ impl<'a> LayoutBuilder<'a> {
             + style.margin.bottom
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::layout::table) fn place_empty_table_wrapper(
         &mut self,
         captions: &[TableCaption<'_>],
@@ -53,23 +60,10 @@ impl<'a> LayoutBuilder<'a> {
         available_table_width: f32,
         table_width: UsedTableWidth,
         relative_offset: RelativeOffset,
+        wrapper_border_box_block_size: Option<BorderBoxLength>,
     ) -> (f32, f32, f32, f32) {
         let content_width = used_empty_table_grid_width(style, available_table_width, table_width);
         let content_width_points = content_width.points();
-        let content_height = used_empty_table_grid_height(
-            style,
-            self.definite_block_size_stack.last().copied().flatten(),
-            table_width,
-        );
-        let border_box_width = table_width.wrapper_border_box_width(content_width).points();
-        let mut used_style = style.clone();
-        resolve_normal_flow_auto_margins_for_known_width(
-            &mut used_style,
-            (self.content_right - self.content_left).max(0.0),
-            border_box_width,
-            self.containing_block_direction,
-        );
-        let style = &used_style;
         let top_caption_height = self.estimate_table_captions_height(
             captions,
             style,
@@ -84,6 +78,26 @@ impl<'a> LayoutBuilder<'a> {
             content_width_points,
             CaptionSide::Bottom,
         );
+        let content_height = used_empty_table_grid_height(
+            style,
+            self.definite_block_size_stack
+                .last()
+                .cloned()
+                .unwrap_or_else(PercentageBasis::indefinite),
+            table_width,
+            wrapper_border_box_block_size,
+            layout_pt(top_caption_height + bottom_caption_height),
+        )
+        .points();
+        let border_box_width = table_width.wrapper_border_box_width(content_width).points();
+        let mut used_style = style.clone();
+        resolve_normal_flow_auto_margins_for_known_width(
+            &mut used_style,
+            (self.content_right - self.content_left).max(0.0),
+            border_box_width,
+            self.containing_block_direction,
+        );
+        let style = &used_style;
         let collision_height = table_wrapper_collision_height(
             style,
             table_width,
@@ -96,8 +110,10 @@ impl<'a> LayoutBuilder<'a> {
         self.prebreak_bfc_margin_box_if_needed(collision_height, style.margin.top);
         let (margin_box_left, avoided_top, _) = self.place_float_avoiding_margin_box(
             self.cursor_y,
-            style.margin.left + border_box_width + style.margin.right,
-            collision_height,
+            PageTopSize::new(
+                style.margin.left + border_box_width + style.margin.right,
+                collision_height,
+            ),
             style.clear,
             style.writing_mode,
             style.direction,
@@ -105,7 +121,7 @@ impl<'a> LayoutBuilder<'a> {
         );
         self.cursor_y = avoided_top;
         (
-            margin_box_left + style.margin.left + relative_offset.x,
+            margin_box_left + style.margin.left + relative_offset.x(),
             content_width_points,
             content_height,
             border_box_width,
@@ -130,6 +146,7 @@ impl<'a> LayoutBuilder<'a> {
         table_metrics: TableMetrics,
         relative_offset: RelativeOffset,
         table_is_document_canvas: bool,
+        wrapper_border_box_block_size: Option<BorderBoxLength>,
     ) {
         let (table_outer_x, content_width, content_height, border_box_width) = self
             .place_empty_table_wrapper(
@@ -139,6 +156,7 @@ impl<'a> LayoutBuilder<'a> {
                 available_table_width,
                 table_width,
                 relative_offset,
+                wrapper_border_box_block_size,
             );
         let border_box_height = table_wrapper_border_box_height(content_height, table_width);
         let table_x = table_width.content_x(table_outer_x);
@@ -146,37 +164,40 @@ impl<'a> LayoutBuilder<'a> {
         self.push_float_context();
         let table_wrapper_top = self.cursor_y;
         let border_box_x = table_x - table_width.padding.left - table_width.border_widths.left;
-        let establishes_positioning_containing_block =
-            matches!(style.position, Position::Relative | Position::Sticky)
-                || !style.transform.is_empty();
-        if establishes_positioning_containing_block {
-            let top_caption_height = self.estimate_table_captions_height(
-                captions,
-                style,
-                stylesheets,
-                content_width,
-                CaptionSide::Top,
-            );
-            let bottom_caption_height = self.estimate_table_captions_height(
-                captions,
-                style,
-                stylesheets,
-                content_width,
-                CaptionSide::Bottom,
-            );
-            self.containing_blocks
-                .push(ContainingBlock::from_page_top_rect(
-                    table_wrapper_positioning_containing_block(
-                        table_x,
-                        table_wrapper_top,
-                        content_width,
-                        content_height,
-                        table_width,
-                        top_caption_height,
-                        bottom_caption_height,
-                    ),
+        let positioning_containing_block_mode = PositionedContainingBlockMode::for_style(style);
+        let top_caption_height = self.estimate_table_captions_height(
+            captions,
+            style,
+            stylesheets,
+            content_width,
+            CaptionSide::Top,
+        );
+        let bottom_caption_height = self.estimate_table_captions_height(
+            captions,
+            style,
+            stylesheets,
+            content_width,
+            CaptionSide::Bottom,
+        );
+        let positioned_containing_block_scope = if let Some(mode) =
+            positioning_containing_block_mode
+        {
+            let containing_block =
+                ContainingBlock::from_page_top_rect(table_wrapper_positioning_containing_block(
+                    table_x,
+                    table_wrapper_top,
+                    content_width,
+                    content_height,
+                    table_width,
+                    top_caption_height,
+                    bottom_caption_height,
                 ));
-        }
+            Some(self.push_positioned_containing_block(mode, containing_block))
+        } else {
+            None
+        };
+        let top_caption_paint_checkpoint = self.current_page.paint_checkpoint();
+        let top_caption_paint_page_index = self.pages.len();
         self.layout_table_captions(
             captions,
             style,
@@ -191,28 +212,40 @@ impl<'a> LayoutBuilder<'a> {
         let table_structure_paint_checkpoint = self.current_page.paint_checkpoint();
         let table_structure_paint_page_index = self.pages.len();
         if let Some(fill) = style.background_color {
-            self.push_rect_in_band(
-                PaintBand::InFlowBlock,
-                PageTopRect::new(
-                    border_box_x,
-                    table_box_top,
-                    border_box_width,
-                    border_box_height,
-                )
-                .rendered_rect(Some(fill)),
+            let border_rect = paint_space_rect(
+                border_box_x,
+                table_box_top - border_box_height,
+                border_box_width,
+                border_box_height,
             );
+            let background_rect = crate::layout::paint_helpers::background_rect_area_for_box(
+                border_rect,
+                style,
+                table_width.border_widths,
+                style.background_clip,
+            );
+            if background_rect.size.width <= 0.0 || background_rect.size.height <= 0.0 {
+                // A zero-sized content box has no background painting area.
+                // <https://www.w3.org/TR/css-backgrounds-3/#background-clip>
+            } else {
+                self.push_rect_in_band(
+                    PaintBand::InFlowBlock,
+                    RenderedRect::from_paint_rect(background_rect, Some(fill)),
+                );
+            }
         }
         let table_paint_box = TableWrapperPaintBox {
             table_x,
             top: table_box_top,
+            axes: TableAxes::for_style(style),
             content_width,
             content_height,
             table_width,
             table_metrics,
         };
-        self.paint_separated_table_wrapper_border(style, table_paint_box);
-        if self.pages.len() == table_structure_paint_page_index {
-            let bounds = table_paint_box.border_box().paint_clip();
+        self.paint_separated_table_wrapper_border(style, table_paint_box.clone());
+        if !style.contain.paint && self.pages.len() == table_structure_paint_page_index {
+            let bounds = table_paint_box.clone().border_box().paint_clip();
             let overflow_clip = table_box_overflow_clip(
                 style,
                 table_paint_box.padding_box().paint_clip(),
@@ -238,15 +271,30 @@ impl<'a> LayoutBuilder<'a> {
             content_width,
             CaptionSide::Bottom,
         );
-        if establishes_positioning_containing_block {
-            self.containing_blocks.pop();
+        if style.contain.paint && self.pages.len() == top_caption_paint_page_index {
+            let fragment = self
+                .current_page
+                .take_paint_fragment_since(top_caption_paint_checkpoint);
+            let wrapper_clip = PageTopRect::new(
+                table_x - table_width.padding.left,
+                table_wrapper_top,
+                content_width + table_width.padding.left + table_width.padding.right,
+                top_caption_height + border_box_height + bottom_caption_height,
+            )
+            .paint_clip();
+            let fragment = fragment.with_effect_scoped_to_rect_all_bands(wrapper_clip);
+            self.current_page
+                .append_paint_fragment_owned(fragment, PaintTranslation::identity());
+        }
+        if let Some(scope) = positioned_containing_block_scope {
+            self.pop_positioned_containing_block(scope);
         }
         self.pop_float_context();
         self.cursor_y -= style.margin.bottom;
         if matches!(style.position, Position::Relative | Position::Sticky) {
-            self.cursor_y -= relative_offset.y;
+            self.cursor_y -= relative_offset.y();
         }
-        self.apply_forced_break(style.break_after);
+        self.apply_forced_break_after_box_in(self.active_fragmentainer_kind(), style);
     }
 
     /// Paint the border of a separated-border table wrapper.
@@ -282,10 +330,12 @@ impl<'a> LayoutBuilder<'a> {
         paint_table_border_edges(
             &mut border_rects,
             &mut border_paths,
-            border_box_x,
-            wrapper.top,
-            border_box_width,
-            border_box_height,
+            PageTopRect::new(
+                border_box_x,
+                wrapper.top,
+                border_box_width,
+                border_box_height,
+            ),
             style,
         );
         for rect in border_rects {
@@ -325,7 +375,7 @@ impl<'a> LayoutBuilder<'a> {
             footer_rows,
             planned_row_heights,
             planned_row_occupancy,
-            table_metrics,
+            table_metrics.clone(),
         );
         if footer_rows.is_empty() || footer_height > self.page_area_height() + 0.01 {
             return;
@@ -349,6 +399,7 @@ impl<'a> LayoutBuilder<'a> {
             table_width,
             table_metrics,
             collapsed_geometry,
+            false,
         );
         self.cursor_y = previous_cursor_y;
     }
@@ -377,6 +428,7 @@ impl<'a> LayoutBuilder<'a> {
         table_width: UsedTableWidth,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
+        scope_as_table_fragment: bool,
     ) {
         if repeated_rows.is_empty() {
             return;
@@ -385,7 +437,7 @@ impl<'a> LayoutBuilder<'a> {
             repeated_rows,
             planned_row_heights,
             planned_row_occupancy,
-            table_metrics,
+            table_metrics.clone(),
         );
         if repeated_height > self.page_area_height() + 0.01 {
             return;
@@ -416,19 +468,19 @@ impl<'a> LayoutBuilder<'a> {
             column_plan,
             planned_row_heights,
             planned_row_occupancy,
-            table_metrics,
+            table_metrics.clone(),
         );
         // Repeated header/footer rows are visual copies, not new source boxes.
         // Suppress element side effects while preserving paint replay.
         // <https://www.w3.org/TR/CSS22/tables.html#value-def-table-header-group>
         self.element_side_effect_suppression_depth += 1;
-        for (position, row_index) in repeated_rows.iter().copied().enumerate() {
+        for (position, row_index) in repeated_rows.iter().cloned().enumerate() {
             let row = &rows[row_index];
             let row_style = self.style_for_table_row(row, table_style, stylesheets);
             let row_height = planned_row_heights[row_index];
             let row_occupied = planned_row_occupancy
                 .get(row_index)
-                .copied()
+                .cloned()
                 .unwrap_or(false);
             let row_top = self.cursor_y;
             repeated_row_tops.push(row_top);
@@ -445,7 +497,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 table_cellpadding,
                 column_plan,
-                table_metrics,
+                table_metrics.clone(),
                 collapsed_geometry,
             );
             // CSS Tables allow repeated table-header-group and
@@ -473,7 +525,7 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     table_cellpadding,
                     column_plan,
-                    table_metrics,
+                    table_metrics.clone(),
                     collapsed_geometry,
                 ) else {
                     continue;
@@ -486,13 +538,12 @@ impl<'a> LayoutBuilder<'a> {
                     planned_row_occupancy,
                     row_index,
                     placement.rowspan,
-                    table_metrics,
+                    table_metrics.clone(),
                 )
                 .max(metrics.border_box_height);
                 let cell_placement = TableGridPlacement::new(PageTopPoint::new(table_x, row_top));
                 let cell_border_box = column_plan
                     .cell_border_box(prepared.area, TableRowBounds::new(0.0, cell_height));
-                let cell_x = cell_border_box.x(cell_placement);
                 let cell_width = cell_border_box.width();
                 let text = prepared.text;
                 let cell_is_empty = text.is_empty() && metrics.content_height <= 0.0;
@@ -507,7 +558,7 @@ impl<'a> LayoutBuilder<'a> {
                     column_plan,
                     planned_row_heights,
                     planned_row_occupancy,
-                    table_metrics,
+                    table_metrics: table_metrics.clone(),
                     collapsed_geometry,
                     row_baseline_offset,
                 };
@@ -518,6 +569,7 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 let content_offset = table_cell_content_offset(
                     cell_style,
+                    cell_borders,
                     metrics.content_height,
                     cell_height,
                     cell_row_baseline_offset,
@@ -530,7 +582,7 @@ impl<'a> LayoutBuilder<'a> {
                     cell_width,
                     cell_borders,
                 );
-                let content_clip = self.collapsed_rowspan_cell_content_clip(
+                let collapsed_content_clip = self.collapsed_rowspan_cell_content_clip(
                     row_index,
                     placement.rowspan,
                     rows,
@@ -538,21 +590,36 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     planned_row_heights,
                     planned_row_occupancy,
-                    table_metrics,
+                    table_metrics.clone(),
                     cell_border_box,
                     cell_placement,
                 );
+                let paint_containment_clip = self.table_cell_content_clip(
+                    cell_style,
+                    cell_border_box,
+                    cell_placement,
+                    cell_borders,
+                );
+                let content_clip = match (collapsed_content_clip, paint_containment_clip) {
+                    (Some(collapsed), Some(containment)) => collapsed.intersect(containment),
+                    (Some(clip), None) | (None, Some(clip)) => Some(clip),
+                    (None, None) => None,
+                };
                 let paint_empty_cell = table_metrics.border_collapse
                     == css::BorderCollapse::Collapse
                     || cell_style.empty_cells == EmptyCells::Show
                     || !cell_is_empty;
 
+                // Cell decoration is painted in physical page coordinates.
+                // The table-grid tracks above remain logical, so projecting
+                // the typed border box here is required for vertical and
+                // sideways table roots as well as horizontal ones.
+                // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+                let cell_border_rect = cell_border_box.page_top_rect(cell_placement);
+
                 if paint_empty_cell {
                     let (rects, rounded_rects, paths, strokes) = block_paint_ops_with_border_insets(
-                        cell_x,
-                        row_top - cell_height,
-                        cell_width,
-                        cell_height,
+                        cell_border_rect.paint_rect(),
                         cell_style,
                         cell_borders,
                         false,
@@ -578,10 +645,7 @@ impl<'a> LayoutBuilder<'a> {
                     paint_table_border_edges(
                         &mut border_rects,
                         &mut border_paths,
-                        cell_x,
-                        row_top,
-                        cell_width,
-                        cell_height,
+                        cell_border_rect,
                         cell_style,
                     );
                     for rect in border_rects {
@@ -611,7 +675,7 @@ impl<'a> LayoutBuilder<'a> {
                         cell_style,
                         content_box,
                         self.table_cell_child_ancestors(cell, row),
-                        None,
+                        PercentageBasis::indefinite(),
                     );
                     self.push_float_context();
                     if let Some(element) = cell.element {
@@ -644,6 +708,7 @@ impl<'a> LayoutBuilder<'a> {
                     cell_style,
                     &prepared.row_sizing_style,
                     table_style,
+                    false,
                     stylesheets,
                     cell_borders,
                     cell_border_box,
@@ -654,6 +719,13 @@ impl<'a> LayoutBuilder<'a> {
                 self.layout_table_cell_positioned_children(
                     cell,
                     row,
+                    &row_style,
+                    Some(ContainingBlock::from_page_top_rect(PageTopRect::new(
+                        table_x,
+                        row_top,
+                        used_table_width,
+                        row_height,
+                    ))),
                     cell_style,
                     stylesheets,
                     cell_borders,
@@ -671,7 +743,7 @@ impl<'a> LayoutBuilder<'a> {
             if row_occupied
                 && repeated_rows[position + 1..]
                     .iter()
-                    .any(|row| planned_row_occupancy.get(*row).copied().unwrap_or(false))
+                    .any(|row| planned_row_occupancy.get(*row).cloned().unwrap_or(false))
             {
                 self.cursor_y -= table_metrics.spacing.vertical.length_points();
             }
@@ -700,7 +772,7 @@ impl<'a> LayoutBuilder<'a> {
                 self.push_path_in_band(PaintBand::InFlowBlock, path);
             }
         }
-        if self.pages.len() == paint_page_index {
+        if scope_as_table_fragment && self.pages.len() == paint_page_index {
             let bounds = PageTopRect::new(
                 table_x - table_width.padding.left - table_width.border_widths.left,
                 fragment_top + table_width.padding.top + table_width.border_widths.top,
@@ -796,12 +868,12 @@ impl<'a> LayoutBuilder<'a> {
             .unwrap_or_else(|| TableInlineBounds::new(0.0, used_table_width));
         let occupied_x = table_x + occupied_inline_bounds.start;
         let occupied_width = occupied_inline_bounds.size;
-        for (position, row_index) in repeated_rows.iter().copied().enumerate() {
+        for (position, row_index) in repeated_rows.iter().cloned().enumerate() {
             local_row_tops.push(cursor_y);
             let row_height = planned_row_heights[row_index];
             let row_occupied = planned_row_occupancy
                 .get(row_index)
-                .copied()
+                .cloned()
                 .unwrap_or(false);
             local_row_heights.push(if row_occupied { row_height } else { 0.0 });
             if row_occupied {
@@ -810,7 +882,7 @@ impl<'a> LayoutBuilder<'a> {
             if row_occupied
                 && repeated_rows[position + 1..]
                     .iter()
-                    .any(|row| planned_row_occupancy.get(*row).copied().unwrap_or(false))
+                    .any(|row| planned_row_occupancy.get(*row).cloned().unwrap_or(false))
             {
                 cursor_y -= table_metrics.spacing.vertical.length_points();
             }
@@ -825,11 +897,31 @@ impl<'a> LayoutBuilder<'a> {
                 fragment_top,
                 fragment_height,
                 column_plan,
+                None,
+                repeated_rows,
                 start_column,
                 end_column,
                 &column_group_style,
                 &local_row_tops,
                 &local_row_heights,
+            ) {
+                self.push_primitive_in_band(PaintBand::InFlowBlock, primitive);
+            }
+            for primitive in table_column_fragment_background_image_primitives(
+                table_x,
+                fragment_top,
+                fragment_height,
+                column_plan,
+                None,
+                repeated_rows,
+                start_column,
+                end_column,
+                &column_group_style,
+                &local_row_tops,
+                &local_row_heights,
+                self.base_url,
+                self.root_url,
+                self.resource_cache,
             ) {
                 self.push_primitive_in_band(PaintBand::InFlowBlock, primitive);
             }
@@ -843,17 +935,49 @@ impl<'a> LayoutBuilder<'a> {
                 .span
                 .min(column_plan.column_count() - column_index)
                 .max(1);
+            // Synthetic columns materialized for a `colgroup` without `col`
+            // children carry the group style only for grid sizing. Their
+            // structural background has already been emitted for the group.
+            // <https://www.w3.org/TR/css-tables-3/#drawing-backgrounds>
+            let is_group_placeholder = column
+                .group
+                .as_ref()
+                .is_some_and(|group| group.signature == column.signature);
+            if is_group_placeholder {
+                column_index += span;
+                continue;
+            }
             let column_style = self.style_for_table_column(column, table_style, stylesheets);
             for primitive in table_column_fragment_background_primitives(
                 table_x,
                 fragment_top,
                 fragment_height,
                 column_plan,
+                None,
+                repeated_rows,
                 column_index,
                 column_index + span,
                 &column_style,
                 &local_row_tops,
                 &local_row_heights,
+            ) {
+                self.push_primitive_in_band(PaintBand::InFlowBlock, primitive);
+            }
+            for primitive in table_column_fragment_background_image_primitives(
+                table_x,
+                fragment_top,
+                fragment_height,
+                column_plan,
+                None,
+                repeated_rows,
+                column_index,
+                column_index + span,
+                &column_style,
+                &local_row_tops,
+                &local_row_heights,
+                self.base_url,
+                self.root_url,
+                self.resource_cache,
             ) {
                 self.push_primitive_in_band(PaintBand::InFlowBlock, primitive);
             }
@@ -866,7 +990,7 @@ impl<'a> LayoutBuilder<'a> {
             if let Some(fill) = row_group_style.background_color {
                 let mut segment_start = None;
                 let mut previous_local = None;
-                for (local_row, original_row) in repeated_rows.iter().copied().enumerate() {
+                for (local_row, original_row) in repeated_rows.iter().cloned().enumerate() {
                     if original_row >= start_row && original_row < end_row {
                         if segment_start.is_none() {
                             segment_start = Some(local_row);

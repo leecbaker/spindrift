@@ -7,27 +7,86 @@ pub(crate) enum BorderEdge {
     Bottom,
     Left,
 }
-#[allow(clippy::too_many_arguments)]
+
+/// Physical paint geometry for one CSS border side.
+///
+/// This keeps the side's paint rectangle and its dash-pattern orientation
+/// together: <https://www.w3.org/TR/css-backgrounds-3/#border-style>.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BorderSideGeometry {
+    pub(crate) rect: PaintRect,
+    pub(crate) horizontal: bool,
+}
+
+impl BorderSideGeometry {
+    pub(crate) fn from_axis_cross(
+        axis_start: f32,
+        axis_length: f32,
+        cross_start: f32,
+        cross_width: f32,
+        horizontal: bool,
+    ) -> Self {
+        let rect = if horizontal {
+            paint_space_rect(axis_start, cross_start, axis_length, cross_width)
+        } else {
+            paint_space_rect(cross_start, axis_start, cross_width, axis_length)
+        };
+        Self { rect, horizontal }
+    }
+
+    pub(crate) fn axis_start(self) -> f32 {
+        if self.horizontal {
+            self.rect.origin.x
+        } else {
+            self.rect.origin.y
+        }
+    }
+
+    pub(crate) fn axis_length(self) -> f32 {
+        if self.horizontal {
+            self.rect.size.width
+        } else {
+            self.rect.size.height
+        }
+    }
+
+    pub(crate) fn cross_start(self) -> f32 {
+        if self.horizontal {
+            self.rect.origin.y
+        } else {
+            self.rect.origin.x
+        }
+    }
+
+    pub(crate) fn cross_width(self) -> f32 {
+        if self.horizontal {
+            self.rect.size.height
+        } else {
+            self.rect.size.width
+        }
+    }
+}
 pub(crate) fn paint_border_side(
     rects: &mut Vec<RenderedRect>,
     paths: &mut Vec<RenderedPath>,
     edge: BorderEdge,
-    x: f32,
-    top: f32,
-    width: f32,
-    height: f32,
+    rect: PageTopRect,
     border: UsedBorderSide,
 ) {
     if !border.is_visible() {
         return;
     }
     if border.style == BorderStyle::Double && border.used_width >= 3.0 {
-        paint_double_border_side(rects, paths, edge, x, top, width, height, border);
+        paint_double_border_side(rects, paths, edge, rect, border);
         return;
     }
 
-    let (axis_start, axis_length, cross_start, cross_width, horizontal) =
-        border_side_geometry(edge, x, top, width, height, border.used_width);
+    let geometry = border_side_geometry(edge, rect, border.used_width);
+    let axis_start = geometry.axis_start();
+    let axis_length = geometry.axis_length();
+    let cross_start = geometry.cross_start();
+    let cross_width = geometry.cross_width();
+    let horizontal = geometry.horizontal;
     match border.style {
         BorderStyle::Dashed => paint_dashed_border_side(
             rects,
@@ -159,29 +218,24 @@ fn outer_inner_cross_positions(edge: BorderEdge, cross_start: f32, cross_width: 
 }
 
 fn lighten_border_color(color: Color) -> Color {
+    // CSS2's inset/outset border shading is an sRGB-era operation. Keep it
+    // at the explicit legacy paint boundary until it gains defined CSS Color
+    // interpolation semantics.
+    let color = crate::css::color_to_srgb(color);
     let (hue, mut saturation, mut value) = rgb_to_hsv(color.r, color.g, color.b);
     value = 1.0 - (1.0 - value) / 1.5;
     if saturation > 0.0 {
         saturation = 1.0 - (1.0 - saturation) / 1.25;
     }
     let (r, g, b) = hsv_to_rgb(hue, saturation, value);
-    Color {
-        r,
-        g,
-        b,
-        a: color.a,
-    }
+    Color::srgb(r, g, b, color.a)
 }
 
 fn darken_border_color(color: Color) -> Color {
+    let color = crate::css::color_to_srgb(color);
     let (hue, saturation, value) = rgb_to_hsv(color.r, color.g, color.b);
     let (r, g, b) = hsv_to_rgb(hue, saturation / 1.25, value / 1.5);
-    Color {
-        r,
-        g,
-        b,
-        a: color.a,
-    }
+    Color::srgb(r, g, b, color.a)
 }
 
 fn rgb_to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
@@ -220,15 +274,11 @@ fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> (f32, f32, f32) {
         _ => (value, p, q),
     }
 }
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_double_border_side(
     rects: &mut Vec<RenderedRect>,
     paths: &mut Vec<RenderedPath>,
     edge: BorderEdge,
-    x: f32,
-    top: f32,
-    width: f32,
-    height: f32,
+    rect: PageTopRect,
     border: UsedBorderSide,
 ) {
     let stripe = (border.used_width / 3.0).max(1.0);
@@ -240,54 +290,62 @@ pub(crate) fn paint_double_border_side(
     };
     match edge {
         BorderEdge::Top => {
-            paint_border_side(rects, paths, edge, x, top, width, height, stripe_border);
+            paint_border_side(rects, paths, edge, rect, stripe_border);
             paint_border_side(
                 rects,
                 paths,
                 edge,
-                x,
-                top - border.used_width + stripe,
-                width,
-                height,
+                PageTopRect::new(
+                    rect.x(),
+                    rect.top_y() - border.used_width + stripe,
+                    rect.width(),
+                    rect.height(),
+                ),
                 stripe_border,
             );
         }
         BorderEdge::Bottom => {
-            paint_border_side(rects, paths, edge, x, top, width, height, stripe_border);
+            paint_border_side(rects, paths, edge, rect, stripe_border);
             paint_border_side(
                 rects,
                 paths,
                 edge,
-                x,
-                top + border.used_width - stripe,
-                width,
-                height,
+                PageTopRect::new(
+                    rect.x(),
+                    rect.top_y() + border.used_width - stripe,
+                    rect.width(),
+                    rect.height(),
+                ),
                 stripe_border,
             );
         }
         BorderEdge::Right => {
-            paint_border_side(rects, paths, edge, x, top, width, height, stripe_border);
+            paint_border_side(rects, paths, edge, rect, stripe_border);
             paint_border_side(
                 rects,
                 paths,
                 edge,
-                x + border.used_width - stripe,
-                top,
-                width,
-                height,
+                PageTopRect::new(
+                    rect.x() - border.used_width + stripe,
+                    rect.top_y(),
+                    rect.width(),
+                    rect.height(),
+                ),
                 stripe_border,
             );
         }
         BorderEdge::Left => {
-            paint_border_side(rects, paths, edge, x, top, width, height, stripe_border);
+            paint_border_side(rects, paths, edge, rect, stripe_border);
             paint_border_side(
                 rects,
                 paths,
                 edge,
-                x - border.used_width + stripe,
-                top,
-                width,
-                height,
+                PageTopRect::new(
+                    rect.x() + border.used_width - stripe,
+                    rect.top_y(),
+                    rect.width(),
+                    rect.height(),
+                ),
                 stripe_border,
             );
         }
@@ -296,22 +354,84 @@ pub(crate) fn paint_double_border_side(
 
 pub(crate) fn border_side_geometry(
     edge: BorderEdge,
-    x: f32,
-    top: f32,
-    width: f32,
-    height: f32,
+    rect: PageTopRect,
     border_width: f32,
-) -> (f32, f32, f32, f32, bool) {
+) -> BorderSideGeometry {
     match edge {
-        BorderEdge::Top => (x, width, top - border_width, border_width, true),
-        BorderEdge::Bottom => (x, width, top - height, border_width, true),
-        BorderEdge::Right => (
-            top - height,
-            height,
-            x + width - border_width,
+        BorderEdge::Top => BorderSideGeometry::from_axis_cross(
+            rect.x(),
+            rect.width(),
+            rect.top_y() - border_width,
+            border_width,
+            true,
+        ),
+        BorderEdge::Bottom => BorderSideGeometry::from_axis_cross(
+            rect.x(),
+            rect.width(),
+            rect.top_y() - rect.height(),
+            border_width,
+            true,
+        ),
+        BorderEdge::Right => BorderSideGeometry::from_axis_cross(
+            rect.top_y() - rect.height(),
+            rect.height(),
+            rect.x() + rect.width() - border_width,
             border_width,
             false,
         ),
-        BorderEdge::Left => (top - height, height, x, border_width, false),
+        BorderEdge::Left => BorderSideGeometry::from_axis_cross(
+            rect.top_y() - rect.height(),
+            rect.height(),
+            rect.x(),
+            border_width,
+            false,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn border_side_geometry_maps_each_physical_edge_to_paint_rect() {
+        let rect = PageTopRect::new(10.0, 100.0, 50.0, 30.0);
+        let top = border_side_geometry(BorderEdge::Top, rect, 4.0);
+        let right = border_side_geometry(BorderEdge::Right, rect, 4.0);
+        let bottom = border_side_geometry(BorderEdge::Bottom, rect, 4.0);
+        let left = border_side_geometry(BorderEdge::Left, rect, 4.0);
+
+        assert_eq!(top.rect, paint_space_rect(10.0, 96.0, 50.0, 4.0));
+        assert_eq!(right.rect, paint_space_rect(56.0, 70.0, 4.0, 30.0));
+        assert_eq!(bottom.rect, paint_space_rect(10.0, 70.0, 50.0, 4.0));
+        assert_eq!(left.rect, paint_space_rect(10.0, 70.0, 4.0, 30.0));
+        assert!(top.horizontal && bottom.horizontal);
+        assert!(!right.horizontal && !left.horizontal);
+    }
+
+    #[test]
+    fn double_top_border_keeps_inner_stripe_on_the_same_page_top_rect_edge() {
+        let border = UsedBorderSide::new(6.0, BorderStyle::Double, Color::new(0, 0, 0));
+        let mut rects = Vec::new();
+        let mut paths = Vec::new();
+        paint_double_border_side(
+            &mut rects,
+            &mut paths,
+            BorderEdge::Top,
+            PageTopRect::new(10.0, 100.0, 50.0, 30.0),
+            border,
+        );
+
+        assert!(paths.is_empty());
+        assert_eq!(
+            rects
+                .into_iter()
+                .map(|rect| rect.paint_rect())
+                .collect::<Vec<_>>(),
+            vec![
+                paint_space_rect(10.0, 98.0, 50.0, 2.0),
+                paint_space_rect(10.0, 94.0, 50.0, 2.0),
+            ]
+        );
     }
 }

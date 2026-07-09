@@ -12,7 +12,7 @@
 //!    [`LogicalRect`], and [`LogicalInlineSpan`] model spec-language inline and
 //!    block dimensions before a writing mode or `direction` has chosen physical
 //!    sides.
-//! 2. Formatting-context geometry: [`InlineRect`], [`BlockRect`],
+//! 2. Formatting-context geometry: [`InlineRect`], [`BlockRect`], [`GridRect`],
 //!    [`ContainerRect`], and table-grid rectangles represent
 //!    resolved physical geometry local to the formatting context that produced
 //!    it.
@@ -87,10 +87,32 @@ pub(super) enum InlineSpace {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BlockSpace {}
 
+/// Physical coordinates inside a CSS grid container's content box.
+///
+/// CSS Grid places resolved item border boxes relative to the grid content box;
+/// its physical block coordinate increases from the content box's top edge
+/// before fragment replay projects it into page-top geometry:
+/// <https://www.w3.org/TR/css-grid-1/#grid-item-placement>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GridSpace {}
+
+/// Physical coordinates spanning the assembled document canvas before one
+/// canvas slice is projected onto its destination page.
+///
+/// Root backgrounds can position and repeat across the document canvas, while
+/// PDF paint primitives remain page-local. This marker prevents those
+/// intermediate coordinates from being passed to page-local paint APIs before
+/// the page-projection boundary:
+/// <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DocumentCanvasSpace {}
+
 /// A point in physical container coordinates.
 pub(super) type ContainerPoint = euclid::Point2D<f32, ContainerSpace>;
 /// A size in physical container coordinates.
 pub(super) type ContainerSize = euclid::Size2D<f32, ContainerSpace>;
+/// A displacement in physical container coordinates.
+pub(super) type ContainerVector = euclid::Vector2D<f32, ContainerSpace>;
 /// An axis-aligned rectangle in physical container coordinates.
 pub(super) type ContainerRect = euclid::Rect<f32, ContainerSpace>;
 /// A point in resolved inline formatting-context coordinates.
@@ -107,12 +129,24 @@ pub(super) type BlockPoint = euclid::Point2D<f32, BlockSpace>;
 pub(super) type BlockSize = euclid::Size2D<f32, BlockSpace>;
 /// A rectangle in block formatting-context coordinates.
 pub(super) type BlockRect = euclid::Rect<f32, BlockSpace>;
+/// A point in grid-container-local physical coordinates.
+pub(super) type GridPoint = euclid::Point2D<f32, GridSpace>;
+/// A size in grid-container-local physical coordinates.
+pub(super) type GridSize = euclid::Size2D<f32, GridSpace>;
+/// A rectangle in grid-container-local physical coordinates.
+pub(super) type GridRect = euclid::Rect<f32, GridSpace>;
 /// A point in raw Taffy output coordinates.
 pub(super) type TaffyPoint = euclid::Point2D<f32, TaffySpace>;
 /// A size in raw Taffy output coordinates.
 pub(super) type TaffySize = euclid::Size2D<f32, TaffySpace>;
 /// An axis-aligned rectangle in raw Taffy output coordinates.
 pub(super) type TaffyRect = euclid::Rect<f32, TaffySpace>;
+/// A point in the document canvas before page projection.
+pub(super) type DocumentCanvasPoint = euclid::Point2D<f32, DocumentCanvasSpace>;
+/// A size in the document canvas before page projection.
+pub(super) type DocumentCanvasSize = euclid::Size2D<f32, DocumentCanvasSpace>;
+/// An axis-aligned rectangle in the document canvas before page projection.
+pub(super) type DocumentCanvasRect = euclid::Rect<f32, DocumentCanvasSpace>;
 
 /// A physical horizontal span in the CSS page box.
 ///
@@ -215,6 +249,19 @@ impl PageTopPoint {
     }
 }
 
+/// Euclid coordinate marker for page layout geometry described from its
+/// physical top edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum PageTopSpace {}
+
+type PageTopEuclidRect = euclid::Rect<f32, PageTopSpace>;
+/// A physical page-local size used with the top-edge layout convention.
+///
+/// This is intentionally separate from [`PaintSize`]: a page-top box's
+/// vertical coordinate grows downward during layout, while paint geometry is
+/// bottom-left-origin.
+pub(in crate::layout) type PageTopSize = euclid::Size2D<f32, PageTopSpace>;
+
 /// A page-space rectangle described by its physical top edge.
 ///
 /// CSS layout code commonly knows a box's physical top edge and block size
@@ -224,47 +271,49 @@ impl PageTopPoint {
 /// <https://www.w3.org/TR/css-box-3/#box-model> and
 /// <https://www.w3.org/TR/css-page-3/#page-model>.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct PageTopRect {
-    pub(super) x: f32,
-    pub(super) top_y: f32,
-    pub(super) width: f32,
-    pub(super) height: f32,
-}
+#[repr(transparent)]
+pub(super) struct PageTopRect(PageTopEuclidRect);
+
+/// Largest visual primitive extent retained in paint space. Layout continues
+/// to use full CSS dimensions; this only prevents an enormous `f32` rectangle
+/// from losing its nearby top edge when `top - height` is formed for painting.
+/// A million points is far beyond a printable page while keeping sub-point
+/// precision at ordinary page coordinates.
+const MAX_PAINT_GEOMETRY_EXTENT: f32 = 1_000_000.0;
 
 impl PageTopRect {
     pub(super) fn new(x: f32, top_y: f32, width: f32, height: f32) -> Self {
-        Self {
-            x,
-            top_y,
-            width: width.max(0.0),
-            height: height.max(0.0),
-        }
+        Self(PageTopEuclidRect::new(
+            euclid::Point2D::new(x, top_y),
+            euclid::Size2D::new(width.max(0.0), height.max(0.0)),
+        ))
     }
 
     pub(super) fn x(self) -> f32 {
-        self.x
+        self.0.origin.x
     }
 
     pub(super) fn top_y(self) -> f32 {
-        self.top_y
+        self.0.origin.y
     }
 
     pub(super) fn width(self) -> f32 {
-        self.width
+        self.0.size.width
     }
 
     pub(super) fn height(self) -> f32 {
-        self.height
+        self.0.size.height
     }
 
     pub(super) fn bottom_y(self) -> f32 {
-        self.top_y - self.height
+        self.top_y() - self.height()
     }
 
     pub(super) fn paint_rect(self) -> PaintRect {
+        let height = self.height().min(MAX_PAINT_GEOMETRY_EXTENT);
         PaintRect::new(
-            PaintPoint::new(self.x, self.bottom_y()),
-            PaintSize::new(self.width, self.height),
+            PaintPoint::new(self.x(), self.top_y() - height),
+            PaintSize::new(self.width().min(MAX_PAINT_GEOMETRY_EXTENT), height),
         )
     }
 
@@ -299,6 +348,39 @@ pub(super) fn paint_space_rect(x: f32, y: f32, width: f32, height: f32) -> Paint
     )
 }
 
+/// Inset a bottom-left-origin paint rectangle by physical CSS box edges.
+///
+/// `euclid::Rect::inner_rect` assumes a downward-pointing y axis, while paint
+/// space follows PDF's upward y axis. Keep this conversion at the paint
+/// geometry boundary so CSS top and bottom edges remain explicit:
+/// <https://www.w3.org/TR/css-box-3/#box-model> and
+/// <https://www.iso.org/standard/75839.html>.
+pub(super) fn inset_paint_rect(rect: PaintRect, edges: css::Edges) -> PaintRect {
+    PaintRect::new(
+        PaintPoint::new(rect.origin.x + edges.left, rect.origin.y + edges.bottom),
+        PaintSize::new(
+            (rect.size.width - edges.left - edges.right).max(0.0),
+            (rect.size.height - edges.top - edges.bottom).max(0.0),
+        ),
+    )
+}
+
+/// Intersect two paint rectangles, preserving an empty rectangle on disjoint
+/// inputs.
+///
+/// CSS background clipping can produce an empty used paint area. Returning a
+/// zero-sized rectangle keeps that result explicit without forcing callers to
+/// special-case `Option` before their normal nonpositive-area checks:
+/// <https://www.w3.org/TR/css-backgrounds-3/#background-clip>.
+pub(super) fn intersect_paint_rect_or_empty(left: PaintRect, right: PaintRect) -> PaintRect {
+    let origin = PaintPoint::new(
+        left.origin.x.max(right.origin.x),
+        left.origin.y.max(right.origin.y),
+    );
+    left.intersection(&right)
+        .unwrap_or_else(|| PaintRect::new(origin, PaintSize::new(0.0, 0.0)))
+}
+
 /// Build a point in page-local paint coordinates.
 ///
 /// Use this for text baselines, path points, and other coordinates that are
@@ -309,6 +391,26 @@ pub(super) fn paint_space_point(x: f32, y: f32) -> PaintPoint {
     PaintPoint::new(x, y)
 }
 
+/// Project a grid-content-local rectangle into page top-edge geometry.
+///
+/// Grid item `y` coordinates advance downward from the container content top,
+/// whereas page layout records physical top edges. Keep that inversion at the
+/// grid replay boundary so grid-local geometry cannot leak into paint APIs:
+/// <https://www.w3.org/TR/css-grid-1/#grid-item-placement> and
+/// <https://www.w3.org/TR/css-page-3/#page-model>.
+pub(super) fn grid_rect_to_page_top_rect(
+    rect: GridRect,
+    page_left: f32,
+    content_top: f32,
+) -> PageTopRect {
+    PageTopRect::new(
+        page_left + rect.origin.x,
+        content_top - rect.origin.y,
+        rect.size.width.max(0.0),
+        rect.size.height.max(0.0),
+    )
+}
+
 /// A point in CSS logical coordinates.
 ///
 /// `inline` advances along the inline axis and `block` advances along the
@@ -317,10 +419,6 @@ pub(super) fn paint_space_point(x: f32, y: f32) -> PaintPoint {
 /// physical coordinate system:
 /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
 #[derive(Debug, Clone, Copy, PartialEq)]
-// Retained as the spec-backed logical/physical conversion boundary for
-// writing-mode work; current production callers still mostly use physical
-// geometry directly, while unit tests lock down the conversion behavior.
-#[allow(dead_code)]
 pub(super) struct LogicalPoint {
     pub(super) inline: f32,
     pub(super) block: f32,
@@ -332,11 +430,97 @@ pub(super) struct LogicalPoint {
 /// In vertical writing modes this maps to physical height/width respectively:
 /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
 #[derive(Debug, Clone, Copy, PartialEq)]
-// See the `LogicalPoint` rationale above.
-#[allow(dead_code)]
 pub(super) struct LogicalSize {
     pub(super) inline: f32,
     pub(super) block: f32,
+}
+
+/// A CSS content-box size on the logical inline axis.
+///
+/// CSS Writing Modes maps the logical inline axis to physical width in
+/// horizontal writing modes and physical height in vertical writing modes.
+/// Wrapping the existing content-box semantic length keeps box-model space
+/// distinct from axis identity:
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box> and
+/// <https://www.w3.org/TR/css-box-3/#content-box>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct LogicalInlineContentSize(ContentBoxLength);
+
+impl LogicalInlineContentSize {
+    pub(in crate::layout) fn new(value: ContentBoxLength) -> Self {
+        Self(value)
+    }
+
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0.points()
+    }
+
+    pub(in crate::layout) fn content_box_length(self) -> ContentBoxLength {
+        self.0
+    }
+}
+
+/// A CSS content-box size on the logical block axis.
+///
+/// In vertical writing modes this maps to physical width, which is the key
+/// distinction needed when applying physical `width` properties through
+/// logical CSS sizing algorithms:
+/// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct LogicalBlockContentSize(ContentBoxLength);
+
+impl LogicalBlockContentSize {
+    pub(in crate::layout) fn new(value: ContentBoxLength) -> Self {
+        Self(value)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "logical block scalar access is staged for broader axis-typed sizing callers"
+    )]
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0.points()
+    }
+
+    pub(in crate::layout) fn content_box_length(self) -> ContentBoxLength {
+        self.0
+    }
+}
+
+/// A CSS content-box size projected onto the physical width axis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct PhysicalContentWidth(ContentBoxLength);
+
+impl PhysicalContentWidth {
+    pub(in crate::layout) fn new(value: ContentBoxLength) -> Self {
+        Self(value)
+    }
+
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0.points()
+    }
+
+    pub(in crate::layout) fn content_box_length(self) -> ContentBoxLength {
+        self.0
+    }
+}
+
+/// A CSS content-box size projected onto the physical height axis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct PhysicalContentHeight(ContentBoxLength);
+
+impl PhysicalContentHeight {
+    pub(in crate::layout) fn new(value: ContentBoxLength) -> Self {
+        Self(value)
+    }
+
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0.points()
+    }
+
+    pub(in crate::layout) fn content_box_length(self) -> ContentBoxLength {
+        self.0
+    }
 }
 
 /// A one-dimensional interval on the CSS logical inline axis.
@@ -380,8 +564,6 @@ impl LogicalInlineSpan {
 /// must go through [`FlowAxes`]:
 /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
 #[derive(Debug, Clone, Copy, PartialEq)]
-// See the `LogicalPoint` rationale above.
-#[allow(dead_code)]
 pub(super) struct LogicalRect {
     pub(super) origin: LogicalPoint,
     pub(super) size: LogicalSize,
@@ -396,67 +578,67 @@ pub(super) struct LogicalRect {
 /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FlowAxes {
-    pub(super) writing_mode: WritingMode,
-    pub(super) direction: Direction,
+    axes: WritingModeAxes,
 }
 
 impl FlowAxes {
     pub(super) const fn new(writing_mode: WritingMode, direction: Direction) -> Self {
         Self {
-            writing_mode,
-            direction,
+            axes: WritingModeAxes::new(writing_mode, direction),
         }
     }
 
     pub(super) fn for_style(style: &ComputedStyle) -> Self {
-        Self::new(style.writing_mode, style.direction)
+        Self::new(style.writing_mode, style.used_direction())
     }
 
-    // Retained with the logical geometry types as the single place for
-    // writing-mode coordinate projection.
-    #[allow(dead_code)]
     pub(super) fn inline_start_side(self) -> PhysicalSide {
-        inline_start_side(self.writing_mode, self.direction)
+        self.axes.physical_side(LogicalSide::InlineStart)
     }
 
-    // Retained with the logical geometry types as the single place for
-    // writing-mode coordinate projection.
-    #[allow(dead_code)]
-    pub(super) fn block_start_side(self) -> PhysicalSide {
-        block_start_side(self.writing_mode)
+    pub(super) const fn writing_mode(self) -> WritingMode {
+        self.axes.writing_mode()
     }
 
-    // Retained with the logical geometry types as the single place for
-    // writing-mode coordinate projection.
-    #[allow(dead_code)]
     pub(super) fn physical_size_from_logical(self, size: LogicalSize) -> ContainerSize {
-        match self.writing_mode {
-            WritingMode::HorizontalTb => ContainerSize::new(size.inline, size.block),
-            WritingMode::VerticalRl | WritingMode::VerticalLr => {
-                ContainerSize::new(size.block, size.inline)
-            }
+        let (width, height) = self.axes.physical_size(size.inline, size.block);
+        ContainerSize::new(width, height)
+    }
+
+    /// Project logical content-box sizes onto the physical width axis.
+    ///
+    /// Width is a physical property, but CSS Writing Modes requires box sizing
+    /// algorithms to operate in logical axes before projection:
+    /// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>.
+    pub(in crate::layout) fn physical_width_from_logical_content_sizes(
+        self,
+        inline: LogicalInlineContentSize,
+        block: LogicalBlockContentSize,
+    ) -> PhysicalContentWidth {
+        if self.axes.swaps_physical_axes() {
+            PhysicalContentWidth::new(block.content_box_length())
+        } else {
+            PhysicalContentWidth::new(inline.content_box_length())
         }
     }
 
-    // Retained with the logical geometry types as the single place for
-    // writing-mode coordinate projection.
-    #[allow(dead_code)]
-    pub(super) fn logical_size_from_physical(self, size: ContainerSize) -> LogicalSize {
-        match self.writing_mode {
-            WritingMode::HorizontalTb => LogicalSize {
-                inline: size.width,
-                block: size.height,
-            },
-            WritingMode::VerticalRl | WritingMode::VerticalLr => LogicalSize {
-                inline: size.height,
-                block: size.width,
-            },
+    /// Project logical content-box sizes onto the physical height axis.
+    #[allow(
+        dead_code,
+        reason = "height projection is added with width projection so both physical axes share one typed model"
+    )]
+    pub(in crate::layout) fn physical_height_from_logical_content_sizes(
+        self,
+        inline: LogicalInlineContentSize,
+        block: LogicalBlockContentSize,
+    ) -> PhysicalContentHeight {
+        if self.axes.swaps_physical_axes() {
+            PhysicalContentHeight::new(inline.content_box_length())
+        } else {
+            PhysicalContentHeight::new(block.content_box_length())
         }
     }
 
-    // Retained with the logical geometry types as the single place for
-    // writing-mode coordinate projection.
-    #[allow(dead_code)]
     pub(super) fn rect_from_logical(
         self,
         containing: ContainerRect,
@@ -471,16 +653,12 @@ impl FlowAxes {
         );
         let block_origin = self.physical_axis_origin(
             containing,
-            self.block_start_side(),
+            self.axes.physical_side(LogicalSide::BlockStart),
             logical.origin.block,
             logical.size.block,
         );
-        let origin = match self.writing_mode {
-            WritingMode::HorizontalTb => ContainerPoint::new(inline_origin, block_origin),
-            WritingMode::VerticalRl | WritingMode::VerticalLr => {
-                ContainerPoint::new(block_origin, inline_origin)
-            }
-        };
+        let (x, y) = self.axes.physical_size(inline_origin, block_origin);
+        let origin = ContainerPoint::new(x, y);
         ContainerRect::new(origin, size)
     }
 
@@ -543,9 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_vertical_writing_modes() {
-        let vertical_rl = FlowAxes::new(WritingMode::VerticalRl, Direction::Ltr);
-        let vertical_lr = FlowAxes::new(WritingMode::VerticalLr, Direction::Ltr);
+    fn maps_all_writing_modes_to_physical_rects() {
         let logical = LogicalRect {
             origin: LogicalPoint {
                 inline: 10.0,
@@ -557,26 +733,134 @@ mod tests {
             },
         };
 
-        assert_eq!(
-            vertical_rl.rect_from_logical(rect(100.0, 80.0), logical),
-            ContainerRect::new(
-                ContainerPoint::new(75.0, 10.0),
-                ContainerSize::new(20.0, 30.0)
-            )
-        );
-        assert_eq!(
-            vertical_lr.rect_from_logical(rect(100.0, 80.0), logical),
-            ContainerRect::new(
-                ContainerPoint::new(5.0, 10.0),
-                ContainerSize::new(20.0, 30.0)
-            )
-        );
+        for (writing_mode, direction, expected) in [
+            (
+                WritingMode::HorizontalTb,
+                Direction::Ltr,
+                ContainerRect::new(
+                    ContainerPoint::new(10.0, 5.0),
+                    ContainerSize::new(30.0, 20.0),
+                ),
+            ),
+            (
+                WritingMode::HorizontalTb,
+                Direction::Rtl,
+                ContainerRect::new(
+                    ContainerPoint::new(60.0, 5.0),
+                    ContainerSize::new(30.0, 20.0),
+                ),
+            ),
+            (
+                WritingMode::VerticalRl,
+                Direction::Ltr,
+                ContainerRect::new(
+                    ContainerPoint::new(75.0, 10.0),
+                    ContainerSize::new(20.0, 30.0),
+                ),
+            ),
+            (
+                WritingMode::VerticalRl,
+                Direction::Rtl,
+                ContainerRect::new(
+                    ContainerPoint::new(75.0, 40.0),
+                    ContainerSize::new(20.0, 30.0),
+                ),
+            ),
+            (
+                WritingMode::VerticalLr,
+                Direction::Ltr,
+                ContainerRect::new(
+                    ContainerPoint::new(5.0, 10.0),
+                    ContainerSize::new(20.0, 30.0),
+                ),
+            ),
+            (
+                WritingMode::VerticalLr,
+                Direction::Rtl,
+                ContainerRect::new(
+                    ContainerPoint::new(5.0, 40.0),
+                    ContainerSize::new(20.0, 30.0),
+                ),
+            ),
+            (
+                WritingMode::SidewaysRl,
+                Direction::Ltr,
+                ContainerRect::new(
+                    ContainerPoint::new(75.0, 10.0),
+                    ContainerSize::new(20.0, 30.0),
+                ),
+            ),
+            (
+                WritingMode::SidewaysRl,
+                Direction::Rtl,
+                ContainerRect::new(
+                    ContainerPoint::new(75.0, 40.0),
+                    ContainerSize::new(20.0, 30.0),
+                ),
+            ),
+            (
+                WritingMode::SidewaysLr,
+                Direction::Ltr,
+                ContainerRect::new(
+                    ContainerPoint::new(5.0, 40.0),
+                    ContainerSize::new(20.0, 30.0),
+                ),
+            ),
+            (
+                WritingMode::SidewaysLr,
+                Direction::Rtl,
+                ContainerRect::new(
+                    ContainerPoint::new(5.0, 10.0),
+                    ContainerSize::new(20.0, 30.0),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                FlowAxes::new(writing_mode, direction)
+                    .rect_from_logical(rect(100.0, 80.0), logical),
+                expected,
+                "{writing_mode:?} {direction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn projects_logical_content_sizes_to_physical_axes() {
+        let inline = LogicalInlineContentSize::new(content_box_pt(40.0));
+        let block = LogicalBlockContentSize::new(content_box_pt(20.0));
+
+        for (writing_mode, width, height) in [
+            (WritingMode::HorizontalTb, 40.0, 20.0),
+            (WritingMode::VerticalRl, 20.0, 40.0),
+            (WritingMode::VerticalLr, 20.0, 40.0),
+            (WritingMode::SidewaysRl, 20.0, 40.0),
+            (WritingMode::SidewaysLr, 20.0, 40.0),
+        ] {
+            let axes = FlowAxes::new(writing_mode, Direction::Ltr);
+            assert_eq!(
+                axes.physical_width_from_logical_content_sizes(inline, block)
+                    .points(),
+                width
+            );
+            assert_eq!(
+                axes.physical_height_from_logical_content_sizes(inline, block)
+                    .points(),
+                height
+            );
+        }
     }
 
     #[test]
     fn page_top_rect_projects_to_bottom_left_paint_geometry() {
         let rect = PageTopRect::new(20.0, 180.0, 50.0, 30.0);
 
+        assert_eq!(
+            rect.0,
+            PageTopEuclidRect::new(
+                euclid::Point2D::new(20.0, 180.0),
+                euclid::Size2D::new(50.0, 30.0),
+            )
+        );
         assert_eq!(rect.bottom_y(), 150.0);
         assert_eq!(
             rect.paint_rect(),
@@ -585,6 +869,42 @@ mod tests {
         assert_eq!(
             rect.paint_clip(),
             PaintClip::from_paint_rect(paint_space_rect(20.0, 150.0, 50.0, 30.0))
+        );
+    }
+
+    #[test]
+    fn paint_rect_inset_respects_upward_paint_coordinates() {
+        let rect = paint_space_rect(10.0, 20.0, 100.0, 80.0);
+        let inset = inset_paint_rect(
+            rect,
+            css::Edges {
+                top: 7.0,
+                right: 11.0,
+                bottom: 13.0,
+                left: 17.0,
+            },
+        );
+
+        assert_eq!(inset, paint_space_rect(27.0, 33.0, 72.0, 60.0));
+    }
+
+    #[test]
+    fn disjoint_paint_rect_intersection_is_empty_at_shared_corner() {
+        let intersection = intersect_paint_rect_or_empty(
+            paint_space_rect(10.0, 20.0, 5.0, 5.0),
+            paint_space_rect(30.0, 40.0, 5.0, 5.0),
+        );
+
+        assert_eq!(intersection, paint_space_rect(30.0, 40.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn grid_rect_projects_local_downward_y_to_page_top_geometry() {
+        let rect = GridRect::new(GridPoint::new(15.0, 40.0), GridSize::new(60.0, 25.0));
+
+        assert_eq!(
+            grid_rect_to_page_top_rect(rect, 100.0, 300.0),
+            PageTopRect::new(115.0, 260.0, 60.0, 25.0)
         );
     }
 }

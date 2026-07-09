@@ -6,6 +6,19 @@ impl FontSystem {
         style: &ComputedStyle,
         character: char,
     ) -> Option<usize> {
+        if let FontFamily::List(families) = &style.font_family {
+            for family in families {
+                if let Some(font_id) = self.resolve_font_family(
+                    family,
+                    style.font_weight,
+                    style.font_style,
+                    style.font_width,
+                ) && self.document_fonts.font_has_character(font_id, character)
+                {
+                    return Some(font_id);
+                }
+            }
+        }
         if let FontFamily::Names(names) = &style.font_family {
             for name in names {
                 if let Some(font_id) = self.resolve_single_family(
@@ -30,18 +43,6 @@ impl FontSystem {
             return Some(font_id);
         }
 
-        if style.font_family != FontFamily::SansSerif
-            && let Some(font_id) = self.resolve_generic_family(
-                &FontFamily::SansSerif,
-                style.font_weight,
-                style.font_style,
-                style.font_width,
-            )
-            && self.document_fonts.font_has_character(font_id, character)
-        {
-            return Some(font_id);
-        }
-
         self.resolve_system_fallback_for_character(
             character,
             style.font_weight,
@@ -62,9 +63,9 @@ impl FontSystem {
         if let Some(id) = self.family_cache.get(&cache_key) {
             return Some(*id);
         }
-        if let Some(id) =
-            self.load_document_font_for_families(families, weight, style, width, None, &cache_key)
-        {
+        if let Some(id) = self.load_outline_embeddable_document_font_for_families(
+            families, weight, style, width, &cache_key,
+        ) {
             let font = self.document_fonts.get(id)?;
             log::debug!(
                 "resolved CSS generic font-family {:?} to system font {} ({})",
@@ -81,6 +82,50 @@ impl FontSystem {
         None
     }
 
+    /// Resolve the family source supplied to Parley for a CSS style.
+    ///
+    /// Generic families are intentionally replaced with Quire's concrete
+    /// system selection. Passing the raw keyword to Parley would invoke its
+    /// platform generic mapping a second time, which can select a different
+    /// font program from the one used for metrics and PDF planning.
+    pub(crate) fn resolved_parley_font_family_source(&mut self, style: &ComputedStyle) -> String {
+        self.resolved_parley_font_family_source_for_family(
+            &style.font_family,
+            style.font_weight,
+            style.font_style,
+            style.font_width,
+        )
+    }
+
+    fn resolved_parley_font_family_source_for_family(
+        &mut self,
+        family: &FontFamily,
+        weight: FontWeight,
+        style: FontStyle,
+        width: FontWidth,
+    ) -> String {
+        match family {
+            FontFamily::List(families) => families
+                .iter()
+                .map(|family| {
+                    self.resolved_parley_font_family_source_for_family(family, weight, style, width)
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            FontFamily::Names(_) => parley_font_family_source(family),
+            _ => self
+                .resolve_generic_family(family, weight, style, width)
+                .and_then(|font_id| self.document_fonts.get(font_id))
+                .map(|font| {
+                    parley_font_family_source(&FontFamily::Names(vec![font.family.clone()]))
+                })
+                // Preserve the authored generic as a last resort. The PDF
+                // audit remains responsible for reporting the unsupported
+                // case when no eligible system candidate exists.
+                .unwrap_or_else(|| parley_font_family_source(family)),
+        }
+    }
+
     pub(super) fn resolve_single_family(
         &mut self,
         name: &str,
@@ -93,12 +138,12 @@ impl FontSystem {
             return Some(*id);
         }
 
-        if let Some(generic) = known_font_family(name) {
-            return self.resolve_generic_family(&generic, weight, style, width);
+        if let Some(family) = standard_ui_family_alias(name) {
+            return self.resolve_generic_family(&family, weight, style, width);
         }
 
         if let Some(id) = self.load_document_font_for_families(
-            &[family_query(name)],
+            &[FontiqueQueryFamily::Named(name)],
             weight,
             style,
             width,
@@ -112,7 +157,7 @@ impl FontSystem {
         None
     }
 
-    pub(super) fn resolve_system_fallback_for_character(
+    pub(crate) fn resolve_system_fallback_for_character(
         &mut self,
         character: char,
         weight: FontWeight,
@@ -124,37 +169,40 @@ impl FontSystem {
             return *font_id;
         }
 
-        let request = FontRequest::from_names(
-            self.visible_fallback_families.iter().map(String::as_str),
-            weight,
-            style,
-            width,
-        );
-        for family_name in self.visible_fallback_families.clone() {
-            for font in self.query_fonts(
-                &[FontiqueQueryFamily::Named(&family_name)],
-                weight,
-                style,
-                width,
-            ) {
-                if !DocumentFontRegistry::font_query_has_character(&font, character) {
-                    continue;
-                }
-                if let Some(font_id) = self.document_font_from_query_font(font, None, &request) {
-                    let font = self.document_fonts.get(font_id)?;
-                    log::debug!(
-                        "resolved fallback font for U+{:04X} to {} ({})",
-                        character as u32,
-                        font.family,
-                        font.post_script_name
-                    );
-                    self.fallback_cache.insert(cache_key, Some(font_id));
-                    return Some(font_id);
-                }
+        // CSS Fonts forbids installed-font fallback for Private Use Area code
+        // points. A missing-glyph representation is required instead.
+        // <https://www.w3.org/TR/css-fonts-4/#character-handling-issues>
+        if character_is_private_use(character) {
+            self.fallback_cache.insert(cache_key, None);
+            return None;
+        }
+
+        let request = FontRequest::single_name("<platform fallback>", weight, style, width);
+        for font in self.query_platform_fallback_fonts(character, weight, style, width) {
+            if !DocumentFontRegistry::font_query_has_character(&font, character) {
+                continue;
+            }
+            if let Some(font_id) = self.document_font_from_query_font(font, None, &request) {
+                let font = self.document_fonts.get(font_id)?;
+                log::debug!(
+                    "resolved platform fallback font for U+{:04X} to {} ({})",
+                    character as u32,
+                    font.family,
+                    font.post_script_name
+                );
+                self.fallback_cache.insert(cache_key, Some(font_id));
+                return Some(font_id);
             }
         }
 
         self.fallback_cache.insert(cache_key, None);
         None
     }
+}
+
+fn character_is_private_use(character: char) -> bool {
+    matches!(
+        character as u32,
+        0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
+    )
 }

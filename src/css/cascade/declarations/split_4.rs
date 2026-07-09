@@ -29,6 +29,24 @@ pub(in crate::css) fn affected_longhands(
             physical_padding_side_longhand(logical_box_side(end, direction, writing_mode)?),
         ]);
     }
+    if matches!(name, "scroll-padding-block" | "scroll-padding-inline") {
+        let [start, end] = logical_box_axis_side_names(name)?;
+        return Some(vec![
+            physical_scroll_padding_side_longhand(logical_box_side(
+                start,
+                direction,
+                writing_mode,
+            )?),
+            physical_scroll_padding_side_longhand(logical_box_side(end, direction, writing_mode)?),
+        ]);
+    }
+    if matches!(name, "scroll-margin-block" | "scroll-margin-inline") {
+        let [start, end] = logical_box_axis_side_names(name)?;
+        return Some(vec![
+            physical_scroll_margin_side_longhand(logical_box_side(start, direction, writing_mode)?),
+            physical_scroll_margin_side_longhand(logical_box_side(end, direction, writing_mode)?),
+        ]);
+    }
     if matches!(name, "inset-block" | "inset-inline") {
         let [start, end] = logical_box_axis_side_names(name)?;
         return Some(vec![
@@ -55,6 +73,28 @@ pub(in crate::css) fn affected_longhands(
             direction,
             writing_mode,
         )?)]);
+    }
+    if matches!(
+        name,
+        "scroll-padding-block-start"
+            | "scroll-padding-block-end"
+            | "scroll-padding-inline-start"
+            | "scroll-padding-inline-end"
+    ) {
+        return Some(vec![physical_scroll_padding_side_longhand(
+            logical_box_side(name, direction, writing_mode)?,
+        )]);
+    }
+    if matches!(
+        name,
+        "scroll-margin-block-start"
+            | "scroll-margin-block-end"
+            | "scroll-margin-inline-start"
+            | "scroll-margin-inline-end"
+    ) {
+        return Some(vec![physical_scroll_margin_side_longhand(
+            logical_box_side(name, direction, writing_mode)?,
+        )]);
     }
     if matches!(
         name,
@@ -287,6 +327,8 @@ pub(in crate::css) fn affected_longhands(
             "background-image",
             "background-size",
             "background-position",
+            "background-position-x",
+            "background-position-y",
             "background-repeat",
             "background-origin",
             "background-clip",
@@ -294,7 +336,13 @@ pub(in crate::css) fn affected_longhands(
         "background-color" => &["background-color"],
         "background-image" => &["background-image"],
         "background-size" => &["background-size"],
-        "background-position" => &["background-position"],
+        "background-position" => &[
+            "background-position",
+            "background-position-x",
+            "background-position-y",
+        ],
+        "background-position-x" => &["background-position-x"],
+        "background-position-y" => &["background-position-y"],
         "background-repeat" => &["background-repeat"],
         "background-origin" => &["background-origin"],
         "background-clip" => &["background-clip"],
@@ -305,6 +353,9 @@ pub(in crate::css) fn affected_longhands(
         "text-box" => &["text-box-trim", "text-box-edge"],
         "text-box-trim" => &["text-box-trim"],
         "text-box-edge" => &["text-box-edge"],
+        "initial-letter" => &["initial-letter"],
+        "initial-letter-align" => &["initial-letter-align"],
+        "initial-letter-wrap" => &["initial-letter-wrap"],
         "box-decoration-break" => &["box-decoration-break"],
         "flex" => &["flex-grow", "flex-shrink", "flex-basis"],
         "flex-grow" => &["flex-grow"],
@@ -433,9 +484,16 @@ pub(in crate::css) fn affected_longhands(
         "row-rule-inset-cap-end" => &["row-rule-inset-cap-end"],
         "row-rule-inset-junction-start" => &["row-rule-inset-junction-start"],
         "row-rule-inset-junction-end" => &["row-rule-inset-junction-end"],
-        "columns" => &["column-count", "column-width"],
+        "columns" => &[
+            "column-count",
+            "column-width",
+            "column-height",
+            "column-wrap",
+        ],
         "column-count" => &["column-count"],
         "column-width" => &["column-width"],
+        "column-height" => &["column-height"],
+        "column-wrap" => &["column-wrap"],
         "list-style" => &["list-style-type", "list-style-position", "list-style-image"],
         "list-style-type" => &["list-style-type"],
         "list-style-position" => &["list-style-position"],
@@ -473,6 +531,29 @@ pub(in crate::css) fn affected_longhands(
         "overflow" => &["overflow-x", "overflow-y"],
         "overflow-x" => &["overflow-x"],
         "overflow-y" => &["overflow-y"],
+        "scroll-snap-type" => &["scroll-snap-type"],
+        "scroll-snap-align" => &["scroll-snap-align"],
+        "scroll-snap-stop" => &["scroll-snap-stop"],
+        "scroll-padding" => &[
+            "scroll-padding-top",
+            "scroll-padding-right",
+            "scroll-padding-bottom",
+            "scroll-padding-left",
+        ],
+        "scroll-padding-top" => &["scroll-padding-top"],
+        "scroll-padding-right" => &["scroll-padding-right"],
+        "scroll-padding-bottom" => &["scroll-padding-bottom"],
+        "scroll-padding-left" => &["scroll-padding-left"],
+        "scroll-margin" => &[
+            "scroll-margin-top",
+            "scroll-margin-right",
+            "scroll-margin-bottom",
+            "scroll-margin-left",
+        ],
+        "scroll-margin-top" => &["scroll-margin-top"],
+        "scroll-margin-right" => &["scroll-margin-right"],
+        "scroll-margin-bottom" => &["scroll-margin-bottom"],
+        "scroll-margin-left" => &["scroll-margin-left"],
         "word-wrap" | "overflow-wrap" => &["overflow-wrap"],
         "font-variant" => &[
             "font-variant-ligatures",
@@ -490,6 +571,7 @@ pub(in crate::css) fn affected_longhands(
         "font-variant-alternates" => &["font-variant-alternates"],
         "font-variant-east-asian" => &["font-variant-east-asian"],
         "font-variant-emoji" => &["font-variant-emoji"],
+        "font-palette" => &["font-palette"],
         "page-break-before" | "break-before" => &["break-before"],
         "page-break-after" | "break-after" => &["break-after"],
         "page-break-inside" | "break-inside" => &["break-inside"],
@@ -646,6 +728,17 @@ pub(in crate::css) fn apply_css_wide_default_longhand(
     keyword: CssWideDefaultKeyword,
     defaulted_style: &ComputedStyle,
 ) {
+    // `font-size` retains a deferred inheritance representation so a normal
+    // inherited font can resolve against the immediate parent's used metric.
+    // That representation is not correct for `initial`: CSS Cascade resets
+    // an inherited property to its property's initial value, rather than
+    // re-inheriting it after the defaulting pass:
+    // <https://drafts.csswg.org/css-cascade-5/#initial> and
+    // <https://drafts.csswg.org/css-fonts-4/#font-size-prop>.
+    if name.eq_ignore_ascii_case("font-size") && keyword == CssWideDefaultKeyword::Initial {
+        set_font_size(style, ComputedStyle::initial().font_size);
+        return;
+    }
     let initial;
     let source = match keyword {
         CssWideDefaultKeyword::Initial => {
@@ -765,5 +858,37 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source(
         declarations,
         inheritance_source,
         parent_ch_advance,
+        false,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zoom_cascade_keeps_local_values_non_inherited_and_composes_effective_scale() {
+        let mut parent = ComputedStyle::initial();
+        apply_declarations(&mut parent, &parse_declarations("zoom: 200%"));
+        assert_eq!(parent.zoom.factor(), 2.0);
+        assert_eq!(parent.effective_zoom.factor(), 2.0);
+
+        let mut child = ComputedStyle::initial();
+        let child_declarations = parse_declarations("zoom: inherit");
+        let declarations =
+            cascaded_declarations_from(&child_declarations, StylesheetOrigin::Author);
+        apply_cascaded_declarations_with_inheritance_source(&mut child, &declarations, &parent);
+        // Explicit inheritance copies the parent's local computed factor; the
+        // child then composes that factor with the inherited effective scale.
+        assert_eq!(child.zoom.factor(), 2.0);
+        assert_eq!(child.effective_zoom.factor(), 4.0);
+
+        let mut grandchild = ComputedStyle::initial();
+        let empty_declarations = Declarations::new();
+        let declarations =
+            cascaded_declarations_from(&empty_declarations, StylesheetOrigin::Author);
+        apply_cascaded_declarations_with_inheritance_source(&mut grandchild, &declarations, &child);
+        assert_eq!(grandchild.zoom.factor(), 1.0);
+        assert_eq!(grandchild.effective_zoom.factor(), 4.0);
+    }
 }

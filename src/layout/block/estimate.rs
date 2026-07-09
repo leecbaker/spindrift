@@ -1,4 +1,6 @@
 use super::super::*;
+use super::float::freeze_float_replay_width;
+use crate::LayoutSize;
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn estimate_element_height(
@@ -27,13 +29,20 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             match replaced_element_kind(element) {
                 Some(ReplacedElementKind::Canvas) => {
-                    let (_, height) = used_canvas_size(element, style, available_outer_width);
-                    Some(style.margin.top + height + style.margin.bottom)
+                    let canvas = used_canvas(
+                        element,
+                        style,
+                        available_outer_width,
+                        BlockSizePercentageBasis::indefinite(),
+                    );
+                    Some(style.margin.top + canvas.border_box_size.height + style.margin.bottom)
                 }
                 Some(ReplacedElementKind::Image) => {
                     Some(self.estimate_image_height(element, style, available_outer_width))
                 }
-                Some(ReplacedElementKind::Svg) => Some(estimate_svg_height(element, style)),
+                Some(ReplacedElementKind::Svg) => {
+                    Some(estimate_svg_height(element, style, available_outer_width))
+                }
                 None if style.display.is_table() || is_html_table_element(element) => {
                     let built_child_boxes;
                     let table_children = if let Some(children) = child_boxes {
@@ -81,26 +90,116 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> f32 {
         let mut used_style = self.style_with_current_used_lengths(style);
-        let box_metrics = apply_used_box_metrics(&mut used_style, available_outer_width.max(0.0));
-        let style = &used_style;
-        let horizontal_extras = non_content_pt(box_metrics.horizontal_non_content());
-        let requested_content_width = self.used_block_content_width(
-            element,
-            style,
-            stylesheets,
-            child_boxes,
-            BlockContentWidthInputs {
-                available_outer_width,
-                percentage_basis: available_outer_width,
-                horizontal_non_content: horizontal_extras,
-            },
+        let box_metrics = apply_used_box_metrics(
+            &mut used_style,
+            PercentageBasis::definite(layout_pt(available_outer_width.max(0.0))),
         );
-        let content_width = constrain_width(
-            style,
-            requested_content_width.points(),
-            available_outer_width,
-        )
+        let style = &used_style;
+        let horizontal_extras = box_metrics.horizontal_non_content_length();
+        let intrinsic_sizes = (needs_intrinsic_width_contribution(style.box_values.width.clone())
+            || needs_intrinsic_width_contribution(style.box_values.min_width.clone())
+            || needs_intrinsic_width_contribution(style.box_values.max_width.clone()))
+        .then(|| {
+            self.block_intrinsic_content_sizes(
+                element,
+                style,
+                stylesheets,
+                child_boxes,
+                available_outer_width,
+            )
+        });
+        let requested_content_width = if let Some(intrinsic_sizes) = intrinsic_sizes {
+            let (min_content, max_content) =
+                intrinsic_sizes.physical_width_min_max(FlowAxes::for_style(style));
+            PhysicalContentWidth::new(intrinsic::content_box_width_from_intrinsic(
+                style,
+                layout_pt(available_outer_width),
+                horizontal_extras,
+                min_content,
+                max_content,
+                intrinsic::IntrinsicAutoWidth::FillAvailable,
+            ))
+        } else {
+            self.used_block_physical_content_width(
+                element,
+                style,
+                stylesheets,
+                child_boxes,
+                BlockContentWidthInputs {
+                    available_outer_width: layout_pt(available_outer_width),
+                    percentage_basis: PercentageBasis::definite(layout_pt(available_outer_width)),
+                    horizontal_non_content: horizontal_extras,
+                },
+            )
+        };
+        let content_width = if let Some(intrinsic_sizes) = intrinsic_sizes {
+            let (min_content, max_content) =
+                intrinsic_sizes.physical_width_min_max(FlowAxes::for_style(style));
+            constrain_width_with_intrinsic(
+                style,
+                requested_content_width.content_box_length(),
+                min_content,
+                max_content,
+                PercentageBasis::definite(content_box_pt(available_outer_width)),
+                horizontal_extras,
+            )
+            .points()
+        } else {
+            constrain_content_width(
+                style,
+                requested_content_width.content_box_length(),
+                PercentageBasis::definite(layout_pt(available_outer_width)),
+            )
+            .points()
+        }
         .max(style.font_size);
+
+        let establishes_multicol = style.column_count.is_some()
+            || matches!(style.column_width, css::ComputedColumnWidth::Length(_))
+            || matches!(style.column_height, css::ComputedColumnHeight::Length(_));
+        if establishes_multicol
+            && has_auto_height(style)
+            && let Some(child_boxes) = child_boxes
+            && let Some(mut content_height) = self.estimate_multicol_auto_block_size(
+                style,
+                stylesheets,
+                child_boxes,
+                content_width,
+            )
+        {
+            // A multicol formatting context's auto block size is the height of
+            // its column rows and spanners. Summing descendant block sizes as
+            // ordinary flow double-counts content that has already been
+            // distributed among columns, and makes an ancestor fragmentainer
+            // manufacture visual-overflow columns.
+            // <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
+            if style.contain.size {
+                content_height = 0.0;
+            }
+            let vertical_extras = box_metrics.vertical_non_content_length();
+            content_height = constrain_content_height(
+                style,
+                content_box_pt(
+                    used_content_box_height_or_auto(
+                        style,
+                        layout_pt(content_height),
+                        vertical_extras,
+                    )
+                    .map(SemanticLengthExt::points)
+                    .unwrap_or(content_height),
+                ),
+                PercentageBasis::definite(layout_pt(content_width)),
+            )
+            .points();
+            let borders = used_border_widths(style);
+            return style.margin.top
+                + borders.top
+                + style.padding.top
+                + content_height
+                + style.padding.bottom
+                + borders.bottom
+                + style.margin.bottom;
+        }
 
         let mut content_height = 0.0;
         let mut estimated_float_context = FloatContext { shapes: Vec::new() };
@@ -110,33 +209,31 @@ impl<'a> LayoutBuilder<'a> {
                 && (has_direct_inline_content_box(child_boxes)
                     || has_atomic_inline_formatting_box(child_boxes))
             {
-                let text = inline_text_from_formatting_boxes(child_boxes);
-                if !text.is_empty() {
-                    content_height += self.estimate_text_height(
-                        &text,
-                        style,
-                        content_width,
-                        style.padding.left,
-                        style.padding.right,
-                    );
-                } else if has_atomic_inline_formatting_box(child_boxes) {
-                    content_height += style.line_height;
+                // Atomic inline descendants contribute their own used box
+                // metrics to the enclosing line. In particular, an
+                // inline-block or replaced element can be taller than the
+                // parent's line-height; a float's clearance must use that
+                // line's actual block size rather than a synthetic strut.
+                // <https://www.w3.org/TR/css-inline-3/#line-layout>
+                // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+                let (inline_height, line_count) = self.intrinsic_inline_block_metrics_for_boxes(
+                    child_boxes,
+                    style,
+                    stylesheets,
+                    content_width,
+                );
+                if line_count > 0 {
+                    content_height += inline_height;
                 }
             }
             for child_box in child_boxes {
                 if let box_tree::FormattingBox::AnonymousBlock(box_) = child_box {
-                    let text = inline_text_from_formatting_boxes(&box_.children);
-                    if !text.is_empty() || has_atomic_inline_formatting_box(&box_.children) {
-                        content_height += self
-                            .estimate_text_height(
-                                &text,
-                                &box_.style,
-                                content_width,
-                                box_.style.padding.left,
-                                box_.style.padding.right,
-                            )
-                            .max(box_.style.line_height);
-                    }
+                    content_height += self.estimate_anonymous_block_height(
+                        &box_.style,
+                        stylesheets,
+                        content_width,
+                        &box_.children,
+                    );
                     continue;
                 }
                 let Some((child_element, _, child_style, child_children)) =
@@ -144,9 +241,18 @@ impl<'a> LayoutBuilder<'a> {
                 else {
                     continue;
                 };
+                // Positioned and running descendants are out of flow and do
+                // not contribute to the containing block's auto height.
+                // Floats are measured separately below because a BFC root's
+                // auto height includes its float exclusion bounds.
+                // <https://www.w3.org/TR/CSS22/visudet.html#root-height>
+                if child_style.display.is_none()
+                    || matches!(child_style.position, Position::Absolute | Position::Fixed)
+                    || child_style.running_element_name.is_some()
+                {
+                    continue;
+                }
                 if child_style.float != Float::None
-                    && !child_style.display.is_none()
-                    && !matches!(child_style.position, Position::Absolute | Position::Fixed)
                     && let Some(float_bottom) = self.estimate_child_float_bottom(
                         &mut estimated_float_context,
                         child_element,
@@ -230,9 +336,13 @@ impl<'a> LayoutBuilder<'a> {
                         stylesheets,
                         Some(style),
                     );
+                    if child_style.display.is_none()
+                        || matches!(child_style.position, Position::Absolute | Position::Fixed)
+                        || child_style.running_element_name.is_some()
+                    {
+                        continue;
+                    }
                     if child_style.float != Float::None
-                        && !child_style.display.is_none()
-                        && !matches!(child_style.position, Position::Absolute | Position::Fixed)
                         && let Some(float_bottom) = self.estimate_child_float_bottom(
                             &mut estimated_float_context,
                             child_element,
@@ -262,16 +372,57 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
         content_height = content_height.max(-estimated_float_bottom);
+        if style.contain.size {
+            // CSS size containment contributes the intrinsic size of an empty
+            // principal box while descendants are laid out only after that
+            // used size has been fixed.
+            // <https://www.w3.org/TR/css-contain-1/#containment-size>
+            content_height = style
+                .contain_intrinsic_size
+                .height
+                .clone()
+                .map(|height| {
+                    used_length_percentage(
+                        height,
+                        PercentageBasis::definite(layout_pt(content_width.max(0.0))),
+                    )
+                    .points()
+                })
+                .unwrap_or(0.0);
+        }
 
+        let height_depends_on_intrinsic_content =
+            needs_intrinsic_height_contribution(style.box_values.height.clone())
+                || needs_intrinsic_height_contribution(style.box_values.min_height.clone())
+                || needs_intrinsic_height_contribution(style.box_values.max_height.clone());
         if !has_auto_height(style)
-            || used_min_height(style, content_width).is_some()
-            || used_max_height(style, content_width).is_some()
+            || used_min_height(style, PercentageBasis::definite(layout_pt(content_width))).is_some()
+            || used_max_height(style, PercentageBasis::definite(layout_pt(content_width))).is_some()
+            || height_depends_on_intrinsic_content
         {
-            let vertical_extras = box_metrics.vertical_non_content();
+            let vertical_extras = box_metrics.vertical_non_content_length();
             let requested_content_height =
-                used_content_height_or_auto(style, content_height, vertical_extras)
+                used_content_box_height_or_auto(style, layout_pt(content_height), vertical_extras)
+                    .map(SemanticLengthExt::points)
                     .unwrap_or(content_height);
-            content_height = constrain_height(style, requested_content_height, content_width);
+            content_height = if height_depends_on_intrinsic_content {
+                constrain_height_with_intrinsic(
+                    style,
+                    content_box_pt(requested_content_height),
+                    content_box_pt(content_height),
+                    content_box_pt(content_height),
+                    PercentageBasis::definite(content_box_pt(content_width)),
+                    vertical_extras,
+                )
+                .points()
+            } else {
+                constrain_content_height(
+                    style,
+                    content_box_pt(requested_content_height),
+                    PercentageBasis::definite(layout_pt(content_width)),
+                )
+                .points()
+            };
         }
 
         let borders = used_border_widths(style);
@@ -282,6 +433,92 @@ impl<'a> LayoutBuilder<'a> {
             + style.padding.bottom
             + borders.bottom
             + style.margin.bottom
+    }
+
+    fn estimate_anonymous_block_height(
+        &mut self,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        content_width: f32,
+        child_boxes: &[box_tree::FormattingBox<'_>],
+    ) -> f32 {
+        let mut content_height = 0.0;
+        let mut estimated_float_context = FloatContext { shapes: Vec::new() };
+        let mut estimated_float_bottom = 0.0f32;
+
+        if formatting_box_has_inline_content(child_boxes) {
+            content_height += self
+                .intrinsic_inline_measurement_for_boxes(
+                    child_boxes,
+                    style,
+                    stylesheets,
+                    content_width,
+                )
+                .height();
+        }
+
+        for child_box in child_boxes {
+            if let box_tree::FormattingBox::AnonymousBlock(box_) = child_box {
+                content_height += self.estimate_anonymous_block_height(
+                    &box_.style,
+                    stylesheets,
+                    content_width,
+                    &box_.children,
+                );
+                continue;
+            }
+
+            let Some((child_element, _, child_style, child_children)) = child_box.element_parts()
+            else {
+                continue;
+            };
+            if child_style.display.is_none()
+                || matches!(child_style.position, Position::Absolute | Position::Fixed)
+                || child_style.running_element_name.is_some()
+            {
+                continue;
+            }
+            if child_style.float != Float::None
+                && let Some(float_bottom) = self.estimate_child_float_bottom(
+                    &mut estimated_float_context,
+                    child_element,
+                    child_style,
+                    stylesheets,
+                    content_width,
+                    Some(child_children),
+                )
+            {
+                estimated_float_bottom = estimated_float_bottom.min(float_bottom);
+                continue;
+            }
+            if child_style.display.is_block_level()
+                || is_replaced_element(child_element)
+                || is_document_canvas_element(child_element)
+            {
+                if let Some(child_height) = self.estimate_element_height(
+                    child_element,
+                    child_style,
+                    stylesheets,
+                    content_width,
+                    Some(child_children),
+                ) {
+                    content_height += child_height;
+                }
+            } else if matches!(
+                child_box,
+                box_tree::FormattingBox::InlineSplitBlockContext(_)
+                    | box_tree::FormattingBox::Inline(_)
+            ) {
+                content_height += self.estimate_anonymous_block_height(
+                    child_style,
+                    stylesheets,
+                    content_width,
+                    child_children,
+                );
+            }
+        }
+
+        content_height.max(-estimated_float_bottom)
     }
 
     pub(in crate::layout) fn estimate_child_float_bottom(
@@ -298,6 +535,9 @@ impl<'a> LayoutBuilder<'a> {
         if placed_style.display.is_inline_level() {
             placed_style.display = placed_style.display.blockified();
         }
+        if placed_style.display.is_flow() {
+            placed_style.display.inner = DisplayInner::FlowRoot;
+        }
         self.resolve_style_current_viewport_lengths(&mut placed_style);
         let float_side = UsedFloatSide::from_float(
             specified_side,
@@ -305,8 +545,11 @@ impl<'a> LayoutBuilder<'a> {
             placed_style.direction,
         )?;
         placed_style.float = Float::None;
-        apply_used_box_metrics(&mut placed_style, containing_width);
-        let width = self.float_margin_box_width(
+        apply_used_box_metrics(
+            &mut placed_style,
+            PercentageBasis::definite(layout_pt(containing_width)),
+        );
+        let inline_size = self.resolved_float_inline_size(
             element,
             &placed_style,
             stylesheets,
@@ -314,13 +557,20 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             None,
         );
-        let height =
-            self.float_margin_box_height(element, &placed_style, stylesheets, width, child_boxes);
+        freeze_float_replay_width(&mut placed_style, inline_size);
+        let width = inline_size.margin_box_width;
+        let height = self.float_margin_box_height(
+            element,
+            &placed_style,
+            stylesheets,
+            inline_size,
+            child_boxes,
+            None,
+        );
         let placement = float_context.avoiding_position(
             0,
             0.0,
-            width,
-            height,
+            PageTopSize::new(width, height),
             placed_style.clear,
             placed_style.writing_mode,
             placed_style.direction,
@@ -353,30 +603,48 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         available_width: f32,
     ) -> f32 {
+        if let Some(image) = used_image(
+            element,
+            style,
+            available_width,
+            BlockSizePercentageBasis::indefinite(),
+            self.base_url,
+            self.root_url,
+            self.resource_cache,
+        ) {
+            return style.margin.top + image.border_box_size.height + style.margin.bottom;
+        }
         let intrinsic_size = element
             .attrs
             .get("src")
             .and_then(|src| {
-                load_image_source(src, self.base_url, self.root_url, self.resource_cache)
+                load_resolved_image_source(
+                    src,
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                    true,
+                )
             })
-            .map(|image| {
-                let natural_size = image.natural_layout_size();
-                (natural_size.width, natural_size.height)
-            });
-        let (intrinsic_width, intrinsic_height) =
-            intrinsic_size.unwrap_or((style.font_size, style.line_height));
-        if intrinsic_width <= 0.0 || intrinsic_height <= 0.0 {
+            .map(|asset| asset.intrinsic_size());
+        let intrinsic_size =
+            intrinsic_size.unwrap_or_else(|| LayoutSize::new(style.font_size, style.line_height));
+        if intrinsic_size.width <= 0.0 || intrinsic_size.height <= 0.0 {
             return 0.0;
         }
-        let aspect_ratio = intrinsic_width / intrinsic_height;
+        let aspect_ratio = intrinsic_size.width / intrinsic_size.height;
         let attr_width = element.attrs.get("width").and_then(|value| {
             parse_html_length(value).filter(|width| *width > 0.0 && !value.contains('%'))
         });
         let attr_height = element.attrs.get("height").and_then(|value| {
             parse_html_length(value).filter(|height| *height > 0.0 && !value.contains('%'))
         });
-        let mut width =
-            used_length_percentage_or_auto(style.box_values.width, available_width).or(attr_width);
+        let mut width = used_length_percentage_or_auto(
+            style.box_values.width.clone(),
+            PercentageBasis::definite(layout_pt(available_width)),
+        )
+        .map(|width| width.points())
+        .or(attr_width);
         let mut height = style
             .box_values
             .height
@@ -386,12 +654,12 @@ impl<'a> LayoutBuilder<'a> {
             (Some(width_value), None) => height = Some(width_value / aspect_ratio),
             (None, Some(height_value)) => width = Some(height_value * aspect_ratio),
             (None, None) => {
-                width = Some(intrinsic_width);
-                height = Some(intrinsic_height);
+                width = Some(intrinsic_size.width);
+                height = Some(intrinsic_size.height);
             }
             (Some(_), Some(_)) => {}
         }
-        let width = width.unwrap_or(intrinsic_width).min(available_width);
+        let width = width.unwrap_or(intrinsic_size.width).min(available_width);
         let height = height.unwrap_or(width / aspect_ratio);
         style.margin.top + height + style.margin.bottom
     }
@@ -420,5 +688,44 @@ impl<'a> LayoutBuilder<'a> {
         let available_width = (available_width - padding_left - padding_right).max(1.0);
         self.intrinsic_inline_measurement_for_text(text, style, available_width)
             .physical_height(style)
+    }
+
+    /// Whether a block's normalized inline contents form one unbreakable line.
+    ///
+    /// A line box is monolithic in fragmentation. If its block is the only
+    /// column-flow subject and even one line cannot fit the fragmentainer, the
+    /// line overflows the originating fragment rather than being sliced into
+    /// decoration-only continuations:
+    /// <https://www.w3.org/TR/css-break-3/#possible-breaks>.
+    pub(in crate::layout) fn block_has_single_unbreakable_inline_line(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        children: &[box_tree::FormattingBox<'_>],
+        available_width: f32,
+    ) -> bool {
+        if style.writing_mode != WritingMode::HorizontalTb
+            || !formatting_box_has_inline_content(children)
+            || has_non_inline_formatting_box(children)
+        {
+            return false;
+        }
+        let text = inline_text_for_style(element, style);
+        if text.contains('\n') || crate::text::trim_css_collapsible_whitespace(&text).is_empty() {
+            return false;
+        }
+        let metrics =
+            used_box_metrics(style, PercentageBasis::definite(layout_pt(available_width)));
+        let inline_size = used_content_box_width_or_auto(
+            style,
+            layout_pt(available_width),
+            metrics.horizontal_non_content_length(),
+        )
+        .map(SemanticLengthExt::points)
+        .unwrap_or_else(|| {
+            (available_width - metrics.horizontal_non_content_length().points()).max(1.0)
+        });
+        self.estimate_text_physical_height(&text, style, inline_size, 0.0, 0.0)
+            <= style.line_height + 0.01
     }
 }

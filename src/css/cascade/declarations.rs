@@ -12,7 +12,7 @@ pub(crate) use self::split_4::*;
 mod split_5;
 pub(crate) use self::split_5::*;
 mod split_6;
-pub(in crate::css) use self::split_6::*;
+pub(crate) use self::split_6::*;
 mod split_7;
 pub(in crate::css) use self::split_7::*;
 mod split_8;

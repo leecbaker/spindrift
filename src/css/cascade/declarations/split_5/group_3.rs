@@ -6,12 +6,37 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
     value: &str,
     declaration: &CascadedDeclaration<'_>,
     inheritance_source: &ComputedStyle,
-    _parent_ch_advance: f32,
+    _parent_ch_advance: LayoutLength,
 ) -> bool {
     match name {
         "font-family" => {
             style.font_family =
                 parse_font_family(value).unwrap_or_else(|| style.font_family.clone());
+        }
+        "font-synthesis" => {
+            if let Some(font_synthesis) = parse_font_synthesis(value) {
+                style.font_synthesis = font_synthesis;
+            }
+        }
+        "font-synthesis-weight" => {
+            if let Some(value) = parse_font_synthesis_subproperty(value) {
+                style.font_synthesis.weight = value;
+            }
+        }
+        "font-synthesis-style" => {
+            if let Some(value) = parse_font_synthesis_subproperty(value) {
+                style.font_synthesis.style = value;
+            }
+        }
+        "font-synthesis-small-caps" => {
+            if let Some(value) = parse_font_synthesis_subproperty(value) {
+                style.font_synthesis.small_caps = value;
+            }
+        }
+        "font-synthesis-position" => {
+            if let Some(value) = parse_font_synthesis_subproperty(value) {
+                style.font_synthesis.position = value;
+            }
         }
         "font-feature-settings" => {
             if let Some(font_feature_settings) = parse_font_feature_settings(value) {
@@ -74,6 +99,11 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
                 style.font_variant_emoji = font_variant_emoji;
             }
         }
+        "font-palette" => {
+            if let Some(font_palette) = parse_font_palette(value) {
+                style.font_palette = font_palette;
+            }
+        }
         "bookmark-level" => {
             if let Some(level) = parse_bookmark_level(value) {
                 style.bookmark_level = level;
@@ -123,10 +153,8 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
                     parse_list_style_image_component(&components.image)
                 {
                     style.list_style_image = Some(image);
-                    style.list_style_image_base_url =
-                        declaration.base_url.map(std::path::Path::to_path_buf);
-                    style.list_style_image_root_url =
-                        declaration.root_url.map(std::path::Path::to_path_buf);
+                    style.list_style_image_base_url = declaration.base_url.cloned();
+                    style.list_style_image_root_url = declaration.root_url.cloned();
                 }
             }
         }
@@ -150,24 +178,23 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
                 style.list_style_image_root_url = None;
             } else if let Some(image) = extract_css_url(value) {
                 style.list_style_image = Some(image);
-                style.list_style_image_base_url =
-                    declaration.base_url.map(std::path::Path::to_path_buf);
-                style.list_style_image_root_url =
-                    declaration.root_url.map(std::path::Path::to_path_buf);
+                style.list_style_image_base_url = declaration.base_url.cloned();
+                style.list_style_image_root_url = declaration.root_url.cloned();
             }
         }
         "counter-reset" => {
-            if let Some(values) = parse_counter_pairs(value, 0, CounterDuplicatePolicy::KeepLast) {
+            if let Some(values) = parse_counter_resets(value) {
                 style.counter_resets = values;
             }
         }
         "counter-increment" => {
-            if let Some(values) = parse_counter_pairs(value, 1, CounterDuplicatePolicy::KeepAll) {
+            if let Some(values) = parse_counter_changes(value, 1, CounterDuplicatePolicy::KeepAll) {
                 style.counter_increments = values;
             }
         }
         "counter-set" => {
-            if let Some(values) = parse_counter_pairs(value, 0, CounterDuplicatePolicy::KeepLast) {
+            if let Some(values) = parse_counter_changes(value, 0, CounterDuplicatePolicy::KeepLast)
+            {
                 style.counter_sets = values;
             }
         }
@@ -190,17 +217,27 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
                 style.page_name_specified = true;
             }
         }
-        "break-before" | "page-break-before" => {
+        "break-before" => {
+            style.break_before = parse_fragment_break(value);
+        }
+        "break-after" => {
+            style.break_after = parse_fragment_break(value);
+        }
+        "page-break-before" => {
             style.break_before = parse_page_break(value);
         }
-        "break-after" | "page-break-after" => {
+        "page-break-after" => {
             style.break_after = parse_page_break(value);
         }
-        "break-inside" | "page-break-inside" => {
-            style.break_inside_avoid = matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "avoid" | "avoid-page"
-            );
+        "break-inside" => {
+            let value = value.trim().to_ascii_lowercase();
+            style.break_inside_avoid = matches!(value.as_str(), "avoid" | "avoid-page");
+            style.break_inside_avoid_column = matches!(value.as_str(), "avoid" | "avoid-column");
+        }
+        "page-break-inside" => {
+            let value = value.trim().to_ascii_lowercase();
+            style.break_inside_avoid = matches!(value.as_str(), "avoid" | "avoid-page");
+            style.break_inside_avoid_column = false;
         }
         "orphans" => {
             if let Some(value) = parse_positive_integer(value) {
@@ -319,28 +356,101 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
             }
         }
         "white-space" => {
-            style.white_space = match value.to_ascii_lowercase().as_str() {
-                "normal" => WhiteSpace::Normal,
-                "nowrap" => WhiteSpace::NoWrap,
-                "pre" => WhiteSpace::Pre,
-                "pre-wrap" => WhiteSpace::PreWrap,
-                "pre-line" => WhiteSpace::PreLine,
-                "break-spaces" => WhiteSpace::BreakSpaces,
-                _ => style.white_space,
+            let parsed = match value.to_ascii_lowercase().as_str() {
+                "normal" => Some((WhiteSpace::Normal, TextWrapMode::Wrap)),
+                "nowrap" => Some((WhiteSpace::NoWrap, TextWrapMode::NoWrap)),
+                "pre" => Some((WhiteSpace::Pre, TextWrapMode::NoWrap)),
+                "pre-wrap" => Some((WhiteSpace::PreWrap, TextWrapMode::Wrap)),
+                "pre-line" => Some((WhiteSpace::PreLine, TextWrapMode::Wrap)),
+                "break-spaces" => Some((WhiteSpace::BreakSpaces, TextWrapMode::Wrap)),
+                _ => None,
             };
+            if let Some((white_space, text_wrap_mode)) = parsed {
+                // `white-space` is a legacy shorthand that resets its
+                // wrapping-mode component, but not text-wrap-style.
+                // CSS Text 4: https://drafts.csswg.org/css-text-4/#white-space-property
+                style.white_space = white_space;
+                style.text_wrap_mode = text_wrap_mode;
+            }
+        }
+        "text-wrap" => {
+            let mut mode = TextWrapMode::Wrap;
+            let mut wrap_style = TextWrapStyle::Auto;
+            let mut saw_mode = false;
+            let mut saw_style = false;
+            let mut valid = true;
+            for component in value.split_ascii_whitespace() {
+                match component.to_ascii_lowercase().as_str() {
+                    "wrap" if !saw_mode => {
+                        mode = TextWrapMode::Wrap;
+                        saw_mode = true;
+                    }
+                    "nowrap" if !saw_mode => {
+                        mode = TextWrapMode::NoWrap;
+                        saw_mode = true;
+                    }
+                    "auto" if !saw_style => {
+                        wrap_style = TextWrapStyle::Auto;
+                        saw_style = true;
+                    }
+                    "balance" if !saw_style => {
+                        wrap_style = TextWrapStyle::Balance;
+                        saw_style = true;
+                    }
+                    "stable" if !saw_style => {
+                        wrap_style = TextWrapStyle::Stable;
+                        saw_style = true;
+                    }
+                    _ => valid = false,
+                }
+            }
+            if valid && (saw_mode || saw_style) {
+                style.text_wrap_mode = mode;
+                style.text_wrap_style = wrap_style;
+            }
+        }
+        "text-wrap-mode" => match value.trim().to_ascii_lowercase().as_str() {
+            "wrap" => style.text_wrap_mode = TextWrapMode::Wrap,
+            "nowrap" => style.text_wrap_mode = TextWrapMode::NoWrap,
+            _ => {}
+        },
+        "text-wrap-style" => match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => style.text_wrap_style = TextWrapStyle::Auto,
+            "balance" => style.text_wrap_style = TextWrapStyle::Balance,
+            "stable" => style.text_wrap_style = TextWrapStyle::Stable,
+            _ => {}
+        },
+        "line-clamp" | "-webkit-line-clamp" => {
+            let legacy_webkit = name == "-webkit-line-clamp";
+            if let Some(line_clamp) = parse_line_clamp(value, legacy_webkit) {
+                style.line_clamp = line_clamp;
+                if style.line_clamp.is_some() && style.legacy_webkit_box {
+                    // The historical display requirement selects legacy
+                    // syntax, not a separate flex-layout algorithm.
+                    style.display = Display::BLOCK;
+                    style.legacy_webkit_box = false;
+                }
+            }
+        }
+        "overflow-clip-margin" => {
+            if let Some(margin) = parse_overflow_clip_margin(value, style.font_size) {
+                style.overflow_clip_margin = margin;
+            }
         }
         "word-break" => {
             match value.trim().to_ascii_lowercase().as_str() {
                 "normal" => style.word_break = WordBreak::Normal,
                 "break-all" => style.word_break = WordBreak::BreakAll,
                 "keep-all" => style.word_break = WordBreak::KeepAll,
+                "manual" => style.word_break = WordBreak::Manual,
                 "break-word" => {
-                    // CSS Text defines legacy `word-break: break-word` as
-                    // normal word breaking plus emergency wrapping when no
-                    // earlier soft wrap opportunity can fit the line:
-                    // https://www.w3.org/TR/css-text-3/#word-break-property
-                    style.word_break = WordBreak::Normal;
-                    style.overflow_wrap = OverflowWrap::BreakWord;
+                    // This legacy value has `overflow-wrap:anywhere`
+                    // behavior regardless of the authored `overflow-wrap`
+                    // value. Preserve it on `word-break` so a later
+                    // `overflow-wrap` declaration cannot erase its
+                    // min-content effect.
+                    // <https://drafts.csswg.org/css-text-3/#valdef-word-break-break-word>
+                    style.word_break = WordBreak::BreakWord;
                 }
                 _ => {}
             }
@@ -362,6 +472,45 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
                 style.overflow_y = overflow;
             }
         }
+        "scroll-snap-type" => {
+            if let Some(value) = parse_scroll_snap_type(value) {
+                style.scroll_snap_type = value;
+            }
+        }
+        "scroll-snap-align" => {
+            if let Some(value) = parse_scroll_snap_align(value) {
+                style.scroll_snap_align = value;
+            }
+        }
+        "scroll-snap-stop" => match value.trim().to_ascii_lowercase().as_str() {
+            "normal" => style.scroll_snap_stop = ScrollSnapStop::Normal,
+            "always" => style.scroll_snap_stop = ScrollSnapStop::Always,
+            _ => {}
+        },
+        "scroll-padding-top" => set_scroll_padding_side(value, style.font_size, |edge| {
+            style.scroll_padding.top = edge;
+        }),
+        "scroll-padding-right" => set_scroll_padding_side(value, style.font_size, |edge| {
+            style.scroll_padding.right = edge;
+        }),
+        "scroll-padding-bottom" => set_scroll_padding_side(value, style.font_size, |edge| {
+            style.scroll_padding.bottom = edge;
+        }),
+        "scroll-padding-left" => set_scroll_padding_side(value, style.font_size, |edge| {
+            style.scroll_padding.left = edge;
+        }),
+        "scroll-margin-top" => set_scroll_margin_side(value, style.font_size, |edge| {
+            style.scroll_margin.top = edge;
+        }),
+        "scroll-margin-right" => set_scroll_margin_side(value, style.font_size, |edge| {
+            style.scroll_margin.right = edge;
+        }),
+        "scroll-margin-bottom" => set_scroll_margin_side(value, style.font_size, |edge| {
+            style.scroll_margin.bottom = edge;
+        }),
+        "scroll-margin-left" => set_scroll_margin_side(value, style.font_size, |edge| {
+            style.scroll_margin.left = edge;
+        }),
         "overflow-wrap" | "word-wrap" => {
             style.overflow_wrap = match value.trim().to_ascii_lowercase().as_str() {
                 "normal" => OverflowWrap::Normal,
@@ -388,6 +537,11 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
                 _ => style.hyphens,
             };
         }
+        "hyphenate-character" => {
+            if let Some(character) = parse_hyphenate_character(value) {
+                style.hyphenate_character = character;
+            }
+        }
         "hyphenate-limit-chars" => {
             if let Some(limit) = parse_hyphenate_limit_chars(value) {
                 style.hyphenate_limit_chars = limit;
@@ -408,4 +562,143 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
         _ => return false,
     }
     true
+}
+
+fn parse_scroll_snap_type(value: &str) -> Option<ScrollSnapType> {
+    let parts = split_css_component_values(value);
+    if parts.as_slice() == ["none"] {
+        return Some(ScrollSnapType::None);
+    }
+    let [axis, strictness] = match parts.as_slice() {
+        [axis] => [*axis, "proximity"],
+        [axis, strictness] => [*axis, *strictness],
+        _ => return None,
+    };
+    let strictness = match strictness.to_ascii_lowercase().as_str() {
+        "mandatory" => ScrollSnapStrictness::Mandatory,
+        "proximity" => ScrollSnapStrictness::Proximity,
+        _ => return None,
+    };
+    match axis.to_ascii_lowercase().as_str() {
+        "x" => Some(ScrollSnapType::X(strictness)),
+        "y" => Some(ScrollSnapType::Y(strictness)),
+        "block" => Some(ScrollSnapType::Block(strictness)),
+        "inline" => Some(ScrollSnapType::Inline(strictness)),
+        "both" => Some(ScrollSnapType::Both(strictness)),
+        _ => None,
+    }
+}
+
+fn parse_scroll_snap_align(value: &str) -> Option<ScrollSnapAlign> {
+    let values = split_css_component_values(value);
+    let [block, inline] = match values.as_slice() {
+        [both] => [*both, *both],
+        [block, inline] => [*block, *inline],
+        _ => return None,
+    };
+    let parse = |value: &str| match value.to_ascii_lowercase().as_str() {
+        "none" => Some(ScrollSnapAlignment::None),
+        "start" => Some(ScrollSnapAlignment::Start),
+        "end" => Some(ScrollSnapAlignment::End),
+        "center" => Some(ScrollSnapAlignment::Center),
+        _ => None,
+    };
+    Some(ScrollSnapAlign {
+        block: parse(block)?,
+        inline: parse(inline)?,
+    })
+}
+
+fn set_scroll_padding_side(value: &str, font_size: f32, set: impl FnOnce(ScrollPadding)) {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        set(ScrollPadding::Auto);
+        return;
+    }
+    let Some(value) = parse_computed_length_percentage(value, font_size) else {
+        return;
+    };
+    if !value.is_definitely_negative() {
+        set(ScrollPadding::LengthPercentage(value));
+    }
+}
+
+fn set_scroll_margin_side(value: &str, font_size: f32, set: impl FnOnce(ComputedLengthPercentage)) {
+    let Some(value) = parse_computed_length_percentage(value, font_size) else {
+        return;
+    };
+    if !value.contains_percentage() {
+        set(value);
+    }
+}
+
+/// Parse the non-auto subset of the CSS Overflow `line-clamp` shorthand.
+///
+/// The tokenization deliberately keeps the optional quoted block ellipsis as
+/// one authored string. `line-clamp:auto` remains unimplemented rather than
+/// being conflated with an unlimited clamp.
+/// <https://drafts.csswg.org/css-overflow-4/#line-clamp>
+fn parse_line_clamp(value: &str, legacy_webkit: bool) -> Option<Option<LineClamp>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    let (limit, remainder) = value
+        .split_once(char::is_whitespace)
+        .map_or((value, ""), |(limit, remainder)| (limit, remainder.trim()));
+    let max_lines = limit.parse::<usize>().ok().filter(|limit| *limit > 0)?;
+    if legacy_webkit && !remainder.is_empty() {
+        return None;
+    }
+    let ellipsis = if remainder.is_empty() || remainder.eq_ignore_ascii_case("auto") {
+        BlockEllipsis::Auto
+    } else if remainder.eq_ignore_ascii_case("no-ellipsis") {
+        BlockEllipsis::None
+    } else {
+        let string = remainder
+            .strip_prefix('"')
+            .and_then(|string| string.strip_suffix('"'))?;
+        BlockEllipsis::String(string.to_string())
+    };
+    Some(Some(LineClamp {
+        max_lines,
+        ellipsis,
+        legacy_webkit,
+    }))
+}
+
+/// Parse the Level 3 `overflow-clip-margin` shorthand.
+///
+/// The visual-box keyword and non-negative length may appear in either order;
+/// percentages and negative lengths are invalid for this Level 3 shorthand.
+/// <https://www.w3.org/TR/css-overflow-3/#overflow-clip-margin>
+fn parse_overflow_clip_margin(value: &str, font_size: f32) -> Option<OverflowClipMargin> {
+    let mut reference_box = None;
+    let mut length = None;
+    for component in value.split_whitespace() {
+        let component = component.to_ascii_lowercase();
+        match component.as_str() {
+            "border-box" if reference_box.is_none() => {
+                reference_box = Some(OverflowClipMarginBox::Border)
+            }
+            "padding-box" if reference_box.is_none() => {
+                reference_box = Some(OverflowClipMarginBox::Padding)
+            }
+            "content-box" if reference_box.is_none() => {
+                reference_box = Some(OverflowClipMarginBox::Content)
+            }
+            _ if length.is_none() => {
+                let parsed = parse_length_with_font_size(&component, font_size)?;
+                if parsed < 0.0 {
+                    return None;
+                }
+                length = Some(parsed);
+            }
+            _ => return None,
+        }
+    }
+    (reference_box.is_some() || length.is_some()).then_some(OverflowClipMargin {
+        reference_box: reference_box.unwrap_or(OverflowClipMarginBox::Padding),
+        length: length.unwrap_or(0.0),
+    })
 }

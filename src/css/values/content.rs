@@ -1,5 +1,4 @@
 use super::*;
-use std::path::Path;
 
 pub(crate) fn parse_marker_content(value: &str) -> Option<MarkerContent> {
     let value = trim_css_value(value);
@@ -23,6 +22,9 @@ pub(crate) fn parse_marker_content(value: &str) -> Option<MarkerContent> {
         } else if let Some((counters, tail)) = parse_counters_token(rest) {
             parts.push(counters);
             rest = tail;
+        } else if let Some((quote, tail)) = parse_generated_quote_token(rest) {
+            parts.push(MarkerContentPart::Quote(quote));
+            rest = tail;
         } else {
             return None;
         }
@@ -32,8 +34,8 @@ pub(crate) fn parse_marker_content(value: &str) -> Option<MarkerContent> {
 
 pub(crate) fn parse_content_property(
     value: &str,
-    base_url: Option<&Path>,
-    root_url: Option<&Path>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
 ) -> Option<Content> {
     let value = trim_css_value(value);
     if value.eq_ignore_ascii_case("normal") {
@@ -63,8 +65,8 @@ pub(crate) fn parse_content_property(
 
 fn parse_generated_content_parts(
     value: &str,
-    base_url: Option<&Path>,
-    root_url: Option<&Path>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
 ) -> Option<GeneratedContent> {
     let mut rest = value.trim();
     if rest.is_empty() {
@@ -433,20 +435,30 @@ fn parse_generated_counters_token(value: &str) -> Option<(GeneratedContentPart, 
 
 fn parse_generated_image_token<'a>(
     value: &'a str,
-    base_url: Option<&Path>,
-    root_url: Option<&Path>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
 ) -> Option<(GeneratedContentPart, &'a str)> {
     if let Some((url, tail)) = parse_css_url_token(value) {
         return Some((
             GeneratedContentPart::Image {
                 image: BackgroundImage::Url {
                     src: url,
-                    base_url: base_url.map(Path::to_path_buf),
-                    root_url: root_url.map(Path::to_path_buf),
+                    base_url: base_url.cloned(),
+                    root_url: root_url.cloned(),
+                    request_modifiers: RequestUrlModifiers::default(),
                 },
             },
             tail,
         ));
+    }
+    if let Some(body) = strip_ascii_function(value, "image-set") {
+        let (argument, tail) = split_function_argument(body)?;
+        let image = crate::css::parse_background_image(
+            &format!("image-set({argument})"),
+            base_url,
+            root_url,
+        )?;
+        return Some((GeneratedContentPart::Image { image }, tail));
     }
     for name in [
         "linear-gradient",

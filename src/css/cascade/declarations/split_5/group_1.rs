@@ -6,7 +6,7 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
     value: &str,
     declaration: &CascadedDeclaration<'_>,
     _inheritance_source: &ComputedStyle,
-    _parent_ch_advance: f32,
+    _parent_ch_advance: LayoutLength,
 ) -> bool {
     match name {
         "direction" => {
@@ -35,6 +35,11 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
                 style.text_orientation = text_orientation;
             }
         }
+        "text-combine-upright" => {
+            if let Some(text_combine_upright) = parse_text_combine_upright(value) {
+                style.text_combine_upright = text_combine_upright;
+            }
+        }
         "line-fit-edge" => {
             if let Some(line_fit_edge) = parse_line_fit_edge(value) {
                 style.line_fit_edge = line_fit_edge;
@@ -56,6 +61,21 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
                 style.text_box_edge = text_box_edge;
             }
         }
+        "initial-letter" => {
+            if let Some(initial_letter) = parse_initial_letter(value) {
+                style.initial_letter = initial_letter;
+            }
+        }
+        "initial-letter-align" => {
+            if let Some(initial_letter_align) = parse_initial_letter_align(value) {
+                style.initial_letter_align = initial_letter_align;
+            }
+        }
+        "initial-letter-wrap" => {
+            if let Some(initial_letter_wrap) = parse_initial_letter_wrap(value, style.font_size) {
+                style.initial_letter_wrap = initial_letter_wrap;
+            }
+        }
         "box-decoration-break" => {
             if let Some(box_decoration_break) = parse_box_decoration_break(value) {
                 style.box_decoration_break = box_decoration_break;
@@ -63,6 +83,21 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
         }
         "display" => {
             style.display = parse_display(value, style.display);
+            style.legacy_webkit_box = matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "-webkit-box" | "-webkit-inline-box"
+            );
+            if style.legacy_webkit_box && style.line_clamp.is_some() {
+                // The prefixed clamp syntax historically required
+                // `display:-webkit-box`, but clamping text must still run
+                // through the shared inline line selector rather than the
+                // unrelated legacy flex layout.
+                style.display = Display::BLOCK;
+                style.legacy_webkit_box = false;
+            } else if style.legacy_webkit_box {
+                style.flex_wrap = FlexWrap::NoWrap;
+                style.flex_line_count = None;
+            }
         }
         "flex-direction" => {
             style.flex_direction = match value.to_ascii_lowercase().as_str() {
@@ -76,7 +111,9 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
         "flex-flow" => {
             if let Some((direction, wrap)) = parse_flex_flow(value) {
                 style.flex_direction = direction;
-                style.flex_wrap = wrap;
+                if !style.legacy_webkit_box {
+                    style.flex_wrap = wrap;
+                }
             }
         }
         "justify-content" => {
@@ -98,22 +135,51 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
             style.align_self = parse_align_self(value, style.align_self);
         }
         "flex-wrap" => {
-            style.flex_wrap = match value.to_ascii_lowercase().as_str() {
-                "wrap" => FlexWrap::Wrap,
-                "wrap-reverse" => FlexWrap::WrapReverse,
-                "nowrap" => FlexWrap::NoWrap,
-                _ => style.flex_wrap,
-            };
+            let mut wrap = None;
+            let mut balance = false;
+            for token in value.split_ascii_whitespace() {
+                match token.to_ascii_lowercase().as_str() {
+                    "wrap" if wrap.is_none() => wrap = Some(FlexWrap::Wrap),
+                    "wrap-reverse" if wrap.is_none() => wrap = Some(FlexWrap::WrapReverse),
+                    "nowrap" if wrap.is_none() => wrap = Some(FlexWrap::NoWrap),
+                    "balance" if !balance => balance = true,
+                    _ => {
+                        wrap = None;
+                        balance = false;
+                        break;
+                    }
+                }
+            }
+            if style.legacy_webkit_box {
+                style.flex_wrap = FlexWrap::NoWrap;
+            } else if balance {
+                style.flex_wrap = match wrap.unwrap_or(FlexWrap::Wrap) {
+                    FlexWrap::WrapReverse => FlexWrap::BalanceReverse,
+                    FlexWrap::Wrap | FlexWrap::Balance | FlexWrap::BalanceReverse => {
+                        FlexWrap::Balance
+                    }
+                    FlexWrap::NoWrap => style.flex_wrap,
+                };
+            } else if let Some(wrap) = wrap {
+                style.flex_wrap = wrap;
+            }
+        }
+        "flex-line-count" => {
+            if let Ok(value) = value.parse::<usize>()
+                && value > 0
+            {
+                style.flex_line_count = Some(value);
+            }
         }
         "flex-grow" => {
-            if let Ok(value) = value.parse::<f32>()
+            if let Some(value) = parse_css_number(value)
                 && value >= 0.0
             {
                 style.flex_grow = value;
             }
         }
         "flex-shrink" => {
-            if let Ok(value) = value.parse::<f32>()
+            if let Some(value) = parse_css_number(value)
                 && value >= 0.0
             {
                 style.flex_shrink = value;
@@ -131,10 +197,10 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
         }
         "flex" => {
             if let Some((grow, shrink, basis)) = parse_flex_shorthand_components(value) {
-                if let Ok(grow) = grow.parse::<f32>() {
+                if let Some(grow) = parse_css_number(&grow) {
                     style.flex_grow = grow;
                 }
-                if let Ok(shrink) = shrink.parse::<f32>() {
+                if let Some(shrink) = parse_css_number(&shrink) {
                     style.flex_shrink = shrink;
                 }
                 if let Some(basis) = parse_computed_flex_basis(&basis, style.font_size) {
@@ -162,6 +228,26 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
         "column-width" => {
             if let Some(width) = parse_column_width(value, style.font_size) {
                 style.column_width = width;
+            }
+        }
+        "column-height" => {
+            if let Some(height) = parse_column_height(value, style.font_size) {
+                style.column_height = height;
+            }
+        }
+        "column-wrap" => {
+            if let Some(wrap) = parse_column_wrap(value) {
+                style.column_wrap = wrap;
+            }
+        }
+        "column-fill" => {
+            if let Some(fill) = parse_column_fill(value) {
+                style.column_fill = fill;
+            }
+        }
+        "column-span" => {
+            if let Some(span) = parse_column_span(value) {
+                style.column_span = span;
             }
         }
         "column-gap" | "grid-column-gap" => {
@@ -267,6 +353,16 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
                 style.grid_auto_flow = flow;
             }
         }
+        "grid-lanes-direction" => {
+            if let Some(direction) = parse_grid_lanes_direction(value) {
+                style.grid_lanes_direction = direction;
+            }
+        }
+        "flow-tolerance" => {
+            if let Some(tolerance) = parse_grid_lanes_flow_tolerance(value, style.font_size) {
+                style.grid_lanes_flow_tolerance = tolerance;
+            }
+        }
         "grid-row-start" => {
             if let Some(placement) = parse_grid_placement(value) {
                 style.grid_row_start = placement;
@@ -301,7 +397,7 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
         }
         "margin" => {
             if let Some(typed) = parse_margin_edge_values(value, style.font_size) {
-                style.box_values.margin = typed;
+                style.box_values.margin = typed.clone();
                 style.margin = legacy_margin_edges(typed);
                 style.ua_margin_em = if declaration.origin == StylesheetOrigin::UserAgent {
                     parse_margin_em_edges(value)
@@ -311,7 +407,7 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
             }
         }
         "margin-top" => set_margin_side(value, style.font_size, |typed| {
-            style.box_values.margin.top = typed;
+            style.box_values.margin.top = typed.clone();
             style.margin.top = typed.length_if_no_percent().unwrap_or(0.0);
             style.ua_margin_em.top = if declaration.origin == StylesheetOrigin::UserAgent {
                 parse_em_length_factor(value)
@@ -320,7 +416,7 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
             };
         }),
         "margin-right" => set_margin_side(value, style.font_size, |typed| {
-            style.box_values.margin.right = typed;
+            style.box_values.margin.right = typed.clone();
             style.margin.right = typed.length_if_no_percent().unwrap_or(0.0);
             style.ua_margin_em.right = if declaration.origin == StylesheetOrigin::UserAgent {
                 parse_em_length_factor(value)
@@ -329,7 +425,7 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
             };
         }),
         "margin-bottom" => set_margin_side(value, style.font_size, |typed| {
-            style.box_values.margin.bottom = typed;
+            style.box_values.margin.bottom = typed.clone();
             style.margin.bottom = typed.length_if_no_percent().unwrap_or(0.0);
             style.ua_margin_em.bottom = if declaration.origin == StylesheetOrigin::UserAgent {
                 parse_em_length_factor(value)
@@ -338,7 +434,7 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
             };
         }),
         "margin-left" => set_margin_side(value, style.font_size, |typed| {
-            style.box_values.margin.left = typed;
+            style.box_values.margin.left = typed.clone();
             style.margin.left = typed.length_if_no_percent().unwrap_or(0.0);
             style.ua_margin_em.left = if declaration.origin == StylesheetOrigin::UserAgent {
                 parse_em_length_factor(value)
@@ -353,32 +449,32 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
         | "padding-inline-end" => apply_logical_padding_side(value, style, name),
         "padding" => {
             if let Some(typed) = parse_edge_values(value, style.font_size) {
-                style.box_values.padding = typed;
+                style.box_values.padding = typed.clone();
                 if let Some(edges) = legacy_edge_lengths(typed) {
                     style.padding = edges;
                 }
             }
         }
         "padding-top" => set_computed_length_percentage(value, style.font_size, |typed| {
-            style.box_values.padding.top = typed;
+            style.box_values.padding.top = typed.clone();
             if let Some(length) = typed.length_if_no_percent() {
                 style.padding.top = length;
             }
         }),
         "padding-right" => set_computed_length_percentage(value, style.font_size, |typed| {
-            style.box_values.padding.right = typed;
+            style.box_values.padding.right = typed.clone();
             if let Some(length) = typed.length_if_no_percent() {
                 style.padding.right = length;
             }
         }),
         "padding-bottom" => set_computed_length_percentage(value, style.font_size, |typed| {
-            style.box_values.padding.bottom = typed;
+            style.box_values.padding.bottom = typed.clone();
             if let Some(length) = typed.length_if_no_percent() {
                 style.padding.bottom = length;
             }
         }),
         "padding-left" => set_computed_length_percentage(value, style.font_size, |typed| {
-            style.box_values.padding.left = typed;
+            style.box_values.padding.left = typed.clone();
             if let Some(length) = typed.length_if_no_percent() {
                 style.padding.left = length;
             }
@@ -394,7 +490,7 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
         }
         "border-width" => {
             if let Some(edges) = parse_border_width_edges(value, style.font_size) {
-                style.border_width_values = edges;
+                style.border_width_values = edges.clone();
                 style.border_widths = Edges {
                     top: edges
                         .top
@@ -529,7 +625,7 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
         }
         "outline-width" => {
             if let Some(length) = parse_computed_border_width(value, style.font_size) {
-                style.outline_width_value = length;
+                style.outline_width_value = length.clone();
                 style.outline_width = length
                     .length_if_no_percent()
                     .unwrap_or(length.length_points());
@@ -565,6 +661,102 @@ pub(in crate::css) fn parse_box_decoration_break(value: &str) -> Option<BoxDecor
         "slice" => Some(BoxDecorationBreak::Slice),
         "clone" => Some(BoxDecorationBreak::Clone),
         _ => None,
+    }
+}
+
+pub(in crate::css) fn parse_initial_letter(value: &str) -> Option<InitialLetter> {
+    let parts = split_css_component_values(trim_css_value(value));
+    if parts.len() == 1 && parts[0].eq_ignore_ascii_case("normal") {
+        return Some(InitialLetter::Normal);
+    }
+    let mut size = None;
+    let mut sink = None;
+    let mut keyword = None;
+    for part in parts {
+        let lower = part.to_ascii_lowercase();
+        match lower.as_str() {
+            "normal" => return None,
+            "drop" | "raise" => {
+                if keyword.replace(lower).is_some() {
+                    return None;
+                }
+            }
+            _ => {
+                if part.contains('.') {
+                    let parsed = part.parse::<f32>().ok()?;
+                    if parsed < 1.0 || !parsed.is_finite() || size.replace(parsed).is_some() {
+                        return None;
+                    }
+                } else if let Ok(integer) = part.parse::<u32>() {
+                    if integer == 0 {
+                        return None;
+                    }
+                    if size.is_none() {
+                        size = Some(integer as f32);
+                    } else if sink.replace(integer).is_some() {
+                        return None;
+                    }
+                } else {
+                    let parsed = part.parse::<f32>().ok()?;
+                    if parsed < 1.0 || !parsed.is_finite() || size.replace(parsed).is_some() {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    let size = size?;
+    let sink = match (sink, keyword.as_deref()) {
+        (Some(sink), None) => sink,
+        (Some(_), Some(_)) => return None,
+        (None, Some("raise")) => 1,
+        (None, Some("drop")) | (None, None) => size.floor().max(1.0) as u32,
+        (None, Some(_)) => return None,
+    };
+    Some(InitialLetter::Specified { size, sink })
+}
+
+pub(in crate::css) fn parse_initial_letter_align(value: &str) -> Option<InitialLetterAlign> {
+    let parts = split_css_component_values(trim_css_value(value));
+    if parts.is_empty() || parts.len() > 2 {
+        return None;
+    }
+    let mut border_box = false;
+    let mut keyword = None;
+    for part in parts {
+        match part.to_ascii_lowercase().as_str() {
+            "border-box" if !border_box => border_box = true,
+            "alphabetic" if keyword.is_none() => {
+                keyword = Some(InitialLetterAlignKeyword::Alphabetic);
+            }
+            "ideographic" if keyword.is_none() => {
+                keyword = Some(InitialLetterAlignKeyword::Ideographic);
+            }
+            "hanging" if keyword.is_none() => keyword = Some(InitialLetterAlignKeyword::Hanging),
+            "leading" if keyword.is_none() => keyword = Some(InitialLetterAlignKeyword::Leading),
+            _ => return None,
+        }
+    }
+    if !border_box && keyword.is_none() {
+        return None;
+    }
+    Some(InitialLetterAlign {
+        border_box,
+        keyword: keyword.unwrap_or(InitialLetterAlignKeyword::Alphabetic),
+    })
+}
+
+pub(in crate::css) fn parse_initial_letter_wrap(
+    value: &str,
+    font_size: f32,
+) -> Option<InitialLetterWrap> {
+    let value = trim_css_value(value);
+    match value.to_ascii_lowercase().as_str() {
+        "none" => Some(InitialLetterWrap::None),
+        "first" => Some(InitialLetterWrap::First),
+        "all" => Some(InitialLetterWrap::All),
+        "grid" => Some(InitialLetterWrap::Grid),
+        _ => parse_computed_length_percentage(value, font_size).map(InitialLetterWrap::Offset),
     }
 }
 

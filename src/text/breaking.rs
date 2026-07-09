@@ -3,6 +3,39 @@ use super::*;
 pub(super) const SOFT_HYPHEN: char = '\u{00ad}';
 pub(super) const ZERO_WIDTH_SPACE: char = '\u{200b}';
 
+/// The subset of computed CSS that determines line-break opportunities.
+///
+/// Keeping this separate from [`ComputedStyle`] lets layout derive a
+/// break-specific policy without cloning unrelated computed values such as
+/// images, counters, and nested pseudo-element styles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextBreakPolicy {
+    line_break: CssLineBreak,
+    word_break: CssWordBreak,
+    white_space: crate::css::WhiteSpace,
+    overflow_wrap: CssOverflowWrap,
+}
+
+impl From<&ComputedStyle> for TextBreakPolicy {
+    fn from(style: &ComputedStyle) -> Self {
+        Self {
+            line_break: style.line_break,
+            word_break: style.word_break,
+            white_space: style.white_space,
+            overflow_wrap: style.overflow_wrap,
+        }
+    }
+}
+
+impl TextBreakPolicy {
+    /// Return this policy with emergency overflow wrapping excluded from the
+    /// ordinary CSS Text opportunity set.
+    pub(crate) const fn without_overflow_wrap(mut self) -> Self {
+        self.overflow_wrap = CssOverflowWrap::Normal;
+        self
+    }
+}
+
 pub(crate) fn text_with_hyphenation_controls<'a>(
     text: &'a str,
     style: &ComputedStyle,
@@ -25,7 +58,10 @@ pub(crate) fn text_with_hyphenation_controls<'a>(
             ));
         }
     }
-    if style.white_space.allows_soft_wrap() && line_break_strictness(style.line_break).is_some() {
+    if style.allows_soft_wrap()
+        && line_break_strictness(style.line_break).is_some()
+        && !matches!(style.line_break, CssLineBreak::Anywhere)
+    {
         let text = output.as_ref();
         if !text.is_empty() {
             output = Cow::Owned(text_with_css_line_breaks(text, style));
@@ -43,7 +79,7 @@ pub(crate) fn text_with_hyphenation_controls<'a>(
 /// Knuth-Liang dictionary and CSS `hyphenate-limit-chars` filtering:
 /// <https://www.w3.org/TR/css-text-3/#hyphenation> and
 /// <https://www.unicode.org/reports/tr29/#Word_Boundaries>.
-pub(super) fn text_with_auto_hyphenation(
+pub(crate) fn text_with_auto_hyphenation(
     text: &str,
     hyphenator: &Standard,
     limit: HyphenateLimitChars,
@@ -123,7 +159,7 @@ pub(super) fn is_hyphenation_word_char(character: char) -> bool {
     character_is_unicode_letter(character)
 }
 
-pub(super) fn hyphenator_for_language(language: &str) -> Option<Arc<Standard>> {
+pub(crate) fn hyphenator_for_language(language: &str) -> Option<Arc<Standard>> {
     let language = hyphenation_language(language)?;
     static CACHE: OnceLock<Mutex<HashMap<Language, Option<Arc<Standard>>>>> = OnceLock::new();
     let mut cache = CACHE
@@ -147,7 +183,7 @@ pub(super) fn hyphenation_language(language: &str) -> Option<Language> {
     })
 }
 
-pub(super) fn text_with_css_line_breaks(text: &str, style: &ComputedStyle) -> String {
+pub(crate) fn text_with_css_line_breaks(text: &str, style: &ComputedStyle) -> String {
     let Some(strictness) = line_break_strictness(style.line_break) else {
         return text.to_string();
     };
@@ -191,34 +227,114 @@ pub(super) fn line_break_word_option(word_break: CssWordBreak) -> LineBreakWordO
         CssWordBreak::Normal => LineBreakWordOption::Normal,
         CssWordBreak::BreakAll => LineBreakWordOption::BreakAll,
         CssWordBreak::KeepAll => LineBreakWordOption::KeepAll,
+        CssWordBreak::Manual => LineBreakWordOption::Normal,
+        CssWordBreak::BreakWord => LineBreakWordOption::Normal,
     }
 }
 
+#[cfg(test)]
 pub(crate) fn measured_break_opportunities(text: &str, style: &ComputedStyle) -> Vec<usize> {
+    let mut breaks = Vec::new();
+    collect_measured_break_opportunities(text, TextBreakPolicy::from(style), &mut breaks);
+    breaks
+}
+
+/// Collect CSS Text break opportunities into caller-owned storage.
+///
+/// The caller can retain the allocation while scanning neighboring inline
+/// fragments. This preserves the complete UAX #14/ICU result and Quire's CSS
+/// tailoring without allocating a fresh position vector for every run.
+pub(crate) fn collect_measured_break_opportunities(
+    text: &str,
+    policy: TextBreakPolicy,
+    breaks: &mut Vec<usize>,
+) {
+    breaks.clear();
     let mut options = LineBreakOptions::default();
-    options.strictness = line_break_strictness(style.line_break);
-    options.word_option = Some(line_break_word_option(style.word_break));
+    options.strictness = line_break_strictness(policy.line_break);
+    options.word_option = Some(line_break_word_option(policy.word_break));
     let segmenter = LineSegmenter::new_auto(options);
-    let mut breaks = segmenter
-        .segment_str(text)
-        .filter(|position| *position > 0 && *position <= text.len())
-        .collect::<Vec<_>>();
-    apply_css_line_break_class_tailoring(text, style, &mut breaks);
-    suppress_keep_all_unit_breaks(text, style, &mut breaks);
-    if style.white_space == crate::css::WhiteSpace::PreWrap {
+    breaks.extend(
+        segmenter
+            .segment_str(text)
+            .filter(|position| *position > 0 && *position <= text.len()),
+    );
+    apply_css_line_break_class_tailoring(text, policy, breaks);
+    suppress_keep_all_unit_breaks(text, policy, breaks);
+    suppress_manual_complex_context_breaks(text, policy, breaks);
+    if policy.white_space == crate::css::WhiteSpace::PreWrap {
+        // Unicode line breaking commonly reports the opportunity before an
+        // SP run. `pre-wrap` preserves that run, but CSS Text hangs preserved
+        // spaces at the end of the preceding line; the next line therefore
+        // starts after the spaces, not with them.
+        // <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
+        for position in breaks.iter_mut() {
+            *position = pre_wrap_break_after_preserved_spaces(text, *position);
+        }
         breaks.extend(pre_wrap_preserved_tab_breaks(text));
     }
+    if policy.white_space == crate::css::WhiteSpace::BreakSpaces {
+        // `break-spaces` preserves every CSS document space and creates a
+        // soft wrap opportunity after each one, including each tab. Unlike
+        // `pre-wrap`, an adjacent preserved-space run is not coalesced and
+        // its advance does not hang at the selected break.
+        // <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces>
+        breaks.extend(text.char_indices().filter_map(|(offset, character)| {
+            (is_css_preserved_document_space(character)
+                || character_is_css_other_space_separator(character))
+            .then_some(offset + character.len_utf8())
+        }));
+    }
 
-    if matches!(style.word_break, CssWordBreak::BreakAll)
-        || matches!(style.line_break, CssLineBreak::Anywhere)
-        || matches!(style.overflow_wrap, CssOverflowWrap::Anywhere)
+    if matches!(policy.word_break, CssWordBreak::BreakAll) {
+        breaks.extend(word_break_all_inner_boundaries(text));
+    }
+    if matches!(policy.line_break, CssLineBreak::Anywhere)
+        || matches!(policy.overflow_wrap, CssOverflowWrap::Anywhere)
     {
-        breaks.extend(grapheme_cluster_inner_boundaries(text));
+        breaks.extend(
+            GraphemeClusterSegmenter::new()
+                .segment_str(text)
+                .filter(|position| {
+                    *position > 0
+                        && *position < text.len()
+                        && pre_wrap_anywhere_break_allowed(text, policy, *position)
+                }),
+        );
     }
     breaks.push(text.len());
     breaks.sort_unstable();
     breaks.dedup();
-    breaks
+}
+
+/// Return whether an emergency-style grapheme opportunity preserves a
+/// `pre-wrap` document-space sequence.
+///
+/// CSS Text Phase II hangs a preserved run at the selected break *after* that
+/// run. An `anywhere` opportunity must not reintroduce a break before or
+/// within it, otherwise collection splits the run before Phase II can assign
+/// its shared line-edge effect:
+/// <https://www.w3.org/TR/css-text-3/#white-space-phase-2>.
+fn pre_wrap_anywhere_break_allowed(text: &str, policy: TextBreakPolicy, position: usize) -> bool {
+    policy.white_space != crate::css::WhiteSpace::PreWrap
+        || text
+            .get(position..)
+            .and_then(|suffix| suffix.chars().next())
+            .is_none_or(|character| !is_css_preserved_document_space(character))
+}
+
+fn pre_wrap_break_after_preserved_spaces(text: &str, position: usize) -> usize {
+    if position >= text.len() || !text.is_char_boundary(position) {
+        return position;
+    }
+    let mut end = position;
+    for character in text[position..].chars() {
+        if !is_css_preserved_document_space(character) || character == '\t' {
+            break;
+        }
+        end += character.len_utf8();
+    }
+    end
 }
 
 /// Return CSS Text soft-wrap positions after preserved tabs in `pre-wrap`.
@@ -236,13 +352,14 @@ fn pre_wrap_preserved_tab_breaks(text: &str) -> impl Iterator<Item = usize> + '_
 /// Return whether CSS Text allows a soft wrap at an atomic inline boundary.
 ///
 /// CSS Text says atomic inline-level boxes participate in Unicode line
-/// breaking as U+FFFC OBJECT REPLACEMENT CHARACTER. Reasyprint uses this
+/// breaking as U+FFFC OBJECT REPLACEMENT CHARACTER. Quire uses this
 /// helper for mixed inline line construction so no-break characters such as
 /// U+034F COMBINING GRAPHEME JOINER, U+200D ZERO WIDTH JOINER, and U+202F
 /// NARROW NO-BREAK SPACE can suppress the item boundary around an atomic box.
 /// CSS Text's atomic-inline tailoring still allows U+00A0 NBSP next to an
 /// atomic inline:
 /// <https://www.w3.org/TR/css-text-3/#line-break-details>.
+#[cfg(test)]
 pub(crate) fn inline_atomic_boundary_allows_soft_wrap(
     before: &str,
     after: &str,
@@ -261,6 +378,7 @@ pub(crate) fn inline_atomic_boundary_allows_soft_wrap(
         || nbsp_is_next_to_atomic_inline(before, after)
 }
 
+#[cfg(test)]
 fn nbsp_is_next_to_atomic_inline(before: &str, after: &str) -> bool {
     matches!(
         (before.chars().next_back(), after.chars().next()),
@@ -269,10 +387,36 @@ fn nbsp_is_next_to_atomic_inline(before: &str, after: &str) -> bool {
     )
 }
 
-pub(crate) fn grapheme_cluster_inner_boundaries(text: &str) -> Vec<usize> {
-    GraphemeClusterSegmenter::new()
-        .segment_str(text)
-        .filter(|position| *position > 0 && *position < text.len())
+/// Collect interior grapheme-cluster boundaries into caller-owned storage.
+pub(crate) fn collect_grapheme_cluster_inner_boundaries(text: &str, boundaries: &mut Vec<usize>) {
+    boundaries.clear();
+    boundaries.extend(
+        GraphemeClusterSegmenter::new()
+            .segment_str(text)
+            .filter(|position| *position > 0 && *position < text.len()),
+    );
+}
+
+/// Return `word-break: break-all` opportunities between typographic letters.
+///
+/// `break-all` adds opportunities between typographic letter units, but does
+/// not turn the boundary beside a white-space separator into a letter break.
+/// White-space processing supplies that boundary according to the owning
+/// `white-space` mode (notably after every preserved `break-spaces` space).
+/// Keeping the two sources distinct prevents an artificial boundary before a
+/// preserved space from displacing the legal after-space opportunity.
+/// <https://drafts.csswg.org/css-text-3/#word-break-property>
+pub(crate) fn word_break_all_inner_boundaries(text: &str) -> Vec<usize> {
+    let units = typographic_unit_ranges(text);
+    units
+        .windows(2)
+        .filter_map(|units| {
+            let previous = &text[units[0].clone()];
+            let next = &text[units[1].clone()];
+            (previous.chars().any(character_is_unicode_alphanumeric)
+                && next.chars().any(character_is_unicode_alphanumeric))
+            .then_some(units[0].end)
+        })
         .collect()
 }
 
@@ -286,14 +430,25 @@ pub(crate) fn grapheme_cluster_inner_boundaries(text: &str) -> Vec<usize> {
 /// <https://www.unicode.org/reports/tr14/#LB13>.
 fn apply_css_line_break_class_tailoring(
     text: &str,
-    style: &ComputedStyle,
+    policy: TextBreakPolicy,
     breaks: &mut Vec<usize>,
 ) {
     breaks.retain(|position| {
         let previous_allows_break = text[..*position]
             .chars()
             .next_back()
-            .is_none_or(|character| line_break_class(character) != LineBreak::OpenPunctuation);
+            .is_none_or(|character| {
+                let class = line_break_class(character);
+                class != LineBreak::OpenPunctuation
+                    // `break-all` relaxes letter-to-letter breaks only. ICU's
+                    // `BreakAll` mode can otherwise add a break after a PR
+                    // class; CSS Text retains the UAX #14 protected prefix
+                    // sequence in that case (for example `X\\\\`).
+                    // <https://drafts.csswg.org/css-text-3/#valdef-word-break-break-all>
+                    // <https://www.unicode.org/reports/tr14/#LB25>
+                    && (!matches!(policy.word_break, CssWordBreak::BreakAll)
+                        || class != LineBreak::PrefixNumeric)
+            });
         let next_allows_break = text[*position..]
             .chars()
             .next()
@@ -310,15 +465,44 @@ fn apply_css_line_break_class_tailoring(
         if let Some((_, previous)) = previous {
             let previous_class = line_break_class(previous);
             let current_class = line_break_class(character);
-            if !matches!(style.word_break, CssWordBreak::KeepAll)
+            if !matches!(policy.word_break, CssWordBreak::KeepAll)
                 && previous_class == LineBreak::Ideographic
                 && current_class == LineBreak::Ideographic
+            {
+                breaks.push(index);
+            }
+            // The bundled UAX #14 data may lack a language-specific CJK
+            // segmentation model. Preserve the ordinary ideograph/word
+            // opportunities in that fallback path: otherwise `中文english`
+            // becomes one unbreakable min-content unit even though CSS Text
+            // permits wrapping on either side of the Latin word. `keep-all`
+            // deliberately suppresses these boundaries below.
+            // <https://www.w3.org/TR/css-text-3/#word-break-property>
+            if !matches!(policy.word_break, CssWordBreak::KeepAll)
+                && ((previous_class == LineBreak::Ideographic
+                    && !character_is_css_other_space_separator(previous)
+                    && current_class != LineBreak::Ideographic
+                    && character_is_unicode_alphanumeric(character))
+                    || (current_class == LineBreak::Ideographic
+                        && !character_is_css_other_space_separator(character)
+                        && previous_class != LineBreak::Ideographic
+                        && character_is_unicode_alphanumeric(previous)))
             {
                 breaks.push(index);
             }
             if current_class == LineBreak::OpenPunctuation
                 && previous_class == LineBreak::Ideographic
             {
+                breaks.push(index);
+            }
+            // ICU's `keep-all` word option can suppress the ordinary UAX #14
+            // opportunity after a hyphen together with CJK word-unit
+            // opportunities. CSS Text keeps punctuation opportunities under
+            // `word-break: keep-all`, including LB21's post-HY boundary.
+            // Add it during common UAX tailoring so later keep-all filtering
+            // still has the same candidate set as normal line layout.
+            // <https://www.unicode.org/reports/tr14/#LB21>
+            if previous_class == LineBreak::Hyphen {
                 breaks.push(index);
             }
         }
@@ -332,8 +516,8 @@ fn apply_css_line_break_class_tailoring(
 /// CJK and non-CJK word units while keeping ordinary whitespace and punctuation
 /// opportunities available:
 /// <https://www.w3.org/TR/css-text-3/#word-break-property>.
-fn suppress_keep_all_unit_breaks(text: &str, style: &ComputedStyle, breaks: &mut Vec<usize>) {
-    if !matches!(style.word_break, CssWordBreak::KeepAll) {
+fn suppress_keep_all_unit_breaks(text: &str, policy: TextBreakPolicy, breaks: &mut Vec<usize>) {
+    if !matches!(policy.word_break, CssWordBreak::KeepAll) {
         return;
     }
     breaks.retain(|position| {
@@ -343,6 +527,42 @@ fn suppress_keep_all_unit_breaks(text: &str, style: &ComputedStyle, breaks: &mut
             (previous, next),
             (Some(previous), Some(next))
                 if keep_all_suppresses_break_between(previous, next)
+        )
+    });
+}
+
+/// Return whether `word-break: manual` suppresses an automatic break between
+/// two adjacent characters.
+///
+/// CSS Text 4 leaves explicit author opportunities such as spaces and U+200B
+/// intact, but disables automatic word-boundary detection in Southeast Asian
+/// scripts. UAX #14 marks the affected sequences with the `SA` class.  This
+/// predicate is shared by line collection and intrinsic sizing so both use the
+/// same definition of an automatic complex-context opportunity.
+/// <https://drafts.csswg.org/css-text-4/#word-boundary-detection> and
+/// <https://www.unicode.org/reports/tr14/#SA>
+pub(crate) fn manual_suppresses_break_between(previous: char, next: char) -> bool {
+    line_break_class(previous) == LineBreak::ComplexContext
+        && line_break_class(next) == LineBreak::ComplexContext
+}
+
+/// Suppress dictionary-derived breaks inside UAX #14 complex-context text for
+/// `word-break: manual`.
+fn suppress_manual_complex_context_breaks(
+    text: &str,
+    policy: TextBreakPolicy,
+    breaks: &mut Vec<usize>,
+) {
+    if !matches!(policy.word_break, CssWordBreak::Manual) {
+        return;
+    }
+    breaks.retain(|position| {
+        let previous = text[..*position].chars().next_back();
+        let next = text[*position..].chars().next();
+        !matches!(
+            (previous, next),
+            (Some(previous), Some(next))
+                if manual_suppresses_break_between(previous, next)
         )
     });
 }
@@ -370,4 +590,19 @@ pub(crate) fn contains_bidi_text(text: &str) -> bool {
     text.chars().any(|character| {
         character_has_rtl_bidi_class(character) || character_is_bidi_format_control(character)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn break_spaces_adds_opportunities_inside_ideographic_space_runs() {
+        let mut style = ComputedStyle::initial();
+        style.white_space = crate::css::WhiteSpace::BreakSpaces;
+        assert_eq!(
+            measured_break_opportunities("　XX　　XX", &style),
+            [3, 8, 11, 13]
+        );
+    }
 }

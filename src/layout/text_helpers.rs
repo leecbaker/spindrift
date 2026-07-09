@@ -1,5 +1,5 @@
 use super::*;
-use crate::text::character_is_unicode_letter;
+use crate::text::character_is_unicode_typographic_letter;
 use icu_casemap::{CaseMapper, TitlecaseMapper, options::TitlecaseOptions};
 use icu_locale_core::LanguageIdentifier;
 use icu_segmenter::{WordSegmenter, options::WordBreakInvariantOptions};

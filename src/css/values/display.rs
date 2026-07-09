@@ -64,6 +64,11 @@ pub(crate) fn parse_display(value: &str, current: Display) -> Display {
                     return current;
                 }
             }
+            "grid-lanes" => {
+                if inner.replace(DisplayInner::GridLanes).is_some() {
+                    return current;
+                }
+            }
             "list-item" => {
                 if list_item {
                     return current;
@@ -98,8 +103,16 @@ fn parse_display_legacy(lower: &str) -> Option<Display> {
         "inline-block" => Some(Display::INLINE_BLOCK),
         "flex" => Some(Display::FLEX),
         "inline-flex" => Some(Display::INLINE_FLEX),
+        // The legacy WebKit box model is a block-level flex formatting
+        // context. Its legacy behavior is retained separately on the
+        // computed style because properties such as `flex-wrap: balance` do
+        // not apply to it.
+        "-webkit-box" => Some(Display::FLEX),
+        "-webkit-inline-box" => Some(Display::INLINE_FLEX),
         "grid" => Some(Display::GRID),
         "inline-grid" => Some(Display::INLINE_GRID),
+        "grid-lanes" => Some(Display::GRID_LANES),
+        "inline-grid-lanes" => Some(Display::INLINE_GRID_LANES),
         "table" => Some(Display::TABLE),
         "inline-table" => Some(Display::INLINE_TABLE),
         "table-caption" => Some(Display::TABLE_CAPTION),

@@ -6,16 +6,34 @@ pub(crate) fn build_page_box<'a>(
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
 ) -> MutablePageBox<'a> {
-    build_page_box_inner(root, stylesheets, parent_style, None)
+    build_page_box_inner(root, stylesheets, parent_style, None, None)
 }
 
+/// Builds the document formatting tree with the used principal-flow axes.
+///
+/// CSS Writing Modes substitutes an eligible HTML body's writing mode and
+/// direction for the root element's used values. Supplying that substitution
+/// while constructing the root box makes inherited root pseudo-elements and
+/// descendants observe the same principal flow as the initial containing
+/// block.
+/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+pub(crate) fn build_page_box_with_principal_flow<'a>(
+    root: &'a Node,
+    stylesheets: &[Stylesheet],
+    parent_style: &ComputedStyle,
+    principal_flow: DocumentPrincipalFlow,
+) -> MutablePageBox<'a> {
+    build_page_box_inner(root, stylesheets, parent_style, None, Some(principal_flow))
+}
+
+#[cfg(test)]
 pub(crate) fn build_page_box_with_font_metrics<'a>(
     root: &'a Node,
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
     font_system: &mut FontSystem,
 ) -> MutablePageBox<'a> {
-    build_page_box_inner(root, stylesheets, parent_style, Some(font_system))
+    build_page_box_inner(root, stylesheets, parent_style, Some(font_system), None)
 }
 
 fn build_page_box_inner<'a>(
@@ -23,23 +41,71 @@ fn build_page_box_inner<'a>(
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
     font_system: Option<&mut FontSystem>,
+    principal_flow: Option<DocumentPrincipalFlow>,
 ) -> MutablePageBox<'a> {
-    let children = match &root.kind {
-        NodeKind::Element(element) => {
-            build_child_boxes_inner(element, stylesheets, parent_style, &[], true, font_system)
-        }
+    let built = match &root.kind {
+        NodeKind::Element(element) => build_child_boxes_inner(
+            element,
+            stylesheets,
+            parent_style,
+            &[],
+            true,
+            false,
+            font_system,
+            principal_flow,
+        ),
         NodeKind::Text(text) => {
             if text.is_empty() {
-                Vec::new()
+                BuiltChildren::default()
             } else {
-                vec![MutableFormattingBox::Text(MutableTextBox {
-                    text: text.clone(),
-                    style: Box::new(parent_style.clone()),
-                })]
+                BuiltChildren {
+                    boxes: vec![MutableFormattingBox::Text(MutableTextBox {
+                        text: text.clone(),
+                        style: inherited_text_style(parent_style),
+                    })],
+                    counter_events: Vec::new(),
+                }
             }
         }
     };
-    MutablePageBox { children }
+    MutablePageBox {
+        children: built.boxes,
+        counter_events: built.counter_events,
+    }
+}
+
+/// Text nodes inherit their parent's used font size. The parent may itself
+/// carry a relative deferred expression, so duplicating it would apply the
+/// expression a second time during pre-freeze resolution.
+fn inherited_text_style(parent_style: &ComputedStyle) -> Box<ComputedStyle> {
+    let mut style = parent_style.clone();
+    style.deferred_font_size = css::DeferredFontSize::Inherit;
+    Box::new(style)
+}
+
+/// Return the inherited text style for a text node flattened out of a
+/// `display: contents` element.
+///
+/// The flattened text box is physically reparented to the contents element's
+/// box parent, but its inherited values still come from the suppressed
+/// element. Store that already-computed font size as absolute so the later
+/// font-metric pass does not inherit again from the physical parent:
+/// <https://www.w3.org/TR/css-display-3/#valdef-display-contents>.
+fn flattened_contents_text_style(parent_style: &ComputedStyle) -> Box<ComputedStyle> {
+    let mut style = parent_style.clone();
+    style.deferred_font_size = css::DeferredFontSize::Absolute(style.font_size);
+    Box::new(style)
+}
+
+#[derive(Default)]
+struct BuiltChildren<'a> {
+    boxes: Vec<MutableFormattingBox<'a>>,
+    counter_events: Vec<CounterEventNode<'a>>,
+}
+
+struct BuiltElement<'a> {
+    box_: MutableFormattingBox<'a>,
+    counter_event: CounterEventNode<'a>,
 }
 
 pub(crate) fn build_child_boxes_with_font_metrics<'a>(
@@ -55,23 +121,31 @@ pub(crate) fn build_child_boxes_with_font_metrics<'a>(
         parent_style,
         ancestors,
         true,
+        false,
         Some(font_system),
+        None,
     )
+    .boxes
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_child_boxes_inner<'a>(
     element: &'a Element,
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
     ancestors: &[ElementSignature],
     normalize_for_parent: bool,
+    text_parent_is_flattened_contents: bool,
     mut font_system: Option<&mut FontSystem>,
-) -> Vec<MutableFormattingBox<'a>> {
+    principal_flow: Option<DocumentPrincipalFlow>,
+) -> BuiltChildren<'a> {
     let sibling_tags = element_sibling_signature_list(element);
     let mut element_index = 0usize;
     let mut raw = Vec::new();
+    let mut counter_events = Vec::new();
     push_generated_pseudo_box(
         &mut raw,
+        &mut counter_events,
         element,
         parent_style,
         parent_style.before_style.as_deref(),
@@ -80,10 +154,14 @@ fn build_child_boxes_inner<'a>(
     for child in &element.children {
         match &child.kind {
             NodeKind::Text(text) => {
-                if !text.is_empty() {
+                if !text.is_empty() && !element_suppresses_direct_text_children(element) {
                     raw.push(MutableFormattingBox::Text(MutableTextBox {
                         text: text.clone(),
-                        style: Box::new(parent_style.clone()),
+                        style: if text_parent_is_flattened_contents {
+                            flattened_contents_text_style(parent_style)
+                        } else {
+                            inherited_text_style(parent_style)
+                        },
                     }));
                 }
             }
@@ -95,6 +173,11 @@ fn build_child_boxes_inner<'a>(
                     sibling_tags.clone(),
                 );
                 element_index += 1;
+                if is_html_select_item_element(child_element)
+                    && !has_html_select_context(element, ancestors)
+                {
+                    continue;
+                }
                 let style = match font_system.as_deref_mut() {
                     Some(font_system) => {
                         let parent_ch_advance = font_system.ch_advance(parent_style);
@@ -134,6 +217,15 @@ fn build_child_boxes_inner<'a>(
                 } else {
                     style
                 };
+                let style = if ancestors.is_empty()
+                    && child_element.document_syntax == dom::DocumentSyntax::Html
+                    && child_element.tag.eq_ignore_ascii_case("html")
+                    && let Some(principal_flow) = principal_flow
+                {
+                    principal_flow_root_style(style, principal_flow)
+                } else {
+                    style
+                };
                 if style.display.is_contents() {
                     // CSS Display 3 `display: contents` suppresses the
                     // element's principal box but keeps its children in the box
@@ -142,15 +234,19 @@ fn build_child_boxes_inner<'a>(
                     // https://www.w3.org/TR/css-display-3/#valdef-display-contents
                     let mut child_ancestors = ancestors.to_vec();
                     child_ancestors.push(signature);
-                    raw.extend(build_child_boxes_inner(
+                    let built = build_child_boxes_inner(
                         child_element,
                         stylesheets,
                         &style,
                         &child_ancestors,
                         false,
+                        true,
                         font_system.as_deref_mut(),
-                    ));
-                } else if let Some(box_) = build_element_box(
+                        None,
+                    );
+                    raw.extend(built.boxes);
+                    counter_events.extend(built.counter_events);
+                } else if let Some(built) = build_element_box(
                     child_element,
                     signature,
                     style,
@@ -158,33 +254,55 @@ fn build_child_boxes_inner<'a>(
                     ancestors,
                     font_system.as_deref_mut(),
                 ) {
-                    raw.push(box_);
+                    raw.push(built.box_);
+                    counter_events.push(built.counter_event);
                 }
             }
         }
     }
     push_generated_pseudo_box(
         &mut raw,
+        &mut counter_events,
         element,
         parent_style,
         parent_style.after_style.as_deref(),
         GeneratedPseudoKind::After,
     );
-    if normalize_for_parent {
+    let boxes = if normalize_for_parent {
         normalize_block_container_children(raw, parent_style)
     } else {
         raw
+    };
+    BuiltChildren {
+        boxes,
+        counter_events,
     }
 }
 
-pub(crate) fn build_element_box<'a>(
+/// Applies the principal-flow used values to the HTML root's formatting style.
+///
+/// This intentionally happens after cascading: the root retains its computed
+/// declarations for selector matching, while its principal box, generated
+/// pseudo-elements, and inherited descendants use the CSS Writing Modes
+/// body-propagated axes.
+/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+fn principal_flow_root_style(
+    mut style: ComputedStyle,
+    principal_flow: DocumentPrincipalFlow,
+) -> ComputedStyle {
+    style.writing_mode = principal_flow.writing_mode;
+    style.direction = principal_flow.direction;
+    style
+}
+
+fn build_element_box<'a>(
     element: &'a Element,
     signature: ElementSignature,
     style: ComputedStyle,
     stylesheets: &[Stylesheet],
     ancestors: &[ElementSignature],
     font_system: Option<&mut FontSystem>,
-) -> Option<MutableFormattingBox<'a>> {
+) -> Option<BuiltElement<'a>> {
     let mut style = Box::new(style);
     if style.display.is_none() {
         return None;
@@ -198,8 +316,8 @@ pub(crate) fn build_element_box<'a>(
     let content_replacement = matches!(style.content, Content::Replacement { .. });
     let mut child_ancestors = ancestors.to_vec();
     child_ancestors.push(signature.clone());
-    let children = if content_replacement || is_horizontal_rule_element(element) {
-        Vec::new()
+    let built_children = if content_replacement || is_horizontal_rule_element(element) {
+        BuiltChildren::default()
     } else {
         build_child_boxes_inner(
             element,
@@ -207,11 +325,27 @@ pub(crate) fn build_element_box<'a>(
             &style,
             &child_ancestors,
             true,
+            false,
             font_system,
+            None,
         )
     };
+    let children = built_children.boxes;
+    let mut counter_children = built_children.counter_events;
     let marker = marker_box(&style);
+    if let Some(marker) = &marker {
+        counter_children.insert(
+            0,
+            CounterEventNode {
+                element,
+                source: CounterEventSource::Marker,
+                style: marker.style.as_ref().clone(),
+                children: Vec::new(),
+            },
+        );
+    }
     let source = BoxSource::Principal;
+    let counter_style = style.as_ref().clone();
 
     if content_replacement || is_replaced_element(element) {
         style.display = if style.display.is_block_level() {
@@ -221,7 +355,7 @@ pub(crate) fn build_element_box<'a>(
         } else {
             Display::INLINE_REPLACED.with_list_item(style.display.is_list_item())
         };
-        return if style.display.is_inline_or_run_in_level() {
+        let box_ = if style.display.is_inline_or_run_in_level() {
             Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
                 element,
                 signature,
@@ -240,12 +374,21 @@ pub(crate) fn build_element_box<'a>(
                 style,
                 children,
             }))
-        };
+        }?;
+        return Some(BuiltElement {
+            box_,
+            counter_event: CounterEventNode {
+                element,
+                source: CounterEventSource::Principal,
+                style: counter_style,
+                children: counter_children,
+            },
+        });
     }
 
-    if style.display.is_table() && style.display.is_inline_or_run_in_level() {
+    let box_ = if style.display.is_table() && style.display.is_inline_or_run_in_level() {
         let fragment = build_table_fragment(element, &signature, &children);
-        Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
+        MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
             element,
             signature,
             source,
@@ -253,12 +396,12 @@ pub(crate) fn build_element_box<'a>(
             style,
             children,
             table_fragment: Some(fragment),
-        }))
+        })
     } else if style.display.is_table()
         || (style.display.is_block_level() && is_html_table_element(element))
     {
         let fragment = build_table_fragment(element, &signature, &children);
-        Some(MutableFormattingBox::Table(MutableTableBox {
+        MutableFormattingBox::Table(MutableTableBox {
             element,
             signature,
             source,
@@ -266,20 +409,20 @@ pub(crate) fn build_element_box<'a>(
             style,
             children,
             fragment,
-        }))
+        })
     } else if style.display.is_flex() && style.display.is_block_level() {
-        Some(MutableFormattingBox::Flex(MutableFlexBox {
+        MutableFormattingBox::Flex(MutableFlexBox {
             element,
             signature,
             source,
             marker,
             style,
             children,
-        }))
+        })
     } else if style.display.is_atomic_inline()
         || (style.display.is_run_in() && !style.display.is_flow())
     {
-        Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
+        MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
             element,
             signature,
             source,
@@ -287,9 +430,9 @@ pub(crate) fn build_element_box<'a>(
             style,
             children,
             table_fragment: None,
-        }))
+        })
     } else if style.display.is_block_level() {
-        Some(MutableFormattingBox::Block(MutableBlockBox {
+        MutableFormattingBox::Block(MutableBlockBox {
             element,
             signature,
             source,
@@ -297,9 +440,9 @@ pub(crate) fn build_element_box<'a>(
             style,
             run_in_children: Vec::new(),
             children,
-        }))
+        })
     } else {
-        Some(MutableFormattingBox::Inline(MutableInlineBox {
+        MutableFormattingBox::Inline(MutableInlineBox {
             element,
             signature,
             source,
@@ -307,12 +450,22 @@ pub(crate) fn build_element_box<'a>(
             style,
             fragment_edges: InlineBoxFragmentEdges::ALL,
             children,
-        }))
-    }
+        })
+    };
+    Some(BuiltElement {
+        box_,
+        counter_event: CounterEventNode {
+            element,
+            source: CounterEventSource::Principal,
+            style: counter_style,
+            children: counter_children,
+        },
+    })
 }
 
 fn push_generated_pseudo_box<'a>(
     output: &mut Vec<MutableFormattingBox<'a>>,
+    counter_events: &mut Vec<CounterEventNode<'a>>,
     originating_element: &'a Element,
     originating_style: &ComputedStyle,
     pseudo_style: Option<&ComputedStyle>,
@@ -342,6 +495,15 @@ fn push_generated_pseudo_box<'a>(
         kind,
     ) {
         output.push(box_);
+        counter_events.push(CounterEventNode {
+            element: originating_element,
+            source: match kind {
+                GeneratedPseudoKind::Before => CounterEventSource::Before,
+                GeneratedPseudoKind::After => CounterEventSource::After,
+            },
+            style: pseudo_style.clone(),
+            children: Vec::new(),
+        });
     }
 }
 
@@ -685,14 +847,11 @@ fn table_fragment_row_child_cells<'a>(
             });
             continue;
         }
-        if is_table_column_box(element, style)
-            || is_table_column_group_box(element, style)
-            || is_table_caption_box(element, style)
-            || is_table_row_group_box(element, style)
-            || is_table_row_box(element, style)
-        {
-            continue;
-        }
+        // CSS Tables fixup generates missing child wrappers before missing
+        // parents. A table-internal child that is not a real cell therefore
+        // belongs to the current anonymous-cell run; the cell flush then wraps
+        // any misparented table-internal boxes in their missing table objects.
+        // <https://drafts.csswg.org/css-tables-3/#fixup>.
         anonymous_cell_children.push(child.clone());
     }
     flush_anonymous_table_fragment_cell(&mut cells, &mut anonymous_cell_children);
@@ -702,20 +861,34 @@ fn table_fragment_row_child_cells<'a>(
 /// Return whether whitespace is ignored while fixing up table-internal boxes.
 ///
 /// CSS Tables ignores whitespace-only anonymous inline boxes that touch
-/// table-internal boxes, but the consecutive-box rules keep whitespace between
-/// non-internal siblings so it can participate in the generated anonymous cell:
+/// table-internal boxes, even when CSS Text would preserve those glyphs, but
+/// the consecutive-box rules keep whitespace between non-internal siblings so
+/// it can participate in the generated anonymous cell:
 /// <https://drafts.csswg.org/css-tables/#consecutive-boxes>.
 fn table_fragment_whitespace_is_ignorable(
     children: &[MutableFormattingBox<'_>],
     index: usize,
 ) -> bool {
-    children
+    if !children
         .get(index)
-        .is_some_and(formatting_box_is_collapsible_space)
-        && (index == 0
-            || index + 1 == children.len()
-            || table_fragment_box_is_internal_or_caption(&children[index - 1])
-            || table_fragment_box_is_internal_or_caption(&children[index + 1]))
+        .is_some_and(formatting_box_is_document_whitespace)
+    {
+        return false;
+    }
+
+    // A CSS Tables whitespace box is a sequence of anonymous inline boxes.
+    // HTML comments can split source indentation into several text nodes, so
+    // inspect the sequence's non-whitespace neighbors rather than only the
+    // immediately adjacent node.
+    let previous = children[..index]
+        .iter()
+        .rev()
+        .find(|child| !formatting_box_is_document_whitespace(child));
+    let next = children[index + 1..]
+        .iter()
+        .find(|child| !formatting_box_is_document_whitespace(child));
+    previous.is_none_or(table_fragment_box_is_internal_or_caption)
+        || next.is_none_or(table_fragment_box_is_internal_or_caption)
 }
 
 fn table_fragment_box_is_internal_or_caption(box_: &MutableFormattingBox<'_>) -> bool {
@@ -745,21 +918,22 @@ fn flush_anonymous_table_fragment_cell<'a>(
     if children.is_empty() {
         return;
     }
-    let children = anonymous_table_fragment_cell_children(children);
+    let (style, children) = anonymous_table_fragment_cell_style_and_children(children);
     cells.push(MutableTableFragmentCell {
         element: None,
         signature: ElementSignature::new("td", HashMap::new()),
-        style: None,
+        style: Some(Box::new(style)),
         children,
         anonymous: true,
     });
 }
 
-fn anonymous_table_fragment_cell_children<'a>(
+fn anonymous_table_fragment_cell_style_and_children<'a>(
     children: &mut Vec<MutableFormattingBox<'a>>,
-) -> Vec<MutableFormattingBox<'a>> {
+) -> (ComputedStyle, Vec<MutableFormattingBox<'a>>) {
     let parent_style = anonymous_table_fragment_cell_parent_style(children);
-    normalize_orphan_table_internal_boxes(std::mem::take(children), &parent_style)
+    let normalized = normalize_orphan_table_internal_boxes(std::mem::take(children), &parent_style);
+    (parent_style, normalized)
 }
 
 /// Build the effective parent style used while normalizing anonymous cell content.
@@ -802,12 +976,19 @@ fn flush_anonymous_table_fragment_row<'a>(
     if cells.is_empty() {
         return;
     }
+    let mut style = css::anonymous_block_style(
+        cells[0]
+            .style
+            .as_deref()
+            .expect("anonymous table cells carry their inherited style"),
+    );
+    style.display = Display::TABLE_ROW;
     rows.push(MutableTableFragmentRow {
         element: cells[0].element,
         signature: ElementSignature::new("tr", HashMap::new()),
         ancestors: ancestors.to_vec(),
         row_groups: row_groups.to_vec(),
-        style: Some(Box::new(css::default_style_for_tag("tr"))),
+        style: Some(Box::new(style)),
         cells: std::mem::take(cells),
     });
 }
@@ -822,7 +1003,7 @@ fn table_fragment_grid(rows: &[MutableTableFragmentRow<'_>]) -> TableFragmentGri
         let mut placements = Vec::new();
         let mut column = 0usize;
         for (cell_index, cell) in row.cells.iter().enumerate() {
-            while active_rowspans.get(column).copied().unwrap_or(0) > 0 {
+            while active_rowspans.get(column).cloned().unwrap_or(0) > 0 {
                 column += 1;
             }
 
@@ -850,7 +1031,7 @@ fn table_fragment_grid(rows: &[MutableTableFragmentRow<'_>]) -> TableFragmentGri
         for active in &mut active_rowspans {
             *active = active.saturating_sub(1);
         }
-        while active_rowspans.last().copied() == Some(0) {
+        while active_rowspans.last().cloned() == Some(0) {
             active_rowspans.pop();
         }
         grid_rows.push(placements);

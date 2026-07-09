@@ -349,7 +349,7 @@ fn split_inline_block_context_or_part<'a>(
     box_: &MutableInlineBox<'a>,
     part: MutableFormattingBox<'a>,
 ) -> MutableFormattingBox<'a> {
-    if !split_inline_style_needs_block_context(&box_.style) {
+    if !split_inline_style_needs_block_context(box_.element, &box_.style) {
         return part;
     }
     MutableFormattingBox::InlineSplitBlockContext(MutableInlineSplitBlockContextBox {
@@ -361,17 +361,18 @@ fn split_inline_block_context_or_part<'a>(
     })
 }
 
-fn split_inline_style_needs_block_context(style: &ComputedStyle) -> bool {
+fn split_inline_style_needs_block_context(element: &Element, style: &ComputedStyle) -> bool {
     matches!(style.position, Position::Relative | Position::Sticky)
         || style.z_index.is_some()
         || style.opacity < 1.0
-        || !style.transform.is_empty()
+        || style.has_transform()
         || style.isolation == Isolation::Isolate
         || style.mix_blend_mode != MixBlendMode::Normal
         || !matches!(style.filter, FilterValue::None)
         || style.clip_path != ClipPath::None
         || style.mask != MaskValue::None
-        || style.contain.paint
+        || (property_containment_applies_to_element(element, style)
+            && (style.contain.layout || style.contain.paint))
         || matches!(
             style.content_visibility,
             ContentVisibility::Auto | ContentVisibility::Hidden
@@ -654,7 +655,7 @@ pub(crate) fn anonymous_table_style(parent_style: &ComputedStyle) -> ComputedSty
     style.text_justify = parent_style.text_justify;
     style.font_style = parent_style.font_style;
     style.font_width = parent_style.font_width;
-    style.text_decoration = parent_style.text_decoration;
+    style.text_decoration = parent_style.text_decoration.clone();
     style.font_family = parent_style.font_family.clone();
     style.font_feature_settings = parent_style.font_feature_settings.clone();
     style.font_kerning = parent_style.font_kerning;
@@ -666,17 +667,18 @@ pub(crate) fn anonymous_table_style(parent_style: &ComputedStyle) -> ComputedSty
     style.font_variant_east_asian = parent_style.font_variant_east_asian.clone();
     style.font_variant_emoji = parent_style.font_variant_emoji;
     style.language = parent_style.language.clone();
-    style.line_height_value = parent_style.line_height_value;
+    style.line_height_value = parent_style.line_height_value.clone();
     style.line_height_multiplier = parent_style.line_height_multiplier;
     style.line_height_is_normal = parent_style.line_height_is_normal;
-    style.word_spacing = parent_style.word_spacing;
+    style.word_spacing = parent_style.word_spacing.clone();
     style.text_transform = parent_style.text_transform;
-    style.tab_size = parent_style.tab_size;
+    style.tab_size = parent_style.tab_size.clone();
     style.white_space = parent_style.white_space;
     style.word_break = parent_style.word_break;
     style.overflow_wrap = parent_style.overflow_wrap;
     style.line_break = parent_style.line_break;
     style.hyphens = parent_style.hyphens;
+    style.hyphenate_character = parent_style.hyphenate_character.clone();
     style.hyphenate_limit_chars = parent_style.hyphenate_limit_chars;
     style.visibility = parent_style.visibility;
     style.list_style_type = parent_style.list_style_type.clone();
@@ -685,13 +687,17 @@ pub(crate) fn anonymous_table_style(parent_style: &ComputedStyle) -> ComputedSty
     style.list_style_image_base_url = parent_style.list_style_image_base_url.clone();
     style.list_style_image_root_url = parent_style.list_style_image_root_url.clone();
     style.font_size = parent_style.font_size;
+    // The copied font size is already the parent's computed value.  Preserve
+    // that inheritance during the later font-metric resolution pass rather
+    // than reapplying the synthetic table style's initial 12pt value.
+    style.deferred_font_size = css::DeferredFontSize::Inherit;
     style.font_size_adjust = parent_style.font_size_adjust;
     style.line_height = parent_style.line_height;
     style.font_weight = parent_style.font_weight;
     style.border_collapse = parent_style.border_collapse;
     style.caption_side = parent_style.caption_side;
     style.empty_cells = parent_style.empty_cells;
-    style.border_spacing = parent_style.border_spacing;
+    style.border_spacing = parent_style.border_spacing.clone();
     style.border_spacing_explicit = parent_style.border_spacing_explicit;
     style
 }
@@ -723,7 +729,7 @@ pub(crate) fn flush_anonymous_block<'a>(
     }
     normalized.push(MutableFormattingBox::AnonymousBlock(
         MutableAnonymousBlockBox {
-            style: Box::new(parent_style.clone()),
+            style: Box::new(css::anonymous_block_style(parent_style)),
             children: std::mem::take(inline_run),
         },
     ));
@@ -734,6 +740,19 @@ where
     S: AsRef<ComputedStyle>,
 {
     matches!(box_, FormattingBoxWith::Text(text) if text_is_css_collapsible_space(&text.text, text.style.as_ref()))
+}
+
+/// Return whether a formatting box is a whitespace-only anonymous inline box.
+///
+/// CSS Tables removes these boxes while fixing up table-internal children even
+/// when the inherited `white-space` mode preserves their glyphs. This is a
+/// table-structure rule, rather than CSS Text's layout-time collapsing step:
+/// <https://drafts.csswg.org/css-tables-3/#anonymous-boxes>.
+pub(crate) fn formatting_box_is_document_whitespace<S>(box_: &FormattingBoxWith<'_, S>) -> bool
+where
+    S: AsRef<ComputedStyle>,
+{
+    matches!(box_, FormattingBoxWith::Text(text) if crate::text::text_is_css_collapsible_whitespace(&text.text))
 }
 
 pub(crate) fn is_inline_level_box<S>(box_: &FormattingBoxWith<'_, S>) -> bool

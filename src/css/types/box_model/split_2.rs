@@ -125,6 +125,73 @@ impl TextBoxEdge {
     }
 }
 
+/// Computed CSS `initial-letter`.
+///
+/// CSS Inline Layout Level 3 defines initial letters as inline-level boxes
+/// with special line-spanning layout. The computed value is either `normal` or
+/// a requested size paired with an integer sink:
+/// <https://drafts.csswg.org/css-inline-3/#initial-letter-property>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum InitialLetter {
+    Normal,
+    Specified { size: f32, sink: u32 },
+}
+
+impl InitialLetter {
+    pub(crate) fn is_normal(self) -> bool {
+        matches!(self, Self::Normal)
+    }
+
+    pub(crate) fn specified(self) -> Option<(f32, u32)> {
+        match self {
+            Self::Normal => None,
+            Self::Specified { size, sink } => Some((size, sink)),
+        }
+    }
+}
+
+/// Baseline alignment keyword for `initial-letter-align`.
+///
+/// CSS Inline uses these keywords to choose the over/under alignment points
+/// used when sizing and positioning an initial letter:
+/// <https://drafts.csswg.org/css-inline-3/#propdef-initial-letter-align>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitialLetterAlignKeyword {
+    Alphabetic,
+    Ideographic,
+    Hanging,
+    Leading,
+}
+
+/// Computed CSS `initial-letter-align`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InitialLetterAlign {
+    pub(crate) border_box: bool,
+    pub(crate) keyword: InitialLetterAlignKeyword,
+}
+
+impl InitialLetterAlign {
+    pub(crate) const ALPHABETIC: Self = Self {
+        border_box: false,
+        keyword: InitialLetterAlignKeyword::Alphabetic,
+    };
+}
+
+/// Computed CSS `initial-letter-wrap`.
+///
+/// The `first`, `all`, and `grid` values are at-risk in CSS Inline 3 but are
+/// modeled so layout can distinguish rectangular wrapping, glyph-contour
+/// wrapping, grid expansion, and explicit author offsets:
+/// <https://drafts.csswg.org/css-inline-3/#propdef-initial-letter-wrap>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum InitialLetterWrap {
+    None,
+    First,
+    All,
+    Grid,
+    Offset(ComputedLengthPercentage),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AlignmentBaseline {
     Baseline,
@@ -138,7 +205,7 @@ pub(crate) enum BaselineSource {
     Last,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BaselineShift {
     LengthPercentage(ComputedLengthPercentage),
     Sub,
@@ -151,27 +218,14 @@ pub(crate) enum BaselineShift {
 impl BaselineShift {
     pub(crate) const ZERO: Self = Self::LengthPercentage(ComputedLengthPercentage::ZERO);
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Self::LengthPercentage(value) = self {
             value.resolve_font_metric_lengths(ch_advance);
         }
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        if let Self::LengthPercentage(value) = self {
-            value.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
-        }
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
     }
 
     /// Resolve `<length-percentage>` against the element's own line-height.
@@ -179,12 +233,12 @@ impl BaselineShift {
     /// CSS Inline Layout Level 3 defines percentages on `baseline-shift` as
     /// percentages of the element's own line-height:
     /// <https://drafts.csswg.org/css-inline-3/#baseline-shift-property>.
-    pub(crate) fn length_percentage_shift(self, line_height: f32) -> f32 {
+    pub(crate) fn length_percentage_shift(&self, line_height: LayoutLength) -> LayoutLength {
         match self {
             Self::LengthPercentage(value) => value
-                .used_length_with_percentage_basis(line_height)
-                .unwrap_or(value.length_with_percentage_basis(line_height)),
-            _ => 0.0,
+                .used_length_with_percentage_basis(PercentageBasis::definite(line_height))
+                .unwrap_or(value.fixed_component()),
+            _ => layout_pt(0.0),
         }
     }
 }
@@ -197,7 +251,7 @@ pub(crate) enum TableCellVerticalAlign {
     Bottom,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct VerticalAlign {
     pub(crate) dominant_baseline: DominantBaseline,
     pub(crate) alignment_baseline: AlignmentBaseline,
@@ -238,23 +292,12 @@ impl VerticalAlign {
         self
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.baseline_shift.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.baseline_shift.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.baseline_shift.requires_ch_advance()
     }
 
     /// Return whether `baseline-shift` positions the aligned subtree relative
@@ -273,7 +316,7 @@ impl VerticalAlign {
     /// Resolve the `baseline-shift` longhand against the element's own line-height.
     ///
     /// Positive values raise the box and negative values lower it.
-    pub(crate) fn length_percentage_shift(self, line_height: f32) -> f32 {
+    pub(crate) fn length_percentage_shift(self, line_height: LayoutLength) -> LayoutLength {
         self.baseline_shift.length_percentage_shift(line_height)
     }
 }
@@ -288,6 +331,34 @@ pub(crate) enum WhiteSpace {
     BreakSpaces,
 }
 
+/// Computed CSS Text wrapping mode.
+///
+/// `white-space` is a legacy shorthand that also sets this component, but
+/// `text-wrap-mode` can subsequently override it without changing collapse or
+/// segment-break preservation. CSS Text Level 4 defines it as an inherited
+/// longhand: <https://drafts.csswg.org/css-text-4/#text-wrap-mode-property>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextWrapMode {
+    /// No CSS `text-wrap-mode` longhand has overridden the legacy shorthand.
+    /// This internal state preserves the semantic relationship for styles
+    /// assembled directly by layout and UA code.
+    Legacy,
+    Wrap,
+    NoWrap,
+}
+
+/// Computed CSS Text wrapping style.
+///
+/// The style selects among the graph's already-legal soft wrap opportunities;
+/// it must never create an opportunity forbidden by `text-wrap-mode` or
+/// `white-space`. <https://drafts.csswg.org/css-text-4/#text-wrap-style-property>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextWrapStyle {
+    Auto,
+    Balance,
+    Stable,
+}
+
 impl WhiteSpace {
     pub(crate) fn collapses_spaces(self) -> bool {
         matches!(self, Self::Normal | Self::NoWrap | Self::PreLine)
@@ -300,19 +371,16 @@ impl WhiteSpace {
         )
     }
 
-    pub(crate) fn allows_soft_wrap(self) -> bool {
-        !matches!(self, Self::NoWrap | Self::Pre)
-    }
-
     /// Return whether trailing Unicode space separators hang at line end.
     ///
     /// CSS Text white-space processing makes trailing "other space
-    /// separators" hang for `normal`, `nowrap`, and `pre-line`; preserved
-    /// modes keep their own edge-space behavior, and `break-spaces` explicitly
-    /// prevents this hanging:
+    /// separators" hang in every legacy white-space mode other than
+    /// `break-spaces`. Unlike U+0020, these Unicode separators are not
+    /// document white space, so `pre` and `pre-wrap` preservation does not
+    /// suppress the Phase II hanging rule:
     /// <https://www.w3.org/TR/css-text-3/#white-space-phase-2>.
     pub(crate) fn hangs_trailing_space_separators(self) -> bool {
-        matches!(self, Self::Normal | Self::NoWrap | Self::PreLine)
+        self != Self::BreakSpaces
     }
 }
 
@@ -321,6 +389,15 @@ pub(crate) enum WordBreak {
     Normal,
     BreakAll,
     KeepAll,
+    /// CSS Text 4 disables automatic word-boundary detection in complex
+    /// (notably Southeast Asian) scripts while retaining manual breaks.
+    /// <https://drafts.csswg.org/css-text-4/#word-boundary-detection>
+    Manual,
+    /// Legacy `word-break: break-word` behaves as `overflow-wrap: anywhere`
+    /// for line breaking and intrinsic sizing, without changing the authored
+    /// `overflow-wrap` computed value.
+    /// <https://drafts.csswg.org/css-text-3/#valdef-word-break-break-word>
+    BreakWord,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +419,65 @@ pub(crate) enum Overflow {
     Clip,
     Scroll,
     Auto,
+}
+
+/// Computed CSS Scroll Snap container policy.
+///
+/// Logical axes stay unresolved until layout maps them through the container's
+/// writing mode.
+/// <https://www.w3.org/TR/css-scroll-snap-1/#propdef-scroll-snap-type>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ScrollSnapType {
+    #[default]
+    None,
+    X(ScrollSnapStrictness),
+    Y(ScrollSnapStrictness),
+    Block(ScrollSnapStrictness),
+    Inline(ScrollSnapStrictness),
+    Both(ScrollSnapStrictness),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollSnapStrictness {
+    Mandatory,
+    Proximity,
+}
+
+/// Per-logical-axis alignment contributed by a scroll snap area.
+/// <https://www.w3.org/TR/css-scroll-snap-1/#propdef-scroll-snap-align>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ScrollSnapAlign {
+    pub(crate) block: ScrollSnapAlignment,
+    pub(crate) inline: ScrollSnapAlignment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ScrollSnapAlignment {
+    #[default]
+    None,
+    Start,
+    End,
+    Center,
+}
+
+/// Directional scrolling trap policy. Static rendering retains it as a
+/// computed value even though no directional operation occurs.
+/// <https://www.w3.org/TR/css-scroll-snap-1/#propdef-scroll-snap-stop>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ScrollSnapStop {
+    #[default]
+    Normal,
+    Always,
+}
+
+/// One computed `scroll-padding-*` edge. `auto` remains distinct until used
+/// values are resolved against a concrete scrollport.
+/// <https://www.w3.org/TR/css-scroll-snap-1/#propdef-scroll-padding>
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) enum ScrollPadding {
+    #[default]
+    Auto,
+    LengthPercentage(ComputedLengthPercentage),
 }
 
 impl Overflow {
@@ -378,6 +514,30 @@ pub(crate) enum Hyphens {
     Auto,
 }
 
+/// Computed CSS `hyphenate-character` value.
+///
+/// CSS Text inserts this string only when a selected line ends at a manual or
+/// automatic hyphenation opportunity. `auto` intentionally remains distinct
+/// from an authored string so a future language/font-specific UA default does
+/// not lose that distinction during cascade:
+/// <https://drafts.csswg.org/css-text-4/#hyphenate-character>.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum HyphenateCharacter {
+    #[default]
+    Auto,
+    String(String),
+}
+
+impl HyphenateCharacter {
+    /// Quire's current UA `auto` glyph, pending language-specific defaults.
+    pub(crate) fn used_text(&self) -> &str {
+        match self {
+            Self::Auto => "-",
+            Self::String(value) => value,
+        }
+    }
+}
+
 /// Computed value of CSS `hyphenate-limit-chars`.
 ///
 /// CSS Text defines this as total word characters, characters before the
@@ -402,4 +562,18 @@ impl HyphenateLimitChars {
         before: Self::AUTO_BEFORE,
         after: Self::AUTO_AFTER,
     };
+}
+
+impl ResolveViewportLengths for BaselineShift {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_viewport_lengths(basis);
+        }
+    }
+}
+
+impl ResolveViewportLengths for VerticalAlign {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.baseline_shift.resolve_viewport_lengths(basis);
+    }
 }

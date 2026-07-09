@@ -1,31 +1,166 @@
 use super::*;
 
-pub(super) fn image_key(image: &RenderedImage) -> ImageKey {
-    let data = image_resource_data(image);
-    ImageKey {
-        pixel_width: data.pixel_width,
-        pixel_height: data.pixel_height,
-        interpolate: image.interpolate,
-        rgb: data.rgb,
-        alpha: data.alpha,
+pub(super) fn image_source(image: &RenderedImage) -> ImageResourceSource {
+    match &image.source {
+        crate::document::RenderedImageSource::Stored {
+            image_id,
+            source_rect,
+            ..
+        } => ImageResourceSource::Stored {
+            image_id: *image_id,
+            source_rect: *source_rect,
+            interpolate: image.interpolate,
+        },
+        crate::document::RenderedImageSource::Inline { raster, .. } => {
+            ImageResourceSource::Inline {
+                pixel_width: raster.pixel_width,
+                pixel_height: raster.pixel_height,
+                interpolate: image.interpolate,
+                color_space: raster.color_space.clone(),
+                rgb: Rc::clone(&raster.rgb),
+                alpha: raster.alpha.clone(),
+            }
+        }
     }
 }
 
-pub(super) fn image_resource_data(image: &RenderedImage) -> ImageResourceData {
-    let Some(source_rect) = image.source_rect else {
-        return ImageResourceData {
-            pixel_width: image.pixel_width,
-            pixel_height: image.pixel_height,
-            rgb: image.rgb.clone(),
-            alpha: image.alpha.clone(),
-        };
+pub(super) fn image_pattern_source(pattern: &RenderedImagePattern) -> ImageResourceSource {
+    match &pattern.source {
+        crate::document::RenderedImageSource::Stored {
+            image_id,
+            source_rect,
+            ..
+        } => ImageResourceSource::Stored {
+            image_id: *image_id,
+            source_rect: *source_rect,
+            interpolate: pattern.interpolate,
+        },
+        crate::document::RenderedImageSource::Inline { raster, .. } => {
+            ImageResourceSource::Inline {
+                pixel_width: raster.pixel_width,
+                pixel_height: raster.pixel_height,
+                interpolate: pattern.interpolate,
+                color_space: raster.color_space.clone(),
+                rgb: Rc::clone(&raster.rgb),
+                alpha: raster.alpha.clone(),
+            }
+        }
+    }
+}
+
+/// Expand one lightweight image source immediately before its PDF objects are
+/// emitted. The resulting pixels must not escape the writer's per-image loop.
+pub(super) fn materialize_image_resource(
+    image_store: &crate::image_store::DocumentImageStore,
+    source: &ImageResourceSource,
+) -> ImageResource {
+    match source {
+        ImageResourceSource::Stored {
+            image_id,
+            source_rect,
+            interpolate,
+        } => image_store
+            .with_rasterized(*image_id, |raster| {
+                let data = crop_image_resource_data(
+                    raster.metadata.pixel_width,
+                    raster.metadata.pixel_height,
+                    raster.rgb,
+                    raster.alpha,
+                    *source_rect,
+                );
+                ImageResource {
+                    pixel_width: data.pixel_width,
+                    pixel_height: data.pixel_height,
+                    interpolate: *interpolate,
+                    color_space: raster.color_space,
+                    rgb: data.rgb,
+                    alpha: data.alpha,
+                }
+            })
+            .unwrap_or_else(|| transparent_fallback(*interpolate)),
+        ImageResourceSource::Inline {
+            pixel_width,
+            pixel_height,
+            interpolate,
+            color_space,
+            rgb,
+            alpha,
+        } => ImageResource {
+            pixel_width: *pixel_width,
+            pixel_height: *pixel_height,
+            interpolate: *interpolate,
+            color_space: color_space.clone(),
+            rgb: rgb.to_vec(),
+            alpha: alpha.as_deref().map(ToOwned::to_owned),
+        },
+    }
+}
+
+#[cfg(test)]
+pub(super) fn image_resource_data(
+    image_store: &crate::image_store::DocumentImageStore,
+    image: &RenderedImage,
+) -> ImageResourceData {
+    let (pixel_width, pixel_height, rgb, alpha) = match &image.source {
+        crate::document::RenderedImageSource::Stored { image_id, .. } => {
+            match image_store.with_rasterized(*image_id, |raster| {
+                (
+                    raster.metadata.pixel_width,
+                    raster.metadata.pixel_height,
+                    raster.rgb,
+                    raster.alpha,
+                )
+            }) {
+                Some(raster) => raster,
+                None => {
+                    return ImageResourceData {
+                        pixel_width: 1,
+                        pixel_height: 1,
+                        rgb: vec![0, 0, 0],
+                        alpha: Some(vec![0]),
+                    };
+                }
+            }
+        }
+        crate::document::RenderedImageSource::Inline { raster, .. } => (
+            raster.pixel_width,
+            raster.pixel_height,
+            raster.rgb.to_vec(),
+            raster.alpha.as_deref().map(ToOwned::to_owned),
+        ),
     };
-    let x0 = source_rect.x.min(image.pixel_width);
-    let y0 = source_rect.y.min(image.pixel_height);
-    let x1 = x0.saturating_add(source_rect.width).min(image.pixel_width);
-    let y1 = y0
-        .saturating_add(source_rect.height)
-        .min(image.pixel_height);
+    let source_rect = image.source_rect().unwrap_or(RenderedImageSourceRect {
+        x: 0,
+        y: 0,
+        width: pixel_width,
+        height: pixel_height,
+    });
+    crop_image_resource_data(pixel_width, pixel_height, rgb, alpha, source_rect)
+}
+
+fn crop_image_resource_data(
+    pixel_width: u32,
+    pixel_height: u32,
+    rgb: Vec<u8>,
+    alpha: Option<Vec<u8>>,
+    source_rect: RenderedImageSourceRect,
+) -> ImageResourceData {
+    if source_rect.x == 0
+        && source_rect.y == 0
+        && source_rect.width == pixel_width
+        && source_rect.height == pixel_height
+    {
+        return ImageResourceData {
+            pixel_width,
+            pixel_height,
+            rgb,
+            alpha,
+        };
+    }
+    let x0 = source_rect.x.min(pixel_width);
+    let y0 = source_rect.y.min(pixel_height);
+    let x1 = x0.saturating_add(source_rect.width).min(pixel_width);
+    let y1 = y0.saturating_add(source_rect.height).min(pixel_height);
     let cropped_width = x1.saturating_sub(x0);
     let cropped_height = y1.saturating_sub(y0);
     if cropped_width == 0 || cropped_height == 0 {
@@ -37,17 +172,18 @@ pub(super) fn image_resource_data(image: &RenderedImage) -> ImageResourceData {
         };
     }
 
-    let mut rgb = Vec::with_capacity(cropped_width as usize * cropped_height as usize * 3);
-    let mut alpha = image
-        .alpha
+    let source_rgb = rgb;
+    let source_alpha = alpha;
+    let mut cropped_rgb = Vec::with_capacity(cropped_width as usize * cropped_height as usize * 3);
+    let mut cropped_alpha = source_alpha
         .as_ref()
         .map(|_| Vec::with_capacity(cropped_width as usize * cropped_height as usize));
     for source_y in y0..y1 {
-        let row_start = (source_y as usize * image.pixel_width as usize + x0 as usize) * 3;
+        let row_start = (source_y as usize * pixel_width as usize + x0 as usize) * 3;
         let row_end = row_start + cropped_width as usize * 3;
-        rgb.extend_from_slice(&image.rgb[row_start..row_end]);
-        if let (Some(source_alpha), Some(cropped_alpha)) = (&image.alpha, &mut alpha) {
-            let alpha_row_start = source_y as usize * image.pixel_width as usize + x0 as usize;
+        cropped_rgb.extend_from_slice(&source_rgb[row_start..row_end]);
+        if let (Some(source_alpha), Some(cropped_alpha)) = (&source_alpha, &mut cropped_alpha) {
+            let alpha_row_start = source_y as usize * pixel_width as usize + x0 as usize;
             let alpha_row_end = alpha_row_start + cropped_width as usize;
             cropped_alpha.extend_from_slice(&source_alpha[alpha_row_start..alpha_row_end]);
         }
@@ -55,8 +191,19 @@ pub(super) fn image_resource_data(image: &RenderedImage) -> ImageResourceData {
     ImageResourceData {
         pixel_width: cropped_width,
         pixel_height: cropped_height,
-        rgb,
-        alpha,
+        rgb: cropped_rgb,
+        alpha: cropped_alpha,
+    }
+}
+
+fn transparent_fallback(interpolate: bool) -> ImageResource {
+    ImageResource {
+        pixel_width: 1,
+        pixel_height: 1,
+        interpolate,
+        color_space: crate::color::RasterColorSpace::SRGB,
+        rgb: vec![0, 0, 0],
+        alpha: Some(vec![0]),
     }
 }
 
@@ -131,12 +278,26 @@ pub(super) fn page_ext_gstate_resources(page: &Page) -> Vec<ExtGStateResource> {
     for stroke in &page.strokes {
         collect_alpha_key(&mut alpha_keys, stroke.color);
     }
+    for path in &page.paths {
+        for paint in [path.fill_paint.as_ref(), path.stroke_paint.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            match paint {
+                crate::document::RenderedPathPaint::Solid(color) => {
+                    collect_alpha_key(&mut alpha_keys, *color);
+                }
+                crate::document::RenderedPathPaint::SvgPattern(pattern) => {
+                    collect_opacity_key(&mut alpha_keys, pattern.opacity);
+                }
+                crate::document::RenderedPathPaint::Gradient(_) => {}
+            }
+        }
+    }
     for line in &page.lines {
         collect_alpha_key(&mut alpha_keys, line.color);
     }
-    if let Some(tree) = page.paint_tree() {
-        collect_paint_tree_ext_gstates(&mut alpha_keys, &mut blend_modes, &tree.root);
-    }
+    collect_paint_tree_ext_gstates(&mut alpha_keys, &mut blend_modes, &page.paint_tree().root);
     if alpha_keys.is_empty() && blend_modes.is_empty() {
         return Vec::new();
     }
@@ -166,15 +327,7 @@ fn collect_alpha_key(alpha_keys: &mut BTreeMap<u16, ()>, color: Color) {
 }
 
 fn collect_opacity_key(alpha_keys: &mut BTreeMap<u16, ()>, opacity: f32) {
-    collect_alpha_key(
-        alpha_keys,
-        Color {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: opacity,
-        },
-    );
+    collect_alpha_key(alpha_keys, Color::TRANSPARENT.with_alpha(opacity));
 }
 
 fn collect_paint_tree_ext_gstates(
@@ -232,5 +385,102 @@ fn alpha_key(color: Color) -> Option<u16> {
         Some((color.a * 1000.0).round().clamp(1.0, 999.0) as u16)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    fn test_image(
+        pixel_width: u32,
+        pixel_height: u32,
+        rgb: Rc<[u8]>,
+        alpha: Option<Rc<[u8]>>,
+        source_rect: Option<RenderedImageSourceRect>,
+    ) -> RenderedImage {
+        RenderedImage::from_paint_rect(
+            crate::document::PaintRect::new(
+                crate::document::PaintPoint::new(0.0, 0.0),
+                crate::document::PaintSize::new(pixel_width as f32, pixel_height as f32),
+            ),
+            false,
+            pixel_width,
+            pixel_height,
+            source_rect,
+            false,
+            rgb,
+            alpha,
+            None,
+        )
+    }
+
+    #[test]
+    fn uncropped_image_resource_data_copies_inline_pixels_for_emission() {
+        let rgb: Rc<[u8]> = Rc::from(vec![1, 2, 3, 4, 5, 6].into_boxed_slice());
+        let alpha: Rc<[u8]> = Rc::from(vec![255, 127].into_boxed_slice());
+        let image = test_image(2, 1, Rc::clone(&rgb), Some(Rc::clone(&alpha)), None);
+
+        let data = image_resource_data(&crate::image_store::DocumentImageStore::default(), &image);
+
+        assert_eq!(data.pixel_width, 2);
+        assert_eq!(data.pixel_height, 1);
+        assert_eq!(data.rgb, rgb.as_ref());
+        assert_eq!(data.alpha.as_deref(), Some(alpha.as_ref()));
+    }
+
+    #[test]
+    fn cropped_image_resource_data_contains_source_rect_pixels() {
+        let rgb: Rc<[u8]> = Rc::from(
+            vec![
+                1, 2, 3, 4, 5, 6, //
+                7, 8, 9, 10, 11, 12,
+            ]
+            .into_boxed_slice(),
+        );
+        let alpha: Rc<[u8]> = Rc::from(vec![10, 20, 30, 40].into_boxed_slice());
+        let image = test_image(
+            2,
+            2,
+            rgb,
+            Some(alpha),
+            Some(RenderedImageSourceRect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 2,
+            }),
+        );
+
+        let data = image_resource_data(&crate::image_store::DocumentImageStore::default(), &image);
+
+        assert_eq!(data.pixel_width, 1);
+        assert_eq!(data.pixel_height, 2);
+        assert_eq!(data.rgb.as_slice(), &[4, 5, 6, 10, 11, 12]);
+        assert_eq!(data.alpha.as_deref(), Some([20, 40].as_slice()));
+    }
+
+    #[test]
+    fn repeated_inline_image_sources_are_deduplicated_without_copying_pixels() {
+        let rgb: Rc<[u8]> = Rc::from(
+            vec![
+                1, 2, 3, 4, 5, 6, //
+                7, 8, 9, 10, 11, 12,
+            ]
+            .into_boxed_slice(),
+        );
+        let source_rect = Some(RenderedImageSourceRect {
+            x: 1,
+            y: 0,
+            width: 1,
+            height: 2,
+        });
+        let first = test_image(2, 2, Rc::clone(&rgb), None, source_rect);
+        let second = test_image(2, 2, rgb, None, source_rect);
+        let first_source = image_source(&first);
+        let second_source = image_source(&second);
+
+        assert_eq!(first_source, second_source);
     }
 }

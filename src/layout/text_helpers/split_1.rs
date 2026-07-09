@@ -43,7 +43,7 @@ pub(in crate::layout) fn evaluate_generated_content_text(
             } => {
                 let value = counter_stack
                     .get(name)
-                    .and_then(|values| values.last().copied())
+                    .and_then(|values| values.last().cloned())
                     .unwrap_or(0);
                 if let Some(counter) = list::counter_text(
                     counter_style.clone().unwrap_or(ListStyleType::Decimal),
@@ -101,7 +101,7 @@ pub(in crate::layout) fn evaluate_generated_alt_text(
             } => {
                 let value = counter_stack
                     .get(name)
-                    .and_then(|values| values.last().copied())
+                    .and_then(|values| values.last().cloned())
                     .unwrap_or(0);
                 if let Some(counter) = list::counter_text(
                     counter_style.clone().unwrap_or(ListStyleType::Decimal),
@@ -211,28 +211,58 @@ pub(in crate::layout) fn used_line_indent(
     style: &ComputedStyle,
     available_width: f32,
 ) -> f32 {
+    used_line_indent_for_formatted_line(
+        line_index == 0,
+        starts_after_forced_break,
+        hanging_indent,
+        style,
+        available_width,
+    )
+}
+
+/// Resolve `text-indent` from a selected line's formatted-line identity.
+///
+/// A float can consume physical line-box block-size before any inline content
+/// is selected. CSS Text applies indentation to the first *formatted* line,
+/// not to that empty float-excluded physical line:
+/// <https://www.w3.org/TR/css-text-3/#text-indent-property>.
+pub(in crate::layout) fn used_line_indent_for_formatted_line(
+    is_first_formatted_line: bool,
+    starts_after_forced_break: bool,
+    hanging_indent: f32,
+    style: &ComputedStyle,
+    available_width: f32,
+) -> f32 {
     let is_indent_line =
-        line_index == 0 || (style.text_indent.each_line && starts_after_forced_break);
+        is_first_formatted_line || (style.text_indent.each_line && starts_after_forced_break);
     let applies_text_indent = is_indent_line != style.text_indent.hanging;
     let text_indent = if applies_text_indent {
-        used_text_indent(style, available_width)
+        used_text_indent(style, layout_pt(available_width)).points()
     } else {
         0.0
     };
-    text_indent + if line_index > 0 { hanging_indent } else { 0.0 }
+    text_indent
+        + if is_first_formatted_line {
+            0.0
+        } else {
+            hanging_indent
+        }
 }
 
-pub(in crate::layout) fn used_text_indent(style: &ComputedStyle, available_width: f32) -> f32 {
+/// Resolve `text-indent` against the available inline size.
+///
+/// The inline line-construction algorithm consumes a scalar coordinate after
+/// this CSS used-value boundary.
+/// <https://www.w3.org/TR/css-text-3/#text-indent-property>
+pub(in crate::layout) fn used_text_indent(
+    style: &ComputedStyle,
+    available_width: LayoutLength,
+) -> LayoutLength {
     style
         .text_indent
         .amount
-        .used_length_with_percentage_basis(available_width)
-        .unwrap_or(
-            style
-                .text_indent
-                .amount
-                .length_with_percentage_basis(available_width),
-        )
+        .used_length_with_percentage_basis(PercentageBasis::definite(available_width))
+        .unwrap_or_else(|| layout_pt(style.text_indent.amount.length_points()))
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -248,7 +278,10 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         parent_style: &ComputedStyle,
     ) -> f32 {
-        let own_baseline = self.font_system.rendered_first_line_baseline_offset(style);
+        let own_baseline = self
+            .font_system
+            .rendered_first_line_baseline_offset(style)
+            .points();
         self.vertical_align_baseline_shift_for_box(
             style,
             parent_style,
@@ -272,7 +305,10 @@ impl<'a> LayoutBuilder<'a> {
         let own_block_size = inline_atom_logical_block_size(atom, parent_style);
         let own_baseline = match parent_style.writing_mode {
             WritingMode::HorizontalTb => atom.style().margin.top + atom.baseline_offset,
-            WritingMode::VerticalRl | WritingMode::VerticalLr => {
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => {
                 inline_atom_logical_block_start_margin(atom, parent_style)
                     + inline_atom_logical_border_block_size(atom, parent_style)
             }
@@ -295,7 +331,10 @@ impl<'a> LayoutBuilder<'a> {
         let alignment_shift = match resolved_alignment_baseline_metric(style, parent_style) {
             BaselineMetric::Alphabetic => 0.0,
             BaselineMetric::Middle => {
-                let parent_x_height = self.font_system.used_x_height_for_style(parent_style);
+                let parent_x_height = self
+                    .font_system
+                    .used_x_height_for_style(parent_style)
+                    .points();
                 own_block_size / 2.0 - own_baseline + parent_x_height / 2.0
             }
             BaselineMetric::TextTop | BaselineMetric::Hanging => {
@@ -303,11 +342,13 @@ impl<'a> LayoutBuilder<'a> {
                     - self
                         .font_system
                         .rendered_first_line_baseline_offset(parent_style)
+                        .points()
             }
             BaselineMetric::TextBottom | BaselineMetric::Ideographic => {
                 let parent_baseline = self
                     .font_system
-                    .rendered_first_line_baseline_offset(parent_style);
+                    .rendered_first_line_baseline_offset(parent_style)
+                    .points();
                 own_block_size - own_baseline - (parent_style.font_size - parent_baseline)
             }
             BaselineMetric::Central | BaselineMetric::Mathematical => {
@@ -317,7 +358,9 @@ impl<'a> LayoutBuilder<'a> {
         let baseline_shift = match style.vertical_align.baseline_shift {
             BaselineShift::LengthPercentage(_) => style
                 .vertical_align
-                .length_percentage_shift(style.line_height),
+                .clone()
+                .length_percentage_shift(layout_pt(style.line_height))
+                .points(),
             BaselineShift::Super => self
                 .font_system
                 .script_vertical_align_shift(style, BaselineShift::Super)
@@ -328,7 +371,7 @@ impl<'a> LayoutBuilder<'a> {
                 .unwrap_or(-style.font_size * 0.4),
             BaselineShift::Top | BaselineShift::Center | BaselineShift::Bottom => 0.0,
         };
-        alignment_shift + baseline_shift
+        css::clamp_used_layout_coordinate(layout_pt(alignment_shift + baseline_shift)).points()
     }
 }
 
@@ -419,7 +462,55 @@ pub(in crate::layout) fn transform_text_inner(
     if style.text_transform.full_size_kana {
         text = full_size_kana_text(&text);
     }
+    if style.text_transform.math_auto {
+        text = math_auto_text(&text);
+    }
     text
+}
+
+/// Apply MathML Core's `math-auto` mathematical-italic mappings.
+///
+/// These are Unicode character substitutions, not an OpenType feature: the
+/// transformed scalar is shaped, measured, painted, and exported through the
+/// ordinary text pipeline. The exceptional Latin `h` and the Greek symbol
+/// variants occupy compatibility code points, while the primary Latin and
+/// Greek alphabets use contiguous Mathematical Alphanumeric Symbol ranges:
+/// <https://w3c.github.io/mathml-core/#math-auto-transform> and
+/// <https://w3c.github.io/mathml-core/#italic-mappings>.
+pub(in crate::layout) fn math_auto_text(text: &str) -> String {
+    let mut characters = text.chars();
+    let Some(character) = characters.next() else {
+        return String::new();
+    };
+    if characters.next().is_some() {
+        return text.to_owned();
+    }
+    math_auto_character(character).to_string()
+}
+
+fn math_auto_character(character: char) -> char {
+    let scalar = character as u32;
+    let mapped = match character {
+        'A'..='Z' => Some(0x1D434 + scalar - 'A' as u32),
+        'a'..='g' | 'i'..='z' => Some(0x1D44E + scalar - 'a' as u32),
+        'h' => Some(0x210E),
+        '\u{0131}' => Some(0x1D6A4),
+        '\u{0237}' => Some(0x1D6A5),
+        '\u{0391}'..='\u{03A1}' => Some(0x1D6E2 + scalar - 0x0391),
+        '\u{03F4}' => Some(0x1D6F3),
+        '\u{03A3}'..='\u{03A9}' => Some(0x1D6F4 + scalar - 0x03A3),
+        '\u{2207}' => Some(0x1D6FB),
+        '\u{03B1}'..='\u{03C9}' => Some(0x1D6FC + scalar - 0x03B1),
+        '\u{2202}' => Some(0x1D715),
+        '\u{03F5}' => Some(0x1D716),
+        '\u{03D1}' => Some(0x1D717),
+        '\u{03F0}' => Some(0x1D718),
+        '\u{03D5}' => Some(0x1D719),
+        '\u{03F1}' => Some(0x1D71A),
+        '\u{03D6}' => Some(0x1D71B),
+        _ => None,
+    };
+    mapped.and_then(char::from_u32).unwrap_or(character)
 }
 
 /// Map text through ICU's full uppercase mapping.
@@ -512,7 +603,7 @@ pub(in crate::layout) fn push_capitalized_word_segment(
     for (offset, character) in segment.char_indices() {
         if character_is_unicode_alphanumeric(character) {
             if state.new_word {
-                if character_is_unicode_letter(character) {
+                if character_is_unicode_typographic_letter(character) {
                     output.push_str(&titlecase_word_tail(&segment[offset..], language));
                     update_text_transform_state_for_output(state, &segment[offset..]);
                     break;
@@ -576,9 +667,40 @@ pub(in crate::layout) fn titlecase_word_tail(
 }
 
 pub(in crate::layout) fn case_mapping_language(language: Option<&str>) -> LanguageIdentifier {
-    language
-        .and_then(|language| language.replace('_', "-").parse().ok())
-        .unwrap_or_else(root_language_identifier)
+    let Some(language) = language else {
+        return root_language_identifier();
+    };
+    let language = language.replace('_', "-");
+    let identifier = language
+        .parse::<LanguageIdentifier>()
+        .unwrap_or_else(|_| root_language_identifier());
+    if language_uses_turkic_case_mapping(&language) && language_declares_non_latin_script(&language)
+    {
+        // CSS Text's writing-system rules give an explicit script subtag
+        // precedence over a contradictory language default. Turkish and Azeri
+        // dotted-I casing applies to their Latin writing systems, not to text
+        // explicitly tagged as Cyrillic, Arabic, and so on.
+        // <https://www.w3.org/TR/css-text-3/#script-tagging>
+        return root_language_identifier();
+    }
+    identifier
+}
+
+fn language_uses_turkic_case_mapping(language: &str) -> bool {
+    matches!(
+        language.split('-').next(),
+        Some(primary) if primary.eq_ignore_ascii_case("tr") || primary.eq_ignore_ascii_case("az")
+    )
+}
+
+fn language_declares_non_latin_script(language: &str) -> bool {
+    language.split('-').skip(1).any(|subtag| {
+        subtag.len() == 4
+            && subtag
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
+            && !subtag.eq_ignore_ascii_case("latn")
+    })
 }
 
 pub(in crate::layout) fn root_language_identifier() -> LanguageIdentifier {
@@ -605,7 +727,7 @@ pub(in crate::layout) fn full_width_text(text: &str) -> String {
     let mut output = String::new();
     let mut characters = text.chars().peekable();
     while let Some(character) = characters.next() {
-        if let Some(next) = characters.peek().copied() {
+        if let Some(next) = characters.peek().cloned() {
             if next == '\u{ff9e}'
                 && let Some(composed) = full_width_voiced_kana(character)
             {
@@ -621,6 +743,10 @@ pub(in crate::layout) fn full_width_text(text: &str) -> String {
                 continue;
             }
         }
+        if let Some(mapped) = full_width_compatibility_character(character) {
+            output.push(mapped);
+            continue;
+        }
         let mapped = full_width_character(character);
         if mapped.is_empty() {
             output.push(character);
@@ -629,6 +755,45 @@ pub(in crate::layout) fn full_width_text(text: &str) -> String {
         }
     }
     output
+}
+
+/// Return the single-scalar compatibility mappings used by CSS `full-width`
+/// that do not belong to ASCII or halfwidth Katakana.
+///
+/// The halfwidth Hangul ranges have sparse source code-point ranges but map to
+/// consecutive Hangul Compatibility Jamo ranges. The remaining mappings are
+/// the Unicode `<wide>` compatibility mappings selected by CSS Text.
+/// <https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt> and
+/// <https://www.w3.org/TR/css-text-3/#valdef-text-transform-full-width>
+pub(in crate::layout) fn full_width_compatibility_character(character: char) -> Option<char> {
+    let scalar = character as u32;
+    let mapped = match scalar {
+        0x2985 => 0xff5f,
+        0x2986 => 0xff60,
+        0xffa0 => 0x3164,
+        0xffa1..=0xffbe => 0x3131 + scalar - 0xffa1,
+        0xffc2..=0xffc6 => 0x314f + scalar - 0xffc2,
+        0xffc7 => 0x3154,
+        0xffca..=0xffcf => 0x3155 + scalar - 0xffca,
+        0xffd2..=0xffd7 => 0x315b + scalar - 0xffd2,
+        0xffda..=0xffdc => 0x3161 + scalar - 0xffda,
+        0x00a2 => 0xffe0,
+        0x00a3 => 0xffe1,
+        0x00ac => 0xffe2,
+        0x00af => 0xffe3,
+        0x00a6 => 0xffe4,
+        0x00a5 => 0xffe5,
+        0x20a9 => 0xffe6,
+        0xffe8 => 0x2502,
+        0xffe9 => 0x2190,
+        0xffea => 0x2191,
+        0xffeb => 0x2192,
+        0xffec => 0x2193,
+        0xffed => 0x25a0,
+        0xffee => 0x25cb,
+        _ => return None,
+    };
+    char::from_u32(mapped)
 }
 
 pub(in crate::layout) fn full_width_character(character: char) -> &'static str {
@@ -853,6 +1018,18 @@ pub(in crate::layout) fn full_size_kana_text(text: &str) -> String {
 
 pub(in crate::layout) fn full_size_kana_character(character: char) -> &'static str {
     match character {
+        // Unicode 15 small Kana additions.
+        // <https://www.unicode.org/Public/15.0.0/ucd/UnicodeData.txt> and
+        // <https://www.w3.org/TR/css-text-3/#valdef-text-transform-full-size-kana>
+        '\u{1b132}' => "こ",
+        '\u{1b150}' => "ゐ",
+        '\u{1b151}' => "ゑ",
+        '\u{1b152}' => "を",
+        '\u{1b155}' => "コ",
+        '\u{1b164}' => "ヰ",
+        '\u{1b165}' => "ヱ",
+        '\u{1b166}' => "ヲ",
+        '\u{1b167}' => "ン",
         'ぁ' => "あ",
         'ぃ' => "い",
         'ぅ' => "う",
@@ -921,5 +1098,51 @@ impl TextTransformState {
             return;
         }
         self.new_word = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn math_auto_uses_mathml_italic_unicode_mappings_for_single_character_text() {
+        assert_eq!(math_auto_text("∂"), "\u{1d715}");
+        assert_eq!(math_auto_text("∂∇"), "∂∇");
+    }
+
+    #[test]
+    fn explicit_non_latin_script_overrides_turkish_case_tailoring() {
+        let mut state = TextTransformState::default();
+        assert_eq!(lowercase_text("I", Some("tr-Cyrl"), &mut state), "i");
+
+        let mut latin_state = TextTransformState::default();
+        assert_eq!(lowercase_text("I", Some("tr-Latn"), &mut latin_state), "ı");
+    }
+
+    #[test]
+    fn full_size_kana_maps_unicode_15_small_kana() {
+        assert_eq!(
+            full_size_kana_text(
+                "\u{1b132}\u{1b150}\u{1b151}\u{1b152}\u{1b155}\u{1b164}\u{1b165}\u{1b166}\u{1b167}"
+            ),
+            "こゐゑをコヰヱヲン"
+        );
+    }
+
+    #[test]
+    fn full_width_maps_hangul_and_symbol_compatibility_characters() {
+        assert_eq!(
+            full_width_text(
+                "\u{2985}\u{2986}\u{ffa0}\u{ffa1}\u{ffbe}\u{ffc2}\u{ffdc}\u{a2}\u{20a9}\u{ffee}"
+            ),
+            "｟｠ㅤㄱㅎㅏㅣ￠￦○"
+        );
+    }
+
+    #[test]
+    fn capitalize_titlecases_letter_number_characters() {
+        let mut state = TextTransformState::default();
+        assert_eq!(capitalize_text("ⅰⅰⅰ", Some("en"), &mut state), "Ⅰⅰⅰ");
     }
 }

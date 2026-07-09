@@ -138,7 +138,7 @@ pub(in crate::layout) fn alphabetic_marker_i32(index: i32, symbols: &[&str]) -> 
         output.push(symbols[value % base]);
         value /= base;
     }
-    output.iter().rev().copied().collect::<String>()
+    output.iter().rev().cloned().collect::<String>()
 }
 
 pub(in crate::layout) fn fixed_marker_i32(index: i32, symbols: &[&str]) -> String {

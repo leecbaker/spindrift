@@ -275,7 +275,7 @@ pub(in crate::css) fn parse_gap_shorthand_components(
     match parts {
         [row] => {
             let row = parse_gap(row, font_size)?;
-            Some((row, row))
+            Some((row.clone(), row))
         }
         [row, column] => Some((parse_gap(row, font_size)?, parse_gap(column, font_size)?)),
         _ => None,
@@ -457,6 +457,17 @@ pub(in crate::css) fn parse_grid_track_list(value: &str, font_size: f32) -> Opti
     if value.eq_ignore_ascii_case("none") {
         return Some(GridTrackList::None);
     }
+    let tokens = split_css_component_values(value);
+    if tokens
+        .first()
+        .is_some_and(|token| token.eq_ignore_ascii_case("subgrid"))
+    {
+        let mut line_names = Vec::new();
+        for token in &tokens[1..] {
+            line_names.extend(parse_grid_line_names(token)?);
+        }
+        return Some(GridTrackList::Subgrid { line_names });
+    }
     let (components, trailing_names) = parse_grid_track_list_components(value, font_size)?;
     (!components.is_empty()).then_some(GridTrackList::Tracks {
         components,
@@ -484,7 +495,7 @@ pub(in crate::css) fn expand_grid_template_shorthand(
     }
     let rows_have_areas = split_css_component_values(rows)
         .iter()
-        .any(|token| css_string_token_contents(token).is_some());
+        .any(|token| parse_css_string_token(trim_css_value(token)).is_some());
     if !rows_have_areas {
         if !has_slash {
             return None;
@@ -511,6 +522,19 @@ pub(in crate::css) fn expand_grid_template_shorthand(
 
 pub(in crate::css) fn expand_grid_shorthand(value: &str) -> Option<Vec<(&'static str, String)>> {
     let value = trim_css_value(value);
+    if matches!(
+        parse_grid_track_list(value, ROOT_FONT_SIZE_PT),
+        Some(GridTrackList::Subgrid { .. })
+    ) {
+        return Some(vec![
+            ("grid-template-rows", value.to_string()),
+            ("grid-template-columns", value.to_string()),
+            ("grid-template-areas", "none".to_string()),
+            ("grid-auto-flow", "row".to_string()),
+            ("grid-auto-rows", "auto".to_string()),
+            ("grid-auto-columns", "auto".to_string()),
+        ]);
+    }
     let (left, right) = split_top_level_once(value, '/')
         .map(|(left, right)| (trim_css_value(left), trim_css_value(right)))
         .unwrap_or((value, ""));
@@ -609,14 +633,17 @@ pub(in crate::css) fn parse_grid_template_ascii_rows(value: &str) -> Option<(Str
             index += 1;
         }
 
-        let area = tokens
+        let (area, tail) = tokens
             .get(index)
-            .and_then(|token| css_string_token_contents(token))?;
-        area_tokens.push(css_quote_string(area));
+            .and_then(|token| parse_css_string_token(trim_css_value(token)))?;
+        if !tail.trim().is_empty() {
+            return None;
+        }
+        area_tokens.push(css_quote_string(&area));
         index += 1;
 
         if index < tokens.len()
-            && css_string_token_contents(tokens[index]).is_none()
+            && parse_css_string_token(trim_css_value(tokens[index])).is_none()
             && parse_grid_line_names(tokens[index]).is_none()
         {
             parse_grid_track_size(tokens[index], ROOT_FONT_SIZE_PT)?;
@@ -633,18 +660,6 @@ pub(in crate::css) fn parse_grid_template_ascii_rows(value: &str) -> Option<(Str
     }
 
     (!area_tokens.is_empty()).then(|| (row_track_tokens.join(" "), area_tokens.join(" ")))
-}
-
-pub(in crate::css) fn css_string_token_contents(token: &str) -> Option<&str> {
-    let token = trim_css_value(token);
-    token
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .or_else(|| {
-            token
-                .strip_prefix('\'')
-                .and_then(|value| value.strip_suffix('\''))
-        })
 }
 
 pub(in crate::css) fn css_quote_string(value: &str) -> String {
@@ -706,14 +721,14 @@ pub(in crate::css) fn parse_grid_track_list_components_with_options(
 pub(in crate::css) fn parse_grid_line_names(token: &str) -> Option<Vec<String>> {
     let token = trim_css_value(token);
     let inner = token.strip_prefix('[')?.strip_suffix(']')?;
+    let mut input = cssparser::ParserInput::new(inner);
+    let mut parser = cssparser::Parser::new(&mut input);
     let mut names = Vec::new();
-    for name in inner.split_whitespace() {
-        if !grid_placement_name_is_custom_ident(name) {
-            return None;
-        }
-        names.push(name.to_string());
+    while !parser.is_exhausted() {
+        let name = parser.expect_ident_cloned().ok()?.to_string();
+        names.push(parse_grid_custom_ident_value(name)?);
     }
-    Some(names)
+    (!names.is_empty()).then_some(names)
 }
 
 pub(in crate::css) fn parse_grid_repeat(token: &str, font_size: f32) -> Option<GridRepeat> {
@@ -749,14 +764,23 @@ pub(in crate::css) fn grid_repeat_tracks_are_valid(
     tracks.iter().all(|component| match component {
         GridTrackListComponent::Track(_, size) => {
             !matches!(count, GridRepeatCount::AutoFill | GridRepeatCount::AutoFit)
-                || grid_track_size_is_fixed_for_auto_repeat(*size)
+                || grid_track_size_is_fixed_for_auto_repeat(size.clone())
+                // Grid Lanes extends auto-repeat to intrinsic track breadths:
+                // <https://drafts.csswg.org/css-grid-3/#track-sizing>.
+                || matches!(
+                    size,
+                    GridTrackSize {
+                        min: GridMinTrackBreadth::Auto,
+                        max: GridMaxTrackBreadth::Auto,
+                    }
+                )
         }
         GridTrackListComponent::Repeat(_, _) => false,
     })
 }
 
 pub(in crate::css) fn grid_track_size_is_fixed_for_auto_repeat(size: GridTrackSize) -> bool {
-    grid_min_track_breadth_is_fixed(size.min)
+    grid_min_track_breadth_is_fixed(size.min.clone())
         || (grid_min_track_breadth_is_inflexible(size.min)
             && grid_max_track_breadth_is_fixed(size.max))
 }
@@ -803,7 +827,7 @@ pub(in crate::css) fn parse_grid_track_size(value: &str, font_size: f32) -> Opti
     if let Some(inner) = grid_function_body(value, "fit-content") {
         return Some(GridTrackSize {
             min: GridMinTrackBreadth::Auto,
-            max: GridMaxTrackBreadth::FitContent(parse_computed_length_percentage(
+            max: GridMaxTrackBreadth::FitContent(parse_nonnegative_grid_track_breadth(
                 inner, font_size,
             )?),
         });
@@ -825,9 +849,9 @@ pub(in crate::css) fn parse_grid_track_size(value: &str, font_size: f32) -> Opti
             max: GridMaxTrackBreadth::MaxContent,
         }),
         _ => {
-            let length = parse_computed_length_percentage(value, font_size)?;
+            let length = parse_nonnegative_grid_track_breadth(value, font_size)?;
             Some(GridTrackSize {
-                min: GridMinTrackBreadth::LengthPercentage(length),
+                min: GridMinTrackBreadth::LengthPercentage(length.clone()),
                 max: GridMaxTrackBreadth::LengthPercentage(length),
             })
         }
@@ -843,7 +867,7 @@ pub(in crate::css) fn parse_grid_min_track_breadth(
         "auto" => Some(GridMinTrackBreadth::Auto),
         "min-content" => Some(GridMinTrackBreadth::MinContent),
         "max-content" => Some(GridMinTrackBreadth::MaxContent),
-        _ => parse_computed_length_percentage(value, font_size)
+        _ => parse_nonnegative_grid_track_breadth(value, font_size)
             .map(GridMinTrackBreadth::LengthPercentage),
     }
 }
@@ -858,16 +882,34 @@ pub(in crate::css) fn parse_grid_max_track_breadth(
         return Some(GridMaxTrackBreadth::Flex(flex));
     }
     if let Some(inner) = grid_function_body(value, "fit-content") {
-        return parse_computed_length_percentage(inner, font_size)
+        return parse_nonnegative_grid_track_breadth(inner, font_size)
             .map(GridMaxTrackBreadth::FitContent);
     }
     match lower.as_str() {
         "auto" => Some(GridMaxTrackBreadth::Auto),
         "min-content" => Some(GridMaxTrackBreadth::MinContent),
         "max-content" => Some(GridMaxTrackBreadth::MaxContent),
-        _ => parse_computed_length_percentage(value, font_size)
+        _ => parse_nonnegative_grid_track_breadth(value, font_size)
             .map(GridMaxTrackBreadth::LengthPercentage),
     }
+}
+
+/// Parse a non-negative CSS Grid track breadth length-percentage.
+///
+/// CSS Grid track breadths use a non-negative range for `<length-percentage>`
+/// arguments, including bare fixed tracks, `minmax()` breadths, and
+/// `fit-content()` arguments:
+/// <https://www.w3.org/TR/css-grid-1/#typedef-track-breadth>.
+fn parse_nonnegative_grid_track_breadth(
+    value: &str,
+    font_size: f32,
+) -> Option<ComputedLengthPercentage> {
+    let length = parse_computed_length_percentage(value, font_size)?;
+    (!grid_track_breadth_is_definitely_negative(length.clone())).then_some(length)
+}
+
+fn grid_track_breadth_is_definitely_negative(value: ComputedLengthPercentage) -> bool {
+    value.is_definitely_absolute() && value.length_points() < 0.0
 }
 
 pub(in crate::css) fn parse_grid_flex(lower: &str) -> Option<f32> {
@@ -895,16 +937,11 @@ pub(in crate::css) fn parse_grid_template_areas(value: &str) -> Option<GridTempl
     }
     let mut rows = Vec::new();
     for token in split_css_component_values(value) {
-        let token = trim_css_value(token);
-        let row = token
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            .or_else(|| {
-                token
-                    .strip_prefix('\'')
-                    .and_then(|value| value.strip_suffix('\''))
-            })?;
-        let cells = parse_grid_template_area_row(row)?;
+        let (row, tail) = parse_css_string_token(trim_css_value(token))?;
+        if !tail.trim().is_empty() {
+            return None;
+        }
+        let cells = parse_grid_template_area_row(&row)?;
         if cells.is_empty() {
             return None;
         }

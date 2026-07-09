@@ -2,11 +2,59 @@ use super::*;
 
 pub(in crate::layout) const GAP_RULE_EPSILON: f32 = 0.01;
 
+/// Physical container-local coordinates used while resolving CSS gap rules.
+/// Local y grows from the content top toward its block end, unlike paint/PDF
+/// coordinates; projection is therefore explicit at the page boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum GapDecorationSpace {}
+
+pub(in crate::layout) type GapDecorationPoint = euclid::Point2D<f32, GapDecorationSpace>;
+pub(in crate::layout) type GapDecorationSize = euclid::Size2D<f32, GapDecorationSpace>;
+pub(in crate::layout) type GapDecorationRect = euclid::Rect<f32, GapDecorationSpace>;
+
+/// The local gap-decoration area and its page-local projection.
+///
+/// Track and item geometry remains in the downward-y local space.  The
+/// top-edge page rectangle is carried beside it so paint emission has one
+/// explicit, auditable coordinate conversion boundary.
 #[derive(Debug, Clone, Copy)]
-pub(in crate::layout) struct GapDecorationGutter {
+pub(in crate::layout) struct GapDecorationContainer {
+    pub(in crate::layout) local_size: GapDecorationSize,
+    pub(in crate::layout) page_rect: PageTopRect,
+}
+
+impl GapDecorationContainer {
+    pub(in crate::layout) fn new(x: f32, top_y: f32, width: f32, height: f32) -> Self {
+        let local_size = GapDecorationSize::new(width.max(0.0), height.max(0.0));
+        Self {
+            local_size,
+            page_rect: PageTopRect::new(x, top_y, local_size.width, local_size.height),
+        }
+    }
+}
+
+/// A one-dimensional gap/rule range. It is not Cartesian geometry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct GapAxisSpan {
     pub(in crate::layout) start: f32,
     pub(in crate::layout) end: f32,
+}
+
+impl GapAxisSpan {
+    pub(in crate::layout) fn new(start: f32, end: f32) -> Self {
+        Self {
+            start,
+            end: end.max(start),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct GapDecorationGutter {
+    pub(in crate::layout) span: GapAxisSpan,
     pub(in crate::layout) grid_line: Option<u16>,
+    pub(in crate::layout) segment_range: Option<GapAxisSpan>,
+    pub(in crate::layout) rule_index: Option<usize>,
 }
 
 impl GapDecorationGutter {
@@ -16,21 +64,23 @@ impl GapDecorationGutter {
 
     pub(in crate::layout) fn with_grid_line(start: f32, end: f32, grid_line: Option<u16>) -> Self {
         Self {
-            start: start.max(0.0),
-            end: end.max(start).max(0.0),
+            span: GapAxisSpan::new(start, end),
             grid_line,
+            segment_range: None,
+            rule_index: None,
         }
     }
 
-    pub(in crate::layout) fn clipped_to_block_range(
-        self,
-        block_start: f32,
-        block_end: f32,
-    ) -> Option<Self> {
-        let start = self.start.max(block_start);
-        let end = self.end.min(block_end);
-        (end > start + GAP_RULE_EPSILON)
-            .then(|| Self::with_grid_line(start - block_start, end - block_start, self.grid_line))
+    pub(in crate::layout) fn with_segment_range(
+        start: f32,
+        end: f32,
+        segment_start: f32,
+        segment_end: f32,
+    ) -> Self {
+        Self {
+            segment_range: Some(GapAxisSpan::new(segment_start, segment_end)),
+            ..Self::new(start, end)
+        }
     }
 }
 
@@ -44,57 +94,45 @@ pub(in crate::layout) type GapDecorationGridGutters = GapDecorationGutters;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct GapDecorationItem {
-    pub(in crate::layout) x: f32,
-    pub(in crate::layout) y: f32,
-    pub(in crate::layout) width: f32,
-    pub(in crate::layout) height: f32,
+    pub(in crate::layout) rect: GapDecorationRect,
     pub(in crate::layout) grid_area: Option<GapDecorationGridArea>,
 }
 
 impl GapDecorationItem {
-    pub(in crate::layout) fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+    pub(in crate::layout) fn from_rect(rect: GapDecorationRect) -> Self {
         Self {
-            x,
-            y,
-            width: width.max(0.0),
-            height: height.max(0.0),
+            rect: GapDecorationRect::new(
+                rect.origin,
+                GapDecorationSize::new(rect.size.width.max(0.0), rect.size.height.max(0.0)),
+            ),
             grid_area: None,
         }
     }
 
-    pub(in crate::layout) fn with_grid_area(
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
+    pub(in crate::layout) fn from_rect_with_grid_area(
+        rect: GapDecorationRect,
         grid_area: GapDecorationGridArea,
     ) -> Self {
         Self {
             grid_area: Some(grid_area),
-            ..Self::new(x, y, width, height)
+            ..Self::from_rect(rect)
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::layout) fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self::from_rect(GapDecorationRect::new(
+            GapDecorationPoint::new(x, y),
+            GapDecorationSize::new(width.max(0.0), height.max(0.0)),
+        ))
+    }
+
     pub(in crate::layout) fn x_end(self) -> f32 {
-        self.x + self.width
+        self.rect.max_x()
     }
 
     pub(in crate::layout) fn y_end(self) -> f32 {
-        self.y + self.height
-    }
-
-    pub(in crate::layout) fn clipped_to_block_range(
-        self,
-        block_start: f32,
-        block_end: f32,
-    ) -> Option<Self> {
-        let start = self.y.max(block_start);
-        let end = self.y_end().min(block_end);
-        (end > start + GAP_RULE_EPSILON).then_some(Self {
-            y: start - block_start,
-            height: end - start,
-            ..self
-        })
+        self.rect.max_y()
     }
 }
 
@@ -128,31 +166,38 @@ pub(in crate::layout) enum GapRuleAxisKind {
 /// <https://drafts.csswg.org/css-gaps-1/#segments>.
 pub(in crate::layout) fn flex_gap_decoration_primitives_with_gutters(
     style: &ComputedStyle,
-    origin_x: f32,
-    content_top: f32,
-    content_width: f32,
-    content_height: f32,
+    container: GapDecorationContainer,
     items: &[GapDecorationItem],
     gutters: &GapDecorationGutters,
 ) -> Vec<PaintPrimitive> {
+    // Row/column rule axes are logical axes of the container's writing mode;
+    // changing flex-direction does not rename them. Vertical writing modes
+    // transpose those logical axes relative to physical x/y gutter bands.
+    // https://drafts.csswg.org/css-gaps-1/#gap-rule-painting
+    let logical_axes_match_physical =
+        !WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes();
+    let axis_mapped_style;
+    let style = if logical_axes_match_physical {
+        style
+    } else {
+        axis_mapped_style = gap_rules_transposed_to_physical_axes(style);
+        &axis_mapped_style
+    };
     let column_gaps = gutters
         .columns
         .iter()
-        .copied()
+        .cloned()
         .map(GapBand::from)
         .collect::<Vec<_>>();
     let row_gaps = gutters
         .rows
         .iter()
-        .copied()
+        .cloned()
         .map(GapBand::from)
         .collect::<Vec<_>>();
     gap_decoration_primitives_for_gaps(GapDecorationContext {
         style,
-        origin_x,
-        content_top,
-        content_width,
-        content_height,
+        container,
         column_gaps: &column_gaps,
         row_gaps: &row_gaps,
         items,
@@ -168,36 +213,128 @@ pub(in crate::layout) fn flex_gap_decoration_primitives_with_gutters(
 /// <https://drafts.csswg.org/css-gaps-1/#assigning>.
 pub(in crate::layout) fn grid_gap_decoration_primitives(
     style: &ComputedStyle,
-    origin_x: f32,
-    content_top: f32,
-    content_width: f32,
-    content_height: f32,
+    container: GapDecorationContainer,
     items: &[GapDecorationItem],
     gutters: &GapDecorationGridGutters,
 ) -> Vec<PaintPrimitive> {
     let column_gaps = gutters
         .columns
         .iter()
-        .copied()
+        .cloned()
         .map(GapBand::from)
         .collect::<Vec<_>>();
     let row_gaps = gutters
         .rows
         .iter()
-        .copied()
+        .cloned()
         .map(GapBand::from)
         .collect::<Vec<_>>();
     gap_decoration_primitives_for_gaps(GapDecorationContext {
         style,
-        origin_x,
-        content_top,
-        content_width,
-        content_height,
+        container,
         column_gaps: &column_gaps,
         row_gaps: &row_gaps,
         items,
         container_kind: GapContainerKind::Grid,
     })
+}
+
+/// A resolved gap-rule centerline segment before it is expanded into PDF paint
+/// primitives.
+///
+/// Fragmentation projects this semantic geometry before expanding a rule's
+/// width.  Projecting an already-filled rectangle changes an endpoint at a
+/// page break into an artificial clipped cap.
+/// <https://drafts.csswg.org/css-gaps-1/#gap-decoration-segments>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct GapRulePaintSegment {
+    pub(in crate::layout) kind: GapRuleAxisKind,
+    pub(in crate::layout) gap: GapBand,
+    pub(in crate::layout) segment: GapDecorationSegment,
+    pub(in crate::layout) width: f32,
+    pub(in crate::layout) style: BorderStyle,
+    pub(in crate::layout) color: Color,
+}
+
+/// Resolves grid gap rules into source-coordinate centerline segments.
+///
+/// This is deliberately separate from primitive generation because a grid may
+/// fragment after its complete track and item geometry has been resolved.
+/// <https://drafts.csswg.org/css-gaps-1/#fragmentation>
+pub(in crate::layout) fn grid_gap_rule_paint_segments(
+    style: &ComputedStyle,
+    container: GapDecorationContainer,
+    items: &[GapDecorationItem],
+    gutters: &GapDecorationGridGutters,
+) -> Vec<GapRulePaintSegment> {
+    let column_gaps = gutters
+        .columns
+        .iter()
+        .cloned()
+        .map(GapBand::from)
+        .collect::<Vec<_>>();
+    let row_gaps = gutters
+        .rows
+        .iter()
+        .cloned()
+        .map(GapBand::from)
+        .collect::<Vec<_>>();
+    let column_rules = axis_rule_paint_segments(AxisRuleContext {
+        kind: GapRuleAxisKind::Column,
+        container_kind: GapContainerKind::Grid,
+        rule: &style.column_rule,
+        crossing_rule: &style.row_rule,
+        container,
+        gaps: &column_gaps,
+        crossing_gaps: &row_gaps,
+        items,
+        rule_count: None,
+    });
+    let row_rules = axis_rule_paint_segments(AxisRuleContext {
+        kind: GapRuleAxisKind::Row,
+        container_kind: GapContainerKind::Grid,
+        rule: &style.row_rule,
+        crossing_rule: &style.column_rule,
+        container,
+        gaps: &row_gaps,
+        crossing_gaps: &column_gaps,
+        items,
+        rule_count: None,
+    });
+    match style.rule_overlap {
+        css::GapRuleOverlap::RowOverColumn => column_rules.into_iter().chain(row_rules).collect(),
+        css::GapRuleOverlap::ColumnOverRow => row_rules.into_iter().chain(column_rules).collect(),
+    }
+}
+
+/// Expands a previously resolved grid segment into paint primitives.
+pub(in crate::layout) fn grid_gap_rule_segment_primitives(
+    style: &ComputedStyle,
+    container: GapDecorationContainer,
+    rule_segment: GapRulePaintSegment,
+) -> Vec<PaintPrimitive> {
+    let (rule, crossing_rule) = match rule_segment.kind {
+        GapRuleAxisKind::Column => (&style.column_rule, &style.row_rule),
+        GapRuleAxisKind::Row => (&style.row_rule, &style.column_rule),
+    };
+    gap_rule_segment_primitives(
+        AxisRuleContext {
+            kind: rule_segment.kind,
+            container_kind: GapContainerKind::Grid,
+            rule,
+            crossing_rule,
+            container,
+            gaps: &[],
+            crossing_gaps: &[],
+            items: &[],
+            rule_count: None,
+        },
+        rule_segment.gap,
+        rule_segment.segment,
+        rule_segment.width,
+        rule_segment.style,
+        rule_segment.color,
+    )
 }
 
 /// Builds grid gutter bands from Taffy's detailed track sizes.
@@ -234,10 +371,7 @@ pub(in crate::layout) fn grid_gap_decoration_gutters_from_tracks(
 
 pub(in crate::layout) struct GapDecorationContext<'a> {
     pub(in crate::layout) style: &'a ComputedStyle,
-    pub(in crate::layout) origin_x: f32,
-    pub(in crate::layout) content_top: f32,
-    pub(in crate::layout) content_width: f32,
-    pub(in crate::layout) content_height: f32,
+    pub(in crate::layout) container: GapDecorationContainer,
     pub(in crate::layout) column_gaps: &'a [GapBand],
     pub(in crate::layout) row_gaps: &'a [GapBand],
     pub(in crate::layout) items: &'a [GapDecorationItem],
@@ -258,26 +392,22 @@ pub(in crate::layout) fn gap_decoration_primitives_for_gaps(
         container_kind: context.container_kind,
         rule: &context.style.column_rule,
         crossing_rule: &context.style.row_rule,
-        origin_x: context.origin_x,
-        content_top: context.content_top,
-        inline_size: context.content_width,
-        block_size: context.content_height,
+        container: context.container,
         gaps: context.column_gaps,
         crossing_gaps: context.row_gaps,
         items: context.items,
+        rule_count: None,
     });
     let row_rules = axis_rule_primitives(AxisRuleContext {
         kind: GapRuleAxisKind::Row,
         container_kind: context.container_kind,
         rule: &context.style.row_rule,
         crossing_rule: &context.style.column_rule,
-        origin_x: context.origin_x,
-        content_top: context.content_top,
-        inline_size: context.content_width,
-        block_size: context.content_height,
+        container: context.container,
         gaps: context.row_gaps,
         crossing_gaps: context.column_gaps,
         items: context.items,
+        rule_count: None,
     });
 
     let mut primitives = Vec::new();
@@ -309,9 +439,17 @@ pub(in crate::layout) fn multicol_gap_decoration_primitives(
     gap: f32,
     column_count: usize,
 ) -> Vec<PaintPrimitive> {
-    if style.visibility != Visibility::Visible || column_count < 2 || gap <= GAP_RULE_EPSILON {
+    if style.visibility != Visibility::Visible || column_count < 2 || gap < 0.0 {
         return Vec::new();
     }
+    let axis_mapped_style;
+    let style = if !WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes()
+    {
+        style
+    } else {
+        axis_mapped_style = gap_rules_transposed_to_physical_axes(style);
+        &axis_mapped_style
+    };
     let gaps = (0..column_count.saturating_sub(1))
         .map(|index| {
             let start = (column_width + gap) * index as f32 + column_width;
@@ -319,6 +457,12 @@ pub(in crate::layout) fn multicol_gap_decoration_primitives(
                 start,
                 end: start + gap,
                 grid_line: None,
+                segment_range: None,
+                rule_index: Some(if physical_column_rule_sequence_is_reversed(style) {
+                    column_count.saturating_sub(2).saturating_sub(index)
+                } else {
+                    index
+                }),
             }
         })
         .collect::<Vec<_>>();
@@ -327,16 +471,139 @@ pub(in crate::layout) fn multicol_gap_decoration_primitives(
         container_kind: GapContainerKind::Multicol,
         rule: &style.column_rule,
         crossing_rule: &style.row_rule,
-        origin_x: content_left,
-        content_top,
-        inline_size: (column_width * column_count as f32
-            + gap * column_count.saturating_sub(1) as f32)
-            .max(0.0),
-        block_size: (content_top - content_bottom).max(0.0),
+        container: GapDecorationContainer::new(
+            content_left,
+            content_top,
+            (column_width * column_count as f32 + gap * column_count.saturating_sub(1) as f32)
+                .max(0.0),
+            (content_top - content_bottom).max(0.0),
+        ),
         gaps: &gaps,
         crossing_gaps: &[],
         items: &[],
+        rule_count: None,
     })
+}
+
+/// Resolves how many anonymous columns contribute gutters for
+/// `column-rule-visibility-items`.
+/// <https://drafts.csswg.org/css-gaps-1/#rule-visibility>
+pub(in crate::layout) fn multicol_decorated_column_count(
+    style: &ComputedStyle,
+    occupied: usize,
+    available: usize,
+) -> usize {
+    match style.column_rule.visibility_items {
+        // With `column-count:auto`, `all` bypasses item-adjacency suppression
+        // but does not instantiate otherwise nonexistent anonymous columns;
+        // the available inline size only caps how many columns may be made.
+        // An explicit count establishes that complete track sequence, so all
+        // of its gaps remain eligible.
+        // <https://drafts.csswg.org/css-gaps-1/#rule-visibility>
+        css::GapRuleVisibilityItems::All if style.column_count.is_none() => occupied.min(available),
+        css::GapRuleVisibilityItems::All => available,
+        css::GapRuleVisibilityItems::Around if occupied > 0 => (occupied + 1).min(available),
+        css::GapRuleVisibilityItems::Normal
+        | css::GapRuleVisibilityItems::Between
+        | css::GapRuleVisibilityItems::Around => occupied.min(available),
+    }
+}
+
+/// Paints the row rule between two adjacent wrapped multicol rows.
+///
+/// Multicol Level 2 creates a row gap after each complete row when overflow
+/// columns wrap in the block direction. Column gaps crossing that row gap are
+/// supplied so `rule-break` and junction inset behavior use the same segment
+/// model as flex and grid decorations.
+/// <https://drafts.csswg.org/css-multicol-2/#row-gaps>
+#[allow(clippy::too_many_arguments)]
+pub(in crate::layout) fn multicol_row_gap_decoration_primitives(
+    style: &ComputedStyle,
+    content_left: f32,
+    content_top: f32,
+    inline_size: f32,
+    column_height: f32,
+    row_gap: f32,
+    row_index: usize,
+    row_gap_count: usize,
+    column_width: f32,
+    column_gap: f32,
+    column_count: usize,
+) -> Vec<PaintPrimitive> {
+    if style.visibility != Visibility::Visible || row_gap < 0.0 {
+        return Vec::new();
+    }
+    let axis_mapped_style;
+    let style = if !WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes()
+    {
+        style
+    } else {
+        axis_mapped_style = gap_rules_transposed_to_physical_axes(style);
+        &axis_mapped_style
+    };
+    let row_start = column_height + row_index as f32 * (column_height + row_gap);
+    let row_gaps = [GapBand {
+        start: row_start,
+        end: row_start + row_gap,
+        grid_line: None,
+        segment_range: None,
+        rule_index: Some(if style.writing_mode.ltr_inline_progresses_upward() {
+            row_gap_count.saturating_sub(1).saturating_sub(row_index)
+        } else {
+            row_index
+        }),
+    }];
+    let column_gaps = (0..column_count.saturating_sub(1))
+        .map(|index| {
+            let start = (column_width + column_gap) * index as f32 + column_width;
+            GapBand {
+                start,
+                end: start + column_gap,
+                grid_line: None,
+                segment_range: None,
+                rule_index: Some(if physical_column_rule_sequence_is_reversed(style) {
+                    column_count.saturating_sub(2).saturating_sub(index)
+                } else {
+                    index
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    axis_rule_primitives(AxisRuleContext {
+        kind: GapRuleAxisKind::Row,
+        container_kind: GapContainerKind::Multicol,
+        rule: &style.row_rule,
+        crossing_rule: &style.column_rule,
+        container: GapDecorationContainer::new(
+            content_left,
+            content_top,
+            inline_size,
+            row_start + row_gap,
+        ),
+        gaps: &row_gaps,
+        crossing_gaps: &column_gaps,
+        items: &[],
+        rule_count: Some(row_gap_count),
+    })
+}
+
+fn gap_rules_transposed_to_physical_axes(style: &ComputedStyle) -> ComputedStyle {
+    let mut mapped = style.clone();
+    std::mem::swap(&mut mapped.column_rule, &mut mapped.row_rule);
+    mapped.rule_overlap = match style.rule_overlap {
+        css::GapRuleOverlap::RowOverColumn => css::GapRuleOverlap::ColumnOverRow,
+        css::GapRuleOverlap::ColumnOverRow => css::GapRuleOverlap::RowOverColumn,
+    };
+    mapped
+}
+
+fn physical_column_rule_sequence_is_reversed(style: &ComputedStyle) -> bool {
+    let axes = WritingModeAxes::new(style.writing_mode, style.direction);
+    if axes.swaps_physical_axes() {
+        axes.physical_side(LogicalSide::BlockStart) == PhysicalSide::Right
+    } else {
+        axes.physical_side(LogicalSide::InlineStart) == PhysicalSide::Right
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -345,13 +612,11 @@ pub(in crate::layout) struct AxisRuleContext<'a> {
     pub(in crate::layout) container_kind: GapContainerKind,
     pub(in crate::layout) rule: &'a css::GapRuleAxis,
     pub(in crate::layout) crossing_rule: &'a css::GapRuleAxis,
-    pub(in crate::layout) origin_x: f32,
-    pub(in crate::layout) content_top: f32,
-    pub(in crate::layout) inline_size: f32,
-    pub(in crate::layout) block_size: f32,
+    pub(in crate::layout) container: GapDecorationContainer,
     pub(in crate::layout) gaps: &'a [GapBand],
     pub(in crate::layout) crossing_gaps: &'a [GapBand],
     pub(in crate::layout) items: &'a [GapDecorationItem],
+    pub(in crate::layout) rule_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -359,6 +624,8 @@ pub(in crate::layout) struct GapBand {
     pub(in crate::layout) start: f32,
     pub(in crate::layout) end: f32,
     pub(in crate::layout) grid_line: Option<u16>,
+    pub(in crate::layout) segment_range: Option<GapAxisSpan>,
+    pub(in crate::layout) rule_index: Option<usize>,
 }
 
 impl GapBand {
@@ -374,9 +641,11 @@ impl GapBand {
 impl From<GapDecorationGutter> for GapBand {
     fn from(gutter: GapDecorationGutter) -> Self {
         Self {
-            start: gutter.start,
-            end: gutter.end,
+            start: gutter.span.start,
+            end: gutter.span.end,
             grid_line: gutter.grid_line,
+            segment_range: gutter.segment_range,
+            rule_index: gutter.rule_index,
         }
     }
 }
@@ -407,7 +676,7 @@ pub(in crate::layout) fn grid_axis_gutters_from_tracks(
     let mut cursor = 0.0;
     let mut seen_track = false;
     let mut bands = Vec::new();
-    for (index, size) in sizes.iter().copied().enumerate() {
+    for (index, size) in sizes.iter().cloned().enumerate() {
         let gutter_size = gutters[index].max(0.0);
         if index > 0 && gutter_size > GAP_RULE_EPSILON {
             bands.push(GapDecorationGutter::with_grid_line(
@@ -580,44 +849,112 @@ impl GapRuleEndpoint {
 }
 
 pub(in crate::layout) fn axis_rule_primitives(context: AxisRuleContext<'_>) -> Vec<PaintPrimitive> {
-    let gap_count = context.gaps.len();
-    let mut primitives = Vec::new();
-    for (index, gap) in context.gaps.iter().copied().enumerate() {
+    axis_rule_paint_segments(context)
+        .into_iter()
+        .flat_map(|rule_segment| {
+            gap_rule_segment_primitives(
+                context,
+                rule_segment.gap,
+                rule_segment.segment,
+                rule_segment.width,
+                rule_segment.style,
+                rule_segment.color,
+            )
+        })
+        .collect()
+}
+
+/// Resolves a rule axis to centerline segments while retaining endpoint
+/// metadata for a later fragment projection.
+pub(in crate::layout) fn axis_rule_paint_segments(
+    context: AxisRuleContext<'_>,
+) -> Vec<GapRulePaintSegment> {
+    let gap_count = context.rule_count.unwrap_or_else(|| {
+        context
+            .gaps
+            .iter()
+            .filter_map(|gap| gap.rule_index)
+            .max()
+            .map_or(context.gaps.len(), |index| index + 1)
+    });
+    let mut paint_segments = Vec::new();
+    for (physical_index, gap) in context.gaps.iter().cloned().enumerate() {
+        let index = gap.rule_index.unwrap_or(physical_index);
         let width = used_gap_rule_length(
             context
                 .rule
                 .widths
                 .value_for_index(index, gap_count)
                 .expect("gap rule width should exist for gap index"),
-            gap.size(),
+            PercentageBasis::definite(layout_pt(gap.size())),
         );
-        let segments = gap_rule_segments(context, gap, width);
-        for segment in segments {
+        let rule_style = context
+            .rule
+            .styles
+            .value_for_index(index, gap_count)
+            .expect("gap rule style should exist for gap index");
+        let rule_color = context
+            .rule
+            .colors
+            .value_for_index(index, gap_count)
+            .expect("gap rule color should exist for gap index");
+        let mut segments = Vec::new();
+        for segment in gap_rule_segments(context, gap, width) {
             let segment = offset_gap_rule_segment(context.rule, segment);
             if segment.end.position <= segment.start.position + GAP_RULE_EPSILON
                 || !segment_is_visible(context, gap, segment)
             {
                 continue;
             }
-            primitives.extend(gap_rule_segment_primitives(
-                context,
+            segments.push(segment);
+        }
+        if rule_style == BorderStyle::Solid {
+            segments = coalesce_overlapping_solid_gap_rule_segments(segments);
+        }
+        for segment in segments {
+            paint_segments.push(GapRulePaintSegment {
+                kind: context.kind,
                 gap,
                 segment,
                 width,
-                context
-                    .rule
-                    .styles
-                    .value_for_index(index, gap_count)
-                    .expect("gap rule style should exist for gap index"),
-                context
-                    .rule
-                    .colors
-                    .value_for_index(index, gap_count)
-                    .expect("gap rule color should exist for gap index"),
-            ));
+                style: rule_style,
+                color: rule_color,
+            });
         }
     }
-    primitives
+    paint_segments
+}
+
+/// Returns the geometric union of overlapping collinear solid-rule segments.
+///
+/// Negative cap and junction insets may deliberately extend adjacent segments
+/// through one another. Painting those opaque pieces independently changes the
+/// antialiasing at their coincident edges; a solid rule instead represents the
+/// union of its segment areas. Patterned rules remain separate so their dash
+/// phase and junction behavior are preserved.
+/// <https://drafts.csswg.org/css-gaps-1/#gap-rule-inset>
+fn coalesce_overlapping_solid_gap_rule_segments(
+    mut segments: Vec<GapDecorationSegment>,
+) -> Vec<GapDecorationSegment> {
+    segments.sort_by(|a, b| {
+        a.start
+            .position
+            .partial_cmp(&b.start.position)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut merged: Vec<GapDecorationSegment> = Vec::with_capacity(segments.len());
+    for segment in segments {
+        if let Some(previous) = merged.last_mut()
+            && segment.start.position <= previous.end.position + GAP_RULE_EPSILON
+        {
+            if segment.end.position > previous.end.position {
+                previous.end = segment.end;
+            }
+        } else {
+            merged.push(segment);
+        }
+    }
+    merged
 }
 
 pub(in crate::layout) fn gap_rule_segments(
@@ -626,26 +963,37 @@ pub(in crate::layout) fn gap_rule_segments(
     own_width: f32,
 ) -> Vec<GapDecorationSegment> {
     let axis_size = context.axis_size();
-    if axis_size <= GAP_RULE_EPSILON {
+    let axis_span = gap
+        .segment_range
+        .unwrap_or_else(|| GapAxisSpan::new(0.0, axis_size));
+    let (axis_start, axis_end) = (axis_span.start, axis_span.end);
+    let axis_start = axis_start.clamp(0.0, axis_size);
+    let axis_end = axis_end.clamp(axis_start, axis_size);
+    if axis_end <= axis_start + GAP_RULE_EPSILON {
         return Vec::new();
     }
     let break_behavior = effective_rule_break(context);
     if break_behavior == css::GapRuleBreak::None {
         return vec![GapDecorationSegment {
-            start: GapRuleEndpoint::cap(0.0),
-            end: GapRuleEndpoint::cap(axis_size),
+            start: GapRuleEndpoint::cap(axis_start),
+            end: GapRuleEndpoint::cap(axis_end),
         }];
     }
 
     let crossing_gap_count = context.crossing_gaps.len();
     let mut segments = Vec::new();
-    let mut cursor = 0.0;
-    for (cross_index, crossing_gap) in context.crossing_gaps.iter().copied().enumerate() {
+    let mut cursor = axis_start;
+    for (cross_index, crossing_gap) in context.crossing_gaps.iter().cloned().enumerate() {
         let crossing_rule_width = context
             .crossing_rule
             .widths
             .value_for_index(cross_index, crossing_gap_count)
-            .map(|width| used_gap_rule_length(width, crossing_gap.size()))
+            .map(|width| {
+                used_gap_rule_length(
+                    width,
+                    PercentageBasis::definite(layout_pt(crossing_gap.size())),
+                )
+            })
             .unwrap_or(0.0);
         let crossing_rule_can_paint = crossing_rule_can_paint(
             crossing_rule_width,
@@ -658,13 +1006,13 @@ pub(in crate::layout) fn gap_rule_segments(
                 .colors
                 .value_for_index(cross_index, crossing_gap_count),
         );
-        if grid_normal_crossing_is_visible(context, gap, crossing_gap, crossing_rule_can_paint)
-            .is_some_and(|visible| !visible)
+        let junction_start = crossing_gap.start.clamp(axis_start, axis_end);
+        let junction_end = crossing_gap.end.clamp(axis_start, axis_end);
+        if junction_end <= axis_start + GAP_RULE_EPSILON
+            || junction_start >= axis_end - GAP_RULE_EPSILON
         {
             continue;
         }
-        let junction_start = crossing_gap.start.clamp(0.0, axis_size);
-        let junction_end = crossing_gap.end.clamp(0.0, axis_size);
         if junction_start > cursor + GAP_RULE_EPSILON {
             segments.push(GapDecorationSegment {
                 start: segment_start_endpoint(
@@ -692,10 +1040,10 @@ pub(in crate::layout) fn gap_rule_segments(
             cursor = junction_end.max(cursor);
         }
     }
-    if axis_size > cursor + GAP_RULE_EPSILON {
+    if axis_end > cursor + GAP_RULE_EPSILON {
         segments.push(GapDecorationSegment {
-            start: if cursor <= GAP_RULE_EPSILON {
-                GapRuleEndpoint::cap(0.0)
+            start: if cursor <= axis_start + GAP_RULE_EPSILON {
+                GapRuleEndpoint::cap(axis_start)
             } else {
                 nearest_crossing_gap(context.crossing_gaps, cursor)
                     .map(|crossing_gap| {
@@ -711,10 +1059,69 @@ pub(in crate::layout) fn gap_rule_segments(
                     })
                     .unwrap_or_else(|| GapRuleEndpoint::cap(cursor))
             },
-            end: GapRuleEndpoint::cap(axis_size),
+            end: GapRuleEndpoint::cap(axis_end),
         });
     }
+    if break_behavior == css::GapRuleBreak::Normal
+        && context.container_kind == GapContainerKind::Grid
+    {
+        // A segment which crosses an item is discontiguous and is discarded
+        // before it can be joined to its neighbour.
+        // <https://drafts.csswg.org/css-gaps-1/#gap-decoration-segments>
+        segments.retain(|segment| {
+            !grid_gap_rule_segment_is_discontiguous(context, gap, *segment).unwrap_or(false)
+        });
+        if !matches!(
+            effective_visibility_items(context),
+            css::GapRuleVisibilityItems::All | css::GapRuleVisibilityItems::Normal
+        ) {
+            // Visibility applies to individual gap portions. Once invisible
+            // portions have been removed, the remaining contiguous portions
+            // can again form one normal-break segment.
+            // <https://drafts.csswg.org/css-gaps-1/#visibility>
+            segments.retain(|segment| segment_is_visible(context, gap, *segment));
+            segments = join_visible_grid_gap_rule_segments(context, gap, segments);
+        }
+    }
     segments
+}
+
+/// Joins adjacent visible atomic portions of a normal grid gap rule.
+///
+/// `around` and `between` visibility can remove an otherwise ordinary grid
+/// portion. Joining only after that filter prevents a visible portion from
+/// expanding through an empty one, while preserving the uninterrupted rule
+/// that remains across occupied portions.
+/// <https://drafts.csswg.org/css-gaps-1/#gap-decoration-segments> and
+/// <https://drafts.csswg.org/css-gaps-1/#visibility>
+fn join_visible_grid_gap_rule_segments(
+    context: AxisRuleContext<'_>,
+    gap: GapBand,
+    segments: Vec<GapDecorationSegment>,
+) -> Vec<GapDecorationSegment> {
+    let mut joined = Vec::<GapDecorationSegment>::with_capacity(segments.len());
+    for segment in segments {
+        let Some(previous) = joined.last_mut() else {
+            joined.push(segment);
+            continue;
+        };
+        let crossing_gap = context.crossing_gaps.iter().cloned().find(|crossing_gap| {
+            crossing_gap.start <= previous.end.position + GAP_RULE_EPSILON
+                && crossing_gap.end >= segment.start.position - GAP_RULE_EPSILON
+        });
+        let joins = crossing_gap.is_some_and(|crossing_gap| {
+            grid_crossing_segment_present_at_junction(context, gap, crossing_gap)
+                .is_none_or(|present| present)
+                && !grid_junction_candidate_is_discontiguous(context, gap, crossing_gap)
+                    .unwrap_or(false)
+        });
+        if joins {
+            previous.end = segment.end;
+        } else {
+            joined.push(segment);
+        }
+    }
+    joined
 }
 
 pub(in crate::layout) fn effective_rule_break(context: AxisRuleContext<'_>) -> css::GapRuleBreak {
@@ -747,27 +1154,27 @@ pub(in crate::layout) fn should_join_across_junction(
             )
         }
         css::GapRuleBreak::Normal if context.container_kind == GapContainerKind::Grid => {
-            grid_junction_is_cross_intersection(context, gap, crossing_gap).unwrap_or(false)
+            // Visibility is evaluated for each segment portion. Keeping the
+            // portions separate lets `around` and `between` remove empty
+            // portions without making an adjacent occupied portion expand
+            // through the rest of the grid gap.
+            if !matches!(
+                effective_visibility_items(context),
+                css::GapRuleVisibilityItems::All | css::GapRuleVisibilityItems::Normal
+            ) {
+                return false;
+            }
+            if grid_crossing_segment_present_at_junction(context, gap, crossing_gap)
+                .is_some_and(|present| !present)
+            {
+                return false;
+            }
+            !grid_junction_candidate_is_discontiguous(context, gap, crossing_gap).unwrap_or_else(
+                || segment_crosses_spanning_item(context, gap, crossing_gap, own_width),
+            )
         }
         _ => false,
     }
-}
-
-pub(in crate::layout) fn grid_normal_crossing_is_visible(
-    context: AxisRuleContext<'_>,
-    gap: GapBand,
-    crossing_gap: GapBand,
-    crossing_rule_can_paint: bool,
-) -> Option<bool> {
-    if context.container_kind != GapContainerKind::Grid
-        || effective_rule_break(context) != css::GapRuleBreak::Normal
-    {
-        return None;
-    }
-    if !crossing_rule_can_paint {
-        return Some(false);
-    }
-    grid_crossing_segment_present_at_junction(context, gap, crossing_gap)
 }
 
 pub(in crate::layout) fn segment_crosses_spanning_item(
@@ -789,9 +1196,9 @@ pub(in crate::layout) fn segment_crosses_spanning_item(
             GapRuleAxisKind::Column,
         )
         .unwrap_or_else(|| {
-            item.x < gap.center() + half
+            item.rect.origin.x < gap.center() + half
                 && item.x_end() > gap.center() - half
-                && item.y <= crossing_gap.start + GAP_RULE_EPSILON
+                && item.rect.origin.y <= crossing_gap.start + GAP_RULE_EPSILON
                 && item.y_end() >= crossing_gap.end - GAP_RULE_EPSILON
         }),
         GapRuleAxisKind::Row => grid_item_spans_intersection(
@@ -802,9 +1209,9 @@ pub(in crate::layout) fn segment_crosses_spanning_item(
             GapRuleAxisKind::Row,
         )
         .unwrap_or_else(|| {
-            item.y < gap.center() + half
+            item.rect.origin.y < gap.center() + half
                 && item.y_end() > gap.center() - half
-                && item.x <= crossing_gap.start + GAP_RULE_EPSILON
+                && item.rect.origin.x <= crossing_gap.start + GAP_RULE_EPSILON
                 && item.x_end() >= crossing_gap.end - GAP_RULE_EPSILON
         }),
     })
@@ -886,7 +1293,15 @@ pub(in crate::layout) fn grid_area_spans_column_line(
     area.column_start < column_line && area.column_end > column_line
 }
 
-pub(in crate::layout) fn grid_junction_is_cross_intersection(
+/// Whether joining the two segments adjacent to a grid gap junction would
+/// paint through an item.
+///
+/// The `normal` break behavior joins two adjacent segments unless their union
+/// is discontiguous. A union is discontiguous when its gap-width line segment
+/// intersects an item. At a grid junction that means an item spanning the
+/// decorated grid line in either track immediately adjacent to the crossing
+/// line. <https://drafts.csswg.org/css-gaps-1/#gap-decoration-segments>
+pub(in crate::layout) fn grid_junction_candidate_is_discontiguous(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     crossing_gap: GapBand,
@@ -900,24 +1315,78 @@ pub(in crate::layout) fn grid_junction_is_cross_intersection(
         GapRuleAxisKind::Column => (own_line, crossing_line),
         GapRuleAxisKind::Row => (crossing_line, own_line),
     };
-    let mut before_column_before_row = false;
-    let mut after_column_before_row = false;
-    let mut before_column_after_row = false;
-    let mut after_column_after_row = false;
+    let mut saw_grid_area = false;
+    let mut intersects_candidate = false;
     for area in context.items.iter().filter_map(|item| item.grid_area) {
-        before_column_before_row |=
-            grid_area_occupies_quadrant(area, column_line, row_line, false, false);
-        after_column_before_row |=
-            grid_area_occupies_quadrant(area, column_line, row_line, true, false);
-        before_column_after_row |=
-            grid_area_occupies_quadrant(area, column_line, row_line, false, true);
-        after_column_after_row |=
-            grid_area_occupies_quadrant(area, column_line, row_line, true, true);
+        saw_grid_area = true;
+        let intersects = match context.kind {
+            GapRuleAxisKind::Column => {
+                area.column_start < column_line
+                    && area.column_end > column_line
+                    && area.row_start <= row_line
+                    && area.row_end >= row_line
+            }
+            GapRuleAxisKind::Row => {
+                area.row_start < row_line
+                    && area.row_end > row_line
+                    && area.column_start <= column_line
+                    && area.column_end >= column_line
+            }
+        };
+        intersects_candidate |= intersects;
     }
-    Some(
-        before_column_before_row
-            && after_column_before_row
-            && before_column_after_row
-            && after_column_after_row,
-    )
+    saw_grid_area.then_some(intersects_candidate)
+}
+
+/// Whether a grid gap-rule segment intersects a grid item.
+///
+/// CSS Gaps discards a segment whose gap-width line segment intersects a
+/// child item. Grid-area line numbers make that test independent of physical
+/// writing direction and of track-size rounding.
+/// <https://drafts.csswg.org/css-gaps-1/#gap-decoration-segments>
+pub(in crate::layout) fn grid_gap_rule_segment_is_discontiguous(
+    context: AxisRuleContext<'_>,
+    gap: GapBand,
+    segment: GapDecorationSegment,
+) -> Option<bool> {
+    if context.container_kind != GapContainerKind::Grid {
+        return None;
+    }
+    let own_line = gap.grid_line?;
+    let (cross_start, cross_end) = grid_segment_cross_axis_line_range(context, segment)?;
+    let mut saw_grid_area = false;
+    let mut intersects_item = false;
+    for area in context.items.iter().filter_map(|item| item.grid_area) {
+        saw_grid_area = true;
+        intersects_item |= match context.kind {
+            GapRuleAxisKind::Column => {
+                area.column_start < own_line
+                    && area.column_end > own_line
+                    && area.row_start < cross_end
+                    && area.row_end > cross_start
+            }
+            GapRuleAxisKind::Row => {
+                area.row_start < own_line
+                    && area.row_end > own_line
+                    && area.column_start < cross_end
+                    && area.column_end > cross_start
+            }
+        };
+    }
+    saw_grid_area.then_some(intersects_item)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_rule_order_uses_sideways_block_progression() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::SidewaysRl;
+        assert!(physical_column_rule_sequence_is_reversed(&style));
+
+        style.writing_mode = WritingMode::SidewaysLr;
+        assert!(!physical_column_rule_sequence_is_reversed(&style));
+    }
 }

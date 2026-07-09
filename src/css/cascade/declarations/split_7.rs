@@ -56,6 +56,35 @@ pub(in crate::css) fn parse_text_autospace(value: &str) -> Option<TextAutospace>
     (!autospace.is_none()).then_some(autospace)
 }
 
+/// Parse CSS Text Level 4's `word-space-transform` keyword set.
+///
+/// The value is an unordered pair of one replacement keyword and optional
+/// `auto-phrase`; `none` cannot be combined with either:
+/// <https://drafts.csswg.org/css-text-4/#word-space-transform>.
+pub(in crate::css) fn parse_word_space_transform(value: &str) -> Option<WordSpaceTransform> {
+    let tokens = split_css_component_values(value);
+    if tokens.is_empty() {
+        return None;
+    }
+    if tokens.len() == 1 && tokens[0].eq_ignore_ascii_case("none") {
+        return Some(WordSpaceTransform::NONE);
+    }
+    let mut transform = WordSpaceTransform::NONE;
+    for token in tokens {
+        match token.to_ascii_lowercase().as_str() {
+            "space" if transform.replacement.is_none() => {
+                transform.replacement = Some(WordSpaceReplacement::Space);
+            }
+            "ideographic-space" if transform.replacement.is_none() => {
+                transform.replacement = Some(WordSpaceReplacement::IdeographicSpace);
+            }
+            "auto-phrase" if !transform.auto_phrase => transform.auto_phrase = true,
+            _ => return None,
+        }
+    }
+    (transform.replacement.is_some() || transform.auto_phrase).then_some(transform)
+}
+
 pub(in crate::css) fn parse_text_align_all(
     value: &str,
     inheritance_source: &ComputedStyle,
@@ -113,8 +142,9 @@ pub(in crate::css) fn resolve_match_parent_text_align(
 
 /// Parse CSS Text's `text-transform` keyword set.
 ///
-/// CSS Text defines `text-transform` as either `none` or a combination of at
-/// most one case transform with optional `full-width` and `full-size-kana`:
+/// CSS Text defines `text-transform` as either `none`, `math-auto`, or a
+/// combination of at most one case transform with optional `full-width` and
+/// `full-size-kana`:
 /// <https://www.w3.org/TR/css-text-3/#text-transform-property>.
 pub(in crate::css) fn parse_text_transform(value: &str) -> Option<TextTransform> {
     let tokens = split_css_component_values(value);
@@ -123,6 +153,12 @@ pub(in crate::css) fn parse_text_transform(value: &str) -> Option<TextTransform>
     }
     if tokens.len() == 1 && tokens[0].eq_ignore_ascii_case("none") {
         return Some(TextTransform::NONE);
+    }
+    if tokens.len() == 1 && tokens[0].eq_ignore_ascii_case("math-auto") {
+        return Some(TextTransform {
+            math_auto: true,
+            ..TextTransform::NONE
+        });
     }
 
     let mut transform = TextTransform::NONE;
@@ -262,7 +298,7 @@ pub(in crate::css) fn parse_text_decoration_inset(
         [single] => {
             let length = parse_computed_length_percentage(single, font_size)?;
             Some(TextDecorationInset::Lengths {
-                start: length,
+                start: length.clone(),
                 end: length,
             })
         }
@@ -609,19 +645,19 @@ pub(in crate::css) fn parse_text_shadow_layer(value: &str, font_size: f32) -> Op
     }
     let spread = lengths
         .get(3)
-        .copied()
+        .cloned()
         .unwrap_or(ComputedLengthPercentage::ZERO);
-    if length_percentage_is_definitely_negative(spread) {
+    if length_percentage_is_definitely_negative(&spread) {
         return None;
     }
     Some(TextShadow {
         color: color.unwrap_or(TextShadowColor::CurrentColor),
-        offset_x: lengths[0],
-        offset_y: lengths[1],
+        offset_x: lengths[0].clone(),
+        offset_y: lengths[1].clone(),
         blur_radius: lengths
             .get(2)
-            .copied()
-            .filter(|length| !length_percentage_is_definitely_negative(*length))
+            .cloned()
+            .filter(|length| !length_percentage_is_definitely_negative(length))
             .unwrap_or(ComputedLengthPercentage::ZERO),
         spread,
         inset,
@@ -668,21 +704,21 @@ pub(in crate::css) fn parse_box_shadow_layer(value: &str, font_size: f32) -> Opt
     if !(2..=4).contains(&lengths.len())
         || lengths
             .get(2)
-            .is_some_and(|blur| length_percentage_is_definitely_negative(*blur))
+            .is_some_and(length_percentage_is_definitely_negative)
     {
         return None;
     }
     Some(BoxShadow {
         color: color.unwrap_or(BoxShadowColor::CurrentColor),
-        offset_x: lengths[0],
-        offset_y: lengths[1],
+        offset_x: lengths[0].clone(),
+        offset_y: lengths[1].clone(),
         blur_radius: lengths
             .get(2)
-            .copied()
+            .cloned()
             .unwrap_or(ComputedLengthPercentage::ZERO),
         spread: lengths
             .get(3)
-            .copied()
+            .cloned()
             .unwrap_or(ComputedLengthPercentage::ZERO),
         inset,
     })
@@ -693,25 +729,13 @@ pub(in crate::css) fn parse_shadow_length(
     font_size: f32,
 ) -> Option<ComputedLengthPercentage> {
     let length = parse_computed_length_percentage(value, font_size)?;
-    (length.percent == 0.0).then_some(length)
+    (!length.contains_percentage()).then_some(length)
 }
 
 pub(in crate::css) fn length_percentage_is_definitely_negative(
-    value: ComputedLengthPercentage,
+    value: &ComputedLengthPercentage,
 ) -> bool {
-    let components = [
-        value.length_points(),
-        value.percent,
-        value.ch,
-        value.vw,
-        value.vh,
-        value.vmin,
-        value.vmax,
-        value.vi,
-        value.vb,
-    ];
-    components.iter().any(|component| *component < 0.0)
-        && components.iter().all(|component| *component <= 0.0)
+    value.is_definitely_absolute() && value.length_points() < 0.0
 }
 
 /// Parses the CSS `text-decoration` shorthand.

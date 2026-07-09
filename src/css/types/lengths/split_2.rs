@@ -8,7 +8,7 @@ use super::*;
 /// flex base sizing instead of retrieving the main-size property like `auto`:
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-basis-property> and
 /// <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ComputedFlexBasis {
     Auto,
     Content,
@@ -22,29 +22,48 @@ pub(crate) enum ComputedFlexBasis {
 ///
 /// CSS Flexbox resolves percentages in `flex-basis` against the flex
 /// container's inner main size, and falls back to `content` when that size is
-/// indefinite. A zero percentage computes to the same numeric components as a
-/// zero length, so flex-basis keeps this authored percentage bit for used-value
-/// resolution:
+/// indefinite. Percentage presence, including authored `0%`, belongs to the
+/// unified `<length-percentage>` representation:
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-basis-property>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedFlexBasisLength {
     pub value: ComputedLengthPercentage,
-    pub has_percentage: bool,
 }
 
 impl ComputedFlexBasisLength {
-    pub(crate) fn new(value: ComputedLengthPercentage, has_percentage: bool) -> Self {
-        Self {
-            value,
-            has_percentage,
-        }
+    pub(crate) fn new(value: ComputedLengthPercentage) -> Self {
+        Self { value }
+    }
+
+    pub(crate) fn contains_percentage(&self) -> bool {
+        self.value.contains_percentage()
     }
 }
 
 impl ComputedFlexBasis {
     pub(crate) const AUTO: Self = Self::Auto;
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    /// Scale the fixed components of a flex basis at the CSS `zoom`
+    /// used-value boundary.
+    ///
+    /// Percentages intentionally remain unscaled: CSS Flexbox resolves them
+    /// against the flex container's already zoomed inner main size.  Intrinsic
+    /// keywords and `auto` likewise remain algorithmic values.
+    /// <https://drafts.csswg.org/css-viewport/#zoom-property>
+    /// <https://drafts.csswg.org/css-flexbox-1/#flex-basis-property>
+    pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
+        match self {
+            Self::FitContent(Some(value)) => value.scale_fixed_length_components(factor),
+            Self::LengthPercentage(value) => value.value.scale_fixed_length_components(factor),
+            Self::Auto
+            | Self::Content
+            | Self::MinContent
+            | Self::MaxContent
+            | Self::FitContent(None) => {}
+        }
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         match self {
             Self::FitContent(Some(value)) => {
                 value.resolve_font_metric_lengths(ch_advance);
@@ -58,33 +77,15 @@ impl ComputedFlexBasis {
         }
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
+    pub(crate) fn requires_ch_advance(&self) -> bool {
         match self {
-            Self::FitContent(Some(value)) => {
-                value.resolve_viewport_lengths(
-                    viewport_width,
-                    viewport_height,
-                    viewport_inline,
-                    viewport_block,
-                );
-            }
-            Self::LengthPercentage(value) => value.value.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            ),
+            Self::FitContent(Some(value)) => value.requires_ch_advance(),
+            Self::LengthPercentage(value) => value.value.requires_ch_advance(),
             Self::Auto
             | Self::Content
             | Self::MinContent
             | Self::MaxContent
-            | Self::FitContent(None) => {}
+            | Self::FitContent(None) => false,
         }
     }
 }
@@ -94,7 +95,7 @@ impl ComputedFlexBasis {
 /// CSS Box Model Level 3 defines physical margin, padding, and border edge
 /// properties in this order:
 /// <https://www.w3.org/TR/css-box-3/#the-margin-properties>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CssEdges<T> {
     pub top: T,
     pub right: T,
@@ -102,12 +103,12 @@ pub(crate) struct CssEdges<T> {
     pub left: T,
 }
 
-impl<T: Copy> CssEdges<T> {
-    pub(crate) const fn all(value: T) -> Self {
+impl<T: Clone> CssEdges<T> {
+    pub(crate) fn all(value: T) -> Self {
         Self {
-            top: value,
-            right: value,
-            bottom: value,
+            top: value.clone(),
+            right: value.clone(),
+            bottom: value.clone(),
             left: value,
         }
     }
@@ -138,7 +139,91 @@ pub(crate) struct ComputedBoxValues {
 }
 
 impl ComputedBoxValues {
-    pub(crate) const fn initial() -> Self {
+    /// Scale fixed box-model length components for CSS `zoom`.
+    pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
+        for value in [
+            &mut self.margin.top,
+            &mut self.margin.right,
+            &mut self.margin.bottom,
+            &mut self.margin.left,
+            &mut self.width,
+            &mut self.height,
+            &mut self.min_width,
+            &mut self.max_width,
+            &mut self.min_height,
+            &mut self.max_height,
+            &mut self.inset_left,
+            &mut self.inset_top,
+            &mut self.inset_right,
+            &mut self.inset_bottom,
+        ] {
+            value.scale_fixed_length_components(factor);
+        }
+        for value in [
+            &mut self.padding.top,
+            &mut self.padding.right,
+            &mut self.padding.bottom,
+            &mut self.padding.left,
+        ] {
+            value.scale_fixed_length_components(factor);
+        }
+    }
+
+    /// Resolves `ch` terms by physical box axis.
+    ///
+    /// In vertical writing, the glyph's horizontal and vertical advances can
+    /// differ. Physical width/left/right values therefore cannot share the
+    /// basis used by physical height/top/bottom values.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn resolve_font_metric_lengths_by_physical_axis(
+        &mut self,
+        horizontal_advance: LayoutLength,
+        vertical_advance: LayoutLength,
+    ) {
+        self.margin
+            .top
+            .resolve_font_metric_lengths(vertical_advance);
+        self.margin
+            .right
+            .resolve_font_metric_lengths(horizontal_advance);
+        self.margin
+            .bottom
+            .resolve_font_metric_lengths(vertical_advance);
+        self.margin
+            .left
+            .resolve_font_metric_lengths(horizontal_advance);
+        self.padding
+            .top
+            .resolve_font_metric_lengths(vertical_advance);
+        self.padding
+            .right
+            .resolve_font_metric_lengths(horizontal_advance);
+        self.padding
+            .bottom
+            .resolve_font_metric_lengths(vertical_advance);
+        self.padding
+            .left
+            .resolve_font_metric_lengths(horizontal_advance);
+        self.width.resolve_font_metric_lengths(horizontal_advance);
+        self.height.resolve_font_metric_lengths(vertical_advance);
+        self.min_width
+            .resolve_font_metric_lengths(horizontal_advance);
+        self.max_width
+            .resolve_font_metric_lengths(horizontal_advance);
+        self.min_height
+            .resolve_font_metric_lengths(vertical_advance);
+        self.max_height
+            .resolve_font_metric_lengths(vertical_advance);
+        self.inset_left
+            .resolve_font_metric_lengths(horizontal_advance);
+        self.inset_top.resolve_font_metric_lengths(vertical_advance);
+        self.inset_right
+            .resolve_font_metric_lengths(horizontal_advance);
+        self.inset_bottom
+            .resolve_font_metric_lengths(vertical_advance);
+    }
+
+    pub(crate) fn initial() -> Self {
         Self {
             margin: CssEdges::all(ComputedLengthPercentageOrAuto::ZERO),
             padding: CssEdges::all(ComputedLengthPercentage::ZERO),
@@ -155,141 +240,340 @@ impl ComputedBoxValues {
         }
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
-        self.margin.top.resolve_font_metric_lengths(ch_advance);
-        self.margin.right.resolve_font_metric_lengths(ch_advance);
-        self.margin.bottom.resolve_font_metric_lengths(ch_advance);
-        self.margin.left.resolve_font_metric_lengths(ch_advance);
-        self.padding.top.resolve_font_metric_lengths(ch_advance);
-        self.padding.right.resolve_font_metric_lengths(ch_advance);
-        self.padding.bottom.resolve_font_metric_lengths(ch_advance);
-        self.padding.left.resolve_font_metric_lengths(ch_advance);
-        self.width.resolve_font_metric_lengths(ch_advance);
-        self.height.resolve_font_metric_lengths(ch_advance);
-        self.min_width.resolve_font_metric_lengths(ch_advance);
-        self.max_width.resolve_font_metric_lengths(ch_advance);
-        self.min_height.resolve_font_metric_lengths(ch_advance);
-        self.max_height.resolve_font_metric_lengths(ch_advance);
-        self.inset_left.resolve_font_metric_lengths(ch_advance);
-        self.inset_top.resolve_font_metric_lengths(ch_advance);
-        self.inset_right.resolve_font_metric_lengths(ch_advance);
-        self.inset_bottom.resolve_font_metric_lengths(ch_advance);
+    /// Resolves box-model font-relative components once the element's used
+    /// font metrics are available.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    #[allow(dead_code)]
+    pub(crate) fn resolve_font_relative_lengths(&mut self, basis: FontRelativeLengthBasis) {
+        self.margin.top.resolve_font_relative_lengths(basis);
+        self.margin.right.resolve_font_relative_lengths(basis);
+        self.margin.bottom.resolve_font_relative_lengths(basis);
+        self.margin.left.resolve_font_relative_lengths(basis);
+        self.padding.top.resolve_font_relative_lengths(basis);
+        self.padding.right.resolve_font_relative_lengths(basis);
+        self.padding.bottom.resolve_font_relative_lengths(basis);
+        self.padding.left.resolve_font_relative_lengths(basis);
+        self.width.resolve_font_relative_lengths(basis);
+        self.height.resolve_font_relative_lengths(basis);
+        self.min_width.resolve_font_relative_lengths(basis);
+        self.max_width.resolve_font_relative_lengths(basis);
+        self.min_height.resolve_font_relative_lengths(basis);
+        self.max_height.resolve_font_relative_lengths(basis);
+        self.inset_left.resolve_font_relative_lengths(basis);
+        self.inset_top.resolve_font_relative_lengths(basis);
+        self.inset_right.resolve_font_relative_lengths(basis);
+        self.inset_bottom.resolve_font_relative_lengths(basis);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
+    /// Resolves the ordinary font-size-relative portion of box-model values
+    /// during computed-value finalization.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn resolve_em_relative_lengths(&mut self, font_size: LayoutLength) {
+        self.margin.top.resolve_em_relative_lengths(font_size);
+        self.margin.right.resolve_em_relative_lengths(font_size);
+        self.margin.bottom.resolve_em_relative_lengths(font_size);
+        self.margin.left.resolve_em_relative_lengths(font_size);
+        self.padding.top.resolve_em_relative_lengths(font_size);
+        self.padding.right.resolve_em_relative_lengths(font_size);
+        self.padding.bottom.resolve_em_relative_lengths(font_size);
+        self.padding.left.resolve_em_relative_lengths(font_size);
+        self.width.resolve_em_relative_lengths(font_size);
+        self.height.resolve_em_relative_lengths(font_size);
+        self.min_width.resolve_em_relative_lengths(font_size);
+        self.max_width.resolve_em_relative_lengths(font_size);
+        self.min_height.resolve_em_relative_lengths(font_size);
+        self.max_height.resolve_em_relative_lengths(font_size);
+        self.inset_left.resolve_em_relative_lengths(font_size);
+        self.inset_top.resolve_em_relative_lengths(font_size);
+        self.inset_right.resolve_em_relative_lengths(font_size);
+        self.inset_bottom.resolve_em_relative_lengths(font_size);
+    }
+
+    /// Resolves root-font-relative box-model components after the document
+    /// root's used font size is known.
+    /// <https://www.w3.org/TR/css-values-4/#rem>
+    pub(crate) fn resolve_root_font_relative_lengths(&mut self, root_font_size: f32) {
+        self.margin
+            .top
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.margin
+            .right
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.margin
+            .bottom
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.margin
+            .left
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.padding
+            .top
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.padding
+            .right
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.padding
+            .bottom
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.padding
+            .left
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.width
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.height
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.min_width
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.max_width
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.min_height
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.max_height
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.inset_left
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.inset_top
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.inset_right
+            .resolve_root_font_relative_lengths(root_font_size);
+        self.inset_bottom
+            .resolve_root_font_relative_lengths(root_font_size);
+    }
+
+    /// Resolves `ic` terms by physical box axis.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn resolve_ic_relative_lengths_by_physical_axis(
         &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
+        horizontal_advance: LayoutLength,
+        vertical_advance: LayoutLength,
     ) {
-        self.margin.top.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.margin.right.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.margin.bottom.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.margin.left.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.padding.top.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.padding.right.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.padding.bottom.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.padding.left.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.width.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.height.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.min_width.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.max_width.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.min_height.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.max_height.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.inset_left.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.inset_top.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.inset_right.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.inset_bottom.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+        self.margin
+            .top
+            .resolve_ic_relative_lengths(vertical_advance);
+        self.margin
+            .right
+            .resolve_ic_relative_lengths(horizontal_advance);
+        self.margin
+            .bottom
+            .resolve_ic_relative_lengths(vertical_advance);
+        self.margin
+            .left
+            .resolve_ic_relative_lengths(horizontal_advance);
+        self.padding
+            .top
+            .resolve_ic_relative_lengths(vertical_advance);
+        self.padding
+            .right
+            .resolve_ic_relative_lengths(horizontal_advance);
+        self.padding
+            .bottom
+            .resolve_ic_relative_lengths(vertical_advance);
+        self.padding
+            .left
+            .resolve_ic_relative_lengths(horizontal_advance);
+        self.width.resolve_ic_relative_lengths(horizontal_advance);
+        self.height.resolve_ic_relative_lengths(vertical_advance);
+        self.min_width
+            .resolve_ic_relative_lengths(horizontal_advance);
+        self.max_width
+            .resolve_ic_relative_lengths(horizontal_advance);
+        self.min_height
+            .resolve_ic_relative_lengths(vertical_advance);
+        self.max_height
+            .resolve_ic_relative_lengths(vertical_advance);
+        self.inset_left
+            .resolve_ic_relative_lengths(horizontal_advance);
+        self.inset_top.resolve_ic_relative_lengths(vertical_advance);
+        self.inset_right
+            .resolve_ic_relative_lengths(horizontal_advance);
+        self.inset_bottom
+            .resolve_ic_relative_lengths(vertical_advance);
+    }
+
+    /// Resolves `ex` components after selecting the element's font.
+    /// <https://www.w3.org/TR/css-values-4/#ex>
+    pub(crate) fn resolve_ex_relative_lengths(&mut self, x_height: f32) {
+        self.margin.top.resolve_ex_relative_lengths(x_height);
+        self.margin.right.resolve_ex_relative_lengths(x_height);
+        self.margin.bottom.resolve_ex_relative_lengths(x_height);
+        self.margin.left.resolve_ex_relative_lengths(x_height);
+        self.padding.top.resolve_ex_relative_lengths(x_height);
+        self.padding.right.resolve_ex_relative_lengths(x_height);
+        self.padding.bottom.resolve_ex_relative_lengths(x_height);
+        self.padding.left.resolve_ex_relative_lengths(x_height);
+        self.width.resolve_ex_relative_lengths(x_height);
+        self.height.resolve_ex_relative_lengths(x_height);
+        self.min_width.resolve_ex_relative_lengths(x_height);
+        self.max_width.resolve_ex_relative_lengths(x_height);
+        self.min_height.resolve_ex_relative_lengths(x_height);
+        self.max_height.resolve_ex_relative_lengths(x_height);
+        self.inset_left.resolve_ex_relative_lengths(x_height);
+        self.inset_top.resolve_ex_relative_lengths(x_height);
+        self.inset_right.resolve_ex_relative_lengths(x_height);
+        self.inset_bottom.resolve_ex_relative_lengths(x_height);
+    }
+
+    /// Resolves `cap` components after selecting the element's font.
+    /// <https://www.w3.org/TR/css-values-4/#cap>
+    pub(crate) fn resolve_cap_relative_lengths(&mut self, cap_height: f32) {
+        self.margin.top.resolve_cap_relative_lengths(cap_height);
+        self.margin.right.resolve_cap_relative_lengths(cap_height);
+        self.margin.bottom.resolve_cap_relative_lengths(cap_height);
+        self.margin.left.resolve_cap_relative_lengths(cap_height);
+        self.padding.top.resolve_cap_relative_lengths(cap_height);
+        self.padding.right.resolve_cap_relative_lengths(cap_height);
+        self.padding.bottom.resolve_cap_relative_lengths(cap_height);
+        self.padding.left.resolve_cap_relative_lengths(cap_height);
+        self.width.resolve_cap_relative_lengths(cap_height);
+        self.height.resolve_cap_relative_lengths(cap_height);
+        self.min_width.resolve_cap_relative_lengths(cap_height);
+        self.max_width.resolve_cap_relative_lengths(cap_height);
+        self.min_height.resolve_cap_relative_lengths(cap_height);
+        self.max_height.resolve_cap_relative_lengths(cap_height);
+        self.inset_left.resolve_cap_relative_lengths(cap_height);
+        self.inset_top.resolve_cap_relative_lengths(cap_height);
+        self.inset_right.resolve_cap_relative_lengths(cap_height);
+        self.inset_bottom.resolve_cap_relative_lengths(cap_height);
+    }
+
+    /// Resolves ordinary `lh` components against this element's computed line
+    /// height. The `line-height` property itself is resolved separately
+    /// against its inherited basis.
+    /// <https://www.w3.org/TR/css-values-4/#lh>
+    pub(crate) fn resolve_line_height_relative_lengths(&mut self, line_height: LayoutLength) {
+        self.margin
+            .top
+            .resolve_line_height_relative_lengths(line_height);
+        self.margin
+            .right
+            .resolve_line_height_relative_lengths(line_height);
+        self.margin
+            .bottom
+            .resolve_line_height_relative_lengths(line_height);
+        self.margin
+            .left
+            .resolve_line_height_relative_lengths(line_height);
+        self.padding
+            .top
+            .resolve_line_height_relative_lengths(line_height);
+        self.padding
+            .right
+            .resolve_line_height_relative_lengths(line_height);
+        self.padding
+            .bottom
+            .resolve_line_height_relative_lengths(line_height);
+        self.padding
+            .left
+            .resolve_line_height_relative_lengths(line_height);
+        self.width.resolve_line_height_relative_lengths(line_height);
+        self.height
+            .resolve_line_height_relative_lengths(line_height);
+        self.min_width
+            .resolve_line_height_relative_lengths(line_height);
+        self.max_width
+            .resolve_line_height_relative_lengths(line_height);
+        self.min_height
+            .resolve_line_height_relative_lengths(line_height);
+        self.max_height
+            .resolve_line_height_relative_lengths(line_height);
+        self.inset_left
+            .resolve_line_height_relative_lengths(line_height);
+        self.inset_top
+            .resolve_line_height_relative_lengths(line_height);
+        self.inset_right
+            .resolve_line_height_relative_lengths(line_height);
+        self.inset_bottom
+            .resolve_line_height_relative_lengths(line_height);
+    }
+
+    /// Resolves root-font metric components against the document-root metric
+    /// snapshot shared by every element.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        self.margin.top.resolve_root_font_metric_lengths(basis);
+        self.margin.right.resolve_root_font_metric_lengths(basis);
+        self.margin.bottom.resolve_root_font_metric_lengths(basis);
+        self.margin.left.resolve_root_font_metric_lengths(basis);
+        self.padding.top.resolve_root_font_metric_lengths(basis);
+        self.padding.right.resolve_root_font_metric_lengths(basis);
+        self.padding.bottom.resolve_root_font_metric_lengths(basis);
+        self.padding.left.resolve_root_font_metric_lengths(basis);
+        self.width.resolve_root_font_metric_lengths(basis);
+        self.height.resolve_root_font_metric_lengths(basis);
+        self.min_width.resolve_root_font_metric_lengths(basis);
+        self.max_width.resolve_root_font_metric_lengths(basis);
+        self.min_height.resolve_root_font_metric_lengths(basis);
+        self.max_height.resolve_root_font_metric_lengths(basis);
+        self.inset_left.resolve_root_font_metric_lengths(basis);
+        self.inset_top.resolve_root_font_metric_lengths(basis);
+        self.inset_right.resolve_root_font_metric_lengths(basis);
+        self.inset_bottom.resolve_root_font_metric_lengths(basis);
+    }
+
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        [
+            &self.margin.top,
+            &self.margin.right,
+            &self.margin.bottom,
+            &self.margin.left,
+            &self.width,
+            &self.height,
+            &self.min_width,
+            &self.max_width,
+            &self.min_height,
+            &self.max_height,
+            &self.inset_left,
+            &self.inset_top,
+            &self.inset_right,
+            &self.inset_bottom,
+        ]
+        .into_iter()
+        .any(|value| value.requires_ch_advance())
+            || [
+                &self.padding.top,
+                &self.padding.right,
+                &self.padding.bottom,
+                &self.padding.left,
+            ]
+            .into_iter()
+            .any(|value| value.requires_ch_advance())
+    }
+}
+
+impl ResolveViewportLengths for ComputedFlexBasis {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        match self {
+            Self::FitContent(Some(value)) => {
+                value.resolve_viewport_lengths(basis);
+            }
+            Self::LengthPercentage(value) => value.value.resolve_viewport_lengths(basis),
+            Self::Auto
+            | Self::Content
+            | Self::MinContent
+            | Self::MaxContent
+            | Self::FitContent(None) => {}
+        }
+    }
+}
+
+impl ResolveViewportLengths for ComputedBoxValues {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.margin.top.resolve_viewport_lengths(basis);
+        self.margin.right.resolve_viewport_lengths(basis);
+        self.margin.bottom.resolve_viewport_lengths(basis);
+        self.margin.left.resolve_viewport_lengths(basis);
+        self.padding.top.resolve_viewport_lengths(basis);
+        self.padding.right.resolve_viewport_lengths(basis);
+        self.padding.bottom.resolve_viewport_lengths(basis);
+        self.padding.left.resolve_viewport_lengths(basis);
+        self.width.resolve_viewport_lengths(basis);
+        self.height.resolve_viewport_lengths(basis);
+        self.min_width.resolve_viewport_lengths(basis);
+        self.max_width.resolve_viewport_lengths(basis);
+        self.min_height.resolve_viewport_lengths(basis);
+        self.max_height.resolve_viewport_lengths(basis);
+        self.inset_left.resolve_viewport_lengths(basis);
+        self.inset_top.resolve_viewport_lengths(basis);
+        self.inset_right.resolve_viewport_lengths(basis);
+        self.inset_bottom.resolve_viewport_lengths(basis);
     }
 }

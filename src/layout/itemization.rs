@@ -4,8 +4,9 @@ use std::borrow::Cow;
 /// Child box generated for a flex or grid formatting context.
 ///
 /// CSS Flexbox and CSS Grid both create one item from each in-flow child, wrap
-/// non-collapsible text runs in anonymous items, and exclude absolutely
-/// positioned descendants from item layout:
+/// non-whitespace text runs in anonymous items, ignore text runs containing
+/// only CSS document white space independent of the computed `white-space`
+/// value, and exclude absolutely positioned descendants from item layout:
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-items> and
 /// <https://www.w3.org/TR/css-grid-1/#grid-items>.
 #[derive(Debug, Clone)]
@@ -171,10 +172,7 @@ fn flush_anonymous_item_run<'a>(
     if anonymous_run.is_empty() {
         return;
     }
-    if anonymous_run
-        .iter()
-        .all(box_tree::formatting_box_is_collapsible_space)
-    {
+    if anonymous_run.iter().all(formatting_box_is_document_space) {
         anonymous_run.clear();
         return;
     }
@@ -188,6 +186,13 @@ fn flush_anonymous_item_run<'a>(
         },
         style,
     });
+}
+
+fn formatting_box_is_document_space(box_: &box_tree::FormattingBox<'_>) -> bool {
+    matches!(
+        box_,
+        box_tree::FormattingBox::Text(text) if text.text.chars().all(is_css_collapsible_whitespace)
+    )
 }
 
 fn anonymous_item_style(tag: &'static str, source: &box_tree::FormattingBox<'_>) -> ComputedStyle {

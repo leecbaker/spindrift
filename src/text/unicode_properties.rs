@@ -4,7 +4,11 @@ static JOINING_TYPES: OnceLock<CodePointMapDataBorrowed<'static, JoiningType>> =
 static JOIN_CONTROLS: OnceLock<CodePointSetDataBorrowed<'static>> = OnceLock::new();
 static BIDI_CONTROLS: OnceLock<CodePointSetDataBorrowed<'static>> = OnceLock::new();
 static BIDI_CLASSES: OnceLock<CodePointMapDataBorrowed<'static, BidiClass>> = OnceLock::new();
+static BIDI_MIRRORING_GLYPHS: OnceLock<CodePointMapDataBorrowed<'static, BidiMirroringGlyph>> =
+    OnceLock::new();
 static LINE_BREAK_CLASSES: OnceLock<CodePointMapDataBorrowed<'static, LineBreak>> = OnceLock::new();
+static EAST_ASIAN_WIDTHS: OnceLock<CodePointMapDataBorrowed<'static, EastAsianWidth>> =
+    OnceLock::new();
 static VERTICAL_ORIENTATIONS: OnceLock<CodePointMapDataBorrowed<'static, VerticalOrientation>> =
     OnceLock::new();
 static WORD_BREAK_CLASSES: OnceLock<CodePointMapDataBorrowed<'static, IcuWordBreak>> =
@@ -12,6 +16,7 @@ static WORD_BREAK_CLASSES: OnceLock<CodePointMapDataBorrowed<'static, IcuWordBre
 static GENERAL_CATEGORIES: OnceLock<CodePointMapDataBorrowed<'static, GeneralCategory>> =
     OnceLock::new();
 static DEFAULT_IGNORABLE_CODE_POINTS: OnceLock<CodePointSetDataBorrowed<'static>> = OnceLock::new();
+static EMOJI_CODE_POINTS: OnceLock<CodePointSetDataBorrowed<'static>> = OnceLock::new();
 
 /// Return whether a character participates in cursive joining.
 ///
@@ -19,7 +24,7 @@ static DEFAULT_IGNORABLE_CODE_POINTS: OnceLock<CodePointSetDataBorrowed<'static>
 /// Unicode defines the joining classes used by Arabic-family shaping engines:
 /// <https://www.w3.org/TR/css-text-3/#letter-spacing-property> and
 /// <https://www.unicode.org/reports/tr44/#Joining_Type>.
-pub(super) fn character_has_joining_behavior(character: char) -> bool {
+pub(crate) fn character_has_joining_behavior(character: char) -> bool {
     matches!(
         joining_type(character),
         JoiningType::JoinCausing
@@ -92,6 +97,135 @@ pub(super) fn line_break_class(character: char) -> LineBreak {
         .get(character)
 }
 
+/// Return whether UAX #14 classifies this scalar as an unconditional line
+/// break independently of CSS `white-space` segment-break processing.
+///
+/// `BK` and `NL` are mandatory breaks. CSS Text keeps LF/CR in its distinct
+/// segment-break transformation pipeline, so they are deliberately excluded
+/// here and handled by inline collection before this predicate is reached.
+/// <https://www.unicode.org/reports/tr14/#BK> and
+/// <https://drafts.csswg.org/css-text-3/#line-break-details>
+pub(crate) fn character_is_mandatory_line_break(character: char) -> bool {
+    matches!(
+        line_break_class(character),
+        LineBreak::MandatoryBreak | LineBreak::NextLine
+    )
+}
+
+/// Neighboring text and writing-system context used to transform a collapsible
+/// CSS Text segment break.
+///
+/// The segment break itself belongs to the style that produced it. Keeping the
+/// language alongside both neighboring characters prevents collection from
+/// baking an untagged East-Asian-width heuristic into every inline boundary.
+/// <https://drafts.csswg.org/css-text-3/#line-break-transform> and
+/// <https://drafts.csswg.org/css-text-3/#script-tagging>
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SegmentBreakContext<'a> {
+    pub(crate) before: char,
+    pub(crate) after: char,
+    /// Whether the preceding text token contains a currency symbol, such as
+    /// the `1.00` at the end of `$1.00`.
+    pub(crate) before_is_currency_amount: bool,
+    pub(crate) language: Option<&'a str>,
+}
+
+/// Return whether CSS Text removes the segment break in this typed context.
+///
+/// Level 3 leaves the choice between a space and removal to language-aware UA
+/// rules. Quire uses no-word-separator behavior for the Chinese, Japanese,
+/// and Yi writing systems, and retains the conservative Unicode width fallback
+/// for untagged content. Currency symbols and Hangul retain their established
+/// word-separating behavior. Default ignorables are skipped by inline
+/// collection before this resolver is called.
+/// <https://drafts.csswg.org/css-text-3/#line-break-transform> and
+/// <https://drafts.csswg.org/css-text-3/#script-tagging>
+pub(crate) fn segment_break_is_removable(context: SegmentBreakContext<'_>) -> bool {
+    let SegmentBreakContext {
+        before,
+        after,
+        before_is_currency_amount,
+        language,
+    } = context;
+    if before == '\u{200b}' || after == '\u{200b}' {
+        return true;
+    }
+    if before_is_currency_amount
+        || character_is_currency_symbol(before)
+        || character_is_currency_symbol(after)
+        || character_is_hangul_for_segment_break(before)
+        || character_is_hangul_for_segment_break(after)
+    {
+        return false;
+    }
+    if writing_system_omits_word_separators(language) {
+        return true;
+    }
+    east_asian_segment_break_width(before) && east_asian_segment_break_width(after)
+}
+
+/// Return whether the declared language identifies a writing system that
+/// conventionally omits inter-word separators.
+///
+/// CSS Text requires at least Chinese, Japanese, and Yi to be identified from
+/// language and ISO 15924 script subtags. This deliberately recognizes script
+/// subtags independently of their primary language, such as `ain-Kana`.
+/// <https://drafts.csswg.org/css-text-3/#script-tagging>
+fn writing_system_omits_word_separators(language: Option<&str>) -> bool {
+    let Some(language) = language else {
+        return false;
+    };
+    let mut subtags = language.split(['-', '_']);
+    let Some(primary) = subtags.next() else {
+        return false;
+    };
+    if primary.eq_ignore_ascii_case("zh")
+        || primary.eq_ignore_ascii_case("ja")
+        || primary.eq_ignore_ascii_case("ii")
+    {
+        return true;
+    }
+    subtags.any(|subtag| {
+        subtag.eq_ignore_ascii_case("hant")
+            || subtag.eq_ignore_ascii_case("hans")
+            || subtag.eq_ignore_ascii_case("hani")
+            || subtag.eq_ignore_ascii_case("hanb")
+            || subtag.eq_ignore_ascii_case("bopo")
+            || subtag.eq_ignore_ascii_case("jpan")
+            || subtag.eq_ignore_ascii_case("hrkt")
+            || subtag.eq_ignore_ascii_case("hira")
+            || subtag.eq_ignore_ascii_case("kana")
+            || subtag.eq_ignore_ascii_case("yiii")
+    })
+}
+
+/// Return whether a scalar has Unicode General_Category `Sc`.
+///
+/// Segment-break transformation protects complete currency amounts from
+/// no-word-separator writing-system tailoring, while text collection uses the
+/// same property to identify the amount's preceding token.
+/// <https://drafts.csswg.org/css-text-3/#line-break-transform> and
+/// <https://www.unicode.org/reports/tr44/#General_Category_Values>
+pub(crate) fn character_is_currency_symbol(character: char) -> bool {
+    matches!(general_category(character), GeneralCategory::CurrencySymbol)
+}
+
+fn east_asian_segment_break_width(character: char) -> bool {
+    matches!(
+        EAST_ASIAN_WIDTHS
+            .get_or_init(CodePointMapData::<EastAsianWidth>::new)
+            .get(character),
+        EastAsianWidth::Fullwidth | EastAsianWidth::Wide | EastAsianWidth::Halfwidth
+    )
+}
+
+fn character_is_hangul_for_segment_break(character: char) -> bool {
+    matches!(
+        line_break_class(character),
+        LineBreak::H2 | LineBreak::H3 | LineBreak::JL | LineBreak::JV | LineBreak::JT
+    )
+}
+
 /// Return the Unicode `Vertical_Orientation` class for a character.
 ///
 /// CSS Writing Modes defines `text-orientation: mixed` in terms of Unicode
@@ -131,13 +265,16 @@ pub(crate) fn character_inherits_vertical_orientation(character: char) -> bool {
 /// Return whether a character is a CSS Text "other space separator".
 ///
 /// CSS Text distinguishes document white space such as U+0020 SPACE and tabs
-/// from other Unicode separator characters. The latter remain visible text,
-/// but CSS Text phase II lets them hang at the end of lines for collapsing
-/// white-space modes:
+/// from other Unicode separator characters. U+00A0 NO-BREAK SPACE remains an
+/// inter-word separator with UAX #14 GL behavior, not an unconditional
+/// hanging separator. The remaining characters stay visible text, but CSS
+/// Text phase II lets them hang at the end of lines for collapsing white-space
+/// modes:
 /// <https://www.w3.org/TR/css-text-3/#white-space-processing> and
 /// <https://www.w3.org/TR/css-text-3/#white-space-phase-2>.
 pub(crate) fn character_is_css_other_space_separator(character: char) -> bool {
-    !is_css_collapsible_whitespace(character)
+    character != '\u{00a0}'
+        && !is_css_collapsible_whitespace(character)
         && matches!(
             GENERAL_CATEGORIES
                 .get_or_init(CodePointMapData::<GeneralCategory>::new)
@@ -157,7 +294,8 @@ pub(crate) fn character_is_css_other_space_separator(character: char) -> bool {
 /// <https://www.w3.org/TR/css-text-3/#word-separator>, and
 /// <https://www.unicode.org/reports/tr44/#General_Category_Values>.
 pub(crate) fn character_is_css_word_separator(character: char) -> bool {
-    is_css_preserved_document_space(character)
+    character == '\u{00a0}'
+        || is_css_preserved_document_space(character)
         || character_is_css_other_space_separator(character)
         || matches!(
             character,
@@ -268,6 +406,19 @@ pub(crate) fn character_is_hangable_stop_or_comma(character: char) -> bool {
 /// <https://www.unicode.org/reports/tr44/#General_Category_Values>.
 pub(crate) fn character_is_unicode_letter(character: char) -> bool {
     GeneralCategoryGroup::Letter.contains(general_category(character))
+}
+
+/// Return whether a character can be the typographic letter selected by CSS
+/// `text-transform: capitalize`.
+///
+/// Unicode `Nl` Letter_Number characters, notably Roman numerals, have case
+/// mappings but are outside the `L*` General_Category group. CSS Text asks for
+/// the first typographic letter unit rather than only an alphabetic letter.
+/// <https://www.w3.org/TR/css-text-3/#valdef-text-transform-capitalize> and
+/// <https://www.unicode.org/reports/tr44/#General_Category_Values>
+pub(crate) fn character_is_unicode_typographic_letter(character: char) -> bool {
+    character_is_unicode_letter(character)
+        || matches!(general_category(character), GeneralCategory::LetterNumber)
 }
 
 /// Return whether a character belongs to a Unicode letter or number category.
@@ -388,6 +539,19 @@ pub(super) fn character_has_rtl_bidi_class(character: char) -> bool {
     )
 }
 
+/// Return the Unicode Bidi_Mirroring_Glyph counterpart for a scalar.
+///
+/// UAX #9 L4 changes the displayed glyph at an odd resolved embedding level,
+/// but it does not change the underlying Unicode text retained for extraction:
+/// <https://www.unicode.org/reports/tr9/#L4> and
+/// <https://www.unicode.org/reports/tr44/#Bidi_Mirroring_Glyph>.
+pub(crate) fn bidi_mirroring_glyph(character: char) -> Option<char> {
+    BIDI_MIRRORING_GLYPHS
+        .get_or_init(CodePointMapData::<BidiMirroringGlyph>::new)
+        .get(character)
+        .mirroring_glyph
+}
+
 /// Return whether a code point is a UBA directional formatting control.
 ///
 /// CSS `unicode-bidi` maps inline scoping to Unicode Bidirectional Algorithm
@@ -424,6 +588,17 @@ pub(crate) fn character_is_unicode_control(character: char) -> bool {
 pub(crate) fn character_is_default_ignorable_code_point(character: char) -> bool {
     DEFAULT_IGNORABLE_CODE_POINTS
         .get_or_init(CodePointSetData::new::<DefaultIgnorableCodePoint>)
+        .contains(character)
+}
+
+/// Returns whether a character has Unicode's `Emoji` property.
+///
+/// This is used only to select the platform's `emoji` generic when script
+/// fallback cannot represent Common-script emoji characters.
+/// <https://www.unicode.org/reports/tr51/#Emoji_Properties>
+pub(crate) fn character_is_emoji(character: char) -> bool {
+    EMOJI_CODE_POINTS
+        .get_or_init(CodePointSetData::new::<Emoji>)
         .contains(character)
 }
 
@@ -526,5 +701,57 @@ mod tests {
         assert!(typographic_unit_is_upright_in_mixed_orientation(
             "\u{200d}中"
         ));
+    }
+
+    #[test]
+    fn segment_break_keeps_currency_symbols_separate_from_cjk_text() {
+        assert!(east_asian_segment_break_width('₩'));
+        assert!(!segment_break_is_removable(SegmentBreakContext {
+            before: '価',
+            after: '₩',
+            before_is_currency_amount: false,
+            language: Some("ja"),
+        }));
+        assert!(!segment_break_is_removable(SegmentBreakContext {
+            before: '₩',
+            after: '格',
+            before_is_currency_amount: false,
+            language: Some("ja"),
+        }));
+        assert!(!segment_break_is_removable(SegmentBreakContext {
+            before: '0',
+            after: '格',
+            before_is_currency_amount: true,
+            language: Some("ja"),
+        }));
+    }
+
+    #[test]
+    fn segment_break_uses_declared_no_word_separator_writing_systems() {
+        assert!(segment_break_is_removable(SegmentBreakContext {
+            before: 'E',
+            after: '～',
+            before_is_currency_amount: false,
+            language: Some("ja"),
+        }));
+        assert!(segment_break_is_removable(SegmentBreakContext {
+            before: '“',
+            after: 'ア',
+            before_is_currency_amount: false,
+            language: Some("ain-Kana"),
+        }));
+        assert!(!segment_break_is_removable(SegmentBreakContext {
+            before: 'E',
+            after: '～',
+            before_is_currency_amount: false,
+            language: Some("en"),
+        }));
+    }
+
+    #[test]
+    fn no_break_space_is_a_word_separator_but_not_a_hanging_other_separator() {
+        assert!(!character_is_css_other_space_separator('\u{00a0}'));
+        assert!(character_is_css_word_separator('\u{00a0}'));
+        assert!(character_is_css_other_space_separator('\u{3000}'));
     }
 }

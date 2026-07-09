@@ -7,6 +7,20 @@ fn inline_fragment_uses_text_edge_layout(fragment: &InlineFragment) -> bool {
         || !matches!(fragment.style().line_fit_edge, LineFitEdge::Leading)
 }
 
+/// Return whether an inline atom is a zero-width, non-isolating boundary for
+/// logical cursive shaping.
+///
+/// Plain inline element edges do not separate CSS Text typographic character
+/// units. Decoration in the inline axis and bidi isolation deliberately do:
+/// <https://www.w3.org/TR/css-text-3/#boundary-shaping>.
+fn inline_atom_is_transparent_to_logical_shaping(atom: &InlineAtom) -> bool {
+    matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge))
+        if edge.advance == 0.0
+            && edge.paint_extent == 0.0
+            && !inline_box_edge_breaks_shaping(atom.style())
+            && !inline_box_bidi_isolation_breaks_shaping(atom.style()))
+}
+
 fn inline_fragment_block_axis_outer_extras(
     style: &ComputedStyle,
     include_margin_border_padding: bool,
@@ -44,19 +58,214 @@ fn physical_edge_value(edges: Edges, side: PhysicalSide) -> f32 {
 /// backgrounds, borders, and padding are anchored to the content area, while
 /// only `line-height` contributes to line box sizing. The content-area height
 /// is intentionally undefined by CSS 2.2; Quire uses its existing em-box
-/// policy and centers that content area inside the line-height box with
-/// half-leading:
+/// policy and resolves block-start/block-end leading separately because
+/// fallback-font unions need not be symmetric around the content box:
 /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct InlineTextBoxMetrics {
     pub(in crate::layout) content_block_size: f32,
     pub(in crate::layout) content_baseline_offset: f32,
     pub(in crate::layout) line_block_size: f32,
-    pub(in crate::layout) half_leading: f32,
+    pub(in crate::layout) block_start_leading: f32,
+    pub(in crate::layout) block_end_leading: f32,
     pub(in crate::layout) line_baseline_offset: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct InlineBaselineExtents {
+    baseline_offset: f32,
+    descent: f32,
+}
+
+impl InlineBaselineExtents {
+    fn new(baseline_offset: f32, descent: f32) -> Self {
+        Self {
+            baseline_offset,
+            descent,
+        }
+    }
+
+    fn from_baseline_and_block_size(baseline_offset: f32, block_size: f32) -> Self {
+        Self::new(baseline_offset, block_size - baseline_offset)
+    }
+
+    /// Return signed extents for a baseline-aligned box after CSS baseline shifting.
+    ///
+    /// CSS Inline Layout applies `<length-percentage>` `baseline-shift` after
+    /// baseline-table alignment. Positive shifts raise the aligned subtree, so
+    /// they increase the line-over extent and reduce the line-under extent:
+    /// <https://drafts.csswg.org/css-inline-3/#baseline-shift-property>.
+    fn from_shifted_baseline_and_block_size(
+        baseline_offset: f32,
+        block_size: f32,
+        baseline_shift: f32,
+    ) -> Self {
+        Self::new(
+            baseline_offset + baseline_shift,
+            block_size - baseline_offset - baseline_shift,
+        )
+    }
+
+    fn height(self) -> f32 {
+        (self.baseline_offset + self.descent).max(0.0)
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            baseline_offset: self.baseline_offset.max(other.baseline_offset),
+            descent: self.descent.max(other.descent),
+        }
+    }
+}
+
 impl<'a> LayoutBuilder<'a> {
+    /// Retain logical source shaping for a joining run before UAX #9 splits it
+    /// into visual fragments.
+    ///
+    /// CSS Text shapes a typographic character unit in logical order, then
+    /// the bidi algorithm selects visual line fragments. Re-shaping those
+    /// fragments independently changes Arabic joining forms at transparent
+    /// inline boundaries. This deliberately applies only to joining scripts:
+    /// non-joining ligatures are already shaped as one paint-preparation
+    /// group, while a source slice through a ligature cluster cannot be
+    /// represented by separate inline fragments.
+    /// <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
+    /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-linebox>.
+    fn preserve_logical_joining_source_shapes(
+        &mut self,
+        items: &[MeasuredInlineItem],
+    ) -> Vec<MeasuredInlineItem> {
+        let mut output = Vec::with_capacity(items.len());
+        let mut index = 0;
+
+        while index < items.len() {
+            let InlineLineItem::Fragment(_) = &items[index].item else {
+                output.push(items[index].clone());
+                index += 1;
+                continue;
+            };
+
+            let start = index;
+            let mut fragment_indices = vec![index];
+            index += 1;
+            while let Some(item) = items.get(index) {
+                match &item.item {
+                    InlineLineItem::Fragment(right) => {
+                        let InlineLineItem::Fragment(left) =
+                            &items[*fragment_indices.last().expect("first fragment index")].item
+                        else {
+                            unreachable!("fragment index always names a fragment");
+                        };
+                        if !can_shape_inline_fragments_together(left, right) {
+                            break;
+                        }
+                        fragment_indices.push(index);
+                        index += 1;
+                    }
+                    InlineLineItem::Atom(atom)
+                        if inline_atom_is_transparent_to_logical_shaping(atom) =>
+                    {
+                        index += 1;
+                    }
+                    InlineLineItem::Atom(_) | InlineLineItem::Float(_) => break,
+                }
+            }
+
+            let joins =
+                fragment_indices
+                    .iter()
+                    .any(|&fragment_index| match &items[fragment_index].item {
+                        InlineLineItem::Fragment(fragment) => {
+                            fragment.text().chars().any(character_has_joining_behavior)
+                        }
+                        InlineLineItem::Atom(_) | InlineLineItem::Float(_) => false,
+                    });
+            if fragment_indices.len() < 2 || !joins {
+                output.extend_from_slice(&items[start..index]);
+                continue;
+            }
+
+            let mut spans = Vec::with_capacity(fragment_indices.len());
+            let mut text = String::new();
+            let mut ranges = Vec::with_capacity(fragment_indices.len());
+            let mut unshaped_width = 0.0;
+            let mut line_height = None;
+            let InlineLineItem::Fragment(first_fragment) = &items[fragment_indices[0]].item else {
+                unreachable!("the fragment grouping loop only yields fragments");
+            };
+            let source_style = first_fragment.style();
+            // CSS Text has already applied `text-transform` before shaping,
+            // and `display` creates a transparent inline boundary. If those
+            // are the only style differences, use one Parley text style so a
+            // ligature such as lam-alef remains eligible across the element
+            // edge.
+            let one_text_style = fragment_indices.iter().all(|&fragment_index| {
+                let InlineLineItem::Fragment(fragment) = &items[fragment_index].item else {
+                    return false;
+                };
+                styles_have_equivalent_text_shaping_inputs(source_style, fragment.style())
+            });
+            for &fragment_index in &fragment_indices {
+                let item = &items[fragment_index];
+                let InlineLineItem::Fragment(fragment) = &item.item else {
+                    unreachable!("the fragment grouping loop only yields fragments");
+                };
+                line_height.get_or_insert(fragment.style().line_height);
+                let start = text.len();
+                text.push_str(fragment.text());
+                ranges.push(start..text.len());
+                spans.push(StyledTextSpan {
+                    text: fragment.text(),
+                    style: if one_text_style {
+                        source_style
+                    } else {
+                        fragment.style()
+                    },
+                });
+                unshaped_width += item.width;
+            }
+            let Some(shaped) = self.font_system.shape_styled_inline_fragments(
+                &spans,
+                text,
+                unshaped_width,
+                line_height.expect("a fragment group always has a first style"),
+                0.0,
+            ) else {
+                output.extend_from_slice(&items[start..index]);
+                continue;
+            };
+            let shaped = Rc::new(shaped);
+            let slices: Option<Vec<_>> = ranges
+                .into_iter()
+                .map(|range| shaped.source_slice(range).map(Rc::new))
+                .collect();
+            let Some(slices) = slices else {
+                output.extend_from_slice(&items[start..index]);
+                continue;
+            };
+
+            let mut shaped_fragments = slices.into_iter();
+            for item in &items[start..index] {
+                if let InlineLineItem::Fragment(fragment) = &item.item {
+                    let shaped = shaped_fragments
+                        .next()
+                        .expect("every logical shaping fragment has one slice");
+                    let mut fragment = fragment.clone();
+                    fragment.set_preserves_source_shaping(true);
+                    output.push(MeasuredInlineItem {
+                        item: InlineLineItem::Fragment(fragment),
+                        width: shaped.advance_width(),
+                        shaped: Some(shaped),
+                    });
+                } else {
+                    output.push(item.clone());
+                }
+            }
+        }
+
+        output
+    }
+
     /// Return mixed inline line items in UBA visual order.
     ///
     /// CSS Writing Modes applies the Unicode Bidirectional Algorithm to inline
@@ -72,6 +281,8 @@ impl<'a> LayoutBuilder<'a> {
         items: &[MeasuredInlineItem],
         block_style: &ComputedStyle,
     ) -> Vec<MeasuredInlineItem> {
+        let logical_items = self.preserve_logical_joining_source_shapes(items);
+        let items = &logical_items;
         if items
             .iter()
             .all(|item| matches!(item.as_ref(), InlineLineItem::Fragment(_)))
@@ -103,54 +314,65 @@ impl<'a> LayoutBuilder<'a> {
             return items.to_vec();
         }
         let (text, ranged_items) = mixed_measured_inline_line_bidi_text(items);
-        let visual_ranges = split_mixed_inline_visual_ranges_at_box_edges(
-            normalize_mixed_inline_visual_ranges(
-                &text,
-                self.font_system
-                    .visual_ranges_for_unwrapped_text(&text, block_style),
-            ),
+        let mut visual_ranges = normalize_mixed_inline_visual_ranges(
+            &text,
+            self.font_system
+                .visual_ranges_for_unwrapped_text(&text, block_style),
+            match block_style.direction {
+                Direction::Ltr => ResolvedBidiDirection::Ltr,
+                Direction::Rtl => ResolvedBidiDirection::Rtl,
+            },
+        );
+        merge_owned_join_control_visual_ranges(&text, &mut visual_ranges, &ranged_items);
+        let visual_ranges = split_mixed_inline_visual_ranges_at_transparent_inline_edges(
+            visual_ranges,
             &ranged_items,
             &text,
         );
         let mut output = Vec::new();
         let mut emitted = vec![false; ranged_items.len()];
         for visual_range in visual_ranges {
-            self.push_mixed_inline_box_edges_at_visual_boundary(
+            self.push_mixed_inline_transparent_edges_at_visual_boundary(
                 &ranged_items,
-                visual_range.start,
+                visual_range.range.start,
                 true,
                 &mut emitted,
                 &mut output,
             );
-            self.push_mixed_inline_box_edges_at_visual_boundary(
+            self.push_mixed_inline_transparent_edges_at_visual_boundary(
                 &ranged_items,
-                visual_range.end,
+                visual_range.range.end,
                 true,
                 &mut emitted,
                 &mut output,
             );
             for (index, ranged) in ranged_items.iter().enumerate() {
-                let start = ranged.range.start.max(visual_range.start);
-                let end = ranged.range.end.min(visual_range.end);
+                let start = ranged.range.start.max(visual_range.range.start);
+                let end = ranged.range.end.min(visual_range.range.end);
                 if start >= end {
                     continue;
                 }
-                if let Some(item) = self.measured_visual_item_slice(ranged, start, end, block_style)
-                {
+                if let Some(item) = self.measured_visual_item_slice(
+                    ranged,
+                    start,
+                    end,
+                    visual_range.direction,
+                    block_style,
+                ) {
                     output.push(item);
                     emitted[index] = true;
                 }
             }
-            self.push_mixed_inline_box_edges_at_visual_boundary(
+            self.push_mixed_inline_transparent_edges_at_visual_boundary(
                 &ranged_items,
-                visual_range.start,
+                visual_range.range.start,
                 false,
                 &mut emitted,
                 &mut output,
             );
-            self.push_mixed_inline_box_edges_at_visual_boundary(
+            self.push_mixed_inline_transparent_edges_at_visual_boundary(
                 &ranged_items,
-                visual_range.end,
+                visual_range.range.end,
                 false,
                 &mut emitted,
                 &mut output,
@@ -182,12 +404,18 @@ impl<'a> LayoutBuilder<'a> {
         ranged: &RangedMeasuredMixedInlineLineItem,
         start: usize,
         end: usize,
+        resolved_direction: ResolvedBidiDirection,
         block_style: &ComputedStyle,
     ) -> Option<MeasuredInlineItem> {
         match &ranged.item.item {
             InlineLineItem::Fragment(fragment) => {
-                let relative_start = start - ranged.range.start;
-                let relative_end = end - ranged.range.start;
+                let visual_slice = expand_visual_slice_with_owned_join_controls(
+                    fragment.text(),
+                    ranged.range.clone(),
+                    start..end,
+                );
+                let relative_start = visual_slice.start - ranged.range.start;
+                let relative_end = visual_slice.end - ranged.range.start;
                 let mut text = char_boundary_slice(fragment.text(), relative_start..relative_end)?;
                 text = text_without_bidi_format_controls(&text).into_owned();
                 if text.is_empty() {
@@ -195,16 +423,35 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 let mut fragment = fragment.clone();
                 let mut hanging_edges = fragment.hanging_edges();
-                fragment.set_text(text);
                 hanging_edges.blocks_start = hanging_edges.blocks_start && relative_start == 0;
                 hanging_edges.blocks_end =
                     hanging_edges.blocks_end && relative_end == ranged.range.len();
                 fragment = fragment.with_hanging_edges(hanging_edges);
-                let shaped = self.font_system.shape_unwrapped_line(
-                    fragment.text(),
-                    fragment.style(),
-                    fragment.style().line_height,
-                );
+                // The enclosing line has already gone through UAX #9 above.
+                // Reapplying this fragment's CSS direction or unicode-bidi
+                // scope here would resolve its edge neutrals in a new context.
+                let selected_shaped = ranged
+                    .item
+                    .shaped
+                    .as_deref()
+                    .and_then(|shaped| shaped.source_slice(relative_start..relative_end));
+                fragment.set_text(text);
+                fragment.set_resolved_bidi_direction(Some(resolved_direction));
+                // Source-run shaping predates the UBA visual level. Reuse it
+                // only for LTR slices; an RTL slice must be shaped under RLO
+                // so UAX #9 L4 selects mirrored punctuation glyphs.
+                let selected_shaped = (resolved_direction == ResolvedBidiDirection::Ltr)
+                    .then_some(selected_shaped)
+                    .flatten();
+                fragment.set_preserves_source_shaping(selected_shaped.is_some());
+                let shaped = selected_shaped.or_else(|| {
+                    self.font_system.shape_visual_ordered_line(
+                        fragment.text(),
+                        fragment.style(),
+                        fragment.style().line_height,
+                        resolved_direction,
+                    )
+                });
                 let width = shaped
                     .as_ref()
                     .map(ShapedInlineLine::advance_width)
@@ -258,7 +505,7 @@ impl<'a> LayoutBuilder<'a> {
         })
     }
 
-    pub(in crate::layout) fn push_mixed_inline_box_edges_at_visual_boundary(
+    pub(in crate::layout) fn push_mixed_inline_transparent_edges_at_visual_boundary(
         &self,
         ranged_items: &[RangedMeasuredMixedInlineLineItem],
         boundary: usize,
@@ -269,9 +516,9 @@ impl<'a> LayoutBuilder<'a> {
         for (edge_index, ranged) in ranged_items.iter().enumerate() {
             if emitted[edge_index]
                 || ranged.range.start != boundary
-                || !measured_item_is_transparent_mixed_inline_box_edge(&ranged.item)
-                || mixed_inline_box_edge_precedes_visual_content(&ranged.item)
-                    != Some(precedes_visual_content)
+                || !measured_item_is_transparent_mixed_inline_edge(&ranged.item)
+                || transparent_inline_edge_precedes_visual_content(&ranged.item)
+                    .is_none_or(|precedes| precedes != precedes_visual_content)
             {
                 continue;
             }
@@ -280,22 +527,26 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
-    /// Return a mixed inline item ascent/descent pair around its baseline.
+    /// Return a mixed inline item's signed extents around its baseline.
     ///
     /// CSS Inline Layout defines line box height from the logical extents of
     /// inline-level boxes placed around the shared line baseline. Text
     /// fragments keep the CSS `line-height` logical box even when selected font
     /// ink metrics are taller; CSS 2.2 permits negative leading, so glyph ink
-    /// can overflow without increasing the line box:
+    /// can overflow without increasing the line box. The descent can therefore
+    /// be negative when the baseline falls below the used `line-height` box:
     /// <https://www.w3.org/TR/css-inline-3/#line-box> and
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>.
     pub(in crate::layout) fn inline_line_item_baseline_extents(
         &mut self,
         item: &MeasuredInlineItem,
         block_style: &ComputedStyle,
-    ) -> (f32, f32) {
+    ) -> InlineBaselineExtents {
         match &item.item {
             InlineLineItem::Fragment(fragment) => {
+                if fragment.style().font_size <= 0.01 || fragment.style().line_height <= 0.01 {
+                    return InlineBaselineExtents::new(0.0, 0.0);
+                }
                 let metrics = self.inline_text_box_metrics(
                     fragment.style(),
                     item.shaped.as_deref(),
@@ -306,16 +557,33 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 let block_size = metrics.line_block_size;
                 if block_size <= 0.0 {
-                    return (0.0, 0.0);
+                    return InlineBaselineExtents::new(0.0, 0.0);
                 }
-                let baseline = metrics.line_baseline_offset.max(0.0);
-                let descent = (block_size - metrics.line_baseline_offset).max(0.0);
-                (baseline, descent)
+                InlineBaselineExtents::from_shifted_baseline_and_block_size(
+                    metrics.line_baseline_offset,
+                    block_size,
+                    fragment.baseline_shift,
+                )
+            }
+            // Inline box-edge atoms represent only the start/end contribution
+            // in the line's inline axis. They retain the originating style so
+            // their background and border can paint, but are not atomic
+            // margin boxes in the block axis: CSS 2.2 specifies that an
+            // inline box's block-axis margin, border, and padding do not
+            // affect the line box height.
+            // <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>
+            InlineLineItem::Atom(atom)
+                if matches!(
+                    atom.content(),
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
+                ) =>
+            {
+                self.inline_style_line_extents(atom.style(), atom.baseline_shift)
             }
             InlineLineItem::Atom(atom) => {
                 Self::inline_atom_line_baseline_extents(atom, block_style)
             }
-            InlineLineItem::Float(_) => (0.0, 0.0),
+            InlineLineItem::Float(_) => InlineBaselineExtents::new(0.0, 0.0),
         }
     }
 
@@ -323,18 +591,18 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         fragment: &InlineFragment,
         metrics: InlineTextBoxMetrics,
-    ) -> (f32, f32) {
+    ) -> InlineBaselineExtents {
         let use_line_fit_edge = !matches!(fragment.style().line_fit_edge, LineFitEdge::Leading);
         let pair = fragment.style().line_fit_edge.text_box_pair();
         let mut over_edge = if use_line_fit_edge {
             self.text_edge_over_position(fragment.style(), metrics, pair.over)
         } else {
-            metrics.half_leading
+            metrics.block_start_leading
         };
         let mut under_edge = if use_line_fit_edge {
             self.text_edge_under_position(fragment.style(), metrics, pair.under)
         } else {
-            metrics.half_leading + metrics.content_block_size
+            metrics.block_start_leading + metrics.content_block_size
         };
         let trim = self.inline_text_box_content_trim_for_style(fragment.style(), metrics);
         over_edge += trim.block_start;
@@ -346,36 +614,41 @@ impl<'a> LayoutBuilder<'a> {
             inline_fragment_block_axis_outer_extras(fragment.style(), use_line_fit_edge);
         let layout_over_edge = over_edge - block_start_extra;
         let layout_under_edge = under_edge + block_end_extra;
-        (
-            (metrics.line_baseline_offset - layout_over_edge).max(0.0),
-            (layout_under_edge - metrics.line_baseline_offset).max(0.0),
+        InlineBaselineExtents::new(
+            metrics.line_baseline_offset - layout_over_edge + fragment.baseline_shift,
+            layout_under_edge - metrics.line_baseline_offset - fragment.baseline_shift,
         )
     }
 
-    /// Return an atomic inline margin box's shifted extents around the line baseline.
+    /// Return an atomic inline margin box's signed extents around the line baseline.
     ///
     /// CSS 2.2 `vertical-align` shifts the whole inline-level box relative to
     /// the parent baseline. Line metrics must enclose the shifted margin-box
     /// top and bottom, instead of reusing the shifted baseline offset as the
     /// box's unshifted ascent; otherwise `vertical-align: middle` lowers an
-    /// inline-block and incorrectly inflates the row advance:
+    /// inline-block and incorrectly inflates the row advance. The returned
+    /// descent remains signed for consistency with negative-leading text boxes:
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height> and
     /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>.
     pub(in crate::layout) fn inline_atom_line_baseline_extents(
         atom: &InlineAtom,
         containing_style: &ComputedStyle,
-    ) -> (f32, f32) {
+    ) -> InlineBaselineExtents {
         let block_size = inline_atom_logical_block_size(atom, containing_style);
         let unshifted_baseline = match containing_style.writing_mode {
             WritingMode::HorizontalTb => atom.style().margin.top + atom.baseline_offset,
-            WritingMode::VerticalRl | WritingMode::VerticalLr => {
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => {
                 inline_atom_logical_block_start_margin(atom, containing_style)
                     + inline_atom_logical_border_block_size(atom, containing_style)
             }
         };
-        let baseline = (unshifted_baseline + atom.baseline_shift).max(0.0);
-        let descent = (block_size - baseline).max(0.0);
-        (baseline, descent)
+        InlineBaselineExtents::from_baseline_and_block_size(
+            unshifted_baseline + atom.baseline_shift,
+            block_size,
+        )
     }
 
     /// Return whether the item is positioned relative to the line box instead
@@ -390,35 +663,40 @@ impl<'a> LayoutBuilder<'a> {
         item: &InlineLineItem,
     ) -> bool {
         let vertical_align = match item {
-            InlineLineItem::Fragment(fragment) => fragment.style().vertical_align,
-            InlineLineItem::Atom(atom) => atom.style().vertical_align,
+            InlineLineItem::Fragment(fragment) => fragment.style().vertical_align.clone(),
+            InlineLineItem::Atom(atom) => {
+                // A layout-contained principal box exports no descendant
+                // baseline. Treat its otherwise baseline-aligned margin box
+                // as block-end aligned while deriving line metrics, instead
+                // of letting a scalar fallback baseline enlarge the line's
+                // ascent.
+                // <https://www.w3.org/TR/css-contain-1/#containment-layout>
+                if !atom.exports_internal_baseline() {
+                    return true;
+                }
+                atom.style().vertical_align.clone()
+            }
             InlineLineItem::Float(_) => VerticalAlign::BASELINE,
         };
         vertical_align.has_line_relative_baseline_shift()
-    }
-
-    fn inline_fragment_blocks_text_only_height_shortcut(fragment: &InlineFragment) -> bool {
-        if inline_fragment_uses_text_edge_layout(fragment) {
-            return true;
-        }
-        let vertical_align = fragment.style().vertical_align;
-        !vertical_align.has_line_relative_baseline_shift()
-            && vertical_align != VerticalAlign::BASELINE
     }
 
     fn inline_line_item_parent_content_edge_extents(
         &mut self,
         item: &MeasuredInlineItem,
         block_style: &ComputedStyle,
-    ) -> Option<(f32, f32)> {
+    ) -> Option<InlineBaselineExtents> {
         let (vertical_align, block_size) = match &item.item {
             InlineLineItem::Fragment(fragment) => {
                 let metrics =
                     self.inline_text_box_metrics(fragment.style(), item.shaped.as_deref(), 0.0);
-                (fragment.style().vertical_align, metrics.line_block_size)
+                (
+                    fragment.style().vertical_align.clone(),
+                    metrics.line_block_size,
+                )
             }
             InlineLineItem::Atom(atom) => (
-                atom.style().vertical_align,
+                atom.style().vertical_align.clone(),
                 inline_line_item_logical_block_size(&item.item, block_style),
             ),
             InlineLineItem::Float(_) => return None,
@@ -444,69 +722,52 @@ impl<'a> LayoutBuilder<'a> {
                 | BaselineMetric::Hanging,
             ) => return None,
         };
-        Some((baseline_offset, descent))
+        Some(InlineBaselineExtents::new(baseline_offset, descent))
     }
 
-    /// Return the parent line strut ascent/descent pair around its baseline.
+    /// Return the parent line strut's signed extents around its baseline.
     ///
     /// The strut participates in every inline formatting context line. Text
     /// painting in this renderer uses the selected-font ascent as the line
     /// baseline coordinate, while `line-height` remains the used block-axis
-    /// line advance:
+    /// line advance. CSS 2.2 allows negative leading, so either side of the
+    /// baseline can be negative; callers clamp only the final line height:
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height> and
     /// <https://www.w3.org/TR/css-inline-3/#line-height-property>.
     pub(in crate::layout) fn inline_style_line_extents(
         &mut self,
         style: &ComputedStyle,
         baseline_shift: f32,
-    ) -> (f32, f32) {
+    ) -> InlineBaselineExtents {
         let metrics = self.inline_text_box_metrics(style, None, baseline_shift);
-        let baseline = metrics.line_baseline_offset.max(0.0);
-        let descent = metrics.line_block_size - metrics.line_baseline_offset;
-        (baseline, descent)
+        InlineBaselineExtents::from_shifted_baseline_and_block_size(
+            metrics.line_baseline_offset,
+            metrics.line_block_size,
+            baseline_shift,
+        )
     }
 
     pub(in crate::layout) fn inline_text_box_metrics(
         &mut self,
         style: &ComputedStyle,
-        _shaped: Option<&ShapedInlineLine>,
-        baseline_shift: f32,
+        shaped: Option<&ShapedInlineLine>,
+        _baseline_shift: f32,
     ) -> InlineTextBoxMetrics {
-        let content_block_size = self
-            .font_system
-            .rendered_font_size_for_style(style)
-            .max(0.0);
-        let content_baseline_offset = self.inline_text_content_baseline_offset(style);
-        let line_block_size = self.font_system.used_line_height(style).max(0.0);
-        let half_leading = (line_block_size - content_block_size) / 2.0;
-        let line_baseline_offset = half_leading + content_baseline_offset - baseline_shift;
+        let resolved = self.font_system.resolved_inline_text_metrics(style, shaped);
+        let content_block_size = layout_points(resolved.content_block_size()).max(0.0);
+        let content_baseline_offset = layout_points(resolved.content.above_baseline);
+        let line_block_size = layout_points(resolved.line_block_size()).max(0.0);
+        let block_start_leading = layout_points(resolved.block_start_leading());
+        let block_end_leading = layout_points(resolved.block_end_leading());
+        let line_baseline_offset = block_start_leading + content_baseline_offset;
         InlineTextBoxMetrics {
             content_block_size,
             content_baseline_offset,
             line_block_size,
-            half_leading,
+            block_start_leading,
+            block_end_leading,
             line_baseline_offset,
         }
-    }
-
-    /// Return a text box baseline offset from the style's first available font.
-    ///
-    /// CSS 2.2 makes `line-height` establish the inline box used for baseline
-    /// alignment, with glyph ink allowed to overflow that box. The baseline
-    /// anchor therefore comes from the selected font for the style, not from a
-    /// later fallback run that happened to shape one glyph:
-    /// <https://www.w3.org/TR/CSS22/visudet.html#line-height> and
-    /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-vertical-align>.
-    pub(in crate::layout) fn inline_text_content_baseline_offset(
-        &mut self,
-        style: &ComputedStyle,
-    ) -> f32 {
-        let font_id = self.font_system.resolve_style(style);
-        let line_height = self.font_system.line_height_for_font(font_id, style);
-        let adjustment =
-            self.font_system
-                .font_ascent_baseline_adjustment(font_id, style, line_height);
-        style.font_size - adjustment
     }
 
     /// Return line metrics for mixed inline line-box participants.
@@ -523,77 +784,41 @@ impl<'a> LayoutBuilder<'a> {
         block_style: &ComputedStyle,
         width: f32,
     ) -> InlineLineMetrics {
-        let (baseline_offset, descent) =
-            self.mixed_inline_line_baseline_extents(items, block_style);
+        let baseline_extents = self.mixed_inline_line_baseline_extents(items, block_style);
         let non_baseline_aligned_height =
             self.mixed_inline_line_non_baseline_aligned_height(items, block_style);
-        let text_only_height = self.mixed_inline_text_only_height(items, block_style);
         InlineLineMetrics {
             width,
-            height: text_only_height
-                .unwrap_or(baseline_offset + descent)
-                .max(non_baseline_aligned_height),
-            baseline_offset,
+            height: baseline_extents.height().max(non_baseline_aligned_height),
+            baseline_offset: baseline_extents.baseline_offset,
         }
-    }
-
-    fn mixed_inline_text_only_height(
-        &mut self,
-        items: &[MeasuredInlineItem],
-        block_style: &ComputedStyle,
-    ) -> Option<f32> {
-        if !items.iter().all(|item| {
-            matches!(
-                item.as_ref(),
-                InlineLineItem::Fragment(_) | InlineLineItem::Float(_)
-            )
-        }) {
-            return None;
-        }
-        if items.iter().any(|item| match item.as_ref() {
-            InlineLineItem::Fragment(fragment) => {
-                Self::inline_fragment_blocks_text_only_height_shortcut(fragment)
-            }
-            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => false,
-        }) {
-            return None;
-        }
-        Some(
-            items
-                .iter()
-                .filter_map(|item| match item.as_ref() {
-                    InlineLineItem::Fragment(fragment) => {
-                        Some(self.font_system.used_line_height(fragment.style()))
-                    }
-                    InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
-                })
-                .fold(block_style.line_height, f32::max),
-        )
     }
 
     pub(in crate::layout) fn mixed_inline_line_baseline_extents(
         &mut self,
         items: &[MeasuredInlineItem],
         block_style: &ComputedStyle,
-    ) -> (f32, f32) {
-        let (mut baseline_offset, mut descent) = self.inline_style_line_extents(block_style, 0.0);
+    ) -> InlineBaselineExtents {
+        let mut extents = self.inline_style_line_extents(block_style, 0.0);
         for item in items {
+            if matches!(item.as_ref(), InlineLineItem::Float(_)) {
+                continue;
+            }
+            if Self::inline_line_item_is_initial_letter(&item.item) {
+                continue;
+            }
             if Self::inline_line_item_has_line_relative_baseline_shift(&item.item) {
                 continue;
             }
-            if let Some((item_baseline_offset, item_descent)) =
+            if let Some(item_extents) =
                 self.inline_line_item_parent_content_edge_extents(item, block_style)
             {
-                baseline_offset = baseline_offset.max(item_baseline_offset);
-                descent = descent.max(item_descent);
+                extents = extents.union(item_extents);
                 continue;
             }
-            let (item_baseline_offset, item_descent) =
-                self.inline_line_item_baseline_extents(item, block_style);
-            baseline_offset = baseline_offset.max(item_baseline_offset);
-            descent = descent.max(item_descent);
+            extents = extents.union(self.inline_line_item_baseline_extents(item, block_style));
         }
-        (baseline_offset, descent)
+        extents
     }
 
     pub(in crate::layout) fn mixed_inline_line_non_baseline_aligned_height<T>(
@@ -607,10 +832,13 @@ impl<'a> LayoutBuilder<'a> {
         let mut height: f32 = 0.0;
         for item in items {
             let item = item.as_ref();
+            if Self::inline_line_item_is_initial_letter(item) {
+                continue;
+            }
             if Self::inline_line_item_has_line_relative_baseline_shift(item) {
                 height = height.max(match item {
                     InlineLineItem::Fragment(fragment) => {
-                        self.font_system.used_line_height(fragment.style())
+                        self.font_system.used_line_height(fragment.style()).points()
                     }
                     InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {
                         inline_line_item_logical_block_size(item, block_style)
@@ -619,5 +847,45 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
         height
+    }
+
+    pub(in crate::layout) fn inline_line_item_is_initial_letter(item: &InlineLineItem) -> bool {
+        match item {
+            InlineLineItem::Fragment(fragment) => !fragment.style().initial_letter.is_normal(),
+            InlineLineItem::Atom(atom) => !atom.style().initial_letter.is_normal(),
+            InlineLineItem::Float(_) => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positive_baseline_shift_raises_text_extents() {
+        let extents = InlineBaselineExtents::from_shifted_baseline_and_block_size(12.0, 20.0, 5.0);
+
+        assert_eq!(extents.baseline_offset, 17.0);
+        assert_eq!(extents.descent, 3.0);
+    }
+
+    #[test]
+    fn negative_baseline_shift_lowers_atomic_extents() {
+        let style = ComputedStyle::initial();
+        let atom = InlineAtom::new(
+            InlineAtomContent::Canvas,
+            style.clone(),
+            None,
+            InlineSize::new(10.0, 20.0),
+            20.0,
+            -4.0,
+            None,
+            None,
+        );
+        let extents = LayoutBuilder::inline_atom_line_baseline_extents(&atom, &style);
+
+        assert_eq!(extents.baseline_offset, 16.0);
+        assert_eq!(extents.descent, 4.0);
     }
 }

@@ -1,24 +1,179 @@
-use crate::document::FontProgramKind;
+use crate::document::RenderedImagePattern;
+use crate::document::{FontProgramKind, RenderedImageSourceRect};
 use crate::{
-    Bookmark, BookmarkState, Color, Document, DocumentFont, DocumentMetadata, Page, PdfVariant,
-    RenderedGlyph, RenderedImage, RenderedPath, RenderedPathCommand, RenderedPathFillRule,
-    RenderedRoundedRect, RenderedTextMatrix,
+    Bookmark, BookmarkState, Color, Document, DocumentFont, DocumentMetadata, Page, RenderedGlyph,
+    RenderedImage, RenderedPath, RenderedPathCommand, RenderedPathFillRule, RenderedRoundedRect,
+    RenderedTextMatrix,
 };
+use pdf_writer::types::BlendMode;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ImageKey {
+/// Bytes prepared for one generated PDF stream.
+///
+/// Keeping the bytes and the required filter together prevents one PDF stream
+/// producer from applying `/FlateDecode` without first encoding its payload.
+pub(super) enum PdfStreamData<'a> {
+    Flate(Vec<u8>),
+    Raw(&'a [u8]),
+}
+
+impl PdfStreamData<'_> {
+    pub(super) fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Flate(data) => data,
+            Self::Raw(data) => data,
+        }
+    }
+
+    pub(super) const fn uses_flate(&self) -> bool {
+        matches!(self, Self::Flate(_))
+    }
+}
+
+/// Select the serialized bytes and PDF filter for a generated stream.
+pub(super) fn encode_pdf_stream(
+    compression: crate::PdfCompression,
+    data: &[u8],
+) -> PdfStreamData<'_> {
+    match compression {
+        crate::PdfCompression::Compressed => PdfStreamData::Flate(flate_compress(data)),
+        crate::PdfCompression::Uncompressed => PdfStreamData::Raw(data),
+    }
+}
+
+/// Compress a PDF stream with the zlib wrapper required by `/FlateDecode`.
+///
+/// ISO 32000-1:2008, 7.4.4 defines the FlateDecode filter. Keeping compression
+/// here makes every PDF stream producer use the same deterministic level.
+pub(super) fn flate_compress(data: &[u8]) -> Vec<u8> {
+    miniz_oxide::deflate::compress_to_vec_zlib(data, 6)
+}
+
+/// Converts Quire paint blend modes to the PDF `/BM` blend-mode values.
+///
+/// PDF 1.4 transparency defines `/BM` in an ExtGState dictionary: ISO
+/// 32000-1:2008, 11.3.5 "Blend Mode".
+impl From<crate::document::PaintBlendMode> for BlendMode {
+    fn from(mode: crate::document::PaintBlendMode) -> Self {
+        match mode {
+            crate::document::PaintBlendMode::Normal => Self::Normal,
+            crate::document::PaintBlendMode::Multiply => Self::Multiply,
+            crate::document::PaintBlendMode::Screen => Self::Screen,
+            crate::document::PaintBlendMode::Overlay => Self::Overlay,
+            crate::document::PaintBlendMode::Darken => Self::Darken,
+            crate::document::PaintBlendMode::Lighten => Self::Lighten,
+            crate::document::PaintBlendMode::ColorDodge => Self::ColorDodge,
+            crate::document::PaintBlendMode::ColorBurn => Self::ColorBurn,
+            crate::document::PaintBlendMode::HardLight => Self::HardLight,
+            crate::document::PaintBlendMode::SoftLight => Self::SoftLight,
+            crate::document::PaintBlendMode::Difference => Self::Difference,
+            crate::document::PaintBlendMode::Exclusion => Self::Exclusion,
+            crate::document::PaintBlendMode::Hue => Self::Hue,
+            crate::document::PaintBlendMode::Saturation => Self::Saturation,
+            crate::document::PaintBlendMode::Color => Self::Color,
+            crate::document::PaintBlendMode::Luminosity => Self::Luminosity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ImageResource {
     pixel_width: u32,
     pixel_height: u32,
     interpolate: bool,
+    color_space: crate::color::RasterColorSpace,
     rgb: Vec<u8>,
     alpha: Option<Vec<u8>>,
 }
 
+/// A PDF image resource before its source has been expanded into samples.
+///
+/// Document-backed images deliberately keep only the stable store handle here.
+/// This lets PDF emission decode one source at a time instead of retaining a
+/// decoded copy of every distinct image while pages and resources are planned.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ImageResourceSource {
+    Stored {
+        image_id: crate::image_store::ImageId,
+        source_rect: RenderedImageSourceRect,
+        interpolate: bool,
+    },
+    Inline {
+        pixel_width: u32,
+        pixel_height: u32,
+        interpolate: bool,
+        color_space: crate::color::RasterColorSpace,
+        rgb: Rc<[u8]>,
+        alpha: Option<Rc<[u8]>>,
+    },
+}
+
+impl ImageResourceSource {
+    fn raster_color_space(
+        &self,
+        image_store: &crate::image_store::DocumentImageStore,
+    ) -> crate::color::RasterColorSpace {
+        match self {
+            Self::Stored { image_id, .. } => image_store
+                .color_space(*image_id)
+                .unwrap_or(crate::color::RasterColorSpace::SRGB),
+            Self::Inline { color_space, .. } => color_space.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ImageObjectIds {
-    image_id: usize,
-    alpha_mask_id: Option<usize>,
+    image_id: PdfImageObjectId,
+    alpha_mask_id: Option<PdfImageObjectId>,
+}
+
+/// Index into the deduplicated image-source plan, distinct from a PDF object
+/// reference so planning code cannot accidentally mix the two domains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PlannedImageIndex(usize);
+
+/// PDF indirect object allocated for an image or soft mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PdfImageObjectId(usize);
+
+#[derive(Debug, Clone, PartialEq)]
+struct ImageResourcePlan {
+    unique_images: Vec<ImageResourceSource>,
+    page_image_unique_indexes: Vec<Vec<PlannedImageIndex>>,
+    page_pattern_tile_unique_indexes: Vec<Vec<PlannedImageIndex>>,
+}
+
+impl ImageResourcePlan {
+    fn embedded_rgb_profiles(
+        &self,
+        image_store: &crate::image_store::DocumentImageStore,
+    ) -> Vec<Rc<[u8]>> {
+        let mut profiles: Vec<Rc<[u8]>> = Vec::new();
+        for source in &self.unique_images {
+            let crate::color::RasterColorSpace::EmbeddedRgb(profile) =
+                source.raster_color_space(image_store)
+            else {
+                continue;
+            };
+            if !profiles.iter().any(|existing| {
+                let existing: &[u8] = existing.as_ref();
+                existing == profile.as_ref()
+            }) {
+                profiles.push(profile);
+            }
+        }
+        profiles
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PageImagePatternPlan {
+    id: usize,
+    name: String,
+    tile_image_id: PdfImageObjectId,
+    pattern: RenderedImagePattern,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,14 +186,93 @@ struct ExtGStateObjectPlan {
 struct PageContentRender {
     stream: Vec<u8>,
     form_xobjects: Vec<FormXObjectRender>,
+    gradient_patterns: Vec<GradientPatternPlan>,
+    gradient_tiling_patterns: Vec<GradientTilingPatternPlan>,
+    svg_tiling_patterns: Vec<SvgTilingPatternPlan>,
+    svg_path_tiling_patterns: Vec<SvgPathTilingPatternPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SvgTilingPatternPlan {
+    id: usize,
+    name: String,
+    form_id: usize,
+    form_name: String,
+    pattern: crate::document::RenderedSvgPattern,
+}
+
+/// A Type 1 tiling pattern used as the fill or stroke paint of one SVG path.
+/// Its stream stays in SVG user space and is transformed by the target path's
+/// active CTM when selected from the page or effect-form resources.
+#[derive(Debug, Clone, PartialEq)]
+struct SvgPathTilingPatternPlan {
+    id: usize,
+    name: String,
+    pattern: crate::document::RenderedSvgPathPattern,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GradientTilingPatternPlan {
+    id: usize,
+    name: String,
+    shading_pattern_name: String,
+    alpha_gstate_name: Option<String>,
+    pattern: crate::document::RenderedGradientPattern,
+}
+
+/// A page-local PDF shading-pattern resource for one normalized gradient paint.
+///
+/// ISO 32000-2:2020, 8.7.4 represents axial and radial SVG/CSS gradients as
+/// `/PatternType 2` resources plus Type 2/3 shading functions.
+#[derive(Debug, Clone, PartialEq)]
+struct GradientPatternPlan {
+    id: usize,
+    name: String,
+    function_ids: Vec<usize>,
+    gradient: crate::document::RenderedGradient,
+    alpha: Option<GradientAlphaPlan>,
+}
+
+/// The PDF resources that interpolate a gradient's stop alpha values.
+///
+/// A PDF shading has no alpha output channel, so SVG stop alpha is emitted as
+/// an `/SMask` transparency group containing an equivalent DeviceGray shading:
+/// ISO 32000-2:2020, 11.7.4.3 and SVG 2, 13.2.4.
+#[derive(Debug, Clone, PartialEq)]
+struct GradientAlphaPlan {
+    pattern_id: usize,
+    pattern_name: String,
+    function_ids: Vec<usize>,
+    form_id: usize,
+    ext_gstate_id: usize,
+    ext_gstate_name: String,
+    page_width: f32,
+    page_height: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct FormXObjectRender {
     id: usize,
     name: String,
+    /// Form XObjects directly invoked by this form's content stream.
+    ///
+    /// PDF Form resource dictionaries must define every nested `Do` name, but
+    /// including the page's complete form set introduces recursive resources
+    /// and duplicate dictionary keys. ISO 32000-1:2008, 8.10 Form XObjects.
+    form_dependencies: Vec<FormXObjectReference>,
     bbox: crate::document::PaintClip,
     stream: Vec<u8>,
+    /// Effect-scope forms need an isolated transparency group; a simple SVG
+    /// tile is an opaque reusable drawing and must retain ordinary form
+    /// painting semantics inside a tiling pattern.
+    transparency_group: bool,
+}
+
+/// A named Form XObject that may be used by a page or another Form stream.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FormXObjectReference {
+    id: usize,
+    name: String,
 }
 
 const EMBEDDED_FONT_OBJECTS: usize = 5;
@@ -55,7 +289,13 @@ struct EmbeddedFontPlan<'a> {
     file_id: usize,
     to_unicode_id: usize,
     cid_set_id: Option<usize>,
-    used_glyphs: BTreeMap<u16, String>,
+    font_program_kind: FontProgramKind,
+    /// Maps shaped source glyph IDs to the compact CIDs emitted in PDF text.
+    ///
+    /// `subsetter` makes remapped GIDs and CIDs identical, so this map keeps
+    /// content streams, the embedded font program, and PDF CMaps in lockstep.
+    source_gid_to_cid: BTreeMap<u16, u16>,
+    used_cids: BTreeMap<u16, String>,
     font_file_data: Vec<u8>,
     embedding_kind: FontEmbeddingKind,
     descriptor_metrics: FontDescriptorMetrics,
@@ -65,7 +305,7 @@ struct EmbeddedFontPlan<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FontEmbeddingKind {
-    SubsetRetainedGids,
+    SubsetCompactGids,
     FullStandaloneFont,
     ExtractedCollectionFace,
     Rejected { reason: String },
@@ -74,8 +314,6 @@ enum FontEmbeddingKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PdfFontValidationProfile {
     Default,
-    #[cfg(test)]
-    StrictPdf,
     PdfA,
 }
 
@@ -119,17 +357,10 @@ struct EmbeddedFontPlans<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct EmbeddedFontKey {
-    blob_id: u64,
+struct EmbeddedFontCandidateKey {
+    program_len: usize,
     face_index: u32,
     program_kind: FontProgramKind,
-    post_script_name: String,
-    units_per_em: u16,
-    ascender: i16,
-    descender: i16,
-    cap_height: i16,
-    italic_angle: i16,
-    bbox: [i16; 4],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +388,7 @@ struct OutlineNodePlan {
     child_count: i32,
 }
 
+mod colors;
 mod content;
 mod font_subset;
 mod fonts;

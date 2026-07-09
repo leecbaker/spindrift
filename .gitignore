@@ -5,3 +5,6 @@ target/
 WeasyPrint
 
 output/
+wpt-results/
+
+*.pdf

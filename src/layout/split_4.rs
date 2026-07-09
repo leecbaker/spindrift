@@ -5,6 +5,7 @@ mod tests {
         BoxDecorationBreak, ComputedLengthPercentage, Hyphens, TextAlignLast, TextBoxEdge,
         TextBoxTrim, TextEdgeMetric, TextEdgePair, TextOrientation,
     };
+    use std::rc::Rc;
 
     fn test_layout_builder<'a>(
         options: &'a RenderOptions,
@@ -17,6 +18,10 @@ mod tests {
             base_url: None,
             root_url: None,
             resource_cache,
+            // The builder retains this reference for its lifetime; tests that do
+            // not exercise iframes use one immutable empty fixture.
+            iframe_documents: Box::leak(Box::new(HashMap::new())),
+            iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
             font_system: FontSystem::new(),
@@ -47,7 +52,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         }))
     }
 
@@ -56,13 +61,13 @@ mod tests {
             InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(InlineBoxEdgeFragment {
                 logical_edge: InlineLogicalEdge::End,
                 physical_side: inline_end_side(style.writing_mode, style.direction),
+                positioning_containing_block_id: None,
                 advance: width,
                 paint_extent: width.max(0.0),
             })),
             style.clone(),
             None,
-            width,
-            style.line_height,
+            InlineSize::new(width, style.line_height),
             style.font_size,
             0.0,
             None,
@@ -82,14 +87,37 @@ mod tests {
                     InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(InlineBoxEdgeFragment {
                         logical_edge,
                         physical_side,
+                        positioning_containing_block_id: None,
                         advance: 5.0,
                         paint_extent: 5.0,
                     })),
                     style.clone(),
                     None,
-                    5.0,
-                    style.line_height,
+                    InlineSize::new(5.0, style.line_height),
                     style.font_size,
+                    0.0,
+                    None,
+                    None,
+                )),
+                width: 5.0,
+                shaped: None,
+            },
+            range: boundary..boundary,
+        }
+    }
+
+    fn measured_text_autospace_edge(
+        boundary: usize,
+        style: &ComputedStyle,
+    ) -> inline_layout::RangedMeasuredMixedInlineLineItem {
+        inline_layout::RangedMeasuredMixedInlineLineItem {
+            item: inline_layout::MeasuredInlineItem {
+                item: InlineLineItem::Atom(InlineAtom::new(
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::TextAutospace),
+                    style.clone(),
+                    None,
+                    InlineSize::new(5.0, 0.0),
+                    0.0,
                     0.0,
                     None,
                     None,
@@ -116,6 +144,13 @@ mod tests {
         }
     }
 
+    fn bidi_visual_range(
+        range: std::ops::Range<usize>,
+        direction: ResolvedBidiDirection,
+    ) -> BidiVisualRange {
+        BidiVisualRange { range, direction }
+    }
+
     #[test]
     fn mixed_inline_visual_ranges_split_at_sibling_box_edge_boundary() {
         let mut style = ComputedStyle::initial();
@@ -127,13 +162,43 @@ mod tests {
             ranged_fragment("pause", 7..12, &style),
         ];
 
-        let split = inline_layout::split_mixed_inline_visual_ranges_at_box_edges(
-            std::iter::once(0..12).collect(),
+        let split = inline_layout::split_mixed_inline_visual_ranges_at_transparent_inline_edges(
+            vec![bidi_visual_range(0..12, ResolvedBidiDirection::Rtl)],
             &ranged_items,
             "inspectpause",
         );
 
-        assert_eq!(split, vec![0..7, 7..12]);
+        assert_eq!(
+            split,
+            vec![
+                bidi_visual_range(0..7, ResolvedBidiDirection::Rtl),
+                bidi_visual_range(7..12, ResolvedBidiDirection::Rtl),
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_inline_visual_ranges_split_at_text_autospace_boundary() {
+        let style = ComputedStyle::initial();
+        let ranged_items = vec![
+            ranged_fragment("漢", 0..3, &style),
+            measured_text_autospace_edge(3, &style),
+            ranged_fragment("A", 3..4, &style),
+        ];
+
+        let split = inline_layout::split_mixed_inline_visual_ranges_at_transparent_inline_edges(
+            vec![bidi_visual_range(0..4, ResolvedBidiDirection::Ltr)],
+            &ranged_items,
+            "漢A",
+        );
+
+        assert_eq!(
+            split,
+            vec![
+                bidi_visual_range(0..3, ResolvedBidiDirection::Ltr),
+                bidi_visual_range(3..4, ResolvedBidiDirection::Ltr),
+            ]
+        );
     }
 
     #[test]
@@ -148,13 +213,19 @@ mod tests {
             ranged_fragment("pause", 8..13, &style),
         ];
 
-        let split = inline_layout::split_mixed_inline_visual_ranges_at_box_edges(
-            std::iter::once(0..13).collect(),
+        let split = inline_layout::split_mixed_inline_visual_ranges_at_transparent_inline_edges(
+            vec![bidi_visual_range(0..13, ResolvedBidiDirection::Rtl)],
             &ranged_items,
             "inspect pause",
         );
 
-        assert_eq!(split, vec![0..7, 7..13]);
+        assert_eq!(
+            split,
+            vec![
+                bidi_visual_range(0..7, ResolvedBidiDirection::Rtl),
+                bidi_visual_range(7..13, ResolvedBidiDirection::Rtl),
+            ]
+        );
     }
 
     #[test]
@@ -168,13 +239,16 @@ mod tests {
             measured_inline_box_edge(12, InlineLogicalEdge::End, PhysicalSide::Left, &style),
         ];
 
-        let split = inline_layout::split_mixed_inline_visual_ranges_at_box_edges(
-            std::iter::once(0..12).collect(),
+        let split = inline_layout::split_mixed_inline_visual_ranges_at_transparent_inline_edges(
+            vec![bidi_visual_range(0..12, ResolvedBidiDirection::Rtl)],
             &ranged_items,
             "inspectpause",
         );
 
-        assert_eq!(split, vec![0..12]);
+        assert_eq!(
+            split,
+            vec![bidi_visual_range(0..12, ResolvedBidiDirection::Rtl)]
+        );
     }
 
     #[test]
@@ -197,14 +271,116 @@ mod tests {
 
         assert!((tall_metrics.content_block_size - 50.0).abs() < 0.01);
         assert!((short_metrics.content_block_size - 50.0).abs() < 0.01);
-        assert!((tall_metrics.half_leading - 75.0).abs() < 0.01);
-        assert!((short_metrics.half_leading + 10.0).abs() < 0.01);
+        assert!((tall_metrics.block_start_leading - 75.0).abs() < 0.01);
+        assert!((short_metrics.block_start_leading + 10.0).abs() < 0.01);
         assert!(
             (tall_metrics.content_baseline_offset - short_metrics.content_baseline_offset).abs()
                 < 0.01
         );
         assert!(
             (tall_metrics.line_baseline_offset - short_metrics.line_baseline_offset - 85.0).abs()
+                < 0.01
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_inline_metrics_union_shaped_fallback_font_runs() {
+        let stylesheet = css::parse_stylesheet(
+            &crate::css::Css::from_string(
+                r#"@font-face {
+                    font-family: HighOnly;
+                    src: url("weasyprint-samples/invoice/SourceSans3-Regular.ttf");
+                    unicode-range: U+0020, U+0061;
+                }
+                @font-face {
+                    font-family: DeepOnly;
+                    src: url("weasyprint-samples/invoice/pacifico.ttf");
+                    unicode-range: U+0020, U+0062;
+                }"#,
+            )
+            .with_base_path(".")
+            .expect("current directory should be a valid file URL"),
+        );
+        let font_system = FontSystem::start_loading()
+            .load_stylesheet_fonts(&[stylesheet])
+            .finish()
+            .await;
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let iframe_documents = HashMap::new();
+        let mut builder = LayoutBuilder::new(LayoutBuilderConfig {
+            options: &options,
+            stylesheets: &stylesheets,
+            base_url: None,
+            root_url: None,
+            resource_cache: &resource_cache,
+            iframe_documents: &iframe_documents,
+            iframe_viewport: None,
+            page_progression_direction: Direction::Ltr,
+            page_counter_initial_values: HashMap::new(),
+            font_system,
+        });
+
+        let mut high = ComputedStyle::initial();
+        high.font_family = css::FontFamily::Names(vec!["HighOnly".to_string()]);
+        high.font_size = 100.0;
+        high.line_height_is_normal = true;
+        let mut deep = high.clone();
+        deep.font_family = css::FontFamily::Names(vec!["DeepOnly".to_string()]);
+        let mut mixed = high.clone();
+        mixed.font_family =
+            css::FontFamily::Names(vec!["HighOnly".to_string(), "DeepOnly".to_string()]);
+
+        let high_shaped = builder
+            .font_system
+            .shape_unwrapped_line("a", &high, high.line_height)
+            .expect("high font should shape a");
+        let deep_shaped = builder
+            .font_system
+            .shape_unwrapped_line("b", &deep, deep.line_height)
+            .expect("deep font should shape b");
+        let mixed_shaped = builder
+            .font_system
+            .shape_unwrapped_line("ab", &mixed, mixed.line_height)
+            .expect("mixed font stack should shape ab");
+        assert!(
+            mixed_shaped
+                .runs
+                .iter()
+                .filter_map(|run| run.font_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 1,
+            "test fonts should produce more than one shaped run: {mixed_shaped:?}"
+        );
+
+        let high_metrics = builder.inline_text_box_metrics(&high, Some(&high_shaped), 0.0);
+        let deep_metrics = builder.inline_text_box_metrics(&deep, Some(&deep_shaped), 0.0);
+        let mixed_metrics = builder.inline_text_box_metrics(&mixed, Some(&mixed_shaped), 0.0);
+
+        let expected_content_above = high_metrics
+            .content_baseline_offset
+            .max(deep_metrics.content_baseline_offset);
+        let expected_content_below = (high_metrics.content_block_size
+            - high_metrics.content_baseline_offset)
+            .max(deep_metrics.content_block_size - deep_metrics.content_baseline_offset);
+        let expected_line_above = high_metrics
+            .line_baseline_offset
+            .max(deep_metrics.line_baseline_offset);
+        let expected_line_below = (high_metrics.line_block_size
+            - high_metrics.line_baseline_offset)
+            .max(deep_metrics.line_block_size - deep_metrics.line_baseline_offset);
+
+        assert!((mixed_metrics.content_baseline_offset - expected_content_above).abs() < 0.01);
+        assert!(
+            (mixed_metrics.content_block_size - (expected_content_above + expected_content_below))
+                .abs()
+                < 0.01
+        );
+        assert!((mixed_metrics.line_baseline_offset - expected_line_above).abs() < 0.01);
+        assert!(
+            (mixed_metrics.line_block_size - (expected_line_above + expected_line_below)).abs()
                 < 0.01
         );
     }
@@ -216,8 +392,7 @@ mod tests {
             },
             style.clone(),
             None,
-            width,
-            0.0,
+            InlineSize::new(width, 0.0),
             0.0,
             0.0,
             None,
@@ -232,7 +407,9 @@ mod tests {
             unreachable!("element constructor should produce an element")
         };
         let signature = ElementSignature::new(element.tag.clone(), element.attrs.clone());
-        InlineItem::Float(Box::new(InlineFloat::new(element, signature, style, None)))
+        InlineItem::Float(Box::new(InlineFloat::new(
+            element, signature, style, false, None,
+        )))
     }
 
     fn inline_leader(pattern: &str, style: &ComputedStyle) -> InlineItem {
@@ -240,8 +417,7 @@ mod tests {
             InlineAtomContent::Leader(pattern.to_string()),
             style.clone(),
             None,
-            0.0,
-            style.line_height,
+            InlineSize::new(0.0, style.line_height),
             style.font_size,
             0.0,
             Some("https://example.test/".to_string()),
@@ -264,12 +440,8 @@ mod tests {
         ListMarker {
             text: String::new(),
             image: Some(MarkerImage {
-                decoded: DecodedPngImage {
-                    pixel_width: 1,
-                    pixel_height: 1,
-                    rgb: vec![0, 0, 0],
-                    alpha: None,
-                },
+                decoded: DecodedPngImage::new(1, 1, vec![0, 0, 0], None),
+                svg: None,
                 width,
                 height,
             }),
@@ -288,6 +460,7 @@ mod tests {
             hanging_indent: 0.0,
             hanging_punctuation_reserve: 0.0,
             fragment_text_box_trim: TextBoxLineTrim::default(),
+            has_flow_side_effects: false,
         }
     }
 
@@ -350,6 +523,7 @@ mod tests {
                 block_start: 10.0,
                 block_end: 20.0,
             },
+            has_flow_side_effects: false,
         };
 
         let (_, records) = sequence.fragment_records_for_slice_paint(0.0, -100.01, -300.0);
@@ -366,8 +540,8 @@ mod tests {
         assert_eq!(records[1].block_end_trim, 20.0);
     }
 
-    #[tokio::test]
-    async fn direct_text_sequence_applies_own_text_box_trim() {
+    #[test]
+    fn direct_text_sequence_applies_own_text_box_trim() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -393,8 +567,8 @@ mod tests {
         assert!(sequence.total_height() < style.line_height);
     }
 
-    #[tokio::test]
-    async fn collected_inline_sequence_preserves_forced_break_clearance() {
+    #[test]
+    fn collected_inline_sequence_preserves_forced_break_clearance() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -407,7 +581,10 @@ mod tests {
         let sequence = builder.collect_inline_line_sequence(
             vec![
                 inline_word("A", &style),
-                InlineItem::Break(InlineBreak { clear: Clear::Both }),
+                InlineItem::Break(InlineBreak {
+                    clear: Clear::Both,
+                    ..InlineBreak::default()
+                }),
             ],
             &style,
             100.0,
@@ -421,8 +598,8 @@ mod tests {
         assert!(sequence.records[0].fragment.is_some());
     }
 
-    #[tokio::test]
-    async fn intrinsic_inline_measurement_applies_own_text_box_trim() {
+    #[test]
+    fn intrinsic_inline_measurement_applies_own_text_box_trim() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -448,8 +625,8 @@ mod tests {
         assert!(measurement.height() < style.line_height * 2.0);
     }
 
-    #[tokio::test]
-    async fn text_box_trim_skips_forced_empty_lines_when_selecting_formatted_edges() {
+    #[test]
+    fn text_box_trim_skips_forced_empty_lines_when_selecting_formatted_edges() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -498,8 +675,8 @@ mod tests {
         assert_eq!(sequence.records[2].block_end_trim, 0.0);
     }
 
-    #[tokio::test]
-    async fn vertical_text_box_trim_reduces_logical_block_line_size() {
+    #[test]
+    fn vertical_text_box_trim_reduces_logical_block_line_size() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -529,8 +706,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn vertical_lr_text_box_trim_reduces_logical_block_line_size() {
+    #[test]
+    fn vertical_lr_text_box_trim_reduces_logical_block_line_size() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -578,6 +755,7 @@ mod tests {
             hanging_indent: 0.0,
             hanging_punctuation_reserve: 0.0,
             fragment_text_box_trim: TextBoxLineTrim::default(),
+            has_flow_side_effects: false,
         };
         let mut trimmed_first = first;
         trimmed_first.block_start_trim = 10.0;
@@ -588,6 +766,7 @@ mod tests {
             hanging_indent: 0.0,
             hanging_punctuation_reserve: 0.0,
             fragment_text_box_trim: TextBoxLineTrim::default(),
+            has_flow_side_effects: false,
         };
 
         let borders = css::Edges::ZERO;
@@ -639,7 +818,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         }));
 
         assert_eq!(
@@ -722,8 +901,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn inline_line_sequence_splits_at_page_scope_boundaries_without_graphing_controls() {
+    #[test]
+    fn inline_line_sequence_splits_at_page_scope_boundaries_without_graphing_controls() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -767,23 +946,14 @@ mod tests {
             .map(|prepared| {
                 prepared_text_groups(&prepared)
                     .into_iter()
-                    .map(|group| group.shaped.text.clone())
+                    .map(|group| group.shaped.text.to_string())
                     .collect::<String>()
             })
             .collect()
     }
 
-    #[tokio::test]
-    async fn wraps_at_word_boundaries() {
-        assert_eq!(
-            wrap_text("one two three", 7),
-            vec!["one two".to_string(), "three".to_string()]
-        );
-        assert_eq!(wrap_text("Parent Child", 4), vec!["Parent", "Child"]);
-    }
-
-    #[tokio::test]
-    async fn production_sequence_wraps_text_with_shaped_widths() {
+    #[test]
+    fn production_sequence_wraps_text_with_shaped_widths() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -802,8 +972,8 @@ mod tests {
         assert_eq!(prepared, vec!["one two", "three"]);
     }
 
-    #[tokio::test]
-    async fn production_sequence_wraps_break_spaces_and_preserves_trailing_advance() {
+    #[test]
+    fn production_sequence_wraps_break_spaces_and_preserves_trailing_advance() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -827,8 +997,49 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn production_sequence_keeps_css_text_hanging_width_effects() {
+    #[test]
+    fn production_sequence_keeps_keep_all_hyphen_breaks() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 20.0;
+        style.line_height = 20.0;
+        style.word_break = css::WordBreak::KeepAll;
+        let available_width = builder
+            .font_system
+            .measure_text("AB-", &style)
+            .max(builder.font_system.measure_text("CD-", &style))
+            + 0.1;
+
+        let sequence = raw_text_sequence(&mut builder, "AB-CD-EF", &style, available_width);
+
+        assert_eq!(sequence_fragment_texts(&sequence), vec!["AB-", "CD-", "EF"]);
+    }
+
+    #[test]
+    fn production_sequence_relaxes_keep_all_only_as_a_last_resort() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 20.0;
+        style.line_height = 20.0;
+        style.word_break = css::WordBreak::KeepAll;
+        style.overflow_wrap = css::OverflowWrap::Normal;
+        let available_width = 0.0;
+
+        let sequence = raw_text_sequence(&mut builder, "文文文", &style, available_width);
+
+        assert_eq!(sequence_fragment_texts(&sequence), vec!["文", "文", "文"]);
+    }
+
+    #[test]
+    fn production_sequence_keeps_css_text_hanging_width_effects() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -865,8 +1076,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn production_prepared_lines_apply_bidi_visual_order() {
+    #[test]
+    fn production_prepared_lines_apply_bidi_visual_order() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -895,8 +1106,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn production_sequence_uses_css_text_emergency_break_controls() {
+    #[test]
+    fn production_sequence_uses_css_text_emergency_break_controls() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -965,8 +1176,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn production_sequence_handles_soft_hyphen_and_auto_hyphenation() {
+    #[test]
+    fn production_sequence_handles_soft_hyphen_and_auto_hyphenation() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1018,8 +1229,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn production_sequence_handles_break_spaces_with_break_all() {
+    #[test]
+    fn production_sequence_handles_break_spaces_with_break_all() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1044,10 +1255,83 @@ mod tests {
         let sequence = raw_text_sequence(&mut builder, "X XX X", &style, available_width);
         assert_eq!(sequence_fragment_texts(&sequence).concat(), "X XX X");
         assert!(sequence.records.len() > 1);
+
+        style.overflow_wrap = css::OverflowWrap::Anywhere;
+        let sequence = raw_text_sequence(&mut builder, "X XX X", &style, available_width);
+        assert_eq!(sequence_fragment_texts(&sequence), ["X XX", " X"]);
     }
 
-    #[tokio::test]
-    async fn css_whitespace_normalization_preserves_ideographic_spaces() {
+    #[test]
+    fn break_spaces_anywhere_keeps_after_space_breaks_preferred() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::BreakSpaces;
+        style.overflow_wrap = css::OverflowWrap::Anywhere;
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        let available_width = builder.font_system.measure_text("X XX", &style) + 0.1;
+        let sequence = raw_text_sequence(&mut builder, "X XX X", &style, available_width);
+
+        assert_eq!(sequence_fragment_texts(&sequence), ["X ", "XX X"]);
+    }
+
+    #[test]
+    fn break_spaces_min_content_uses_after_each_preserved_space_break() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::BreakSpaces;
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        let graph =
+            builder.build_inline_opportunity_graph(&[inline_word("123    8", &style)], &style);
+        let contribution = graph.intrinsic_contribution(&mut builder.font_system, &style);
+
+        assert!(
+            contribution.min_content <= builder.font_system.measure_text("123 ", &style) + 0.01,
+            "break-spaces min-content should break after each preserved space: {contribution:?}"
+        );
+    }
+
+    #[test]
+    fn break_spaces_keeps_later_preserved_spaces_with_following_text_when_they_fit() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::BreakSpaces;
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 32.0;
+        let available_width = builder.font_system.measure_text("123 ", &style) + 0.01;
+        let sequence = raw_text_sequence(&mut builder, "123    8", &style, available_width);
+
+        assert_eq!(sequence_fragment_texts(&sequence), ["123 ", "   8"]);
+    }
+
+    #[test]
+    fn break_spaces_tabs_constrain_graph_break_selection_at_tab_stops() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::BreakSpaces;
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 20.0;
+        let tab_period = builder.font_system.measure_text(" ", &style) * 8.0;
+        let sequence = raw_text_sequence(&mut builder, "XX\t\tXX", &style, tab_period * 2.0);
+
+        assert_eq!(sequence_fragment_texts(&sequence), ["XX\t\t", "XX"]);
+    }
+
+    #[test]
+    fn css_whitespace_normalization_preserves_ideographic_spaces() {
         assert_eq!(
             collapse_whitespace("\u{3000}\u{3000}XX"),
             "\u{3000}\u{3000}XX"
@@ -1059,8 +1343,8 @@ mod tests {
         assert_eq!(normalize_inline_text("  XX  "), "XX");
     }
 
-    #[tokio::test]
-    async fn inline_whitespace_processor_collapses_across_transparent_edges() {
+    #[test]
+    fn inline_whitespace_processor_collapses_across_transparent_edges() {
         let mut style = ComputedStyle::initial();
         style.font_family = css::FontFamily::SansSerif;
         let mut items = vec![
@@ -1072,8 +1356,8 @@ mod tests {
         assert_eq!(normalized_inline_item_text(&mut items), "A \u{fffc}B");
     }
 
-    #[tokio::test]
-    async fn inline_whitespace_processor_treats_page_scopes_as_text_transparent() {
+    #[test]
+    fn inline_whitespace_processor_treats_page_scopes_as_text_transparent() {
         let mut style = ComputedStyle::initial();
         style.font_family = css::FontFamily::SansSerif;
         let mut spaced = vec![
@@ -1093,8 +1377,8 @@ mod tests {
         assert_eq!(normalized_inline_item_text(&mut cjk), "中文");
     }
 
-    #[tokio::test]
-    async fn inline_whitespace_processor_resets_across_real_atoms() {
+    #[test]
+    fn inline_whitespace_processor_resets_across_real_atoms() {
         let mut style = ComputedStyle::initial();
         style.font_family = css::FontFamily::SansSerif;
         let mut items = vec![
@@ -1106,8 +1390,8 @@ mod tests {
         assert_eq!(normalized_inline_item_text(&mut items), "A \u{fffc} B");
     }
 
-    #[tokio::test]
-    async fn inline_whitespace_processor_handles_pre_line_and_preserved_modes() {
+    #[test]
+    fn inline_whitespace_processor_handles_pre_line_and_preserved_modes() {
         let mut pre_line = ComputedStyle::initial();
         pre_line.font_family = css::FontFamily::SansSerif;
         pre_line.white_space = WhiteSpace::PreLine;
@@ -1122,20 +1406,12 @@ mod tests {
         let mut pre_wrap = pre_line.clone();
         pre_wrap.white_space = WhiteSpace::PreWrap;
         let mut pre_wrap_items = vec![inline_word("A\t B\n", &pre_wrap)];
-        assert_eq!(normalized_inline_item_text(&mut pre_wrap_items), "A\t B");
+        assert_eq!(normalized_inline_item_text(&mut pre_wrap_items), "A\t B|");
 
         let mut pre = pre_line.clone();
         pre.white_space = WhiteSpace::Pre;
         let mut pre_items = vec![inline_word("\n", &pre)];
         assert_eq!(normalized_inline_item_text(&mut pre_items), "|");
-        assert_eq!(
-            inline_collect::trim_terminal_preserved_segment_breaks("\n", &pre),
-            "\n"
-        );
-        assert_eq!(
-            inline_collect::trim_terminal_preserved_segment_breaks("A\n", &pre),
-            "A"
-        );
 
         let mut break_spaces = pre_line;
         break_spaces.white_space = WhiteSpace::BreakSpaces;
@@ -1150,30 +1426,44 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn inline_whitespace_processor_replaces_visible_controls() {
+    #[test]
+    fn inline_whitespace_processor_preserves_mandatory_control_breaks() {
         let mut style = ComputedStyle::initial();
         style.font_family = css::FontFamily::SansSerif;
-        let mut items = vec![inline_word("A\u{0099}B", &style)];
+        let mut items = vec![inline_word("A\u{000b}\u{000c}\u{0099}B", &style)];
 
-        assert_eq!(normalized_inline_item_text(&mut items), "A\u{fffd}B");
+        assert_eq!(normalized_inline_item_text(&mut items), "A||\u{fffd}B");
     }
 
-    #[tokio::test]
-    async fn inline_whitespace_processor_transforms_segment_breaks_by_context() {
+    #[test]
+    fn inline_whitespace_processor_maps_carriage_return_to_space() {
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        let mut items = vec![inline_word("A\rB", &style)];
+
+        assert_eq!(normalized_inline_item_text(&mut items), "A B");
+    }
+
+    #[test]
+    fn inline_whitespace_processor_transforms_segment_breaks_by_context() {
         let mut style = ComputedStyle::initial();
         style.font_family = css::FontFamily::SansSerif;
         let mut cjk = vec![inline_word("中文\n中文", &style)];
         let mut mixed = vec![inline_word("中文\nenglish", &style)];
         let mut latin = vec![inline_word("word\nword", &style)];
+        let mut zero_width_break = vec![inline_word("aa\u{200b}\nbbb", &style)];
 
         assert_eq!(normalized_inline_item_text(&mut cjk), "中文中文");
         assert_eq!(normalized_inline_item_text(&mut mixed), "中文 english");
         assert_eq!(normalized_inline_item_text(&mut latin), "word word");
+        assert_eq!(
+            normalized_inline_item_text(&mut zero_width_break),
+            "aa\u{200b}bbb"
+        );
     }
 
-    #[tokio::test]
-    async fn inline_whitespace_processor_keeps_bidi_controls_transparent() {
+    #[test]
+    fn inline_whitespace_processor_keeps_bidi_controls_transparent() {
         let mut style = ComputedStyle::initial();
         style.font_family = css::FontFamily::SansSerif;
         let mut items = vec![
@@ -1185,8 +1475,8 @@ mod tests {
         assert_eq!(normalized_inline_item_text(&mut items), "中\u{2066}文");
     }
 
-    #[tokio::test]
-    async fn inside_marker_text_participates_in_shared_whitespace_context() {
+    #[test]
+    fn inside_marker_text_participates_in_shared_whitespace_context() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1206,8 +1496,8 @@ mod tests {
         assert_eq!(normalized_inline_item_text(&mut items), "中文");
     }
 
-    #[tokio::test]
-    async fn inside_marker_image_resets_whitespace_context_as_atomic_boundary() {
+    #[test]
+    fn inside_marker_image_resets_whitespace_context_as_atomic_boundary() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1231,8 +1521,8 @@ mod tests {
         assert_eq!(normalized_inline_item_text(&mut items), "\u{fffc} B");
     }
 
-    #[tokio::test]
-    async fn generated_marker_forced_breaks_survive_sequence_records() {
+    #[test]
+    fn generated_marker_forced_breaks_survive_sequence_records() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1254,8 +1544,8 @@ mod tests {
         assert!(sequence.records[1].fragment.is_none());
     }
 
-    #[tokio::test]
-    async fn bidi_controls_around_forced_breaks_stay_invisible_in_prepared_lines() {
+    #[test]
+    fn bidi_controls_around_forced_breaks_stay_invisible_in_prepared_lines() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1290,8 +1580,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn plaintext_alignment_resolves_per_forced_sequence_line() {
+    #[test]
+    fn plaintext_alignment_resolves_per_forced_sequence_line() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1329,8 +1619,53 @@ mod tests {
         assert_eq!(sequence.records[1].fragment.as_ref().unwrap().text(), "abc");
     }
 
-    #[tokio::test]
-    async fn inline_line_sequence_keeps_forced_empty_lines_as_records() {
+    #[test]
+    fn plaintext_alignment_uses_a_leading_right_to_left_mark() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        builder.cursor_y = 100.0;
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 16.0;
+        style.line_height = 20.0;
+        style.text_align = TextAlign::Start;
+        style.unicode_bidi = UnicodeBidi::Plaintext;
+        style.direction = Direction::Ltr;
+        let mut items = Vec::new();
+        builder.push_bidi_scope_start(&style, None, 0.0, InlineVisualOffset::zero(), &mut items);
+        items.extend([
+            inline_word("TES", &style),
+            InlineItem::Break(InlineBreak::default()),
+            inline_word("\u{200f}TIN", &style),
+        ]);
+        builder.push_bidi_scope_end(&style, None, 0.0, InlineVisualOffset::zero(), &mut items);
+        inline_collect::normalize_inline_whitespace_items(&mut items);
+        inline_collect::insert_text_autospace_items(&mut builder.font_system, &mut items);
+        let sequence = builder.collect_inline_line_sequence(items, &style, 120.0, 0.0, 0.0);
+        let context = inline_paragraph_context(&style, 120.0);
+        let mut plaintext_state = None;
+
+        let ltr_prepared = builder
+            .prepare_inline_line_record(&sequence.records[0], context, &mut plaintext_state)
+            .expect("LTR plaintext line should prepare");
+        let rtl_prepared = builder
+            .prepare_inline_line_record(&sequence.records[1], context, &mut plaintext_state)
+            .expect("RLM plaintext line should prepare");
+        let ltr_group = prepared_text_groups(&ltr_prepared)[0];
+        let rtl_group = prepared_text_groups(&rtl_prepared)[0];
+
+        assert_eq!(
+            sequence_fragment_texts(&sequence),
+            vec!["\u{2068}TES", "\u{200f}TIN\u{2069}"]
+        );
+        assert_eq!(plaintext_state, Some(Direction::Rtl));
+        assert!(rtl_group.x() > ltr_group.x() + 60.0);
+    }
+
+    #[test]
+    fn inline_line_sequence_keeps_forced_empty_lines_as_records() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1359,8 +1694,8 @@ mod tests {
         assert_eq!(sequence.total_height(), 30.0);
     }
 
-    #[tokio::test]
-    async fn forced_empty_line_updates_last_in_flow_line_baseline() {
+    #[test]
+    fn forced_empty_line_updates_last_in_flow_line_baseline() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1394,8 +1729,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn generated_terminal_preserved_break_creates_forced_empty_line() {
+    #[test]
+    fn generated_terminal_preserved_break_creates_forced_empty_line() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1417,7 +1752,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Generated,
             hanging_edges: InlineHangingEdges::default(),
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         }))];
         let mut normal_items = vec![inline_word("\n", &style)];
 
@@ -1426,15 +1761,15 @@ mod tests {
         let sequence =
             builder.collect_inline_line_sequence(generated_items, &style, 100.0, 0.0, 0.0);
 
-        assert!(matches!(normal_items.as_slice(), []));
+        assert!(matches!(normal_items.as_slice(), [InlineItem::Break(_)]));
         assert_eq!(sequence.records.len(), 1);
         assert!(sequence.records[0].fragment.is_none());
         assert!(sequence.records[0].is_forced_empty);
         assert_eq!(sequence.total_height(), 10.0);
     }
 
-    #[tokio::test]
-    async fn terminal_pre_newline_creates_forced_empty_line() {
+    #[test]
+    fn terminal_pre_newline_creates_forced_empty_line() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1466,8 +1801,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn zero_advance_inline_box_edge_creates_line_with_owner_line_height() {
+    #[test]
+    fn zero_advance_inline_box_edge_is_an_invisible_line_box() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1481,11 +1816,36 @@ mod tests {
         let sequence = builder.collect_inline_line_sequence(items, &style, 100.0, 0.0, 0.0);
 
         assert_eq!(sequence.records.len(), 1);
-        assert!((sequence.total_height() - 100.0).abs() < 0.01);
+        assert!(sequence.total_height().abs() < 0.01);
     }
 
-    #[tokio::test]
-    async fn inline_line_sequence_fitting_applies_orphans_and_widows() {
+    #[test]
+    fn inline_box_block_margins_do_not_expand_line_height() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 20.0;
+        style.margin.top = 30.0;
+        style.margin.bottom = 30.0;
+
+        let sequence = builder.collect_inline_line_sequence(
+            vec![inline_box_edge(5.0, &style), inline_word("x", &style)],
+            &style,
+            100.0,
+            0.0,
+            0.0,
+        );
+
+        assert_eq!(sequence.records.len(), 1);
+        assert!((sequence.total_height() - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_line_sequence_fitting_applies_orphans_and_widows() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1515,8 +1875,8 @@ mod tests {
         assert_eq!(sequence.fitting_line_count(0, 5.0, true, 2, 2), 1);
     }
 
-    #[tokio::test]
-    async fn inline_line_sequence_flags_are_paragraph_local() {
+    #[test]
+    fn inline_line_sequence_flags_are_paragraph_local() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1544,8 +1904,8 @@ mod tests {
         assert!(sequence.records[1].is_last_line_in_paragraph);
     }
 
-    #[tokio::test]
-    async fn inline_line_sequence_shares_paragraph_last_hanging_width() {
+    #[test]
+    fn inline_line_sequence_shares_paragraph_last_hanging_width() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1570,8 +1930,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn inline_line_sequence_keeps_plaintext_bidi_logical_text() {
+    #[test]
+    fn inline_line_sequence_keeps_plaintext_bidi_logical_text() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1589,8 +1949,8 @@ mod tests {
         assert_eq!(fragment.text(), "אבג");
     }
 
-    #[tokio::test]
-    async fn inline_box_padding_breaks_boundary_shaping() {
+    #[test]
+    fn inline_box_padding_breaks_boundary_shaping() {
         let mut left_style = ComputedStyle::initial();
         left_style.display = Display::BLOCK;
         left_style.padding.left = 10.0;
@@ -1604,8 +1964,8 @@ mod tests {
         assert!(!can_shape_inline_fragments_together(&left, &right));
     }
 
-    #[tokio::test]
-    async fn inline_box_margin_breaks_boundary_shaping() {
+    #[test]
+    fn inline_box_margin_breaks_boundary_shaping() {
         let left = inline_fragment("ع", ComputedStyle::initial());
         let mut right = left.clone();
 
@@ -1615,8 +1975,29 @@ mod tests {
         assert!(!can_shape_inline_fragments_together(&left, &right));
     }
 
-    #[tokio::test]
-    async fn inline_box_used_border_breaks_boundary_shaping() {
+    #[test]
+    fn inline_box_block_axis_edges_do_not_break_boundary_shaping() {
+        let left = inline_fragment("ع", ComputedStyle::initial());
+        let mut right = left.clone();
+
+        right.style_mut().margin.top = 1.0;
+        right.style_mut().padding.bottom = 1.0;
+        right.style_mut().border_widths.top = 1.0;
+        right.style_mut().border_styles.top = BorderStyle::Solid;
+        assert!(can_shape_inline_fragments_together(&left, &right));
+
+        let mut vertical_left = inline_fragment("ع", ComputedStyle::initial());
+        vertical_left.style_mut().writing_mode = WritingMode::VerticalRl;
+        let mut vertical_right = vertical_left.clone();
+        vertical_right.style_mut().margin.top = 1.0;
+        assert!(!can_shape_inline_fragments_together(
+            &vertical_left,
+            &vertical_right
+        ));
+    }
+
+    #[test]
+    fn inline_box_used_border_breaks_boundary_shaping() {
         let left = inline_fragment("ع", ComputedStyle::initial());
         let mut right = left.clone();
         right.style_mut().border_widths.left = 1.0;
@@ -1628,8 +2009,8 @@ mod tests {
         assert!(!can_shape_inline_fragments_together(&left, &right));
     }
 
-    #[tokio::test]
-    async fn font_style_change_does_not_break_boundary_shaping() {
+    #[test]
+    fn font_style_change_does_not_break_boundary_shaping() {
         let left = inline_fragment("ع", ComputedStyle::initial());
         let mut right = left.clone();
         right.style_mut().font_style = css::FontStyle::Italic;
@@ -1637,8 +2018,8 @@ mod tests {
         assert!(can_shape_inline_fragments_together(&left, &right));
     }
 
-    #[tokio::test]
-    async fn tatweel_only_inline_fragments_preserve_shaping_group() {
+    #[test]
+    fn tatweel_only_inline_fragments_preserve_shaping_group() {
         let left = inline_fragment("\u{0640}", ComputedStyle::initial());
         let mut right = left.clone();
         right.set_text("ب");
@@ -1649,8 +2030,8 @@ mod tests {
         assert!(can_queue_inline_fragments_for_shaping(&left, &right));
     }
 
-    #[tokio::test]
-    async fn direction_change_alone_does_not_break_boundary_shaping() {
+    #[test]
+    fn direction_change_alone_does_not_break_boundary_shaping() {
         let mut left_style = ComputedStyle::initial();
         left_style.direction = Direction::Rtl;
         let left = inline_fragment("ع", left_style);
@@ -1663,8 +2044,8 @@ mod tests {
         assert!(!can_shape_inline_fragments_together(&left, &right));
     }
 
-    #[tokio::test]
-    async fn table_cell_anonymous_inline_text_uses_baseline_vertical_align() {
+    #[test]
+    fn table_cell_anonymous_inline_text_uses_baseline_vertical_align() {
         let mut cell_style = ComputedStyle::initial();
         cell_style.display = Display::TABLE_CELL;
         cell_style.vertical_align =
@@ -1677,8 +2058,8 @@ mod tests {
         assert_eq!(normalized.unicode_bidi, css::UnicodeBidi::Normal);
     }
 
-    #[tokio::test]
-    async fn join_control_inline_fragments_do_not_break_boundary_shaping() {
+    #[test]
+    fn join_control_inline_fragments_do_not_break_boundary_shaping() {
         let mut left_style = ComputedStyle::initial();
         left_style.font_family = css::FontFamily::SansSerif;
         let left = inline_fragment("ع", left_style);
@@ -1696,8 +2077,8 @@ mod tests {
         assert!(!can_shape_inline_fragments_together(&left, &visible_right));
     }
 
-    #[tokio::test]
-    async fn prepared_inline_text_group_preserves_shaped_runs() {
+    #[test]
+    fn prepared_inline_text_group_preserves_shaped_runs() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1717,7 +2098,7 @@ mod tests {
             .expect("text group should shape");
 
         assert_eq!(group.x(), 12.0);
-        assert_eq!(group.shaped.text, "AB");
+        assert_eq!(group.shaped.text.as_ref(), "AB");
         assert!(group.shaped.first_font_id().is_some());
         assert!((group.width() - group.shaped.advance_width()).abs() < 0.01);
         assert!(
@@ -1730,8 +2111,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepared_inline_text_group_keeps_join_controls_out_of_paint() {
+    #[test]
+    fn prepared_inline_text_group_keeps_join_controls_out_of_paint() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1757,7 +2138,7 @@ mod tests {
                 .shaped
                 .rendered_runs()
                 .iter()
-                .flat_map(|run| run.glyphs.iter().flatten())
+                .flat_map(|run| run.glyphs.as_deref().unwrap_or_default())
                 .all(|glyph| !glyph.unicode.chars().any(character_is_join_control)),
             "{:?}",
             group.shaped
@@ -1777,7 +2158,8 @@ mod tests {
                     src: url("tests/resources/fonts/Scheherazade-Regular.woff");
                 }"#,
             )
-            .with_base_url(Some(std::path::PathBuf::from("."))),
+            .with_base_path(".")
+            .expect("current directory should be a valid file URL"),
         );
         let font_system = FontSystem::start_loading()
             .load_stylesheet_fonts(&[stylesheet])
@@ -1786,12 +2168,15 @@ mod tests {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
+        let iframe_documents = HashMap::new();
         let mut builder = LayoutBuilder::new(LayoutBuilderConfig {
             options: &options,
             stylesheets: &stylesheets,
             base_url: None,
             root_url: None,
             resource_cache: &resource_cache,
+            iframe_documents: &iframe_documents,
+            iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
             font_system,
@@ -1884,8 +2269,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepared_inline_line_splits_text_groups_at_atoms() {
+    #[test]
+    fn prepared_inline_line_splits_text_groups_at_atoms() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -1900,13 +2285,13 @@ mod tests {
             InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(InlineBoxEdgeFragment {
                 logical_edge: InlineLogicalEdge::End,
                 physical_side: PhysicalSide::Right,
+                positioning_containing_block_id: None,
                 advance: 10.0,
                 paint_extent: 10.0,
             })),
             style.clone(),
             None,
-            10.0,
-            0.0,
+            InlineSize::new(10.0, 0.0),
             0.0,
             0.0,
             None,
@@ -1987,8 +2372,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepared_split_inline_end_edge_keeps_border_paint_with_negative_margin() {
+    #[test]
+    fn prepared_split_inline_end_edge_keeps_border_paint_with_negative_margin() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -2005,6 +2390,7 @@ mod tests {
         let edge = InlineBoxEdgeFragment {
             logical_edge: InlineLogicalEdge::End,
             physical_side: PhysicalSide::Right,
+            positioning_containing_block_id: None,
             advance: 0.0,
             paint_extent: 150.0,
         };
@@ -2014,8 +2400,7 @@ mod tests {
                     InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)),
                     style.clone(),
                     None,
-                    edge.advance,
-                    style.line_height,
+                    InlineSize::new(edge.advance, style.line_height),
                     style.font_size,
                     0.0,
                     None,
@@ -2064,8 +2449,8 @@ mod tests {
         assert_eq!(edge_rect.height(), 150.0);
     }
 
-    #[tokio::test]
-    async fn sequence_materialization_preserves_internal_spaces_around_opaque_atoms() {
+    #[test]
+    fn sequence_materialization_preserves_internal_spaces_around_opaque_atoms() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -2100,8 +2485,8 @@ mod tests {
         assert_eq!(fragment_texts, vec!["A", " ", " ", "B"]);
     }
 
-    #[tokio::test]
-    async fn prepared_inline_line_emits_space_text_groups_around_opaque_atoms() {
+    #[test]
+    fn prepared_inline_line_emits_space_text_groups_around_opaque_atoms() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -2134,14 +2519,14 @@ mod tests {
         let groups = prepared_text_groups(&prepared);
 
         assert_eq!(groups.len(), 2, "{prepared:?}");
-        assert_eq!(groups[0].shaped.text, "A ");
-        assert_eq!(groups[1].shaped.text, " B");
+        assert_eq!(groups[0].shaped.text.as_ref(), "A ");
+        assert_eq!(groups[1].shaped.text.as_ref(), " B");
         assert!(groups[0].width() > builder.font_system.measure_text("A", &style));
         assert!(groups[1].width() > builder.font_system.measure_text("B", &style));
     }
 
-    #[tokio::test]
-    async fn prepared_inline_line_keeps_transparent_edge_spaces_in_text_context() {
+    #[test]
+    fn prepared_inline_line_keeps_transparent_edge_spaces_in_text_context() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -2173,7 +2558,7 @@ mod tests {
             .expect("transparent-edge line should prepare");
         let group_text = prepared_text_groups(&prepared)
             .into_iter()
-            .map(|group| group.shaped.text.as_str())
+            .map(|group| group.shaped.text.as_ref())
             .collect::<String>();
 
         assert_eq!(sequence.records[0].fragment.as_ref().unwrap().text(), "A B");
@@ -2214,8 +2599,8 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test]
-    async fn split_inline_after_block_paints_only_inline_end_edge() {
+    #[test]
+    fn split_inline_after_block_paints_only_inline_end_edge() {
         let root = dom::parse(
             r#"<!DOCTYPE html>
             <html><body><span><div>One</div>Two</span></body></html>"#,
@@ -2257,7 +2642,7 @@ mod tests {
             0.0,
             InlineVisualOffset::zero(),
             &anonymous.style,
-            anonymous.style.text_decoration,
+            anonymous.style.text_decoration.clone(),
             &mut items,
         );
 
@@ -2310,26 +2695,30 @@ mod tests {
         available_width: f32,
         style: &ComputedStyle,
     ) -> inline_layout::InlineLineRecord {
+        let fragment = inline_layout::InlineLineFragment::new(
+            items,
+            InlineLineMetrics {
+                width,
+                height: style.line_height,
+                baseline_offset: style.font_size,
+            },
+            HangingPunctuationWidths::default(),
+            0.0,
+            available_width,
+            false,
+            text,
+        );
+        let is_phantom = inline_layout::inline_line_fragment_is_phantom(&fragment);
         inline_layout::InlineLineRecord {
             paragraph_index: 0,
             block_line_index: 0,
             paragraph_line_index: 0,
-            fragment: Some(inline_layout::InlineLineFragment::new(
-                items,
-                InlineLineMetrics {
-                    width,
-                    height: style.line_height,
-                    baseline_offset: style.font_size,
-                },
-                HangingPunctuationWidths::default(),
-                0.0,
-                available_width,
-                false,
-                text,
-            )),
+            fragment: Some(fragment),
+            is_phantom,
             is_first_formatted_line: true,
             is_last_line_in_paragraph: true,
             is_forced_empty: false,
+            starts_after_preserved_segment_break: false,
             clear_after: Clear::None,
             block_start_trim: 0.0,
             block_end_trim: 0.0,
@@ -2478,8 +2867,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepared_inline_line_record_unifies_split_and_unsplit_text() {
+    #[test]
+    fn prepared_inline_line_record_unifies_split_and_unsplit_text() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -2530,14 +2919,14 @@ mod tests {
 
         let whole_group = prepared_text_groups(&whole_prepared)[0];
         let split_group = prepared_text_groups(&split_prepared)[0];
-        assert_eq!(whole_group.shaped.text, "A B");
-        assert_eq!(split_group.shaped.text, "A B");
+        assert_eq!(whole_group.shaped.text.as_ref(), "A B");
+        assert_eq!(split_group.shaped.text.as_ref(), "A B");
         assert!((whole_group.x() - split_group.x()).abs() < 0.01);
         assert!((whole_group.width() - split_group.width()).abs() < 0.01);
     }
 
-    #[tokio::test]
-    async fn prepared_justified_line_uses_boundary_shaped_width_for_expansion() {
+    #[test]
+    fn prepared_justified_line_uses_boundary_shaped_width_for_expansion() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -2588,7 +2977,7 @@ mod tests {
             .expect("justified line should prepare");
 
         let group = prepared_text_groups(&prepared)[0];
-        assert_eq!(group.shaped.text, text);
+        assert_eq!(group.shaped.text.as_ref(), text);
         assert!(
             (group.width() - 120.0).abs() < 0.01,
             "justification should fill from painted text width, got {}",
@@ -2596,8 +2985,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepared_inline_line_record_excludes_trailing_tracking_once() {
+    #[test]
+    fn prepared_inline_line_record_excludes_trailing_tracking_once() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -2617,7 +3006,7 @@ mod tests {
                 shaped: None,
             }],
             "AB",
-            measured_width - style.used_letter_spacing(),
+            measured_width - style.used_letter_spacing().points(),
             100.0,
             &style,
         );
@@ -2632,12 +3021,14 @@ mod tests {
 
         let background = prepared_fragment_backgrounds(&prepared)[0];
         assert!(
-            (background.rect.width() - (measured_width - style.used_letter_spacing())).abs() < 0.01
+            (background.rect.width() - (measured_width - style.used_letter_spacing().points()))
+                .abs()
+                < 0.01
         );
     }
 
-    #[tokio::test]
-    async fn prepared_inline_fragment_background_uses_font_content_area() {
+    #[test]
+    fn prepared_inline_fragment_background_uses_font_content_area() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -2715,8 +3106,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn rtl_inline_border_backgrounds_expand_away_from_text_content() {
+    #[test]
+    fn rtl_inline_border_backgrounds_expand_away_from_text_content() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -2842,7 +3233,7 @@ mod tests {
               </div>
             </body>"#,
         )
-        .render_async(&RenderOptions::default())
+        .render(&RenderOptions::default())
         .await
         .expect("RTL nested inline document should render");
 
@@ -2887,8 +3278,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepared_inline_line_record_vertical_indent_moves_logical_inline_start() {
+    #[test]
+    fn prepared_inline_line_record_vertical_indent_moves_logical_inline_start() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -2935,8 +3326,103 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn vertical_writing_positions_cjk_upright_and_latin_sideways() {
+    #[test]
+    fn initial_containing_block_uses_document_root_writing_mode() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        // The initial containing block follows the document's principal flow,
+        // which may differ from the document-root style when an HTML body
+        // supplies its writing mode.
+        builder.initial_containing_block_writing_mode = WritingMode::VerticalRl;
+
+        let available = builder.page_child_available_space();
+
+        assert_eq!(available.writing_mode, WritingMode::VerticalRl);
+        assert_eq!(
+            available.logical_inline_size_for(WritingMode::VerticalRl),
+            LogicalInlineContentSize::new(content_box_pt(builder.page_area_height()))
+        );
+    }
+
+    #[test]
+    fn html_body_principal_flow_supplies_initial_containing_block_axes() {
+        let root = dom::parse("<html><body>content</body></html>");
+        let author = css::parse_stylesheet(&crate::css::Css::from_string(
+            "body { writing-mode: vertical-rl; direction: rtl }",
+        ));
+        let stylesheets = vec![css::html5_user_agent_stylesheet(), author];
+        let parent_style = ComputedStyle::initial();
+        let root_style = document_root_style(&root, &stylesheets, &parent_style);
+
+        assert_eq!(root_style.writing_mode, WritingMode::HorizontalTb);
+        assert_eq!(
+            super::super::split_1::document_principal_flow(
+                &root,
+                &stylesheets,
+                &parent_style,
+                &root_style,
+            ),
+            super::super::split_1::DocumentPrincipalFlow {
+                writing_mode: WritingMode::VerticalRl,
+                direction: Direction::Rtl,
+            }
+        );
+    }
+
+    #[test]
+    fn principal_flow_axes_apply_to_the_html_principal_box() {
+        let root = dom::parse("<html><body>content</body></html>");
+        let author = css::parse_stylesheet(&crate::css::Css::from_string(
+            "body { writing-mode: vertical-lr; direction: rtl }",
+        ));
+        let stylesheets = vec![css::html5_user_agent_stylesheet(), author];
+        let parent_style = ComputedStyle::initial();
+        let root_style = document_root_style(&root, &stylesheets, &parent_style);
+        let principal_flow = super::super::split_1::document_principal_flow(
+            &root,
+            &stylesheets,
+            &parent_style,
+            &root_style,
+        );
+        let page = box_tree::build_page_box_with_principal_flow(
+            &root,
+            &stylesheets,
+            &parent_style,
+            principal_flow,
+        );
+        let (_, _, html_style, _) = page.children[0]
+            .element_parts()
+            .expect("HTML root should generate a principal box");
+
+        assert_eq!(html_style.writing_mode, WritingMode::VerticalLr);
+        assert_eq!(html_style.direction, Direction::Rtl);
+    }
+
+    #[test]
+    fn root_property_containment_blocks_body_principal_flow_propagation() {
+        let root = dom::parse("<html><body>content</body></html>");
+        let author = css::parse_stylesheet(&crate::css::Css::from_string(
+            "html { contain: paint } body { writing-mode: vertical-rl; direction: rtl }",
+        ));
+        let stylesheets = vec![css::html5_user_agent_stylesheet(), author];
+        let parent_style = ComputedStyle::initial();
+        let root_style = document_root_style(&root, &stylesheets, &parent_style);
+
+        assert_eq!(
+            super::super::split_1::document_principal_flow(
+                &root,
+                &stylesheets,
+                &parent_style,
+                &root_style,
+            ),
+            super::super::split_1::DocumentPrincipalFlow::from_style(&root_style)
+        );
+    }
+
+    #[test]
+    fn vertical_writing_positions_cjk_upright_and_latin_sideways() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -2970,8 +3456,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn vertical_mixed_orientation_uses_unicode_vertical_orientation() {
+    #[test]
+    fn vertical_mixed_orientation_uses_unicode_vertical_orientation() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3002,8 +3488,8 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
-    async fn horizontal_writing_ignores_text_orientation_for_run_matrices() {
+    #[test]
+    fn horizontal_writing_ignores_text_orientation_for_run_matrices() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3026,8 +3512,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn vertical_text_orientation_upright_keeps_text_units_upright() {
+    #[test]
+    fn vertical_text_orientation_upright_keeps_text_units_upright() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3054,8 +3540,8 @@ mod tests {
         assert!(runs.iter().any(|run| run.text.contains('中')));
     }
 
-    #[tokio::test]
-    async fn vertical_text_orientation_sideways_rotates_all_text_units() {
+    #[test]
+    fn vertical_text_orientation_sideways_rotates_all_text_units() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3082,8 +3568,52 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepared_inline_line_record_inter_character_preserves_fragment_metadata() {
+    #[test]
+    fn sideways_writing_modes_ignore_text_orientation_and_use_their_own_rotation() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+
+        for (writing_mode, direction, matrix) in [
+            (
+                WritingMode::SidewaysRl,
+                Direction::Rtl,
+                RenderedTextMatrix::ROTATE_CW,
+            ),
+            (
+                WritingMode::SidewaysLr,
+                Direction::Ltr,
+                RenderedTextMatrix::ROTATE_CCW,
+            ),
+        ] {
+            let mut style = ComputedStyle::initial();
+            style.font_family = css::FontFamily::SansSerif;
+            style.font_size = 16.0;
+            style.line_height = 20.0;
+            style.writing_mode = writing_mode;
+            style.direction = direction;
+            style.text_orientation = TextOrientation::Upright;
+
+            let shaped = builder
+                .font_system
+                .shape_unwrapped_line("A中", &style, style.line_height)
+                .expect("sideways text should shape");
+            let runs = text_paint::positioned_rendered_runs_for_writing_mode(&shaped, &style);
+
+            assert!(runs.iter().any(|run| run.text.contains('A')));
+            assert!(runs.iter().any(|run| run.text.contains('中')));
+            assert!(
+                runs.iter()
+                    .filter(|run| !run.text.is_empty())
+                    .all(|run| run.text_matrix == matrix),
+                "{writing_mode:?} must ignore text-orientation"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_inline_line_record_inter_character_preserves_fragment_metadata() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3135,8 +3665,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepared_inline_line_record_inter_character_avoids_joining_sequences() {
+    #[test]
+    fn prepared_inline_line_record_inter_character_avoids_joining_sequences() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3178,8 +3708,8 @@ mod tests {
         assert!(groups[0].width() < 80.0);
     }
 
-    #[tokio::test]
-    async fn prepared_inline_line_record_inter_character_blocks_atom_boundaries() {
+    #[test]
+    fn prepared_inline_line_record_inter_character_expands_around_atomic_inline_runs() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3197,7 +3727,19 @@ mod tests {
         let right_width = builder.font_system.measure_text("B", &style);
         let atom_width = 10.0;
         let line_left = builder.content_left;
-        let record = inline_line_record_for_items(
+        let atom = || {
+            InlineLineItem::Atom(InlineAtom::new(
+                InlineAtomContent::Canvas,
+                style.clone(),
+                None,
+                InlineSize::new(atom_width, 10.0),
+                8.0,
+                0.0,
+                None,
+                None,
+            ))
+        };
+        let single_atom_record = inline_line_record_for_items(
             vec![
                 inline_layout::MeasuredInlineItem {
                     item: InlineLineItem::Fragment(inline_fragment("A", style.clone())),
@@ -3205,17 +3747,7 @@ mod tests {
                     shaped: None,
                 },
                 inline_layout::MeasuredInlineItem {
-                    item: InlineLineItem::Atom(InlineAtom::new(
-                        InlineAtomContent::Canvas,
-                        style.clone(),
-                        None,
-                        atom_width,
-                        10.0,
-                        8.0,
-                        0.0,
-                        None,
-                        None,
-                    )),
+                    item: atom(),
                     width: atom_width,
                     shaped: None,
                 },
@@ -3231,15 +3763,15 @@ mod tests {
             &style,
         );
         let mut plaintext_state = None;
-        let prepared = builder
+        let single_atom_prepared = builder
             .prepare_inline_line_record(
-                &record,
+                &single_atom_record,
                 inline_paragraph_context(&style, 200.0),
                 &mut plaintext_state,
             )
             .expect("mixed inter-character line should prepare");
 
-        let atom_x = prepared
+        let atom_x = single_atom_prepared
             .paint_items
             .iter()
             .find_map(|item| match item {
@@ -3247,14 +3779,70 @@ mod tests {
                 _ => None,
             })
             .expect("atom should be prepared");
+        let single_extra = (200.0 - left_width - atom_width - right_width) / 2.0;
         assert!(
-            (atom_x - (line_left + left_width)).abs() < 0.01,
-            "inter-character justification must not expand across opaque atom boundaries"
+            (atom_x - (line_left + left_width + single_extra)).abs() < 0.5,
+            "inter-character justification should expand before an atomic inline: atom_x={atom_x}, extra={single_extra}"
+        );
+
+        let two_atom_record = inline_line_record_for_items(
+            vec![
+                inline_layout::MeasuredInlineItem {
+                    item: InlineLineItem::Fragment(inline_fragment("A", style.clone())),
+                    width: left_width,
+                    shaped: None,
+                },
+                inline_layout::MeasuredInlineItem {
+                    item: atom(),
+                    width: atom_width,
+                    shaped: None,
+                },
+                inline_layout::MeasuredInlineItem {
+                    item: atom(),
+                    width: atom_width,
+                    shaped: None,
+                },
+                inline_layout::MeasuredInlineItem {
+                    item: InlineLineItem::Fragment(inline_fragment("B", style.clone())),
+                    width: right_width,
+                    shaped: None,
+                },
+            ],
+            "AB",
+            left_width + atom_width * 2.0 + right_width,
+            200.0,
+            &style,
+        );
+        let two_atom_prepared = builder
+            .prepare_inline_line_record(
+                &two_atom_record,
+                inline_paragraph_context(&style, 200.0),
+                &mut plaintext_state,
+            )
+            .expect("mixed inter-character line with atom run should prepare");
+
+        let atom_xs = two_atom_prepared
+            .paint_items
+            .iter()
+            .filter_map(|item| match item {
+                PreparedInlinePaintItem::Atom(atom) => Some(atom.content_rect.x()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(atom_xs.len(), 2, "{two_atom_prepared:?}");
+        let two_atom_extra = (200.0 - left_width - atom_width * 2.0 - right_width) / 2.0;
+        assert!(
+            (atom_xs[0] - (line_left + left_width + two_atom_extra)).abs() < 0.5,
+            "inter-character justification should expand before the atomic inline run: atoms={atom_xs:?}, extra={two_atom_extra}"
+        );
+        assert!(
+            (atom_xs[1] - atom_xs[0] - atom_width).abs() < 0.01,
+            "consecutive atomic inlines must stay one typographic unit: atoms={atom_xs:?}"
         );
     }
 
-    #[tokio::test]
-    async fn prepared_inline_line_record_keeps_plaintext_alignment_paint_local() {
+    #[test]
+    fn prepared_inline_line_record_keeps_plaintext_alignment_paint_local() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3281,7 +3869,7 @@ mod tests {
             120.0,
             &style,
         );
-        let original_text = record.fragment.as_ref().unwrap().text.clone();
+        let original_text = Rc::clone(&record.fragment.as_ref().unwrap().text);
         let mut plaintext_state = None;
         let prepared = builder
             .prepare_inline_line_record(
@@ -3300,8 +3888,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn inline_text_measurement_splits_pre_line_paragraphs() {
+    #[test]
+    fn inline_text_measurement_splits_pre_line_paragraphs() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3343,8 +3931,8 @@ mod tests {
         assert!((measurement.contribution.max_content - first_line.max(gamma)).abs() < 0.01);
     }
 
-    #[tokio::test]
-    async fn intrinsic_inline_measurement_uses_sequence_for_forced_empty_lines() {
+    #[test]
+    fn intrinsic_inline_measurement_uses_sequence_for_forced_empty_lines() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3381,8 +3969,8 @@ mod tests {
         assert!((measurement.height() - 42.0).abs() < 0.01);
     }
 
-    #[tokio::test]
-    async fn raw_text_sequence_preserves_forced_empty_lines() {
+    #[test]
+    fn raw_text_sequence_preserves_forced_empty_lines() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3414,8 +4002,36 @@ mod tests {
         assert!((sequence.total_height() - 42.0).abs() < 0.01);
     }
 
-    #[tokio::test]
-    async fn inline_line_sequence_keeps_generated_like_forced_break_records() {
+    #[test]
+    fn break_spaces_terminal_segment_breaks_create_real_empty_line_records() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        style.white_space = WhiteSpace::BreakSpaces;
+
+        let sequence = builder.inline_line_sequence_for_raw_inline_text(
+            "\n\n    \n\n",
+            &style,
+            200.0,
+            0.0,
+            None,
+        );
+
+        assert_eq!(sequence.records.len(), 4);
+        assert!(sequence.records[0].is_forced_empty);
+        assert!(sequence.records[1].is_forced_empty);
+        assert_eq!(sequence_fragment_texts(&sequence)[2], "    ");
+        assert!(sequence.records[3].is_forced_empty);
+        assert!((sequence.total_height() - 56.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_line_sequence_keeps_generated_like_forced_break_records() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3442,8 +4058,8 @@ mod tests {
         assert!((sequence.total_height() - 42.0).abs() < 0.01);
     }
 
-    #[tokio::test]
-    async fn inline_line_sequence_resolves_generated_leaders_before_painting() {
+    #[test]
+    fn inline_line_sequence_resolves_generated_leaders_before_painting() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3493,8 +4109,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn inline_line_sequence_divides_multiple_generated_leaders() {
+    #[test]
+    fn inline_line_sequence_divides_multiple_generated_leaders() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3534,8 +4150,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn inline_line_sequence_drops_empty_generated_leaders() {
+    #[test]
+    fn inline_line_sequence_drops_empty_generated_leaders() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3562,8 +4178,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn generated_leader_fragments_are_not_justification_opportunities() {
+    #[test]
+    fn generated_leader_fragments_are_not_justification_opportunities() {
         let mut style = ComputedStyle::initial();
         style.font_family = css::FontFamily::Monospace;
         let normal_space = inline_fragment("   ", style);
@@ -3571,12 +4187,14 @@ mod tests {
         leader_space.set_mergeable(false);
         leader_space.set_generated_leader(true);
 
-        assert!(inline_fragment_is_inter_word_justification_space(
-            &normal_space
-        ));
-        assert!(!inline_fragment_is_inter_word_justification_space(
-            &leader_space
-        ));
+        assert_eq!(
+            inline_fragment_inter_word_justification_space_count(&normal_space),
+            3
+        );
+        assert_eq!(
+            inline_fragment_inter_word_justification_space_count(&leader_space),
+            0
+        );
         let plan = InlineJustificationPlan::for_line(
             &[InlineLineItem::Fragment(leader_space)],
             TextJustify::InterCharacter,
@@ -3585,8 +4203,85 @@ mod tests {
         assert_eq!(plan.expansion_opportunity_count(), 0);
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_records_break_spaces_before_atoms() {
+    #[test]
+    fn inter_word_justification_counts_no_break_spaces_inside_text_fragments() {
+        let style = ComputedStyle::initial();
+        let plan = InlineJustificationPlan::for_line(
+            &[InlineLineItem::Fragment(inline_fragment(
+                "A\u{00a0}B",
+                style,
+            ))],
+            TextJustify::InterWord,
+            true,
+        );
+
+        assert_eq!(plan.expansion_opportunity_count(), 1);
+    }
+
+    #[test]
+    fn preserved_tabs_disable_line_justification() {
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::PreWrap;
+        let tabbed = inline_fragment("a b\tc", style);
+        let plan = InlineJustificationPlan::for_line(
+            &[InlineLineItem::Fragment(tabbed)],
+            TextJustify::InterWord,
+            true,
+        );
+        assert_eq!(plan.mode, InlineJustificationMode::None);
+        assert_eq!(plan.expansion_opportunity_count(), 0);
+    }
+
+    #[test]
+    fn initial_letter_first_letter_is_graph_measured_without_inflating_line_height() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        style.line_height_value = css::ComputedLineHeight::from_points(14.0);
+        style.line_height_multiplier = None;
+        style.line_height_is_normal = false;
+        let mut first_letter = style.clone();
+        first_letter.initial_letter = css::InitialLetter::Specified { size: 3.0, sink: 3 };
+        style.first_letter_style = Some(Box::new(first_letter));
+
+        let graph = builder.build_inline_opportunity_graph([inline_word("Hello", &style)], &style);
+        let graph = builder.graph_with_first_letter_pseudo(&graph, &style);
+
+        let first = &graph.runs[0];
+        let second = &graph.runs[1];
+        let InlineLineItem::Fragment(first_fragment) = &first.item else {
+            panic!("first graph run should be a text fragment");
+        };
+        let InlineLineItem::Fragment(second_fragment) = &second.item else {
+            panic!("second graph run should be a text fragment");
+        };
+        assert_eq!(first_fragment.text(), "H");
+        assert_eq!(second_fragment.text(), "ello");
+        assert!(first_fragment.style().font_size > style.font_size * 2.0);
+        assert!(first_fragment.baseline_shift < -style.line_height);
+
+        let items = vec![
+            inline_layout::MeasuredInlineItem {
+                item: first.item.clone(),
+                width: first.width,
+                shaped: first.shaped.clone(),
+            },
+            inline_layout::MeasuredInlineItem {
+                item: second.item.clone(),
+                width: second.width,
+                shaped: second.shaped.clone(),
+            },
+        ];
+        let metrics = builder.mixed_inline_line_metrics(&items, &style, first.width + second.width);
+        assert!((metrics.height - style.line_height).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_opportunity_graph_records_break_spaces_before_atoms() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3604,7 +4299,7 @@ mod tests {
                 mergeable: true,
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
-                ancestor_inline_decorations: Vec::new(),
+                ancestor_inline_decorations: Vec::new().into(),
             })),
             InlineItem::Word(Box::new(InlineWord {
                 text: " ".to_string(),
@@ -3615,7 +4310,7 @@ mod tests {
                 mergeable: true,
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
-                ancestor_inline_decorations: Vec::new(),
+                ancestor_inline_decorations: Vec::new().into(),
             })),
             InlineItem::Atom(Box::new(InlineAtom::new(
                 InlineAtomContent::InlineBox {
@@ -3623,8 +4318,7 @@ mod tests {
                 },
                 style.clone(),
                 None,
-                5.0,
-                0.0,
+                InlineSize::new(5.0, 0.0),
                 0.0,
                 0.0,
                 None,
@@ -3639,7 +4333,7 @@ mod tests {
                 mergeable: true,
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
-                ancestor_inline_decorations: Vec::new(),
+                ancestor_inline_decorations: Vec::new().into(),
             })),
         ];
 
@@ -3653,8 +4347,8 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_preserves_float_marker_source_order_without_width() {
+    #[test]
+    fn inline_opportunity_graph_preserves_float_marker_source_order_without_width() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3683,8 +4377,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_intrinsic_contribution_uses_segments_and_atoms() {
+    #[test]
+    fn inline_opportunity_graph_intrinsic_contribution_uses_segments_and_atoms() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3703,7 +4397,7 @@ mod tests {
                 mergeable: true,
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
-                ancestor_inline_decorations: Vec::new(),
+                ancestor_inline_decorations: Vec::new().into(),
             })),
             InlineItem::Atom(Box::new(InlineAtom::new(
                 InlineAtomContent::InlineBox {
@@ -3711,8 +4405,7 @@ mod tests {
                 },
                 style.clone(),
                 None,
-                28.0,
-                0.0,
+                InlineSize::new(28.0, 0.0),
                 0.0,
                 0.0,
                 None,
@@ -3727,7 +4420,7 @@ mod tests {
                 mergeable: true,
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
-                ancestor_inline_decorations: Vec::new(),
+                ancestor_inline_decorations: Vec::new().into(),
             })),
         ];
 
@@ -3741,8 +4434,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_records_soft_hyphen_inside_text_run() {
+    #[test]
+    fn inline_opportunity_graph_records_soft_hyphen_inside_text_run() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3760,7 +4453,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         }))];
 
         let graph = builder.build_inline_opportunity_graph(&items, &style);
@@ -3774,8 +4467,8 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_records_zero_width_space_inside_text_run() {
+    #[test]
+    fn inline_opportunity_graph_records_zero_width_space_inside_text_run() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3793,7 +4486,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         }))];
 
         let graph = builder.build_inline_opportunity_graph(&items, &style);
@@ -3808,8 +4501,8 @@ mod tests {
         assert!(contribution.max_content > contribution.min_content);
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_materializes_soft_hyphen_visibility() {
+    #[test]
+    fn inline_opportunity_graph_materializes_soft_hyphen_visibility() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3823,7 +4516,7 @@ mod tests {
         let hyphen_break = graph
             .opportunities
             .iter()
-            .copied()
+            .cloned()
             .find(|opportunity| opportunity.soft_hyphen)
             .expect("soft hyphen should create a graph opportunity");
 
@@ -3850,8 +4543,8 @@ mod tests {
         assert_eq!(broken.text, "hyphen-");
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_materialization_strips_zero_width_space() {
+    #[test]
+    fn inline_opportunity_graph_materialization_strips_zero_width_space() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3878,8 +4571,8 @@ mod tests {
         assert!(materialized.content_width > 0.0);
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_materialization_trims_collapsed_trailing_space() {
+    #[test]
+    fn inline_opportunity_graph_materialization_trims_collapsed_trailing_space() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3902,12 +4595,12 @@ mod tests {
         );
 
         assert_eq!(materialized.text, "A");
-        assert!(materialized.trimmed_width > 0.0);
-        assert_eq!(materialized.items.len(), 1);
+        assert!(materialized.edge_effects.collapsed_end_trim_width > 0.0);
+        assert_eq!(materialized.items.len(), 2);
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_materialization_hangs_pre_wrap_spaces_only_at_break() {
+    #[test]
+    fn inline_opportunity_graph_materialization_hangs_pre_wrap_spaces_only_at_break() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3926,7 +4619,7 @@ mod tests {
         let space_break = graph
             .opportunities
             .iter()
-            .copied()
+            .cloned()
             .find(|opportunity| opportunity.hangs && opportunity.position.run_index == 2)
             .expect("pre-wrap trailing spaces should create a hanging break");
 
@@ -3949,13 +4642,234 @@ mod tests {
             &style,
         );
 
-        assert_eq!(broken.text, "A");
-        assert!(broken.hanging_space_width > 0.0);
+        // Phase II hanging changes the line advance, not its source items.
+        // The preserved spaces remain available to bidi, painting, extraction,
+        // and inline decoration processing.
+        assert_eq!(broken.text, "A   ");
+        assert!(broken.edge_effects.pre_wrap_hanging_width > 0.0);
+        assert_eq!(broken.edge_effects.source_effects.len(), 1);
+        assert_eq!(
+            broken.edge_effects.source_effects[0].kind,
+            inline_layout::InlineLineEdgeEffectKind::PreWrapHang
+        );
+        assert_eq!(broken.edge_effects.source_effects[0].item_index, 1);
+        assert_eq!(broken.edge_effects.source_effects[0].source_range, 0..3);
         assert_eq!(unbroken.text, "A   B");
+        assert_eq!(unbroken.edge_effects.pre_wrap_hanging_width, 0.0);
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_materialization_preserves_break_spaces() {
+    #[test]
+    fn pre_wrap_spaces_hang_before_an_unconditional_separator_at_a_forced_end() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut normal = ComputedStyle::initial();
+        normal.font_family = css::FontFamily::SansSerif;
+        normal.font_size = 12.0;
+        normal.line_height = 14.0;
+        let mut pre_wrap = normal.clone();
+        pre_wrap.white_space = WhiteSpace::PreWrap;
+        let graph = builder.build_inline_opportunity_graph(
+            &[
+                inline_word("X", &pre_wrap),
+                inline_word("  ", &pre_wrap),
+                inline_word("\u{3000}", &normal),
+            ],
+            &normal,
+        );
+
+        let materialized = graph.materialize_line(
+            inline_layout::InlineGraphRange {
+                start: graph.start_position(),
+                end: graph.end_position(),
+            },
+            None,
+            &mut builder.font_system,
+            &normal,
+        );
+
+        // The other-space separator hangs unconditionally, so the preceding
+        // preserved spaces are no longer immediately followed by the forced
+        // break.  They are excluded from fitting while their source items are
+        // retained for later paint and alignment processing.
+        assert!(materialized.edge_effects.pre_wrap_hanging_width > 0.0);
+    }
+
+    #[test]
+    fn mixed_pre_wrap_and_unicode_space_sequence_is_one_line_edge_effect() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        style.white_space = WhiteSpace::PreWrap;
+        let graph = builder.build_inline_opportunity_graph(
+            &[
+                inline_word("X", &style),
+                inline_word("\u{3000} \u{3000} \u{3000}", &style),
+            ],
+            &style,
+        );
+
+        let materialized = graph.materialize_line(
+            inline_layout::InlineGraphRange {
+                start: graph.start_position(),
+                end: graph.end_position(),
+            },
+            None,
+            &mut builder.font_system,
+            &style,
+        );
+
+        // CSS Text Phase II scans the whole selected whitespace sequence,
+        // including document spaces interleaved with U+3000, rather than
+        // trimming only the final homogeneous text run.
+        // <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
+        assert!(materialized.edge_effects.pre_wrap_hanging_width > 0.0);
+        assert!(materialized.edge_effects.hanging_space_separator_width > 0.0);
+        assert!(
+            materialized
+                .edge_effects
+                .source_effects
+                .iter()
+                .any(|effect| {
+                    effect.kind == inline_layout::InlineLineEdgeEffectKind::PreWrapHang
+                })
+        );
+        assert!(
+            materialized
+                .edge_effects
+                .source_effects
+                .iter()
+                .any(|effect| {
+                    effect.kind
+                        == inline_layout::InlineLineEdgeEffectKind::UnconditionalSeparatorHang
+                })
+        );
+        let x_width = builder.font_system.measure_text("X", &style);
+        assert!(
+            (materialized.content_width - x_width).abs() < 0.01,
+            "expected {x_width}, got {} (unconditional {}, pre-wrap {})",
+            materialized.content_width,
+            materialized.edge_effects.hanging_space_separator_width,
+            materialized.edge_effects.pre_wrap_hanging_width,
+        );
+    }
+
+    #[test]
+    fn legacy_hanging_sequence_owns_interleaved_collapsed_space_source() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        let graph = builder.build_inline_opportunity_graph(
+            &[
+                inline_word("X", &style),
+                inline_word("\u{3000}", &style),
+                inline_word(" ", &style),
+                inline_word("\u{3000}", &style),
+            ],
+            &style,
+        );
+
+        let materialized = graph.materialize_line(
+            inline_layout::InlineGraphRange {
+                start: graph.start_position(),
+                end: graph.end_position(),
+            },
+            None,
+            &mut builder.font_system,
+            &style,
+        );
+
+        assert!(materialized.edge_effects.hanging_space_separator_width > 0.0);
+        assert!(
+            materialized
+                .edge_effects
+                .source_effects
+                .iter()
+                .any(|effect| {
+                    effect.kind
+                        == inline_layout::InlineLineEdgeEffectKind::UnconditionalSeparatorHang
+                        && effect.source_range == (0..1)
+                })
+        );
+        assert!(
+            (materialized.content_width - builder.font_system.measure_text("X", &style)).abs()
+                < 0.01
+        );
+    }
+
+    #[test]
+    fn pre_wrap_trailing_spaces_do_not_expand_graph_min_content() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        style.white_space = WhiteSpace::PreWrap;
+        let x_only = builder.build_inline_opportunity_graph(&[inline_word("X", &style)], &style);
+        let with_trailing_spaces = builder.build_inline_opportunity_graph(
+            &[inline_word("X", &style), inline_word("   ", &style)],
+            &style,
+        );
+
+        let x_width = x_only
+            .intrinsic_contribution(&mut builder.font_system, &style)
+            .min_content;
+        let contribution =
+            with_trailing_spaces.intrinsic_contribution(&mut builder.font_system, &style);
+        assert!((contribution.min_content - x_width).abs() < 0.01);
+    }
+
+    #[test]
+    fn pre_wrap_terminal_tail_is_nonconstraining_but_remains_in_final_line_geometry() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        style.white_space = WhiteSpace::PreWrap;
+        let graph = builder.build_inline_opportunity_graph(
+            &[inline_word("X", &style), inline_word("   ", &style)],
+            &style,
+        );
+        let terminal_range = inline_layout::InlineGraphRange {
+            start: graph.start_position(),
+            end: graph.end_position(),
+        };
+
+        let candidate = graph
+            .borrowed_line_measurement_for_full_run_range(
+                terminal_range,
+                None,
+                &mut builder.font_system,
+            )
+            .expect("whole preserved run should have a borrowed measurement");
+        let materialized =
+            graph.materialize_line(terminal_range, None, &mut builder.font_system, &style);
+
+        assert!(candidate.content_width < materialized.content_width);
+        assert_eq!(materialized.edge_effects.pre_wrap_hanging_width, 0.0);
+        assert_eq!(materialized.text, "X   ");
+    }
+
+    #[test]
+    fn inline_opportunity_graph_materialization_preserves_break_spaces() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3980,11 +4894,70 @@ mod tests {
 
         assert_eq!(materialized.text, "A ");
         assert_eq!(materialized.items.len(), 2);
-        assert_eq!(materialized.trimmed_width, 0.0);
+        assert_eq!(materialized.edge_effects.collapsed_end_trim_width, 0.0);
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_materialization_preserves_metadata_after_control_stripping() {
+    #[test]
+    fn collapsed_line_end_spaces_trim_through_inline_box_edges() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        let graph = builder.build_inline_opportunity_graph(
+            &[
+                inline_word("A", &style),
+                inline_word(" ", &style),
+                inline_box_edge(5.0, &style),
+            ],
+            &style,
+        );
+
+        let materialized = graph.materialize_line(
+            inline_layout::InlineGraphRange {
+                start: graph.start_position(),
+                end: graph.end_position(),
+            },
+            None,
+            &mut builder.font_system,
+            &style,
+        );
+
+        // The graph retains the collapsed source item, while the used text
+        // summary represents the selected line after Phase II end trimming.
+        assert_eq!(materialized.text, "A");
+        assert_eq!(materialized.items.len(), 3);
+        assert!(materialized.edge_effects.collapsed_end_trim_width > 0.0);
+    }
+
+    #[test]
+    fn break_spaces_anywhere_adds_emergency_boundary_before_preserved_space_run() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        style.white_space = WhiteSpace::BreakSpaces;
+        style.overflow_wrap = css::OverflowWrap::Anywhere;
+        let items = vec![inline_word("X", &style), inline_word(" ", &style)];
+        let graph = builder.build_inline_opportunity_graph(&items, &style);
+
+        assert!(graph.opportunities.iter().any(|opportunity| {
+            opportunity.kind == inline_layout::InlineBreakKind::Emergency
+                && opportunity.emergency
+                && opportunity.position.run_index == 1
+                && opportunity.position.byte_offset == 0
+        }));
+    }
+
+    #[test]
+    fn inline_opportunity_graph_materialization_preserves_metadata_after_control_stripping() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -3998,14 +4971,14 @@ mod tests {
             style: inline_style(&style),
             baseline_shift: 2.0,
             visual_offset: InlineVisualOffset::zero(),
-            link_target: Some("https://example.test/".to_string()),
+            link_target: Some(Rc::from("https://example.test/")),
             mergeable: false,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges {
                 blocks_start: true,
                 blocks_end: true,
             },
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         }))];
         let graph = builder.build_inline_opportunity_graph(&items, &style);
 
@@ -4033,8 +5006,8 @@ mod tests {
         assert!(fragment.hanging_edges().blocks_end);
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_records_uax14_breaks_without_splitting_text_run() {
+    #[test]
+    fn inline_opportunity_graph_records_uax14_breaks_without_splitting_text_run() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -4052,7 +5025,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         }))];
 
         let graph = builder.build_inline_opportunity_graph(&items, &style);
@@ -4066,8 +5039,8 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_distinguishes_anywhere_from_break_word_min_content() {
+    #[test]
+    fn inline_opportunity_graph_distinguishes_anywhere_from_break_word_min_content() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -4086,7 +5059,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         }))];
 
         let anywhere_graph = builder.build_inline_opportunity_graph(&anywhere_items, &anywhere);
@@ -4111,7 +5084,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         }))];
 
         let break_word_graph =
@@ -4129,10 +5102,44 @@ mod tests {
             (break_word_contribution.max_content - break_word_contribution.min_content).abs()
                 < 0.01
         );
+
+        let mut legacy_word_break = break_word.clone();
+        legacy_word_break.word_break = css::WordBreak::BreakWord;
+        legacy_word_break.overflow_wrap = css::OverflowWrap::Normal;
+        let legacy_word_break_items = vec![InlineItem::Word(Box::new(InlineWord {
+            text: "abcdefgh".to_string(),
+            style: inline_style(&legacy_word_break),
+            baseline_shift: 0.0,
+            visual_offset: InlineVisualOffset::zero(),
+            link_target: None,
+            mergeable: true,
+            source: InlineTextSource::Normal,
+            hanging_edges: InlineHangingEdges::default(),
+            ancestor_inline_decorations: Vec::new().into(),
+        }))];
+        let legacy_word_break_graph =
+            builder.build_inline_opportunity_graph(&legacy_word_break_items, &legacy_word_break);
+        let legacy_word_break_contribution = legacy_word_break_graph
+            .intrinsic_contribution(&mut builder.font_system, &legacy_word_break);
+
+        assert!(
+            legacy_word_break_graph
+                .opportunities
+                .iter()
+                .any(|opportunity| {
+                    opportunity.kind == inline_layout::InlineBreakKind::Emergency
+                        && opportunity.position.run_index == 0
+                        && opportunity.position.byte_offset > 0
+                        && opportunity.min_content
+                })
+        );
+        assert!(
+            legacy_word_break_contribution.max_content > legacy_word_break_contribution.min_content
+        );
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_partial_run_materialization_preserves_fragment_metadata() {
+    #[test]
+    fn inline_opportunity_graph_partial_run_materialization_preserves_fragment_metadata() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -4147,20 +5154,20 @@ mod tests {
             style: inline_style(&style),
             baseline_shift: 3.0,
             visual_offset: InlineVisualOffset::zero(),
-            link_target: Some("https://example.test/".to_string()),
+            link_target: Some(Rc::from("https://example.test/")),
             mergeable: false,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges {
                 blocks_start: true,
                 blocks_end: true,
             },
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         }))];
         let graph = builder.build_inline_opportunity_graph(&items, &style);
         let opportunity = graph
             .opportunities
             .iter()
-            .copied()
+            .cloned()
             .find(|opportunity| {
                 opportunity.position.run_index == 0 && opportunity.position.byte_offset > 0
             })
@@ -4189,8 +5196,8 @@ mod tests {
         assert!(!fragment.hanging_edges().blocks_end);
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_breaks_across_transparent_box_edges() {
+    #[test]
+    fn inline_opportunity_graph_breaks_across_transparent_box_edges() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -4219,8 +5226,8 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_preserves_space_breaks_after_transparent_box_edges() {
+    #[test]
+    fn inline_opportunity_graph_preserves_space_breaks_after_transparent_box_edges() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -4243,8 +5250,8 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_keeps_real_atoms_atomic() {
+    #[test]
+    fn inline_opportunity_graph_keeps_real_atoms_atomic() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -4271,8 +5278,8 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_tracks_across_transparent_box_edges() {
+    #[test]
+    fn inline_opportunity_graph_tracks_across_transparent_box_edges() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -4296,8 +5303,8 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
-    async fn inline_opportunity_graph_materializes_ranges_with_transparent_box_edges() {
+    #[test]
+    fn inline_opportunity_graph_materializes_ranges_with_transparent_box_edges() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -4312,11 +5319,11 @@ mod tests {
                 style: inline_style(&style),
                 baseline_shift: 2.0,
                 visual_offset: InlineVisualOffset::zero(),
-                link_target: Some("https://example.test/".to_string()),
+                link_target: Some(Rc::from("https://example.test/")),
                 mergeable: false,
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
-                ancestor_inline_decorations: Vec::new(),
+                ancestor_inline_decorations: Vec::new().into(),
             })),
             inline_box_edge(2.0, &style),
             inline_word(" cd", &style),
@@ -4325,7 +5332,7 @@ mod tests {
         let opportunity = graph
             .opportunities
             .iter()
-            .copied()
+            .cloned()
             .find(|opportunity| {
                 opportunity.position.run_index == 2 && opportunity.position.byte_offset > 0
             })
@@ -4353,8 +5360,8 @@ mod tests {
         assert!(!fragment.mergeable());
     }
 
-    #[tokio::test]
-    async fn inline_line_fragment_preserves_graph_text_summary() {
+    #[test]
+    fn inline_line_fragment_preserves_graph_text_summary() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -4373,7 +5380,7 @@ mod tests {
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         }))];
         let graph = builder.build_inline_opportunity_graph(&items, &style);
         let context = InlineParagraphContext {
@@ -4385,15 +5392,58 @@ mod tests {
             hanging_punctuation_reserve: 0.0,
         };
 
-        let (lines, _) = builder.select_inline_lines_from_graph(&graph, context, 0, false);
+        let selected_lines = builder.select_inline_lines_from_graph(&graph, context, 0, false);
+        let lines = selected_lines.fragments;
 
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text(), "Hello");
         assert_eq!(lines[0].items().len(), 1);
     }
 
-    #[tokio::test]
-    async fn used_border_preserves_layout_width_but_hides_non_painting_sides() {
+    #[test]
+    fn selected_line_keeps_pre_wrap_space_separator_sequence_as_hanging_edge() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 16.0;
+        style.line_height = 20.0;
+        style.white_space = WhiteSpace::PreWrap;
+        let graph = builder.build_inline_opportunity_graph(
+            [
+                inline_word("ああ", &style),
+                inline_word("\u{3000}\u{3000} \u{3000} \u{3000}", &style),
+                inline_word("ああ", &style),
+            ],
+            &style,
+        );
+        let context = InlineParagraphContext {
+            block_style: &style,
+            stylesheets: &[],
+            available_width: graph.runs.iter().take(2).map(|run| run.width).sum::<f32>() + 0.5,
+            padding_left: 0.0,
+            hanging_indent: 0.0,
+            hanging_punctuation_reserve: 0.0,
+        };
+
+        let lines = builder
+            .select_inline_lines_from_graph(&graph, context, 0, false)
+            .fragments;
+
+        assert_eq!(
+            lines.len(),
+            2,
+            "selected lines: {:?}",
+            lines.iter().map(|line| line.text()).collect::<Vec<_>>()
+        );
+        assert_eq!(lines[0].text(), "ああ\u{3000}\u{3000} \u{3000} \u{3000}");
+        assert_eq!(lines[1].text(), "ああ");
+    }
+
+    #[test]
+    fn used_border_preserves_layout_width_but_hides_non_painting_sides() {
         let mut style = ComputedStyle::initial();
         style.border_widths.top = 4.0;
         style.border_widths.right = 3.0;
@@ -4415,8 +5465,8 @@ mod tests {
         assert!(!border.bottom.is_visible());
     }
 
-    #[tokio::test]
-    async fn gap_decoration_helper_paints_flex_row_and_column_rules() {
+    #[test]
+    fn gap_decoration_helper_paints_flex_row_and_column_rules() {
         let mut style = ComputedStyle::initial();
         style.visibility = Visibility::Visible;
         style.column_rule.widths =
@@ -4444,15 +5494,12 @@ mod tests {
             rows: vec![GapDecorationGutter::new(50.0, 80.0)],
         };
         let primitives = flex_gap_decoration_primitives_with_gutters(
-            &style, 0.0, 130.0, 230.0, 130.0, &items, &gutters,
+            &style,
+            GapDecorationContainer::new(0.0, 130.0, 230.0, 130.0),
+            &items,
+            &gutters,
         );
-        let strokes = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::Stroke(stroke) => Some(*stroke),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let strokes = solid_gap_rule_centerlines(&primitives);
 
         assert_eq!(strokes.len(), 3);
         assert!(
@@ -4470,8 +5517,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn gap_decoration_helper_splits_intersection_segments_with_overlap_join() {
+    #[test]
+    fn gap_decoration_helper_coalesces_overlap_join_segments() {
         let mut style = ComputedStyle::initial();
         style.visibility = Visibility::Visible;
         style.column_rule.widths =
@@ -4496,31 +5543,23 @@ mod tests {
             rows: vec![GapDecorationGutter::new(50.0, 80.0)],
         };
         let primitives = flex_gap_decoration_primitives_with_gutters(
-            &style, 0.0, 130.0, 150.0, 130.0, &items, &gutters,
+            &style,
+            GapDecorationContainer::new(0.0, 130.0, 150.0, 130.0),
+            &items,
+            &gutters,
         );
-        let strokes = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::Stroke(stroke) => Some(*stroke),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let strokes = solid_gap_rule_centerlines(&primitives);
 
-        assert_eq!(strokes.len(), 2);
+        assert_eq!(strokes.len(), 1);
         assert!(
             strokes.iter().any(|stroke| {
-                stroke.x1() == 75.0 && stroke.y1() == 130.0 && stroke.y2() == 62.0
+                stroke.x1() == 75.0 && stroke.y1() == 130.0 && stroke.y2() == 0.0
             })
-        );
-        assert!(
-            strokes
-                .iter()
-                .any(|stroke| { stroke.x1() == 75.0 && stroke.y1() == 68.0 && stroke.y2() == 0.0 })
         );
     }
 
-    #[tokio::test]
-    async fn gap_decoration_helper_paints_grid_empty_track_gutters() {
+    #[test]
+    fn gap_decoration_helper_paints_grid_empty_track_gutters() {
         let mut style = ComputedStyle::initial();
         style.visibility = Visibility::Visible;
         style.column_rule.widths =
@@ -4537,15 +5576,13 @@ mod tests {
             50.0,
         );
 
-        let primitives =
-            grid_gap_decoration_primitives(&style, 0.0, 50.0, 170.0, 50.0, &[], &gutters);
-        let strokes = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::Stroke(stroke) => Some(*stroke),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let primitives = grid_gap_decoration_primitives(
+            &style,
+            GapDecorationContainer::new(0.0, 50.0, 170.0, 50.0),
+            &[],
+            &gutters,
+        );
+        let strokes = solid_gap_rule_centerlines(&primitives);
 
         assert_eq!(strokes.len(), 2);
         assert!(
@@ -4560,8 +5597,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn gap_decoration_helper_uses_grid_area_spans_for_intersections() {
+    #[test]
+    fn gap_decoration_helper_coalesces_grid_area_span_intersections() {
         let mut style = ComputedStyle::initial();
         style.visibility = Visibility::Visible;
         style.column_rule.widths =
@@ -4577,11 +5614,11 @@ mod tests {
             rows: vec![GapDecorationGutter::with_grid_line(50.0, 80.0, Some(2))],
         };
         let items = [
-            GapDecorationItem::with_grid_area(
-                0.0,
-                0.0,
-                0.0,
-                0.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(0.0, 0.0),
+                    GapDecorationSize::new(0.0, 0.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 3,
@@ -4589,11 +5626,11 @@ mod tests {
                     column_end: 2,
                 },
             ),
-            GapDecorationItem::with_grid_area(
-                80.0,
-                0.0,
-                0.0,
-                0.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(80.0, 0.0),
+                    GapDecorationSize::new(0.0, 0.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 3,
@@ -4603,31 +5640,24 @@ mod tests {
             ),
         ];
 
-        let primitives =
-            grid_gap_decoration_primitives(&style, 0.0, 130.0, 150.0, 130.0, &items, &gutters);
-        let strokes = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::Stroke(stroke) => Some(*stroke),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let primitives = grid_gap_decoration_primitives(
+            &style,
+            GapDecorationContainer::new(0.0, 130.0, 150.0, 130.0),
+            &items,
+            &gutters,
+        );
+        let strokes = solid_gap_rule_centerlines(&primitives);
 
-        assert_eq!(strokes.len(), 2);
+        assert_eq!(strokes.len(), 1);
         assert!(
             strokes.iter().any(|stroke| {
-                stroke.x1() == 75.0 && stroke.y1() == 130.0 && stroke.y2() == 80.0
+                stroke.x1() == 75.0 && stroke.y1() == 130.0 && stroke.y2() == 0.0
             })
-        );
-        assert!(
-            strokes
-                .iter()
-                .any(|stroke| { stroke.x1() == 75.0 && stroke.y1() == 80.0 && stroke.y2() == 0.0 })
         );
     }
 
-    #[tokio::test]
-    async fn gap_decoration_helper_does_not_join_single_grid_item_span_as_flanking_items() {
+    #[test]
+    fn gap_decoration_helper_does_not_join_single_grid_item_span_as_flanking_items() {
         let mut style = ComputedStyle::initial();
         style.visibility = Visibility::Visible;
         style.column_rule.widths =
@@ -4642,11 +5672,11 @@ mod tests {
             columns: vec![GapDecorationGutter::with_grid_line(70.0, 80.0, Some(2))],
             rows: vec![GapDecorationGutter::with_grid_line(50.0, 80.0, Some(2))],
         };
-        let items = [GapDecorationItem::with_grid_area(
-            0.0,
-            0.0,
-            20.0,
-            20.0,
+        let items = [GapDecorationItem::from_rect_with_grid_area(
+            GapDecorationRect::new(
+                GapDecorationPoint::new(0.0, 0.0),
+                GapDecorationSize::new(20.0, 20.0),
+            ),
             GapDecorationGridArea {
                 row_start: 1,
                 row_end: 3,
@@ -4655,15 +5685,13 @@ mod tests {
             },
         )];
 
-        let primitives =
-            grid_gap_decoration_primitives(&style, 0.0, 130.0, 150.0, 130.0, &items, &gutters);
-        let strokes = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::Stroke(stroke) => Some(*stroke),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let primitives = grid_gap_decoration_primitives(
+            &style,
+            GapDecorationContainer::new(0.0, 130.0, 150.0, 130.0),
+            &items,
+            &gutters,
+        );
+        let strokes = solid_gap_rule_centerlines(&primitives);
 
         assert_eq!(strokes.len(), 2);
         assert!(
@@ -4680,8 +5708,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn gap_decoration_helper_uses_cap_endpoint_for_empty_grid_junction() {
+    #[test]
+    fn gap_decoration_helper_uses_cap_endpoint_for_empty_grid_junction() {
         let mut style = ComputedStyle::initial();
         style.visibility = Visibility::Visible;
         style.column_rule.widths =
@@ -4700,11 +5728,11 @@ mod tests {
             rows: vec![GapDecorationGutter::with_grid_line(50.0, 60.0, Some(2))],
         };
         let items = [
-            GapDecorationItem::with_grid_area(
-                0.0,
-                0.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(0.0, 0.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 2,
@@ -4712,11 +5740,11 @@ mod tests {
                     column_end: 2,
                 },
             ),
-            GapDecorationItem::with_grid_area(
-                60.0,
-                0.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(60.0, 0.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 2,
@@ -4726,15 +5754,13 @@ mod tests {
             ),
         ];
 
-        let primitives =
-            grid_gap_decoration_primitives(&style, 0.0, 110.0, 110.0, 110.0, &items, &gutters);
-        let strokes = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::Stroke(stroke) => Some(*stroke),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let primitives = grid_gap_decoration_primitives(
+            &style,
+            GapDecorationContainer::new(0.0, 110.0, 110.0, 110.0),
+            &items,
+            &gutters,
+        );
+        let strokes = solid_gap_rule_centerlines(&primitives);
 
         assert!(
             strokes.iter().any(|stroke| {
@@ -4744,8 +5770,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn gap_decoration_helper_uses_cap_endpoint_for_non_painting_crossing_rule() {
+    #[test]
+    fn gap_decoration_helper_uses_cap_endpoint_for_non_painting_crossing_rule() {
         let mut style = ComputedStyle::initial();
         style.visibility = Visibility::Visible;
         style.column_rule.widths =
@@ -4763,11 +5789,11 @@ mod tests {
             rows: vec![GapDecorationGutter::with_grid_line(50.0, 60.0, Some(2))],
         };
         let items = [
-            GapDecorationItem::with_grid_area(
-                0.0,
-                0.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(0.0, 0.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 2,
@@ -4775,11 +5801,11 @@ mod tests {
                     column_end: 2,
                 },
             ),
-            GapDecorationItem::with_grid_area(
-                60.0,
-                0.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(60.0, 0.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 2,
@@ -4787,11 +5813,11 @@ mod tests {
                     column_end: 3,
                 },
             ),
-            GapDecorationItem::with_grid_area(
-                0.0,
-                60.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(0.0, 60.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 2,
                     row_end: 3,
@@ -4799,11 +5825,11 @@ mod tests {
                     column_end: 2,
                 },
             ),
-            GapDecorationItem::with_grid_area(
-                60.0,
-                60.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(60.0, 60.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 2,
                     row_end: 3,
@@ -4813,15 +5839,13 @@ mod tests {
             ),
         ];
 
-        let primitives =
-            grid_gap_decoration_primitives(&style, 0.0, 110.0, 110.0, 110.0, &items, &gutters);
-        let strokes = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::Stroke(stroke) => Some(*stroke),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let primitives = grid_gap_decoration_primitives(
+            &style,
+            GapDecorationContainer::new(0.0, 110.0, 110.0, 110.0),
+            &items,
+            &gutters,
+        );
+        let strokes = solid_gap_rule_centerlines(&primitives);
 
         assert!(
             strokes.iter().any(|stroke| {
@@ -4831,8 +5855,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn gap_decoration_helper_uses_grid_area_spans_for_visibility_items() {
+    #[test]
+    fn gap_decoration_helper_uses_grid_area_spans_for_visibility_items() {
         let mut style = ComputedStyle::initial();
         style.visibility = Visibility::Visible;
         style.column_rule.widths =
@@ -4845,11 +5869,11 @@ mod tests {
             rows: Vec::new(),
         };
         let items = [
-            GapDecorationItem::with_grid_area(
-                0.0,
-                0.0,
-                0.0,
-                0.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(0.0, 0.0),
+                    GapDecorationSize::new(0.0, 0.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 2,
@@ -4857,11 +5881,11 @@ mod tests {
                     column_end: 2,
                 },
             ),
-            GapDecorationItem::with_grid_area(
-                60.0,
-                0.0,
-                0.0,
-                0.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(60.0, 0.0),
+                    GapDecorationSize::new(0.0, 0.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 2,
@@ -4871,15 +5895,13 @@ mod tests {
             ),
         ];
 
-        let primitives =
-            grid_gap_decoration_primitives(&style, 0.0, 50.0, 110.0, 50.0, &items, &gutters);
-        let strokes = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::Stroke(stroke) => Some(*stroke),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let primitives = grid_gap_decoration_primitives(
+            &style,
+            GapDecorationContainer::new(0.0, 50.0, 110.0, 50.0),
+            &items,
+            &gutters,
+        );
+        let strokes = solid_gap_rule_centerlines(&primitives);
 
         assert_eq!(strokes.len(), 1);
         assert!(
@@ -4893,8 +5915,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn gap_decoration_helper_grid_normal_joins_cross_intersections() {
+    #[test]
+    fn gap_decoration_helper_grid_normal_joins_cross_intersections() {
         let mut style = ComputedStyle::initial();
         style.visibility = Visibility::Visible;
         style.column_rule.widths =
@@ -4910,11 +5932,11 @@ mod tests {
             rows: vec![GapDecorationGutter::with_grid_line(50.0, 60.0, Some(2))],
         };
         let items = [
-            GapDecorationItem::with_grid_area(
-                0.0,
-                0.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(0.0, 0.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 2,
@@ -4922,11 +5944,11 @@ mod tests {
                     column_end: 2,
                 },
             ),
-            GapDecorationItem::with_grid_area(
-                60.0,
-                0.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(60.0, 0.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 2,
@@ -4934,11 +5956,11 @@ mod tests {
                     column_end: 3,
                 },
             ),
-            GapDecorationItem::with_grid_area(
-                0.0,
-                60.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(0.0, 60.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 2,
                     row_end: 3,
@@ -4946,11 +5968,11 @@ mod tests {
                     column_end: 2,
                 },
             ),
-            GapDecorationItem::with_grid_area(
-                60.0,
-                60.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(60.0, 60.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 2,
                     row_end: 3,
@@ -4960,38 +5982,30 @@ mod tests {
             ),
         ];
 
-        let primitives =
-            grid_gap_decoration_primitives(&style, 0.0, 110.0, 110.0, 110.0, &items, &gutters);
-        let strokes = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::Stroke(stroke) => Some(*stroke),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let primitives = grid_gap_decoration_primitives(
+            &style,
+            GapDecorationContainer::new(0.0, 110.0, 110.0, 110.0),
+            &items,
+            &gutters,
+        );
+        let strokes = solid_gap_rule_centerlines(&primitives);
         let column_strokes = strokes
             .iter()
-            .copied()
+            .cloned()
             .filter(|stroke| stroke.color == Color::new(255, 0, 0))
             .collect::<Vec<_>>();
 
-        assert_eq!(column_strokes.len(), 2);
+        assert_eq!(column_strokes.len(), 1);
         assert!(
             column_strokes.iter().any(|stroke| {
-                stroke.x1() == 55.0 && stroke.y1() == 110.0 && stroke.y2() == 60.0
+                stroke.x1() == 55.0 && stroke.y1() == 110.0 && stroke.y2() == 0.0
             }),
-            "first normal grid segment should end at the cross-intersection start: {column_strokes:?}"
-        );
-        assert!(
-            column_strokes
-                .iter()
-                .any(|stroke| { stroke.x1() == 55.0 && stroke.y1() == 60.0 && stroke.y2() == 0.0 }),
-            "second normal grid segment should resume at the same cross-intersection point: {column_strokes:?}"
+            "a solid normal grid rule should coalesce across a joined cross-intersection: {column_strokes:?}"
         );
     }
 
-    #[tokio::test]
-    async fn gap_decoration_helper_grid_normal_ignores_non_painting_crossing_rule() {
+    #[test]
+    fn gap_decoration_helper_grid_normal_ignores_non_painting_crossing_rule() {
         let mut style = ComputedStyle::initial();
         style.visibility = Visibility::Visible;
         style.column_rule.widths =
@@ -5006,11 +6020,11 @@ mod tests {
             rows: vec![GapDecorationGutter::with_grid_line(50.0, 60.0, Some(2))],
         };
         let items = [
-            GapDecorationItem::with_grid_area(
-                0.0,
-                0.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(0.0, 0.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 2,
@@ -5018,11 +6032,11 @@ mod tests {
                     column_end: 2,
                 },
             ),
-            GapDecorationItem::with_grid_area(
-                60.0,
-                0.0,
-                50.0,
-                50.0,
+            GapDecorationItem::from_rect_with_grid_area(
+                GapDecorationRect::new(
+                    GapDecorationPoint::new(60.0, 0.0),
+                    GapDecorationSize::new(50.0, 50.0),
+                ),
                 GapDecorationGridArea {
                     row_start: 1,
                     row_end: 2,
@@ -5032,15 +6046,13 @@ mod tests {
             ),
         ];
 
-        let primitives =
-            grid_gap_decoration_primitives(&style, 0.0, 110.0, 110.0, 110.0, &items, &gutters);
-        let strokes = primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                PaintPrimitive::Stroke(stroke) => Some(*stroke),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let primitives = grid_gap_decoration_primitives(
+            &style,
+            GapDecorationContainer::new(0.0, 110.0, 110.0, 110.0),
+            &items,
+            &gutters,
+        );
+        let strokes = solid_gap_rule_centerlines(&primitives);
 
         assert_eq!(strokes.len(), 1);
         assert!(

@@ -46,7 +46,7 @@ impl<'a> LayoutBuilder<'a> {
         let fragment = self
             .current_page
             .paint_fragment()
-            .translated(PaintVector::new(0.0, -top));
+            .translated(PaintTranslation::new(0.0, -top));
         let assignments = self.captured_current_page_assignment_values();
         let height = (top - self.cursor_y).max(0.0);
         self.restore_table_cell_content_scope(content_scope);
@@ -93,7 +93,7 @@ impl<'a> LayoutBuilder<'a> {
             cell_style,
             content_box,
             self.table_cell_child_ancestors(cell, row),
-            None,
+            PercentageBasis::indefinite(),
         );
 
         for child_plan in child_fragments {
@@ -286,7 +286,7 @@ impl<'a> LayoutBuilder<'a> {
         let translated = nested
             .fragment
             .clone()
-            .translated(PaintVector::new(x, child_plan.child_top));
+            .translated(PaintTranslation::new(x, child_plan.child_top));
         let bounds =
             PageTopRect::new(x, child_plan.child_top, nested.width, nested.height).paint_clip();
         let slice_clip = PaintClip::from_paint_rect(PaintRect::new(
@@ -304,7 +304,7 @@ impl<'a> LayoutBuilder<'a> {
         let fragment =
             PaintFragment::from_stacking_context_in_band(PaintBand::InFlowBlock, context);
         self.current_page
-            .append_paint_fragment(&fragment, PaintVector::new(0.0, 0.0));
+            .append_paint_fragment_owned(fragment, PaintTranslation::identity());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -322,23 +322,32 @@ impl<'a> LayoutBuilder<'a> {
         if matches!(style.position, Position::Absolute | Position::Fixed) {
             return;
         }
+        let mut used_style = self.style_with_current_used_lengths(style);
+        let containing_width = (self.content_right - self.content_left).max(0.0);
+        apply_used_box_metrics(
+            &mut used_style,
+            PercentageBasis::definite(layout_pt(containing_width)),
+        );
+        let style = &used_style;
         let paint_checkpoint = self.current_page.paint_checkpoint();
-        let outer_width = (self.content_right - self.content_left).max(0.0);
+        let outer_width = (containing_width - style.margin.left - style.margin.right).max(0.0);
         let border_box_top = child_top - style.margin.top;
         let border_box_height = (child_height - style.margin.top - style.margin.bottom).max(0.0);
+        let horizontal_non_content = non_content_pt(
+            style.padding.left + style.padding.right + horizontal_border_width(style),
+        );
+        let content_width =
+            used_content_box_width(style, layout_pt(outer_width), horizontal_non_content).points();
         let bounds = PageTopRect::new(
             self.content_left + style.margin.left,
             border_box_top,
-            outer_width - style.margin.left - style.margin.right,
+            content_width + horizontal_non_content.points(),
             border_box_height,
         )
         .paint_clip();
         if border_box_height > 0.0 && style.visibility == Visibility::Visible {
             for primitive in self.box_background_primitives(
-                bounds.x(),
-                bounds.y(),
-                bounds.width(),
-                bounds.height(),
+                paint_space_rect(bounds.x(), bounds.y(), bounds.width(), bounds.height()),
                 style,
             ) {
                 self.push_primitive_in_band(PaintBand::BackgroundBorder, primitive);
@@ -348,7 +357,7 @@ impl<'a> LayoutBuilder<'a> {
         let previous_right = self.content_right;
         let borders = used_border_widths(style);
         self.content_left += style.margin.left + borders.left + style.padding.left;
-        self.content_right -= style.margin.right + borders.right + style.padding.right;
+        self.content_right = self.content_left + content_width;
         let content_width = (self.content_right - self.content_left).max(1.0);
         if let Some(sequence) = self.table_cell_nested_inline_sequence_for_children(
             style,
@@ -356,6 +365,7 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             element.attrs.get("href").cloned(),
             content_width,
+            PercentageBasis::indefinite(),
         ) {
             let text_top = border_box_top - borders.top - style.padding.top;
             self.paint_table_cell_nested_inline_sequence_slice(
@@ -400,23 +410,21 @@ impl<'a> LayoutBuilder<'a> {
         )
         .paint_clip();
         for primitive in self.box_background_primitives(
-            bounds.x(),
-            bounds.y(),
-            bounds.width(),
-            bounds.height(),
+            paint_space_rect(bounds.x(), bounds.y(), bounds.width(), bounds.height()),
             style,
         ) {
             self.push_primitive_in_band(PaintBand::BackgroundBorder, primitive);
         }
 
-        if let Some((width, height, fill)) = svg_rect(element) {
+        if let Some(asset) = self.resource_cache.inline_svg_asset(element) {
+            let size = asset.intrinsic_size();
             let borders = used_border_widths(style);
             let x = self.content_left + style.margin.left + borders.left + style.padding.left;
             let y_top = border_box_top - borders.top - style.padding.top;
-            self.push_rect_in_band(
-                PaintBand::Inline,
-                PageTopRect::new(x, y_top, width, height).rendered_rect(Some(fill)),
-            );
+            let rect = PageTopRect::new(x, y_top, size.width, size.height).paint_rect();
+            for path in asset.paint_paths(rect) {
+                self.push_path_in_band(PaintBand::Inline, path);
+            }
         }
         self.scope_current_page_atomic_paint_since(
             &paint_checkpoint,
@@ -443,6 +451,7 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             None,
             available_width,
+            PercentageBasis::indefinite(),
         ) {
             self.paint_table_cell_nested_inline_sequence_slice(
                 &sequence,
@@ -455,7 +464,7 @@ impl<'a> LayoutBuilder<'a> {
             children,
             stylesheets,
             available_width,
-            None,
+            PercentageBasis::indefinite(),
             child_top,
             slice_top,
             slice_bottom,
@@ -476,6 +485,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout::table) fn table_body_fragment_structural_primitives(
         &mut self,
         rows: &[TableRow<'_>],
+        grid: &TableGrid,
         columns: &[TableColumn<'_>],
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
@@ -507,39 +517,80 @@ impl<'a> LayoutBuilder<'a> {
                 - vertical_edge_spacing
                 - table_width.padding.bottom
                 - table_width.border_widths.bottom;
-            backgrounds.push(PaintPrimitive::Rect(
-                PageTopRect::new(
-                    table_x - table_width.padding.left - table_width.border_widths.left,
-                    background_top,
-                    used_table_width
-                        + table_width.padding.left
-                        + table_width.padding.right
-                        + table_width.border_widths.left
-                        + table_width.border_widths.right,
-                    background_top - background_bottom,
-                )
-                .rendered_rect(Some(fill)),
-            ));
+            let border_rect = paint_space_rect(
+                table_x - table_width.padding.left - table_width.border_widths.left,
+                background_bottom,
+                used_table_width
+                    + table_width.padding.left
+                    + table_width.padding.right
+                    + table_width.border_widths.left
+                    + table_width.border_widths.right,
+                background_top - background_bottom,
+            );
+            let clip_rect = crate::layout::paint_helpers::background_rect_area_for_box(
+                border_rect,
+                table_style,
+                table_width.border_widths,
+                table_style.background_clip,
+            );
+            backgrounds.push(PaintPrimitive::Rect(RenderedRect::from_paint_rect(
+                clip_rect,
+                Some(fill),
+            )));
         }
         let fragment_rows = fragment.rows();
         let fragment_row_tops = fragment.row_tops();
         let fragment_row_heights = fragment.row_heights();
+        let grid_placement = fragment.grid_placement;
         for (start_column, end_column, column_group) in
             table_column_group_spans(columns, column_plan.column_count())
         {
             let column_group_style =
                 self.style_for_table_column_group(&column_group, table_style, stylesheets);
-            backgrounds.extend(table_column_fragment_background_primitives(
-                table_x,
-                top,
-                height,
-                column_plan,
-                start_column,
-                end_column,
-                &column_group_style,
-                &fragment_row_tops,
-                &fragment_row_heights,
-            ));
+            if let Some(placement) = grid_placement
+                && column_group_style.writing_mode.has_vertical_lines()
+            {
+                backgrounds.extend(table_column_grid_background_primitives(
+                    placement,
+                    column_plan,
+                    start_column,
+                    end_column,
+                    &column_group_style,
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                ));
+            } else {
+                backgrounds.extend(table_column_fragment_background_primitives(
+                    table_x,
+                    top,
+                    height,
+                    column_plan,
+                    Some(grid),
+                    &fragment_rows,
+                    start_column,
+                    end_column,
+                    &column_group_style,
+                    &fragment_row_tops,
+                    &fragment_row_heights,
+                ));
+                backgrounds.extend(table_column_fragment_background_image_primitives(
+                    table_x,
+                    top,
+                    height,
+                    column_plan,
+                    Some(grid),
+                    &fragment_rows,
+                    start_column,
+                    end_column,
+                    &column_group_style,
+                    &fragment_row_tops,
+                    &fragment_row_heights,
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                ));
+            }
         }
         let mut column_index = 0;
         for column in columns {
@@ -550,18 +601,65 @@ impl<'a> LayoutBuilder<'a> {
                 .span
                 .min(column_plan.column_count() - column_index)
                 .max(1);
+            // A `colgroup` without explicit `col` children is represented by
+            // one synthetic column carrying the group's style. The group was
+            // already painted above, so replaying that synthetic column would
+            // alpha-composite the same structural background twice. Explicit
+            // columns remain independent background layers.
+            // <https://www.w3.org/TR/css-tables-3/#drawing-backgrounds>
+            let is_group_placeholder = column
+                .group
+                .as_ref()
+                .is_some_and(|group| group.signature == column.signature);
+            if is_group_placeholder {
+                column_index += span;
+                continue;
+            }
             let column_style = self.style_for_table_column(column, table_style, stylesheets);
-            backgrounds.extend(table_column_fragment_background_primitives(
-                table_x,
-                top,
-                height,
-                column_plan,
-                column_index,
-                column_index + span,
-                &column_style,
-                &fragment_row_tops,
-                &fragment_row_heights,
-            ));
+            if let Some(placement) = grid_placement
+                && column_style.writing_mode.has_vertical_lines()
+            {
+                backgrounds.extend(table_column_grid_background_primitives(
+                    placement,
+                    column_plan,
+                    column_index,
+                    column_index + span,
+                    &column_style,
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                ));
+            } else {
+                backgrounds.extend(table_column_fragment_background_primitives(
+                    table_x,
+                    top,
+                    height,
+                    column_plan,
+                    Some(grid),
+                    &fragment_rows,
+                    column_index,
+                    column_index + span,
+                    &column_style,
+                    &fragment_row_tops,
+                    &fragment_row_heights,
+                ));
+                backgrounds.extend(table_column_fragment_background_image_primitives(
+                    table_x,
+                    top,
+                    height,
+                    column_plan,
+                    Some(grid),
+                    &fragment_rows,
+                    column_index,
+                    column_index + span,
+                    &column_style,
+                    &fragment_row_tops,
+                    &fragment_row_heights,
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                ));
+            }
             column_index += span;
         }
 
@@ -577,7 +675,7 @@ impl<'a> LayoutBuilder<'a> {
             if let Some(fill) = row_group_style.background_color {
                 let mut segment_start = None;
                 let mut previous_local = None;
-                for (local_row, original_row) in fragment_rows.iter().copied().enumerate() {
+                for (local_row, original_row) in fragment_rows.iter().cloned().enumerate() {
                     if original_row >= start_row && original_row < end_row {
                         if segment_start.is_none() {
                             segment_start = Some(local_row);
@@ -626,19 +724,30 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
 
-        for (local_row, original_row) in fragment_rows.iter().copied().enumerate() {
+        for (local_row, original_row) in fragment_rows.iter().cloned().enumerate() {
             let row_style = self.style_for_table_row(&rows[original_row], table_style, stylesheets);
-            if let Some(fill) = row_style.background_color {
-                push_table_fragment_row_span_background(
-                    &mut backgrounds,
-                    occupied_x,
-                    occupied_width,
+            if let Some(bounds) = table_fragment_row_span_bounds(
+                occupied_x,
+                occupied_width,
+                &fragment_row_tops,
+                &fragment_row_heights,
+                local_row,
+                local_row + 1,
+            ) {
+                backgrounds.extend(table_row_fragment_background_primitives(
+                    table_x,
+                    bounds.paint_rect(),
+                    column_plan,
+                    grid,
+                    &fragment_rows,
                     &fragment_row_tops,
                     &fragment_row_heights,
-                    local_row,
-                    local_row + 1,
-                    fill,
-                );
+                    original_row,
+                    &row_style,
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                ));
             }
         }
         (backgrounds, outlines)
@@ -659,7 +768,7 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let mut segment_start = None;
         let mut previous_local = None;
-        for (local_row, original_row) in rows.iter().copied().enumerate() {
+        for (local_row, original_row) in rows.iter().cloned().enumerate() {
             if original_row >= start_row && original_row < end_row {
                 if segment_start.is_none() {
                     segment_start = Some(local_row);
@@ -715,10 +824,7 @@ impl<'a> LayoutBuilder<'a> {
             return;
         };
         primitives.extend(self.box_outline_primitives(
-            bounds.x(),
-            bounds.y(),
-            bounds.width(),
-            bounds.height(),
+            paint_space_rect(bounds.x(), bounds.y(), bounds.width(), bounds.height()),
             row_group_style,
         ));
     }
@@ -769,9 +875,12 @@ impl<'a> LayoutBuilder<'a> {
     ) -> f32 {
         let row = &context.rows[row_index];
         let placements = &context.grid.rows[row_index];
-        let mut row_height: f32 =
-            used_length_percentage_or_auto_with_optional_basis(row_style.box_values.height, None)
-                .unwrap_or(0.0);
+        let mut row_height: f32 = used_length_percentage_or_auto_with_basis(
+            table_root_block_size(row_style),
+            percentage_basis_from_points(None),
+        )
+        .map(|height| height.points())
+        .unwrap_or(0.0);
         let mut max_baseline: f32 = 0.0;
         let mut max_after_baseline: f32 = 0.0;
         let mut has_baseline_cells = false;
@@ -787,21 +896,41 @@ impl<'a> LayoutBuilder<'a> {
                 context.stylesheets,
                 context.table_cellpadding,
                 context.column_plan,
-                context.table_metrics,
+                context.table_metrics.clone(),
                 context.collapsed_geometry,
             ) else {
                 continue;
             };
             if placement.rowspan == 1 {
-                row_height = row_height.max(prepared.metrics.border_box_height);
+                // Rows are table-root block tracks.  In a vertical table the
+                // logical block axis is physical width, so a cell's ordinary
+                // physical-height metric cannot size that track.
+                // <https://drafts.csswg.org/css-tables-3/#row-layout>
+                // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+                let cell_block_contribution =
+                    if context.table_style.writing_mode.has_vertical_lines() {
+                        table_cell_content_max_width(
+                            self,
+                            cell,
+                            &prepared.style,
+                            context.stylesheets,
+                            Some(prepared.borders),
+                        )
+                    } else {
+                        prepared.metrics.border_box_height
+                    };
+                row_height = row_height.max(cell_block_contribution);
             }
             if table_cell_participates_in_physical_y_row_baseline(
                 &prepared.style,
                 row_style,
                 placement,
+            ) && let Some(baseline) = self.table_cell_physical_y_row_baseline_candidate(
+                cell,
+                &prepared,
+                context.stylesheets,
             ) {
                 has_baseline_cells = true;
-                let baseline = prepared.metrics.baseline_offset;
                 max_baseline = max_baseline.max(baseline);
                 max_after_baseline = max_after_baseline
                     .max((prepared.metrics.border_box_height - baseline).max(0.0));
@@ -853,7 +982,7 @@ impl<'a> LayoutBuilder<'a> {
                 context.stylesheets,
                 context.table_cellpadding,
                 context.column_plan,
-                context.table_metrics,
+                context.table_metrics.clone(),
             ) {
                 plan_rows.push(TableRowHeightPlan {
                     base: 0.0,
@@ -869,7 +998,7 @@ impl<'a> LayoutBuilder<'a> {
                 base,
                 reference: base,
                 final_height: base,
-                auto: row_style.box_values.height.is_auto(),
+                auto: table_root_block_size(&row_style).is_auto(),
                 collapsed: false,
             });
             for placement in &context.grid.rows[row_index] {
@@ -885,16 +1014,24 @@ impl<'a> LayoutBuilder<'a> {
                         context.stylesheets,
                         context.table_cellpadding,
                         context.column_plan,
-                        context.table_metrics,
+                        context.table_metrics.clone(),
                         context.collapsed_geometry,
                     ) else {
                         continue;
                     };
-                    spanning_cells.push((
-                        row_index,
-                        placement.rowspan,
-                        prepared.metrics.border_box_height,
-                    ));
+                    let required_block_size =
+                        if context.table_style.writing_mode.has_vertical_lines() {
+                            table_cell_content_max_width(
+                                self,
+                                cell,
+                                &prepared.style,
+                                context.stylesheets,
+                                Some(prepared.borders),
+                            )
+                        } else {
+                            prepared.metrics.border_box_height
+                        };
+                    spanning_cells.push((row_index, placement.rowspan, required_block_size));
                 }
             }
         }
@@ -905,7 +1042,7 @@ impl<'a> LayoutBuilder<'a> {
                 row_index,
                 rowspan,
                 required_height,
-                context.table_metrics,
+                context.table_metrics.clone(),
                 TableHeightTarget::Base,
             );
         }
@@ -914,13 +1051,29 @@ impl<'a> LayoutBuilder<'a> {
             row.final_height = row.base;
         }
 
-        let target_content_height = self.resolve_table_target_content_height(context.table_style);
-        self.compute_table_reference_heights(&mut plan_rows, context, target_content_height);
+        let target_content_height = self.resolve_table_target_content_height(
+            context.table_style,
+            context.collapsed_geometry,
+            context.wrapper_border_box_block_size,
+            context.wrapper_non_grid_block_size,
+        );
+        self.compute_table_reference_heights(
+            &mut plan_rows,
+            context,
+            target_content_height
+                .map(|value| {
+                    PercentageBasis::definite_from(value, BlockSizeBasisSource::TableWrapper)
+                })
+                .unwrap_or_else(PercentageBasis::indefinite),
+        );
         self.distribute_table_height_plan(
             &mut plan_rows,
             target_content_height,
-            context.table_metrics,
+            context.table_metrics.clone(),
         );
-        TableHeightPlan { rows: plan_rows }
+        TableHeightPlan {
+            rows: plan_rows,
+            target_content_height,
+        }
     }
 }

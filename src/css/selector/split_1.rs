@@ -22,31 +22,33 @@ pub(in crate::css) fn element_namespace_matches(
         || normalized_element_namespace(element_namespace, document_is_html) == selector_namespace
 }
 
-/// Matches a style rule selector and returns its Cascade 5 scoped proximity.
+/// Matches a style rule selector against a prebuilt selector chain.
 ///
 /// A scoped declaration applies only if each enclosing `@scope` contains the
 /// element. The final selector is then matched with the innermost scoping root
 /// as Selectors 4 `:scope`. The returned proximity is the ancestor distance
 /// from the element to that root; lower distances sort stronger in Cascade 5:
 /// <https://www.w3.org/TR/css-cascade-5/#scoped-styles>.
-pub(in crate::css) fn selector_matches_with_scope_proximity(
-    selector: &SelectorList<ReasySelectorImpl>,
+pub(in crate::css) fn selector_matches_with_scope_proximity_in_chain<'a>(
+    selector: &SelectorList<QuireSelectorImpl>,
     scopes: &[ScopeRule],
-    current: &ElementSignature,
-    ancestors: &[ElementSignature],
+    chain: &Rc<Vec<Cow<'a, ElementSignature>>>,
+    current_index: usize,
+    caches: &mut SelectorCaches,
 ) -> Option<usize> {
-    let chain = selector_chain(current, ancestors);
     if scopes.is_empty() {
-        return selector_matches_at(selector, &chain, ancestors.len(), None).then_some(usize::MAX);
+        return selector_matches_at(selector, chain, current_index, None, caches)
+            .then_some(usize::MAX);
     }
     let mut proximity = usize::MAX;
     let mut scope_root_index = None;
     for scope in scopes {
-        let (root_index, distance) = scope_rule_distance(scope, &chain, ancestors.len())?;
+        let (root_index, distance) = scope_rule_distance(scope, chain, current_index, caches)?;
         scope_root_index = Some(root_index);
         proximity = distance;
     }
-    selector_matches_at(selector, &chain, ancestors.len(), scope_root_index).then_some(proximity)
+    selector_matches_at(selector, chain, current_index, scope_root_index, caches)
+        .then_some(proximity)
 }
 
 pub(in crate::css) fn selector_chain<'a>(
@@ -60,21 +62,21 @@ pub(in crate::css) fn selector_chain<'a>(
 }
 
 pub(in crate::css) fn selector_matches_at<'a>(
-    selector: &SelectorList<ReasySelectorImpl>,
+    selector: &SelectorList<QuireSelectorImpl>,
     chain: &Rc<Vec<Cow<'a, ElementSignature>>>,
     index: usize,
     scope_index: Option<usize>,
+    caches: &mut SelectorCaches,
 ) -> bool {
     let element = StyleElement {
         chain: Rc::clone(chain),
         index,
     };
     let scope_element = scope_index.map(|index| OpaqueElement::new(&*chain[index].opaque_id));
-    let mut caches = SelectorCaches::default();
     let mut context = MatchingContext::new(
         MatchingMode::Normal,
         None,
-        &mut caches,
+        caches,
         QuirksMode::NoQuirks,
         NeedsSelectorFlags::No,
         MatchingForInvalidation::No,
@@ -87,14 +89,15 @@ pub(in crate::css) fn scope_rule_distance<'a>(
     scope: &ScopeRule,
     chain: &Rc<Vec<Cow<'a, ElementSignature>>>,
     current_index: usize,
+    caches: &mut SelectorCaches,
 ) -> Option<(usize, usize)> {
     for root_index in (0..=current_index).rev() {
-        if !selector_matches_at(&scope.root, chain, root_index, None) {
+        if !selector_matches_at(&scope.root, chain, root_index, None, caches) {
             continue;
         }
         if let Some(limit) = &scope.limit
             && (root_index + 1..=current_index)
-                .any(|index| selector_matches_at(limit, chain, index, None))
+                .any(|index| selector_matches_at(limit, chain, index, None, caches))
         {
             continue;
         }
@@ -471,7 +474,7 @@ pub(in crate::css) fn is_language_range_subtag(value: &str) -> bool {
 }
 
 impl SelectorElement for StyleElement<'_> {
-    type Impl = ReasySelectorImpl;
+    type Impl = QuireSelectorImpl;
 
     fn opaque(&self) -> OpaqueElement {
         OpaqueElement::new(&*self.signature().opaque_id)
@@ -566,49 +569,49 @@ impl SelectorElement for StyleElement<'_> {
 
     fn match_non_ts_pseudo_class(
         &self,
-        pc: &ReasyPseudoClass,
-        _context: &mut MatchingContext<ReasySelectorImpl>,
+        pc: &QuirePseudoClass,
+        _context: &mut MatchingContext<QuireSelectorImpl>,
     ) -> bool {
         match pc {
-            ReasyPseudoClass::AnyLink | ReasyPseudoClass::Link => self.is_link(),
-            ReasyPseudoClass::Dir(direction) => self.directionality() == Some(*direction),
-            ReasyPseudoClass::Lang(ranges) => language_matches_any_range(&self.language(), ranges),
-            ReasyPseudoClass::StaticFalse(_) => false,
-            ReasyPseudoClass::Target => self.signature().is_target,
-            ReasyPseudoClass::TargetWithin => {
+            QuirePseudoClass::AnyLink | QuirePseudoClass::Link => self.is_link(),
+            QuirePseudoClass::Dir(direction) => self.directionality() == Some(*direction),
+            QuirePseudoClass::Lang(ranges) => language_matches_any_range(&self.language(), ranges),
+            QuirePseudoClass::StaticFalse(_) => false,
+            QuirePseudoClass::Target => self.signature().is_target,
+            QuirePseudoClass::TargetWithin => {
                 self.signature().is_target || self.signature().has_target_descendant
             }
-            ReasyPseudoClass::Open => self.is_open(),
-            ReasyPseudoClass::Defined => true,
-            ReasyPseudoClass::Enabled => {
+            QuirePseudoClass::Open => self.is_open(),
+            QuirePseudoClass::Defined => true,
+            QuirePseudoClass::Enabled => {
                 html_form_state::disableable_element(self.signature().tag.as_str())
                     && !self.is_disabled()
             }
-            ReasyPseudoClass::Disabled => self.is_disabled(),
-            ReasyPseudoClass::Checked => self.is_checked(),
-            ReasyPseudoClass::Indeterminate => self.is_indeterminate(),
-            ReasyPseudoClass::Default => self.is_default(),
-            ReasyPseudoClass::Unchecked => self.is_unchecked(),
-            ReasyPseudoClass::PlaceholderShown => self.is_placeholder_shown(),
-            ReasyPseudoClass::Valid => self.is_valid(),
-            ReasyPseudoClass::Invalid => self.is_invalid(),
-            ReasyPseudoClass::InRange => self.is_in_range(),
-            ReasyPseudoClass::OutOfRange => self.is_out_of_range(),
-            ReasyPseudoClass::Required => {
+            QuirePseudoClass::Disabled => self.is_disabled(),
+            QuirePseudoClass::Checked => self.is_checked(),
+            QuirePseudoClass::Indeterminate => self.is_indeterminate(),
+            QuirePseudoClass::Default => self.is_default(),
+            QuirePseudoClass::Unchecked => self.is_unchecked(),
+            QuirePseudoClass::PlaceholderShown => self.is_placeholder_shown(),
+            QuirePseudoClass::Valid => self.is_valid(),
+            QuirePseudoClass::Invalid => self.is_invalid(),
+            QuirePseudoClass::InRange => self.is_in_range(),
+            QuirePseudoClass::OutOfRange => self.is_out_of_range(),
+            QuirePseudoClass::Required => {
                 self.is_required_capable() && self.signature().attrs.contains_key("required")
             }
-            ReasyPseudoClass::Optional => {
+            QuirePseudoClass::Optional => {
                 self.is_required_capable() && !self.signature().attrs.contains_key("required")
             }
-            ReasyPseudoClass::ReadWrite => self.is_read_write(),
-            ReasyPseudoClass::ReadOnly => !self.is_read_write(),
+            QuirePseudoClass::ReadWrite => self.is_read_write(),
+            QuirePseudoClass::ReadOnly => !self.is_read_write(),
         }
     }
 
     fn match_pseudo_element(
         &self,
-        _pe: &ReasyPseudoElement,
-        _context: &mut MatchingContext<ReasySelectorImpl>,
+        _pe: &QuirePseudoElement,
+        _context: &mut MatchingContext<QuireSelectorImpl>,
     ) -> bool {
         false
     }
@@ -665,9 +668,9 @@ impl SelectorElement for StyleElement<'_> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReasySelectorImpl;
+pub(crate) struct QuireSelectorImpl;
 
-impl SelectorImpl for ReasySelectorImpl {
+impl SelectorImpl for QuireSelectorImpl {
     type ExtraMatchingData<'a> = ();
     type AttrValue = CssString;
     type Identifier = CssAtom;
@@ -676,17 +679,17 @@ impl SelectorImpl for ReasySelectorImpl {
     type NamespacePrefix = CssAtom;
     type BorrowedLocalName = CssAtom;
     type BorrowedNamespaceUrl = CssAtom;
-    type NonTSPseudoClass = ReasyPseudoClass;
-    type PseudoElement = ReasyPseudoElement;
+    type NonTSPseudoClass = QuirePseudoClass;
+    type PseudoElement = QuirePseudoElement;
 }
 
 #[derive(Debug, Clone, Default)]
-pub(in crate::css) struct ReasySelectorParser {
+pub(in crate::css) struct QuireSelectorParser {
     pub(in crate::css) default_namespace: Option<CssAtom>,
     pub(in crate::css) namespaces: HashMap<String, CssAtom>,
 }
 
-impl ReasySelectorParser {
+impl QuireSelectorParser {
     pub(in crate::css) fn new(
         default_namespace: Option<String>,
         namespaces: HashMap<String, String>,
@@ -701,8 +704,8 @@ impl ReasySelectorParser {
     }
 }
 
-impl<'i> SelectorParser<'i> for ReasySelectorParser {
-    type Impl = ReasySelectorImpl;
+impl<'i> SelectorParser<'i> for QuireSelectorParser {
+    type Impl = QuireSelectorImpl;
     type Error = SelectorParseErrorKind<'i>;
 
     fn parse_is_and_where(&self) -> bool {
@@ -733,49 +736,49 @@ impl<'i> SelectorParser<'i> for ReasySelectorParser {
         &self,
         location: SourceLocation,
         name: CowRcStr<'i>,
-    ) -> Result<ReasyPseudoClass, cssparser::ParseError<'i, Self::Error>> {
+    ) -> Result<QuirePseudoClass, cssparser::ParseError<'i, Self::Error>> {
         match name.as_ref().to_ascii_lowercase().as_str() {
-            "link" => Ok(ReasyPseudoClass::Link),
-            "any-link" => Ok(ReasyPseudoClass::AnyLink),
-            "visited" => Ok(ReasyPseudoClass::StaticFalse("visited")),
-            "target" => Ok(ReasyPseudoClass::Target),
-            "target-within" => Ok(ReasyPseudoClass::TargetWithin),
-            "hover" => Ok(ReasyPseudoClass::StaticFalse("hover")),
-            "active" => Ok(ReasyPseudoClass::StaticFalse("active")),
-            "focus" => Ok(ReasyPseudoClass::StaticFalse("focus")),
-            "focus-visible" => Ok(ReasyPseudoClass::StaticFalse("focus-visible")),
-            "focus-within" => Ok(ReasyPseudoClass::StaticFalse("focus-within")),
-            "playing" => Ok(ReasyPseudoClass::StaticFalse("playing")),
-            "paused" => Ok(ReasyPseudoClass::StaticFalse("paused")),
-            "seeking" => Ok(ReasyPseudoClass::StaticFalse("seeking")),
-            "buffering" => Ok(ReasyPseudoClass::StaticFalse("buffering")),
-            "stalled" => Ok(ReasyPseudoClass::StaticFalse("stalled")),
-            "muted" => Ok(ReasyPseudoClass::StaticFalse("muted")),
-            "volume-locked" => Ok(ReasyPseudoClass::StaticFalse("volume-locked")),
-            "open" => Ok(ReasyPseudoClass::Open),
-            "popover-open" => Ok(ReasyPseudoClass::StaticFalse("popover-open")),
-            "modal" => Ok(ReasyPseudoClass::StaticFalse("modal")),
-            "fullscreen" => Ok(ReasyPseudoClass::StaticFalse("fullscreen")),
-            "picture-in-picture" => Ok(ReasyPseudoClass::StaticFalse("picture-in-picture")),
-            "autofill" => Ok(ReasyPseudoClass::StaticFalse("autofill")),
-            "default" => Ok(ReasyPseudoClass::Default),
-            "unchecked" => Ok(ReasyPseudoClass::Unchecked),
-            "placeholder-shown" => Ok(ReasyPseudoClass::PlaceholderShown),
-            "valid" => Ok(ReasyPseudoClass::Valid),
-            "invalid" => Ok(ReasyPseudoClass::Invalid),
-            "in-range" => Ok(ReasyPseudoClass::InRange),
-            "out-of-range" => Ok(ReasyPseudoClass::OutOfRange),
-            "user-valid" => Ok(ReasyPseudoClass::StaticFalse("user-valid")),
-            "user-invalid" => Ok(ReasyPseudoClass::StaticFalse("user-invalid")),
-            "defined" => Ok(ReasyPseudoClass::Defined),
-            "enabled" => Ok(ReasyPseudoClass::Enabled),
-            "disabled" => Ok(ReasyPseudoClass::Disabled),
-            "checked" => Ok(ReasyPseudoClass::Checked),
-            "indeterminate" => Ok(ReasyPseudoClass::Indeterminate),
-            "required" => Ok(ReasyPseudoClass::Required),
-            "optional" => Ok(ReasyPseudoClass::Optional),
-            "read-write" => Ok(ReasyPseudoClass::ReadWrite),
-            "read-only" => Ok(ReasyPseudoClass::ReadOnly),
+            "link" => Ok(QuirePseudoClass::Link),
+            "any-link" => Ok(QuirePseudoClass::AnyLink),
+            "visited" => Ok(QuirePseudoClass::StaticFalse("visited")),
+            "target" => Ok(QuirePseudoClass::Target),
+            "target-within" => Ok(QuirePseudoClass::TargetWithin),
+            "hover" => Ok(QuirePseudoClass::StaticFalse("hover")),
+            "active" => Ok(QuirePseudoClass::StaticFalse("active")),
+            "focus" => Ok(QuirePseudoClass::StaticFalse("focus")),
+            "focus-visible" => Ok(QuirePseudoClass::StaticFalse("focus-visible")),
+            "focus-within" => Ok(QuirePseudoClass::StaticFalse("focus-within")),
+            "playing" => Ok(QuirePseudoClass::StaticFalse("playing")),
+            "paused" => Ok(QuirePseudoClass::StaticFalse("paused")),
+            "seeking" => Ok(QuirePseudoClass::StaticFalse("seeking")),
+            "buffering" => Ok(QuirePseudoClass::StaticFalse("buffering")),
+            "stalled" => Ok(QuirePseudoClass::StaticFalse("stalled")),
+            "muted" => Ok(QuirePseudoClass::StaticFalse("muted")),
+            "volume-locked" => Ok(QuirePseudoClass::StaticFalse("volume-locked")),
+            "open" => Ok(QuirePseudoClass::Open),
+            "popover-open" => Ok(QuirePseudoClass::StaticFalse("popover-open")),
+            "modal" => Ok(QuirePseudoClass::StaticFalse("modal")),
+            "fullscreen" => Ok(QuirePseudoClass::StaticFalse("fullscreen")),
+            "picture-in-picture" => Ok(QuirePseudoClass::StaticFalse("picture-in-picture")),
+            "autofill" => Ok(QuirePseudoClass::StaticFalse("autofill")),
+            "default" => Ok(QuirePseudoClass::Default),
+            "unchecked" => Ok(QuirePseudoClass::Unchecked),
+            "placeholder-shown" => Ok(QuirePseudoClass::PlaceholderShown),
+            "valid" => Ok(QuirePseudoClass::Valid),
+            "invalid" => Ok(QuirePseudoClass::Invalid),
+            "in-range" => Ok(QuirePseudoClass::InRange),
+            "out-of-range" => Ok(QuirePseudoClass::OutOfRange),
+            "user-valid" => Ok(QuirePseudoClass::StaticFalse("user-valid")),
+            "user-invalid" => Ok(QuirePseudoClass::StaticFalse("user-invalid")),
+            "defined" => Ok(QuirePseudoClass::Defined),
+            "enabled" => Ok(QuirePseudoClass::Enabled),
+            "disabled" => Ok(QuirePseudoClass::Disabled),
+            "checked" => Ok(QuirePseudoClass::Checked),
+            "indeterminate" => Ok(QuirePseudoClass::Indeterminate),
+            "required" => Ok(QuirePseudoClass::Required),
+            "optional" => Ok(QuirePseudoClass::Optional),
+            "read-write" => Ok(QuirePseudoClass::ReadWrite),
+            "read-only" => Ok(QuirePseudoClass::ReadOnly),
             _ => Err(location.new_custom_error(
                 SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
             )),
@@ -787,7 +790,7 @@ impl<'i> SelectorParser<'i> for ReasySelectorParser {
         name: CowRcStr<'i>,
         parser: &mut CssParser<'i, 't>,
         _after_part: bool,
-    ) -> Result<ReasyPseudoClass, cssparser::ParseError<'i, Self::Error>> {
+    ) -> Result<QuirePseudoClass, cssparser::ParseError<'i, Self::Error>> {
         if name.eq_ignore_ascii_case("lang") {
             let ranges = parser.parse_comma_separated(|parser| {
                 let argument = if let Ok(argument) = parser.try_parse(|parser| {
@@ -812,7 +815,7 @@ impl<'i> SelectorParser<'i> for ReasySelectorParser {
                     SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
                 ));
             }
-            return Ok(ReasyPseudoClass::Lang(ranges));
+            return Ok(QuirePseudoClass::Lang(ranges));
         }
         if !name.eq_ignore_ascii_case("dir") {
             return Err(parser.new_custom_error(
@@ -832,24 +835,24 @@ impl<'i> SelectorParser<'i> for ReasySelectorParser {
             }
         };
         parser.expect_exhausted()?;
-        Ok(ReasyPseudoClass::Dir(direction))
+        Ok(QuirePseudoClass::Dir(direction))
     }
 
     fn parse_pseudo_element(
         &self,
         location: SourceLocation,
         name: CowRcStr<'i>,
-    ) -> Result<ReasyPseudoElement, cssparser::ParseError<'i, Self::Error>> {
+    ) -> Result<QuirePseudoElement, cssparser::ParseError<'i, Self::Error>> {
         if name.eq_ignore_ascii_case("before") {
-            Ok(ReasyPseudoElement::Before)
+            Ok(QuirePseudoElement::Before)
         } else if name.eq_ignore_ascii_case("after") {
-            Ok(ReasyPseudoElement::After)
+            Ok(QuirePseudoElement::After)
         } else if name.eq_ignore_ascii_case("marker") {
-            Ok(ReasyPseudoElement::Marker)
+            Ok(QuirePseudoElement::Marker)
         } else if name.eq_ignore_ascii_case("first-line") {
-            Ok(ReasyPseudoElement::FirstLine)
+            Ok(QuirePseudoElement::FirstLine)
         } else if name.eq_ignore_ascii_case("first-letter") {
-            Ok(ReasyPseudoElement::FirstLetter)
+            Ok(QuirePseudoElement::FirstLetter)
         } else {
             Err(
                 location.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(
@@ -861,7 +864,7 @@ impl<'i> SelectorParser<'i> for ReasySelectorParser {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReasyPseudoClass {
+pub(crate) enum QuirePseudoClass {
     Link,
     AnyLink,
     Dir(Direction),
@@ -888,37 +891,37 @@ pub(crate) enum ReasyPseudoClass {
     ReadOnly,
 }
 
-impl ToCss for ReasyPseudoClass {
+impl ToCss for QuirePseudoClass {
     fn to_css<W>(&self, dest: &mut W) -> fmt::Result
     where
         W: fmt::Write,
     {
         match self {
-            ReasyPseudoClass::Link => dest.write_str(":link"),
-            ReasyPseudoClass::AnyLink => dest.write_str(":any-link"),
-            ReasyPseudoClass::Dir(Direction::Ltr) => dest.write_str(":dir(ltr)"),
-            ReasyPseudoClass::Dir(Direction::Rtl) => dest.write_str(":dir(rtl)"),
-            ReasyPseudoClass::StaticFalse(name) => write!(dest, ":{name}"),
-            ReasyPseudoClass::Target => dest.write_str(":target"),
-            ReasyPseudoClass::TargetWithin => dest.write_str(":target-within"),
-            ReasyPseudoClass::Open => dest.write_str(":open"),
-            ReasyPseudoClass::Defined => dest.write_str(":defined"),
-            ReasyPseudoClass::Enabled => dest.write_str(":enabled"),
-            ReasyPseudoClass::Disabled => dest.write_str(":disabled"),
-            ReasyPseudoClass::Checked => dest.write_str(":checked"),
-            ReasyPseudoClass::Indeterminate => dest.write_str(":indeterminate"),
-            ReasyPseudoClass::Default => dest.write_str(":default"),
-            ReasyPseudoClass::Unchecked => dest.write_str(":unchecked"),
-            ReasyPseudoClass::PlaceholderShown => dest.write_str(":placeholder-shown"),
-            ReasyPseudoClass::Valid => dest.write_str(":valid"),
-            ReasyPseudoClass::Invalid => dest.write_str(":invalid"),
-            ReasyPseudoClass::InRange => dest.write_str(":in-range"),
-            ReasyPseudoClass::OutOfRange => dest.write_str(":out-of-range"),
-            ReasyPseudoClass::Required => dest.write_str(":required"),
-            ReasyPseudoClass::Optional => dest.write_str(":optional"),
-            ReasyPseudoClass::ReadWrite => dest.write_str(":read-write"),
-            ReasyPseudoClass::ReadOnly => dest.write_str(":read-only"),
-            ReasyPseudoClass::Lang(ranges) => {
+            QuirePseudoClass::Link => dest.write_str(":link"),
+            QuirePseudoClass::AnyLink => dest.write_str(":any-link"),
+            QuirePseudoClass::Dir(Direction::Ltr) => dest.write_str(":dir(ltr)"),
+            QuirePseudoClass::Dir(Direction::Rtl) => dest.write_str(":dir(rtl)"),
+            QuirePseudoClass::StaticFalse(name) => write!(dest, ":{name}"),
+            QuirePseudoClass::Target => dest.write_str(":target"),
+            QuirePseudoClass::TargetWithin => dest.write_str(":target-within"),
+            QuirePseudoClass::Open => dest.write_str(":open"),
+            QuirePseudoClass::Defined => dest.write_str(":defined"),
+            QuirePseudoClass::Enabled => dest.write_str(":enabled"),
+            QuirePseudoClass::Disabled => dest.write_str(":disabled"),
+            QuirePseudoClass::Checked => dest.write_str(":checked"),
+            QuirePseudoClass::Indeterminate => dest.write_str(":indeterminate"),
+            QuirePseudoClass::Default => dest.write_str(":default"),
+            QuirePseudoClass::Unchecked => dest.write_str(":unchecked"),
+            QuirePseudoClass::PlaceholderShown => dest.write_str(":placeholder-shown"),
+            QuirePseudoClass::Valid => dest.write_str(":valid"),
+            QuirePseudoClass::Invalid => dest.write_str(":invalid"),
+            QuirePseudoClass::InRange => dest.write_str(":in-range"),
+            QuirePseudoClass::OutOfRange => dest.write_str(":out-of-range"),
+            QuirePseudoClass::Required => dest.write_str(":required"),
+            QuirePseudoClass::Optional => dest.write_str(":optional"),
+            QuirePseudoClass::ReadWrite => dest.write_str(":read-write"),
+            QuirePseudoClass::ReadOnly => dest.write_str(":read-only"),
+            QuirePseudoClass::Lang(ranges) => {
                 dest.write_str(":lang(")?;
                 for (index, range) in ranges.iter().enumerate() {
                     if index > 0 {

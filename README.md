@@ -18,6 +18,21 @@ Current implementation status and the resume checklist live in
 Design notes on current async usage and future PDF/rendering parallelism live in
 [`docs/CONCURRENCY_AND_PARALLELISM.md`](docs/CONCURRENCY_AND_PARALLELISM.md).
 
+## Examples
+
+Convert an HTML file to a PDF file:
+
+```sh
+quire document.html document.pdf
+```
+
+Set the initial page size while converting a file. Values use CSS absolute
+length units; an `@page` rule in the document can override this size:
+
+```sh
+quire --page-size 8.5in 11in document.html document.pdf
+```
+
 Implemented now:
 
 - crate API and CLI
@@ -44,8 +59,8 @@ Implemented now:
 - CSS bookmarks and PDF outlines for heading defaults and authored
   `bookmark-level`, `bookmark-label`, and `bookmark-state`
 - URI link annotations
-- deterministic uncompressed PDF output with embedded system TrueType fonts for
-  normal text
+- deterministic PDF output with embedded system TrueType fonts for normal text;
+  generated streams use Flate compression by default
 
 ## CLI
 
@@ -59,23 +74,46 @@ cargo run -- KinSNP_example.html /tmp/kinsnp.pdf
 Once installed as a binary:
 
 ```sh
-reasyprint KinSNP_example.html /tmp/kinsnp.pdf
+quire KinSNP_example.html /tmp/kinsnp.pdf
 ```
 
-Enable ReasyPrint debug logs, including PDF generation timing, with:
+Enable Quire debug logs, including PDF generation timing, with:
 
 ```sh
-RUST_LOG=reasyprint=debug cargo run -- KinSNP_example.html /tmp/kinsnp.pdf
+cargo run -- --debug KinSNP_example.html /tmp/kinsnp.pdf
 ```
 
+Without a logging flag, Quire shows warnings and errors by default. Set
+`RUST_LOG` to customize `env_logger` filtering; `--verbose`, `--debug`, and
+`--quiet` override `RUST_LOG` for WeasyPrint-compatible CLI behavior.
+
+Use `--full-fonts` to embed complete font programs when PDF embedding permits
+it, matching WeasyPrint's opt-out of font subsetting:
+
 ```sh
-cargo run -- '<p>Hello, world</p>' /tmp/hello.pdf
+cargo run -- --full-fonts input.html /tmp/full-fonts.pdf
 ```
 
-Use `--string` to force the first argument to be treated as HTML source:
+Use `--pdf-profile` to select Quire's PDF writer policy. The default is
+`pdf/a-2b`; supported values are `pdf`, `pdf/a-1b`, `pdf/a-2b`, `pdf/a-3b`,
+`pdf/a-2u`, and `pdf/a-3u`. These profiles select the implemented header,
+metadata, and font-planning behavior, but do not yet guarantee PDF/A
+conformance. `--pdf-variant` and `--pdf-type` remain aliases.
+
+Use `--uncompressed-pdf` to omit `/FlateDecode` from every generated PDF
+stream. This is primarily useful when inspecting PDF syntax while debugging;
+it substantially increases output size:
 
 ```sh
-cargo run -- --string '<h1>Hello</h1><p>From Rust.</p>' /tmp/hello.pdf
+cargo run -- --uncompressed-pdf input.html /tmp/debug.pdf
+```
+
+Quire follows HTTP redirects by default and treats every external resource
+failure as fatal. Use `--no-http-redirects` to reject HTTP redirects, or
+`--allow-fetch-errors` to skip failed optional subresources and continue:
+
+```sh
+cargo run -- --no-http-redirects --allow-fetch-errors input.html /tmp/output.pdf
 ```
 
 Use `--input-syntax xml` to force XML/XHTML parsing. The default
@@ -85,32 +123,36 @@ declaration such as `<?xml version="1.0"?>`.
 External stylesheets are supported:
 
 ```sh
-cargo run -- --string -s style.css '<p class="lead">Hello</p>' /tmp/hello.pdf
+cargo run -- -s style.css input.html /tmp/hello.pdf
 ```
 
 Generate shell completions with:
 
 ```sh
-cargo run -- --generate-completion bash > reasyprint.bash
+cargo run -- --generate-completion bash > quire.bash
 ```
 
 ## Library
 
 ```rust
-use quire::{Html, RenderOptions};
+use quire::{Html, PdfOptions, RenderOptions};
 
 let pdf = Html::from_string("<p>Hello, world</p>")
-    .write_pdf_bytes(&RenderOptions::default())?;
+    .write_pdf_bytes(&RenderOptions::default(), &PdfOptions::default())?;
 # Ok::<(), quire::Error>(())
 ```
 
 Rendering the KinSNP fixture from Rust uses the same library path:
 
 ```rust
-use quire::{Html, RenderOptions};
+use quire::{Html, PdfOptions, RenderOptions};
 
 Html::from_file("KinSNP_example.html")?
-    .write_pdf("/tmp/kinsnp.pdf", &RenderOptions::default())?;
+    .write_pdf(
+        "/tmp/kinsnp.pdf",
+        &RenderOptions::default(),
+        &PdfOptions::default(),
+    )?;
 # Ok::<(), quire::Error>(())
 ```
 
@@ -135,3 +177,7 @@ codesign --force  --sign - --timestamp=none --entitlements debug.entitlements ta
 </dict>
 </plist>
 ```
+
+## Web Platform Tests
+
+There is an external runner for web platform tests in `../quire-wpt`; there is a checkout of the tests there at `../quire-wpt/third_party/wpt`.

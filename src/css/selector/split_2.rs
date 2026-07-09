@@ -28,8 +28,8 @@ impl ToCss for LanguageRange {
     }
 }
 
-impl NonTSPseudoClass for ReasyPseudoClass {
-    type Impl = ReasySelectorImpl;
+impl NonTSPseudoClass for QuirePseudoClass {
+    type Impl = QuireSelectorImpl;
 
     fn is_active_or_hover(&self) -> bool {
         false
@@ -41,7 +41,7 @@ impl NonTSPseudoClass for ReasyPseudoClass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReasyPseudoElement {
+pub(crate) enum QuirePseudoElement {
     Before,
     After,
     Marker,
@@ -49,23 +49,23 @@ pub(crate) enum ReasyPseudoElement {
     FirstLetter,
 }
 
-impl ToCss for ReasyPseudoElement {
+impl ToCss for QuirePseudoElement {
     fn to_css<W>(&self, dest: &mut W) -> fmt::Result
     where
         W: fmt::Write,
     {
         dest.write_str(match self {
-            ReasyPseudoElement::Before => "::before",
-            ReasyPseudoElement::After => "::after",
-            ReasyPseudoElement::Marker => "::marker",
-            ReasyPseudoElement::FirstLine => "::first-line",
-            ReasyPseudoElement::FirstLetter => "::first-letter",
+            QuirePseudoElement::Before => "::before",
+            QuirePseudoElement::After => "::after",
+            QuirePseudoElement::Marker => "::marker",
+            QuirePseudoElement::FirstLine => "::first-line",
+            QuirePseudoElement::FirstLetter => "::first-letter",
         })
     }
 }
 
-impl PseudoElement for ReasyPseudoElement {
-    type Impl = ReasySelectorImpl;
+impl PseudoElement for QuirePseudoElement {
+    type Impl = QuireSelectorImpl;
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]

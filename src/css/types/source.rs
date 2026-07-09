@@ -1,20 +1,37 @@
 use super::*;
 use cssparser::{Parser, ParserInput, Token};
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
+use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A stylesheet source and its resource-loading context.
+///
+/// ```
+/// use quire::Css;
+///
+/// let stylesheet = Css::from_string("p { color: navy }");
+/// ```
 pub struct Css {
     source: String,
     origin: StylesheetOrigin,
-    base_url: Option<PathBuf>,
-    root_url: Option<PathBuf>,
+    base_url: Option<Url>,
+    root_url: Option<Url>,
     layer_order_prefix: Vec<String>,
     import_layer_name: Option<String>,
     specificity_override: Option<u32>,
+    resource_policy: crate::ResourcePolicy,
 }
 
 impl Css {
+    /// Creates an author-origin stylesheet from CSS source text.
+    ///
+    /// ```
+    /// use quire::Css;
+    ///
+    /// let stylesheet = Css::from_string("article { margin: 1in }");
+    /// ```
     pub fn from_string(source: impl Into<String>) -> Self {
         Self {
             source: source.into(),
@@ -24,24 +41,94 @@ impl Css {
             layer_order_prefix: Vec::new(),
             import_layer_name: None,
             specificity_override: None,
+            resource_policy: crate::ResourcePolicy::default(),
         }
     }
 
-    pub async fn from_file_async<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
+    /// Asynchronously loads an author-origin stylesheet from a local file.
+    ///
+    /// ```no_run
+    /// # async fn load() -> quire::Result<()> {
+    /// let stylesheet = quire::Css::from_file("styles.css").await?;
+    /// # let _ = stylesheet;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_file<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
         let path = path.as_ref();
         log::debug!("reading CSS file {}", path.display());
+        let url = crate::resource::file_url_from_path(path)?;
         Ok(Self {
-            source: crate::resource::read_to_string(path).await?,
+            source: crate::resource::read_to_string(&url).await?,
             origin: StylesheetOrigin::Author,
-            base_url: crate::resource::resource_parent(path),
+            base_url: Some(url),
             root_url: None,
             layer_order_prefix: Vec::new(),
             import_layer_name: None,
             specificity_override: None,
+            resource_policy: crate::ResourcePolicy::default(),
         })
     }
 
-    pub fn source(&self) -> &str {
+    /// Loads an author stylesheet from a local-file, HTTP, or HTTPS URL.
+    ///
+    /// ```no_run
+    /// # async fn load() -> Result<(), Box<dyn std::error::Error>> {
+    /// let url = "https://example.test/styles.css".parse()?;
+    /// let stylesheet = quire::Css::from_url_async(url).await?;
+    /// # let _ = stylesheet;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_url_async(url: Url) -> crate::Result<Self> {
+        Self::from_url_async_with_resource_policy(url, crate::ResourcePolicy::default()).await
+    }
+
+    /// Loads an author stylesheet from a URL with an explicit resource policy.
+    ///
+    /// ```no_run
+    /// # async fn load() -> Result<(), Box<dyn std::error::Error>> {
+    /// let url = "https://example.test/styles.css".parse()?;
+    /// let policy = quire::ResourcePolicy {
+    ///     follow_http_redirects: false,
+    ///     ..Default::default()
+    /// };
+    /// let stylesheet = quire::Css::from_url_async_with_resource_policy(url, policy).await?;
+    /// # let _ = stylesheet;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_url_async_with_resource_policy(
+        url: Url,
+        resource_policy: crate::ResourcePolicy,
+    ) -> crate::Result<Self> {
+        let fetcher = crate::resource::ResourceFetcher::new(resource_policy)?;
+        Self::from_url_async_with_fetcher(url, &fetcher).await
+    }
+
+    pub(crate) async fn from_url_async_with_fetcher(
+        url: Url,
+        fetcher: &crate::resource::ResourceFetcher,
+    ) -> crate::Result<Self> {
+        if crate::resource::fetch_url(&url).is_none() {
+            return Err(crate::Error::InvalidInput(format!(
+                "unsupported URL for stylesheet input: {url}"
+            )));
+        }
+        let (source, final_url) = fetcher.read_to_string(&url).await?;
+        Ok(Self {
+            source,
+            origin: StylesheetOrigin::Author,
+            base_url: Some(final_url),
+            root_url: None,
+            layer_order_prefix: Vec::new(),
+            import_layer_name: None,
+            specificity_override: None,
+            resource_policy: fetcher.policy(),
+        })
+    }
+
+    pub(crate) fn source(&self) -> &str {
         &self.source
     }
 
@@ -51,6 +138,10 @@ impl Css {
     /// author declarations, while user `!important` declarations outrank
     /// author `!important` declarations:
     /// <https://www.w3.org/TR/css-cascade-5/#cascade-origin>.
+    ///
+    /// ```
+    /// let stylesheet = quire::Css::from_string("p { color: navy }").with_user_origin();
+    /// ```
     pub fn with_user_origin(mut self) -> Self {
         self.origin = StylesheetOrigin::User;
         self
@@ -61,18 +152,30 @@ impl Css {
     /// Author origin is the default for styles supplied by the document or the
     /// public stylesheet API:
     /// <https://www.w3.org/TR/css-cascade-5/#cascade-origin>.
-    pub fn with_author_origin(mut self) -> Self {
+    pub(crate) fn with_author_origin(mut self) -> Self {
         self.origin = StylesheetOrigin::Author;
         self
     }
 
     /// Marks this stylesheet as a user-agent-origin stylesheet.
     ///
-    /// This is primarily useful for tests and custom embedding; Reasyprint's
+    /// This is primarily useful for tests and custom embedding; Quire's
     /// built-in HTML defaults are already loaded as UA-origin rules:
     /// <https://www.w3.org/TR/css-cascade-5/#cascade-origin>.
-    pub fn with_user_agent_origin(mut self) -> Self {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_user_agent_origin(mut self) -> Self {
         self.origin = StylesheetOrigin::UserAgent;
+        self
+    }
+
+    /// Sets the policy used to load this stylesheet's `@import` resources.
+    ///
+    /// ```
+    /// let stylesheet = quire::Css::from_string("@import url(theme.css);")
+    ///     .with_resource_policy(quire::ResourcePolicy::default());
+    /// ```
+    pub fn with_resource_policy(mut self, resource_policy: crate::ResourcePolicy) -> Self {
+        self.resource_policy = resource_policy;
         self
     }
 
@@ -92,22 +195,42 @@ impl Css {
         self
     }
 
-    pub(crate) fn with_base_url(mut self, base_url: Option<PathBuf>) -> Self {
+    pub(crate) fn with_base_url(mut self, base_url: Option<Url>) -> Self {
         self.base_url = base_url;
         self
     }
 
-    pub(crate) fn with_root_url(mut self, root_url: Option<PathBuf>) -> Self {
+    /// Sets a local directory as the base URL for stylesheet-relative resources.
+    ///
+    /// CSS resolves relative URLs against the stylesheet's base URL:
+    /// <https://www.w3.org/TR/css-values-4/#urls>.
+    ///
+    /// ```no_run
+    /// # fn configure() -> quire::Result<()> {
+    /// let stylesheet = quire::Css::from_string("img { content: url(icon.svg) }")
+    ///     .with_base_path("assets")?;
+    /// # let _ = stylesheet;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_base_path<P: AsRef<Path>>(mut self, base_path: P) -> crate::Result<Self> {
+        self.base_url = Some(crate::resource::directory_url_from_path(
+            base_path.as_ref(),
+        )?);
+        Ok(self)
+    }
+
+    pub(crate) fn with_root_url(mut self, root_url: Option<Url>) -> Self {
         self.root_url = root_url;
         self
     }
 
-    pub(crate) fn base_url(&self) -> Option<&Path> {
-        self.base_url.as_deref()
+    pub(crate) fn base_url(&self) -> Option<&Url> {
+        self.base_url.as_ref()
     }
 
-    pub(crate) fn root_url(&self) -> Option<&Path> {
-        self.root_url.as_deref()
+    pub(crate) fn root_url(&self) -> Option<&Url> {
+        self.root_url.as_ref()
     }
 
     pub(crate) fn layer_order_prefix(&self) -> &[String] {
@@ -137,17 +260,19 @@ impl Css {
         self
     }
 
-    pub(crate) async fn with_imports_async(&self) -> crate::Result<Vec<Self>> {
+    pub(crate) async fn with_imports(&self) -> crate::Result<Vec<Self>> {
         let mut stylesheets = Vec::new();
         let mut seen = HashSet::new();
-        self.collect_with_imports_async(&mut seen, &mut stylesheets)
+        let fetcher = crate::resource::ResourceFetcher::new(self.resource_policy)?;
+        self.collect_with_imports_async(&fetcher, &mut seen, &mut stylesheets)
             .await?;
         Ok(stylesheets)
     }
 
     fn collect_with_imports_async<'a>(
         &'a self,
-        seen: &'a mut HashSet<PathBuf>,
+        fetcher: &'a crate::resource::ResourceFetcher,
+        seen: &'a mut HashSet<Url>,
         stylesheets: &'a mut Vec<Self>,
     ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + 'a>> {
         Box::pin(async move {
@@ -158,18 +283,24 @@ impl Css {
                 self.import_layer_name(),
                 self.layer_order_prefix(),
             ) {
-                let key = import
-                    .path
-                    .canonicalize()
-                    .unwrap_or_else(|_| import.path.clone());
-                if seen.insert(key) {
-                    Css::from_file_async(&import.path)
-                        .await?
-                        .with_origin(self.origin)
-                        .with_root_url(self.root_url.clone())
-                        .with_layer_context(import.layer_order_prefix, import.layer_name)
-                        .collect_with_imports_async(seen, stylesheets)
-                        .await?;
+                if seen.insert(import.url.clone()) {
+                    match Css::from_url_async_with_fetcher(import.url.clone(), fetcher).await {
+                        Ok(stylesheet) => {
+                            stylesheet
+                                .with_origin(self.origin)
+                                .with_root_url(self.root_url.clone())
+                                .with_layer_context(import.layer_order_prefix, import.layer_name)
+                                .collect_with_imports_async(fetcher, seen, stylesheets)
+                                .await?;
+                        }
+                        Err(error) if fetcher.allows_fetch_errors() => {
+                            log::debug!(
+                                "failed to load imported stylesheet {}: {error}",
+                                import.url
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             stylesheets.push(self.clone());
@@ -180,7 +311,7 @@ impl Css {
 
 #[derive(Debug)]
 struct StylesheetImport {
-    path: PathBuf,
+    url: Url,
     layer_name: Option<String>,
     layer_order_prefix: Vec<String>,
 }
@@ -196,8 +327,8 @@ struct StylesheetImport {
 /// <https://www.w3.org/TR/css-cascade-5/#at-import>.
 fn imported_stylesheet_rules(
     source: &str,
-    base_url: Option<&Path>,
-    root_url: Option<&Path>,
+    base_url: Option<&Url>,
+    root_url: Option<&Url>,
     parent_layer: Option<&str>,
     inherited_layer_prefix: &[String],
 ) -> Vec<StylesheetImport> {
@@ -240,12 +371,9 @@ fn imported_stylesheet_rules(
         if let Some(layer_name) = &layer_name {
             push_unique_layer_name(&mut layer_order, layer_name.clone());
         }
-        if !parsed.url.contains(':')
-            && !parsed.url.starts_with("//")
-            && let Some(path) = crate::resource::resolve_url_path(&parsed.url, base_url, root_url)
-        {
+        if let Some(url) = crate::resource::resolve_fetchable_url(&parsed.url, base_url, root_url) {
             imports.push(StylesheetImport {
-                path,
+                url,
                 layer_name,
                 layer_order_prefix: layer_order.clone(),
             });

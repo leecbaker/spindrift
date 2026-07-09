@@ -8,7 +8,7 @@ pub(in crate::layout) struct InlineFloatBand {
 impl InlineFloatBand {
     pub(in crate::layout) fn new(left_offset: f32, width: f32) -> Self {
         Self {
-            span: LogicalInlineSpan::new(left_offset, width.max(1.0)),
+            span: LogicalInlineSpan::new(left_offset, width.max(0.0)),
         }
     }
 

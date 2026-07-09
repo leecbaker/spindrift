@@ -1,102 +1,7 @@
 use std::rc::Rc;
 
 use super::*;
-
-impl LogicalFloatBand {
-    pub(in crate::layout) fn new(
-        inline_start: f32,
-        inline_size: f32,
-        physical_top: f32,
-        physical_bottom: f32,
-    ) -> Self {
-        Self {
-            inline_span: LogicalInlineSpan::new(inline_start, inline_size),
-            block_span: PageBlockSpan::from_edges(physical_top, physical_bottom),
-        }
-    }
-
-    pub(in crate::layout) fn inline_start(self) -> f32 {
-        self.inline_span.start()
-    }
-
-    pub(in crate::layout) fn inline_end(self) -> f32 {
-        self.inline_span.end()
-    }
-
-    pub(in crate::layout) fn available_inline_size(self) -> f32 {
-        self.inline_span.size()
-    }
-
-    pub(in crate::layout) fn physical_top(self) -> f32 {
-        self.block_span.top_y()
-    }
-
-    pub(in crate::layout) fn physical_bottom(self) -> f32 {
-        self.block_span.bottom_y()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct FloatPlacement {
-    /// Physical top-left placement of the float margin box in page-top space.
-    ///
-    /// CSS 2.2 places a float as far left or right as possible while its top
-    /// edge is at or below the current line, after `clear` and active float
-    /// exclusions are applied. The top-edge convention matches block layout's
-    /// downward cursor before paint conversion:
-    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
-    pub(in crate::layout) origin: PageTopPoint,
-    /// Physical line-box span available at this float's block position.
-    ///
-    /// CSS floats shorten later line boxes in the same block formatting
-    /// context. This span is the page-local horizontal band that accepted the
-    /// float, not a CSS logical inline interval; vertical-writing float
-    /// avoidance maps its logical inline availability into this typed result.
-    /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
-    pub(in crate::layout) available_span: PageInlineSpan,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct FloatAvoidingBfcMeasurement {
-    pub(in crate::layout) border_box_width: f32,
-    pub(in crate::layout) border_box_height: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct FloatAvoidingBfcPlacement {
-    pub(in crate::layout) left: f32,
-    pub(in crate::layout) top: f32,
-    pub(in crate::layout) available_width: f32,
-    pub(in crate::layout) border_box_width: f32,
-    pub(in crate::layout) border_box_height: f32,
-}
-
-impl FloatPlacement {
-    pub(in crate::layout) fn new(left: f32, top: f32, available_width: f32) -> Self {
-        Self {
-            origin: PageTopPoint::new(left, top),
-            available_span: PageInlineSpan::new(left, available_width),
-        }
-    }
-
-    pub(in crate::layout) fn left(self) -> f32 {
-        self.origin.x()
-    }
-
-    pub(in crate::layout) fn top(self) -> f32 {
-        self.origin.top_y()
-    }
-
-    pub(in crate::layout) fn available_width(self) -> f32 {
-        self.available_span.width()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct FloatClearanceResolution {
-    pub(in crate::layout) top: f32,
-    pub(in crate::layout) continued_float: Option<FloatId>,
-}
+use crate::image_store::ImageId;
 
 /// Page-local containing block for positioned descendants.
 ///
@@ -108,27 +13,54 @@ pub(in crate::layout) struct FloatClearanceResolution {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct ContainingBlock {
     pub(in crate::layout) rect: PageTopRect,
+    /// Page containing the block-start fragment when known.
+    ///
+    /// Page ownership is required for nested positioned fragmentation. Normal
+    /// formatting contexts that have not yet exported durable fragment
+    /// metadata leave this unknown and use their source page as a fallback.
+    pub(in crate::layout) origin_page_index: Option<usize>,
+}
+
+/// Physical content-box geometry of a normal-flow containing block.
+///
+/// Every in-flow formatting context supplies its used content box while its
+/// children lay out. Relatively positioned descendants resolve percentage
+/// insets against that box, even though it does not create an absolute
+/// positioning containing-block scope:
+/// <https://www.w3.org/TR/css-position-3/#relative-positioning>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct NormalFlowRelativeContainingBlock {
+    pub(in crate::layout) physical_content_width: PhysicalContentWidth,
+    pub(in crate::layout) physical_content_height: Option<PhysicalContentHeight>,
 }
 
 impl ContainingBlock {
     pub(in crate::layout) fn from_page_top_rect(rect: PageTopRect) -> Self {
-        Self { rect }
+        Self {
+            rect,
+            origin_page_index: None,
+        }
+    }
+
+    pub(in crate::layout) fn on_page(mut self, page_index: usize) -> Self {
+        self.origin_page_index = Some(page_index);
+        self
     }
 
     pub(in crate::layout) fn x(self) -> f32 {
-        self.rect.x
+        self.rect.x()
     }
 
     pub(in crate::layout) fn top_y(self) -> f32 {
-        self.rect.top_y
+        self.rect.top_y()
     }
 
     pub(in crate::layout) fn width(self) -> f32 {
-        self.rect.width
+        self.rect.width()
     }
 
     pub(in crate::layout) fn height(self) -> f32 {
-        self.rect.height
+        self.rect.height()
     }
 }
 
@@ -138,38 +70,156 @@ impl ContainingBlock {
 /// from the containing block's perpendicular physical axis, with fallback
 /// constraints when that axis is indefinite:
 /// <https://www.w3.org/TR/css-writing-modes-3/#orthogonal-auto>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum OrthogonalAvailableSizeSource {
+    /// The initial containing block supplies the fallback when no intervening
+    /// scroll container has a usable block-size constraint.
+    InitialContainingBlock,
+    /// The nearest scroll container supplies the fallback. This is layout
+    /// availability only and never makes a percentage basis definite.
+    NearestScrollContainer,
+}
+
+/// A physical-height constraint used solely to choose the available inline
+/// size of an orthogonal descendant.
+///
+/// This remains distinct from [`PercentageBasis`]: CSS Writing Modes can use
+/// a nearest-scroll-container or initial-containing-block fallback to fit
+/// lines while CSS Sizing keeps percentage resolution indefinite.
+/// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-auto>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct OrthogonalAvailableHeight {
+    pub(in crate::layout) value: PhysicalContentHeight,
+    pub(in crate::layout) source: OrthogonalAvailableSizeSource,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct ChildAvailableSpace {
     pub(in crate::layout) writing_mode: WritingMode,
-    pub(in crate::layout) physical_content_width: f32,
-    pub(in crate::layout) physical_content_height: Option<f32>,
-    pub(in crate::layout) fallback_physical_content_height: f32,
+    /// Definite physical width of this formatting context's content box.
+    ///
+    /// This is deliberately not its logical inline size: vertical descendants
+    /// use the physical height instead. Keeping the physical projection here
+    /// prevents callers from accidentally reusing a logical scalar across an
+    /// orthogonal writing-mode boundary.
+    pub(in crate::layout) physical_content_width: PhysicalContentWidth,
+    /// Physical height of this formatting context's content box when it is a
+    /// definite percentage basis. An orthogonal-flow fallback is deliberately
+    /// not stored here: CSS Writing Modes can use that fallback to choose an
+    /// available line measure without making percentages definite.
+    ///
+    /// <https://drafts.csswg.org/css-writing-modes-4/#orthogonal-auto>
+    pub(in crate::layout) physical_content_height: PercentageBasis<PhysicalContentHeight>,
+    /// Scoped physical-height fallback used only for CSS Writing Modes
+    /// orthogonal-flow layout when the actual physical height is indefinite.
+    /// This tracks the nearest scroll container independently of percentage
+    /// definiteness.
+    pub(in crate::layout) orthogonal_available_height: OrthogonalAvailableHeight,
 }
+
+/// Provenance for the inline percentage basis used while collecting an
+/// intrinsic inline contribution.
+///
+/// The line-breaking width remains available as a geometric constraint, but
+/// it is not necessarily a definite percentage basis: intrinsic sizing may be
+/// determining that very width. CSS Sizing requires cyclic percentages to act
+/// as `auto` in that case.
+/// <https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum IntrinsicInlinePercentageBasisSource {
+    MeasurementAvailableWidth,
+}
+
+pub(in crate::layout) type IntrinsicInlinePercentageBasis =
+    PercentageBasis<ContentBoxLength, IntrinsicInlinePercentageBasisSource>;
 
 impl ChildAvailableSpace {
     pub(in crate::layout) fn new(
         writing_mode: WritingMode,
-        physical_content_width: f32,
-        physical_content_height: Option<f32>,
-        fallback_physical_content_height: f32,
+        physical_content_width: PhysicalContentWidth,
+        physical_content_height: Option<PhysicalContentHeight>,
+        fallback_physical_content_height: PhysicalContentHeight,
     ) -> Self {
         Self {
             writing_mode,
-            physical_content_width: physical_content_width.max(0.0),
-            physical_content_height: physical_content_height.map(|height| height.max(0.0)),
-            fallback_physical_content_height: fallback_physical_content_height.max(0.0),
+            physical_content_width: PhysicalContentWidth::new(content_box_pt(
+                physical_content_width.points().max(0.0),
+            )),
+            physical_content_height: physical_content_height.map_or_else(
+                PercentageBasis::indefinite,
+                |height| {
+                    PercentageBasis::definite(PhysicalContentHeight::new(content_box_pt(
+                        height.points().max(0.0),
+                    )))
+                },
+            ),
+            orthogonal_available_height: OrthogonalAvailableHeight {
+                value: PhysicalContentHeight::new(content_box_pt(
+                    fallback_physical_content_height.points().max(0.0),
+                )),
+                source: OrthogonalAvailableSizeSource::InitialContainingBlock,
+            },
         }
     }
 
-    pub(in crate::layout) fn available_physical_height(self) -> f32 {
-        self.physical_content_height
-            .unwrap_or(self.fallback_physical_content_height)
+    /// Replace the inherited orthogonal-flow fallback without changing the
+    /// physical percentage basis.
+    pub(in crate::layout) fn with_orthogonal_available_height(
+        mut self,
+        height: OrthogonalAvailableHeight,
+    ) -> Self {
+        self.orthogonal_available_height = OrthogonalAvailableHeight {
+            value: PhysicalContentHeight::new(content_box_pt(height.value.points().max(0.0))),
+            source: height.source,
+        };
+        self
     }
 
-    pub(in crate::layout) fn logical_inline_size_for(self, writing_mode: WritingMode) -> f32 {
-        match writing_mode {
-            WritingMode::HorizontalTb => self.physical_content_width,
-            WritingMode::VerticalRl | WritingMode::VerticalLr => self.available_physical_height(),
+    pub(in crate::layout) fn available_physical_height(self) -> PhysicalContentHeight {
+        self.physical_content_height
+            .value()
+            .unwrap_or(self.orthogonal_available_height.value)
+    }
+
+    /// The physical height percentage basis exported to descendants.
+    ///
+    /// This intentionally differs from [`Self::available_physical_height`]:
+    /// fallback available space is not a definite CSS percentage basis.
+    pub(in crate::layout) fn physical_height_percentage_basis(
+        self,
+    ) -> PercentageBasis<PhysicalContentHeight> {
+        self.physical_content_height
+    }
+
+    pub(in crate::layout) fn logical_inline_size_for(
+        self,
+        writing_mode: WritingMode,
+    ) -> LogicalInlineContentSize {
+        if WritingModeAxes::new(writing_mode, Direction::Ltr).swaps_physical_axes() {
+            LogicalInlineContentSize::new(self.available_physical_height().content_box_length())
+        } else {
+            LogicalInlineContentSize::new(self.physical_content_width.content_box_length())
+        }
+    }
+
+    /// Return the definite logical inline percentage basis for a descendant.
+    ///
+    /// Percentage resolution follows the descendant's logical inline axis,
+    /// while line fitting may use a non-definite orthogonal fallback. Keeping
+    /// these paths separate prevents intrinsic layout from resolving cyclic
+    /// percentages against an initial-containing-block fallback.
+    /// <https://drafts.csswg.org/css-sizing-3/#definite>
+    pub(in crate::layout) fn logical_inline_percentage_basis_for(
+        self,
+        writing_mode: WritingMode,
+    ) -> PercentageBasis<LogicalInlineContentSize> {
+        if WritingModeAxes::new(writing_mode, Direction::Ltr).swaps_physical_axes() {
+            self.physical_height_percentage_basis()
+                .map_value(|height| LogicalInlineContentSize::new(height.content_box_length()))
+        } else {
+            PercentageBasis::definite(LogicalInlineContentSize::new(
+                self.physical_content_width.content_box_length(),
+            ))
         }
     }
 }
@@ -182,25 +232,38 @@ impl ChildAvailableSpace {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct OverflowClip {
     pub(in crate::layout) rect: PaintRect,
-    pub(in crate::layout) line_mode: OverflowClipLineMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::layout) enum OverflowClipLineMode {
-    Intersect,
-    Contain,
+    pub(in crate::layout) clips_x: bool,
+    pub(in crate::layout) clips_y: bool,
 }
 
 impl OverflowClip {
     pub(in crate::layout) fn from_paint_rect(rect: PaintRect) -> Self {
         Self {
             rect,
-            line_mode: OverflowClipLineMode::Intersect,
+            clips_x: true,
+            clips_y: true,
         }
     }
 
-    pub(in crate::layout) fn with_line_mode(mut self, line_mode: OverflowClipLineMode) -> Self {
-        self.line_mode = line_mode;
+    /// Construct an overflow clip that constrains only the requested physical
+    /// axes. `overflow: clip visible` must not acquire rounded or rectangular
+    /// clipping on its visible axis.
+    /// <https://www.w3.org/TR/css-overflow-3/#overflow-properties>
+    pub(in crate::layout) fn from_paint_rect_with_axes(
+        rect: PaintRect,
+        clips_x: bool,
+        clips_y: bool,
+    ) -> Self {
+        Self {
+            rect,
+            clips_x,
+            clips_y,
+        }
+    }
+
+    pub(in crate::layout) fn with_axes(mut self, clips_x: bool, clips_y: bool) -> Self {
+        self.clips_x = clips_x;
+        self.clips_y = clips_y;
         self
     }
 
@@ -219,17 +282,49 @@ impl OverflowClip {
     pub(in crate::layout) fn paint_rect(self) -> PaintRect {
         self.rect
     }
+
+    pub(in crate::layout) fn intersect(self, other: Self) -> Option<Self> {
+        let rect = self.rect.intersection(&other.rect)?;
+        Some(Self {
+            rect,
+            clips_x: self.clips_x || other.clips_x,
+            clips_y: self.clips_y || other.clips_y,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(in crate::layout) struct DecodedPngImage {
+    pub(in crate::layout) image_id: Option<ImageId>,
     pub(in crate::layout) pixel_width: u32,
     pub(in crate::layout) pixel_height: u32,
-    pub(in crate::layout) rgb: Vec<u8>,
-    pub(in crate::layout) alpha: Option<Vec<u8>>,
+    pub(in crate::layout) rgb: Rc<[u8]>,
+    pub(in crate::layout) alpha: Option<Rc<[u8]>>,
+    pub(in crate::layout) color_space: crate::color::RasterColorSpace,
 }
 
 impl DecodedPngImage {
+    pub(in crate::layout) fn new(
+        pixel_width: u32,
+        pixel_height: u32,
+        rgb: Vec<u8>,
+        alpha: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            image_id: None,
+            pixel_width,
+            pixel_height,
+            rgb: Rc::from(rgb.into_boxed_slice()),
+            alpha: alpha.map(|alpha| Rc::from(alpha.into_boxed_slice())),
+            color_space: crate::color::RasterColorSpace::SRGB,
+        }
+    }
+
+    pub(in crate::layout) fn in_color_space(mut self, color_space: crate::css::ColorSpace) -> Self {
+        self.color_space = crate::color::RasterColorSpace::BuiltIn(color_space);
+        self
+    }
+
     pub(in crate::layout) fn pixel_size(&self) -> RasterPixelSize {
         RasterPixelSize::new(self.pixel_width, self.pixel_height)
     }
@@ -239,25 +334,71 @@ impl DecodedPngImage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::layout) struct ListState {
-    pub(in crate::layout) step: i32,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(in crate::layout) struct CounterSet {
-    pub(in crate::layout) values: HashMap<String, Vec<i32>>,
+    pub(in crate::layout) values: HashMap<String, Vec<CounterInstance>>,
     pub(in crate::layout) frames: Vec<CounterFrame>,
+    pub(in crate::layout) next_scope_id: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) struct CounterInstance {
+    pub(in crate::layout) value: CounterValue,
+    pub(in crate::layout) reversed: bool,
+    pub(in crate::layout) creator_scope: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) struct CounterOriginKey {
+    pub(in crate::layout) element_id: crate::dom::ElementId,
+    pub(in crate::layout) source: box_tree::CounterEventSource,
+}
+
+impl CounterOriginKey {
+    pub(in crate::layout) fn new(element: &Element, source: box_tree::CounterEventSource) -> Self {
+        Self {
+            element_id: element.id,
+            source,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) struct CounterResetKey {
+    pub(in crate::layout) origin: CounterOriginKey,
+    pub(in crate::layout) declaration_index: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(in crate::layout) struct CounterPlan {
+    pub(in crate::layout) reversed_initial_values: HashMap<CounterResetKey, CounterValue>,
+    pub(in crate::layout) values_at_origin: HashMap<CounterOriginKey, HashMap<String, Vec<i32>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::layout) struct CounterFrame {
     pub(in crate::layout) base_lengths: HashMap<String, usize>,
+    pub(in crate::layout) scope_id: usize,
+    /// The innermost style-containment boundary visible to this scope.
+    ///
+    /// `counter-increment` and `counter-set` must not mutate instances
+    /// created outside this scope. See CSS Containment 2 § 3.3:
+    /// <https://drafts.csswg.org/css-contain-2/#containment-style>.
+    pub(in crate::layout) counter_mutation_floor: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(in crate::layout) struct CounterScopeState {
     pub(in crate::layout) temporary_counters: Vec<String>,
+    /// Generated pseudo-content is evaluated against the durable source-order
+    /// counter snapshot and restores the caller's transient layout state when
+    /// complete.
+    pub(in crate::layout) previous_counter_set: Option<CounterSet>,
+    /// Style containment also scopes generated-quote nesting.  The enclosing
+    /// quote depth remains observable inside the scope, but quote operations
+    /// performed there must not affect following siblings outside it.
+    /// <https://drafts.csswg.org/css-contain-2/#containment-style>
+    pub(in crate::layout) previous_quote_depth: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +410,11 @@ pub(in crate::layout) enum GeneratedPseudoCounterMode {
 #[derive(Debug, Clone, PartialEq)]
 pub(in crate::layout) struct PositionedPaintLayer {
     pub(in crate::layout) page_index: usize,
+    /// The originating box's computed style is retained with the final
+    /// page-space stacking context so enclosing scroll containers can form
+    /// snap areas only after positioned remapping is complete.
+    pub(in crate::layout) source_style: ComputedStyle,
+    pub(in crate::layout) source_is_target: bool,
     pub(in crate::layout) stack_level: StackLevel,
     pub(in crate::layout) context: PaintStackingContext,
     pub(in crate::layout) links: Vec<RenderedLink>,
@@ -276,7 +422,7 @@ pub(in crate::layout) struct PositionedPaintLayer {
 }
 
 impl PositionedPaintLayer {
-    pub(in crate::layout) fn translated(mut self, offset: PaintVector) -> Self {
+    pub(in crate::layout) fn translated(mut self, offset: PaintTranslation) -> Self {
         self.context = self.context.translated(offset);
         self.links = self
             .links
@@ -326,8 +472,8 @@ impl EscapedAtomTranslation {
         }
     }
 
-    pub(in crate::layout) fn escape_offset(self, atom_local_y_offset: f32) -> PaintVector {
-        PaintVector::new(
+    pub(in crate::layout) fn escape_offset(self, atom_local_y_offset: f32) -> PaintTranslation {
+        PaintTranslation::new(
             self.normalize_x,
             if self.translate_y_with_atom {
                 atom_local_y_offset
@@ -337,8 +483,8 @@ impl EscapedAtomTranslation {
         )
     }
 
-    pub(in crate::layout) fn atom_offset(self, atom_x: f32, atom_y: f32) -> PaintVector {
-        PaintVector::new(
+    pub(in crate::layout) fn atom_offset(self, atom_x: f32, atom_y: f32) -> PaintTranslation {
+        PaintTranslation::new(
             if self.translate_x_with_atom {
                 atom_x
             } else {
@@ -355,6 +501,10 @@ impl EscapedAtomTranslation {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(in crate::layout) struct FixedPaintLayer {
+    /// The source element makes speculative layout cleanup precise: table
+    /// track sizing may discover a fixed descendant before its committed
+    /// transformed containing block is known.
+    pub(in crate::layout) source_element: crate::dom::ElementId,
     pub(in crate::layout) stack_level: StackLevel,
     pub(in crate::layout) context: PaintStackingContext,
     pub(in crate::layout) links: Vec<RenderedLink>,
@@ -408,7 +558,11 @@ impl StackingContextPolicy {
         let effects = assets::paint_effects_for_element_box(element, style, bounds);
         let is_real_stacking_context = matches!(style.position, Position::Fixed | Position::Sticky)
             || style.z_index.is_some()
-            || style_creates_effect_stacking_context(style, effects);
+            || style_creates_effect_stacking_context_with_containment(
+                style,
+                effects,
+                property_containment_applies_to_element(element, style),
+            );
         let is_fake_context = !is_real_stacking_context
             && matches!(style.position, Position::Relative | Position::Absolute);
         Self {
@@ -432,7 +586,7 @@ impl StackingContextPolicy {
             establishes_containing_block: matches!(
                 style.position,
                 Position::Relative | Position::Absolute | Position::Fixed | Position::Sticky
-            ) || !style.transform.is_empty(),
+            ) || style.has_transform(),
             captures_positioned_descendants: is_real_stacking_context,
             effects,
         }
@@ -443,8 +597,16 @@ impl StackingContextPolicy {
         style: &ComputedStyle,
         bounds: PaintClip,
     ) -> Self {
-        let effects = assets::paint_effects_for_element_box(element, style, bounds);
-        Self::for_non_positioned_effect_with_effects(style, effects)
+        let mut effects = assets::paint_effects_for_element_box(element, style, bounds);
+        // Block/flex/grid layout owns the exact used padding-box clip. The
+        // dispatcher only sees descendant ink bounds, which are not a valid
+        // overflow clip rectangle.
+        effects.overflow_clip = None;
+        Self::for_non_positioned_effect_with_effects(
+            style,
+            effects,
+            property_containment_applies_to_element(element, style),
+        )
     }
 
     pub(in crate::layout) fn for_non_positioned_style_effect(
@@ -452,12 +614,13 @@ impl StackingContextPolicy {
         bounds: PaintClip,
     ) -> Self {
         let effects = assets::paint_effects_for_box(style, bounds);
-        Self::for_non_positioned_effect_with_effects(style, effects)
+        Self::for_non_positioned_effect_with_effects(style, effects, true)
     }
 
     pub(in crate::layout) fn for_non_positioned_effect_with_effects(
         style: &ComputedStyle,
         effects: PaintEffects,
+        containment_applies: bool,
     ) -> Self {
         let in_flow_positioned = matches!(style.position, Position::Relative | Position::Sticky);
         let stack_level = if in_flow_positioned {
@@ -467,7 +630,11 @@ impl StackingContextPolicy {
         };
         let is_real_stacking_context = matches!(style.position, Position::Sticky)
             || (style.position == Position::Relative && style.z_index.is_some())
-            || style_creates_effect_stacking_context(style, effects);
+            || style_creates_effect_stacking_context_with_containment(
+                style,
+                effects,
+                containment_applies,
+            );
         let is_fake_context = style.position == Position::Relative && !is_real_stacking_context;
         Self {
             parent_band: if in_flow_positioned {
@@ -493,7 +660,7 @@ impl StackingContextPolicy {
             is_real_stacking_context,
             is_fake_context,
             creates_compositing_group: effects.needs_group(),
-            establishes_containing_block: !style.transform.is_empty(),
+            establishes_containing_block: style.has_transform(),
             captures_positioned_descendants: is_real_stacking_context,
             effects,
         }
@@ -522,7 +689,7 @@ impl StackingContextPolicy {
             is_real_stacking_context,
             is_fake_context: true,
             creates_compositing_group: effects.needs_group(),
-            establishes_containing_block: !style.transform.is_empty(),
+            establishes_containing_block: style.has_transform(),
             captures_positioned_descendants: is_real_stacking_context,
             effects,
         }
@@ -530,6 +697,12 @@ impl StackingContextPolicy {
 
     pub(in crate::layout) fn for_flex_item(style: &ComputedStyle, bounds: PaintClip) -> Self {
         let stack_level = StackLevel::from_optional_z_index(style.z_index);
+        // The grid/flex item's independent formatting context owns the used
+        // padding-box clip, and its replayed paint is captured as one atomic
+        // item context. Keep that clip on the item policy so descendants
+        // whose geometry was intentionally retained for positioning and
+        // compositing cannot escape when the context is serialized.
+        // <https://www.w3.org/TR/css-overflow-3/#overflow-clipping>
         let effects = assets::paint_effects_for_box(style, bounds);
         let is_real_stacking_context =
             style.z_index.is_some() || style_creates_effect_stacking_context(style, effects);
@@ -549,10 +722,21 @@ impl StackingContextPolicy {
             is_real_stacking_context,
             is_fake_context: false,
             creates_compositing_group: effects.needs_group(),
-            establishes_containing_block: !style.transform.is_empty(),
+            establishes_containing_block: style.has_transform(),
             captures_positioned_descendants: is_real_stacking_context,
             effects,
         }
+    }
+
+    /// Return the stacking policy for a grid item fragment.
+    ///
+    /// CSS Grid items, like flex items, paint as stacking-context-capable
+    /// formatting-context items even when `position` is `static`; a non-auto
+    /// `z-index` therefore creates a stacking context:
+    /// <https://www.w3.org/TR/css-grid-1/#z-order> and
+    /// <https://www.w3.org/TR/css-position-3/#painting-order>.
+    pub(in crate::layout) fn for_grid_item(style: &ComputedStyle, bounds: PaintClip) -> Self {
+        Self::for_flex_item(style, bounds)
     }
 
     pub(in crate::layout) fn style_needs_non_positioned_scope(
@@ -560,13 +744,14 @@ impl StackingContextPolicy {
         style: &ComputedStyle,
     ) -> bool {
         matches!(style.position, Position::Relative | Position::Sticky)
-            || style_creates_effect_stacking_context(
+            || style_creates_effect_stacking_context_with_containment(
                 style,
                 assets::paint_effects_for_element_box(
                     element,
                     style,
                     PaintClip::from_paint_rect(paint_space_rect(0.0, 0.0, 0.0, 0.0)),
                 ),
+                property_containment_applies_to_element(element, style),
             )
             || used_overflow_clips_element(element, style)
     }
@@ -575,6 +760,14 @@ impl StackingContextPolicy {
 pub(in crate::layout) fn style_creates_effect_stacking_context(
     style: &ComputedStyle,
     effects: PaintEffects,
+) -> bool {
+    style_creates_effect_stacking_context_with_containment(style, effects, true)
+}
+
+fn style_creates_effect_stacking_context_with_containment(
+    style: &ComputedStyle,
+    effects: PaintEffects,
+    containment_applies: bool,
 ) -> bool {
     effects.opacity < 1.0
         || effects.transform.is_some()
@@ -588,7 +781,7 @@ pub(in crate::layout) fn style_creates_effect_stacking_context(
         || !matches!(style.filter, FilterValue::None)
         || style.clip_path != ClipPath::None
         || !matches!(style.mask, MaskValue::None)
-        || style.contain.paint
+        || (containment_applies && (style.contain.layout || style.contain.paint))
         || matches!(
             style.content_visibility,
             ContentVisibility::Auto | ContentVisibility::Hidden
@@ -728,11 +921,35 @@ pub(in crate::layout) struct ListMarker {
     pub(in crate::layout) suffix_space: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl ListMarker {
+    pub(in crate::layout) fn participates_in_first_line(&self) -> bool {
+        self.position == ListStylePosition::Inside
+    }
+
+    pub(in crate::layout) fn paints_outside(&self) -> bool {
+        self.position == ListStylePosition::Outside && !self.participates_in_first_line()
+    }
+
+    pub(in crate::layout) fn follows_content_in_first_line(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(in crate::layout) struct MarkerImage {
     pub(in crate::layout) decoded: DecodedPngImage,
+    pub(in crate::layout) svg: Option<SharedSvgAsset>,
     pub(in crate::layout) width: f32,
     pub(in crate::layout) height: f32,
+}
+
+impl PartialEq for MarkerImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.decoded == other.decoded
+            && self.width == other.width
+            && self.height == other.height
+            && self.svg.as_ref().map(Rc::as_ptr) == other.svg.as_ref().map(Rc::as_ptr)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -741,11 +958,11 @@ pub(in crate::layout) struct InlineWord {
     pub(in crate::layout) style: InlineStyle,
     pub(in crate::layout) baseline_shift: f32,
     pub(in crate::layout) visual_offset: InlineVisualOffset,
-    pub(in crate::layout) link_target: Option<String>,
+    pub(in crate::layout) link_target: Option<Rc<str>>,
     pub(in crate::layout) mergeable: bool,
     pub(in crate::layout) source: InlineTextSource,
     pub(in crate::layout) hanging_edges: InlineHangingEdges,
-    pub(in crate::layout) ancestor_inline_decorations: Vec<InlineAncestorDecoration>,
+    pub(in crate::layout) ancestor_inline_decorations: Rc<[InlineAncestorDecoration]>,
 }
 
 pub(in crate::layout) type InlineStyle = Rc<ComputedStyle>;
@@ -768,7 +985,7 @@ impl InlineVisualOffset {
 
     pub(in crate::layout) fn from_relative_offset(offset: RelativeOffset) -> Self {
         Self {
-            vector: InlineVector::new(offset.x, offset.y),
+            vector: InlineVector::new(offset.x(), offset.y()),
         }
     }
 
@@ -805,7 +1022,19 @@ pub(in crate::layout) struct InlineFragmentData {
     pub(in crate::layout) mergeable: bool,
     pub(in crate::layout) source: InlineTextSource,
     pub(in crate::layout) generated_leader: bool,
+    /// Whether a typographic pseudo gives this text fragment an inline
+    /// decoration even though its originating display type is block-level.
+    pub(in crate::layout) force_inline_background_paint: bool,
     pub(in crate::layout) hanging_edges: InlineHangingEdges,
+    /// True when this fragment is a selected source-range slice whose glyph
+    /// forms were retained from its unbroken shaping run.
+    pub(in crate::layout) preserves_source_shaping: bool,
+    /// UAX #9 direction resolved for a selected visual source slice.
+    ///
+    /// Logical source fragments leave this unset. It is only carried after
+    /// mixed-inline visual reordering so the final paint shaping pass can
+    /// preserve the already-selected order and glyph mirroring level.
+    pub(in crate::layout) resolved_bidi_direction: Option<ResolvedBidiDirection>,
     pub(in crate::layout) ancestor_inline_decorations: Rc<[InlineAncestorDecoration]>,
 }
 
@@ -830,42 +1059,43 @@ impl InlineFragment {
         ancestor_inline_decorations: Vec<InlineAncestorDecoration>,
     ) -> Self {
         Self::new_shared_style(
-            text,
+            Rc::<str>::from(text.into()),
             Rc::new(style),
             baseline_shift,
-            link_target,
+            link_target.map(Rc::from),
             mergeable,
             source,
             generated_leader,
             hanging_edges,
-            ancestor_inline_decorations,
+            Rc::from(ancestor_inline_decorations.into_boxed_slice()),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(in crate::layout) fn new_shared_style(
-        text: impl Into<String>,
+        text: impl Into<Rc<str>>,
         style: InlineStyle,
         baseline_shift: f32,
-        link_target: Option<String>,
+        link_target: Option<Rc<str>>,
         mergeable: bool,
         source: InlineTextSource,
         generated_leader: bool,
         hanging_edges: InlineHangingEdges,
-        ancestor_inline_decorations: Vec<InlineAncestorDecoration>,
+        ancestor_inline_decorations: Rc<[InlineAncestorDecoration]>,
     ) -> Self {
         Self {
             data: Rc::new(InlineFragmentData {
-                text: Rc::from(text.into()),
+                text: text.into(),
                 style,
-                link_target: link_target.map(Rc::from),
+                link_target,
                 mergeable,
                 source,
                 generated_leader,
+                force_inline_background_paint: false,
                 hanging_edges,
-                ancestor_inline_decorations: Rc::from(
-                    ancestor_inline_decorations.into_boxed_slice(),
-                ),
+                preserves_source_shaping: false,
+                resolved_bidi_direction: None,
+                ancestor_inline_decorations,
             }),
             baseline_shift,
             visual_offset: InlineVisualOffset::zero(),
@@ -893,12 +1123,34 @@ impl InlineFragment {
         self
     }
 
-    pub(in crate::layout) fn set_text(&mut self, text: impl Into<String>) {
-        Rc::make_mut(&mut self.data).text = Rc::from(text.into());
+    pub(in crate::layout) fn set_text(&mut self, text: impl Into<Rc<str>>) {
+        Rc::make_mut(&mut self.data).text = text.into();
     }
 
     pub(in crate::layout) fn set_mergeable(&mut self, mergeable: bool) {
         Rc::make_mut(&mut self.data).mergeable = mergeable;
+    }
+
+    pub(in crate::layout) fn set_preserves_source_shaping(&mut self, value: bool) {
+        Rc::make_mut(&mut self.data).preserves_source_shaping = value;
+    }
+
+    pub(in crate::layout) fn set_resolved_bidi_direction(
+        &mut self,
+        value: Option<ResolvedBidiDirection>,
+    ) {
+        Rc::make_mut(&mut self.data).resolved_bidi_direction = value;
+    }
+
+    /// Preserve a `::first-line` background on text directly owned by a block
+    /// formatting context. Such a fragment has a block computed display, but
+    /// its pseudo decoration still paints as an inline line fragment.
+    pub(in crate::layout) fn set_force_inline_background_paint(&mut self, value: bool) {
+        Rc::make_mut(&mut self.data).force_inline_background_paint = value;
+    }
+
+    pub(in crate::layout) fn force_inline_background_paint(&self) -> bool {
+        self.data.force_inline_background_paint
     }
 
     #[cfg(test)]
@@ -957,6 +1209,13 @@ pub(in crate::layout) trait InlineFragmentAccess {
     fn mergeable(&self) -> bool;
     fn source(&self) -> InlineTextSource;
     fn generated_leader(&self) -> bool;
+    /// A shaped selected-line artifact that can be reused without losing
+    /// source-run contextual shaping at a soft wrap.
+    fn selected_shaped(&self) -> Option<&ShapedInlineLine> {
+        None
+    }
+    fn preserves_source_shaping(&self) -> bool;
+    fn resolved_bidi_direction(&self) -> Option<ResolvedBidiDirection>;
     fn ancestor_inline_decorations(&self) -> &[InlineAncestorDecoration];
 }
 
@@ -993,6 +1252,14 @@ impl InlineFragmentAccess for InlineFragment {
         self.generated_leader()
     }
 
+    fn preserves_source_shaping(&self) -> bool {
+        self.data.preserves_source_shaping
+    }
+
+    fn resolved_bidi_direction(&self) -> Option<ResolvedBidiDirection> {
+        self.data.resolved_bidi_direction
+    }
+
     fn ancestor_inline_decorations(&self) -> &[InlineAncestorDecoration] {
         self.ancestor_inline_decorations()
     }
@@ -1001,21 +1268,22 @@ impl InlineFragmentAccess for InlineFragment {
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct PendingInlineFragment<'a> {
     fragment: &'a InlineFragment,
+    shaped: Option<&'a ShapedInlineLine>,
     baseline_shift: f32,
     visual_offset: InlineVisualOffset,
 }
 
 impl<'a> PendingInlineFragment<'a> {
-    pub(in crate::layout) fn new(fragment: &'a InlineFragment) -> Self {
+    pub(in crate::layout) fn new(
+        fragment: &'a InlineFragment,
+        shaped: Option<&'a ShapedInlineLine>,
+    ) -> Self {
         Self {
             fragment,
+            shaped,
             baseline_shift: fragment.baseline_shift,
             visual_offset: fragment.visual_offset,
         }
-    }
-
-    pub(in crate::layout) fn add_baseline_shift(&mut self, shift: f32) {
-        self.baseline_shift += shift;
     }
 
     pub(in crate::layout) fn to_owned_fragment(self) -> InlineFragment {
@@ -1059,6 +1327,18 @@ impl InlineFragmentAccess for PendingInlineFragment<'_> {
         self.fragment.generated_leader()
     }
 
+    fn selected_shaped(&self) -> Option<&ShapedInlineLine> {
+        self.shaped
+    }
+
+    fn preserves_source_shaping(&self) -> bool {
+        self.fragment.data.preserves_source_shaping
+    }
+
+    fn resolved_bidi_direction(&self) -> Option<ResolvedBidiDirection> {
+        self.fragment.data.resolved_bidi_direction
+    }
+
     fn ancestor_inline_decorations(&self) -> &[InlineAncestorDecoration] {
         self.fragment.ancestor_inline_decorations()
     }
@@ -1068,6 +1348,7 @@ impl InlineFragmentAccess for PendingInlineFragment<'_> {
 pub(in crate::layout) enum InlineTextSource {
     Normal,
     Generated,
+    RunIn,
     Marker,
 }
 
@@ -1119,11 +1400,24 @@ pub(in crate::layout) struct InlineStaticPosition {
 pub(in crate::layout) struct StaticHorizontalPosition {
     pub(in crate::layout) left: f32,
     pub(in crate::layout) right: f32,
+    pub(in crate::layout) can_fall_outside: bool,
 }
 
 impl StaticHorizontalPosition {
     pub(in crate::layout) fn new(left: f32, right: f32) -> Self {
-        Self { left, right }
+        Self {
+            left,
+            right,
+            can_fall_outside: false,
+        }
+    }
+
+    pub(in crate::layout) fn new_unclamped(left: f32, right: f32) -> Self {
+        Self {
+            left,
+            right,
+            can_fall_outside: true,
+        }
     }
 }
 
@@ -1132,6 +1426,38 @@ pub(in crate::layout) struct AbsoluteStaticPosition {
     page_left_x: f32,
     page_right_x: f32,
     page_top_y: f32,
+    horizontal_can_fall_outside: bool,
+    has_vertical_position: bool,
+    grid_alignment: Option<GridAbsposStaticAlignment>,
+}
+
+/// Grid data that remains relevant until an absolutely positioned box's used
+/// size and automatic insets are known.
+///
+/// The grid area is deliberately distinct from the CSS containing block. It
+/// supplies the alignment container for a grid-positioned box, while absolute
+/// positioning still resolves inset equations against its actual containing
+/// block: <https://www.w3.org/TR/css-grid-1/#abspos> and
+/// <https://drafts.csswg.org/css-align-3/#abspos-align>.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct GridAbsposStaticAlignment {
+    pub(in crate::layout) area: PageTopRect,
+    pub(in crate::layout) writing_mode: WritingMode,
+    pub(in crate::layout) direction: Direction,
+    pub(in crate::layout) justify_items: css::SelfAlignment,
+    pub(in crate::layout) align_items: css::SelfAlignment,
+}
+
+impl GridAbsposStaticAlignment {
+    pub(in crate::layout) fn new(area: PageTopRect, container_style: &ComputedStyle) -> Self {
+        Self {
+            area,
+            writing_mode: container_style.writing_mode,
+            direction: container_style.direction,
+            justify_items: container_style.justify_items,
+            align_items: container_style.align_items,
+        }
+    }
 }
 
 impl AbsoluteStaticPosition {
@@ -1149,25 +1475,76 @@ impl AbsoluteStaticPosition {
         page_right_x: f32,
         page_top_y: f32,
     ) -> Self {
+        Self::from_page_rect_with_horizontal_outside(page_left_x, page_right_x, page_top_y, false)
+    }
+
+    pub(in crate::layout) fn from_page_rect_with_horizontal_outside(
+        page_left_x: f32,
+        page_right_x: f32,
+        page_top_y: f32,
+        horizontal_can_fall_outside: bool,
+    ) -> Self {
         Self {
             page_left_x,
             page_right_x,
             page_top_y,
+            horizontal_can_fall_outside,
+            has_vertical_position: true,
+            grid_alignment: None,
         }
+    }
+
+    /// Store only the inline-axis part of a static-position rectangle.
+    ///
+    /// A blockified box encountered within an inline run retains that run's
+    /// inline position, while its block position is still selected by the
+    /// block formatting context's hypothetical in-flow box.
+    /// <https://www.w3.org/TR/css-position-3/#static-position>
+    pub(in crate::layout) fn from_page_horizontal_position(
+        page_left_x: f32,
+        page_right_x: f32,
+    ) -> Self {
+        Self {
+            page_left_x,
+            page_right_x,
+            page_top_y: 0.0,
+            horizontal_can_fall_outside: false,
+            has_vertical_position: false,
+            grid_alignment: None,
+        }
+    }
+
+    pub(in crate::layout) fn with_grid_alignment(
+        mut self,
+        grid_alignment: GridAbsposStaticAlignment,
+    ) -> Self {
+        self.grid_alignment = Some(grid_alignment);
+        self
+    }
+
+    pub(in crate::layout) fn grid_alignment(self) -> Option<GridAbsposStaticAlignment> {
+        self.grid_alignment
     }
 
     pub(in crate::layout) fn horizontal_position(
         self,
         containing_block: ContainingBlock,
     ) -> StaticHorizontalPosition {
-        StaticHorizontalPosition::new(
-            self.page_left_x - containing_block.x(),
-            containing_block.x() + containing_block.width() - self.page_right_x,
-        )
+        let left = self.page_left_x - containing_block.x();
+        let right = containing_block.x() + containing_block.width() - self.page_right_x;
+        if self.horizontal_can_fall_outside {
+            StaticHorizontalPosition::new_unclamped(left, right)
+        } else {
+            StaticHorizontalPosition::new(left, right)
+        }
     }
 
     pub(in crate::layout) fn vertical_start(self, containing_block: ContainingBlock) -> f32 {
         containing_block.top_y() - self.page_top_y
+    }
+
+    pub(in crate::layout) const fn has_vertical_position(self) -> bool {
+        self.has_vertical_position
     }
 }
 
@@ -1320,11 +1697,11 @@ pub(in crate::layout) struct PhysicalInlineRect {
 }
 
 impl PhysicalInlineRect {
-    pub(in crate::layout) fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+    pub(in crate::layout) fn new(rect: InlineRect) -> Self {
         Self {
             rect: InlineRect::new(
-                InlinePoint::new(x, y),
-                InlineSize::new(width.max(0.0), height.max(0.0)),
+                rect.origin,
+                InlineSize::new(rect.size.width.max(0.0), rect.size.height.max(0.0)),
             ),
         }
     }
@@ -1349,12 +1726,10 @@ impl PhysicalInlineRect {
         if offset.is_zero() {
             return self;
         }
-        Self::new(
-            self.x() + offset.x(),
-            self.y() + offset.y(),
-            self.width(),
-            self.height(),
-        )
+        Self::new(InlineRect::new(
+            InlinePoint::new(self.x() + offset.x(), self.y() + offset.y()),
+            self.rect.size,
+        ))
     }
 
     pub(in crate::layout) fn paint_rect(self) -> PaintRect {
@@ -1381,4 +1756,71 @@ impl PhysicalInlineRect {
 pub(in crate::layout) struct PhysicalInlineTextBounds {
     pub(in crate::layout) baseline_origin: InlinePoint,
     pub(in crate::layout) inline_size: f32,
+}
+
+#[cfg(test)]
+mod child_available_space_tests {
+    use super::*;
+
+    #[test]
+    fn orthogonal_fallback_is_not_a_percentage_basis() {
+        let space = ChildAvailableSpace::new(
+            WritingMode::HorizontalTb,
+            PhysicalContentWidth::new(content_box_pt(300.0)),
+            None,
+            PhysicalContentHeight::new(content_box_pt(200.0)),
+        );
+
+        assert_eq!(space.available_physical_height().points(), 200.0);
+        assert!(!space.physical_height_percentage_basis().is_definite());
+        assert!(
+            !space
+                .logical_inline_percentage_basis_for(WritingMode::VerticalRl)
+                .is_definite()
+        );
+        assert_eq!(
+            space.logical_inline_percentage_basis_for(WritingMode::HorizontalTb),
+            PercentageBasis::definite(LogicalInlineContentSize::new(content_box_pt(300.0)))
+        );
+    }
+
+    #[test]
+    fn definite_perpendicular_size_projects_to_vertical_percentage_basis() {
+        let space = ChildAvailableSpace::new(
+            WritingMode::HorizontalTb,
+            PhysicalContentWidth::new(content_box_pt(300.0)),
+            Some(PhysicalContentHeight::new(content_box_pt(200.0))),
+            PhysicalContentHeight::new(content_box_pt(500.0)),
+        );
+
+        assert_eq!(
+            space.logical_inline_percentage_basis_for(WritingMode::VerticalLr),
+            PercentageBasis::definite(LogicalInlineContentSize::new(content_box_pt(200.0)))
+        );
+    }
+
+    #[test]
+    fn scrollport_availability_stays_indefinite_for_percentages() {
+        let space = ChildAvailableSpace::new(
+            WritingMode::HorizontalTb,
+            PhysicalContentWidth::new(content_box_pt(300.0)),
+            None,
+            PhysicalContentHeight::new(content_box_pt(500.0)),
+        )
+        .with_orthogonal_available_height(OrthogonalAvailableHeight {
+            value: PhysicalContentHeight::new(content_box_pt(120.0)),
+            source: OrthogonalAvailableSizeSource::NearestScrollContainer,
+        });
+
+        assert_eq!(space.available_physical_height().points(), 120.0);
+        assert_eq!(
+            space.orthogonal_available_height.source,
+            OrthogonalAvailableSizeSource::NearestScrollContainer
+        );
+        assert!(
+            !space
+                .logical_inline_percentage_basis_for(WritingMode::VerticalRl)
+                .is_definite()
+        );
+    }
 }

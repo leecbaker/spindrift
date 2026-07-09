@@ -9,7 +9,7 @@ use super::*;
 pub(in crate::css) fn parse_grid_template_area_row(row: &str) -> Option<Vec<Option<String>>> {
     let mut cells = Vec::new();
     let mut chars = row.chars().peekable();
-    while let Some(ch) = chars.peek().copied() {
+    while let Some(ch) = chars.peek().cloned() {
         if ch.is_whitespace() {
             chars.next();
             continue;
@@ -23,7 +23,7 @@ pub(in crate::css) fn parse_grid_template_area_row(row: &str) -> Option<Vec<Opti
         }
         if grid_template_area_name_code_point(ch) {
             let mut name = String::new();
-            while let Some(ch) = chars.peek().copied() {
+            while let Some(ch) = chars.peek().cloned() {
                 if !grid_template_area_name_code_point(ch) {
                     break;
                 }
@@ -111,6 +111,47 @@ pub(in crate::css) fn parse_grid_auto_flow(value: &str) -> Option<GridAutoFlow> 
     }
 }
 
+pub(in crate::css) fn parse_grid_lanes_direction(value: &str) -> Option<GridLanesDirection> {
+    let mut axis = None;
+    let mut track_reverse = false;
+    let mut fill_reverse = false;
+    for token in split_css_component_values(value) {
+        match token.to_ascii_lowercase().as_str() {
+            "row" if axis.is_none() => axis = Some(GridLanesDirectionAxis::Row),
+            "column" if axis.is_none() => axis = Some(GridLanesDirectionAxis::Column),
+            "track-reverse" if !track_reverse => track_reverse = true,
+            "fill-reverse" if !fill_reverse => fill_reverse = true,
+            _ => return None,
+        }
+    }
+    Some(GridLanesDirection {
+        axis: axis?,
+        track_reverse,
+        fill_reverse,
+    })
+}
+
+pub(in crate::css) fn parse_grid_lanes_flow_tolerance(
+    value: &str,
+    font_size: f32,
+) -> Option<GridLanesFlowTolerance> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => Some(GridLanesFlowTolerance::Normal),
+        "infinite" => Some(GridLanesFlowTolerance::Infinite),
+        _ => parse_computed_length_percentage(value, font_size)
+            .filter(|value| {
+                value
+                    .used_length_with_percentage_basis(crate::units::PercentageBasis::definite(
+                        crate::units::layout_pt(0.0),
+                    ))
+                    .map(crate::units::layout_points)
+                    .unwrap_or(0.0)
+                    >= 0.0
+            })
+            .map(GridLanesFlowTolerance::LengthPercentage),
+    }
+}
+
 pub(in crate::css) fn parse_grid_placement(value: &str) -> Option<GridPlacement> {
     let parts = split_css_component_values(value);
     if parts.is_empty() {
@@ -166,21 +207,21 @@ pub(in crate::css) fn expand_grid_area_shorthand(
         return None;
     }
     let row_start = parts[0];
-    let column_start = parts.get(1).copied().unwrap_or_else(|| {
+    let column_start = parts.get(1).cloned().unwrap_or_else(|| {
         if grid_placement_is_custom_ident(row_start) {
             row_start
         } else {
             "auto"
         }
     });
-    let row_end = parts.get(2).copied().unwrap_or_else(|| {
+    let row_end = parts.get(2).cloned().unwrap_or_else(|| {
         if grid_placement_is_custom_ident(row_start) {
             row_start
         } else {
             "auto"
         }
     });
-    let column_end = parts.get(3).copied().unwrap_or_else(|| {
+    let column_end = parts.get(3).cloned().unwrap_or_else(|| {
         if grid_placement_is_custom_ident(column_start) {
             column_start
         } else {
@@ -205,12 +246,28 @@ pub(in crate::css) fn grid_placement_is_custom_ident(value: &str) -> bool {
     )
 }
 
-pub(in crate::css) fn grid_placement_name_is_custom_ident(value: &str) -> bool {
-    is_css_identifier(value)
-        && !matches!(
-            value.to_ascii_lowercase().as_str(),
-            "auto" | "span" | "initial" | "inherit" | "unset" | "revert" | "revert-layer"
-        )
+/// Parse a CSS Grid `<custom-ident>` and return its canonical ident value.
+///
+/// Grid placement accepts normal CSS identifiers, including escaped names such
+/// as `\31st` for template-area names that are not plain identifiers:
+/// <https://www.w3.org/TR/css-grid-1/#grid-template-areas-property> and
+/// <https://www.w3.org/TR/css-grid-1/#typedef-grid-line>.
+pub(in crate::css) fn parse_grid_custom_ident(value: &str) -> Option<String> {
+    let mut input = cssparser::ParserInput::new(trim_css_value(value));
+    let mut parser = cssparser::Parser::new(&mut input);
+    let ident = parser.expect_ident_cloned().ok()?.to_string();
+    if !parser.is_exhausted() {
+        return None;
+    }
+    parse_grid_custom_ident_value(ident)
+}
+
+pub(in crate::css) fn parse_grid_custom_ident_value(ident: String) -> Option<String> {
+    (!matches!(
+        ident.to_ascii_lowercase().as_str(),
+        "auto" | "span" | "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+    ))
+    .then_some(ident)
 }
 
 pub(in crate::css) fn parse_grid_line_placement(parts: &[&str]) -> Option<GridLinePlacement> {
@@ -226,10 +283,8 @@ pub(in crate::css) fn parse_grid_line_placement(parts: &[&str]) -> Option<GridLi
             }
             continue;
         }
-        if !grid_placement_name_is_custom_ident(part) {
-            return None;
-        }
-        if name.replace((*part).to_string()).is_some() {
+        let custom_ident = parse_grid_custom_ident(part)?;
+        if name.replace(custom_ident).is_some() {
             return None;
         }
     }
@@ -260,10 +315,8 @@ pub(in crate::css) fn parse_grid_span_placement(parts: &[&str]) -> Option<GridSp
             }
             continue;
         }
-        if !grid_placement_name_is_custom_ident(part) {
-            return None;
-        }
-        if name.replace((*part).to_string()).is_some() {
+        let custom_ident = parse_grid_custom_ident(part)?;
+        if name.replace(custom_ident).is_some() {
             return None;
         }
     }
@@ -370,7 +423,7 @@ pub(in crate::css) fn is_unitless_zero(value: &str) -> bool {
 
 pub(in crate::css) fn parse_nonnegative_flex_number(value: &str) -> Option<String> {
     let value = trim_css_value(value);
-    let number = value.parse::<f32>().ok()?;
+    let number = parse_css_number(value)?;
     (number >= 0.0).then(|| value.to_string())
 }
 
@@ -648,10 +701,24 @@ pub(in crate::css) fn parse_justify_self(value: &str, current: JustifySelf) -> J
 }
 
 pub(in crate::css) fn expand_columns_shorthand(value: &str) -> Option<Vec<(&'static str, String)>> {
+    let (inline_components, height) = split_top_level_once(trim_css_value(value), '/')
+        .map(|(inline, height)| (trim_css_value(inline), trim_css_value(height)))
+        .unwrap_or((trim_css_value(value), "auto"));
+    if height.is_empty()
+        || (!height.eq_ignore_ascii_case("auto")
+            && !parse_computed_length_percentage(height, ROOT_FONT_SIZE_PT).is_some_and(|length| {
+                !length.contains_percentage()
+                    && length
+                        .length_if_no_percent()
+                        .is_some_and(|value| value >= 0.0)
+            }))
+    {
+        return None;
+    }
     let mut count = "auto".to_string();
     let mut width = "auto".to_string();
     let mut saw_component = false;
-    for part in trim_css_value(value).split_whitespace() {
+    for part in inline_components.split_whitespace() {
         if part.eq_ignore_ascii_case("auto") {
             saw_component = true;
         } else if part
@@ -663,7 +730,7 @@ pub(in crate::css) fn expand_columns_shorthand(value: &str) -> Option<Vec<(&'sta
             count = part.to_string();
             saw_component = true;
         } else if parse_computed_length_percentage(part, ROOT_FONT_SIZE_PT)
-            .is_some_and(|length| length.percent == 0.0)
+            .is_some_and(|length| !length.contains_percentage())
         {
             width = part.to_string();
             saw_component = true;
@@ -671,7 +738,14 @@ pub(in crate::css) fn expand_columns_shorthand(value: &str) -> Option<Vec<(&'sta
             return None;
         }
     }
-    saw_component.then(|| vec![("column-count", count), ("column-width", width)])
+    saw_component.then(|| {
+        vec![
+            ("column-count", count),
+            ("column-width", width),
+            ("column-height", height.to_string()),
+            ("column-wrap", "auto".to_string()),
+        ]
+    })
 }
 
 /// Returns whether two parsed declarations affect at least one same longhand.

@@ -1,4 +1,6 @@
-use super::assets::{BackgroundPaintArea, background_images_for_style, paint_effects_for_box};
+use super::assets::{
+    PaintBackgroundArea, background_image_primitives_for_style, paint_effects_for_box,
+};
 use super::page_generated::{
     PageContentResolveContext, PageMarginContentItem, ResolvedPageContent,
     resolve_page_content_parts,

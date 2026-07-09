@@ -1,6 +1,6 @@
 # CSS Flexbox Parity
 
-Last updated: 2026-07-08
+Last updated: 2026-07-18
 
 This document tracks Quire's implementation status for CSS Flexible Box
 Layout. The normative references are CSS Flexible Box Layout Level 1, CSS Box
@@ -10,7 +10,19 @@ references, but spec conformance is the priority when the two disagree.
 
 ## Current Implementation
 
+- The local renderable `css/css-flexbox/` WPT run currently passes 647 of 935
+  tests (69.20%). This raw reftest baseline includes reference-side rendering
+  gaps (notably float clearance and CSS-versus-image color precision), so it
+  is a triage input rather than a direct count of flex-algorithm defects. The
+  largest material layout clusters are baseline/writing-mode layout, intrinsic
+  sizing and automatic minimums, tables as flex items, absolute static
+  positioning, and the unfinished `flex-wrap: balance` Level 2 cases.
+
 - Flex layout is implemented under `src/layout/flex/`.
+- Flex containers and items consume an effective-zoom used style at the flex
+  layout boundary. Fixed flex bases, gaps, box edges, margins, and intrinsic
+  replaced sizes scale once; percentages resolve against the resulting zoomed
+  containing geometry, while automatic and intrinsic sizing remain algorithmic.
 - Taffy 0.11.0 remains the core engine for line formation, flexible length
   distribution, wrapping, gaps, auto margins, and common alignment.
 - Taffy-specific limitations and Quire adapter workarounds are tracked in
@@ -24,7 +36,9 @@ references, but spec conformance is the priority when the two disagree.
   independent formatting context for intrinsic estimates and replay, so first
   and last child block margins stay contained by the flex item, floats do not
   intrude into sibling items or outside block flow, and blockified inline-source
-  item paint is normalized before item layout.
+  item paint is normalized before item layout. Anonymous flex text items are
+  created for non-whitespace text runs, while CSS document-whitespace-only text
+  runs are ignored even in preserved `white-space` modes.
 - Absolutely positioned flex children are collected out of flow. Their
   static-position probe uses fixed sole-item sizing and ignores authored
   flexing, including `flex-basis`, while normal absolute positioning computes
@@ -38,19 +52,61 @@ references, but spec conformance is the priority when the two disagree.
   cross contributions, flex base size, hypothetical main size, grow/shrink
   factors, definite cross-size contributions, and gap handling. Wrapped row
   min-content uses the largest item contribution, nowrap rows keep all items
-  on one line, definite flex-basis values floor max-content contributions, and
-  non-growing item contributions are capped by the outer flex base size for
-  min-content sizing. Cyclic percentage gaps contribute only their
-  non-percentage length component. Definite flex item widths contribute to
-  column flex min-content inline sizing, including wrapped column containers
-  with empty fixed-width items. When a definite-height wrapped column flex
-  container forms multiple columns, min-content inline sizing uses the largest
-  item cross contribution rather than summing columns; max-content sizing still
-  uses the summed wrapped line cross sizes. Wrapped CSS column containers
+  on one line, and intrinsic item contributions use their intrinsic size plus
+  a non-auto preferred main size before min/max clamping; an auto preferred
+  size is not replaced by an automatic flex base size, while a definite basis
+  caps non-growing item contributions. Cyclic percentage gaps contribute only
+  their non-percentage length component, while used flex layout resolves percentage
+  and mixed `calc()` gaps against a definite physical content-box axis when
+  one is available. Block flex item intrinsic widths merge same-line floated
+  children into the max-content inline contribution, so wrapped column
+  `flex-basis:auto` items are remeasured against the max cross available width
+  before line packing. Definite flex item widths contribute to column flex
+  min-content inline sizing, including wrapped column containers
+  with empty fixed-width items. Wrapped column flex min-content inline sizing
+  uses the largest item cross contribution rather than summing columns, and
+  auto-width floated/atomic wrapped column flex containers shrink-to-fit to
+  that cross contribution unless a smaller containing block clamps between the
+  min-content and wrapped max-content widths. Wrapped CSS column containers
   remeasure max-content item contributions with the largest max-content cross
   contribution as the available cross size, so percentage-width items and
   float-only block descendants participate in flex-basis calculation with the
   same available size used by the intrinsic cross-size algorithm.
+- Nested percentage-width tables now expose their grid-based intrinsic minimum
+  with an indefinite percentage basis while retaining their definite preferred
+  flex base size. This prevents a percentage table wrapper from becoming an
+  artificial automatic minimum for its flex-item ancestor.
+- The flex/Taffy margin and padding adapters resolve percentage and mixed
+  `calc()` values against the containing block's logical inline percentage
+  basis before converting to physical Taffy edges. Replay uses the same used
+  padding, avoiding a vertical container's inline basis being conflated with
+  its physical width. Flex replay resolves that padding before freezing final
+  main-axis bounds, so a percentage padding edge cannot be added a second time
+  by the independently replayed formatting context.
+- Flex item replay clears both cached and typed margins after Taffy positions
+  the item's margin box, so normal-flow replay cannot reapply fixed margins.
+- An inline-flex atom now uses its captured first line only when flex layout
+  has no participating baseline and the container is not a wrapping column.
+  This preserves the dedicated multi-line column baseline algorithm while
+  allowing content-only inline flex containers to align with their parent line.
+- Replayed flex and grid item formatting contexts now retain an explicit
+  physical normal-flow containing-block scope for relative/sticky descendants.
+  Block, nested flex/grid/table, and inline formatting contexts consume that
+  scope, so percentage insets resolve against the item's used content box
+  without falsely establishing an absolute-positioning containing block.
+- Block-start parent/first-child margin collapse remains valid when the parent
+  has a specified height; only block-end collapse depends on auto height. This
+  keeps a definite-height document body from introducing an extra top margin
+  before its first flow child.
+- Grid's Taffy adapter maps CSS Grid's logical inline/block tracks, placement
+  lines, auto tracks, alignment axes, and gaps to physical Taffy columns/rows
+  in vertical writing modes. This lets a vertical-writing grid flex item size
+  `grid-template-rows` along physical width rather than physical height.
+- A grid container participating as a flex item now contributes its measured
+  Grid track sizes to flex base and automatic-minimum sizing rather than using
+  an inline text-line fallback. This preserves the zero intrinsic height of an
+  empty grid item and keeps flex replay's temporary used height separate from
+  Grid's percentage definiteness.
 - Simple inline-content multi-column flex items measure their inline sequence at
   the resolved column width and use the balanced column block-size for
   auto-height hypothetical cross sizing, so flex replay paints all balanced
@@ -69,6 +125,14 @@ references, but spec conformance is the priority when the two disagree.
 - Flex item margins preserve negative length and percentage values through the
   Taffy layout bridge, so overlapping flex items participate in
   order-modified layout and paint in the CSS Flexbox `order` sequence.
+- Intrinsic `min-content` and `max-content` maximum cross sizes cap stretch
+  targets before final item replay. Auto main sizes are then remeasured in the
+  capped cross size, so floats and inline wrapping use the same dimensions as
+  the final flex item.
+- CSS math `calc(infinity)` is accepted for flex factors. Before adapting to
+  Taffy, an infinite grow factor is normalized into the spec's finite used
+  distribution: all infinite growers receive equal shares and finite growers
+  receive none.
 - Max-content flex container sizing uses the concrete ideal flex-fraction
   algorithm from CSS Flexbox 9.9.1.1. The draft's web-compatible intrinsic
   sizing algorithm remains unresolved, so any future browser-compatibility
@@ -80,12 +144,37 @@ references, but spec conformance is the priority when the two disagree.
   height before the item's row-axis flex base size is finalized, and
   horizontal row flex items whose inline replaced descendants resolve
   `height:100%` against the stretched item before transferring width through
-  an intrinsic aspect ratio.
+  an intrinsic aspect ratio. Percentage-height descendants of column flex
+  items resolve against the item's definite post-flexing main size instead of
+  the remaining fragmentainer height. Once an auto-height row flex
+  container's line cross size is final, its items replay with that final
+  content-box height as a definite descendant percentage basis, including
+  lines clamped by `min-height` or `max-height`. Conversely, a percentage
+  flex-basis that falls back to `auto` against an indefinite column main size
+  does not gain a definite descendant percentage basis merely because replay
+  freezes the item's final used height.
+- Root/body overflow propagation now retains the propagated viewport clip when
+  deciding whether descendants may fragment. This prevents an auto-height flex
+  descendant with a definite max-clamped cross size from materializing extra
+  pages after the document canvas has requested `overflow: hidden`.
+- Flex item available-size and replay boundaries carry distinct physical
+  content width/height quantities, while flex-line main/cross values remain
+  axis-typed. This prevents a physical width from being silently reused as a
+  logical inline size in orthogonal flex descendants. Split flex and grid item
+  replay records likewise preserve used physical border-box dimensions as
+  border-box quantities until their explicit layout boundary conversion.
 - Flex item `stretch` min cross sizes resolve through CSS Sizing Level 4
   stretch-fit sizing when the flex line/container cross size is definite.
   Final flex item border boxes are floored by their padding and borders, so a
   zero stretched cross-size target cannot create a negative content box or
   clip away item decorations.
+- Non-stretched auto cross-size flex items preserve their hypothetical
+  cross-size during final line alignment, including shrinkwrapped anonymous
+  text flex items. Column flex anonymous item replay scopes the placed item's
+  own logical inline size, so inherited text alignment is applied inside the
+  flex item rather than the flex container. Only stretched auto cross-size
+  items relayout against the final flex line cross size for definite descendant
+  sizing.
 - Replaced flex items with an intrinsic aspect ratio transfer cross-axis
   min/max constraints into the content-basis candidate used by
   `flex-basis:auto`, while keeping main-axis min/max constraints out of the
@@ -93,13 +182,48 @@ references, but spec conformance is the priority when the two disagree.
   image pixels to CSS px and then to Quire layout points before they contribute
   to flex max-content main-size calculations, including vertical-writing row
   flex items.
+- Automatic flex minimums use a preferred aspect ratio to transfer a definite
+  cross-axis minimum even when the preferred cross size is automatic; that
+  transfer remains separate from flex-base sizing. CSS Overflow's paired
+  computed-value rule is applied after the cascade, so a scrollable or clipped
+  axis makes the other axis's `visible`/`clip` value compute to `auto`/`hidden`
+  before Flexbox selects its automatic minimum.
+- Canvas, image-backed, and inline SVG share one replaced-element geometry
+  path across flex, inline, block, grid, and table layout. Their content,
+  border, and margin boxes remain distinct through flex sizing and replay, so
+  padding and borders contribute exactly once to cross sizing and inline
+  fallback references.
+- Resource-less video and iframe elements now remain atomic replaced boxes for
+  flex sizing and replay even when Quire has no frame/embed painter. Their
+  unavailable content is transparent while author backgrounds and borders
+  still paint; iframe fallback dimensions deliberately carry no preferred
+  aspect ratio. Ratio-only inline SVG roots likewise use CSS's 300px default
+  object width for sizing and are normalized to their final CSS viewport before
+  percentage SVG geometry is painted.
+- Floated flex containers resolve their clearance height from flex-line
+  intrinsic sizing after their shrink-to-fit width is known, rather than from
+  an ordinary block-child sum. This preserves one-line row height for later
+  `clear` placement and downstream float exclusions. A narrow snapshot replay
+  supplies the real line height for otherwise zero-height atomic-inline
+  floats, so their overflow and clearance geometry remains materialized.
+- When a content-based flex basis runs along an item's logical inline axis,
+  Quire measures hypothetical cross-size line boxes at that resolved
+  max-content base rather than at a narrower available container width. This
+  avoids introducing soft wraps before the flex algorithm establishes the
+  item's main size.
+- Ratio-only inline SVG roots use their available flex inline space, after
+  margins, as the automatic size contribution; their `viewBox` ratio supplies
+  the opposite axis. This keeps the generic default object dimensions from
+  becoming an erroneous flex base size.
 - Authored `aspect-ratio` values on non-replaced flex items participate in
   Quire's flex base-size and automatic minimum main-size calculations, including
   content-box transferred flex bases that Taffy expands through item padding
   and borders according to `box-sizing`. The flex/Taffy adapter carries those
   transferred sizes through semantic content-box and non-content typed lengths
-  until the final Taffy scalar boundary; stretched cross sizes remain
-  authoritative for final flex item geometry.
+  until the final Taffy scalar boundary. The adapter withholds Taffy's
+  generic `aspect_ratio` field when the item's cross-size property is definite
+  or resolved by stretch, so ratio transfer affects the flex base size without
+  expanding the final cross-axis geometry.
 - Raster image flex items resolve CSS Sizing `aspect-ratio` fallback before
   flex sizing, so bare authored ratios override the natural image ratio while
   `auto <ratio>` keeps the natural ratio when present. Auto cross sizes that
@@ -124,16 +248,63 @@ references, but spec conformance is the priority when the two disagree.
 - Normal-flow block flex containers can now fragment at flex boundaries in
   paged media: row containers break by flex line, column containers break by
   item progression, and forced item `break-before`/`break-after` values are
-  consumed at the flex-container layer. Oversized row-line and column-item
-  fragments split into page-local item slices and replay split visual content
-  from the source item layout with page-local clipping. Fragmented block flex
-  containers clone simple container backgrounds onto page-local fragments.
-  Document-canvas flex boxes and floated/atomic replay contexts continue to use
-  their existing specialized pagination behavior.
+  consumed at the flex-container layer. Forced `break-after` propagation now
+  takes the shared adjacent-box break context and target-aware forced-break
+  carry state also used by table pagination, so a forced item break is either
+  the next flex unit's pending break or the outgoing flex-container break when
+  the item sequence ends. Flex page break units consume `break-inside` and
+  carried `break-after` avoid values through the active fragmentainer kind,
+  preserving the same page/column target split used by the shared CSS Break
+  classifier. Flex break-unit construction now receives the active
+  fragmentainer kind before aggregating line/item `break-before`,
+  `break-after`, and `break-inside`, and flex line/item break-value combining
+  uses the shared target-aware break combiner for forced and avoided breaks.
+  Flex pre-unit overflow/avoid decisions now receive that same active
+  fragmentainer kind before asking whether the committed break opportunity is
+  avoided. Flex container wrapper `break-before`/`break-after` page
+  transitions use the shared standalone box break context and
+  `FragmentainerKind` page-cursor materialization gate before falling back to
+  any outgoing forced item break.
+  Flex fragment advances for forced item breaks, pre-unit overflow/avoid moves,
+  and oversized-item slice continuation now flow through committed flex
+  transition decisions that own the active fragmentainer kind and next source
+  block offset before replay materializes any target-specific cursor mutation.
+  Forced item transitions use the same shared page-cursor materialization gate
+  as overflow/avoid and slice continuation transitions, so column-targeted
+  forced breaks can remain committed transition records without advancing paged
+  media.
+  Pre-unit avoid checks now
+  consume the shared target-aware
+  fragmentation break-opportunity model also used by grid row-boundary
+  planning, while pre-unit overflow checks consume the shared fragmentainer
+  capacity value built from cursor bounds and also used underneath table and
+  grid fragmentation. Flex container definite/available-height setup also
+  reserves block-axis margins through that shared fragmentainer capacity
+  primitive.
+  Oversized flex units choose a fragment-local source-slice decision before
+  painting from the shared source-slice primitive also used by table row
+  fragmentation; this includes the progress transition used when the current
+  fragmentainer has no remaining block-size.
+  Flex pre-unit overflow and avoid moves use the shared fragment advance gate
+  before constructing the flex-local fragment-transition metadata.
+  Oversized row-line and column-item fragments split into page-local item
+  slices and replay split visual content from the source item layout with
+  page-local clipping. Fragmented block flex containers clone simple container
+  backgrounds onto page-local fragments; empty flex containers now contribute
+  a fragmentable source range so their decoration can continue instead of
+  disappearing. Fragment planning also carries a non-size-contained item's
+  measured overflowing descendant block extent separately from its used flex
+  border box, so that overflow can continue into later fragmentainers.
+  Document-canvas flex boxes and floated/atomic replay contexts continue to
+  use their existing specialized pagination behavior.
 - `visibility: collapse` now uses a visible-layout probe to measure collapsed
   item struts and source-line placement, then relayouts with collapsed items
   omitted from main-axis distribution. Wrapped lines are repacked when a strut
-  expands an affected line.
+  expands an affected line, including `wrap-reverse` line packing. Row- and
+  column-axis collapsed replaced flex items preserve their cross-size struts
+  without painting their images or consuming main-axis space, and
+  vertical-writing row flex items preserve the same physical cross-size strut
+  behavior.
 - Wrapped row flex containers apply Quire post-Taffy baseline passes for
   `align-content: baseline` and `align-content: last baseline`, using recorded
   first/last line baseline sets and content baselines synthesized from flex
@@ -155,11 +326,15 @@ references, but spec conformance is the priority when the two disagree.
   parent inline formatting context synthesizes the atom baseline from the
   margin box, so padding, borders, and margins align with adjacent text as
   CSS Inline requires.
-  Baseline fallback paths for single-item self-alignment and line
-  content-alignment use CSS Align logical start/end sides through
-  writing-mode-aware side mapping, including column flex content-alignment and
-  column-axis self-alignment fallback when compatible baseline sharing cannot
-  apply.
+  Baseline sharing groups only include flex items whose inline axis is
+  parallel to the container main axis; orthogonal baseline-aligned items fall
+  back through CSS Align first/last-baseline self-alignment. Baseline fallback
+  paths preserve a `wrap-reverse` column line's packed cross-end slot and use CSS
+  Align logical start/end sides through writing-mode-aware side mapping,
+  including column flex content-alignment and column-axis self-alignment
+  fallback when compatible baseline sharing cannot apply. Column flex
+  containers share first and last vertical text baselines for vertical-writing
+  items in the column cross axis.
   Row-axis nested flex containers export first and last baselines from their
   intrinsic estimates so they can join parent flex baseline-sharing groups; definite
   wrapped `row`, `row-reverse`, and `wrap-reverse` nested flex containers form
@@ -176,7 +351,10 @@ references, but spec conformance is the priority when the two disagree.
   `wrap-reverse` line packing, when their wrapped line estimates have either a
   definite physical cross size or an auto cross size resolved from the wrapped
   line stack, and when percentage physical cross sizes resolve against a
-  definite parent cross size.
+  definite parent cross size or behave as auto because the parent cross size is
+  indefinite. Overflowed `wrap-reverse` line estimates can export negative
+  cross-start baselines so last-baseline alignment can target lines that fall
+  outside the nested flex border box.
 - Existing smoke coverage includes row/column and reverse directions, wrapping,
   `order`, `flex-grow`/`flex-shrink`, intrinsic `flex-basis` keywords,
   percentage and mixed math sizing, gaps, auto margins, baseline alignment,
@@ -200,23 +378,36 @@ references, but spec conformance is the priority when the two disagree.
 - Paged flex fragmentation is partial. Boundary breaks between row lines and
   column items work for normal-flow block flex containers, and oversized
   row-line/column-item fragments now produce page-local item slices with visual
-  content continuation. Full border/outline/background decoration slicing and
-  complete fragment-plan metadata for links, running elements, named pages, and
-  other PDF side effects still need work.
-- `visibility: collapse` still needs broader audits for column-axis and
-  `wrap-reverse` strut placement, collapsed replaced items, and rare
-  writing-mode combinations.
+  content continuation. Split row and wrapped-column item replay translates
+  its consumed source offset before clipping, so early descendant paint is not
+  duplicated in a later fragmentainer; single-line column continuations still
+  need fragment-local main-size re-layout. The focused local runs currently
+  pass 348 of 427 `css/css-flexbox/flexbox` tests and 102 of 327
+  `css/css-break/flexbox/` reftests (450 of 754 combined). Automatic
+  single-line row flex containers that end at a multicolumn boundary now enter
+  the fragment plan when their item subtree has no independently forced break.
+  Column flex replay also preserves normal items' final border-box main-size
+  constraints, avoiding an erroneous padding/border-sized gap. Fragmented row
+  flex items retain fragment-local stretched cross sizes and replay positioned
+  descendants against the flex container's fragment-local containing block.
+  The remaining matrix shows that multi-line and column fragment-local relayout,
+  padding/border decoration slicing, and positioned-descendant containing blocks
+  inside nested multicol fragmentainers still need work. Complete fragment-plan
+  metadata for links, running elements, named pages, and other PDF side effects
+  also remains incomplete.
 - Baseline handling now covers horizontal and vertical-writing row
   `align-content` baseline packing. Baseline fallback alignment is
   writing-mode aware for the covered self- and content-alignment cases,
   including column flex content-alignment fallback, and nested vertical-writing
   row flex containers export text-orientation-aware horizontal baselines for
   definite wrapped rows, auto-width wrapped rows, definite-parent percentage
-  wrapped rows, and `wrap-reverse`. Row flex items with normal-flow block
-  descendants export descendant text baselines for first/last baseline
-  self-alignment. True column-axis baseline sharing still needs vertical
-  baseline-set support; indefinite percentage nested exported baselines and
-  rarer nested edge cases also need more work.
+  wrapped rows, indefinite-parent percentage wrapped rows, `wrap-reverse`, and
+  first- and last-baseline `wrap-reverse` exports with indefinite percentage
+  cross sizes.
+  Row flex items with normal-flow block descendants export descendant text
+  baselines for first/last baseline self-alignment. Column-axis baseline
+  sharing covers first and last vertical text baselines for vertical-writing
+  flex items. Rarer nested baseline edge cases still need more work.
 - Intrinsic flex container sizing now has a dedicated contribution pipeline,
   but still needs WPT-backed auditing for the unresolved web-compatible
   algorithm, deeply nested flex/table descendants, complex block-child
@@ -243,8 +434,10 @@ references, but spec conformance is the priority when the two disagree.
   alignment, definite wrapped nested `row`/`row-reverse`/`wrap-reverse`
   baseline exports, max-constrained auto-width nested baseline exports,
   fit-content-constrained nested baseline exports, definite-parent percentage
-  nested vertical baseline exports, column flex content
-  alignment fallback, baseline fallback in vertical and `wrap-reverse` cases,
+  and indefinite-parent percentage nested vertical baseline exports, including
+  `wrap-reverse` overflowed first/last baseline exports, column flex content
+  alignment fallback, column-axis first/last vertical text baseline sharing,
+  baseline fallback in vertical and `wrap-reverse` cases,
   vertical-writing row flex item line-under baseline synthesis,
   wrapped row `align-items: baseline` line-slot preservation,
   absolutely positioned flex static positions including vertical-lr/vertical-rl
@@ -257,8 +450,10 @@ references, but spec conformance is the priority when the two disagree.
   item breaks, including wrapped column flex min-content cross-size aggregation
   and max-content available cross-size propagation for percentage-width
   float-only flex items, plus stretched vertical flex-item descendant
-  percentage padding and non-negative border-box sizing for `min-height:
-  stretch` flex items. Add
+  percentage padding, non-negative border-box sizing for `min-height: stretch`
+  flex items, definite-cross-size raster image flex items using flex-resolved
+  main sizes, and stretched column flex items whose aspect-ratio transferred
+  main size is clamped by content auto-minimum sizing. Add
   Quire-specific regression tests for full PDF fragment
   metadata, running elements and links inside fragmented flex items, full
   cloned decorations, and Taffy adapter edge cases as fragmentation is

@@ -1,4 +1,6 @@
-use quire::{Css, Html, RenderOptions};
+//! HTML-to-PDF rendering example with an explicit author stylesheet.
+
+use quire::{Css, Html, PdfOptions, RenderOptions};
 
 #[tokio::main]
 async fn main() -> quire::Result<()> {
@@ -14,14 +16,15 @@ async fn main() -> quire::Result<()> {
         r#"
         <title>Styled</title>
         <h1>Styled PDF</h1>
-        <div class="box">A styled block from reasyprint.</div>
+        <div class="box">A styled block from quire.</div>
         <ol><li>Parse HTML</li><li>Apply CSS</li><li>Write PDF</li></ol>
         "#,
     )
     .with_stylesheet(css)
-    .write_pdf_async(
-        "output/reasyprint-styled-example.pdf",
+    .write_pdf(
+        "output/quire-styled-example.pdf",
         &RenderOptions::default(),
+        &PdfOptions::default(),
     )
     .await
 }

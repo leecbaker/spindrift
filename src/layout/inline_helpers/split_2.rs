@@ -1,4 +1,5 @@
 use super::*;
+use std::rc::Rc;
 
 /// Return whether an inline fragment needs glyph or decoration paint.
 ///
@@ -11,7 +12,7 @@ pub(in crate::layout) fn inline_fragment_has_visible_text_paint(
     fragment: &(impl InlineFragmentAccess + ?Sized),
 ) -> bool {
     fragment.style().color.is_visible()
-        || (fragment.style().text_decoration.has_visible_line()
+        || (fragment.style().text_decoration.clone().has_visible_line()
             && fragment
                 .style()
                 .text_decoration
@@ -29,8 +30,7 @@ pub(in crate::layout) fn justifiable_fragment_space_count<F: InlineFragmentAcces
     }
     fragments[..end]
         .iter()
-        .filter(|fragment| inline_fragment_is_inter_word_justification_space(*fragment))
-        .map(|fragment| fragment.text().chars().count())
+        .map(inline_fragment_inter_word_justification_space_count)
         .sum()
 }
 
@@ -113,15 +113,25 @@ pub(in crate::layout) struct JustificationOpportunity {
 
 /// CSS Text justification opportunity kind recorded for diagnostics/tests.
 ///
-/// Suppressed and blocking entries are retained so tests can prove that
-/// cursive/control gaps and opaque atom boundaries were considered by policy
-/// rather than silently omitted by the painter.
+/// Suppressed entries are retained so tests can prove that cursive/control
+/// gaps were considered by policy rather than silently omitted by the painter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::layout) enum JustificationOpportunityKind {
     WordSeparator,
     TypographicUnitGap,
     SuppressedScriptOrControlGap,
-    OpaqueAtomBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InterCharacterJustificationUnit<'a> {
+    after_item_index: usize,
+    kind: InterCharacterJustificationUnitKind<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterCharacterJustificationUnitKind<'a> {
+    Text(&'a str),
+    AtomicInlineRun,
 }
 
 impl InlineJustificationPlan {
@@ -130,10 +140,21 @@ impl InlineJustificationPlan {
         text_justify: TextJustify,
         should_justify: bool,
     ) -> Self {
-        let mode = match (should_justify, text_justify) {
-            (false, _) | (_, TextJustify::None) => InlineJustificationMode::None,
-            (true, TextJustify::InterCharacter) => InlineJustificationMode::InterCharacter,
-            (true, TextJustify::Auto | TextJustify::InterWord) => {
+        // A preserved tab is resolved against the logical inline cursor. CSS
+        // Text requires those tab stops to retain that geometry; distributing
+        // preceding document spaces for justification would move every later
+        // stop. Keep the selected line un-justified until justification has
+        // source-range metadata for text after a tab.
+        // <https://drafts.csswg.org/css-text-4/#text-align-property> and
+        // <https://drafts.csswg.org/css-text-3/#tab-size-property>
+        let contains_preserved_tab = items.iter().any(|item| {
+            matches!(item, InlineLineItem::Fragment(fragment) if fragment.text().contains('\t'))
+        });
+        let mode = match (should_justify, text_justify, contains_preserved_tab) {
+            (_, _, true) => InlineJustificationMode::None,
+            (false, _, false) | (_, TextJustify::None, false) => InlineJustificationMode::None,
+            (true, TextJustify::InterCharacter, false) => InlineJustificationMode::InterCharacter,
+            (true, TextJustify::Auto | TextJustify::InterWord, false) => {
                 InlineJustificationMode::InterWord
             }
         };
@@ -180,7 +201,7 @@ impl InlineJustificationPlan {
     pub(in crate::layout) fn expansion_count_after_item(&self, item_index: usize) -> usize {
         self.item_expansion_counts
             .get(item_index)
-            .copied()
+            .cloned()
             .unwrap_or(0)
     }
 
@@ -193,13 +214,21 @@ impl InlineJustificationPlan {
             let InlineLineItem::Fragment(fragment) = item else {
                 continue;
             };
-            if !inline_fragment_is_inter_word_justification_space(fragment) {
+            // `text-justify` inherits, but an inline descendant can suppress
+            // expansion for just its own word separators while the parent
+            // justified line continues to distribute its remaining eligible
+            // opportunities.
+            // <https://drafts.csswg.org/css-text-3/#text-justify-property>
+            if matches!(fragment.style().text_justify, TextJustify::None) {
                 continue;
             }
-            let count = fragment.text().chars().count();
-            self.item_expansion_counts[index] = count;
+            let separator_count = inline_fragment_inter_word_justification_space_count(fragment);
+            if separator_count == 0 {
+                continue;
+            }
+            self.item_expansion_counts[index] = separator_count;
             self.opportunities
-                .extend((0..count).map(|_| JustificationOpportunity {
+                .extend((0..separator_count).map(|_| JustificationOpportunity {
                     after_item_index: index,
                     kind: JustificationOpportunityKind::WordSeparator,
                 }));
@@ -210,34 +239,13 @@ impl InlineJustificationPlan {
         &mut self,
         items: &[InlineLineItem],
     ) {
-        for index in 0..items.len().saturating_sub(1) {
-            let item = &items[index];
-            let next = &items[index + 1];
-            if matches!(item, InlineLineItem::Float(_)) || matches!(next, InlineLineItem::Float(_))
-            {
-                continue;
-            }
-            if matches!(item, InlineLineItem::Atom(_)) || matches!(next, InlineLineItem::Atom(_)) {
-                self.opportunities.push(JustificationOpportunity {
-                    after_item_index: index,
-                    kind: JustificationOpportunityKind::OpaqueAtomBoundary,
-                });
-                continue;
-            }
-            let (InlineLineItem::Fragment(fragment), InlineLineItem::Fragment(next_fragment)) =
-                (item, next)
-            else {
-                continue;
-            };
-            if !inline_fragment_is_inter_character_unit(fragment)
-                || !inline_fragment_is_inter_character_unit(next_fragment)
-            {
-                continue;
-            }
-            let allowed =
-                inter_character_gap_allowed_between_text(fragment.text(), next_fragment.text());
+        let units = inter_character_justification_units(items);
+        for pair in units.windows(2) {
+            let unit = pair[0];
+            let next = pair[1];
+            let allowed = inter_character_gap_allowed_between_units(unit, next);
             self.opportunities.push(JustificationOpportunity {
-                after_item_index: index,
+                after_item_index: unit.after_item_index,
                 kind: if allowed {
                     JustificationOpportunityKind::TypographicUnitGap
                 } else {
@@ -245,9 +253,78 @@ impl InlineJustificationPlan {
                 },
             });
             if allowed {
-                self.item_expansion_counts[index] = 1;
+                self.item_expansion_counts[unit.after_item_index] += 1;
             }
         }
+    }
+}
+
+fn inter_character_justification_units(
+    items: &[InlineLineItem],
+) -> Vec<InterCharacterJustificationUnit<'_>> {
+    let mut units = Vec::new();
+    let mut previous_visible_unit_was_atomic = false;
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            InlineLineItem::Fragment(fragment) => {
+                previous_visible_unit_was_atomic = false;
+                if inline_fragment_is_inter_character_unit(fragment) {
+                    units.push(InterCharacterJustificationUnit {
+                        after_item_index: index,
+                        kind: InterCharacterJustificationUnitKind::Text(fragment.text()),
+                    });
+                }
+            }
+            InlineLineItem::Atom(atom) if inline_atom_is_inter_character_unit(atom) => {
+                let can_extend_atomic_run = previous_visible_unit_was_atomic
+                    && matches!(
+                        units.last(),
+                        Some(InterCharacterJustificationUnit {
+                            kind: InterCharacterJustificationUnitKind::AtomicInlineRun,
+                            ..
+                        })
+                    );
+                if can_extend_atomic_run {
+                    let Some(InterCharacterJustificationUnit {
+                        after_item_index,
+                        kind: InterCharacterJustificationUnitKind::AtomicInlineRun,
+                    }) = units.last_mut()
+                    else {
+                        unreachable!("atomic run check must match last unit");
+                    };
+                    *after_item_index = index;
+                } else {
+                    units.push(InterCharacterJustificationUnit {
+                        after_item_index: index,
+                        kind: InterCharacterJustificationUnitKind::AtomicInlineRun,
+                    });
+                }
+                previous_visible_unit_was_atomic = true;
+            }
+            InlineLineItem::Atom(atom) if inline_atom_is_inter_character_transparent(atom) => {}
+            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {
+                previous_visible_unit_was_atomic = false;
+            }
+        }
+    }
+    units
+}
+
+fn inter_character_gap_allowed_between_units(
+    unit: InterCharacterJustificationUnit<'_>,
+    next: InterCharacterJustificationUnit<'_>,
+) -> bool {
+    match (unit.kind, next.kind) {
+        (
+            InterCharacterJustificationUnitKind::Text(text),
+            InterCharacterJustificationUnitKind::Text(next_text),
+        ) => inter_character_gap_allowed_between_text(text, next_text),
+        (
+            InterCharacterJustificationUnitKind::Text(_)
+            | InterCharacterJustificationUnitKind::AtomicInlineRun,
+            InterCharacterJustificationUnitKind::Text(_)
+            | InterCharacterJustificationUnitKind::AtomicInlineRun,
+        ) => true,
     }
 }
 
@@ -257,20 +334,106 @@ pub(in crate::layout) fn inline_fragment_is_inter_character_unit(
     !fragment.generated_leader() && typographic_unit_count(fragment.text()) > 0
 }
 
+pub(in crate::layout) fn inline_atom_is_inter_character_unit(atom: &InlineAtom) -> bool {
+    matches!(
+        atom.content(),
+        InlineAtomContent::Canvas
+            | InlineAtomContent::Iframe(_)
+            | InlineAtomContent::Image(_)
+            | InlineAtomContent::Svg { .. }
+            | InlineAtomContent::InlineBox { .. }
+            | InlineAtomContent::TextCombineUpright { .. }
+            | InlineAtomContent::InlineFragment(_)
+    )
+}
+
+fn inline_atom_is_inter_character_transparent(atom: &InlineAtom) -> bool {
+    matches!(
+        atom.content(),
+        InlineAtomContent::InlineEdge(_) | InlineAtomContent::StaticPositionPlaceholder
+    )
+}
+
 pub(in crate::layout) fn apply_first_line_pseudos_to_line_items(
     items: &mut Vec<InlineLineItem>,
     block_style: &ComputedStyle,
+    apply_first_letter: bool,
 ) {
     if let Some(first_line_style) = block_style.first_line_style.as_deref() {
         for item in items.iter_mut() {
-            if let InlineLineItem::Fragment(fragment) = item {
-                *fragment.style_mut() = first_line_style.clone();
+            if let InlineLineItem::Fragment(fragment) = item
+                && apply_first_line_style_delta(fragment.style_mut(), block_style, first_line_style)
+            {
+                fragment.set_force_inline_background_paint(true);
             }
         }
     }
-    if let Some(first_letter_style) = block_style.first_letter_style.as_deref() {
+    if apply_first_letter
+        && let Some(first_letter_style) = block_style.first_letter_style.as_deref()
+    {
         apply_first_letter_pseudo_to_line_items(items, first_letter_style);
     }
+}
+
+/// Apply properties established by `::first-line` without discarding a nested
+/// inline fragment's own cascade (such as `<strong>`'s font weight).
+///
+/// A typographic pseudo style inherits from the originating block, while an
+/// inline fragment may inherit from a descendant of that block. Copy only a
+/// property whose pseudo computed value differs from its originating value:
+/// that difference represents the pseudo rule's cascaded effect.
+/// <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
+fn apply_first_line_style_delta(
+    fragment_style: &mut ComputedStyle,
+    originating_style: &ComputedStyle,
+    first_line_style: &ComputedStyle,
+) -> bool {
+    let mut background_changed = false;
+    if first_line_style.color != originating_style.color {
+        fragment_style.color = first_line_style.color;
+    }
+    if first_line_style.text_fill_color != originating_style.text_fill_color {
+        fragment_style.text_fill_color = first_line_style.text_fill_color;
+    }
+    if first_line_style.background_color != originating_style.background_color {
+        fragment_style.background_color = first_line_style.background_color;
+        background_changed = true;
+    }
+    if first_line_style.background_color_is_current_color
+        != originating_style.background_color_is_current_color
+    {
+        fragment_style.background_color_is_current_color =
+            first_line_style.background_color_is_current_color;
+        background_changed = true;
+    }
+    if first_line_style.font_weight != originating_style.font_weight {
+        fragment_style.font_weight = first_line_style.font_weight;
+    }
+    if first_line_style.font_style != originating_style.font_style {
+        fragment_style.font_style = first_line_style.font_style;
+    }
+    if first_line_style.font_width != originating_style.font_width {
+        fragment_style.font_width = first_line_style.font_width;
+    }
+    if first_line_style.font_size != originating_style.font_size {
+        fragment_style.font_size = first_line_style.font_size;
+    }
+    if first_line_style.line_height != originating_style.line_height {
+        fragment_style.line_height = first_line_style.line_height;
+    }
+    if first_line_style.letter_spacing != originating_style.letter_spacing {
+        fragment_style.letter_spacing = first_line_style.letter_spacing.clone();
+    }
+    if first_line_style.word_spacing != originating_style.word_spacing {
+        fragment_style.word_spacing = first_line_style.word_spacing.clone();
+    }
+    if first_line_style.text_transform != originating_style.text_transform {
+        fragment_style.text_transform = first_line_style.text_transform;
+    }
+    if first_line_style.vertical_align != originating_style.vertical_align {
+        fragment_style.vertical_align = first_line_style.vertical_align.clone();
+    }
+    background_changed
 }
 
 pub(in crate::layout) fn apply_first_letter_pseudo_to_line_items(
@@ -301,17 +464,17 @@ pub(in crate::layout) fn split_fragment_for_first_letter(
     let mut pieces = Vec::new();
     if range.start > 0 {
         let mut before = fragment.clone();
-        before.set_text(fragment.text()[..range.start].to_string());
+        before.set_text(Rc::<str>::from(&fragment.text()[..range.start]));
         pieces.push(before);
     }
     let mut letter = fragment.clone();
-    letter.set_text(fragment.text()[range.clone()].to_string());
+    letter.set_text(Rc::<str>::from(&fragment.text()[range.clone()]));
     *letter.style_mut() = first_letter_style.clone();
     letter.set_mergeable(false);
     pieces.push(letter);
     if range.end < fragment.text().len() {
         let mut after = fragment.clone();
-        after.set_text(fragment.text()[range.end..].to_string());
+        after.set_text(Rc::<str>::from(&fragment.text()[range.end..]));
         pieces.push(after);
     }
     pieces

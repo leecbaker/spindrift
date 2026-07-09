@@ -10,6 +10,7 @@ impl<'a> LayoutBuilder<'a> {
         TableFragmentRepeatPolicy,
     ) {
         let TableBodyRowsInput {
+            fragmentainer_kind,
             rows,
             grid,
             columns,
@@ -21,6 +22,7 @@ impl<'a> LayoutBuilder<'a> {
             column_plan,
             planned_row_heights,
             planned_row_occupancy,
+            table_height_is_definite,
             table_width,
             table_metrics,
             collapsed_geometry,
@@ -36,8 +38,6 @@ impl<'a> LayoutBuilder<'a> {
         let mut table_x = table_x;
         let mut table_page_content_left = self.content_left;
         let mut table_body_fragment: Option<TableBodyPaintFragment> = None;
-        let mut pending_table_fragment_break_reason = TableFragmentBreakReason::TableStart;
-        let mut pending_repeated_header_rows = Vec::new();
         let mut current_fragment_repeat_policy = table_fragment_repeat_policy(
             0.01,
             self.page_area_height(),
@@ -46,14 +46,35 @@ impl<'a> LayoutBuilder<'a> {
             false,
             true,
         );
-        let mut page_break_before_next_row = PageBreak::Auto;
-        let mut forced_break_after_table_rows = PageBreak::Auto;
-        let mut avoid_break_candidate: Option<TableBreakCandidate> = None;
-        let mut previous_row_candidate: Option<TableBreakCandidate> = None;
-        let mut previous_break_after_avoid = false;
+        let mut pending_fragment_start = TableFragmentStartDecision::new(
+            TableFragmentBreakReason::TableStart,
+            current_fragment_repeat_policy,
+            false,
+        );
+        let mut forced_break_carry = TableForcedBreakCarryState::new(fragmentainer_kind);
+        let mut avoid_break_candidates = TableAvoidBreakCandidateState::new(fragmentainer_kind);
         let mut previous_row_page_end: Option<Option<String>> = None;
-        let mut unfragmented_avoid_row_group_end: Option<usize> = None;
+        let mut avoid_row_group_keep_state = TableAvoidRowGroupKeepState::default();
         let row_group_end_indices = table_row_group_end_indices(rows);
+        let mut fragment_commit_context = TableBodyFragmentCommitContext {
+            rows,
+            grid,
+            columns,
+            style,
+            stylesheets,
+            table_x,
+            used_table_width,
+            table_cellpadding,
+            column_plan,
+            planned_row_heights,
+            planned_row_occupancy,
+            table_width,
+            table_metrics: table_metrics.clone(),
+            collapsed_geometry,
+            table_is_document_canvas,
+            repeating_header_rows,
+            repeating_footer_rows,
+        };
         let mut row_index = 0usize;
         while row_index < rows.len() {
             let row = &rows[row_index];
@@ -63,6 +84,13 @@ impl<'a> LayoutBuilder<'a> {
             let row_height = planned_row_heights[row_index];
             let row_is_running = row_style.running_element_name.is_some();
             let row_collapsed = table_row_is_collapsed(&row_style);
+            let row_chrome_context = TableFragmentChromeContext {
+                fragmentainer_block_size: self.page_area_height(),
+                header_height: repeating_header_height,
+                footer_height: repeating_footer_height,
+                allow_header: !row_is_repeating_header,
+                allow_footer: !row_is_repeating_footer,
+            };
             let row_fragment_required_height = if row_height > self.page_area_height() + 0.01 {
                 0.01
             } else {
@@ -82,76 +110,33 @@ impl<'a> LayoutBuilder<'a> {
             };
             let row_page_start = page_boundary_name_in_parent_scope(row_page_start_source, style);
             let row_page_end = page_boundary_name_in_parent_scope(row_page_end_source, style);
-            if let Some(previous_page_end) = &previous_row_page_end
-                && previous_page_end != &row_page_start
+            if let Some(previous_page_end) = previous_row_page_end.clone()
+                && let Some(named_page_break) =
+                    TableNamedPageBreakDecision::choose(TableNamedPageBreakInput {
+                        previous_page_end,
+                        row_page_start: row_page_start.clone(),
+                        outgoing_repeat_policy: current_fragment_repeat_policy,
+                        row_required_height: row_fragment_required_height,
+                        chrome_context: row_chrome_context,
+                        paint_repeated_footer: !row_is_repeating_footer
+                            && !self.cursor_is_at_page_top(),
+                    })
             {
-                if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
-                    self.mark_table_body_fragment_repeated_footers(
-                        &mut table_body_fragment,
-                        current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                        planned_row_heights,
-                        planned_row_occupancy,
-                        table_metrics,
-                    );
-                }
-                self.finalize_table_body_paint_fragment(
+                self.commit_table_body_fragment_boundary(
                     &mut table_body_fragment,
-                    rows,
-                    grid,
-                    columns,
-                    style,
-                    stylesheets,
-                    table_x,
-                    used_table_width,
-                    table_cellpadding,
-                    column_plan,
-                    table_width,
-                    table_metrics,
-                    collapsed_geometry,
-                    table_is_document_canvas,
+                    &fragment_commit_context,
+                    named_page_break.boundary,
                 );
-                if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
-                    self.layout_repeated_table_footer_rows_at_page_bottom(
-                        rows,
-                        grid,
-                        columns,
-                        current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                        style,
-                        stylesheets,
-                        table_x,
-                        used_table_width,
-                        table_cellpadding,
-                        column_plan,
-                        planned_row_heights,
-                        planned_row_occupancy,
-                        table_width,
-                        table_metrics,
-                        collapsed_geometry,
-                    );
-                }
-                self.switch_page_name_at_class_a_boundary(row_page_start.as_deref());
+                self.switch_page_name_at_class_a_boundary(named_page_break.page_name.as_deref());
                 table_x += self.content_left - table_page_content_left;
+                fragment_commit_context.table_x = table_x;
                 table_page_content_left = self.content_left;
-                current_fragment_repeat_policy = table_fragment_repeat_policy(
-                    row_fragment_required_height,
-                    self.page_area_height(),
-                    repeating_header_height,
-                    repeating_footer_height,
-                    !row_is_repeating_header,
-                    !row_is_repeating_footer,
-                );
-                pending_table_fragment_break_reason = TableFragmentBreakReason::Forced;
-                if !row_is_repeating_header {
-                    pending_repeated_header_rows = current_fragment_repeat_policy
-                        .header_rows(repeating_header_rows)
-                        .to_vec();
-                }
+                current_fragment_repeat_policy = named_page_break.start.repeat_policy;
+                pending_fragment_start = named_page_break.start;
             }
             if !row_is_running {
                 previous_row_page_end = Some(row_page_end);
             }
-            let mut broke_before_row = page_break_before_next_row.is_forced();
-            let pending_avoid_before_row = page_break_before_next_row.avoids_page();
             let break_before = Self::effective_table_row_break_before(
                 row_index,
                 &row_style,
@@ -170,6 +155,10 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 PageBreak::Auto
             };
+            let row_breaks =
+                forced_break_carry.take_box_context(break_before, break_after, next_break_before);
+            let forced_break_before = row_breaks.forced_break_before_in(fragmentainer_kind);
+            let mut broke_before_row = forced_break_before.is_some();
             let pending_row_start_candidate = PendingTableBreakCandidate {
                 meta: TableBreakCandidateMeta {
                     row_index,
@@ -178,599 +167,251 @@ impl<'a> LayoutBuilder<'a> {
                     height: 0.0,
                 },
             };
-            let row_start_may_be_rollback_target =
-                (!row_collapsed && !row_is_running && break_after.avoids_page())
-                    || next_break_before.avoids_page()
-                    || (previous_break_after_avoid && avoid_break_candidate.is_none());
-            let row_start_candidate =
-                row_start_may_be_rollback_target.then(|| pending_row_start_candidate.arm(self));
-            if page_break_before_next_row.is_forced() {
-                if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
-                    self.mark_table_body_fragment_repeated_footers(
-                        &mut table_body_fragment,
-                        current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                        planned_row_heights,
-                        planned_row_occupancy,
-                        table_metrics,
-                    );
-                }
-                self.finalize_table_body_paint_fragment(
-                    &mut table_body_fragment,
-                    rows,
-                    grid,
-                    columns,
-                    style,
-                    stylesheets,
-                    table_x,
-                    used_table_width,
-                    table_cellpadding,
-                    column_plan,
-                    table_width,
-                    table_metrics,
-                    collapsed_geometry,
-                    table_is_document_canvas,
-                );
-                if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
-                    self.layout_repeated_table_footer_rows_at_page_bottom(
-                        rows,
-                        grid,
-                        columns,
-                        current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                        style,
-                        stylesheets,
-                        table_x,
-                        used_table_width,
-                        table_cellpadding,
-                        column_plan,
-                        planned_row_heights,
-                        planned_row_occupancy,
-                        table_width,
-                        table_metrics,
-                        collapsed_geometry,
-                    );
-                }
-                self.apply_forced_break(page_break_before_next_row);
-                current_fragment_repeat_policy = table_fragment_repeat_policy(
+            let row_start_candidate = avoid_break_candidates
+                .row_start_may_be_rollback_target(row_collapsed, row_is_running, row_breaks)
+                .then(|| pending_row_start_candidate.arm(self));
+            let mut start_chrome_replayed_after_break = false;
+            if let Some(page_break) = forced_break_before {
+                let forced_break = Self::table_body_forced_break(
+                    current_fragment_repeat_policy,
+                    fragmentainer_kind,
+                    page_break,
                     row_fragment_required_height,
-                    self.page_area_height(),
-                    repeating_header_height,
-                    repeating_footer_height,
-                    !row_is_repeating_header,
-                    !row_is_repeating_footer,
+                    row_chrome_context,
+                    !row_is_repeating_footer && !self.cursor_is_at_page_top(),
                 );
-                pending_table_fragment_break_reason = TableFragmentBreakReason::Forced;
-            }
-            page_break_before_next_row = PageBreak::Auto;
-            // CSS Fragmentation applies forced break-before/break-after values
-            // to table row and row-group boxes as ordinary fragmentation boxes.
-            // https://www.w3.org/TR/css-break-3/#break-between
-            if break_before.is_forced() {
-                if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
-                    self.mark_table_body_fragment_repeated_footers(
-                        &mut table_body_fragment,
-                        current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                        planned_row_heights,
-                        planned_row_occupancy,
-                        table_metrics,
-                    );
-                }
-                self.finalize_table_body_paint_fragment(
+                current_fragment_repeat_policy = forced_break.start.repeat_policy;
+                pending_fragment_start = forced_break.start;
+                self.apply_table_body_forced_break(
                     &mut table_body_fragment,
-                    rows,
-                    grid,
-                    columns,
-                    style,
-                    stylesheets,
-                    table_x,
-                    used_table_width,
-                    table_cellpadding,
-                    column_plan,
-                    table_width,
-                    table_metrics,
-                    collapsed_geometry,
-                    table_is_document_canvas,
+                    &fragment_commit_context,
+                    forced_break,
                 );
-                if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
-                    self.layout_repeated_table_footer_rows_at_page_bottom(
-                        rows,
-                        grid,
-                        columns,
-                        current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                        style,
-                        stylesheets,
-                        table_x,
-                        used_table_width,
-                        table_cellpadding,
-                        column_plan,
-                        planned_row_heights,
-                        planned_row_occupancy,
-                        table_width,
-                        table_metrics,
-                        collapsed_geometry,
-                    );
-                }
-                self.apply_forced_break(break_before);
-                current_fragment_repeat_policy = table_fragment_repeat_policy(
-                    row_fragment_required_height,
-                    self.page_area_height(),
-                    repeating_header_height,
-                    repeating_footer_height,
-                    !row_is_repeating_header,
-                    !row_is_repeating_footer,
-                );
-                pending_table_fragment_break_reason = TableFragmentBreakReason::Forced;
-                broke_before_row = true;
             }
-            if let Some((_, end, _)) = avoid_break_row_groups
+            if let Some(avoid_row_group) = avoid_break_row_groups
                 .iter()
-                .find(|(start, _, _)| *start == row_index)
+                .find(|avoid_row_group| avoid_row_group.start == row_index)
             {
                 let group_height = table_row_span_height(
                     planned_row_heights,
                     planned_row_occupancy,
                     row_index,
-                    end - row_index,
-                    table_metrics,
+                    avoid_row_group.row_span(),
+                    table_metrics.clone(),
                 );
-                let remaining_height = self.cursor_y - self.page_bottom();
+                let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
+                    self.page_area_height(),
+                    self.cursor_y,
+                    self.page_bottom(),
+                    current_fragment_repeat_policy,
+                    repeating_header_height,
+                    repeating_footer_height,
+                    !row_is_repeating_footer,
+                );
                 // CSS Fragmentation 3 treats `break-inside: avoid` as a
                 // preference to keep a fragmentation container together when
                 // possible. For table row groups, use the measured group height
                 // so rows are moved as a unit when the group fits on a fresh
                 // page but not in the current remaining fragmentainer.
                 // https://www.w3.org/TR/css-break-3/#break-within
-                let mut next_fragment_repeat_policy = table_fragment_repeat_policy(
-                    group_height,
-                    self.page_area_height(),
-                    repeating_header_height,
-                    repeating_footer_height,
-                    !row_is_repeating_header,
-                    !row_is_repeating_footer,
-                );
-                let next_fragment_body_capacity = next_fragment_repeat_policy.body_capacity(
-                    self.page_area_height(),
-                    repeating_header_height,
-                    repeating_footer_height,
-                );
-                let group_fits_next_fragment = group_height <= next_fragment_body_capacity + 0.01;
-                let no_repeat_policy = TableFragmentRepeatPolicy {
-                    repeat_header: false,
-                    repeat_footer: false,
-                };
-                let no_repeat_body_capacity = no_repeat_policy.body_capacity(
-                    self.page_area_height(),
-                    repeating_header_height,
-                    repeating_footer_height,
-                );
-                let group_can_overflow_next_fragment = !group_fits_next_fragment
-                    && group_height
-                        <= no_repeat_body_capacity + TABLE_AVOID_UNFRAGMENTED_OVERFLOW_TOLERANCE;
-                if group_can_overflow_next_fragment {
-                    next_fragment_repeat_policy = no_repeat_policy;
-                }
-                if (group_fits_next_fragment || group_can_overflow_next_fragment)
-                    && group_height > remaining_height + 0.01
-                    && !self.cursor_is_at_page_top()
-                {
-                    if !row_is_repeating_footer {
-                        self.mark_table_body_fragment_repeated_footers(
-                            &mut table_body_fragment,
-                            current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                            planned_row_heights,
-                            planned_row_occupancy,
-                            table_metrics,
-                        );
-                    }
-                    self.finalize_table_body_paint_fragment(
-                        &mut table_body_fragment,
-                        rows,
-                        grid,
-                        columns,
-                        style,
-                        stylesheets,
-                        table_x,
-                        used_table_width,
-                        table_cellpadding,
-                        column_plan,
-                        table_width,
-                        table_metrics,
-                        collapsed_geometry,
-                        table_is_document_canvas,
+                let row_group_avoid_decision =
+                    TableRowGroupAvoidDecision::choose(TableRowGroupAvoidDecisionInput {
+                        group: *avoid_row_group,
+                        group_height,
+                        current_fragmentainer,
+                        chrome_context: row_chrome_context,
+                        can_advance: !self.cursor_is_at_page_top(),
+                    });
+                if let Some(decision) = row_group_avoid_decision {
+                    debug_assert!(
+                        decision.group_height > current_fragmentainer.available_block_size() + 0.01
                     );
-                    if !row_is_repeating_footer {
-                        self.layout_repeated_table_footer_rows_at_page_bottom(
-                            rows,
-                            grid,
-                            columns,
-                            current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                            style,
-                            stylesheets,
-                            table_x,
-                            used_table_width,
-                            table_cellpadding,
-                            column_plan,
-                            planned_row_heights,
-                            planned_row_occupancy,
-                            table_width,
-                            table_metrics,
-                            collapsed_geometry,
-                        );
-                    }
-                    self.push_page();
-                    self.cursor_y = self.page_top();
-                    current_fragment_repeat_policy = next_fragment_repeat_policy;
-                    if group_can_overflow_next_fragment {
-                        unfragmented_avoid_row_group_end = Some(*end);
-                    }
-                    pending_table_fragment_break_reason = TableFragmentBreakReason::AvoidedOverflow;
+                    let transition = Self::table_body_fragment_transition(
+                        fragmentainer_kind,
+                        current_fragment_repeat_policy,
+                        TableFragmentBreakReason::AvoidedOverflow,
+                        decision.repeat_policy,
+                        !row_is_repeating_header,
+                        !row_is_repeating_footer,
+                    );
+                    current_fragment_repeat_policy = transition.start.repeat_policy;
+                    avoid_row_group_keep_state.commit(decision);
+                    pending_fragment_start = transition.start;
+                    self.apply_table_body_fragment_transition(
+                        &mut table_body_fragment,
+                        &fragment_commit_context,
+                        transition,
+                    );
+                    start_chrome_replayed_after_break = true;
                     broke_before_row = true;
                 }
             }
-            let reserved_footer_height = if row_is_repeating_footer {
-                0.0
-            } else {
-                current_fragment_repeat_policy.reserved_footer_height(repeating_footer_height)
-            };
-            let avoid_boundary = pending_avoid_before_row
-                || previous_break_after_avoid
-                || break_before.avoids_page();
-            let avoid_candidate = if pending_avoid_before_row || previous_break_after_avoid {
-                avoid_break_candidate.clone()
-            } else if break_before.avoids_page() {
-                previous_row_candidate.clone()
-            } else {
-                None
-            };
+            let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
+                self.page_area_height(),
+                self.cursor_y,
+                self.page_bottom(),
+                current_fragment_repeat_policy,
+                repeating_header_height,
+                repeating_footer_height,
+                !row_is_repeating_footer,
+            );
+            let row_break_opportunity = FragmentBreakOpportunity::before_box_boundary(
+                fragmentainer_kind,
+                row_index as f32,
+                row_breaks,
+                avoid_break_candidates.previous_break_after,
+                false,
+            );
+            let avoid_boundary = row_break_opportunity.avoids_break_in(fragmentainer_kind);
+            let avoid_candidate = avoid_break_candidates.boundary_candidate(row_breaks);
             if avoid_boundary
                 && let Some(candidate) = avoid_candidate
-                && !self.cursor_is_at_page_top()
-                && row_height > self.cursor_y - self.page_bottom() + 0.01
+                && let Some(decision) =
+                    TableAvoidRunBreakDecision::choose(TableAvoidRunBreakInput {
+                        candidate,
+                        row_height,
+                        current_fragmentainer,
+                        chrome_context: row_chrome_context,
+                        can_advance: !self.cursor_is_at_page_top(),
+                    })
             {
-                let avoid_run_height = candidate.height() + row_height;
-                let next_fragment_repeat_policy = table_fragment_repeat_policy(
-                    avoid_run_height,
-                    self.page_area_height(),
-                    repeating_header_height,
-                    repeating_footer_height,
-                    !row_is_repeating_header,
-                    !row_is_repeating_footer,
+                debug_assert!(
+                    decision.avoid_run_height > current_fragmentainer.available_block_size() + 0.01
                 );
-                if avoid_run_height
-                    > next_fragment_repeat_policy.body_capacity(
-                        self.page_area_height(),
-                        repeating_header_height,
-                        repeating_footer_height,
-                    ) + 0.01
-                {
-                    // The run cannot be kept together on the next fragment;
-                    // fall through to the ordinary row break rules.
-                } else {
-                    let candidate_meta = candidate.restore(self);
-                    table_body_fragment = candidate_meta.table_body_fragment;
-                    current_fragment_repeat_policy = candidate_meta.repeat_policy;
-                    if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
-                        self.mark_table_body_fragment_repeated_footers(
-                            &mut table_body_fragment,
-                            current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                            planned_row_heights,
-                            planned_row_occupancy,
-                            table_metrics,
-                        );
-                    }
-                    self.finalize_table_body_paint_fragment(
-                        &mut table_body_fragment,
-                        rows,
-                        grid,
-                        columns,
-                        style,
-                        stylesheets,
-                        table_x,
-                        used_table_width,
-                        table_cellpadding,
-                        column_plan,
-                        table_width,
-                        table_metrics,
-                        collapsed_geometry,
-                        table_is_document_canvas,
-                    );
-                    if !row_is_repeating_footer && !self.cursor_is_at_page_top() {
-                        self.layout_repeated_table_footer_rows_at_page_bottom(
-                            rows,
-                            grid,
-                            columns,
-                            current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                            style,
-                            stylesheets,
-                            table_x,
-                            used_table_width,
-                            table_cellpadding,
-                            column_plan,
-                            planned_row_heights,
-                            planned_row_occupancy,
-                            table_width,
-                            table_metrics,
-                            collapsed_geometry,
-                        );
-                    }
-                    self.push_page();
-                    self.cursor_y = self.page_top();
-                    current_fragment_repeat_policy = next_fragment_repeat_policy;
-                    pending_table_fragment_break_reason = TableFragmentBreakReason::AvoidedOverflow;
-                    if !row_is_repeating_header {
-                        self.layout_repeated_table_rows(
-                            rows,
-                            grid,
-                            columns,
-                            current_fragment_repeat_policy.header_rows(repeating_header_rows),
-                            style,
-                            stylesheets,
-                            table_x,
-                            used_table_width,
-                            table_cellpadding,
-                            column_plan,
-                            planned_row_heights,
-                            planned_row_occupancy,
-                            table_width,
-                            table_metrics,
-                            collapsed_geometry,
-                        );
-                        pending_repeated_header_rows = current_fragment_repeat_policy
-                            .header_rows(repeating_header_rows)
-                            .to_vec();
-                    }
-                    row_index = candidate_meta.row_index;
-                    page_break_before_next_row = PageBreak::Auto;
-                    avoid_break_candidate = None;
-                    previous_row_candidate = None;
-                    previous_break_after_avoid = false;
-                    continue;
-                }
-            }
-            let row_requires_split = row_height > self.page_area_height() + 0.01;
-            let row_kept_by_avoid_group =
-                unfragmented_avoid_row_group_end.is_some_and(|end| row_index < end);
-            let available_height = self.cursor_y - self.page_bottom();
-            let row_overflows_page = if row_requires_split {
-                !row_kept_by_avoid_group && available_height <= 0.01
-            } else {
-                self.cursor_y - row_height < self.page_bottom()
-            };
-            let row_overflows_reserved_footer = if row_requires_split {
-                !row_kept_by_avoid_group && available_height - reserved_footer_height <= 0.01
-            } else {
-                self.cursor_y - row_height - reserved_footer_height < self.page_bottom()
-            };
-            if (row_overflows_page || row_overflows_reserved_footer)
-                && !self.cursor_is_at_page_top()
-                && self.out_of_flow_prebreak_suppression_depth == 0
-            {
-                if !row_is_repeating_footer {
-                    self.mark_table_body_fragment_repeated_footers(
-                        &mut table_body_fragment,
-                        current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                        planned_row_heights,
-                        planned_row_occupancy,
-                        table_metrics,
-                    );
-                }
-                self.finalize_table_body_paint_fragment(
+                let candidate_meta = decision.candidate.restore(self);
+                table_body_fragment = candidate_meta.table_body_fragment;
+                current_fragment_repeat_policy = candidate_meta.repeat_policy;
+                let transition = Self::table_body_fragment_transition(
+                    fragmentainer_kind,
+                    current_fragment_repeat_policy,
+                    TableFragmentBreakReason::AvoidedOverflow,
+                    decision.incoming_repeat_policy,
+                    !row_is_repeating_header,
+                    !row_is_repeating_footer && !self.cursor_is_at_page_top(),
+                );
+                current_fragment_repeat_policy = transition.start.repeat_policy;
+                pending_fragment_start = transition.start;
+                self.apply_table_body_fragment_transition(
                     &mut table_body_fragment,
-                    rows,
-                    grid,
-                    columns,
-                    style,
-                    stylesheets,
-                    table_x,
-                    used_table_width,
-                    table_cellpadding,
-                    column_plan,
-                    table_width,
-                    table_metrics,
-                    collapsed_geometry,
-                    table_is_document_canvas,
+                    &fragment_commit_context,
+                    transition,
                 );
-                if !row_is_repeating_footer {
-                    self.layout_repeated_table_footer_rows_at_page_bottom(
-                        rows,
-                        grid,
-                        columns,
-                        current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                        style,
-                        stylesheets,
-                        table_x,
-                        used_table_width,
-                        table_cellpadding,
-                        column_plan,
-                        planned_row_heights,
-                        planned_row_occupancy,
-                        table_width,
-                        table_metrics,
-                        collapsed_geometry,
-                    );
-                }
-                self.push_page();
-                self.cursor_y = self.page_top();
-                current_fragment_repeat_policy = table_fragment_repeat_policy(
-                    row_fragment_required_height,
-                    self.page_area_height(),
-                    repeating_header_height,
-                    repeating_footer_height,
+                row_index = candidate_meta.row_index;
+                avoid_break_candidates.reset();
+                continue;
+            }
+            let row_kept_by_avoid_group = avoid_row_group_keep_state.contains_row(row_index);
+            if let Some(overflow_break) =
+                TableRowOverflowBreakDecision::choose(TableRowOverflowBreakInput {
+                    row_height,
+                    row_required_height: row_fragment_required_height,
+                    current_fragmentainer,
+                    row_kept_by_avoid_group,
+                    can_break: !self.cursor_is_at_page_top()
+                        && self.out_of_flow_prebreak_suppression_depth == 0,
+                    chrome_context: row_chrome_context,
+                })
+            {
+                debug_assert_eq!(overflow_break.row_height, row_height);
+                let transition = Self::table_body_fragment_transition(
+                    fragmentainer_kind,
+                    current_fragment_repeat_policy,
+                    TableFragmentBreakReason::Overflow,
+                    overflow_break.incoming_repeat_policy,
                     !row_is_repeating_header,
                     !row_is_repeating_footer,
                 );
-                pending_table_fragment_break_reason = TableFragmentBreakReason::Overflow;
+                current_fragment_repeat_policy = transition.start.repeat_policy;
+                pending_fragment_start = transition.start;
+                self.apply_table_body_fragment_transition(
+                    &mut table_body_fragment,
+                    &fragment_commit_context,
+                    transition,
+                );
+                start_chrome_replayed_after_break = true;
                 broke_before_row = true;
             }
-            if broke_before_row && !row_is_repeating_header {
-                self.layout_repeated_table_rows(
-                    rows,
-                    grid,
-                    columns,
-                    current_fragment_repeat_policy.header_rows(repeating_header_rows),
-                    style,
-                    stylesheets,
-                    table_x,
-                    used_table_width,
-                    table_cellpadding,
-                    column_plan,
-                    planned_row_heights,
-                    planned_row_occupancy,
-                    table_width,
-                    table_metrics,
-                    collapsed_geometry,
-                );
-                pending_repeated_header_rows = current_fragment_repeat_policy
-                    .header_rows(repeating_header_rows)
-                    .to_vec();
-                let reserved_footer_height_after_header = if row_is_repeating_footer {
-                    0.0
-                } else {
-                    current_fragment_repeat_policy.reserved_footer_height(repeating_footer_height)
-                };
-                let available_height_after_header = self.cursor_y - self.page_bottom();
-                let row_still_overflows_after_header = if row_requires_split {
-                    !row_kept_by_avoid_group
-                        && available_height_after_header - reserved_footer_height_after_header
-                            <= 0.01
-                } else {
-                    self.cursor_y - row_height - reserved_footer_height_after_header
-                        < self.page_bottom()
-                };
-                if row_still_overflows_after_header && !self.cursor_is_at_page_top() {
-                    if !row_is_repeating_footer {
-                        self.mark_table_body_fragment_repeated_footers(
-                            &mut table_body_fragment,
-                            current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                            planned_row_heights,
-                            planned_row_occupancy,
-                            table_metrics,
-                        );
-                    }
-                    self.finalize_table_body_paint_fragment(
-                        &mut table_body_fragment,
-                        rows,
-                        grid,
-                        columns,
-                        style,
-                        stylesheets,
-                        table_x,
-                        used_table_width,
-                        table_cellpadding,
-                        column_plan,
-                        table_width,
-                        table_metrics,
-                        collapsed_geometry,
-                        table_is_document_canvas,
+            if broke_before_row {
+                if !start_chrome_replayed_after_break {
+                    self.replay_table_fragment_start_chrome(
+                        &fragment_commit_context,
+                        pending_fragment_start,
                     );
-                    if !row_is_repeating_footer {
-                        self.layout_repeated_table_footer_rows_at_page_bottom(
-                            rows,
-                            grid,
-                            columns,
-                            current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                            style,
-                            stylesheets,
-                            table_x,
-                            used_table_width,
-                            table_cellpadding,
-                            column_plan,
-                            planned_row_heights,
-                            planned_row_occupancy,
-                            table_width,
-                            table_metrics,
-                            collapsed_geometry,
-                        );
-                    }
-                    self.push_page();
-                    self.cursor_y = self.page_top();
-                    current_fragment_repeat_policy = table_fragment_repeat_policy(
-                        row_fragment_required_height,
-                        self.page_area_height(),
-                        repeating_header_height,
-                        repeating_footer_height,
+                }
+                let after_header_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
+                    self.page_area_height(),
+                    self.cursor_y,
+                    self.page_bottom(),
+                    current_fragment_repeat_policy,
+                    repeating_header_height,
+                    repeating_footer_height,
+                    !row_is_repeating_footer,
+                );
+                if let Some(overflow_break) =
+                    TableRowOverflowBreakDecision::choose(TableRowOverflowBreakInput {
+                        row_height,
+                        row_required_height: row_fragment_required_height,
+                        current_fragmentainer: after_header_fragmentainer,
+                        row_kept_by_avoid_group,
+                        can_break: !self.cursor_is_at_page_top(),
+                        chrome_context: TableFragmentChromeContext {
+                            allow_header: false,
+                            ..row_chrome_context
+                        },
+                    })
+                {
+                    debug_assert_eq!(overflow_break.row_height, row_height);
+                    let transition = Self::table_body_fragment_transition(
+                        fragmentainer_kind,
+                        current_fragment_repeat_policy,
+                        TableFragmentBreakReason::Overflow,
+                        overflow_break.incoming_repeat_policy,
                         false,
                         !row_is_repeating_footer,
                     );
-                    pending_table_fragment_break_reason = TableFragmentBreakReason::Overflow;
-                    self.layout_repeated_table_rows(
-                        rows,
-                        grid,
-                        columns,
-                        current_fragment_repeat_policy.header_rows(repeating_header_rows),
-                        style,
-                        stylesheets,
-                        table_x,
-                        used_table_width,
-                        table_cellpadding,
-                        column_plan,
-                        planned_row_heights,
-                        planned_row_occupancy,
-                        table_width,
-                        table_metrics,
-                        collapsed_geometry,
+                    current_fragment_repeat_policy = transition.start.repeat_policy;
+                    pending_fragment_start = transition.start;
+                    self.apply_table_body_fragment_transition(
+                        &mut table_body_fragment,
+                        &fragment_commit_context,
+                        transition,
                     );
-                    pending_repeated_header_rows = current_fragment_repeat_policy
-                        .header_rows(repeating_header_rows)
-                        .to_vec();
                 }
             }
 
             let row_top = self.cursor_y;
-            if self.ensure_table_body_paint_fragment(
+            self.ensure_committed_table_body_fragment(
                 &mut table_body_fragment,
+                fragmentainer_kind,
                 row_top,
-                pending_table_fragment_break_reason,
-                &pending_repeated_header_rows,
-            ) {
-                pending_table_fragment_break_reason = TableFragmentBreakReason::TableStart;
-                pending_repeated_header_rows.clear();
-            }
+                &mut pending_fragment_start,
+                current_fragment_repeat_policy,
+                repeating_header_rows,
+            );
             if row_collapsed {
-                let starts_page_fragment = !self.current_page_has_content();
-                let placement = table_body_fragment.as_ref().map(|fragment| {
-                    Self::table_row_fragment_assignment_placement(
-                        fragment,
-                        table_x,
-                        used_table_width,
-                        row_top,
-                        0.0,
-                        starts_page_fragment,
-                    )
-                });
-                if let Some(placement) = placement {
-                    self.capture_table_row_named_string_assignments(
-                        row, &row_style, placement, 0.0,
-                    );
-                    self.capture_table_row_running_cell_assignments(
-                        row,
-                        &row_style,
-                        stylesheets,
-                        table_x,
-                        row_top,
-                        0.0,
-                    );
-                }
+                let decision = self.table_row_fragment_decision(
+                    table_body_fragment.as_ref(),
+                    table_x,
+                    used_table_width,
+                    row_index,
+                    row_top,
+                    0.0,
+                    0.0,
+                    0.0,
+                    true,
+                    TableRowFragmentMode::Whole,
+                );
+                self.capture_table_row_fragment_decision_assignments(
+                    row,
+                    &row_style,
+                    stylesheets,
+                    table_x,
+                    decision,
+                );
                 if let Some(fragment) = &mut table_body_fragment {
-                    fragment.push_row(
-                        row_index,
-                        row_top,
-                        0.0,
-                        0.0,
-                        0.0,
-                        true,
-                        Self::table_row_source_fragment(placement),
-                    );
+                    fragment.push_row_decision(decision);
                 }
-                previous_row_candidate = next_break_before.avoids_page().then(|| {
-                    row_start_candidate
-                        .clone()
-                        .expect(
-                            "row start candidate must be armed when next row has break-before: avoid",
-                        )
-                        .with_height(0.0)
-                });
-                avoid_break_candidate = None;
-                previous_break_after_avoid = false;
+                avoid_break_candidates.finish_non_content_row(row_breaks, row_start_candidate);
                 row_index += 1;
                 continue;
             }
@@ -779,16 +420,7 @@ impl<'a> LayoutBuilder<'a> {
                 if let Some(element) = row.element {
                     self.capture_assignments_for_fragment_source(element, &row_style, placement);
                 }
-                previous_row_candidate = next_break_before.avoids_page().then(|| {
-                    row_start_candidate
-                        .clone()
-                        .expect(
-                            "row start candidate must be armed when next row has break-before: avoid",
-                        )
-                        .with_height(0.0)
-                });
-                avoid_break_candidate = None;
-                previous_break_after_avoid = false;
+                avoid_break_candidates.finish_non_content_row(row_breaks, row_start_candidate);
                 row_index += 1;
                 continue;
             }
@@ -800,153 +432,93 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 table_cellpadding,
                 column_plan,
-                table_metrics,
+                table_metrics.clone(),
                 collapsed_geometry,
             );
             if row_height > self.page_area_height() + 0.01 && !row_kept_by_avoid_group {
                 let mut remaining = row_height;
                 let mut piece_offset = 0.0;
                 while remaining > 0.01 {
-                    let reserved_footer_height = if row_is_repeating_footer {
-                        0.0
-                    } else {
-                        current_fragment_repeat_policy
-                            .reserved_footer_height(repeating_footer_height)
-                    };
-                    let available_height =
-                        (self.cursor_y - self.page_bottom() - reserved_footer_height).max(0.0);
-                    if available_height <= 0.01 {
-                        if !row_is_repeating_footer {
-                            self.mark_table_body_fragment_repeated_footers(
-                                &mut table_body_fragment,
-                                current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                                planned_row_heights,
-                                planned_row_occupancy,
-                                table_metrics,
-                            );
-                        }
-                        self.finalize_table_body_paint_fragment(
-                            &mut table_body_fragment,
-                            rows,
-                            grid,
-                            columns,
-                            style,
-                            stylesheets,
-                            table_x,
-                            used_table_width,
-                            table_cellpadding,
-                            column_plan,
-                            table_width,
-                            table_metrics,
-                            collapsed_geometry,
-                            table_is_document_canvas,
-                        );
-                        if !row_is_repeating_footer {
-                            self.layout_repeated_table_footer_rows_at_page_bottom(
-                                rows,
-                                grid,
-                                columns,
-                                current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                                style,
-                                stylesheets,
-                                table_x,
-                                used_table_width,
-                                table_cellpadding,
-                                column_plan,
-                                planned_row_heights,
-                                planned_row_occupancy,
-                                table_width,
-                                table_metrics,
-                                collapsed_geometry,
-                            );
-                        }
-                        self.push_page();
-                        self.cursor_y = self.page_top();
-                        current_fragment_repeat_policy = table_fragment_repeat_policy(
-                            row_fragment_required_height,
-                            self.page_area_height(),
-                            repeating_header_height,
-                            repeating_footer_height,
+                    let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
+                        self.page_area_height(),
+                        self.cursor_y,
+                        self.page_bottom(),
+                        current_fragment_repeat_policy,
+                        repeating_header_height,
+                        repeating_footer_height,
+                        !row_is_repeating_footer,
+                    );
+                    let slice_decision =
+                        TableOversizedRowSliceDecision::choose(TableOversizedRowSliceInput {
+                            remaining_height: remaining,
+                            row_required_height: row_fragment_required_height,
+                            current_fragmentainer,
+                            chrome_context: row_chrome_context,
+                            can_advance: !self.cursor_is_at_page_top(),
+                        });
+                    if !slice_decision.paints_slice() {
+                        debug_assert!(slice_decision.available_body_size <= 0.01);
+                        let transition = Self::table_body_fragment_transition(
+                            fragmentainer_kind,
+                            current_fragment_repeat_policy,
+                            TableFragmentBreakReason::OversizedRowSlice,
+                            slice_decision.incoming_repeat_policy,
                             !row_is_repeating_header,
                             !row_is_repeating_footer,
                         );
-                        pending_table_fragment_break_reason =
-                            TableFragmentBreakReason::OversizedRowSlice;
-                        if !row_is_repeating_header {
-                            self.layout_repeated_table_rows(
-                                rows,
-                                grid,
-                                columns,
-                                current_fragment_repeat_policy.header_rows(repeating_header_rows),
-                                style,
-                                stylesheets,
-                                table_x,
-                                used_table_width,
-                                table_cellpadding,
-                                column_plan,
-                                planned_row_heights,
-                                planned_row_occupancy,
-                                table_width,
-                                table_metrics,
-                                collapsed_geometry,
-                            );
-                            pending_repeated_header_rows = current_fragment_repeat_policy
-                                .header_rows(repeating_header_rows)
-                                .to_vec();
-                        }
-                        if self.ensure_table_body_paint_fragment(
+                        current_fragment_repeat_policy = transition.start.repeat_policy;
+                        pending_fragment_start = transition.start;
+                        self.apply_table_body_fragment_transition(
                             &mut table_body_fragment,
+                            &fragment_commit_context,
+                            transition,
+                        );
+                        self.ensure_committed_table_body_fragment(
+                            &mut table_body_fragment,
+                            fragmentainer_kind,
                             self.cursor_y,
-                            pending_table_fragment_break_reason,
-                            &pending_repeated_header_rows,
-                        ) {
-                            pending_table_fragment_break_reason =
-                                TableFragmentBreakReason::TableStart;
-                            pending_repeated_header_rows.clear();
-                        }
+                            &mut pending_fragment_start,
+                            current_fragment_repeat_policy,
+                            repeating_header_rows,
+                        );
                         continue;
                     }
 
-                    let piece_height = remaining.min(available_height);
+                    let piece_height = slice_decision.piece_height;
                     let piece_top = self.cursor_y;
-                    if self.ensure_table_body_paint_fragment(
+                    self.ensure_committed_table_body_fragment(
                         &mut table_body_fragment,
+                        fragmentainer_kind,
                         piece_top,
-                        pending_table_fragment_break_reason,
-                        &pending_repeated_header_rows,
-                    ) {
-                        pending_table_fragment_break_reason = TableFragmentBreakReason::TableStart;
-                        pending_repeated_header_rows.clear();
-                    }
-                    let starts_page_fragment = !self.current_page_has_content();
-                    let placement = table_body_fragment.as_ref().map(|fragment| {
-                        Self::table_row_fragment_assignment_placement(
-                            fragment,
-                            table_x,
-                            used_table_width,
-                            piece_top,
-                            piece_height,
-                            starts_page_fragment,
-                        )
-                    });
-                    if let Some(placement) = placement {
-                        self.capture_table_row_named_string_assignments(
-                            row,
-                            &row_style,
-                            placement,
-                            piece_offset,
-                        );
-                        self.capture_table_row_running_cell_assignments(
-                            row,
-                            &row_style,
-                            stylesheets,
-                            table_x,
-                            piece_top,
-                            piece_offset,
-                        );
-                    }
-                    self.layout_table_row_paint_piece(
+                        &mut pending_fragment_start,
+                        current_fragment_repeat_policy,
+                        repeating_header_rows,
+                    );
+                    let decision = self.table_row_fragment_decision(
+                        table_body_fragment.as_ref(),
+                        table_x,
+                        used_table_width,
                         row_index,
+                        piece_top,
+                        piece_height,
+                        piece_offset,
+                        row_height,
+                        !planned_row_occupancy
+                            .get(row_index)
+                            .cloned()
+                            .unwrap_or(false),
+                        TableRowFragmentMode::Sliced,
+                    );
+                    self.capture_table_row_fragment_decision_assignments(
+                        row,
+                        &row_style,
+                        stylesheets,
+                        table_x,
+                        decision,
+                    );
+                    self.paint_committed_table_row_fragment(
+                        &mut table_body_fragment,
+                        decision,
                         row,
                         &row_style,
                         rows,
@@ -959,150 +531,72 @@ impl<'a> LayoutBuilder<'a> {
                         column_plan,
                         planned_row_heights,
                         planned_row_occupancy,
-                        table_metrics,
-                        piece_top,
-                        row_height,
-                        piece_height,
-                        piece_offset,
+                        table_height_is_definite,
+                        table_metrics.clone(),
                         collapsed_geometry,
                         row_baseline_offset,
                     );
-                    if let Some(fragment) = &mut table_body_fragment {
-                        fragment.push_row(
-                            row_index,
-                            piece_top,
-                            piece_height,
-                            piece_offset,
-                            row_height,
-                            !planned_row_occupancy
-                                .get(row_index)
-                                .copied()
-                                .unwrap_or(false),
-                            Self::table_row_source_fragment(placement),
-                        );
-                    }
                     self.cursor_y -= piece_height;
                     remaining -= piece_height;
                     piece_offset += piece_height;
 
-                    if remaining > 0.01 {
-                        if !row_is_repeating_footer {
-                            self.mark_table_body_fragment_repeated_footers(
-                                &mut table_body_fragment,
-                                current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                                planned_row_heights,
-                                planned_row_occupancy,
-                                table_metrics,
-                            );
-                        }
-                        self.finalize_table_body_paint_fragment(
-                            &mut table_body_fragment,
-                            rows,
-                            grid,
-                            columns,
-                            style,
-                            stylesheets,
-                            table_x,
-                            used_table_width,
-                            table_cellpadding,
-                            column_plan,
-                            table_width,
-                            table_metrics,
-                            collapsed_geometry,
-                            table_is_document_canvas,
-                        );
-                        if !row_is_repeating_footer {
-                            self.layout_repeated_table_footer_rows_at_page_bottom(
-                                rows,
-                                grid,
-                                columns,
-                                current_fragment_repeat_policy.footer_rows(repeating_footer_rows),
-                                style,
-                                stylesheets,
-                                table_x,
-                                used_table_width,
-                                table_cellpadding,
-                                column_plan,
-                                planned_row_heights,
-                                planned_row_occupancy,
-                                table_width,
-                                table_metrics,
-                                collapsed_geometry,
-                            );
-                        }
-                        self.push_page();
-                        self.cursor_y = self.page_top();
-                        current_fragment_repeat_policy = table_fragment_repeat_policy(
-                            row_fragment_required_height,
-                            self.page_area_height(),
-                            repeating_header_height,
-                            repeating_footer_height,
+                    if slice_decision.continues_after_slice() {
+                        let transition = Self::table_body_fragment_transition(
+                            fragmentainer_kind,
+                            current_fragment_repeat_policy,
+                            TableFragmentBreakReason::OversizedRowSlice,
+                            slice_decision.incoming_repeat_policy,
                             !row_is_repeating_header,
                             !row_is_repeating_footer,
                         );
-                        pending_table_fragment_break_reason =
-                            TableFragmentBreakReason::OversizedRowSlice;
-                        if !row_is_repeating_header {
-                            self.layout_repeated_table_rows(
-                                rows,
-                                grid,
-                                columns,
-                                current_fragment_repeat_policy.header_rows(repeating_header_rows),
-                                style,
-                                stylesheets,
-                                table_x,
-                                used_table_width,
-                                table_cellpadding,
-                                column_plan,
-                                planned_row_heights,
-                                planned_row_occupancy,
-                                table_width,
-                                table_metrics,
-                                collapsed_geometry,
-                            );
-                            pending_repeated_header_rows = current_fragment_repeat_policy
-                                .header_rows(repeating_header_rows)
-                                .to_vec();
-                        }
-                        if self.ensure_table_body_paint_fragment(
+                        current_fragment_repeat_policy = transition.start.repeat_policy;
+                        pending_fragment_start = transition.start;
+                        self.apply_table_body_fragment_transition(
                             &mut table_body_fragment,
+                            &fragment_commit_context,
+                            transition,
+                        );
+                        self.ensure_committed_table_body_fragment(
+                            &mut table_body_fragment,
+                            fragmentainer_kind,
                             self.cursor_y,
-                            pending_table_fragment_break_reason,
-                            &pending_repeated_header_rows,
-                        ) {
-                            pending_table_fragment_break_reason =
-                                TableFragmentBreakReason::TableStart;
-                            pending_repeated_header_rows.clear();
-                        }
+                            &mut pending_fragment_start,
+                            current_fragment_repeat_policy,
+                            repeating_header_rows,
+                        );
                     }
                 }
             } else {
-                let starts_page_fragment = !self.current_page_has_content();
-                let placement = table_body_fragment.as_ref().map(|fragment| {
-                    Self::table_row_fragment_assignment_placement(
-                        fragment,
-                        table_x,
-                        used_table_width,
-                        row_top,
-                        row_height,
-                        starts_page_fragment,
-                    )
-                });
-                if let Some(placement) = placement {
-                    self.capture_table_row_named_string_assignments(
-                        row, &row_style, placement, 0.0,
-                    );
-                    self.capture_table_row_running_cell_assignments(
-                        row,
-                        &row_style,
-                        stylesheets,
-                        table_x,
-                        row_top,
-                        0.0,
-                    );
-                }
-                self.layout_table_row_paint_piece(
+                let row_fragment_mode = if row_kept_by_avoid_group {
+                    TableRowFragmentMode::KeptByAvoidOverflow
+                } else {
+                    TableRowFragmentMode::Whole
+                };
+                let decision = self.table_row_fragment_decision(
+                    table_body_fragment.as_ref(),
+                    table_x,
+                    used_table_width,
                     row_index,
+                    row_top,
+                    row_height,
+                    0.0,
+                    row_height,
+                    !planned_row_occupancy
+                        .get(row_index)
+                        .cloned()
+                        .unwrap_or(false),
+                    row_fragment_mode,
+                );
+                self.capture_table_row_fragment_decision_assignments(
+                    row,
+                    &row_style,
+                    stylesheets,
+                    table_x,
+                    decision,
+                );
+                self.paint_committed_table_row_fragment(
+                    &mut table_body_fragment,
+                    decision,
                     row,
                     &row_style,
                     rows,
@@ -1115,33 +609,16 @@ impl<'a> LayoutBuilder<'a> {
                     column_plan,
                     planned_row_heights,
                     planned_row_occupancy,
-                    table_metrics,
-                    row_top,
-                    row_height,
-                    row_height,
-                    0.0,
+                    table_height_is_definite,
+                    table_metrics.clone(),
                     collapsed_geometry,
                     row_baseline_offset,
                 );
-                if let Some(fragment) = &mut table_body_fragment {
-                    fragment.push_row(
-                        row_index,
-                        row_top,
-                        row_height,
-                        0.0,
-                        row_height,
-                        !planned_row_occupancy
-                            .get(row_index)
-                            .copied()
-                            .unwrap_or(false),
-                        Self::table_row_source_fragment(placement),
-                    );
-                }
                 self.cursor_y -= row_height;
             }
             if planned_row_occupancy
                 .get(row_index)
-                .copied()
+                .cloned()
                 .unwrap_or(false)
                 && planned_row_occupancy
                     .get(row_index + 1..)
@@ -1149,61 +626,259 @@ impl<'a> LayoutBuilder<'a> {
             {
                 self.cursor_y -= table_metrics.spacing.vertical.length_points();
             }
-            if break_after.is_forced() {
-                if row_index + 1 < rows.len() {
-                    page_break_before_next_row = break_after;
-                } else {
-                    forced_break_after_table_rows = break_after;
-                }
-            }
-            let row_candidate = if previous_break_after_avoid {
-                let this = avoid_break_candidate.clone().unwrap_or_else(|| {
-                    row_start_candidate.clone().expect(
-                        "row start candidate must be armed when an avoid run fallback is needed",
-                    )
-                });
-                let height = avoid_break_candidate
-                    .as_ref()
-                    .map(|candidate| candidate.height())
-                    .unwrap_or(0.0)
-                    + row_height;
-                Some(this.with_height(height))
-            } else if break_after.avoids_page() || next_break_before.avoids_page() {
-                Some(
-                    row_start_candidate
-                        .clone()
-                        .expect(
-                            "row start candidate must be armed when this row can become a table break candidate",
-                        )
-                        .with_height(row_height),
-                )
-            } else {
-                None
-            };
-            previous_row_candidate = next_break_before.avoids_page().then(|| {
-                row_candidate
-                    .clone()
-                    .expect("table break candidate must exist for next row break-before: avoid")
-            });
-            if break_after.avoids_page() {
-                avoid_break_candidate = Some(
-                    row_candidate.expect("table break candidate must exist for break-after: avoid"),
-                );
-            } else {
-                avoid_break_candidate = None;
-            }
-            previous_break_after_avoid = break_after.avoids_page();
+            let has_next_row = row_index + 1 < rows.len();
+            forced_break_carry.finish_box(row_breaks, has_next_row);
+            avoid_break_candidates.finish_content_row(row_breaks, row_start_candidate, row_height);
             row_index += 1;
-            if unfragmented_avoid_row_group_end.is_some_and(|end| row_index >= end) {
-                unfragmented_avoid_row_group_end = None;
-            }
+            avoid_row_group_keep_state.finish_row(row_index);
         }
 
         (
             table_body_fragment,
-            forced_break_after_table_rows,
+            forced_break_carry.outgoing_source_break(),
             current_fragment_repeat_policy,
         )
+    }
+
+    /// Commit the current table-body page fragment before starting another one.
+    ///
+    /// CSS Fragmentation commits one fragmentainer slice before layout
+    /// advances to the next page; CSS 2.2 table header/footer repetition is
+    /// page-fragment chrome around that same committed body slice. Centralizing
+    /// the side effects here keeps footer reservation, footer painting, and
+    /// table paint finalization tied to a single fragment boundary decision:
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model> and
+    /// <https://www.w3.org/TR/CSS22/tables.html#value-def-table-footer-group>.
+    pub(in crate::layout::table) fn commit_table_body_fragment_boundary(
+        &mut self,
+        fragment: &mut Option<TableBodyPaintFragment>,
+        context: &TableBodyFragmentCommitContext<'_, '_>,
+        boundary: TableFragmentBoundaryDecision,
+    ) {
+        let has_normal_flow_content = fragment.as_ref().is_some_and(|fragment| {
+            fragment
+                .plan
+                .body_rows
+                .iter()
+                .any(|row| !row.collapsed && row.row_height > 0.0)
+        });
+        let footer_rows = boundary
+            .repeat_policy
+            .footer_rows(context.repeating_footer_rows);
+        if let Some(fragment) = fragment {
+            fragment.mark_outgoing_boundary(boundary);
+        }
+        if boundary.footer_action.record_repeated_rows() {
+            self.mark_table_body_fragment_repeated_footers(
+                fragment,
+                footer_rows,
+                context.planned_row_heights,
+                context.planned_row_occupancy,
+                context.table_metrics.clone(),
+            );
+        }
+        self.finalize_table_body_paint_fragment(
+            fragment,
+            context.rows,
+            context.grid,
+            context.columns,
+            context.style,
+            context.stylesheets,
+            context.table_x,
+            context.used_table_width,
+            context.table_cellpadding,
+            context.column_plan,
+            context.table_width,
+            context.table_metrics.clone(),
+            context.collapsed_geometry,
+            context.table_is_document_canvas,
+        );
+        if has_normal_flow_content {
+            self.mark_current_page_flow_content();
+            self.current_page.mark_fragmentation_content();
+        }
+        if boundary.footer_action.paint_repeated_chrome() {
+            self.layout_repeated_table_footer_rows_at_page_bottom(
+                context.rows,
+                context.grid,
+                context.columns,
+                footer_rows,
+                context.style,
+                context.stylesheets,
+                context.table_x,
+                context.used_table_width,
+                context.table_cellpadding,
+                context.column_plan,
+                context.planned_row_heights,
+                context.planned_row_occupancy,
+                context.table_width,
+                context.table_metrics.clone(),
+                context.collapsed_geometry,
+            );
+        }
+    }
+
+    /// Replay table chrome committed at the start of a body fragment.
+    ///
+    /// CSS Fragmentation fixes the new page fragment before its body rows are
+    /// painted. Repeated table headers are page-fragment chrome, so their
+    /// replay is driven by the same start decision later recorded on the body
+    /// fragment plan:
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model> and
+    /// <https://www.w3.org/TR/CSS22/tables.html#value-def-table-header-group>.
+    fn replay_table_fragment_start_chrome(
+        &mut self,
+        context: &TableBodyFragmentCommitContext<'_, '_>,
+        start: TableFragmentStartDecision,
+    ) {
+        let header_rows = start.repeated_header_rows(context.repeating_header_rows);
+        if header_rows.is_empty() {
+            return;
+        }
+        self.layout_repeated_table_rows(
+            context.rows,
+            context.grid,
+            context.columns,
+            header_rows,
+            context.style,
+            context.stylesheets,
+            context.table_x,
+            context.used_table_width,
+            context.table_cellpadding,
+            context.column_plan,
+            context.planned_row_heights,
+            context.planned_row_occupancy,
+            context.table_width,
+            context.table_metrics.clone(),
+            context.collapsed_geometry,
+            true,
+        );
+    }
+
+    /// Apply one committed table-fragment transition.
+    ///
+    /// The outgoing boundary owns footer replay/finalization and the incoming
+    /// start owns repeated header replay. Keeping those decisions paired
+    /// prevents target-specific cursor state from becoming an independent
+    /// source of table fragmentation behavior:
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
+    fn apply_table_body_fragment_transition(
+        &mut self,
+        fragment: &mut Option<TableBodyPaintFragment>,
+        context: &TableBodyFragmentCommitContext<'_, '_>,
+        transition: TableFragmentTransitionDecision,
+    ) {
+        self.commit_table_body_fragment_boundary(fragment, context, transition.boundary);
+        let Some(cursor_top) = self.materialize_fragmentainer_advance(
+            transition.fragmentainer_kind,
+            FragmentainerAdvance::Unforced,
+        ) else {
+            return;
+        };
+        self.cursor_y = cursor_top;
+        self.replay_table_fragment_start_chrome(context, transition.start);
+    }
+
+    /// Ensure a table body paint fragment exists and consume its start decision.
+    ///
+    /// A committed table fragment start owns the break reason and repeated
+    /// header replay for exactly one newly-created table body fragment. After
+    /// that start decision is recorded in the fragment plan, pagination resets
+    /// the pending start to a neutral table-start value so later rows cannot
+    /// accidentally inherit stale break metadata:
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
+    fn ensure_committed_table_body_fragment(
+        &mut self,
+        fragment: &mut Option<TableBodyPaintFragment>,
+        fragmentainer_kind: FragmentainerKind,
+        fragment_top: f32,
+        pending_start: &mut TableFragmentStartDecision,
+        current_repeat_policy: TableFragmentRepeatPolicy,
+        repeating_header_rows: &[usize],
+    ) {
+        if self.ensure_table_body_paint_fragment(
+            fragment,
+            fragmentainer_kind,
+            fragment_top,
+            *pending_start,
+            repeating_header_rows,
+        ) {
+            *pending_start = TableFragmentStartDecision::new(
+                TableFragmentBreakReason::TableStart,
+                current_repeat_policy,
+                false,
+            );
+        }
+    }
+
+    /// Build the committed transition between table body fragments.
+    ///
+    /// CSS Fragmentation treats the outgoing fragment boundary and incoming
+    /// fragmentainer start as one break decision. This helper keeps row
+    /// pagination branches from independently assembling footer replay,
+    /// incoming repeat policy, break reason, and header replay:
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
+    fn table_body_fragment_transition(
+        fragmentainer_kind: FragmentainerKind,
+        outgoing_repeat_policy: TableFragmentRepeatPolicy,
+        break_reason: TableFragmentBreakReason,
+        incoming_repeat_policy: TableFragmentRepeatPolicy,
+        paint_repeated_header: bool,
+        paint_repeated_footer: bool,
+    ) -> TableFragmentTransitionDecision {
+        TableFragmentTransitionDecision::from_input(TableFragmentTransitionInput {
+            fragmentainer_kind,
+            outgoing_repeat_policy,
+            footer_action: TableFragmentFooterAction::paint_repeated_if(paint_repeated_footer),
+            break_reason,
+            incoming_repeat_policy,
+            paint_repeated_header,
+        })
+    }
+
+    /// Build the committed forced break before a table body row.
+    ///
+    /// Forced row and row-group breaks are resolved before the row is painted.
+    /// The decision records the outgoing footer action, the authored break
+    /// value passed to paged-media page selection, and the incoming repeated
+    /// header/footer policy as one table-local break choice:
+    /// <https://www.w3.org/TR/css-break-3/#forced-breaks>.
+    fn table_body_forced_break(
+        outgoing_repeat_policy: TableFragmentRepeatPolicy,
+        fragmentainer_kind: FragmentainerKind,
+        page_break: PageBreak,
+        row_required_height: f32,
+        chrome_context: TableFragmentChromeContext,
+        paint_repeated_footer: bool,
+    ) -> TableForcedBreakDecision {
+        TableForcedBreakDecision::choose(TableForcedBreakInput {
+            outgoing_repeat_policy,
+            fragmentainer_kind,
+            page_break,
+            row_required_height,
+            chrome_context,
+            paint_repeated_footer,
+        })
+    }
+
+    /// Apply a committed forced break before continuing table body pagination.
+    ///
+    /// The outgoing table fragment is finalized from the committed boundary
+    /// before `apply_forced_break` performs the paged-media page transition.
+    /// Repeated header replay remains owned by the returned start decision and
+    /// is consumed just before the next row fragment is painted:
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
+    fn apply_table_body_forced_break(
+        &mut self,
+        fragment: &mut Option<TableBodyPaintFragment>,
+        context: &TableBodyFragmentCommitContext<'_, '_>,
+        decision: TableForcedBreakDecision,
+    ) {
+        self.commit_table_body_fragment_boundary(fragment, context, decision.boundary);
+        let _ = self.materialize_fragmentainer_advance(
+            decision.fragmentainer_kind,
+            FragmentainerAdvance::Forced(decision.page_break),
+        );
     }
 
     fn effective_table_row_break_before(
@@ -1227,6 +902,133 @@ impl<'a> LayoutBuilder<'a> {
             row_style.break_after
         } else {
             row_group_break_after[row_index]
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn table_row_fragment_decision(
+        &self,
+        fragment: Option<&TableBodyPaintFragment>,
+        table_x: f32,
+        used_table_width: f32,
+        row_index: usize,
+        row_top: f32,
+        row_height: f32,
+        row_offset: f32,
+        original_row_height: f32,
+        collapsed: bool,
+        fragment_mode: TableRowFragmentMode,
+    ) -> TableRowFragmentDecision {
+        let starts_page_fragment = !self.current_page_has_content();
+        let assignment_placement = fragment.map(|fragment| {
+            Self::table_row_fragment_assignment_placement(
+                fragment,
+                table_x,
+                used_table_width,
+                row_top,
+                row_height,
+                starts_page_fragment,
+            )
+        });
+        TableRowFragmentDecision {
+            row_index,
+            row_top,
+            row_height,
+            row_offset,
+            original_row_height,
+            collapsed,
+            fragment_mode,
+            assignment_placement,
+            source_fragment: Self::table_row_source_fragment(assignment_placement),
+        }
+    }
+
+    fn capture_table_row_fragment_decision_assignments(
+        &mut self,
+        row: &TableRow<'_>,
+        row_style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        table_x: f32,
+        decision: TableRowFragmentDecision,
+    ) {
+        let Some(placement) = decision.assignment_placement else {
+            return;
+        };
+        self.capture_table_row_named_string_assignments(
+            row,
+            row_style,
+            placement,
+            decision.row_offset,
+        );
+        self.capture_table_row_running_cell_assignments(
+            row,
+            row_style,
+            stylesheets,
+            table_x,
+            decision.row_top,
+            decision.row_offset,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_committed_table_row_fragment(
+        &mut self,
+        table_body_fragment: &mut Option<TableBodyPaintFragment>,
+        decision: TableRowFragmentDecision,
+        row: &TableRow<'_>,
+        row_style: &ComputedStyle,
+        rows: &[TableRow<'_>],
+        grid: &TableGrid,
+        table_style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        table_x: f32,
+        used_table_width: f32,
+        table_cellpadding: Option<f32>,
+        column_plan: &TableColumnPlan,
+        planned_row_heights: &[f32],
+        planned_row_occupancy: &[bool],
+        table_height_is_definite: bool,
+        table_metrics: TableMetrics,
+        collapsed_geometry: Option<&CollapsedTableGeometry>,
+        row_baseline_offset: Option<f32>,
+    ) {
+        if let Some(fragment) = table_body_fragment {
+            fragment.initialize_grid_placement(
+                decision,
+                table_style,
+                table_x,
+                column_plan,
+                planned_row_heights,
+                planned_row_occupancy,
+                table_metrics.clone(),
+            );
+        }
+        self.layout_table_row_paint_piece(
+            decision.row_index,
+            row,
+            row_style,
+            rows,
+            grid,
+            table_style,
+            stylesheets,
+            table_x,
+            used_table_width,
+            table_cellpadding,
+            column_plan,
+            planned_row_heights,
+            planned_row_occupancy,
+            table_height_is_definite,
+            table_metrics,
+            decision.row_top,
+            decision.original_row_height,
+            decision.row_height,
+            decision.row_offset,
+            decision.fragment_mode,
+            collapsed_geometry,
+            row_baseline_offset,
+        );
+        if let Some(fragment) = table_body_fragment {
+            fragment.push_row_decision(decision);
         }
     }
 
@@ -1299,7 +1101,7 @@ impl<'a> LayoutBuilder<'a> {
         {
             let group_style = self.style_for_table_row_group(group, table_style, stylesheets);
             if group_style.page_name_specified {
-                let group_value = (group_style.page_name, true);
+                let group_value = (group_style.page_name.clone(), true);
                 start = group_value.clone();
                 if !end.1 {
                     end = group_value;

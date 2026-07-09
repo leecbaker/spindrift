@@ -54,11 +54,11 @@ pub(in crate::layout) fn inline_fragment_horizontal_content_bottom_y(
 ) -> Option<f32> {
     match fragment.style().vertical_align.baseline_shift {
         BaselineShift::Top => Some(
-            line_top - metrics.half_leading - metrics.content_block_size
+            line_top - metrics.block_start_leading - metrics.content_block_size
                 + fragment.baseline_shift(),
         ),
         BaselineShift::Bottom => {
-            Some(line_top - line_height + metrics.half_leading + fragment.baseline_shift())
+            Some(line_top - line_height + metrics.block_end_leading + fragment.baseline_shift())
         }
         BaselineShift::Center => Some(centered_content_bottom_y(
             line_top,
@@ -75,10 +75,10 @@ pub(in crate::layout) fn inline_fragment_horizontal_content_bottom_y(
             line_top - line_baseline_offset + parent_metrics.content_baseline_offset;
         match fragment.style().vertical_align.alignment_baseline {
             AlignmentBaseline::Metric(BaselineMetric::TextTop) => {
-                Some(parent_content_top - metrics.half_leading - metrics.content_block_size)
+                Some(parent_content_top - metrics.content_block_size)
             }
             AlignmentBaseline::Metric(BaselineMetric::TextBottom) => {
-                Some(parent_content_top - parent_metrics.content_block_size + metrics.half_leading)
+                Some(parent_content_top - parent_metrics.content_block_size)
             }
             AlignmentBaseline::Baseline
             | AlignmentBaseline::Metric(
@@ -103,10 +103,11 @@ pub(in crate::layout) fn inline_edge_horizontal_content_y(
 ) -> f32 {
     match atom.style().vertical_align.baseline_shift {
         BaselineShift::Top => {
-            line_top - metrics.half_leading - metrics.content_block_size + atom.baseline_shift
+            line_top - metrics.block_start_leading - metrics.content_block_size
+                + atom.baseline_shift
         }
         BaselineShift::Bottom => {
-            line_top - line_height + metrics.half_leading + atom.baseline_shift
+            line_top - line_height + metrics.block_end_leading + atom.baseline_shift
         }
         BaselineShift::Center => centered_content_bottom_y(
             line_top,
@@ -121,12 +122,12 @@ pub(in crate::layout) fn inline_edge_horizontal_content_y(
                 AlignmentBaseline::Metric(BaselineMetric::TextTop) => {
                     let parent_content_top =
                         line_top - line_baseline_offset + parent_metrics.content_baseline_offset;
-                    parent_content_top - metrics.half_leading - metrics.content_block_size
+                    parent_content_top - metrics.content_block_size
                 }
                 AlignmentBaseline::Metric(BaselineMetric::TextBottom) => {
                     let parent_content_top =
                         line_top - line_baseline_offset + parent_metrics.content_baseline_offset;
-                    parent_content_top - parent_metrics.content_block_size + metrics.half_leading
+                    parent_content_top - parent_metrics.content_block_size
                 }
                 AlignmentBaseline::Baseline
                 | AlignmentBaseline::Metric(
@@ -156,25 +157,42 @@ pub(in crate::layout) fn trim_inline_content_rect(
         return rect;
     }
     match writing_mode {
-        WritingMode::HorizontalTb => PhysicalInlineRect::new(
-            rect.x(),
-            rect.y() + trim.block_end,
-            rect.width(),
-            (rect.height() - trim.block_start - trim.block_end).max(0.0),
-        ),
-        WritingMode::VerticalRl => PhysicalInlineRect::new(
-            rect.x() + trim.block_end,
-            rect.y(),
-            (rect.width() - trim.block_start - trim.block_end).max(0.0),
-            rect.height(),
-        ),
-        WritingMode::VerticalLr => PhysicalInlineRect::new(
-            rect.x() + trim.block_start,
-            rect.y(),
-            (rect.width() - trim.block_start - trim.block_end).max(0.0),
-            rect.height(),
-        ),
+        WritingMode::HorizontalTb => PhysicalInlineRect::new(InlineRect::new(
+            InlinePoint::new(rect.x(), rect.y() + trim.block_end),
+            InlineSize::new(
+                rect.width(),
+                (rect.height() - trim.block_start - trim.block_end).max(0.0),
+            ),
+        )),
+        WritingMode::VerticalRl | WritingMode::SidewaysRl => {
+            PhysicalInlineRect::new(InlineRect::new(
+                InlinePoint::new(rect.x() - trim.block_start, rect.y()),
+                InlineSize::new(
+                    (rect.width() - trim.block_start - trim.block_end).max(0.0),
+                    rect.height(),
+                ),
+            ))
+        }
+        WritingMode::VerticalLr | WritingMode::SidewaysLr => {
+            PhysicalInlineRect::new(InlineRect::new(
+                InlinePoint::new(rect.x() + trim.block_end, rect.y()),
+                InlineSize::new(
+                    (rect.width() - trim.block_start - trim.block_end).max(0.0),
+                    rect.height(),
+                ),
+            ))
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct InlineAtomHorizontalPlacement {
+    pub(in crate::layout) line_top: f32,
+    pub(in crate::layout) line_height: f32,
+    pub(in crate::layout) line_baseline_offset: f32,
+    pub(in crate::layout) line_rendered_baseline_shift: f32,
+    pub(in crate::layout) content_block_size: f32,
+    pub(in crate::layout) parent_metrics: InlineTextBoxMetrics,
 }
 
 /// Return the physical bottom y for a horizontal atomic inline content box.
@@ -186,28 +204,34 @@ pub(in crate::layout) fn trim_inline_content_rect(
 pub(in crate::layout) fn inline_atom_horizontal_content_y(
     atom: &InlineAtom,
     containing_style: &ComputedStyle,
-    line_top: f32,
-    line_height: f32,
-    line_baseline_offset: f32,
-    content_block_size: f32,
-    parent_metrics: InlineTextBoxMetrics,
+    placement: InlineAtomHorizontalPlacement,
 ) -> f32 {
+    if !atom.exports_internal_baseline() {
+        // Layout containment removes an atom's exported baseline. Its
+        // synthesized baseline is the principal box's block-end edge, so the
+        // atom is positioned as a block-end-aligned line participant rather
+        // than against an internal descendant line.
+        // <https://www.w3.org/TR/css-contain-1/#containment-layout>
+        return placement.line_top - placement.line_height
+            + inline_atom_logical_block_end_margin(atom, containing_style)
+            + atom.baseline_shift;
+    }
     match atom.style().vertical_align.baseline_shift {
         BaselineShift::Top => {
-            line_top
+            placement.line_top
                 - inline_atom_logical_block_start_margin(atom, containing_style)
-                - content_block_size
+                - placement.content_block_size
                 + atom.baseline_shift
         }
         BaselineShift::Bottom => {
-            line_top - line_height
+            placement.line_top - placement.line_height
                 + inline_atom_logical_block_end_margin(atom, containing_style)
                 + atom.baseline_shift
         }
         BaselineShift::Center => centered_content_bottom_y(
-            line_top,
-            line_height,
-            content_block_size,
+            placement.line_top,
+            placement.line_height,
+            placement.content_block_size,
             inline_atom_logical_block_start_margin(atom, containing_style),
             inline_atom_logical_block_end_margin(atom, containing_style),
             atom.baseline_shift,
@@ -215,16 +239,16 @@ pub(in crate::layout) fn inline_atom_horizontal_content_y(
         BaselineShift::LengthPercentage(_) | BaselineShift::Sub | BaselineShift::Super => {
             match atom.style().vertical_align.alignment_baseline {
                 AlignmentBaseline::Metric(BaselineMetric::TextTop) => {
-                    let parent_content_top =
-                        line_top - line_baseline_offset + parent_metrics.content_baseline_offset;
+                    let parent_content_top = placement.line_top - placement.line_baseline_offset
+                        + placement.parent_metrics.content_baseline_offset;
                     parent_content_top
                         - inline_atom_logical_block_start_margin(atom, containing_style)
-                        - content_block_size
+                        - placement.content_block_size
                 }
                 AlignmentBaseline::Metric(BaselineMetric::TextBottom) => {
-                    let parent_content_top =
-                        line_top - line_baseline_offset + parent_metrics.content_baseline_offset;
-                    parent_content_top - parent_metrics.content_block_size
+                    let parent_content_top = placement.line_top - placement.line_baseline_offset
+                        + placement.parent_metrics.content_baseline_offset;
+                    parent_content_top - placement.parent_metrics.content_block_size
                         + inline_atom_logical_block_end_margin(atom, containing_style)
                 }
                 AlignmentBaseline::Baseline
@@ -236,8 +260,10 @@ pub(in crate::layout) fn inline_atom_horizontal_content_y(
                     | BaselineMetric::Mathematical
                     | BaselineMetric::Hanging,
                 ) => {
-                    line_top - line_baseline_offset + atom.baseline_offset - content_block_size
+                    placement.line_top - placement.line_baseline_offset + atom.baseline_offset
+                        - placement.content_block_size
                         + atom.baseline_shift
+                        - placement.line_rendered_baseline_shift
                 }
             }
         }
@@ -250,9 +276,11 @@ pub(in crate::layout) fn inline_atom_content_preserves_adjacent_space_summary(
     matches!(
         content,
         InlineAtomContent::Canvas
+            | InlineAtomContent::Iframe(_)
             | InlineAtomContent::Image(_)
             | InlineAtomContent::Svg { .. }
             | InlineAtomContent::InlineBox { .. }
+            | InlineAtomContent::TextCombineUpright { .. }
             | InlineAtomContent::InlineFragment(_)
             | InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
     )
@@ -412,13 +440,13 @@ mod tests {
 
     fn test_text_group() -> PreparedInlineTextGroup {
         PreparedInlineTextGroup {
-            bounds: PhysicalInlineTextBounds::new(0.0, 0.0, 0.0),
+            bounds: PhysicalInlineTextBounds::new(InlinePoint::new(0.0, 0.0), 0.0),
             style: ComputedStyle::initial(),
             link_target: None,
             link_paint_rect: None,
             decoration_paint_rect: None,
             shaped: ShapedInlineLine {
-                text: String::new(),
+                text: String::new().into(),
                 width: 0.0,
                 offset: 0.0,
                 aligned_by_parley: false,
@@ -437,7 +465,8 @@ mod tests {
             content_block_size: 30.0,
             content_baseline_offset: 22.0,
             line_block_size: 10.0,
-            half_leading: -10.0,
+            block_start_leading: -10.0,
+            block_end_leading: -10.0,
             line_baseline_offset: 12.0,
         };
 

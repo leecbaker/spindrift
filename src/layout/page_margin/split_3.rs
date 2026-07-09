@@ -1,10 +1,32 @@
 use super::*;
 
-pub(in crate::layout) fn distribute_two_auto_sizes(
+/// Resolves the outer sizes of the two boxes used by a variable-axis step.
+///
+/// When exactly one box is automatic, it receives the space left by its
+/// definite peer. When both are automatic, CSS Paged Media distributes the
+/// space by their intrinsic outer dimensions.
+/// <https://www.w3.org/TR/css-page-3/#margin-dimension>
+pub(in crate::layout) fn resolve_two_outer_sizes(
     available: f32,
     measures: [PageMarginBoxMeasure; 2],
 ) -> [f32; 2] {
     let available = available.max(0.0);
+    let mut sizes = [
+        measures[0].resolved_or_zero(),
+        measures[1].resolved_or_zero(),
+    ];
+    match (measures[0].auto_outer(), measures[1].auto_outer()) {
+        (false, false) => return sizes,
+        (true, false) => {
+            sizes[0] = (available - sizes[1]).max(0.0);
+            return sizes;
+        }
+        (false, true) => {
+            sizes[1] = (available - sizes[0]).max(0.0);
+            return sizes;
+        }
+        (true, true) => {}
+    }
     let max_sum = measures[0].max_outer + measures[1].max_outer;
     let min_sum = measures[0].min_outer + measures[1].min_outer;
     if max_sum < available {
@@ -30,6 +52,45 @@ pub(in crate::layout) fn distribute_two_auto_sizes(
     }
 }
 
+/// Resolve a two-box CSS Page allocation, repeating it for saturated min/max
+/// constraints instead of independently clamping the first result.
+///
+/// CSS Paged Media §5.3.2 says a violated maximum is used as the computed
+/// dimension and the allocation is rerun; minima are handled by the same
+/// mechanism after maximums. This is also used for the centre box and each
+/// separate imaginary symmetric side candidate.
+/// <https://www.w3.org/TR/css-page-3/#margin-dimension>
+pub(in crate::layout) fn resolve_two_outer_sizes_with_constraints(
+    available: f32,
+    measures: [PageMarginBoxMeasure; 2],
+) -> [f32; 2] {
+    let mut saturated = measures;
+    loop {
+        let sizes = resolve_two_outer_sizes(available, saturated);
+        let Some((index, value)) = saturated.iter().enumerate().find_map(|(index, measure)| {
+            measure
+                .max_constraint
+                .filter(|maximum| sizes[index] > *maximum)
+                .map(|maximum| (index, maximum))
+        }) else {
+            break;
+        };
+        saturated[index] = saturated[index].with_definite_outer(value);
+    }
+    loop {
+        let sizes = resolve_two_outer_sizes(available, saturated);
+        let Some((index, value)) = saturated.iter().enumerate().find_map(|(index, measure)| {
+            measure
+                .min_constraint
+                .filter(|minimum| sizes[index] < *minimum)
+                .map(|minimum| (index, minimum))
+        }) else {
+            return sizes;
+        };
+        saturated[index] = saturated[index].with_definite_outer(value);
+    }
+}
+
 pub(in crate::layout) fn normalized_flex_factors(values: [f32; 2]) -> [f32; 2] {
     let sum = values[0] + values[1];
     if sum <= 0.0 {
@@ -48,13 +109,7 @@ pub(in crate::layout) fn paint_page_margin_box(
     if style.visibility != Visibility::Visible {
         return;
     }
-    let (rects, rounded_rects, paths, strokes) = block_paint_ops(
-        layout.border_x(),
-        layout.border_y(),
-        layout.border_width(),
-        layout.border_height(),
-        style,
-    );
+    let (rects, rounded_rects, paths, strokes) = block_paint_ops(layout.border_rect, style);
     for rect in rects {
         page.push_rect_in_band(PaintBand::BackgroundBorder, rect);
     }
@@ -67,19 +122,14 @@ pub(in crate::layout) fn paint_page_margin_box(
     for stroke in strokes {
         page.push_stroke_in_band(PaintBand::BackgroundBorder, stroke);
     }
-    for image in background_images_for_style(
-        BackgroundPaintArea {
-            x: layout.border_x(),
-            y: layout.border_y(),
-            width: layout.border_width(),
-            height: layout.border_height(),
-        },
+    for primitive in background_image_primitives_for_style(
+        PaintBackgroundArea::from_paint_rect(layout.border_rect),
         style,
         context.base_url,
         context.root_url,
         context.resource_cache,
     ) {
-        page.push_image_in_band(PaintBand::BackgroundBorder, image);
+        push_page_margin_primitive(page, PaintBand::BackgroundBorder, primitive);
     }
     for primitive in page_margin_box_outline_primitives(layout, style) {
         push_page_margin_primitive(page, PaintBand::Outline, primitive);
@@ -97,6 +147,11 @@ pub(in crate::layout) fn push_page_margin_primitive(
         PaintPrimitive::Path(path) => page.push_path_in_band(band, path),
         PaintPrimitive::Stroke(stroke) => page.push_stroke_in_band(band, stroke),
         PaintPrimitive::Image(image) => page.push_image_in_band(band, image),
+        PaintPrimitive::ImagePattern(pattern) => page.push_image_pattern_in_band(band, pattern),
+        PaintPrimitive::GradientPattern(pattern) => {
+            page.push_gradient_pattern_in_band(band, pattern)
+        }
+        PaintPrimitive::SvgPattern(pattern) => page.push_svg_pattern_in_band(band, pattern),
         PaintPrimitive::Line(line) => page.push_line_in_band(band, line),
     };
 }
@@ -112,56 +167,7 @@ pub(in crate::layout) fn page_margin_box_outline_primitives(
     layout: &PageMarginBoxLayout<'_>,
     style: &ComputedStyle,
 ) -> Vec<PaintPrimitive> {
-    if style.outline_width <= 0.0 || style.outline_style.suppresses_used_width() {
-        return Vec::new();
-    }
-    if layout.border_width() <= 0.0 || layout.border_height() <= 0.0 {
-        return Vec::new();
-    }
-
-    let mut outline_style = style.clone();
-    outline_style.background_color = None;
-    outline_style.background_image = None;
-    outline_style.background_layers.clear();
-    outline_style.border_image = css::BorderImage::initial();
-    outline_style.border_width = style.outline_width;
-    outline_style.border_widths = css::Edges {
-        top: style.outline_width,
-        right: style.outline_width,
-        bottom: style.outline_width,
-        left: style.outline_width,
-    };
-    outline_style.border_width_values = css::CssEdges::all(
-        css::ComputedLengthPercentage::from_points(style.outline_width),
-    );
-    outline_style.border_color = style.outline_color;
-    outline_style.border_colors = css::BorderColors {
-        top: style.outline_color,
-        right: style.outline_color,
-        bottom: style.outline_color,
-        left: style.outline_color,
-    };
-    outline_style.border_styles = css::BorderStyles {
-        top: style.outline_style,
-        right: style.outline_style,
-        bottom: style.outline_style,
-        left: style.outline_style,
-    };
-
-    let outset = style.outline_offset.length_points() + style.outline_width;
-    let (rects, rounded_rects, paths, strokes) = block_paint_ops(
-        layout.border_x() - outset,
-        layout.border_y() - outset,
-        layout.border_width() + outset * 2.0,
-        layout.border_height() + outset * 2.0,
-        &outline_style,
-    );
-    let mut primitives = Vec::new();
-    primitives.extend(rects.into_iter().map(PaintPrimitive::Rect));
-    primitives.extend(rounded_rects.into_iter().map(PaintPrimitive::RoundedRect));
-    primitives.extend(paths.into_iter().map(PaintPrimitive::Path));
-    primitives.extend(strokes.into_iter().map(PaintPrimitive::Stroke));
-    primitives
+    crate::layout::paint_ops::outline_primitives_for_border_rect(layout.border_rect, style)
 }
 
 /// Returns the top edge of the page-margin text line stack.
@@ -196,26 +202,163 @@ pub(in crate::layout) fn page_margin_text_stack_top(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct PageMarginLogicalInlineSize(f32);
+
+impl PageMarginLogicalInlineSize {
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct PageMarginLogicalBlockSize(f32);
+
+impl PageMarginLogicalBlockSize {
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct PageMarginPhysicalX(f32);
+
+impl PageMarginPhysicalX {
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct PageMarginPhysicalY(f32);
+
+impl PageMarginPhysicalY {
+    pub(in crate::layout) fn new(points: f32) -> Self {
+        Self(points)
+    }
+
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct PageMarginFixedBoxGeometry {
+    line_block_start_x: PageMarginPhysicalX,
+    line_inline_start_y: PageMarginPhysicalY,
+    inline_size: PageMarginLogicalInlineSize,
+    block_size: PageMarginLogicalBlockSize,
+}
+
+impl PageMarginFixedBoxGeometry {
+    /// Convert a page-margin content rectangle into logical fixed-box axes.
+    ///
+    /// CSS Paged Media gives margin boxes fixed physical rectangles, while CSS
+    /// Writing Modes maps inline layout through logical inline and block axes.
+    /// Keeping this conversion typed makes it explicit that vertical writing
+    /// uses the content box's physical height as logical inline size and its
+    /// physical width as logical block size:
+    /// <https://www.w3.org/TR/css-page-3/#page-margin-boxes> and
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+    pub(in crate::layout) fn from_layout(layout: &PageMarginBoxLayout<'_>) -> Self {
+        let style = &layout.spec.style;
+        let physical_left = PageMarginPhysicalX(layout.content_x());
+        let physical_right = PageMarginPhysicalX(layout.content_x() + layout.content_width());
+        let physical_top = PageMarginPhysicalY(layout.content_y() + layout.content_height());
+        let (inline_size, block_size) = match style.writing_mode {
+            WritingMode::HorizontalTb => (
+                PageMarginLogicalInlineSize(layout.content_width().max(1.0)),
+                PageMarginLogicalBlockSize(layout.content_height().max(0.0)),
+            ),
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => (
+                PageMarginLogicalInlineSize(layout.content_height().max(1.0)),
+                PageMarginLogicalBlockSize(layout.content_width().max(0.0)),
+            ),
+        };
+        let line_block_start_x = match style.writing_mode {
+            // The block-start edge of a right-to-left vertical writing mode
+            // is the physical right edge. Inline line layout subtracts each
+            // line's block size from this origin as it advances leftward.
+            WritingMode::VerticalRl | WritingMode::SidewaysRl => physical_right,
+            WritingMode::HorizontalTb | WritingMode::VerticalLr | WritingMode::SidewaysLr => {
+                physical_left
+            }
+        };
+        Self {
+            line_block_start_x,
+            line_inline_start_y: physical_top,
+            inline_size,
+            block_size,
+        }
+    }
+
+    pub(in crate::layout) fn inline_size(self) -> PageMarginLogicalInlineSize {
+        self.inline_size
+    }
+
+    pub(in crate::layout) fn block_size(self) -> PageMarginLogicalBlockSize {
+        self.block_size
+    }
+
+    pub(in crate::layout) fn line_block_start_x(self) -> PageMarginPhysicalX {
+        self.line_block_start_x
+    }
+
+    pub(in crate::layout) fn line_inline_start_y(self) -> PageMarginPhysicalY {
+        self.line_inline_start_y
+    }
+
+    pub(in crate::layout) fn with_line_inline_start(mut self, y: PageMarginPhysicalY) -> Self {
+        self.line_inline_start_y = y;
+        self
+    }
+
+    pub(in crate::layout) fn with_line_block_alignment(
+        mut self,
+        _line_stack_block_size: f32,
+        first_line_block_size: f32,
+        _vertical_align: VerticalAlign,
+        writing_mode: WritingMode,
+    ) -> Self {
+        // Vertical right-to-left line layout starts a column by painting to
+        // the left of its block cursor. Place that first cursor one line
+        // block-size inside the physical right edge; subsequent columns then
+        // advance left without escaping the margin-box content rectangle.
+        // <https://www.w3.org/TR/css-writing-modes-4/#block-flow>
+        if matches!(
+            writing_mode,
+            WritingMode::VerticalRl | WritingMode::SidewaysRl
+        ) {
+            self.line_block_start_x.0 -= first_line_block_size;
+        }
+        self
+    }
+}
+
 pub(in crate::layout) fn margin_box_intrinsic_inline_sizes(
     font_system: &mut FontSystem,
     content: &ResolvedPageContent,
     style: &ComputedStyle,
     available_width: f32,
-    base_url: Option<&std::path::Path>,
-    root_url: Option<&std::path::Path>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
 ) -> (f32, f32) {
     let mut min_content: f32 = 0.0;
     let mut max_content: f32 = 0.0;
     let mut paragraph = Vec::new();
-    for item in page_margin_intrinsic_inline_items(
+    let items = page_margin_intrinsic_inline_items(
         content,
         style,
         available_width,
         base_url,
         root_url,
         resource_cache,
-    ) {
+    );
+    for item in &items {
         if matches!(item, InlineItem::Break(_)) {
             accumulate_page_margin_intrinsic_paragraph(
                 font_system,
@@ -225,7 +368,7 @@ pub(in crate::layout) fn margin_box_intrinsic_inline_sizes(
                 &mut max_content,
             );
         } else {
-            paragraph.push(item);
+            paragraph.push(item.clone());
         }
     }
     accumulate_page_margin_intrinsic_paragraph(
@@ -235,10 +378,50 @@ pub(in crate::layout) fn margin_box_intrinsic_inline_sizes(
         &mut min_content,
         &mut max_content,
     );
+    if min_content == 0.0 && max_content == 0.0 {
+        // CSS Text permits other space separators to hang at an inline end,
+        // but a generated page-margin box with only such content still has a
+        // non-zero intrinsic contribution for CSS Page's variable-dimension
+        // algorithm. Otherwise `content: "\\a0"` becomes indistinguishable
+        // from `content: ""` and incorrectly receives no share of a margin
+        // triplet. WPT: dimensions-010-print.html.
+        // https://www.w3.org/TR/css-page-3/#margin-dimension
+        // https://www.w3.org/TR/css-text-3/#white-space-phase-2
+        let generated_advance = page_margin_generated_inline_advance(&items, font_system);
+        min_content = generated_advance;
+        max_content = generated_advance;
+    }
     if min_content == 0.0 {
         min_content = max_content;
     }
     (min_content, max_content)
+}
+
+/// Returns the widest forced paragraph advance in a generated content list.
+///
+/// This fallback is deliberately limited to content whose regular intrinsic
+/// contribution is zero. It keeps a lone non-breaking space visible to CSS
+/// Page sizing without changing normal CSS Text line selection or the
+/// treatment of ordinary text and break opportunities.
+fn page_margin_generated_inline_advance(items: &[InlineItem], font_system: &mut FontSystem) -> f32 {
+    let mut paragraph_advance = 0.0;
+    let mut max_advance: f32 = 0.0;
+    for item in items {
+        match item {
+            InlineItem::Word(word) => {
+                paragraph_advance += font_system.measure_text(&word.text, &word.style);
+            }
+            InlineItem::Atom(atom) => {
+                paragraph_advance += atom.size.width;
+            }
+            InlineItem::Break(_) => {
+                max_advance = max_advance.max(paragraph_advance);
+                paragraph_advance = 0.0;
+            }
+            InlineItem::Float(_) | InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd => {}
+        }
+    }
+    max_advance.max(paragraph_advance)
 }
 
 /// Builds page-margin intrinsic sizing input from generated inline content.
@@ -254,8 +437,8 @@ pub(in crate::layout) fn page_margin_intrinsic_inline_items(
     content: &ResolvedPageContent,
     style: &ComputedStyle,
     available_width: f32,
-    base_url: Option<&std::path::Path>,
-    root_url: Option<&std::path::Path>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
 ) -> Vec<InlineItem> {
     let mut items = Vec::new();
@@ -310,8 +493,8 @@ pub(in crate::layout) fn append_page_margin_intrinsic_part(
     inline_style: &ComputedStyle,
     box_style: &ComputedStyle,
     available_width: f32,
-    base_url: Option<&std::path::Path>,
-    root_url: Option<&std::path::Path>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
 ) {
     match part {
@@ -324,8 +507,7 @@ pub(in crate::layout) fn append_page_margin_intrinsic_part(
                 InlineAtomContent::Leader(text.clone()),
                 inline_style.clone(),
                 None,
-                0.0,
-                inline_style.line_height,
+                InlineSize::new(0.0, inline_style.line_height),
                 inline_style.font_size,
                 0.0,
                 None,
@@ -348,12 +530,15 @@ pub(in crate::layout) fn append_page_margin_intrinsic_part(
             ) {
                 let border_box_width = image.border_box_size.width;
                 let border_box_height = image.border_box_size.height;
+                let content = image
+                    .svg
+                    .map(|asset| InlineAtomContent::Svg { asset: Some(asset) })
+                    .unwrap_or(InlineAtomContent::Image(image.decoded));
                 items.push(InlineItem::Atom(Box::new(InlineAtom::new(
-                    InlineAtomContent::Image(image.decoded),
+                    content,
                     inline_style.clone(),
                     None,
-                    border_box_width,
-                    border_box_height,
+                    InlineSize::new(border_box_width, border_box_height),
                     border_box_height,
                     0.0,
                     None,
@@ -424,6 +609,13 @@ pub(in crate::layout) fn running_element_inline_parts(
 /// <https://www.w3.org/TR/css-content-3/#content-property>.
 pub(in crate::layout) fn page_margin_inline_content_style(style: &ComputedStyle) -> ComputedStyle {
     let mut inline_style = style.clone();
+    // Page-margin `vertical-align` positions the generated content stack in
+    // the fixed margin rectangle. It is not an inline-level alignment for the
+    // anonymous generated text/image runs themselves, which retain their
+    // synthesized baselines.
+    // https://www.w3.org/TR/css-page-3/#margin-boxes
+    // https://www.w3.org/TR/css-inline-3/#valdef-vertical-align-baseline
+    inline_style.vertical_align = VerticalAlign::BASELINE;
     inline_style.margin = css::Edges::ZERO;
     inline_style.ua_margin_em = css::OptionalEdges::NONE;
     inline_style.padding = css::Edges::ZERO;
@@ -451,8 +643,8 @@ pub(in crate::layout) fn append_page_margin_inline_part(
     inline_style: &ComputedStyle,
     box_style: &ComputedStyle,
     available_width: f32,
-    base_url: Option<&std::path::Path>,
-    root_url: Option<&std::path::Path>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
     quote_depth: &mut usize,
 ) {
@@ -472,8 +664,7 @@ pub(in crate::layout) fn append_page_margin_inline_part(
                 InlineAtomContent::Leader(text.clone()),
                 inline_style.clone(),
                 None,
-                0.0,
-                inline_style.line_height,
+                InlineSize::new(0.0, inline_style.line_height),
                 inline_style.font_size,
                 0.0,
                 None,
@@ -502,12 +693,15 @@ pub(in crate::layout) fn append_page_margin_inline_part(
             ) {
                 let border_box_width = image.border_box_size.width;
                 let border_box_height = image.border_box_size.height;
+                let content = image
+                    .svg
+                    .map(|asset| InlineAtomContent::Svg { asset: Some(asset) })
+                    .unwrap_or(InlineAtomContent::Image(image.decoded));
                 items.push(InlineItem::Atom(Box::new(InlineAtom::new(
-                    InlineAtomContent::Image(image.decoded),
+                    content,
                     inline_style.clone(),
                     None,
-                    border_box_width,
-                    border_box_height,
+                    InlineSize::new(border_box_width, border_box_height),
                     border_box_height,
                     0.0,
                     None,

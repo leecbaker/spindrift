@@ -113,7 +113,7 @@ pub(super) fn append_outline_nodes(
             bookmark: node.bookmark.clone(),
             parent_id,
             prev_id: index.checked_sub(1).map(|prev| ids[prev]),
-            next_id: ids.get(index + 1).copied(),
+            next_id: ids.get(index + 1).cloned(),
             first_child_id,
             last_child_id,
             child_count: match node.bookmark.state {

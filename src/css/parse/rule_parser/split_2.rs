@@ -88,6 +88,7 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "flex-grow"
             | "flex-shrink"
             | "flex-basis"
+            | "-webkit-flex-basis"
             | "flex"
             | "grid-gap"
             | "grid-row-gap"
@@ -95,6 +96,10 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "columns"
             | "column-count"
             | "column-width"
+            | "column-height"
+            | "column-wrap"
+            | "column-fill"
+            | "column-span"
             | "column-rule"
             | "column-rule-width"
             | "column-rule-style"
@@ -205,6 +210,13 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "empty-cells"
             | "border-spacing"
             | "background"
+            | "color"
+            | "background-color"
+            | "border-color"
+            | "border-top-color"
+            | "border-right-color"
+            | "border-bottom-color"
+            | "border-left-color"
             | "background-image"
             | "background-size"
             | "background-position"
@@ -215,6 +227,11 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "line-height"
             | "box-sizing"
             | "z-index"
+            | "transform"
+            | "translate"
+            | "rotate"
+            | "scale"
+            | "transform-origin"
             | "isolation"
             | "mix-blend-mode"
             | "filter"
@@ -229,6 +246,10 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "text-align-last"
             | "text-justify"
             | "text-autospace"
+            | "word-space-transform"
+            | "initial-letter"
+            | "initial-letter-align"
+            | "initial-letter-wrap"
             | "text-orientation"
             | "text-indent"
             | "hanging-punctuation"
@@ -244,6 +265,12 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "font-family"
             | "font"
             | "font-feature-settings"
+            | "font-palette"
+            | "font-synthesis"
+            | "font-synthesis-weight"
+            | "font-synthesis-style"
+            | "font-synthesis-small-caps"
+            | "font-synthesis-position"
             | "font-kerning"
             | "font-size-adjust"
             | "font-variant"
@@ -306,6 +333,7 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "word-wrap"
             | "line-break"
             | "hyphens"
+            | "hyphenate-character"
             | "word-spacing"
             | "hyphenate-limit-chars"
     )
@@ -379,6 +407,29 @@ pub(in crate::css) fn supports_text_autospace_value(value: &str) -> bool {
         }
     }
     ideograph_alpha || ideograph_numeric || punctuation
+}
+
+/// Return whether a `word-space-transform` declaration uses the implemented
+/// CSS Text Level 4 keyword grammar.
+///
+/// This intentionally mirrors the computed-value parser so feature queries
+/// cannot expose a value that collection would later ignore:
+/// <https://drafts.csswg.org/css-text-4/#word-space-transform>.
+pub(in crate::css) fn supports_word_space_transform_value(value: &str) -> bool {
+    let tokens = split_css_component_values(value);
+    if tokens.len() == 1 && tokens[0].eq_ignore_ascii_case("none") {
+        return true;
+    }
+    let mut replacement = false;
+    let mut auto_phrase = false;
+    for token in tokens {
+        match token.to_ascii_lowercase().as_str() {
+            "space" | "ideographic-space" if !replacement => replacement = true,
+            "auto-phrase" if !auto_phrase => auto_phrase = true,
+            _ => return false,
+        }
+    }
+    replacement || auto_phrase
 }
 
 pub(in crate::css) fn supports_text_decoration_line_value(value: &str) -> bool {
@@ -731,7 +782,7 @@ pub(in crate::css) fn supports_box_shadow_layer_value(value: &str) -> bool {
     (2..=4).contains(&lengths.len())
         && !lengths
             .get(2)
-            .is_some_and(|blur| length_percentage_is_definitely_negative(*blur))
+            .is_some_and(|blur| length_percentage_is_definitely_negative(blur.clone()))
 }
 
 pub(in crate::css) fn supports_shadow_length(value: &str) -> bool {
@@ -742,25 +793,13 @@ pub(in crate::css) fn parse_shadow_support_length(
     value: &str,
 ) -> Option<crate::css::ComputedLengthPercentage> {
     let length = parse_computed_length_percentage(value, crate::css::ROOT_FONT_SIZE_PT)?;
-    (length.percent == 0.0).then_some(length)
+    (!length.needs_percentage_basis()).then_some(length)
 }
 
 pub(in crate::css) fn length_percentage_is_definitely_negative(
     value: crate::css::ComputedLengthPercentage,
 ) -> bool {
-    let components = [
-        value.length_points(),
-        value.percent,
-        value.ch,
-        value.vw,
-        value.vh,
-        value.vmin,
-        value.vmax,
-        value.vi,
-        value.vb,
-    ];
-    components.iter().any(|component| *component < 0.0)
-        && components.iter().all(|component| *component <= 0.0)
+    value.is_definitely_negative()
 }
 
 /// Returns whether a logical margin/padding axis value has valid arity.
@@ -888,13 +927,24 @@ pub(in crate::css) fn word_boundary_after(bytes: &[u8], index: usize) -> bool {
 pub(in crate::css) fn strip_pseudo_selector<'a>(
     selector: &'a str,
     pseudo: &str,
-) -> Option<&'a str> {
+) -> Option<std::borrow::Cow<'a, str>> {
     let trimmed = selector.trim();
     let double_colon = format!("::{pseudo}");
     let single_colon = format!(":{pseudo}");
-    let base = trimmed
+    let raw_base = trimmed
         .strip_suffix(&double_colon)
-        .or_else(|| trimmed.strip_suffix(&single_colon))?
-        .trim();
-    (!base.is_empty()).then_some(base)
+        .or_else(|| trimmed.strip_suffix(&single_colon))?;
+    let base = raw_base.trim();
+    if base.is_empty() {
+        return Some(std::borrow::Cow::Borrowed("*"));
+    }
+    if raw_base
+        .chars()
+        .last()
+        .is_some_and(|character| character.is_ascii_whitespace())
+        || base.ends_with(['>', '+', '~'])
+    {
+        return Some(std::borrow::Cow::Owned(format!("{base} *")));
+    }
+    Some(std::borrow::Cow::Borrowed(base))
 }

@@ -1,6 +1,8 @@
 use super::super::*;
 use super::graph::*;
-use super::{InlineLineRecord, InlineLineSequence};
+use super::{
+    InlineLayoutOutcome, InlineLineRecord, InlineLineSequence, inline_line_fragment_is_phantom,
+};
 use crate::text::is_css_preserved_document_space;
 
 mod split_1;

@@ -28,42 +28,53 @@ lto = "thin"
 split-debuginfo = "packed"
 
 [dependencies]
-base64 = "0.22.1"
-clap = { version = "4.5.53", features = ["derive"] }
-clap_complete = "4.6.5"
-cssparser = "0.37.0"
-env_logger = "0.11.10"
-euclid = "0.22.14"
-fontique = "0.10.0"
-fontcull = { version = "2.0.1", default-features = false }
-fontcull-klippa = "0.1.2"
-fontcull-write-fonts = { version = "0.44.3", features = ["read"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+cssparser = "0.37"
+data-url = "0.3"
+env_logger = "0.11"
+euclid = "0.22"
+fontique = "0.11"
 html5ever = "0.39.0"
 xml5ever = "0.39.0"
 hyphenation = { version = "0.8.4", features = ["embed_all"] }
-icu_casemap = "2.2.0"
-icu_locale_core = "2.2.0"
-icu_properties = "2.2.0"
-icu_segmenter = "2.2.0"
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
-log = "0.4.32"
+icu_casemap = "2.2"
+icu_locale_core = "2.2"
+icu_properties = "2.2"
+icu_segmenter = "2.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+log = "0.4"
+lcms2 = "6.1.1"
+subsetter = { version = "0.2.6", default-features = false }
 markup5ever_rcdom = "0.39.0"
 miniz_oxide = "0.8.9"
-parley = "0.10.0"
-pdf-writer = "0.15.0"
+parley = "0.11"
+pdf-writer = "0.15"
 precomputed-hash = "0.1.1"
-reqwest = { version = "0.13.4", default-features = false }
-selectors = "0.38.0"
-taffy = "0.11.0"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "fs"] }
-ttf-parser = "0.25.1"
-woff2-patched = "0.4.0"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+sha2 = "0.10"
+selectors = "0.38"
+taffy = "0.12"
+thiserror = "2"
+tiny-skia-path = "0.12"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "fs", "sync"] }
+ttf-parser = "0.25"
+url = "2"
+usvg = { version = "0.47", default-features = false }
+woff2-patched = "0.4"
 
 [dev-dependencies]
 criterion = "0.8.2"
+
+[lints.rust]
+missing_docs = "deny"
+
+[lints.rustdoc]
+missing_doc_code_examples = "deny"
 
 [lints.clippy]
 redundant_clone = "warn"
 needless_collect = "warn"
 unnecessary_to_owned = "warn"
+clone_on_ref_ptr = "warn"

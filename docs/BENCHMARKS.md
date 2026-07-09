@@ -38,3 +38,7 @@ loading, HTML/CSS parsing, resource/font loading, layout, drawing, and PDF
 serialization. The empty-document benchmark intentionally exercises the same
 path with a minimal HTML string so it captures the renderer's one-time setup
 costs, especially font-system initialization.
+
+The benchmark uses the sample project's authoring configuration: `book` loads
+`book.css` and `poster` loads `poster.css` as explicit author stylesheets.
+Those sample HTML files do not link their companion stylesheets themselves.

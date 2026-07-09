@@ -222,7 +222,7 @@ impl ElementSignature {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TextDecoration {
     pub underline: bool,
     pub overline: bool,
@@ -247,7 +247,7 @@ impl TextDecoration {
         self
     }
 
-    pub(crate) fn has_visible_line(self) -> bool {
+    pub(crate) fn has_visible_line(&self) -> bool {
         self.underline
             || self.overline
             || self.line_through
@@ -255,38 +255,17 @@ impl TextDecoration {
             || self.grammar_error
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.thickness.resolve_font_metric_lengths(ch_advance);
         self.underline_offset
             .resolve_font_metric_lengths(ch_advance);
         self.inset.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.thickness.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.underline_offset.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.inset.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.thickness.requires_ch_advance()
+            || self.underline_offset.requires_ch_advance()
+            || self.inset.requires_ch_advance()
     }
 }
 
@@ -309,7 +288,7 @@ pub(crate) enum TextDecorationStyle {
 /// CSS Text Decoration Level 4 adds `text-decoration-thickness` as `auto`,
 /// `from-font`, or a length/percentage:
 /// <https://www.w3.org/TR/css-text-decor-4/#text-decoration-width-property>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TextDecorationThickness {
     Auto,
     FromFont,
@@ -317,27 +296,14 @@ pub(crate) enum TextDecorationThickness {
 }
 
 impl TextDecorationThickness {
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Self::LengthPercentage(value) = self {
             value.resolve_font_metric_lengths(ch_advance);
         }
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        if let Self::LengthPercentage(value) = self {
-            value.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
-        }
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
     }
 }
 
@@ -346,7 +312,7 @@ impl TextDecorationThickness {
 /// CSS Text Decoration Level 4 trims or extends the start and end endpoints of
 /// line decorations:
 /// <https://drafts.csswg.org/css-text-decor-4/#text-decoration-inset-property>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TextDecorationInset {
     Auto,
     Lengths {
@@ -361,34 +327,15 @@ impl TextDecorationInset {
         end: ComputedLengthPercentage::ZERO,
     };
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Self::Lengths { start, end } = self {
             start.resolve_font_metric_lengths(ch_advance);
             end.resolve_font_metric_lengths(ch_advance);
         }
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        if let Self::Lengths { start, end } = self {
-            start.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
-            end.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
-        }
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        matches!(self, Self::Lengths { start, end } if start.requires_ch_advance() || end.requires_ch_advance())
     }
 
     pub(crate) fn used(self, font_size: f32) -> (f32, f32) {
@@ -396,10 +343,16 @@ impl TextDecorationInset {
             Self::Auto => (font_size * 0.125, font_size * 0.125),
             Self::Lengths { start, end } => (
                 start
-                    .used_length_with_percentage_basis(font_size)
-                    .unwrap_or(start.length_with_percentage_basis(font_size)),
-                end.used_length_with_percentage_basis(font_size)
-                    .unwrap_or(end.length_with_percentage_basis(font_size)),
+                    .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                        font_size,
+                    )))
+                    .map(layout_points)
+                    .unwrap_or(start.length_points()),
+                end.used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                    font_size,
+                )))
+                .map(layout_points)
+                .unwrap_or(end.length_points()),
             ),
         }
     }
@@ -510,9 +463,9 @@ impl TextEmphasisStyle {
             Self::None => None,
             Self::String(mark) => (!mark.is_empty()).then_some(mark.as_str()),
             Self::Keywords { fill, shape } => {
-                let shape = shape.unwrap_or(match writing_mode {
-                    WritingMode::HorizontalTb => TextEmphasisShape::Circle,
-                    WritingMode::VerticalRl | WritingMode::VerticalLr => TextEmphasisShape::Sesame,
+                let shape = shape.unwrap_or(match writing_mode.typographic_mode() {
+                    TypographicMode::Horizontal => TextEmphasisShape::Circle,
+                    TypographicMode::Vertical => TextEmphasisShape::Sesame,
                 });
                 Some(match (fill, shape) {
                     (TextEmphasisFill::Filled, TextEmphasisShape::Dot) => "\u{2022}",
@@ -596,7 +549,7 @@ impl Default for TextEmphasisSkip {
 /// image outside or inside the border box, with the same geometry as the
 /// border box unless offset, blur, or spread modifies it:
 /// <https://www.w3.org/TR/css-backgrounds-3/#box-shadow>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoxShadow {
     pub(crate) color: BoxShadowColor,
     pub(crate) offset_x: ComputedLengthPercentage,
@@ -607,44 +560,18 @@ pub(crate) struct BoxShadow {
 }
 
 impl BoxShadow {
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.offset_x.resolve_font_metric_lengths(ch_advance);
         self.offset_y.resolve_font_metric_lengths(ch_advance);
         self.blur_radius.resolve_font_metric_lengths(ch_advance);
         self.spread.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.offset_x.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.offset_y.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.blur_radius.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.spread.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.offset_x.requires_ch_advance()
+            || self.offset_y.requires_ch_advance()
+            || self.blur_radius.requires_ch_advance()
+            || self.spread.requires_ch_advance()
     }
 }
 
@@ -674,7 +601,7 @@ impl BoxShadowColor {
 /// CSS Text Decoration Level 4 follows the box-shadow grammar but applies
 /// each shadow layer to text and decorations:
 /// <https://drafts.csswg.org/css-text-decor-4/#text-shadow-property>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TextShadow {
     pub(crate) color: TextShadowColor,
     pub(crate) offset_x: ComputedLengthPercentage,
@@ -685,44 +612,18 @@ pub(crate) struct TextShadow {
 }
 
 impl TextShadow {
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.offset_x.resolve_font_metric_lengths(ch_advance);
         self.offset_y.resolve_font_metric_lengths(ch_advance);
         self.blur_radius.resolve_font_metric_lengths(ch_advance);
         self.spread.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.offset_x.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.offset_y.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.blur_radius.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.spread.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.offset_x.requires_ch_advance()
+            || self.offset_y.requires_ch_advance()
+            || self.blur_radius.requires_ch_advance()
+            || self.spread.requires_ch_advance()
     }
 }
 
@@ -752,34 +653,21 @@ impl TextShadowColor {
 /// CSS Text Decoration Level 4 defines underline offset as `auto` or a
 /// length/percentage:
 /// <https://www.w3.org/TR/css-text-decor-4/#text-underline-offset-property>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TextUnderlineOffset {
     Auto,
     LengthPercentage(ComputedLengthPercentage),
 }
 
 impl TextUnderlineOffset {
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Self::LengthPercentage(value) = self {
             value.resolve_font_metric_lengths(ch_advance);
         }
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        if let Self::LengthPercentage(value) = self {
-            value.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
-        }
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
     }
 }
 
@@ -803,4 +691,55 @@ impl TextUnderlinePosition {
         left: false,
         right: false,
     };
+}
+
+impl ResolveViewportLengths for TextDecoration {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.thickness.resolve_viewport_lengths(basis);
+        self.underline_offset.resolve_viewport_lengths(basis);
+        self.inset.resolve_viewport_lengths(basis);
+    }
+}
+
+impl ResolveViewportLengths for TextDecorationThickness {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_viewport_lengths(basis);
+        }
+    }
+}
+
+impl ResolveViewportLengths for TextDecorationInset {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        if let Self::Lengths { start, end } = self {
+            start.resolve_viewport_lengths(basis);
+            end.resolve_viewport_lengths(basis);
+        }
+    }
+}
+
+impl ResolveViewportLengths for BoxShadow {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.offset_x.resolve_viewport_lengths(basis);
+        self.offset_y.resolve_viewport_lengths(basis);
+        self.blur_radius.resolve_viewport_lengths(basis);
+        self.spread.resolve_viewport_lengths(basis);
+    }
+}
+
+impl ResolveViewportLengths for TextShadow {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.offset_x.resolve_viewport_lengths(basis);
+        self.offset_y.resolve_viewport_lengths(basis);
+        self.blur_radius.resolve_viewport_lengths(basis);
+        self.spread.resolve_viewport_lengths(basis);
+    }
+}
+
+impl ResolveViewportLengths for TextUnderlineOffset {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_viewport_lengths(basis);
+        }
+    }
 }

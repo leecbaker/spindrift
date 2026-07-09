@@ -28,12 +28,13 @@ pub(super) fn taffy_dimension(
         css::ComputedLengthPercentageOrAuto::FitContent(limit) => limit
             .map(taffy_dimension_from_length_percentage)
             .unwrap_or_else(taffy_layout::Dimension::auto),
+        css::ComputedLengthPercentageOrAuto::CalcSize(_) => taffy_layout::Dimension::auto(),
     }
 }
 
 pub(super) fn taffy_grid_item_min_dimension(
     value: css::ComputedLengthPercentageOrAuto,
-    percentage_basis: Option<f32>,
+    percentage_basis: GridPercentageBasis,
     min_content: ContentBoxLength,
     max_content: ContentBoxLength,
 ) -> taffy_layout::Dimension {
@@ -46,7 +47,80 @@ pub(super) fn taffy_grid_item_min_dimension(
 
 pub(super) fn taffy_grid_item_dimension(
     value: css::ComputedLengthPercentageOrAuto,
-    percentage_basis: Option<f32>,
+    percentage_basis: GridPercentageBasis,
+    min_content: ContentBoxLength,
+    max_content: ContentBoxLength,
+) -> taffy_layout::Dimension {
+    let min_content = min_content.points().max(0.0);
+    let max_content = max_content.points().max(min_content);
+    match value {
+        css::ComputedLengthPercentageOrAuto::Auto
+        | css::ComputedLengthPercentageOrAuto::Stretch => taffy_layout::Dimension::auto(),
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
+            // A grid item's percentage size resolves against its final grid
+            // area, not the grid container. Preserve a pure percentage for
+            // Taffy's grid-item resolution instead of eagerly turning it
+            // into a container-relative length:
+            // <https://www.w3.org/TR/css-grid-1/#grid-item-sizing>.
+            if let Some(percent) = value
+                .pure_percentage_coefficient()
+                .filter(|percent| *percent != 0.0)
+            {
+                percentage_basis
+                    .points()
+                    .map(|_| taffy_layout::Dimension::percent(percent))
+                    .unwrap_or_else(taffy_layout::Dimension::auto)
+            } else {
+                taffy_dimension_from_length_percentage_with_basis(value, percentage_basis)
+            }
+        }
+        css::ComputedLengthPercentageOrAuto::MinContent => {
+            taffy_layout::Dimension::length(min_content)
+        }
+        css::ComputedLengthPercentageOrAuto::MaxContent => {
+            taffy_layout::Dimension::length(max_content)
+        }
+        css::ComputedLengthPercentageOrAuto::FitContent(limit) => {
+            let limit = limit
+                .and_then(|limit| {
+                    percentage_basis.points().map(|basis| {
+                        used_length_percentage(limit, PercentageBasis::definite(layout_pt(basis)))
+                            .points()
+                    })
+                })
+                .unwrap_or(max_content);
+            taffy_layout::Dimension::length(max_content.min(min_content.max(limit)).max(0.0))
+        }
+        css::ComputedLengthPercentageOrAuto::CalcSize(value) => {
+            let percentage_basis = percentage_basis.points().unwrap_or(0.0);
+            let fit_content = max_content.min(min_content.max(percentage_basis));
+            taffy_layout::Dimension::length(
+                value
+                    .used_value(
+                        max_content,
+                        min_content,
+                        max_content,
+                        fit_content,
+                        percentage_basis,
+                        PercentageBasis::definite(layout_pt(percentage_basis)),
+                    )
+                    .max(layout_pt(0.0))
+                    .points(),
+            )
+        }
+    }
+}
+
+/// Convert a grid item's min/max constraint for Taffy's track-sizing pass.
+///
+/// Taffy's grid algorithm resolves a percentage `Dimension` relative to its
+/// available sizing input while calculating tracks. That is appropriate for a
+/// used item size only after its grid area is known, but not for a constraint
+/// that participates in track sizing. Keep the established definite-basis
+/// conversion for constraints until they can be applied after area resolution.
+pub(super) fn taffy_grid_item_constraint_dimension(
+    value: css::ComputedLengthPercentageOrAuto,
+    percentage_basis: GridPercentageBasis,
     min_content: ContentBoxLength,
     max_content: ContentBoxLength,
 ) -> taffy_layout::Dimension {
@@ -67,10 +141,30 @@ pub(super) fn taffy_grid_item_dimension(
         css::ComputedLengthPercentageOrAuto::FitContent(limit) => {
             let limit = limit
                 .and_then(|limit| {
-                    percentage_basis.map(|basis| used_length_percentage(limit, basis))
+                    percentage_basis.points().map(|basis| {
+                        used_length_percentage(limit, PercentageBasis::definite(layout_pt(basis)))
+                            .points()
+                    })
                 })
                 .unwrap_or(max_content);
             taffy_layout::Dimension::length(max_content.min(min_content.max(limit)).max(0.0))
+        }
+        css::ComputedLengthPercentageOrAuto::CalcSize(value) => {
+            let percentage_basis = percentage_basis.points().unwrap_or(0.0);
+            let fit_content = max_content.min(min_content.max(percentage_basis));
+            taffy_layout::Dimension::length(
+                value
+                    .used_value(
+                        max_content,
+                        min_content,
+                        max_content,
+                        fit_content,
+                        percentage_basis,
+                        PercentageBasis::definite(layout_pt(percentage_basis)),
+                    )
+                    .max(layout_pt(0.0))
+                    .points(),
+            )
         }
     }
 }
@@ -78,37 +172,62 @@ pub(super) fn taffy_grid_item_dimension(
 pub(super) fn taffy_dimension_from_length_percentage(
     value: css::ComputedLengthPercentage,
 ) -> taffy_layout::Dimension {
-    if value.percent != 0.0 && value.length_is_zero() {
-        taffy_layout::Dimension::percent(value.percent)
+    // CSS zero percentages resolve to zero even when the usual percentage
+    // basis is indefinite. Do not turn an authored `0%` into `auto` while
+    // translating into Taffy's scalar model.
+    if value.pure_percentage_coefficient() == Some(0.0) {
+        return taffy_layout::Dimension::length(0.0);
+    }
+    if let Some(percent) = value
+        .pure_percentage_coefficient()
+        .filter(|percent| *percent != 0.0)
+    {
+        taffy_layout::Dimension::percent(percent)
+    } else if let Some(length) =
+        value.used_length_with_percentage_basis(PercentageBasis::<ContentBoxLength>::indefinite())
+    {
+        taffy_layout::Dimension::length(length.points())
     } else {
-        taffy_layout::Dimension::length(value.length_points())
+        // Deferred metric terms must be resolved in their CSS phase before
+        // Taffy receives a scalar.  Passing only their fixed component would
+        // silently turn `calc(10pt + 1em)` into `10pt`.
+        taffy_layout::Dimension::auto()
     }
 }
 
+/// Convert a grid item size into Taffy's model with a definite percentage basis.
+///
+/// CSS Sizing resolves percentages only against definite containing-block
+/// sizes. For grid row intrinsic sizing the container block size can be
+/// indefinite, so unresolved nonzero percentages must behave as automatic
+/// sizes instead of being handed to Taffy as percentages:
+/// <https://www.w3.org/TR/css-sizing-3/#percentage-sizing> and
+/// <https://www.w3.org/TR/css-grid-1/#algo-overview>.
 pub(super) fn taffy_dimension_from_length_percentage_with_basis(
     value: css::ComputedLengthPercentage,
-    percentage_basis: Option<f32>,
+    percentage_basis: GridPercentageBasis,
 ) -> taffy_layout::Dimension {
-    if value.math.is_some()
-        && let Some(basis) = percentage_basis
+    if value.pure_percentage_coefficient() == Some(0.0) {
+        return taffy_layout::Dimension::length(0.0);
+    }
+    if let Some(basis) = percentage_basis.points()
+        && let Some(length) =
+            value.used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(basis)))
     {
-        return taffy_layout::Dimension::length(used_length_percentage(value, basis));
+        return taffy_layout::Dimension::length(length.points());
     }
-    if value.percent != 0.0 && value.length_is_zero() {
-        if let Some(basis) = percentage_basis {
-            taffy_layout::Dimension::length(used_length_percentage(value, basis))
-        } else {
-            taffy_layout::Dimension::percent(value.percent)
-        }
-    } else {
-        taffy_layout::Dimension::length(value.length_points())
+    if let Some(length) =
+        value.used_length_with_percentage_basis(PercentageBasis::<ContentBoxLength>::indefinite())
+    {
+        return taffy_layout::Dimension::length(length.points());
     }
+    taffy_layout::Dimension::auto()
 }
 
 pub(super) fn taffy_margin(
     style: &ComputedStyle,
 ) -> taffy_layout::Rect<taffy_layout::LengthPercentageAuto> {
-    let edges = style.box_values.margin;
+    let edges = style.box_values.margin.clone();
     taffy_layout::Rect {
         left: taffy_length_percentage_auto(edges.left),
         right: taffy_length_percentage_auto(edges.right),
@@ -120,7 +239,7 @@ pub(super) fn taffy_margin(
 pub(super) fn taffy_padding(
     style: &ComputedStyle,
 ) -> taffy_layout::Rect<taffy_layout::LengthPercentage> {
-    let edges = style.box_values.padding;
+    let edges = style.box_values.padding.clone();
     taffy_layout::Rect {
         left: taffy_length_percentage(edges.left),
         right: taffy_length_percentage(edges.right),
@@ -141,8 +260,11 @@ pub(super) fn taffy_edges(edges: css::Edges) -> taffy_layout::Rect<taffy_layout:
 pub(super) fn taffy_length_percentage(
     value: css::ComputedLengthPercentage,
 ) -> taffy_layout::LengthPercentage {
-    if value.percent != 0.0 && value.length_is_zero() {
-        taffy_layout::LengthPercentage::percent(value.percent)
+    if let Some(percent) = value
+        .pure_percentage_coefficient()
+        .filter(|percent| *percent != 0.0)
+    {
+        taffy_layout::LengthPercentage::percent(percent)
     } else {
         taffy_layout::LengthPercentage::length(value.length_points())
     }
@@ -164,13 +286,39 @@ pub(super) fn taffy_length_percentage_auto(
         | css::ComputedLengthPercentageOrAuto::FitContent(_) => {
             taffy_layout::LengthPercentageAuto::auto()
         }
+        css::ComputedLengthPercentageOrAuto::CalcSize(_) => {
+            taffy_layout::LengthPercentageAuto::auto()
+        }
     }
 }
 
-pub(super) fn taffy_gap(value: css::ComputedGap) -> taffy_layout::LengthPercentage {
+/// Convert a grid gap to a Taffy length using the CSS percentage basis.
+///
+/// CSS Grid resolves percentage gaps against the corresponding content-box
+/// size when that size is definite. Cyclic percentages contribute zero during
+/// intrinsic sizing, so an indefinite basis preserves only the non-percentage
+/// length component:
+/// <https://www.w3.org/TR/css-align-3/#gap-percent>.
+pub(super) fn taffy_grid_gap(
+    value: css::ComputedGap,
+    percentage_basis: GridPercentageBasis,
+) -> taffy_layout::LengthPercentage {
     match value {
         css::ComputedGap::Normal => taffy_layout::LengthPercentage::length(0.0),
-        css::ComputedGap::LengthPercentage(value) => taffy_length_percentage(value),
+        css::ComputedGap::LengthPercentage(value) => percentage_basis
+            .points()
+            .map(|basis| {
+                taffy_layout::LengthPercentage::length(
+                    used_length_percentage(
+                        value.clone(),
+                        PercentageBasis::definite(layout_pt(basis.max(0.0))),
+                    )
+                    .points(),
+                )
+            })
+            .unwrap_or_else(|| {
+                taffy_layout::LengthPercentage::length(value.length_max_zero().points())
+            }),
     }
 }
 
@@ -244,21 +392,115 @@ mod tests {
 
     #[test]
     fn grid_item_dimension_extracts_typed_min_and_max_content_points() {
+        let indefinite_basis = PercentageBasis::indefinite();
         let min_content = taffy_grid_item_dimension(
             css::ComputedLengthPercentageOrAuto::MinContent,
-            None,
+            indefinite_basis,
             content_box_pt(12.0),
             content_box_pt(48.0),
         );
         let max_content = taffy_grid_item_dimension(
             css::ComputedLengthPercentageOrAuto::MaxContent,
-            None,
+            indefinite_basis,
             content_box_pt(12.0),
             content_box_pt(48.0),
         );
 
         assert_eq!(min_content, taffy_layout::Dimension::length(12.0));
         assert_eq!(max_content, taffy_layout::Dimension::length(48.0));
+    }
+
+    #[test]
+    fn grid_item_dimension_keeps_indefinite_percentages_auto() {
+        let percent = css::ComputedLengthPercentage::from_percent(0.5);
+        let indefinite_basis = PercentageBasis::indefinite();
+        let definite_basis = grid_percentage_basis_from_points(
+            Some(80.0),
+            GridAvailableSizeSource::ContainerInlineSize,
+        );
+
+        assert_eq!(
+            taffy_dimension_from_length_percentage_with_basis(percent.clone(), indefinite_basis),
+            taffy_layout::Dimension::auto()
+        );
+        assert_eq!(
+            taffy_dimension_from_length_percentage_with_basis(percent, definite_basis),
+            taffy_layout::Dimension::length(40.0)
+        );
+    }
+
+    #[test]
+    fn grid_dimension_does_not_treat_unresolved_metrics_as_zero() {
+        let deferred = css::ComputedLengthPercentage::sum(
+            css::ComputedLengthPercentage::from_points(10.0),
+            css::ComputedLengthPercentage::from_em(1.0),
+        );
+        let indefinite_basis = PercentageBasis::indefinite();
+
+        assert_eq!(
+            taffy_dimension_from_length_percentage(deferred.clone()),
+            taffy_layout::Dimension::auto(),
+        );
+        assert_eq!(
+            taffy_dimension_from_length_percentage_with_basis(deferred, indefinite_basis),
+            taffy_layout::Dimension::auto(),
+        );
+    }
+
+    #[test]
+    fn grid_dimension_keeps_authored_zero_percentage_as_zero_without_a_basis() {
+        let zero_percent = css::ComputedLengthPercentage::from_percent(0.0);
+
+        assert_eq!(
+            taffy_dimension_from_length_percentage_with_basis(
+                zero_percent,
+                PercentageBasis::indefinite(),
+            ),
+            taffy_layout::Dimension::length(0.0),
+        );
+    }
+
+    #[test]
+    fn grid_gap_resolves_percentages_only_with_definite_basis() {
+        let percent_gap =
+            css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_percent(0.5));
+        let mixed = css::ComputedLengthPercentage::from_affine(layout_pt(4.0), 0.5, true);
+        let mixed_gap = css::ComputedGap::LengthPercentage(mixed);
+        let indefinite_basis = PercentageBasis::indefinite();
+        let definite_basis = grid_percentage_basis_from_points(
+            Some(40.0),
+            GridAvailableSizeSource::ContainerInlineSize,
+        );
+
+        assert_eq!(
+            taffy_grid_gap(percent_gap.clone(), indefinite_basis),
+            taffy_layout::LengthPercentage::length(0.0)
+        );
+        assert_eq!(
+            taffy_grid_gap(percent_gap, definite_basis),
+            taffy_layout::LengthPercentage::length(20.0)
+        );
+        assert_eq!(
+            taffy_grid_gap(mixed_gap.clone(), indefinite_basis),
+            taffy_layout::LengthPercentage::length(4.0)
+        );
+        assert_eq!(
+            taffy_grid_gap(mixed_gap, definite_basis),
+            taffy_layout::LengthPercentage::length(24.0)
+        );
+    }
+
+    #[test]
+    fn zero_breadth_auto_repeat_uses_nonzero_counting_floor() {
+        let track = css::GridTrackSize {
+            min: css::GridMinTrackBreadth::LengthPercentage(css::ComputedLengthPercentage::ZERO),
+            max: css::GridMaxTrackBreadth::Flex(1.0),
+        };
+
+        assert_eq!(
+            taffy_auto_repeat_track_size(&track).min,
+            taffy_layout::MinTrackSizingFunction::length(0.75)
+        );
     }
 }
 
@@ -276,9 +518,9 @@ pub(super) fn taffy_grid_justify_content(
 ///
 /// CSS Grid applies `align-items`/`justify-items` as defaults for grid items
 /// and lets `align-self`/`justify-self` override them. Baseline alignment and
-/// writing-mode-sensitive self-start/self-end still need Quire-owned follow-up
-/// handling, but the common positional and stretch keywords can be delegated
-/// to Taffy:
+/// writing-mode-sensitive self-start/self-end need Quire-owned follow-up
+/// handling after Taffy for cases outside the adapter's common positional and
+/// stretch keyword mapping:
 /// <https://www.w3.org/TR/css-align-3/#self-alignment> and
 /// <https://www.w3.org/TR/css-grid-1/#alignment>.
 pub(super) fn taffy_grid_items_alignment(alignment: AlignItems) -> taffy_layout::AlignItems {
@@ -360,7 +602,7 @@ pub(super) fn taffy_effective_grid_justify_self(
     }
 }
 
-fn effective_grid_align_self(
+pub(super) fn effective_grid_align_self(
     child_style: &ComputedStyle,
     container_style: &ComputedStyle,
 ) -> AlignSelf {
@@ -371,7 +613,7 @@ fn effective_grid_align_self(
     }
 }
 
-fn effective_grid_justify_self(
+pub(super) fn effective_grid_justify_self(
     child_style: &ComputedStyle,
     container_style: &ComputedStyle,
 ) -> JustifySelf {
@@ -383,15 +625,772 @@ fn effective_grid_justify_self(
 }
 
 pub(super) fn taffy_grid_template_tracks(
-    value: &css::GridTrackList,
+    tracks: &css::GridTrackList,
+    areas: &css::GridTemplateAreas,
+    auto_tracks: &css::GridAutoTrackList,
+    axis: GridAxis,
 ) -> Vec<taffy_layout::GridTemplateComponent<String>> {
-    match value {
-        css::GridTrackList::None => Vec::new(),
+    let mut components = match tracks {
+        css::GridTrackList::None | css::GridTrackList::Subgrid { .. } => Vec::new(),
         css::GridTrackList::Tracks { components, .. } => components
             .iter()
             .filter_map(taffy_grid_template_component)
             .collect(),
+    };
+    let Some(track_count) = grid_template_track_component_count(tracks) else {
+        return components;
+    };
+    let area_track_count = grid_template_area_track_count(areas, axis);
+    if area_track_count <= track_count || auto_tracks.tracks.is_empty() {
+        return components;
     }
+    components.extend((0..area_track_count - track_count).map(|index| {
+        taffy_layout::GridTemplateComponent::Single(taffy_track_size(
+            &auto_tracks.tracks[index % auto_tracks.tracks.len()],
+        ))
+    }));
+    components
+}
+
+pub(super) fn taffy_grid_template_columns_with_startward_adjustment(
+    style: &ComputedStyle,
+    adjustment: &StartwardImplicitTrackAdjustment,
+) -> Vec<taffy_layout::GridTemplateComponent<String>> {
+    taffy_grid_template_tracks_with_startward_adjustment(style, GridAxis::Column, adjustment)
+}
+
+pub(super) fn taffy_grid_template_rows_with_startward_adjustment(
+    style: &ComputedStyle,
+    adjustment: &StartwardImplicitTrackAdjustment,
+) -> Vec<taffy_layout::GridTemplateComponent<String>> {
+    taffy_grid_template_tracks_with_startward_adjustment(style, GridAxis::Row, adjustment)
+}
+
+fn taffy_grid_template_tracks_with_startward_adjustment(
+    style: &ComputedStyle,
+    axis: GridAxis,
+    adjustment: &StartwardImplicitTrackAdjustment,
+) -> Vec<taffy_layout::GridTemplateComponent<String>> {
+    let (tracks, areas, auto_tracks) = grid_template_axis_inputs(style, axis);
+    let mut components = if adjustment.before_count > 0
+        && let Some(auto_repeat_count) = adjustment.auto_repeat_count
+    {
+        expanded_grid_template_tracks_with_auto_repeat_count(
+            tracks,
+            areas,
+            auto_tracks,
+            axis,
+            auto_repeat_count,
+        )
+    } else {
+        taffy_grid_template_tracks(tracks, areas, auto_tracks, axis)
+    };
+    if adjustment.before_count == 0 {
+        return components;
+    }
+    let mut prefix = (0..adjustment.before_count)
+        .filter_map(|index| {
+            let distance_from_explicit = adjustment.before_count - index;
+            startward_auto_track_size(auto_tracks, distance_from_explicit)
+                .map(|size| taffy_layout::GridTemplateComponent::Single(taffy_track_size(&size)))
+        })
+        .collect::<Vec<_>>();
+    prefix.extend(components);
+    components = prefix;
+    components
+}
+
+pub(super) fn taffy_grid_template_column_names_with_startward_adjustment(
+    style: &ComputedStyle,
+    adjustment: &StartwardImplicitTrackAdjustment,
+) -> Vec<Vec<String>> {
+    taffy_grid_template_line_names_with_startward_adjustment(style, GridAxis::Column, adjustment)
+}
+
+pub(super) fn taffy_grid_template_row_names_with_startward_adjustment(
+    style: &ComputedStyle,
+    adjustment: &StartwardImplicitTrackAdjustment,
+) -> Vec<Vec<String>> {
+    taffy_grid_template_line_names_with_startward_adjustment(style, GridAxis::Row, adjustment)
+}
+
+fn taffy_grid_template_line_names_with_startward_adjustment(
+    style: &ComputedStyle,
+    axis: GridAxis,
+    adjustment: &StartwardImplicitTrackAdjustment,
+) -> Vec<Vec<String>> {
+    let (tracks, areas, _) = grid_template_axis_inputs(style, axis);
+    let mut line_names = if adjustment.before_count > 0 && adjustment.auto_repeat_count.is_some() {
+        adjustment.explicit_line_names.clone()
+    } else {
+        taffy_grid_template_line_names_without_generated_areas(tracks)
+    };
+    if adjustment.before_count == 0 {
+        add_generated_area_line_names(&mut line_names, areas, axis);
+        return line_names;
+    }
+    let mut prefix = vec![Vec::new(); adjustment.before_count];
+    prefix.extend(line_names);
+    line_names = prefix;
+    add_shifted_generated_area_line_names(&mut line_names, areas, axis, adjustment.before_count);
+    line_names
+}
+
+/// Convert template areas after startward implicit-column expansion.
+///
+/// CSS Grid's explicit grid can be enlarged by `grid-template-areas`, and
+/// missing named span lines can synthesize startward implicit tracks. When
+/// Quire prepends those tracks for Taffy, area coordinates must be shifted so
+/// generated `*-start`/`*-end` lines remain attached to their explicit area
+/// columns:
+/// <https://www.w3.org/TR/css-grid-1/#explicit-grids> and
+/// <https://www.w3.org/TR/css-grid-1/#grid-placement-span-int>.
+pub(super) fn taffy_grid_template_areas_with_startward_adjustment(
+    areas: &css::GridTemplateAreas,
+    row_adjustment: &StartwardImplicitTrackAdjustment,
+    column_adjustment: &StartwardImplicitTrackAdjustment,
+) -> Vec<taffy::style::GridTemplateArea<String>> {
+    let mut template_areas = taffy_grid_template_areas(areas);
+    if row_adjustment.before_count == 0 && column_adjustment.before_count == 0 {
+        return template_areas;
+    }
+    let row_shift = u16::try_from(row_adjustment.before_count).unwrap_or(0);
+    let column_shift = u16::try_from(column_adjustment.before_count).unwrap_or(0);
+    for area in &mut template_areas {
+        area.row_start = area.row_start.saturating_add(row_shift);
+        area.row_end = area.row_end.saturating_add(row_shift);
+        area.column_start = area.column_start.saturating_add(column_shift);
+        area.column_end = area.column_end.saturating_add(column_shift);
+    }
+    template_areas
+}
+
+/// Startward implicit tracks that must be made visible to Taffy.
+///
+/// CSS Grid treats missing named lines in the search direction as existing on
+/// implicit grid lines. Taffy currently resolves a backward named span with a
+/// missing name on the after-explicit side, so Quire pre-expands simple
+/// before-explicit tracks and rewrites the affected item placement into
+/// numeric line coordinates before calling Taffy:
+/// <https://www.w3.org/TR/css-grid-1/#grid-placement-span-int>.
+#[derive(Debug, Clone, Default)]
+pub(super) struct StartwardImplicitTrackAdjustment {
+    before_count: usize,
+    explicit_line_names: Vec<Vec<String>>,
+    auto_repeat_count: Option<u16>,
+}
+
+impl StartwardImplicitTrackAdjustment {
+    fn line_shift(&self) -> i32 {
+        i32::try_from(self.before_count).unwrap_or(0)
+    }
+}
+
+pub(super) fn taffy_startward_implicit_column_adjustment(
+    style: &ComputedStyle,
+    children: &[GridChild<'_>],
+    container_width: f32,
+) -> StartwardImplicitTrackAdjustment {
+    taffy_startward_implicit_track_adjustment(
+        style,
+        children,
+        GridAxis::Column,
+        Some(container_width),
+    )
+}
+
+pub(super) fn taffy_startward_implicit_row_adjustment(
+    style: &ComputedStyle,
+    children: &[GridChild<'_>],
+    container_height: Option<f32>,
+) -> StartwardImplicitTrackAdjustment {
+    taffy_startward_implicit_track_adjustment(style, children, GridAxis::Row, container_height)
+}
+
+fn taffy_startward_implicit_track_adjustment(
+    style: &ComputedStyle,
+    children: &[GridChild<'_>],
+    axis: GridAxis,
+    container_size: Option<f32>,
+) -> StartwardImplicitTrackAdjustment {
+    let Some(explicit) =
+        simple_explicit_line_names_for_startward_adjustment(style, axis, container_size)
+    else {
+        return StartwardImplicitTrackAdjustment::default();
+    };
+    let before_count = children
+        .iter()
+        .filter_map(|child| {
+            let (start, end) = match axis {
+                GridAxis::Row => (&child.style.grid_row_start, &child.style.grid_row_end),
+                GridAxis::Column => (&child.style.grid_column_start, &child.style.grid_column_end),
+            };
+            backward_named_span_startward_line_range(start, end, &explicit.line_names).or_else(
+                || negative_named_line_startward_line_range(start, end, &explicit.line_names),
+            )
+        })
+        .filter_map(|range| {
+            (range.start < 1)
+                .then(|| usize::try_from(1_i32 - range.start).ok())
+                .flatten()
+        })
+        .max()
+        .unwrap_or(0);
+    StartwardImplicitTrackAdjustment {
+        before_count,
+        explicit_line_names: explicit.line_names,
+        auto_repeat_count: explicit.auto_repeat_count,
+    }
+}
+
+struct StartwardAdjustmentExplicitLines {
+    line_names: Vec<Vec<String>>,
+    auto_repeat_count: Option<u16>,
+}
+
+fn simple_explicit_line_names_for_startward_adjustment(
+    style: &ComputedStyle,
+    axis: GridAxis,
+    container_size: Option<f32>,
+) -> Option<StartwardAdjustmentExplicitLines> {
+    let (tracks, areas, _, gap) = grid_template_axis_inputs_with_gap(style, axis);
+    let area_track_count = grid_template_area_track_count(areas, axis);
+    let (mut line_names, auto_repeat_count) = match tracks {
+        css::GridTrackList::None | css::GridTrackList::Subgrid { .. } => {
+            (vec![Vec::new(); area_track_count + 1], None)
+        }
+        css::GridTrackList::Tracks {
+            components,
+            trailing_names,
+        } => {
+            let auto_repeat_count = if grid_track_components_have_auto_repeat(components) {
+                simple_fixed_auto_repeat_count(components, gap, container_size?.max(0.0))?
+            } else {
+                None
+            };
+            (
+                startward_adjustment_explicit_grid_line_names(
+                    components,
+                    trailing_names,
+                    auto_repeat_count,
+                )?,
+                auto_repeat_count,
+            )
+        }
+    };
+    let explicit_track_count = line_names.len().saturating_sub(1).max(area_track_count);
+    line_names.resize_with(explicit_track_count + 1, Vec::new);
+    add_generated_area_line_names(&mut line_names, areas, axis);
+    Some(StartwardAdjustmentExplicitLines {
+        line_names,
+        auto_repeat_count,
+    })
+}
+
+fn grid_track_components_have_auto_repeat(components: &[css::GridTrackListComponent]) -> bool {
+    components.iter().any(|component| match component {
+        css::GridTrackListComponent::Track(_, _) => false,
+        css::GridTrackListComponent::Repeat(_, repeat) => {
+            matches!(
+                repeat.count,
+                css::GridRepeatCount::AutoFill | css::GridRepeatCount::AutoFit
+            ) || grid_track_components_have_auto_repeat(&repeat.tracks)
+        }
+    })
+}
+
+fn startward_adjustment_explicit_grid_line_names(
+    components: &[css::GridTrackListComponent],
+    trailing_names: &[String],
+    auto_repeat_count: Option<u16>,
+) -> Option<Vec<Vec<String>>> {
+    let mut line_names = Vec::new();
+    let mut current_line_names = Vec::new();
+    collect_startward_adjustment_line_names(
+        components,
+        auto_repeat_count,
+        &mut current_line_names,
+        &mut line_names,
+    )?;
+    current_line_names.extend(trailing_names.iter().cloned());
+    line_names.push(current_line_names);
+    Some(line_names)
+}
+
+fn collect_startward_adjustment_line_names(
+    components: &[css::GridTrackListComponent],
+    auto_repeat_count: Option<u16>,
+    current_line_names: &mut Vec<String>,
+    line_names: &mut Vec<Vec<String>>,
+) -> Option<()> {
+    for component in components {
+        match component {
+            css::GridTrackListComponent::Track(names, _) => {
+                current_line_names.extend(names.iter().cloned());
+                line_names.push(std::mem::take(current_line_names));
+            }
+            css::GridTrackListComponent::Repeat(names, repeat) => {
+                current_line_names.extend(names.iter().cloned());
+                let count = match repeat.count {
+                    css::GridRepeatCount::Number(count) => count,
+                    css::GridRepeatCount::AutoFill | css::GridRepeatCount::AutoFit => {
+                        auto_repeat_count?
+                    }
+                };
+                for _ in 0..count {
+                    collect_startward_adjustment_line_names(
+                        &repeat.tracks,
+                        auto_repeat_count,
+                        current_line_names,
+                        line_names,
+                    )?;
+                    current_line_names.extend(repeat.trailing_names.iter().cloned());
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// Compute the definite same-page count for fixed-size auto-repeat.
+///
+/// This mirrors the fixed-size branch of Taffy's explicit-grid initialization
+/// so Quire can resolve startward implicit named spans before constructing the
+/// Taffy tree. Startward auto-fit support currently freezes the repeat count
+/// for simple occupied-track placement; broader empty-track collapse
+/// interactions remain tracked as a grid placement divergence:
+/// <https://www.w3.org/TR/css-grid-1/#auto-repeat>.
+pub(in crate::layout::grid) fn simple_fixed_auto_repeat_count(
+    components: &[css::GridTrackListComponent],
+    gap: css::ComputedGap,
+    container_size: f32,
+) -> Option<Option<u16>> {
+    let mut auto_repeat = None;
+    let mut non_auto_track_count = 0_usize;
+    let mut non_auto_track_used_space = 0.0_f32;
+    for component in components {
+        collect_auto_repeat_count_inputs(
+            component,
+            container_size,
+            &mut auto_repeat,
+            &mut non_auto_track_count,
+            &mut non_auto_track_used_space,
+        )?;
+    }
+    let Some(auto_repeat) = auto_repeat else {
+        return Some(None);
+    };
+    let AutoRepeatCountInput {
+        track_count,
+        used_space,
+    } = auto_repeat;
+    if track_count == 0 || used_space <= 0.0 {
+        return None;
+    }
+    let gap = definite_auto_repeat_gap(gap, container_size)?;
+    let first_repeat_size = non_auto_track_used_space
+        + used_space
+        + (non_auto_track_count + track_count).saturating_sub(1) as f32 * gap;
+    let count = if first_repeat_size > container_size {
+        1
+    } else {
+        let per_repeat_size = used_space + track_count as f32 * gap;
+        ((container_size - first_repeat_size) / per_repeat_size).floor() as u16 + 1
+    };
+    Some(Some(count.max(1)))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AutoRepeatCountInput {
+    track_count: usize,
+    used_space: f32,
+}
+
+fn collect_auto_repeat_count_inputs(
+    component: &css::GridTrackListComponent,
+    container_width: f32,
+    auto_repeat: &mut Option<AutoRepeatCountInput>,
+    non_auto_track_count: &mut usize,
+    non_auto_track_used_space: &mut f32,
+) -> Option<()> {
+    match component {
+        css::GridTrackListComponent::Track(_, size) => {
+            *non_auto_track_count = non_auto_track_count.checked_add(1)?;
+            *non_auto_track_used_space +=
+                definite_auto_repeat_track_size(size.clone(), container_width)?;
+        }
+        css::GridTrackListComponent::Repeat(_, repeat) => match repeat.count {
+            css::GridRepeatCount::Number(count) => {
+                let mut track_count = 0_usize;
+                let mut used_space = 0.0_f32;
+                collect_repeat_track_count_and_used_space(
+                    &repeat.tracks,
+                    container_width,
+                    &mut track_count,
+                    &mut used_space,
+                )?;
+                *non_auto_track_count =
+                    non_auto_track_count.checked_add(usize::from(count) * track_count)?;
+                *non_auto_track_used_space += used_space * f32::from(count);
+            }
+            css::GridRepeatCount::AutoFill | css::GridRepeatCount::AutoFit => {
+                if auto_repeat.is_some() {
+                    return None;
+                }
+                let mut track_count = 0_usize;
+                let mut used_space = 0.0_f32;
+                collect_repeat_track_count_and_used_space(
+                    &repeat.tracks,
+                    container_width,
+                    &mut track_count,
+                    &mut used_space,
+                )?;
+                *auto_repeat = Some(AutoRepeatCountInput {
+                    track_count,
+                    used_space,
+                });
+            }
+        },
+    }
+    Some(())
+}
+
+fn collect_repeat_track_count_and_used_space(
+    components: &[css::GridTrackListComponent],
+    container_width: f32,
+    track_count: &mut usize,
+    used_space: &mut f32,
+) -> Option<()> {
+    for component in components {
+        match component {
+            css::GridTrackListComponent::Track(_, size) => {
+                *track_count = track_count.checked_add(1)?;
+                *used_space += definite_auto_repeat_track_size(size.clone(), container_width)?;
+            }
+            css::GridTrackListComponent::Repeat(_, repeat) => {
+                let css::GridRepeatCount::Number(count) = repeat.count else {
+                    return None;
+                };
+                let mut repeated_count = 0_usize;
+                let mut repeated_space = 0.0_f32;
+                collect_repeat_track_count_and_used_space(
+                    &repeat.tracks,
+                    container_width,
+                    &mut repeated_count,
+                    &mut repeated_space,
+                )?;
+                *track_count = track_count.checked_add(usize::from(count) * repeated_count)?;
+                *used_space += repeated_space * f32::from(count);
+            }
+        }
+    }
+    Some(())
+}
+
+pub(in crate::layout::grid) fn definite_auto_repeat_track_size(
+    size: css::GridTrackSize,
+    container_width: f32,
+) -> Option<f32> {
+    let max = match size.max {
+        css::GridMaxTrackBreadth::LengthPercentage(value) => value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                container_width,
+            )))
+            .map(layout_points),
+        css::GridMaxTrackBreadth::FitContent(value) => value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                container_width,
+            )))
+            .map(layout_points),
+        css::GridMaxTrackBreadth::Auto
+        | css::GridMaxTrackBreadth::MinContent
+        | css::GridMaxTrackBreadth::MaxContent
+        | css::GridMaxTrackBreadth::Flex(_) => None,
+    };
+    let min = match size.min {
+        css::GridMinTrackBreadth::LengthPercentage(value) => value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                container_width,
+            )))
+            .map(layout_points),
+        css::GridMinTrackBreadth::Auto
+        | css::GridMinTrackBreadth::MinContent
+        | css::GridMinTrackBreadth::MaxContent => None,
+    };
+    max.map(|max| max.max(min.unwrap_or(0.0)))
+        .or(min)
+        .map(|size| size.max(0.0))
+}
+
+fn definite_auto_repeat_gap(gap: css::ComputedGap, container_width: f32) -> Option<f32> {
+    match gap {
+        css::ComputedGap::Normal => Some(0.0),
+        css::ComputedGap::LengthPercentage(value) => value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                container_width,
+            )))
+            .map(layout_points)
+            .map(|gap| gap.max(0.0)),
+    }
+}
+
+fn taffy_grid_template_line_names_without_generated_areas(
+    tracks: &css::GridTrackList,
+) -> Vec<Vec<String>> {
+    match tracks {
+        css::GridTrackList::None | css::GridTrackList::Subgrid { .. } => Vec::new(),
+        css::GridTrackList::Tracks {
+            components,
+            trailing_names,
+        } => {
+            let mut line_names = Vec::with_capacity(components.len() + 1);
+            for component in components {
+                match component {
+                    css::GridTrackListComponent::Track(names, _)
+                    | css::GridTrackListComponent::Repeat(names, _) => {
+                        line_names.push(names.clone());
+                    }
+                }
+            }
+            line_names.push(trailing_names.clone());
+            line_names
+        }
+    }
+}
+
+fn add_shifted_generated_area_line_names(
+    line_names: &mut Vec<Vec<String>>,
+    areas: &css::GridTemplateAreas,
+    axis: GridAxis,
+    shift: usize,
+) {
+    let css::GridTemplateAreas::Areas(rows) = areas else {
+        return;
+    };
+    for area in collect_grid_template_area_bounds(rows) {
+        let (start, end) = match axis {
+            GridAxis::Row => (area.row_start + shift, area.row_end + 1 + shift),
+            GridAxis::Column => (area.column_start + shift, area.column_end + 1 + shift),
+        };
+        ensure_grid_line_names_length(line_names, end + 1);
+        add_grid_line_name(&mut line_names[start], format!("{}-start", area.name));
+        add_grid_line_name(&mut line_names[end], format!("{}-end", area.name));
+    }
+}
+
+fn startward_auto_track_size(
+    auto_tracks: &css::GridAutoTrackList,
+    distance_from_explicit: usize,
+) -> Option<css::GridTrackSize> {
+    let len = auto_tracks.tracks.len();
+    if len == 0 {
+        return None;
+    }
+    let offset = distance_from_explicit % len;
+    let index = (len - offset) % len;
+    auto_tracks.tracks.get(index).cloned()
+}
+
+fn expanded_grid_template_tracks_with_auto_repeat_count(
+    tracks: &css::GridTrackList,
+    areas: &css::GridTemplateAreas,
+    auto_tracks: &css::GridAutoTrackList,
+    axis: GridAxis,
+    auto_repeat_count: u16,
+) -> Vec<taffy_layout::GridTemplateComponent<String>> {
+    let mut components = match tracks {
+        css::GridTrackList::None | css::GridTrackList::Subgrid { .. } => Vec::new(),
+        css::GridTrackList::Tracks { components, .. } => components
+            .iter()
+            .flat_map(|component| {
+                expanded_grid_template_component_with_auto_repeat_count(
+                    component,
+                    auto_repeat_count,
+                )
+            })
+            .collect(),
+    };
+    let area_track_count = grid_template_area_track_count(areas, axis);
+    if components.len() < area_track_count && !auto_tracks.tracks.is_empty() {
+        components.extend((0..area_track_count - components.len()).map(|index| {
+            taffy_layout::GridTemplateComponent::Single(taffy_track_size(
+                &auto_tracks.tracks[index % auto_tracks.tracks.len()],
+            ))
+        }));
+    }
+    components
+}
+
+fn expanded_grid_template_component_with_auto_repeat_count(
+    component: &css::GridTrackListComponent,
+    auto_repeat_count: u16,
+) -> Vec<taffy_layout::GridTemplateComponent<String>> {
+    match component {
+        css::GridTrackListComponent::Track(_, size) => {
+            vec![taffy_layout::GridTemplateComponent::Single(
+                taffy_track_size(size),
+            )]
+        }
+        css::GridTrackListComponent::Repeat(_, repeat) => {
+            let count = match repeat.count {
+                css::GridRepeatCount::Number(count) => count,
+                css::GridRepeatCount::AutoFill => auto_repeat_count,
+                css::GridRepeatCount::AutoFit => auto_repeat_count,
+            };
+            (0..count)
+                .flat_map(|_| {
+                    repeat.tracks.iter().flat_map(|component| {
+                        expanded_grid_template_component_with_auto_repeat_count(
+                            component,
+                            auto_repeat_count,
+                        )
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
+pub(super) fn startward_adjusted_auto_fit_track_range(
+    style: &ComputedStyle,
+    axis: GridAxis,
+    adjustment: &StartwardImplicitTrackAdjustment,
+) -> Option<std::ops::Range<usize>> {
+    if adjustment.before_count == 0 {
+        return None;
+    }
+    let auto_repeat_count = adjustment.auto_repeat_count?;
+    let (tracks, _, _) = grid_template_axis_inputs(style, axis);
+    let css::GridTrackList::Tracks { components, .. } = tracks else {
+        return None;
+    };
+    let range = auto_fit_track_range(components, auto_repeat_count)?;
+    Some(
+        range.start.checked_add(adjustment.before_count)?
+            ..range.end.checked_add(adjustment.before_count)?,
+    )
+}
+
+fn auto_fit_track_range(
+    components: &[css::GridTrackListComponent],
+    auto_repeat_count: u16,
+) -> Option<std::ops::Range<usize>> {
+    let mut start = 0_usize;
+    for component in components {
+        match component {
+            css::GridTrackListComponent::Track(_, _) => start = start.checked_add(1)?,
+            css::GridTrackListComponent::Repeat(_, repeat) => {
+                let repeat_track_count = repeated_track_component_count(&repeat.tracks)?;
+                let repeated_count = match repeat.count {
+                    css::GridRepeatCount::Number(count) => count,
+                    css::GridRepeatCount::AutoFill => auto_repeat_count,
+                    css::GridRepeatCount::AutoFit => {
+                        let len = usize::from(auto_repeat_count).checked_mul(repeat_track_count)?;
+                        return Some(start..start.checked_add(len)?);
+                    }
+                };
+                start = start.checked_add(usize::from(repeated_count) * repeat_track_count)?;
+            }
+        }
+    }
+    None
+}
+
+fn repeated_track_component_count(components: &[css::GridTrackListComponent]) -> Option<usize> {
+    components.iter().try_fold(0_usize, |count, component| {
+        Some(match component {
+            css::GridTrackListComponent::Track(_, _) => count.checked_add(1)?,
+            css::GridTrackListComponent::Repeat(_, repeat) => {
+                let css::GridRepeatCount::Number(repeat_count) = repeat.count else {
+                    return None;
+                };
+                count.checked_add(
+                    usize::from(repeat_count) * repeated_track_component_count(&repeat.tracks)?,
+                )?
+            }
+        })
+    })
+}
+
+/// Count finite explicit grid tracks represented by an authored track list.
+///
+/// CSS Grid's explicit grid can be enlarged by `grid-template-areas`; this
+/// helper tells the Taffy adapter how many missing area-created explicit
+/// tracks need sizes from `grid-auto-rows` or `grid-auto-columns`:
+/// <https://www.w3.org/TR/css-grid-1/#explicit-grids>.
+fn grid_template_track_component_count(tracks: &css::GridTrackList) -> Option<usize> {
+    let css::GridTrackList::Tracks { components, .. } = tracks else {
+        return Some(0);
+    };
+    let mut count = 0_usize;
+    for component in components {
+        match component {
+            css::GridTrackListComponent::Track(_, _) => count = count.checked_add(1)?,
+            css::GridTrackListComponent::Repeat(_, repeat) => {
+                let css::GridRepeatCount::Number(repeat_count) = repeat.count else {
+                    return None;
+                };
+                let repeated_tracks = repeat
+                    .tracks
+                    .iter()
+                    .filter(|component| {
+                        matches!(component, css::GridTrackListComponent::Track(_, _))
+                    })
+                    .count();
+                count = count.checked_add(usize::from(repeat_count) * repeated_tracks)?;
+            }
+        }
+    }
+    Some(count)
+}
+
+fn grid_template_area_track_count(areas: &css::GridTemplateAreas, axis: GridAxis) -> usize {
+    let css::GridTemplateAreas::Areas(rows) = areas else {
+        return 0;
+    };
+    match axis {
+        GridAxis::Row => rows.len(),
+        GridAxis::Column => rows.iter().map(|row| row.cells.len()).max().unwrap_or(0),
+    }
+}
+
+fn grid_template_axis_inputs(
+    style: &ComputedStyle,
+    axis: GridAxis,
+) -> (
+    &css::GridTrackList,
+    &css::GridTemplateAreas,
+    &css::GridAutoTrackList,
+) {
+    match axis {
+        GridAxis::Row => (
+            &style.grid_template_rows,
+            &style.grid_template_areas,
+            &style.grid_auto_rows,
+        ),
+        GridAxis::Column => (
+            &style.grid_template_columns,
+            &style.grid_template_areas,
+            &style.grid_auto_columns,
+        ),
+    }
+}
+
+fn grid_template_axis_inputs_with_gap(
+    style: &ComputedStyle,
+    axis: GridAxis,
+) -> (
+    &css::GridTrackList,
+    &css::GridTemplateAreas,
+    &css::GridAutoTrackList,
+    css::ComputedGap,
+) {
+    let (tracks, areas, auto_tracks) = grid_template_axis_inputs(style, axis);
+    let gap = match axis {
+        GridAxis::Row => style.row_gap.clone(),
+        GridAxis::Column => style.column_gap.clone(),
+    };
+    (tracks, areas, auto_tracks, gap)
 }
 
 pub(super) fn taffy_grid_template_component(
@@ -414,7 +1413,9 @@ pub(super) fn taffy_grid_template_component(
                     .tracks
                     .iter()
                     .filter_map(|component| match component {
-                        css::GridTrackListComponent::Track(_, size) => Some(taffy_track_size(size)),
+                        css::GridTrackListComponent::Track(_, size) => {
+                            Some(taffy_auto_repeat_track_size(size))
+                        }
                         css::GridTrackListComponent::Repeat(_, _) => None,
                     })
                     .collect(),
@@ -424,32 +1425,20 @@ pub(super) fn taffy_grid_template_component(
     }
 }
 
-pub(super) fn taffy_grid_template_line_names(
-    tracks: &css::GridTrackList,
-    areas: &css::GridTemplateAreas,
-    axis: GridAxis,
-) -> Vec<Vec<String>> {
-    let mut line_names = match tracks {
-        css::GridTrackList::None => Vec::new(),
-        css::GridTrackList::Tracks {
-            components,
-            trailing_names,
-        } => {
-            let mut line_names = Vec::with_capacity(components.len() + 1);
-            for component in components {
-                match component {
-                    css::GridTrackListComponent::Track(names, _)
-                    | css::GridTrackListComponent::Repeat(names, _) => {
-                        line_names.push(names.clone());
-                    }
-                }
-            }
-            line_names.push(trailing_names.clone());
-            line_names
-        }
-    };
-    add_generated_area_line_names(&mut line_names, areas, axis);
-    line_names
+/// Convert a track used by auto-repeat while applying Grid's non-zero floor.
+///
+/// The auto-repeat count algorithm must floor a zero fixed track breadth to a
+/// UA-defined non-zero value to avoid division by zero and an unbounded repeat
+/// count. Quire uses one CSS pixel (0.75 PDF points), the value suggested by
+/// CSS Grid. The floor only affects repeat-count selection; flexible growth
+/// and auto-fit collapse remain Taffy's ordinary track sizing behavior.
+/// <https://www.w3.org/TR/css-grid-1/#auto-repeat>
+fn taffy_auto_repeat_track_size(value: &css::GridTrackSize) -> taffy_layout::TrackSizingFunction {
+    let mut track = taffy_track_size(value);
+    if definite_auto_repeat_track_size(value.clone(), 0.0).is_some_and(|size| size <= 0.0) {
+        track.min = taffy_layout::MinTrackSizingFunction::length(0.75);
+    }
+    track
 }
 
 pub(super) fn taffy_grid_repeat_line_names(repeat: &css::GridRepeat) -> Vec<Vec<String>> {
@@ -515,7 +1504,12 @@ fn collect_grid_template_area_bounds(
         .collect()
 }
 
-fn add_generated_area_line_names(
+/// Add `*-start` and `*-end` implicit line names generated by named grid areas.
+///
+/// CSS Grid named areas create implicitly named lines on both axes, and those
+/// line names participate in normal line-placement resolution:
+/// <https://www.w3.org/TR/css-grid-1/#implicit-named-lines>.
+pub(super) fn add_generated_area_line_names(
     line_names: &mut Vec<Vec<String>>,
     areas: &css::GridTemplateAreas,
     axis: GridAxis,
@@ -580,8 +1574,8 @@ pub(super) fn taffy_grid_auto_tracks(
 
 pub(super) fn taffy_track_size(value: &css::GridTrackSize) -> taffy_layout::TrackSizingFunction {
     taffy_layout::TrackSizingFunction {
-        min: taffy_min_track_breadth(value.min),
-        max: taffy_max_track_breadth(value.max),
+        min: taffy_min_track_breadth(value.min.clone()),
+        max: taffy_max_track_breadth(value.max.clone()),
     }
 }
 
@@ -606,8 +1600,11 @@ pub(super) fn taffy_max_track_breadth(
         css::GridMaxTrackBreadth::LengthPercentage(value) => taffy_length_percentage(value).into(),
         css::GridMaxTrackBreadth::Flex(value) => taffy_layout::MaxTrackSizingFunction::fr(value),
         css::GridMaxTrackBreadth::FitContent(value) => {
-            if value.percent != 0.0 && value.length_is_zero() {
-                taffy_layout::MaxTrackSizingFunction::fit_content_percent(value.percent)
+            if let Some(percent) = value
+                .pure_percentage_coefficient()
+                .filter(|percent| *percent != 0.0)
+            {
+                taffy_layout::MaxTrackSizingFunction::fit_content_percent(percent)
             } else {
                 taffy_layout::MaxTrackSizingFunction::fit_content_px(value.length_points())
             }
@@ -629,6 +1626,131 @@ pub(super) fn taffy_grid_line(
         start = taffy_layout::GridPlacement::Span(1);
     }
     taffy_layout::Line { start, end }
+}
+
+pub(super) fn taffy_grid_line_with_startward_adjustment(
+    start: &css::GridPlacement,
+    end: &css::GridPlacement,
+    adjustment: &StartwardImplicitTrackAdjustment,
+) -> taffy_layout::Line<taffy_layout::GridPlacement<String>> {
+    if adjustment.before_count == 0 {
+        return taffy_grid_line(start, end);
+    }
+    if let Some(range) =
+        backward_named_span_startward_line_range(start, end, &adjustment.explicit_line_names)
+    {
+        let shift = adjustment.line_shift();
+        return taffy_layout::Line {
+            start: taffy_layout::line((range.start + shift).clamp(1, i32::from(i16::MAX)) as i16),
+            end: taffy_layout::line((range.end + shift).clamp(1, i32::from(i16::MAX)) as i16),
+        };
+    }
+    if let Some(range) =
+        negative_named_line_startward_line_range(start, end, &adjustment.explicit_line_names)
+    {
+        let shift = adjustment.line_shift();
+        return taffy_layout::Line {
+            start: taffy_layout::line((range.start + shift).clamp(1, i32::from(i16::MAX)) as i16),
+            end: taffy_layout::line((range.end + shift).clamp(1, i32::from(i16::MAX)) as i16),
+        };
+    }
+    let mut start = taffy_grid_placement_with_positive_line_shift(start, adjustment.line_shift());
+    let mut end = taffy_grid_placement_with_positive_line_shift(end, adjustment.line_shift());
+    if taffy_grid_placement_is_line(&start) && matches!(end, taffy_layout::GridPlacement::Auto) {
+        end = taffy_layout::GridPlacement::Span(1);
+    } else if matches!(start, taffy_layout::GridPlacement::Auto)
+        && taffy_grid_placement_is_line(&end)
+    {
+        start = taffy_layout::GridPlacement::Span(1);
+    }
+    taffy_layout::Line { start, end }
+}
+
+fn backward_named_span_startward_line_range(
+    start: &css::GridPlacement,
+    end: &css::GridPlacement,
+    explicit_line_names: &[Vec<String>],
+) -> Option<std::ops::Range<i32>> {
+    let css::GridPlacement::Span(span) = start else {
+        return None;
+    };
+    let name = span.name.as_ref()?;
+    let target = span.span.unwrap_or(1);
+    if target == 0 {
+        return None;
+    }
+    let end = grid_line_index(end, explicit_line_names)?;
+    let mut matches_seen = 0_u16;
+    for (index, names) in explicit_line_names.iter().enumerate().rev() {
+        let line_index = i32::try_from(index + 1).ok()?;
+        if line_index >= end {
+            continue;
+        }
+        if names.iter().any(|line_name| line_name == name) {
+            matches_seen += 1;
+            if matches_seen == target {
+                return Some(line_index..end);
+            }
+        }
+    }
+    let missing = i32::from(target - matches_seen);
+    let start_line = 1_i32.checked_sub(missing)?;
+    Some(start_line..end)
+}
+
+/// Resolve a negative named line placement that falls before the explicit grid.
+///
+/// CSS Grid treats implicit lines on the search side as having the requested
+/// name when an occurrence cannot be satisfied by explicit named lines:
+/// <https://www.w3.org/TR/css-grid-1/#grid-placement-slot>.
+fn negative_named_line_startward_line_range(
+    start: &css::GridPlacement,
+    end: &css::GridPlacement,
+    explicit_line_names: &[Vec<String>],
+) -> Option<std::ops::Range<i32>> {
+    let css::GridPlacement::Line(line) = start else {
+        return None;
+    };
+    let name = line.name.as_ref()?;
+    let occurrence = line.index.unwrap_or(1);
+    if occurrence >= 0 {
+        return None;
+    }
+    let start_line =
+        negative_named_implicit_grid_line_index(explicit_line_names, name, occurrence)?;
+    if start_line >= 1 {
+        return None;
+    }
+    let end_line = match end {
+        css::GridPlacement::Auto => start_line.checked_add(1)?,
+        css::GridPlacement::Line(_) => grid_line_index(end, explicit_line_names)?,
+        css::GridPlacement::Span(span) if span.name.is_none() => {
+            start_line.checked_add(i32::from(span.span.unwrap_or(1)))?
+        }
+        css::GridPlacement::Span(_) => return None,
+    };
+    Some(start_line..end_line)
+}
+
+fn taffy_grid_placement_with_positive_line_shift(
+    value: &css::GridPlacement,
+    shift: i32,
+) -> taffy_layout::GridPlacement<String> {
+    match value {
+        css::GridPlacement::Line(line) if line.name.is_none() => line
+            .index
+            .and_then(|index| {
+                let shifted = if index > 0 {
+                    index.checked_add(shift)?
+                } else {
+                    index
+                };
+                i16::try_from(shifted).ok()
+            })
+            .map(taffy_layout::line)
+            .unwrap_or(taffy_layout::GridPlacement::Auto),
+        _ => taffy_grid_placement(value),
+    }
 }
 
 pub(super) fn taffy_grid_placement_is_line(value: &taffy_layout::GridPlacement<String>) -> bool {

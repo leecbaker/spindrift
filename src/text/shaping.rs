@@ -1,5 +1,30 @@
 use super::*;
 
+/// The directional level assigned to a source range after UAX #9 resolution.
+///
+/// This deliberately differs from CSS `direction`: it describes the visual
+/// embedding level chosen for one already-reordered cluster, which determines
+/// the directional override needed when the cluster is shaped for painting.
+/// <https://www.unicode.org/reports/tr9/#Reordering_Resolved_Levels>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedBidiDirection {
+    Ltr,
+    Rtl,
+}
+
+impl ResolvedBidiDirection {
+    pub(super) const fn from_parley_cluster_is_rtl(is_rtl: bool) -> Self {
+        if is_rtl { Self::Rtl } else { Self::Ltr }
+    }
+}
+
+/// One source range in UAX #9 visual order together with its resolved level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BidiVisualRange {
+    pub(crate) range: Range<usize>,
+    pub(crate) direction: ResolvedBidiDirection,
+}
+
 pub(super) fn shape_text_with_document_font(
     font: &DocumentFont,
     text: &str,
@@ -19,7 +44,7 @@ pub(super) fn shape_text_with_document_font(
         .filter(|character| !character_is_bidi_format_control(*character))
         .collect::<Vec<_>>();
     let mut glyphs = Vec::with_capacity(characters.len());
-    for (index, character) in characters.iter().copied().enumerate() {
+    for (index, character) in characters.iter().cloned().enumerate() {
         let glyph_id = if character == '\t' {
             face.glyph_index(' ')?
         } else {
@@ -35,7 +60,7 @@ pub(super) fn shape_text_with_document_font(
         if used_letter_spacing != 0.0 && index + 1 < characters.len() {
             x_advance += used_letter_spacing;
         }
-        if word_spacing != 0.0 && character == ' ' {
+        if word_spacing != 0.0 && character_is_css_word_separator(character) {
             x_advance += word_spacing;
         }
         glyphs.push(RenderedGlyph {
@@ -130,28 +155,40 @@ pub(super) fn used_letter_spacing_for_text(text: &str, letter_spacing: f32) -> f
 
 pub(super) fn visual_ranges_for_line<B: parley::style::Brush>(
     line: parley::Line<'_, B>,
-) -> Vec<Range<usize>> {
-    let mut ranges = Vec::<Range<usize>>::new();
+) -> Vec<BidiVisualRange> {
+    let mut ranges = Vec::<BidiVisualRange>::new();
     for run in line.runs() {
         for cluster in run.visual_clusters() {
-            push_visual_range(&mut ranges, cluster.text_range());
+            push_visual_range(
+                &mut ranges,
+                cluster.text_range(),
+                ResolvedBidiDirection::from_parley_cluster_is_rtl(cluster.is_rtl()),
+            );
         }
     }
     if ranges.is_empty() {
-        ranges.push(line.text_range());
+        ranges.push(BidiVisualRange {
+            range: line.text_range(),
+            direction: ResolvedBidiDirection::Ltr,
+        });
     }
     ranges
 }
 
-pub(super) fn push_visual_range(ranges: &mut Vec<Range<usize>>, range: Range<usize>) {
+pub(super) fn push_visual_range(
+    ranges: &mut Vec<BidiVisualRange>,
+    range: Range<usize>,
+    direction: ResolvedBidiDirection,
+) {
     if range.is_empty() {
         return;
     }
     if let Some(previous) = ranges.last_mut()
-        && previous.end == range.start
+        && previous.direction == direction
+        && previous.range.end == range.start
     {
-        previous.end = range.end;
+        previous.range.end = range.end;
         return;
     }
-    ranges.push(range);
+    ranges.push(BidiVisualRange { range, direction });
 }

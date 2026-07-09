@@ -1,4 +1,8 @@
 use super::*;
+use crate::css::Hyphens;
+use crate::text::character_is_css_other_space_separator;
+use crate::text::{hyphenator_for_language, text_with_auto_hyphenation, text_with_css_line_breaks};
+use std::borrow::Cow;
 use std::rc::Rc;
 
 /// One normalized inline formatting participant in an inline paragraph graph.
@@ -56,21 +60,64 @@ impl AsRef<InlineLineItem> for MeasuredInlineItem {
 /// same materialized line model:
 /// <https://www.w3.org/TR/css-text-3/#white-space-processing> and
 /// <https://www.w3.org/TR/css-text-3/#line-breaking>.
+/// CSS Text Phase II effects selected at one line edge.
+///
+/// Source items are deliberately retained; consumers use these used-advance
+/// deductions instead of deleting source text during collection.
+/// <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+/// The selected source behavior at one line edge.
+///
+/// CSS Text Phase II changes used geometry without deleting the corresponding
+/// source. Keeping the effect keyed to a selected item range lets paint,
+/// decorations, and PDF extraction distinguish the source owner from the
+/// width deducted for fitting.
+/// <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum InlineLineEdgeEffectKind {
+    CollapsedEndTrim,
+    PreWrapHang,
+    UnconditionalSeparatorHang,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::layout) struct InlineLineEdgeEffect {
+    pub(in crate::layout) kind: InlineLineEdgeEffectKind,
+    pub(in crate::layout) item_index: usize,
+    pub(in crate::layout) source_range: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(in crate::layout) struct InlineLineEdgeEffects {
+    /// CSS Text Phase II removes this advance from the selected line measure.
+    /// The corresponding source fragments remain in `InlineLineFragment` and
+    /// are omitted only from the visual paint sequence after bidi ordering.
+    /// <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+    pub(in crate::layout) collapsed_end_trim_width: f32,
+    pub(in crate::layout) pre_wrap_hanging_width: f32,
+    pub(in crate::layout) hanging_space_separator_width: f32,
+    pub(in crate::layout) trailing_tracking_width: f32,
+    /// Source-owned Phase II effects, in selected item coordinates.
+    pub(in crate::layout) source_effects: Rc<[InlineLineEdgeEffect]>,
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::layout) struct MaterializedInlineGraphLine {
     pub(in crate::layout) items: Vec<MeasuredInlineItem>,
     pub(in crate::layout) text: String,
+    /// Advance used while choosing a break candidate. Once a candidate creates
+    /// a line edge, CSS Text Phase II trimming and hanging apply to that edge
+    /// before the candidate is compared with the available measure.
+    pub(in crate::layout) fitting_width: f32,
     pub(in crate::layout) content_width: f32,
-    // Retained for line-materialization tests that verify CSS Text trimming
-    // behavior before all consumers need the trimmed amount.
-    #[allow(dead_code)]
-    pub(in crate::layout) trimmed_width: f32,
-    pub(in crate::layout) hanging_space_width: f32,
-    pub(in crate::layout) trailing_tracking_width: f32,
+    pub(in crate::layout) edge_effects: InlineLineEdgeEffects,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::layout) struct InlineContentWidth {
+    /// Advance used to choose a selected line edge. Terminal tracking and
+    /// unconditional hanging Unicode space separators are painted outside the
+    /// formatted line and therefore do not make a candidate overflow.
+    pub(in crate::layout) fitting_width: f32,
     pub(in crate::layout) content_width: f32,
     pub(in crate::layout) trailing_space_width: f32,
     pub(in crate::layout) trailing_tracking_width: f32,
@@ -79,6 +126,7 @@ pub(in crate::layout) struct InlineContentWidth {
 #[derive(Debug, Clone)]
 pub(in crate::layout) struct BorrowedInlineLineMeasurement {
     pub(in crate::layout) run_range: std::ops::Range<usize>,
+    pub(in crate::layout) fitting_width: f32,
     pub(in crate::layout) content_width: f32,
 }
 
@@ -102,6 +150,7 @@ where
         trailing_hanging_space_separator_width_for_line_items(items, font_system);
     let trailing_tracking_width = trailing_letter_spacing_width_for_line_items(items);
     InlineContentWidth {
+        fitting_width: (raw_width - trailing_space_width - trailing_tracking_width).max(0.0),
         content_width: (raw_width - trailing_space_width - trailing_tracking_width).max(0.0),
         trailing_space_width,
         trailing_tracking_width,
@@ -137,7 +186,10 @@ pub(in crate::layout) fn resolve_materialized_line_leaders(
 
     let old_trailing_space_width =
         trailing_hanging_space_separator_width_for_line_items(&line.items, font_system);
-    let consumed_pre_wrap_width = (line.hanging_space_width - old_trailing_space_width).max(0.0);
+    let consumed_pre_wrap_width = (line.edge_effects.pre_wrap_hanging_width
+        + line.edge_effects.hanging_space_separator_width
+        - old_trailing_space_width)
+        .max(0.0);
     let mut remaining_inline_width = (available_inline_width - line.content_width).max(0.0);
     let mut remaining_leaders = leader_count;
     let mut resolved_items = Vec::with_capacity(line.items.len());
@@ -159,7 +211,18 @@ pub(in crate::layout) fn resolve_materialized_line_leaders(
             0.0
         };
         remaining_leaders = remaining_leaders.saturating_sub(1);
-        if pattern.is_empty() || pattern_width <= 0.0 || leader_share <= 0.0 {
+        // Intrinsic inline measurement deliberately supplies an unbounded
+        // available width.  A leader fills *remaining* line space, so it has
+        // no finite intrinsic contribution in that pass; expanding it here
+        // would convert infinity to `usize::MAX` and attempt an impossible
+        // allocation.  The later, used-width materialization receives the
+        // finite line width and expands the leader normally.
+        if pattern.is_empty()
+            || pattern_width <= 0.0
+            || leader_share <= 0.0
+            || !leader_share.is_finite()
+            || available_inline_width == f32::MAX
+        {
             continue;
         }
 
@@ -200,9 +263,11 @@ pub(in crate::layout) fn resolve_materialized_line_leaders(
 
     line.items = resolved_items;
     let widths = inline_content_width_for_line_items(&line.items, font_system, |item| item.width);
-    line.trailing_tracking_width = widths.trailing_tracking_width;
-    line.hanging_space_width = consumed_pre_wrap_width + widths.trailing_space_width;
-    line.content_width = widths.content_width;
+    line.edge_effects.pre_wrap_hanging_width = consumed_pre_wrap_width;
+    line.edge_effects.hanging_space_separator_width = widths.trailing_space_width;
+    line.edge_effects.trailing_tracking_width = widths.trailing_tracking_width;
+    line.fitting_width = (widths.fitting_width - consumed_pre_wrap_width).max(0.0);
+    line.content_width = (widths.content_width - consumed_pre_wrap_width).max(0.0);
     line.text = text_for_measured_items(&line.items);
 }
 
@@ -341,7 +406,10 @@ impl InlineIntrinsicMeasurement {
     pub(in crate::layout) fn physical_height(&self, style: &ComputedStyle) -> f32 {
         match style.writing_mode {
             WritingMode::HorizontalTb => self.height(),
-            WritingMode::VerticalRl | WritingMode::VerticalLr => self
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => self
                 .sequence
                 .records
                 .iter()
@@ -354,7 +422,10 @@ impl InlineIntrinsicMeasurement {
     pub(in crate::layout) fn physical_width(&self, style: &ComputedStyle) -> f32 {
         match style.writing_mode {
             WritingMode::HorizontalTb => self.contribution.max_content,
-            WritingMode::VerticalRl | WritingMode::VerticalLr => self.height(),
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => self.height(),
         }
     }
 
@@ -387,6 +458,7 @@ pub(in crate::layout) struct InlineLineFragment {
     pub(in crate::layout) indent: f32,
     pub(in crate::layout) available_width: f32,
     pub(in crate::layout) suppress_float_adjust: bool,
+    pub(in crate::layout) edge_effects: InlineLineEdgeEffects,
     pub(in crate::layout) text: Rc<str>,
 }
 
@@ -408,6 +480,7 @@ impl InlineLineFragment {
             indent,
             available_width,
             suppress_float_adjust,
+            edge_effects: InlineLineEdgeEffects::default(),
             text: Rc::from(text.into()),
         }
     }
@@ -419,6 +492,14 @@ impl InlineLineFragment {
     pub(in crate::layout) fn text(&self) -> &str {
         &self.text
     }
+
+    pub(in crate::layout) fn with_edge_effects(
+        mut self,
+        edge_effects: InlineLineEdgeEffects,
+    ) -> Self {
+        self.edge_effects = edge_effects;
+        self
+    }
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -426,7 +507,7 @@ impl<'a> LayoutBuilder<'a> {
     ///
     /// Text transform is applied exactly once while normalizing `InlineItem`s
     /// into graph runs. Unicode break opportunities come from the existing
-    /// ICU/Parley-backed text helpers; Reasyprint records CSS policy metadata
+    /// ICU/Parley-backed text helpers; Quire records CSS policy metadata
     /// on the resulting boundaries so later line selection does not repeat
     /// whitespace, hyphenation, and atomic-inline decisions:
     /// <https://www.w3.org/TR/css-text-3/#text-transform-property>,
@@ -442,6 +523,138 @@ impl<'a> LayoutBuilder<'a> {
         I::Item: AsRef<InlineItem>,
     {
         build_inline_opportunity_graph(&mut self.font_system, items, block_style)
+    }
+
+    /// Return a graph whose first typographic letter has its `::first-letter`
+    /// style applied before line fitting.
+    ///
+    /// CSS Inline's `initial-letter` changes the shaped advance and exclusion
+    /// geometry of the first letter, so it must be materialized before the
+    /// line-break graph selects the first line:
+    /// <https://drafts.csswg.org/css-inline-3/#initial-letter-property> and
+    /// <https://www.w3.org/TR/css-pseudo-4/#first-letter-pseudo>.
+    pub(in crate::layout) fn graph_with_first_letter_pseudo(
+        &mut self,
+        graph: &InlineOpportunityGraph,
+        block_style: &ComputedStyle,
+    ) -> InlineOpportunityGraph {
+        let Some(first_letter_style) = block_style.first_letter_style.as_deref() else {
+            return graph.clone();
+        };
+        let mut runs = Vec::with_capacity(graph.runs.len() + 2);
+        let mut applied = false;
+        for run in &graph.runs {
+            let InlineLineItem::Fragment(fragment) = &run.item else {
+                runs.push(run.clone());
+                continue;
+            };
+            if applied {
+                runs.push(run.clone());
+                continue;
+            }
+            let Some(range) = first_letter_byte_range(fragment.text()) else {
+                runs.push(run.clone());
+                continue;
+            };
+            applied = true;
+            for fragment in split_fragment_for_first_letter_in_graph(
+                fragment,
+                range,
+                first_letter_style,
+                block_style,
+                &mut self.font_system,
+            ) {
+                runs.push(measured_fragment_run(fragment, &mut self.font_system));
+            }
+        }
+        if !applied {
+            return graph.clone();
+        }
+        // `::first-letter` splits an already shaped source fragment. Its
+        // pseudo-element boundary is transparent to cursive shaping unless
+        // the used style introduces a real shaping boundary, so restore
+        // logical source shaping before deriving line-break opportunities.
+        // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
+        // <https://www.w3.org/TR/css-pseudo-4/#first-letter-pseudo>.
+        shape_logical_joining_graph_runs(&mut runs, &mut self.font_system);
+        let opportunities = inline_break_opportunities_for_runs(&runs, block_style);
+        InlineOpportunityGraph {
+            runs,
+            opportunities,
+        }
+    }
+}
+
+fn split_fragment_for_first_letter_in_graph(
+    fragment: &InlineFragment,
+    range: std::ops::Range<usize>,
+    first_letter_style: &ComputedStyle,
+    block_style: &ComputedStyle,
+    font_system: &mut FontSystem,
+) -> Vec<InlineFragment> {
+    let mut pieces = Vec::new();
+    if range.start > 0 {
+        let mut before = fragment.clone();
+        before.set_text(Rc::<str>::from(&fragment.text()[..range.start]));
+        pieces.push(before);
+    }
+    let mut letter = fragment.clone();
+    letter.set_text(Rc::<str>::from(&fragment.text()[range.clone()]));
+    let used_style =
+        used_first_letter_style_for_graph(first_letter_style, block_style, font_system);
+    if let Some((_size, sink)) = used_style.initial_letter.specified() {
+        letter.baseline_shift -= sink.saturating_sub(1) as f32 * block_style.line_height;
+    }
+    *letter.style_mut() = used_style;
+    letter.set_mergeable(false);
+    pieces.push(letter);
+    if range.end < fragment.text().len() {
+        let mut after = fragment.clone();
+        after.set_text(Rc::<str>::from(&fragment.text()[range.end..]));
+        pieces.push(after);
+    }
+    pieces
+}
+
+fn used_first_letter_style_for_graph(
+    first_letter_style: &ComputedStyle,
+    block_style: &ComputedStyle,
+    font_system: &mut FontSystem,
+) -> ComputedStyle {
+    let mut style = first_letter_style.clone();
+    let Some((size, _sink)) = style.initial_letter.specified() else {
+        return style;
+    };
+    let surrounding_cap_height = font_system.used_cap_height_for_style(block_style).points();
+    let initial_cap_height = font_system.used_cap_height_for_style(&style).points();
+    let cap_ratio = (initial_cap_height / style.font_size.max(0.01)).max(0.01);
+    let target_cap_height =
+        ((size - 1.0).max(0.0) * block_style.line_height) + surrounding_cap_height.max(0.0);
+    let used_font_size = (target_cap_height / cap_ratio).max(style.font_size);
+    style.font_size = used_font_size;
+    style.line_height = used_font_size;
+    style.line_height_multiplier = None;
+    style.line_height_is_normal = false;
+    style
+}
+
+fn measured_fragment_run(
+    fragment: InlineFragment,
+    font_system: &mut FontSystem,
+) -> InlineParagraphRun {
+    let shaped = font_system.shape_unwrapped_line(
+        fragment.text(),
+        fragment.style(),
+        fragment.style().line_height,
+    );
+    let width = shaped
+        .as_ref()
+        .map(ShapedInlineLine::advance_width)
+        .unwrap_or(0.0);
+    InlineParagraphRun {
+        item: InlineLineItem::Fragment(fragment),
+        width,
+        shaped: shaped.map(Rc::new),
     }
 }
 
@@ -483,11 +696,234 @@ where
             }
         }
     }
-    let opportunities = inline_break_opportunities_for_runs(&runs);
+    apply_auto_hyphenation_across_transparent_inline_edges(&mut runs, font_system);
+    shape_logical_joining_graph_runs(&mut runs, font_system);
+    let opportunities = inline_break_opportunities_for_runs(&runs, block_style);
     InlineOpportunityGraph {
         runs,
         opportunities,
     }
+}
+
+/// Apply dictionary hyphenation after joining source fragments that CSS Text
+/// treats as one word.
+///
+/// An ordinary inline element is transparent to word formation: `high<span>
+/// way</span>` must be offered to the language dictionary as `highway`, while
+/// its resulting soft hyphen remains owned by the source fragment before the
+/// selected break. Atomic boxes, used inline-axis decoration, bidi isolation,
+/// and differing hyphenation policies terminate the word.
+/// <https://www.w3.org/TR/css-text-3/#hyphenation>
+fn apply_auto_hyphenation_across_transparent_inline_edges(
+    runs: &mut [InlineParagraphRun],
+    font_system: &mut FontSystem,
+) {
+    let mut index = 0;
+    while index < runs.len() {
+        let InlineLineItem::Fragment(first) = &runs[index].item else {
+            index += 1;
+            continue;
+        };
+        if first.style().hyphens != Hyphens::Auto {
+            index += 1;
+            continue;
+        }
+        let mut fragment_indices = vec![index];
+        index += 1;
+        while let Some(run) = runs.get(index) {
+            match &run.item {
+                InlineLineItem::Fragment(next)
+                    if graph_fragments_share_auto_hyphenation_policy(
+                        match &runs[*fragment_indices.last().expect("first auto fragment")].item {
+                            InlineLineItem::Fragment(fragment) => fragment,
+                            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => {
+                                unreachable!("auto fragment index names a fragment")
+                            }
+                        },
+                        next,
+                    ) =>
+                {
+                    fragment_indices.push(index);
+                    index += 1;
+                }
+                InlineLineItem::Atom(atom) if graph_atom_is_transparent_to_shaping(atom) => {
+                    index += 1;
+                }
+                InlineLineItem::Fragment(_)
+                | InlineLineItem::Atom(_)
+                | InlineLineItem::Float(_) => break,
+            }
+        }
+        let InlineLineItem::Fragment(first) = &runs[fragment_indices[0]].item else {
+            unreachable!("first auto fragment index names a fragment");
+        };
+        let Some(language) = first.style().language.as_deref() else {
+            continue;
+        };
+        let Some(hyphenator) = hyphenator_for_language(language) else {
+            continue;
+        };
+        let mut source = String::new();
+        let mut source_ends = Vec::with_capacity(fragment_indices.len());
+        for &fragment_index in &fragment_indices {
+            let InlineLineItem::Fragment(fragment) = &runs[fragment_index].item else {
+                unreachable!("auto fragment index names a fragment");
+            };
+            source.push_str(fragment.text());
+            source_ends.push(source.len());
+        }
+        let hyphenated =
+            text_with_auto_hyphenation(&source, &hyphenator, first.style().hyphenate_limit_chars);
+        let mut output = vec![String::new(); fragment_indices.len()];
+        let mut source_offset = 0;
+        let mut fragment_offset = 0;
+        for character in hyphenated.chars() {
+            let source_character = source[source_offset..].chars().next();
+            if character == '\u{00ad}' && source_character != Some(character) {
+                output[fragment_offset].push(character);
+                continue;
+            }
+            while fragment_offset + 1 < source_ends.len()
+                && source_offset >= source_ends[fragment_offset]
+            {
+                fragment_offset += 1;
+            }
+            output[fragment_offset].push(character);
+            source_offset += character.len_utf8();
+        }
+        debug_assert_eq!(source_offset, source.len());
+        for (&fragment_index, text) in fragment_indices.iter().zip(output) {
+            let InlineLineItem::Fragment(fragment) = &mut runs[fragment_index].item else {
+                unreachable!("auto fragment index names a fragment");
+            };
+            let text = text_with_css_line_breaks(&text, fragment.style());
+            if fragment.text() != text {
+                fragment.set_text(text);
+                let shaped = font_system.shape_unwrapped_line(
+                    fragment.text(),
+                    fragment.style(),
+                    fragment.style().line_height,
+                );
+                runs[fragment_index].width = shaped
+                    .as_ref()
+                    .map(ShapedInlineLine::advance_width)
+                    .unwrap_or(0.0);
+                runs[fragment_index].shaped = shaped.map(Rc::new);
+            }
+        }
+    }
+}
+
+fn graph_fragments_share_auto_hyphenation_policy(
+    left: &InlineFragment,
+    right: &InlineFragment,
+) -> bool {
+    left.style().hyphens == Hyphens::Auto
+        && right.style().hyphens == Hyphens::Auto
+        && left.style().language == right.style().language
+        && left.style().hyphenate_limit_chars == right.style().hyphenate_limit_chars
+}
+
+/// Shape joining-script source runs across transparent inline element edges.
+///
+/// CSS Text establishes shaping before it selects a line break. Keeping the
+/// source-shaped slices on graph runs means a later selected soft-hyphen edge
+/// cannot turn an Arabic medial glyph into a final glyph merely because an
+/// otherwise transparent `span` owns the soft hyphen:
+/// <https://www.w3.org/TR/css-text-3/#boundary-shaping>.
+fn shape_logical_joining_graph_runs(runs: &mut [InlineParagraphRun], font_system: &mut FontSystem) {
+    let mut index = 0;
+    while index < runs.len() {
+        let InlineLineItem::Fragment(_) = &runs[index].item else {
+            index += 1;
+            continue;
+        };
+        let mut fragment_indices = vec![index];
+        index += 1;
+        while let Some(run) = runs.get(index) {
+            match &run.item {
+                InlineLineItem::Fragment(right) => {
+                    let InlineLineItem::Fragment(left) =
+                        &runs[*fragment_indices.last().expect("first graph fragment")].item
+                    else {
+                        unreachable!("graph fragment indices name fragments");
+                    };
+                    if !can_shape_inline_fragments_together(left, right) {
+                        break;
+                    }
+                    fragment_indices.push(index);
+                    index += 1;
+                }
+                InlineLineItem::Atom(atom) if graph_atom_is_transparent_to_shaping(atom) => {
+                    index += 1;
+                }
+                InlineLineItem::Atom(_) | InlineLineItem::Float(_) => break,
+            }
+        }
+        if fragment_indices.len() < 2
+            || !fragment_indices.iter().any(|&fragment_index| {
+                matches!(&runs[fragment_index].item, InlineLineItem::Fragment(fragment)
+                    if fragment.text().chars().any(character_has_joining_behavior))
+            })
+        {
+            continue;
+        }
+        let mut spans = Vec::with_capacity(fragment_indices.len());
+        let mut text = String::new();
+        let mut ranges = Vec::with_capacity(fragment_indices.len());
+        let mut line_height = None;
+        let InlineLineItem::Fragment(first) = &runs[fragment_indices[0]].item else {
+            unreachable!("graph shaping group has a first fragment");
+        };
+        let source_style = first.style();
+        let one_text_style = fragment_indices.iter().all(|&fragment_index| {
+            let InlineLineItem::Fragment(fragment) = &runs[fragment_index].item else {
+                return false;
+            };
+            styles_have_equivalent_text_shaping_inputs(source_style, fragment.style())
+        });
+        for &fragment_index in &fragment_indices {
+            let InlineLineItem::Fragment(fragment) = &runs[fragment_index].item else {
+                unreachable!("graph fragment indices name fragments");
+            };
+            line_height.get_or_insert(fragment.style().line_height);
+            let start = text.len();
+            text.push_str(fragment.text());
+            ranges.push(start..text.len());
+            spans.push(StyledTextSpan {
+                text: fragment.text(),
+                style: if one_text_style {
+                    source_style
+                } else {
+                    fragment.style()
+                },
+            });
+        }
+        let Some(shaped) = font_system.shape_styled_inline_fragments(
+            &spans,
+            text,
+            0.0,
+            line_height.expect("graph shaping group has a fragment"),
+            0.0,
+        ) else {
+            continue;
+        };
+        for (&fragment_index, range) in fragment_indices.iter().zip(ranges) {
+            let Some(slice) = shaped.source_slice(range) else {
+                continue;
+            };
+            runs[fragment_index].width = slice.advance_width();
+            runs[fragment_index].shaped = Some(Rc::new(slice));
+        }
+    }
+}
+
+fn graph_atom_is_transparent_to_shaping(atom: &InlineAtom) -> bool {
+    matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge))
+        if edge.advance == 0.0
+            && edge.paint_extent == 0.0
+            && !inline_box_edge_breaks_shaping(atom.style())
+            && !inline_box_bidi_isolation_breaks_shaping(atom.style()))
 }
 
 pub(in crate::layout) fn push_text_graph_runs(
@@ -499,7 +935,11 @@ pub(in crate::layout) fn push_text_graph_runs(
     if text.is_empty() {
         return;
     }
-    let break_text = text_with_hyphenation_controls(text, &word.style);
+    let break_text = if word.style.hyphens == Hyphens::Auto {
+        Cow::Borrowed(text)
+    } else {
+        text_with_hyphenation_controls(text, &word.style)
+    };
     let text = break_text.as_ref();
     if text.is_empty() {
         return;
@@ -520,21 +960,17 @@ pub(in crate::layout) fn push_text_graph_run_segment(
     }
     let fragment = InlineFragment::new_shared_style(
         text,
-        word.style.clone(),
+        Rc::clone(&word.style),
         word.baseline_shift,
         word.link_target.clone(),
         word.mergeable,
         word.source,
         false,
         hanging_edges,
-        word.ancestor_inline_decorations.clone(),
+        Rc::clone(&word.ancestor_inline_decorations),
     )
     .with_visual_offset(word.visual_offset);
-    let shaped = font_system.shape_unwrapped_line(
-        fragment.text(),
-        fragment.style(),
-        fragment.style().line_height,
-    );
+    let shaped = font_system.shape_unwrapped_line(text, &word.style, word.style.line_height);
     let width = shaped
         .as_ref()
         .map(ShapedInlineLine::advance_width)
@@ -615,31 +1051,118 @@ impl InlineOpportunityGraph {
         font_system: &mut FontSystem,
         _block_style: &ComputedStyle,
     ) -> MaterializedInlineGraphLine {
+        self.materialize_line_with_terminal_pre_wrap_hang(
+            range,
+            selected_break,
+            false,
+            font_system,
+            _block_style,
+        )
+    }
+
+    /// Materialize a selected line whose paragraph began at a preserved forced
+    /// break. HTML textarea raw text exposes that terminal editing-value case:
+    /// its final preserved document-space suffix is outside the right-aligned
+    /// editing line measure even though an ordinary terminal `pre-wrap` line
+    /// retains its advance. CSS Text's general terminal rule remains in the
+    /// public materializer used by intrinsic sizing and non-control layout.
+    /// <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+    pub(in crate::layout) fn materialize_line_with_terminal_pre_wrap_hang(
+        &self,
+        range: InlineGraphRange,
+        selected_break: Option<InlineBreakOpportunity>,
+        terminal_pre_wrap_hang: bool,
+        font_system: &mut FontSystem,
+        _block_style: &ComputedStyle,
+    ) -> MaterializedInlineGraphLine {
         let mut items = self.line_measured_items_for_graph_range(range, font_system);
-        let trimmed_width = trim_trailing_collapsible_measured_items(&mut items);
-        let consumed_pre_wrap_width = if selected_break
-            .is_some_and(|opportunity| opportunity.hangs || opportunity_is_soft_wrap(opportunity))
-        {
-            trim_trailing_pre_wrap_hanging_measured_items(&mut items)
-        } else {
-            0.0
-        };
+        // Do not mutate the selected source sequence for CSS Text Phase II.
+        // In particular, a collapsed separator before `br` remains available
+        // to bidi, extraction, and decoration ownership even though it has no
+        // used advance at the selected line edge.
+        let trimmed_width = trailing_collapsible_measured_width(&items);
         normalize_materialized_control_characters(
             &mut items,
             selected_break.is_some_and(|opportunity| opportunity.soft_hyphen),
             font_system,
         );
+        if self.source_character_before(range.start) == Some('\u{00ad}')
+            && materialized_items_have_joining_behavior(&items)
+        {
+            // A selected soft-hyphen break divides one shaping run into two
+            // independently painted line fragments. Preserve joining context
+            // at the new line edge; the matching trailing ZWJ is inserted
+            // with the used hyphenate character above. This is observable for
+            // Arabic-family scripts even when the used marker is not joining.
+            // <https://drafts.csswg.org/css-text-4/#hyphenate-character>
+            prepend_materialized_line_joiner(&mut items, font_system);
+        }
         let widths = inline_content_width_for_line_items(&items, font_system, |item| item.width);
-        let hanging_space_width = consumed_pre_wrap_width + widths.trailing_space_width;
-        let text = text_for_measured_items(&items);
+        // A `pre-wrap` run hangs at a selected soft boundary.  It also hangs
+        // before an unconditionally hanging other-space separator, even when
+        // the line itself ends at a forced break: that separator means the
+        // preserved run is not immediately followed by the forced break.
+        // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+        let hanging_pre_wrap_width = if selected_break
+            .is_some_and(|opportunity| opportunity.hangs || opportunity_is_soft_wrap(opportunity))
+            || terminal_pre_wrap_hang
+            || widths.trailing_space_width > 0.0
+        {
+            trailing_pre_wrap_hanging_width_with_unconditional_separators(&items, font_system)
+        } else {
+            0.0
+        };
+        let tab_advance_adjustment =
+            selected_line_tab_advance_adjustment(&items, font_system, |item| item.width);
+        let edge_effects = InlineLineEdgeEffects {
+            collapsed_end_trim_width: trimmed_width,
+            pre_wrap_hanging_width: hanging_pre_wrap_width,
+            hanging_space_separator_width: widths.trailing_space_width,
+            trailing_tracking_width: widths.trailing_tracking_width,
+            source_effects: selected_line_edge_source_effects(
+                &items,
+                trimmed_width > 0.0,
+                hanging_pre_wrap_width > 0.0,
+                widths.trailing_space_width > 0.0,
+            ),
+        };
+        // The materialized line retains the selected source text. Edge
+        // effects change its used advance; paint materialization applies the
+        // corresponding source-range suppression only when emitting the
+        // formatted fragment. Keeping this summary source-faithful preserves
+        // bidi, extraction, and decoration ownership.
+        let mut text = text_for_measured_items(&items);
+        if trimmed_width > 0.0 {
+            text.truncate(text.trim_end_matches(is_css_collapsible_whitespace).len());
+        }
+        let fitting_width = (widths.fitting_width + tab_advance_adjustment
+            - edge_effects.collapsed_end_trim_width
+            - edge_effects.pre_wrap_hanging_width)
+            .max(0.0);
         MaterializedInlineGraphLine {
             items,
             text,
-            content_width: widths.content_width,
-            trimmed_width,
-            hanging_space_width,
-            trailing_tracking_width: widths.trailing_tracking_width,
+            fitting_width,
+            content_width: fitting_width,
+            edge_effects,
         }
+    }
+
+    fn source_character_before(&self, position: InlineGraphPosition) -> Option<char> {
+        if position.byte_offset > 0 {
+            return self
+                .runs
+                .get(position.run_index)
+                .and_then(|run| match &run.item {
+                    InlineLineItem::Fragment(fragment) => fragment
+                        .text()
+                        .get(..position.byte_offset)
+                        .and_then(|text| text.chars().next_back()),
+                    InlineLineItem::Atom(_) | InlineLineItem::Float(_) => None,
+                });
+        }
+        previous_text_fragment_before(&self.runs, position.run_index)
+            .and_then(|fragment| fragment.text().chars().next_back())
     }
 
     pub(in crate::layout) fn break_opportunities_after(
@@ -648,7 +1171,7 @@ impl InlineOpportunityGraph {
     ) -> impl Iterator<Item = InlineBreakOpportunity> + '_ {
         self.opportunities
             .iter()
-            .copied()
+            .cloned()
             .filter(move |opportunity| opportunity.position > start)
     }
 
@@ -677,21 +1200,18 @@ impl InlineOpportunityGraph {
         if range.start.byte_offset != 0 || range.end.byte_offset != 0 {
             return None;
         }
-        let mut run_range = self.run_indices_for_graph_range(range)?;
-        while run_range.end > run_range.start
-            && inline_line_item_is_collapsible_space(&self.runs[run_range.end - 1].item)
-        {
-            run_range.end -= 1;
-        }
-        if selected_break
+        let run_range = self.run_indices_for_graph_range(range)?;
+        let ends_line = selected_break
             .is_some_and(|opportunity| opportunity.hangs || opportunity_is_soft_wrap(opportunity))
-        {
-            while run_range.end > run_range.start
-                && inline_line_item_is_pre_wrap_hanging_space(&self.runs[run_range.end - 1].item)
-            {
-                run_range.end -= 1;
-            }
-        }
+            || (selected_break.is_none() && range.end == self.end_position());
+        let hanging_pre_wrap_width = if ends_line {
+            trailing_pre_wrap_hanging_width_with_unconditional_separators(
+                &self.runs[run_range.clone()],
+                font_system,
+            )
+        } else {
+            0.0
+        };
         let runs = &self.runs[run_range.clone()];
         if runs.iter().any(|run| match &run.item {
             InlineLineItem::Fragment(fragment) => fragment_text_needs_materialized_normalization(
@@ -703,9 +1223,18 @@ impl InlineOpportunityGraph {
             return None;
         }
         let widths = inline_content_width_for_line_items(runs, font_system, |run| run.width);
+        let tab_advance_adjustment =
+            selected_line_tab_advance_adjustment(runs, font_system, |run| run.width);
         Some(BorrowedInlineLineMeasurement {
             run_range,
-            content_width: widths.content_width,
+            fitting_width: (widths.fitting_width + tab_advance_adjustment
+                - trailing_collapsible_run_width(runs)
+                - hanging_pre_wrap_width)
+                .max(0.0),
+            content_width: (widths.content_width + tab_advance_adjustment
+                - trailing_collapsible_run_width(runs)
+                - hanging_pre_wrap_width)
+                .max(0.0),
         })
     }
 
@@ -742,17 +1271,26 @@ impl InlineOpportunityGraph {
                         shaped: run.shaped.clone(),
                     });
                 }
+                let source_text = fragment.text().to_owned();
                 let mut fragment = fragment.clone();
                 let mut hanging_edges = fragment.hanging_edges();
-                fragment.set_text(fragment.text()[start..end].to_string());
+                let segment_text = Rc::<str>::from(&source_text[start..end]);
+                fragment.set_text(segment_text);
                 hanging_edges.blocks_start = hanging_edges.blocks_start && start == 0;
                 hanging_edges.blocks_end = hanging_edges.blocks_end && end == text_len;
                 fragment = fragment.with_hanging_edges(hanging_edges);
-                let shaped = font_system.shape_unwrapped_line(
-                    fragment.text(),
-                    fragment.style(),
-                    fragment.style().line_height,
-                );
+                let selected_shaped = run
+                    .shaped
+                    .as_deref()
+                    .and_then(|shaped| shaped.source_slice(start..end));
+                fragment.set_preserves_source_shaping(selected_shaped.is_some());
+                let shaped = selected_shaped.or_else(|| {
+                    font_system.shape_unwrapped_line(
+                        fragment.text(),
+                        fragment.style(),
+                        fragment.style().line_height,
+                    )
+                });
                 let width = shaped
                     .as_ref()
                     .map(ShapedInlineLine::advance_width)
@@ -785,6 +1323,8 @@ impl InlineOpportunityGraph {
             return InlineIntrinsicContribution::default();
         }
         let widths = inline_content_width_for_line_items(&self.runs, font_system, |run| run.width);
+        let tab_advance_adjustment =
+            selected_line_tab_advance_adjustment(&self.runs, font_system, |run| run.width);
         let hanging_widths = hanging_punctuation_widths_for_line_items(
             font_system,
             &self.runs,
@@ -793,15 +1333,16 @@ impl InlineOpportunityGraph {
             true,
             false,
         );
-        let max_content =
-            (widths.content_width - hanging_widths.start - hanging_widths.end).max(0.0);
-
+        let max_content = (widths.content_width + tab_advance_adjustment
+            - hanging_widths.start
+            - hanging_widths.end)
+            .max(0.0);
         let mut min_content = 0.0_f32;
         let mut segment_start = self.start_position();
         for opportunity in self
             .opportunities
             .iter()
-            .copied()
+            .cloned()
             .filter(|opportunity| opportunity.min_content)
         {
             if opportunity.position <= segment_start || opportunity.position >= self.end_position()
@@ -812,8 +1353,12 @@ impl InlineOpportunityGraph {
                 start: segment_start,
                 end: opportunity.position,
             };
-            min_content =
-                min_content.max(self.intrinsic_segment_width(range, font_system, block_style));
+            min_content = min_content.max(self.intrinsic_segment_width(
+                range,
+                Some(opportunity),
+                font_system,
+                block_style,
+            ));
             segment_start = opportunity.position;
         }
         min_content = min_content.max(self.intrinsic_segment_width(
@@ -821,6 +1366,7 @@ impl InlineOpportunityGraph {
                 start: segment_start,
                 end: self.end_position(),
             },
+            None,
             font_system,
             block_style,
         ));
@@ -833,15 +1379,16 @@ impl InlineOpportunityGraph {
     pub(in crate::layout) fn intrinsic_segment_width(
         &self,
         range: InlineGraphRange,
+        selected_break: Option<InlineBreakOpportunity>,
         font_system: &mut FontSystem,
         block_style: &ComputedStyle,
     ) -> f32 {
         if let Some(measurement) =
-            self.borrowed_line_measurement_for_full_run_range(range, None, font_system)
+            self.borrowed_line_measurement_for_full_run_range(range, selected_break, font_system)
         {
             return measurement.content_width;
         }
-        let materialized = self.materialize_line(range, None, font_system, block_style);
+        let materialized = self.materialize_line(range, selected_break, font_system, block_style);
         if materialized.items.is_empty() {
             return 0.0;
         }
@@ -849,39 +1396,361 @@ impl InlineOpportunityGraph {
     }
 }
 
+/// Reconcile tabs after graph materialization has rejoined adjacent text runs.
+///
+/// The opportunity graph intentionally splits text at legal boundaries, but a
+/// preserved tab's advance depends on all preceding text in its selected line.
+/// Re-shaping one all-text materialized line keeps its fitting and alignment
+/// measure consistent with the boundary-shaped paint group. Atomic inline
+/// participants contribute to the running logical inline cursor even though
+/// they split a shaping group, so a following tab resolves from the same block
+/// content edge as it does during paint:
+/// <https://drafts.csswg.org/css-text-3/#white-space-phase-2>.
+fn selected_line_tab_advance_adjustment<T>(
+    items: &[T],
+    font_system: &mut FontSystem,
+    item_width: impl Fn(&T) -> f32,
+) -> f32
+where
+    T: AsRef<InlineLineItem>,
+{
+    let mut cursor = 0.0;
+    let mut adjustment = 0.0;
+    let mut index = 0;
+    while index < items.len() {
+        let InlineLineItem::Fragment(first_fragment) = items[index].as_ref() else {
+            cursor += item_width(&items[index]);
+            index += 1;
+            continue;
+        };
+
+        let start = index;
+        let mut spans = Vec::new();
+        let mut text = String::new();
+        let mut unadjusted_width = 0.0;
+        let mut has_tab = false;
+        while let Some(item) = items.get(index) {
+            let InlineLineItem::Fragment(fragment) = item.as_ref() else {
+                break;
+            };
+            has_tab |= fragment.text().contains('\t');
+            spans.push(StyledTextSpan {
+                text: fragment.text(),
+                style: fragment.style(),
+            });
+            text.push_str(fragment.text());
+            unadjusted_width += item_width(item);
+            index += 1;
+        }
+        debug_assert!(index > start);
+        let used_width = if has_tab {
+            font_system
+                .shape_styled_inline_fragments(
+                    &spans,
+                    text,
+                    0.0,
+                    first_fragment.style().line_height,
+                    cursor,
+                )
+                .map(|shaped| shaped.advance_width())
+                .unwrap_or(unadjusted_width)
+        } else {
+            unadjusted_width
+        };
+        adjustment += used_width - unadjusted_width;
+        cursor += used_width;
+    }
+    adjustment
+}
+
 pub(in crate::layout) fn opportunity_is_soft_wrap(opportunity: InlineBreakOpportunity) -> bool {
     !matches!(opportunity.kind, InlineBreakKind::Forced)
 }
 
-pub(in crate::layout) fn trim_trailing_collapsible_measured_items(
-    items: &mut Vec<MeasuredInlineItem>,
-) -> f32 {
+/// Return the selected Phase II trim advance without deleting source items.
+///
+/// Regular inline box edges are transparent to CSS Text line-edge processing,
+/// but remain in the item sequence for their painting ownership.
+/// <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+pub(in crate::layout) fn trailing_collapsible_measured_width(items: &[MeasuredInlineItem]) -> f32 {
     let mut trimmed_width = 0.0;
-    while let Some(MeasuredInlineItem {
-        item: InlineLineItem::Fragment(fragment),
-        width,
-        ..
-    }) = items.last()
-        && fragment.style().white_space.collapses_spaces()
-        && fragment.text().chars().all(is_css_collapsible_whitespace)
-    {
-        trimmed_width += *width;
-        items.pop();
+    for item in items.iter().rev() {
+        match &item.item {
+            // Inline box edges decorate the same inline stream but do not
+            // give an otherwise-empty tail textual content. Phase II trims
+            // collapsed spaces through nested inline boxes, retaining their
+            // borders/padding while removing the space advances on either
+            // side of those edges.
+            // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+            InlineLineItem::Atom(atom)
+                if matches!(
+                    atom.content(),
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
+                ) => {}
+            InlineLineItem::Fragment(fragment)
+                if fragment.style().white_space.collapses_spaces()
+                    && fragment.text().chars().all(is_css_collapsible_whitespace) =>
+            {
+                trimmed_width += item.width;
+            }
+            _ => break,
+        }
     }
     trimmed_width
 }
 
-pub(in crate::layout) fn trim_trailing_pre_wrap_hanging_measured_items(
-    items: &mut Vec<MeasuredInlineItem>,
-) -> f32 {
+pub(in crate::layout) fn trailing_collapsible_run_width(runs: &[InlineParagraphRun]) -> f32 {
     let mut trimmed_width = 0.0;
-    while let Some(MeasuredInlineItem { item, width, .. }) = items.last()
-        && inline_line_item_is_pre_wrap_hanging_space(item)
-    {
-        trimmed_width += *width;
-        items.pop();
+    for run in runs.iter().rev() {
+        match &run.item {
+            InlineLineItem::Atom(atom)
+                if matches!(
+                    atom.content(),
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
+                ) => {}
+            InlineLineItem::Fragment(fragment)
+                if fragment.style().white_space.collapses_spaces()
+                    && fragment.text().chars().all(is_css_collapsible_whitespace) =>
+            {
+                trimmed_width += run.width;
+            }
+            _ => break,
+        }
     }
     trimmed_width
+}
+
+/// Return conditional `pre-wrap` hanging advance at a selected line edge,
+/// including a preserved-space run immediately before a trailing sequence of
+/// unconditionally hanging Unicode space separators.
+///
+/// Phase II first identifies the complete visual line-end whitespace sequence:
+/// a `pre-wrap` run before U+3000 (or another other-space separator) is still
+/// at line end and therefore hangs with it.
+/// <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+pub(in crate::layout) fn trailing_pre_wrap_hanging_width_with_unconditional_separators<T>(
+    items: &[T],
+    font_system: &mut FontSystem,
+) -> f32
+where
+    T: AsRef<InlineLineItem>,
+{
+    let mut width = 0.0;
+    for item in items.iter().rev() {
+        let InlineLineItem::Fragment(fragment) = item.as_ref() else {
+            if matches!(
+                item.as_ref(),
+                InlineLineItem::Atom(atom)
+                    if matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_)))
+            ) {
+                continue;
+            }
+            break;
+        };
+        for character in fragment.text().chars().rev() {
+            // Collapsed terminal document whitespace is removed before the
+            // unconditional other-space-separator rule. Continue through it
+            // so a preceding U+3000 (or another other separator) is still
+            // recognized as the visual line edge.
+            // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+            if fragment.style().white_space.collapses_spaces()
+                && is_css_collapsible_whitespace(character)
+            {
+                continue;
+            }
+            if fragment.style().white_space == WhiteSpace::PreWrap
+                && is_css_preserved_document_space(character)
+            {
+                width += font_system.measure_text(&character.to_string(), fragment.style());
+                continue;
+            }
+            if character_is_css_other_space_separator(character)
+                && fragment
+                    .style()
+                    .white_space
+                    .hangs_trailing_space_separators()
+            {
+                continue;
+            }
+            return width;
+        }
+    }
+    width
+}
+
+/// Collect the selected source ranges that own Phase II end-edge behavior.
+///
+/// The width helpers intentionally remain geometry-only, but painting cannot
+/// infer source ownership from a scalar advance when spaces cross inline
+/// boxes. Record the selected fragment ranges in the same reverse visual-edge
+/// traversal used by CSS Text's Phase II whitespace rules.
+/// <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+fn selected_line_edge_source_effects(
+    items: &[MeasuredInlineItem],
+    has_collapsed_trim: bool,
+    has_pre_wrap_hang: bool,
+    has_unconditional_separator_hang: bool,
+) -> Rc<[InlineLineEdgeEffect]> {
+    let mut effects = Vec::new();
+
+    if has_collapsed_trim {
+        for (item_index, item) in items.iter().enumerate().rev() {
+            match &item.item {
+                InlineLineItem::Atom(atom)
+                    if matches!(
+                        atom.content(),
+                        InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
+                    ) => {}
+                InlineLineItem::Fragment(fragment)
+                    if fragment.style().white_space.collapses_spaces()
+                        && fragment.text().chars().all(is_css_collapsible_whitespace) =>
+                {
+                    effects.push(InlineLineEdgeEffect {
+                        kind: InlineLineEdgeEffectKind::CollapsedEndTrim,
+                        item_index,
+                        source_range: 0..fragment.text().len(),
+                    });
+                }
+                _ => break,
+            }
+        }
+    }
+
+    if has_pre_wrap_hang {
+        for (item_index, item) in items.iter().enumerate().rev() {
+            let InlineLineItem::Fragment(fragment) = &item.item else {
+                if matches!(
+                    &item.item,
+                    InlineLineItem::Atom(atom)
+                        if matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_)))
+                ) {
+                    continue;
+                }
+                break;
+            };
+            let mut start = fragment.text().len();
+            let mut saw_pre_wrap_space = false;
+            for (offset, character) in fragment.text().char_indices().rev() {
+                if fragment.style().white_space.collapses_spaces()
+                    && is_css_collapsible_whitespace(character)
+                {
+                    continue;
+                }
+                if fragment.style().white_space == WhiteSpace::PreWrap
+                    && is_css_preserved_document_space(character)
+                {
+                    start = offset;
+                    saw_pre_wrap_space = true;
+                    continue;
+                }
+                if character_is_css_other_space_separator(character)
+                    && fragment
+                        .style()
+                        .white_space
+                        .hangs_trailing_space_separators()
+                {
+                    continue;
+                }
+                break;
+            }
+            if saw_pre_wrap_space {
+                effects.push(InlineLineEdgeEffect {
+                    kind: InlineLineEdgeEffectKind::PreWrapHang,
+                    item_index,
+                    source_range: start..fragment.text().len(),
+                });
+                continue;
+            }
+            if fragment
+                .text()
+                .chars()
+                .all(character_is_css_other_space_separator)
+                && fragment
+                    .style()
+                    .white_space
+                    .hangs_trailing_space_separators()
+            {
+                continue;
+            }
+            break;
+        }
+    }
+
+    if has_unconditional_separator_hang {
+        let mut follows_hanging_separator = false;
+        for (item_index, item) in items.iter().enumerate().rev() {
+            let InlineLineItem::Fragment(fragment) = &item.item else {
+                if matches!(
+                    &item.item,
+                    InlineLineItem::Atom(atom)
+                        if matches!(atom.content(), InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_)))
+                ) {
+                    continue;
+                }
+                break;
+            };
+            let mut start = fragment.text().len();
+            let mut saw_separator = false;
+            for (offset, character) in fragment.text().char_indices().rev() {
+                if fragment.style().white_space.collapses_spaces()
+                    && is_css_collapsible_whitespace(character)
+                    && !follows_hanging_separator
+                {
+                    continue;
+                }
+                if character_is_css_other_space_separator(character)
+                    && fragment
+                        .style()
+                        .white_space
+                        .hangs_trailing_space_separators()
+                {
+                    start = offset;
+                    saw_separator = true;
+                    follows_hanging_separator = true;
+                    continue;
+                }
+                if fragment.style().white_space != WhiteSpace::PreWrap
+                    && fragment
+                        .style()
+                        .white_space
+                        .hangs_trailing_space_separators()
+                    && follows_hanging_separator
+                    && is_css_preserved_document_space(character)
+                {
+                    start = offset;
+                    continue;
+                }
+                break;
+            }
+            if saw_separator {
+                effects.push(InlineLineEdgeEffect {
+                    kind: InlineLineEdgeEffectKind::UnconditionalSeparatorHang,
+                    item_index,
+                    source_range: start..fragment.text().len(),
+                });
+                continue;
+            }
+            if fragment.style().white_space != WhiteSpace::PreWrap
+                && fragment
+                    .style()
+                    .white_space
+                    .hangs_trailing_space_separators()
+                && follows_hanging_separator
+                && fragment.text().chars().all(is_css_preserved_document_space)
+            {
+                effects.push(InlineLineEdgeEffect {
+                    kind: InlineLineEdgeEffectKind::UnconditionalSeparatorHang,
+                    item_index,
+                    source_range: 0..fragment.text().len(),
+                });
+                continue;
+            }
+            break;
+        }
+    }
+
+    effects.sort_by_key(|effect| effect.item_index);
+    Rc::from(effects.into_boxed_slice())
 }
 
 pub(in crate::layout) fn normalize_materialized_control_characters(
@@ -889,6 +1758,8 @@ pub(in crate::layout) fn normalize_materialized_control_characters(
     visible_trailing_soft_hyphen: bool,
     font_system: &mut FontSystem,
 ) {
+    let preserve_soft_hyphen_joining =
+        visible_trailing_soft_hyphen && materialized_items_have_joining_behavior(items);
     let trailing_soft_hyphen_index = visible_trailing_soft_hyphen
         .then(|| {
             items.iter().rposition(|item| {
@@ -903,6 +1774,8 @@ pub(in crate::layout) fn normalize_materialized_control_characters(
             && let Some(text) = normalize_materialized_fragment_text(
                 fragment.text(),
                 Some(index) == trailing_soft_hyphen_index,
+                preserve_soft_hyphen_joining,
+                fragment.style().hyphenate_character.used_text(),
             )
         {
             fragment.set_text(text);
@@ -917,6 +1790,39 @@ pub(in crate::layout) fn normalize_materialized_control_characters(
             index += 1;
         }
     }
+}
+
+fn materialized_items_have_joining_behavior(items: &[MeasuredInlineItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(&item.item, InlineLineItem::Fragment(fragment)
+            if fragment.text().chars().any(character_has_joining_behavior))
+    })
+}
+
+/// Add the leading half of a selected soft-hyphen shaping boundary.
+///
+/// The source soft hyphen is removed during CSS Text's line-edge processing,
+/// so the following physical line otherwise begins without the joining context
+/// that the source word had. The control has no advance and is not added at
+/// arbitrary visual-order boundaries.
+fn prepend_materialized_line_joiner(
+    items: &mut [MeasuredInlineItem],
+    font_system: &mut FontSystem,
+) {
+    let Some(item) = items.iter_mut().find(|item| {
+        matches!(&item.item, InlineLineItem::Fragment(fragment) if !fragment.text().is_empty())
+    }) else {
+        return;
+    };
+    let InlineLineItem::Fragment(fragment) = &mut item.item else {
+        return;
+    };
+    let mut text = String::with_capacity(fragment.text().len() + '\u{200d}'.len_utf8());
+    text.push('\u{200d}');
+    text.push_str(fragment.text());
+    fragment.set_text(text);
+    fragment.set_preserves_source_shaping(false);
+    remeasure_materialized_item(item, font_system);
 }
 
 pub(in crate::layout) fn fragment_text_needs_materialized_normalization(
@@ -942,14 +1848,14 @@ mod tests {
         let shared_style = inline_style(&style);
         let word = InlineWord {
             text: "Hello".to_string(),
-            style: shared_style.clone(),
+            style: Rc::clone(&shared_style),
             baseline_shift: 0.0,
             visual_offset: InlineVisualOffset::zero(),
             link_target: None,
             mergeable: true,
             source: InlineTextSource::Normal,
             hanging_edges: InlineHangingEdges::default(),
-            ancestor_inline_decorations: Vec::new(),
+            ancestor_inline_decorations: Vec::new().into(),
         };
         let mut font_system = FontSystem::new();
         let mut runs = Vec::new();
@@ -966,5 +1872,99 @@ mod tests {
             panic!("expected graph run fragment");
         };
         assert!(Rc::ptr_eq(&shared_style, &fragment.data.style));
+    }
+
+    #[test]
+    fn unconditional_hanging_separator_does_not_constrain_fitting() {
+        let style = ComputedStyle::initial();
+        let fragment = InlineFragment::new(
+            "A\u{3000}",
+            style.clone(),
+            0.0,
+            None,
+            true,
+            InlineTextSource::Normal,
+            false,
+            InlineHangingEdges::default(),
+            Vec::new(),
+        );
+        let mut font_system = FontSystem::new();
+        let separator_width = font_system.measure_text("\u{3000}", &style);
+        let widths = inline_content_width_for_line_items(
+            &[MeasuredInlineItem {
+                item: InlineLineItem::Fragment(fragment),
+                width: 40.0 + separator_width,
+                shaped: None,
+            }],
+            &mut font_system,
+            |item| item.width,
+        );
+
+        assert_eq!(widths.trailing_space_width, separator_width);
+        assert_eq!(widths.fitting_width, 40.0);
+        assert_eq!(widths.content_width, 40.0);
+    }
+
+    #[test]
+    fn collapsed_terminal_space_exposes_hanging_separator_for_fitting() {
+        let style = ComputedStyle::initial();
+        let fragment = InlineFragment::new(
+            "A\u{3000} ",
+            style.clone(),
+            0.0,
+            None,
+            true,
+            InlineTextSource::Normal,
+            false,
+            InlineHangingEdges::default(),
+            Vec::new(),
+        );
+        let mut font_system = FontSystem::new();
+        let separator_width = font_system.measure_text("\u{3000}", &style);
+        let document_space_width = font_system.measure_text(" ", &style);
+        let widths = inline_content_width_for_line_items(
+            &[MeasuredInlineItem {
+                item: InlineLineItem::Fragment(fragment),
+                width: 40.0 + separator_width + document_space_width,
+                shaped: None,
+            }],
+            &mut font_system,
+            |item| item.width,
+        );
+
+        assert_eq!(widths.trailing_space_width, separator_width);
+        assert_eq!(widths.fitting_width, 40.0 + document_space_width,);
+    }
+
+    #[test]
+    fn pre_hanging_sequence_includes_interleaved_document_spaces() {
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::Pre;
+        let text = "A\u{3000} \u{2000}";
+        let fragment = InlineFragment::new(
+            text,
+            style.clone(),
+            0.0,
+            None,
+            true,
+            InlineTextSource::Normal,
+            false,
+            InlineHangingEdges::default(),
+            Vec::new(),
+        );
+        let mut font_system = FontSystem::new();
+        let hanging_width = font_system.measure_text("\u{3000} \u{2000}", &style);
+        let widths = inline_content_width_for_line_items(
+            &[MeasuredInlineItem {
+                item: InlineLineItem::Fragment(fragment),
+                width: 40.0 + hanging_width,
+                shaped: None,
+            }],
+            &mut font_system,
+            |item| item.width,
+        );
+
+        assert_eq!(widths.trailing_space_width, hanging_width);
+        assert_eq!(widths.fitting_width, 40.0);
     }
 }

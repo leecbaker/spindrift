@@ -12,24 +12,24 @@ pub(in crate::layout::flex) fn synthesis_writing_mode(
         return container_style.writing_mode;
     }
     match (child_style.writing_mode, child_style.direction) {
-        (WritingMode::VerticalRl | WritingMode::VerticalLr, _) => WritingMode::HorizontalTb,
+        (
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr,
+            _,
+        ) => WritingMode::HorizontalTb,
         (WritingMode::HorizontalTb, Direction::Ltr) => WritingMode::VerticalLr,
         (WritingMode::HorizontalTb, Direction::Rtl) => WritingMode::VerticalRl,
     }
 }
 
 pub(in crate::layout::flex) fn line_under_side(writing_mode: WritingMode) -> PhysicalSide {
-    match writing_mode {
-        WritingMode::HorizontalTb => PhysicalSide::Bottom,
-        WritingMode::VerticalRl | WritingMode::VerticalLr => PhysicalSide::Left,
-    }
+    css::line_under_side(writing_mode)
 }
 
 pub(in crate::layout::flex) fn line_over_side(writing_mode: WritingMode) -> PhysicalSide {
-    match writing_mode {
-        WritingMode::HorizontalTb => PhysicalSide::Top,
-        WritingMode::VerticalRl | WritingMode::VerticalLr => PhysicalSide::Right,
-    }
+    css::line_over_side(writing_mode)
 }
 
 /// Return a flex item's absolute baseline coordinate in the flex line cross
@@ -70,45 +70,45 @@ pub(in crate::layout::flex) fn measured_item_cross_axis_baseline(
         )
 }
 
-/// Return a horizontal flex container's first exported baseline offset.
+/// Return a row flex container's first exported main-axis baseline offset.
 ///
-/// CSS Flexbox says a flex container's first main-axis baseline is generated
-/// from the first flex item's first baseline set when that item has a baseline
-/// parallel to the main axis; otherwise it is synthesized from the content box:
+/// CSS Flexbox first uses the shared first baseline of baseline-aligned items
+/// on the startmost flex line. When no items on that line participate in
+/// baseline alignment, its startmost item instead contributes (or
+/// synthesizes) the baseline:
 /// <https://www.w3.org/TR/css-flexbox-1/#flex-baselines>.
 pub(in crate::layout::flex) fn flex_container_first_baseline(
+    lines: &[FlexLineLayout],
     items: &[FlexItemLayout],
     estimates: &[FlexItemEstimate],
     children: &[StyledChild<'_>],
     container_style: &ComputedStyle,
+    physical_direction: FlexDirection,
 ) -> Option<f32> {
     if !container_style.flex_direction.is_row_axis() {
         return None;
     }
 
-    let (item, estimate, child) = items
-        .iter()
-        .zip(estimates)
-        .zip(children)
-        .map(|((item, estimate), child)| (item, estimate, child))
-        .next()?;
-
-    Some(
-        item.y()
-            + estimate
-                .first_baseline
-                .unwrap_or_else(|| synthesized_item_baseline(item, &child.style))
-            + child.style.margin.top,
+    flex_line_content_baseline(
+        lines.first()?,
+        items,
+        estimates,
+        children,
+        container_style,
+        FlexBaselineSet::First,
+        physical_direction,
     )
 }
 
-/// Recompute auto cross-size flex items against their final flex line cross size.
+/// Recompute auto cross-size flex items that depend on their flex line.
 ///
-/// CSS Flexbox first lays out each item to determine its hypothetical cross size,
-/// then determines each flex line's cross size, and finally aligns each item in
-/// that line. Non-stretched auto cross-size items behave as fit-content in the
-/// cross axis, so their available cross size is the resolved flex line cross
-/// size, not only the container cross size used during line construction:
+/// CSS Flexbox uses each item's hypothetical cross size for non-stretch
+/// alignments, but that hypothetical size is still measured from block layout
+/// with the flex line's available cross size. For column flex items this can
+/// change shrink-to-fit auto widths and therefore float layout. Stretch items
+/// also relayout against the resolved line cross size. Quire's wrapped-line
+/// metadata may span to the next line start for alignment and fragmentation, so
+/// this pass excludes the following cross-axis gap from the item stretch slot:
 /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>,
 /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-line>, and
 /// <https://www.w3.org/TR/css-flexbox-1/#algo-cross-align>.
@@ -121,31 +121,186 @@ pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasuremen
     context: FlexLineCrossRemeasureContext<'_>,
 ) -> bool {
     let physical_direction = context.physical_direction;
-    let axes = FlexAxes::from_physical_direction(physical_direction);
+    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
     let mut changed = false;
+    if context.container_style.flex_wrap == FlexWrap::NoWrap
+        && !context.container_cross_size_basis.is_definite()
+        && !lines.iter().any(|line| !line.collapsed_struts.is_empty())
+    {
+        return false;
+    }
 
     for line in lines {
-        let line_cross_size = line.cross_size();
+        let line_cross_size = flex_line_item_stretch_cross_size(
+            line,
+            lines,
+            FlexLineItemStretchContext {
+                estimates,
+                children,
+                physical_direction: context.physical_direction,
+                container_style: context.container_style,
+                container_cross_size_basis: context.container_cross_size_basis,
+                line_cross_gap: context.line_cross_gap,
+            },
+        );
         for &index in &line.item_indices {
             let child = &children[index];
-            if !flex_item_needs_final_line_cross_remeasurement(
+            let remeasure_kind = flex_item_line_cross_remeasurement_kind(
                 &child.style,
                 context.container_style,
                 physical_direction,
-            ) {
+            );
+            if remeasure_kind == FlexLineCrossRemeasureKind::None {
                 continue;
             }
 
-            let item_available = flex_item_final_line_cross_available_space(
+            let item_available = flex_item_line_cross_available_space(
                 &child.style,
                 physical_direction,
                 context.available,
                 line_cross_size,
             );
-            let remeasured =
-                layout.estimate_flex_item_size(child, context.stylesheets, item_available);
-            let border_cross_size =
-                estimated_flex_item_border_cross_size(&child.style, remeasured, physical_direction);
+            let mut remeasured = layout.estimate_flex_item_size(
+                child,
+                context.stylesheets,
+                item_available,
+                physical_direction,
+            );
+            let mut border_cross_size = match remeasure_kind {
+                FlexLineCrossRemeasureKind::Stretch => stretched_flex_item_line_cross_border_size(
+                    &child.style,
+                    physical_direction,
+                    line_cross_size,
+                    context.available.width_basis,
+                ),
+                FlexLineCrossRemeasureKind::ColumnShrinkToFit => {
+                    remeasured_flex_item_cross_border_size(
+                        &child.style,
+                        remeasured,
+                        physical_direction,
+                    )
+                    .points()
+                }
+                FlexLineCrossRemeasureKind::None => continue,
+            };
+
+            // Taffy's stretch adapter accepts only numeric maxima. Preserve
+            // CSS intrinsic maxima here, then remeasure auto main sizes at the
+            // used cross size so float and inline wrapping observe the same
+            // constraint as final replay:
+            // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes> and
+            // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>.
+            let intrinsic_max_cross_size = match physical_direction.is_row_axis() {
+                true => match child.style.box_values.max_height {
+                    css::ComputedLengthPercentageOrAuto::MinContent => Some(
+                        remeasured_flex_item_cross_border_size(
+                            &child.style,
+                            FlexItemEstimate::fixed(
+                                remeasured.width.points(),
+                                remeasured.min_height.points(),
+                            ),
+                            physical_direction,
+                        )
+                        .points(),
+                    ),
+                    css::ComputedLengthPercentageOrAuto::MaxContent => Some(
+                        remeasured_flex_item_cross_border_size(
+                            &child.style,
+                            FlexItemEstimate::fixed(
+                                remeasured.width.points(),
+                                remeasured.content_height.points(),
+                            ),
+                            physical_direction,
+                        )
+                        .points(),
+                    ),
+                    _ => None,
+                },
+                false => match child.style.box_values.max_width {
+                    css::ComputedLengthPercentageOrAuto::MinContent => Some(
+                        remeasured_flex_item_cross_border_size(
+                            &child.style,
+                            FlexItemEstimate::fixed(
+                                remeasured.min_width.points(),
+                                remeasured.height.points(),
+                            ),
+                            physical_direction,
+                        )
+                        .points(),
+                    ),
+                    css::ComputedLengthPercentageOrAuto::MaxContent => Some(
+                        remeasured_flex_item_cross_border_size(
+                            &child.style,
+                            FlexItemEstimate::fixed(
+                                remeasured.content_width.points(),
+                                remeasured.height.points(),
+                            ),
+                            physical_direction,
+                        )
+                        .points(),
+                    ),
+                    _ => None,
+                },
+            };
+            if let Some(max_cross_size) = intrinsic_max_cross_size
+                && max_cross_size + 0.01 < border_cross_size
+            {
+                border_cross_size = max_cross_size;
+            }
+
+            // A stretch-fit size is clamped by definite min/max constraints
+            // before the flex item's contents are laid out. Remeasure an
+            // automatic main size against that final cross size; otherwise a
+            // narrower `max-width` can leave inline content measured at the
+            // unconstrained stretch width and incorrectly avoid wrapping.
+            // <https://drafts.csswg.org/css-flexbox-1/#algo-stretch> and
+            // <https://drafts.csswg.org/css-sizing-4/#stretch-fit-sizing>.
+            let used_line_cross_size = if physical_direction.is_row_axis() {
+                border_cross_size + child.style.margin.top + child.style.margin.bottom
+            } else {
+                border_cross_size + child.style.margin.left + child.style.margin.right
+            };
+            if (used_line_cross_size - line_cross_size).abs() > 0.01 {
+                remeasured = layout.estimate_flex_item_size(
+                    child,
+                    context.stylesheets,
+                    flex_item_line_cross_available_space(
+                        &child.style,
+                        physical_direction,
+                        context.available,
+                        used_line_cross_size,
+                    ),
+                    physical_direction,
+                );
+                if remeasure_kind == FlexLineCrossRemeasureKind::Stretch
+                    && matches!(child.style.flex_basis, css::ComputedFlexBasis::Auto)
+                {
+                    let borders = used_border_widths(&child.style);
+                    let automatic_main_size = if physical_direction.is_row_axis() {
+                        child.style.box_values.width.is_auto().then(|| {
+                            remeasured.width.points()
+                                + child.style.padding.left
+                                + child.style.padding.right
+                                + borders.left
+                                + borders.right
+                        })
+                    } else {
+                        child.style.box_values.height.is_auto().then(|| {
+                            remeasured.height.points()
+                                + child.style.padding.top
+                                + child.style.padding.bottom
+                                + borders.top
+                                + borders.bottom
+                        })
+                    };
+                    if let Some(automatic_main_size) = automatic_main_size
+                        && (items[index].main_size(axes) - automatic_main_size).abs() > 0.01
+                    {
+                        items[index].set_main_size(axes, automatic_main_size);
+                        changed = true;
+                    }
+                }
+            }
 
             if (items[index].cross_size(axes) - border_cross_size).abs() > 0.01 {
                 items[index].set_cross_size(axes, border_cross_size);
@@ -162,11 +317,20 @@ pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasuremen
     changed
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout::flex) enum FlexLineCrossRemeasureKind {
+    None,
+    Stretch,
+    ColumnShrinkToFit,
+}
+
 pub(in crate::layout::flex) struct FlexLineCrossRemeasureContext<'a> {
     pub(in crate::layout::flex) container_style: &'a ComputedStyle,
     pub(in crate::layout::flex) stylesheets: &'a [Stylesheet],
     pub(in crate::layout::flex) physical_direction: FlexDirection,
     pub(in crate::layout::flex) available: FlexAvailableSpace,
+    pub(in crate::layout::flex) container_cross_size_basis: FlexAvailablePercentageBasis,
+    pub(in crate::layout::flex) line_cross_gap: f32,
 }
 
 /// Resolve auto cross sizes that depend on the final flexed main size.
@@ -184,7 +348,7 @@ pub(in crate::layout::flex) fn apply_main_size_aspect_ratio_cross_size_correctio
     physical_direction: FlexDirection,
     available: FlexAvailableSpace,
 ) -> bool {
-    let axes = FlexAxes::from_physical_direction(physical_direction);
+    let axes = FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction));
     let mut changed = false;
     for ((item, estimate), child) in items.iter_mut().zip(estimates).zip(children) {
         let child_style = &child.style;
@@ -205,9 +369,14 @@ pub(in crate::layout::flex) fn apply_main_size_aspect_ratio_cross_size_correctio
                 | SelfAlignmentKeyword::Normal
                 | SelfAlignmentKeyword::Stretch
         ) && if physical_direction.is_row_axis() {
-            available.height_is_definite
+            // The percentage basis inherited from the containing block does
+            // not make an auto-height flex container's own cross size
+            // definite. Only its resolved used content height can suppress
+            // the item's ratio-dependent automatic cross size here.
+            // <https://www.w3.org/TR/css-flexbox-1/#definite-sizes>
+            available.height.is_some()
         } else {
-            available.width_is_definite
+            available.width_basis.is_definite()
         };
         if stretch_with_definite_cross_size {
             continue;
@@ -230,22 +399,47 @@ pub(in crate::layout::flex) fn apply_main_size_aspect_ratio_cross_size_correctio
                 child_style.padding.left + child_style.padding.right + borders.left + borders.right,
             )
         };
-        let main_content_size = (item.main_size(axes) - main_non_content).max(0.0);
-        let mut cross_content_size = if physical_direction.is_row_axis() {
-            main_content_size / ratio
+        let main_size = item.main_size(axes).max(0.0);
+        let main_content_size = (main_size - main_non_content).max(0.0);
+        let mut cross_content_size = if child_style.aspect_ratio.uses_content_box_for_non_replaced()
+            || child_style.box_sizing == BoxSizing::ContentBox
+        {
+            if physical_direction.is_row_axis() {
+                main_content_size / ratio
+            } else {
+                main_content_size * ratio
+            }
+        } else if physical_direction.is_row_axis() {
+            (main_size / ratio - cross_non_content).max(0.0)
         } else {
-            main_content_size * ratio
+            (main_size * ratio - cross_non_content).max(0.0)
         };
-        let percentage_basis = available.width;
+        let percentage_basis = available.width.points();
         let (min_cross, max_cross) = if physical_direction.is_row_axis() {
             (
-                used_min_height(child_style, percentage_basis),
-                used_max_height(child_style, percentage_basis),
+                used_min_height(
+                    child_style,
+                    PercentageBasis::definite(layout_pt(percentage_basis)),
+                )
+                .map(SemanticLengthExt::points),
+                used_max_height(
+                    child_style,
+                    PercentageBasis::definite(layout_pt(percentage_basis)),
+                )
+                .map(SemanticLengthExt::points),
             )
         } else {
             (
-                used_min_width(child_style, percentage_basis),
-                used_max_width(child_style, percentage_basis),
+                used_min_width(
+                    child_style,
+                    PercentageBasis::definite(layout_pt(percentage_basis)),
+                )
+                .map(SemanticLengthExt::points),
+                used_max_width(
+                    child_style,
+                    PercentageBasis::definite(layout_pt(percentage_basis)),
+                )
+                .map(SemanticLengthExt::points),
             )
         };
         if let Some(min_cross) = min_cross {
@@ -270,28 +464,111 @@ pub(in crate::layout::flex) fn apply_main_size_aspect_ratio_cross_size_correctio
     changed
 }
 
-pub(in crate::layout::flex) fn flex_item_needs_final_line_cross_remeasurement(
+pub(in crate::layout::flex) fn flex_item_line_cross_remeasurement_kind(
     child_style: &ComputedStyle,
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
-) -> bool {
+) -> FlexLineCrossRemeasureKind {
     if flex_item_has_auto_cross_margin(child_style, physical_direction) {
-        return false;
+        return FlexLineCrossRemeasureKind::None;
     }
-    if matches!(
+    let align_stretches = matches!(
         effective_align_self(child_style, container_style).keyword,
         SelfAlignmentKeyword::Auto | SelfAlignmentKeyword::Normal | SelfAlignmentKeyword::Stretch
-    ) {
-        return false;
-    }
-    if physical_direction.is_row_axis() {
+    );
+    let cross_size_is_auto = if physical_direction.is_row_axis() {
         child_style.box_values.height.is_auto()
     } else {
         child_style.box_values.width.is_auto()
+    };
+    if !cross_size_is_auto {
+        return FlexLineCrossRemeasureKind::None;
+    }
+    if align_stretches {
+        return FlexLineCrossRemeasureKind::Stretch;
+    }
+    if physical_direction.is_column_axis() {
+        return FlexLineCrossRemeasureKind::ColumnShrinkToFit;
+    }
+    FlexLineCrossRemeasureKind::None
+}
+
+pub(in crate::layout::flex) fn flex_line_cross_gap(
+    container_style: &ComputedStyle,
+    physical_direction: FlexDirection,
+    available: FlexAvailableSpace,
+    physical_gap_width: css::ComputedGap,
+    physical_gap_height: css::ComputedGap,
+) -> f32 {
+    if container_style.flex_wrap == FlexWrap::NoWrap {
+        return 0.0;
+    }
+    if physical_direction.is_row_axis() {
+        used_flex_gap_with_basis(physical_gap_height, available.height_basis).points()
+    } else {
+        used_flex_gap_with_basis(physical_gap_width, available.width_basis).points()
     }
 }
 
-pub(in crate::layout::flex) fn flex_item_final_line_cross_available_space(
+pub(in crate::layout::flex) fn flex_line_item_stretch_cross_size(
+    line: &FlexLineLayout,
+    lines: &[FlexLineLayout],
+    context: FlexLineItemStretchContext<'_, '_>,
+) -> f32 {
+    let cross_size = if context.container_style.flex_wrap == FlexWrap::NoWrap
+        && !context.container_cross_size_basis.is_definite()
+        && line.collapsed_struts.is_empty()
+    {
+        flex_line_estimated_outer_cross_extent(
+            line,
+            context.estimates,
+            context.children,
+            context.physical_direction,
+        )
+        .unwrap_or_else(|| line.cross_size().points())
+    } else {
+        line.cross_size().points()
+    };
+    if context.line_cross_gap <= 0.0 {
+        return cross_size;
+    }
+    let has_following_adjacent_line = lines.iter().any(|other| {
+        other.cross_start.points() > line.cross_start.points() + 0.01
+            && other.cross_start.points() <= line.cross_end.points() + 0.01
+    });
+    if has_following_adjacent_line {
+        (cross_size - context.line_cross_gap).max(0.0)
+    } else {
+        cross_size
+    }
+}
+
+pub(in crate::layout::flex) struct FlexLineItemStretchContext<'a, 'dom> {
+    pub(in crate::layout::flex) estimates: &'a [FlexItemEstimate],
+    pub(in crate::layout::flex) children: &'a [StyledChild<'dom>],
+    pub(in crate::layout::flex) physical_direction: FlexDirection,
+    pub(in crate::layout::flex) container_style: &'a ComputedStyle,
+    pub(in crate::layout::flex) container_cross_size_basis: FlexAvailablePercentageBasis,
+    pub(in crate::layout::flex) line_cross_gap: f32,
+}
+
+pub(in crate::layout::flex) fn flex_line_estimated_outer_cross_extent(
+    line: &FlexLineLayout,
+    estimates: &[FlexItemEstimate],
+    children: &[StyledChild<'_>],
+    physical_direction: FlexDirection,
+) -> Option<f32> {
+    line.item_indices
+        .iter()
+        .cloned()
+        .map(|index| {
+            estimated_outer_cross_size(&children[index].style, estimates[index], physical_direction)
+                .points()
+        })
+        .reduce(f32::max)
+}
+
+pub(in crate::layout::flex) fn flex_item_line_cross_available_space(
     child_style: &ComputedStyle,
     physical_direction: FlexDirection,
     available: FlexAvailableSpace,
@@ -301,35 +578,72 @@ pub(in crate::layout::flex) fn flex_item_final_line_cross_available_space(
     if physical_direction.is_row_axis() {
         let cross_size =
             (line_cross_size - child_style.margin.top - child_style.margin.bottom).max(0.0);
-        item_available.height = Some(cross_size);
-        item_available.height_is_definite = true;
+        item_available.set_definite_height(
+            PhysicalContentHeight::new(content_box_pt(cross_size)),
+            FlexAvailableSizeSource::DefiniteCrossSize,
+        );
     } else {
         let cross_size =
             (line_cross_size - child_style.margin.left - child_style.margin.right).max(0.0);
-        item_available.width = cross_size;
-        item_available.width_is_definite = true;
+        item_available.set_definite_width(
+            PhysicalContentWidth::new(content_box_pt(cross_size)),
+            FlexAvailableSizeSource::DefiniteCrossSize,
+        );
     }
     item_available
 }
 
-pub(in crate::layout::flex) fn estimated_flex_item_border_cross_size(
+pub(in crate::layout::flex) fn remeasured_flex_item_cross_border_size(
     style: &ComputedStyle,
     estimate: FlexItemEstimate,
     physical_direction: FlexDirection,
+) -> BorderBoxLength {
+    let borders = used_border_widths(style);
+    border_box_pt(
+        if physical_direction.is_row_axis() {
+            estimate.height.points()
+                + style.padding.top
+                + style.padding.bottom
+                + borders.top
+                + borders.bottom
+        } else {
+            estimate.width.points()
+                + style.padding.left
+                + style.padding.right
+                + borders.left
+                + borders.right
+        }
+        .max(0.0),
+    )
+}
+
+pub(in crate::layout::flex) fn stretched_flex_item_line_cross_border_size(
+    style: &ComputedStyle,
+    physical_direction: FlexDirection,
+    line_cross_size: f32,
+    percentage_basis: FlexAvailablePercentageBasis,
 ) -> f32 {
     let borders = used_border_widths(style);
     if physical_direction.is_row_axis() {
-        estimate.height.points()
-            + style.padding.top
-            + style.padding.bottom
-            + borders.top
-            + borders.bottom
+        let non_content = style.padding.top + style.padding.bottom + borders.top + borders.bottom;
+        let outer_cross_size = (line_cross_size - style.margin.top - style.margin.bottom).max(0.0);
+        constrain_content_height(
+            style,
+            content_box_pt((outer_cross_size - non_content).max(0.0)),
+            percentage_basis,
+        )
+        .points()
+            + non_content
     } else {
-        estimate.width.points()
-            + style.padding.left
-            + style.padding.right
-            + borders.left
-            + borders.right
+        let non_content = style.padding.left + style.padding.right + borders.left + borders.right;
+        let outer_cross_size = (line_cross_size - style.margin.left - style.margin.right).max(0.0);
+        constrain_content_width(
+            style,
+            content_box_pt((outer_cross_size - non_content).max(0.0)),
+            percentage_basis,
+        )
+        .points()
+            + non_content
     }
     .max(0.0)
 }

@@ -1,41 +1,100 @@
 mod paint;
 
+pub use paint::LinkAnnotation;
+pub(crate) use paint::PaintSpace;
+pub(crate) use paint::RenderedImageSource;
 pub(crate) use paint::{
     PagePaintTree, PaintBand, PaintBlendMode, PaintCheckpoint, PaintClip, PaintClipPathEffect,
-    PaintDisplayItem, PaintEffectScope, PaintEffectStep, PaintEffects, PaintFilterEffect,
-    PaintFragment, PaintMaskEffect, PaintPrimitive, PaintStackingContext, PaintTransform,
-    PaintVector, RenderedLineSource, RenderedPathCommandPoints, StackLevel, paint_point_to_pdf,
+    PaintDisplacement, PaintDisplayItem, PaintEffectScope, PaintEffectStep, PaintEffects,
+    PaintFilterEffect, PaintFragment, PaintMaskEffect, PaintPrimitive, PaintStackingContext,
+    PaintTransform, PaintTranslation, RenderedGradient, RenderedGradientKind, RenderedGradientStop,
+    RenderedLineSource, RenderedPathCommandPoints, RenderedPathLineCap, RenderedPathLineJoin,
+    RenderedPathPaint, RenderedPathPaintOrder, RenderedPathStrokeStyle, RenderedPeriodicGradient,
+    RenderedSvgPathPattern, StackLevel, paint_point_to_pdf, paint_rect_path_commands,
     paint_rect_to_pdf,
 };
-pub use paint::{
+pub(crate) use paint::{
     PaintOperation, PaintPoint, PaintRect, PaintSize, RenderedCornerRadius, RenderedGlyph,
-    RenderedImage, RenderedImageSourceRect, RenderedLine, RenderedLink, RenderedPath,
-    RenderedPathClip, RenderedPathClipPath, RenderedPathCommand, RenderedPathFillRule,
-    RenderedRect, RenderedRoundedRect, RenderedRoundedRectRadii, RenderedStroke,
-    RenderedTextMatrix, RenderedTextRun,
+    RenderedGradientPattern, RenderedImage, RenderedImagePattern, RenderedImageSourceRect,
+    RenderedLine, RenderedLink, RenderedPath, RenderedPathClip, RenderedPathClipPath,
+    RenderedPathCommand, RenderedPathFillRule, RenderedRect, RenderedRoundedRect,
+    RenderedRoundedRectRadii, RenderedStroke, RenderedSvgPattern, RenderedTextMatrix,
+    RenderedTextRun, TextRunPoint,
 };
 
-use crate::{Error, Result, pdf, timing::DebugTimer};
+use crate::{Error, Result, image_store::DocumentImageStore, pdf, timing::DebugTimer};
 use fontique::Blob as FontiqueBlob;
+use std::borrow::Cow;
 use std::fmt;
 use std::ops::Deref;
 use std::path::Path;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq)]
+/// The fully rendered, inspectable document before PDF serialization.
+///
+/// ```no_run
+/// # fn inspect(document: &quire::Document) {
+/// let page_count = document.pages().len();
+/// # let _ = page_count;
+/// # }
+/// ```
 pub struct Document {
-    pub pages: Vec<Page>,
-    pub metadata: DocumentMetadata,
-    pub fonts: Vec<DocumentFont>,
-    pub bookmarks: Vec<Bookmark>,
+    pub(crate) pages: Vec<Page>,
+    pub(crate) metadata: DocumentMetadata,
+    pub(crate) fonts: Vec<DocumentFont>,
+    pub(crate) bookmarks: Vec<Bookmark>,
+    pub(crate) image_store: Box<DocumentImageStore>,
 }
 
 impl Document {
-    pub fn write_pdf_bytes(&self) -> Result<Vec<u8>> {
-        self.write_pdf_bytes_with_options(&crate::RenderOptions::default())
+    /// Returns the rendered pages in document order.
+    ///
+    /// ```no_run
+    /// # fn inspect(document: &quire::Document) {
+    /// let pages = document.pages();
+    /// # let _ = pages;
+    /// # }
+    /// ```
+    pub fn pages(&self) -> &[Page] {
+        &self.pages
     }
 
-    pub fn write_pdf_bytes_with_options(&self, options: &crate::RenderOptions) -> Result<Vec<u8>> {
+    /// Returns document-wide PDF metadata extracted during rendering.
+    ///
+    /// ```no_run
+    /// # fn inspect(document: &quire::Document) {
+    /// let title = document.metadata().title();
+    /// # let _ = title;
+    /// # }
+    /// ```
+    pub fn metadata(&self) -> &DocumentMetadata {
+        &self.metadata
+    }
+
+    /// Returns document bookmarks in source order.
+    ///
+    /// ```no_run
+    /// # fn inspect(document: &quire::Document) {
+    /// for bookmark in document.bookmarks() {
+    ///     println!("{}", bookmark.label());
+    /// }
+    /// # }
+    /// ```
+    pub fn bookmarks(&self) -> &[Bookmark] {
+        &self.bookmarks
+    }
+
+    /// Serializes this document as PDF bytes using the supplied PDF options.
+    ///
+    /// ```no_run
+    /// # fn write(document: &quire::Document) -> quire::Result<()> {
+    /// let pdf = document.write_pdf_bytes(&quire::PdfOptions::default())?;
+    /// # let _ = pdf;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn write_pdf_bytes(&self, options: &PdfOptions) -> Result<Vec<u8>> {
         let _timer =
             DebugTimer::start(format!("writing {} page(s) to PDF bytes", self.pages.len()));
         if self.pages.is_empty() {
@@ -45,25 +104,25 @@ impl Document {
             let _timer = DebugTimer::start("validating paint operations");
             self.validate_paint_operations()?;
         }
-        Ok(pdf::write_document(self, options.pdf_variant))
+        pdf::write_document(self, options)
     }
 
-    pub fn write_pdf<P: AsRef<Path>>(&self, target: P) -> Result<()> {
-        self.write_pdf_with_options(target, &crate::RenderOptions::default())
-    }
-
-    pub fn write_pdf_with_options<P: AsRef<Path>>(
-        &self,
-        target: P,
-        options: &crate::RenderOptions,
-    ) -> Result<()> {
+    /// Serializes this document to a PDF file using the supplied PDF options.
+    ///
+    /// ```no_run
+    /// # fn write(document: &quire::Document) -> quire::Result<()> {
+    /// document.write_pdf("document.pdf", &quire::PdfOptions::default())?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn write_pdf<P: AsRef<Path>>(&self, target: P, options: &PdfOptions) -> Result<()> {
         let target = target.as_ref();
         log::debug!("writing PDF file {}", target.display());
-        std::fs::write(target, self.write_pdf_bytes_with_options(options)?)?;
+        std::fs::write(target, self.write_pdf_bytes(options)?)?;
         Ok(())
     }
 
-    pub fn validate_paint_operations(&self) -> Result<()> {
+    pub(crate) fn validate_paint_operations(&self) -> Result<()> {
         for (page_index, page) in self.pages.iter().enumerate() {
             page.validate_paint_operations(page_index)?;
         }
@@ -71,24 +130,75 @@ impl Document {
     }
 }
 
-/// Selects the PDF variant and conformance-identification metadata to emit.
+/// Controls whether Quire applies Flate compression to generated PDF streams.
+///
+/// ISO 32000-1:2008, 7.4.4 defines the `/FlateDecode` stream filter. Disabling
+/// compression is useful when inspecting generated PDF syntax, but increases
+/// output size substantially for images and embedded font programs.
+///
+/// ```
+/// let compression = quire::PdfCompression::Uncompressed;
+/// assert_eq!(compression, quire::PdfCompression::Uncompressed);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum PdfCompression {
+    /// Apply Flate compression to eligible PDF streams.
+    #[default]
+    Compressed,
+    /// Leave PDF streams uncompressed for inspection or debugging.
+    Uncompressed,
+}
+
+/// Controls whether PDF embedding keeps complete font programs or subsets them.
+///
+/// `Subset` is the default because it produces smaller PDFs and emits a compact CID mapping.
+/// `Full` embeds complete programs where the selected PDF profile permits it.
+///
+/// ISO 32000-2:2020, 9.7 and 9.9 define Type 0/CIDFont and embedded font
+/// program requirements.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FontEmbeddingMode {
+    /// Embed only the glyphs used by the document.
+    #[default]
+    Subset,
+    /// Embed complete font programs where the selected PDF profile permits it.
+    Full,
+}
+
+/// Selects the PDF output profile and conformance-identification metadata to emit.
 ///
 /// PDF/A identification is defined by ISO 19005's PDF/A extension schema. The
-/// variant value controls only explicit writer behavior, such as PDF header
+/// profile controls only explicit writer behavior, such as PDF header
 /// version, XMP identification fields, and stricter font-planning hooks; it is
 /// not by itself a guarantee that every PDF/A requirement has been satisfied.
+///
+/// ```
+/// let profile = quire::PdfProfile::PdfA2B;
+/// assert!(profile.is_pdfa());
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum PdfVariant {
+pub enum PdfProfile {
+    /// A regular PDF document without a PDF/A conformance target.
     Pdf,
+    /// A PDF/A-1b document.
     PdfA1B,
+    /// A PDF/A-2b document.
     #[default]
     PdfA2B,
+    /// A PDF/A-3b document.
     PdfA3B,
+    /// A PDF/A-2u document.
     PdfA2U,
+    /// A PDF/A-3u document.
     PdfA3U,
 }
 
-impl PdfVariant {
+impl PdfProfile {
+    /// Returns the PDF version required by this profile.
+    ///
+    /// ```
+    /// assert_eq!(quire::PdfProfile::PdfA2B.pdf_version(), (1, 7));
+    /// ```
     pub const fn pdf_version(self) -> (u8, u8) {
         match self {
             Self::Pdf | Self::PdfA1B => (1, 4),
@@ -96,6 +206,11 @@ impl PdfVariant {
         }
     }
 
+    /// Returns whether this profile targets a PDF/A conformance level.
+    ///
+    /// ```
+    /// assert!(!quire::PdfProfile::Pdf.is_pdfa());
+    /// ```
     pub const fn is_pdfa(self) -> bool {
         !matches!(self, Self::Pdf)
     }
@@ -127,7 +242,7 @@ impl PdfVariant {
     }
 }
 
-impl fmt::Display for PdfVariant {
+impl fmt::Display for PdfProfile {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Pdf => "pdf",
@@ -140,7 +255,7 @@ impl fmt::Display for PdfVariant {
     }
 }
 
-impl FromStr for PdfVariant {
+impl FromStr for PdfProfile {
     type Err = String;
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
@@ -152,7 +267,7 @@ impl FromStr for PdfVariant {
             "pdf/a-2u" => Ok(Self::PdfA2U),
             "pdf/a-3u" => Ok(Self::PdfA3U),
             _ => Err(format!(
-                "unsupported PDF variant {value:?}; expected one of pdf, pdf/a-1b, pdf/a-2b, pdf/a-3b, pdf/a-2u, pdf/a-3u"
+                "unsupported PDF profile {value:?}; expected one of pdf, pdf/a-1b, pdf/a-2b, pdf/a-3b, pdf/a-2u, pdf/a-3u"
             )),
         }
     }
@@ -164,25 +279,97 @@ pub(crate) struct PdfAIdentification {
     pub conformance: &'static str,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DocumentMetadata {
-    pub title: Option<String>,
-    pub author: Option<String>,
-    pub creator: Option<String>,
+/// Policy for serializing a rendered document as PDF.
+///
+/// These settings do not affect CSS parsing, cascade, layout, or paint. The
+/// same [`Document`] can therefore be serialized repeatedly with distinct PDF
+/// profiles, compression, font embedding, or producer values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfOptions {
+    /// PDF profile and conformance-identification metadata to emit.
+    pub profile: PdfProfile,
+    /// Font-program embedding policy.
+    pub font_embedding: FontEmbeddingMode,
+    /// Generated-stream compression policy.
+    pub compression: PdfCompression,
+    /// Producer string written to PDF document information and XMP metadata.
     pub producer: String,
 }
 
+impl Default for PdfOptions {
+    fn default() -> Self {
+        Self {
+            profile: PdfProfile::default(),
+            font_embedding: FontEmbeddingMode::default(),
+            compression: PdfCompression::default(),
+            producer: "quire 0.1.0".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Source metadata associated with a rendered document.
+pub struct DocumentMetadata {
+    pub(crate) title: Option<String>,
+    pub(crate) author: Option<String>,
+    pub(crate) creator: Option<String>,
+}
+
+impl DocumentMetadata {
+    /// Returns the document title, if one was present in the source.
+    ///
+    /// ```no_run
+    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// assert!(metadata.title().is_none());
+    /// # }
+    /// ```
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// Returns the document author, if one was present in the source.
+    ///
+    /// ```no_run
+    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// let author = metadata.author();
+    /// # let _ = author;
+    /// # }
+    /// ```
+    pub fn author(&self) -> Option<&str> {
+        self.author.as_deref()
+    }
+
+    /// Returns the document creator, if one was present in the source.
+    ///
+    /// ```no_run
+    /// # fn inspect(metadata: &quire::DocumentMetadata) {
+    /// let creator = metadata.creator();
+    /// # let _ = creator;
+    /// # }
+    /// ```
+    pub fn creator(&self) -> Option<&str> {
+        self.creator.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
+/// A document bookmark derived from the rendered source.
+///
+/// ```no_run
+/// # fn inspect(bookmark: &quire::Bookmark) {
+/// println!("{}", bookmark.label());
+/// # }
+/// ```
 pub struct Bookmark {
-    pub level: u32,
-    pub label: String,
-    pub page_index: usize,
+    pub(crate) level: u32,
+    pub(crate) label: String,
+    pub(crate) page_index: usize,
     target: PaintPoint,
-    pub state: BookmarkState,
+    pub(crate) state: BookmarkState,
 }
 
 impl Bookmark {
-    pub fn new(
+    pub(crate) fn new(
         level: u32,
         label: String,
         page_index: usize,
@@ -199,12 +386,75 @@ impl Bookmark {
         }
     }
 
+    /// Returns the bookmark destination's horizontal position in PDF points.
+    ///
+    /// ```no_run
+    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// let x = bookmark.x();
+    /// # let _ = x;
+    /// # }
+    /// ```
     pub fn x(&self) -> f32 {
         self.target.x
     }
 
+    /// Returns the bookmark destination's vertical position in PDF points.
+    ///
+    /// ```no_run
+    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// let y = bookmark.y();
+    /// # let _ = y;
+    /// # }
+    /// ```
     pub fn y(&self) -> f32 {
         self.target.y
+    }
+
+    /// Returns the bookmark nesting level, starting at one.
+    ///
+    /// ```no_run
+    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// assert!(bookmark.level() >= 1);
+    /// # }
+    /// ```
+    pub fn level(&self) -> u32 {
+        self.level
+    }
+
+    /// Returns the bookmark's displayed label.
+    ///
+    /// ```no_run
+    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// let label = bookmark.label();
+    /// # let _ = label;
+    /// # }
+    /// ```
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Returns the zero-based index of the destination page.
+    ///
+    /// ```no_run
+    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// let page_index = bookmark.page_index();
+    /// # let _ = page_index;
+    /// # }
+    /// ```
+    pub fn page_index(&self) -> usize {
+        self.page_index
+    }
+
+    /// Returns the bookmark's initial expansion state.
+    ///
+    /// ```no_run
+    /// # fn inspect(bookmark: &quire::Bookmark) {
+    /// let state = bookmark.state();
+    /// # let _ = state;
+    /// # }
+    /// ```
+    pub fn state(&self) -> BookmarkState {
+        self.state
     }
 
     pub(crate) fn target(&self) -> PaintPoint {
@@ -218,16 +468,31 @@ impl Bookmark {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The initial expansion state of a bookmark in a PDF viewer.
+///
+/// ```
+/// let state = quire::BookmarkState::Open;
+/// assert_eq!(state, quire::BookmarkState::Open);
+/// ```
 pub enum BookmarkState {
+    /// Display the bookmark's children initially.
     Open,
+    /// Hide the bookmark's children initially.
     Closed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// A rendered page in document order.
+///
+/// ```no_run
+/// # fn inspect(page: &quire::Page) {
+/// let area = page.width() * page.height();
+/// # let _ = area;
+/// # }
+/// ```
 pub struct Page {
     size: PaintSize,
-    pub rotation: i32,
-    pub(crate) operations: Vec<PaintOperation>,
+    pub(crate) rotation: i32,
     pub(crate) rects: Vec<RenderedRect>,
     pub(crate) rounded_rects: Vec<RenderedRoundedRect>,
     pub(crate) paths: Vec<RenderedPath>,
@@ -235,15 +500,22 @@ pub struct Page {
     pub(crate) lines: Vec<RenderedLine>,
     pub(crate) links: Vec<RenderedLink>,
     pub(crate) images: Vec<RenderedImage>,
-    paint_tree: Option<paint::PagePaintTree>,
+    pub(crate) image_patterns: Vec<RenderedImagePattern>,
+    pub(crate) gradient_patterns: Vec<RenderedGradientPattern>,
+    pub(crate) svg_patterns: Vec<RenderedSvgPattern>,
+    /// A committed CSS fragmentation slice that owns this page even when it
+    /// has no visible paint primitives (for example, the trailing slice of a
+    /// tall table row).
+    pub(crate) has_fragmentation_content: bool,
+    paint_tree: paint::PagePaintTree,
 }
 
+#[allow(dead_code)]
 impl Page {
-    pub fn new(width: f32, height: f32) -> Self {
+    pub(crate) fn new(width: f32, height: f32) -> Self {
         Self {
             size: PaintSize::new(width.max(0.0), height.max(0.0)),
             rotation: 0,
-            operations: Vec::new(),
             rects: Vec::new(),
             rounded_rects: Vec::new(),
             paths: Vec::new(),
@@ -251,48 +523,104 @@ impl Page {
             lines: Vec::new(),
             links: Vec::new(),
             images: Vec::new(),
-            paint_tree: Some(paint::PagePaintTree::new()),
+            image_patterns: Vec::new(),
+            gradient_patterns: Vec::new(),
+            svg_patterns: Vec::new(),
+            has_fragmentation_content: false,
+            paint_tree: paint::PagePaintTree::new(),
         }
     }
 
+    /// Returns the page width in PDF points.
+    ///
+    /// ```no_run
+    /// # fn inspect(page: &quire::Page) {
+    /// let width = page.width();
+    /// # let _ = width;
+    /// # }
+    /// ```
     pub fn width(&self) -> f32 {
         self.size.width
     }
 
+    /// Returns the page height in PDF points.
+    ///
+    /// ```no_run
+    /// # fn inspect(page: &quire::Page) {
+    /// let height = page.height();
+    /// # let _ = height;
+    /// # }
+    /// ```
     pub fn height(&self) -> f32 {
         self.size.height
     }
 
-    pub fn operations(&self) -> &[PaintOperation] {
-        &self.operations
+    /// Return the paint-operation projection of the canonical paint tree.
+    ///
+    /// The tree retains stacking contexts and effect scopes; this flattened
+    /// view is for inspection and structural assertions only.
+    pub(crate) fn operations(&self) -> Cow<'_, [PaintOperation]> {
+        Cow::Owned(self.paint_tree.flattened_operations())
     }
 
-    pub fn rects(&self) -> &[RenderedRect] {
+    pub(crate) fn rects(&self) -> &[RenderedRect] {
         &self.rects
     }
 
-    pub fn rounded_rects(&self) -> &[RenderedRoundedRect] {
+    pub(crate) fn rounded_rects(&self) -> &[RenderedRoundedRect] {
         &self.rounded_rects
     }
 
-    pub fn paths(&self) -> &[RenderedPath] {
+    pub(crate) fn paths(&self) -> &[RenderedPath] {
         &self.paths
     }
 
-    pub fn strokes(&self) -> &[RenderedStroke] {
+    pub(crate) fn strokes(&self) -> &[RenderedStroke] {
         &self.strokes
     }
 
-    pub fn lines(&self) -> &[RenderedLine] {
+    pub(crate) fn lines(&self) -> &[RenderedLine] {
         &self.lines
     }
 
-    pub fn links(&self) -> &[RenderedLink] {
+    /// Returns link annotations in page-local PDF-point coordinates.
+    ///
+    /// ```no_run
+    /// # fn inspect(page: &quire::Page) {
+    /// for link in page.links() {
+    ///     println!("{}", link.target());
+    /// }
+    /// # }
+    /// ```
+    pub fn links(&self) -> &[LinkAnnotation] {
         &self.links
     }
 
-    pub fn images(&self) -> &[RenderedImage] {
+    pub(crate) fn images(&self) -> &[RenderedImage] {
         &self.images
+    }
+
+    pub(crate) fn image_patterns(&self) -> &[RenderedImagePattern] {
+        &self.image_patterns
+    }
+
+    /// Typed CSS gradient patterns painted on this page.
+    ///
+    /// Gradients remain vector PDF shadings rather than being flattened into
+    /// raster images, while preserving their resolved CSS tile geometry.
+    pub(crate) fn gradient_patterns(&self) -> &[RenderedGradientPattern] {
+        &self.gradient_patterns
+    }
+
+    /// Returns the clockwise page rotation in degrees.
+    ///
+    /// ```no_run
+    /// # fn inspect(page: &quire::Page) {
+    /// assert_eq!(page.rotation() % 90, 0);
+    /// # }
+    /// ```
+    pub fn rotation(&self) -> i32 {
+        self.rotation
     }
 
     pub(crate) fn paint_size(&self) -> PaintSize {
@@ -303,29 +631,34 @@ impl Page {
     ///
     /// PDF content streams are ordered drawing operators (§8.2, ISO 32000-1),
     /// while CSS painting defines the source paint order for all visual
-    /// primitives (CSS 2.2 Appendix E). This predicate therefore follows the
-    /// complete primitive storage model instead of checking only text/rects.
+    /// primitives (CSS 2.2 Appendix E). The retained paint tree is therefore
+    /// the source of truth; backing storage without a tree operation does not
+    /// make a page renderable.
     pub(crate) fn has_paint_content(&self) -> bool {
-        !self.lines.is_empty()
-            || !self.rects.is_empty()
-            || !self.rounded_rects.is_empty()
-            || !self.paths.is_empty()
-            || !self.strokes.is_empty()
-            || !self.images.is_empty()
+        !self.paint_tree.flattened_operations().is_empty()
+    }
+
+    pub(crate) fn mark_fragmentation_content(&mut self) {
+        self.has_fragmentation_content = true;
+    }
+
+    pub(crate) fn has_fragmentation_content(&self) -> bool {
+        self.has_fragmentation_content
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FontProgramKind {
+pub(crate) enum FontProgramKind {
     TrueType,
     OpenTypeCff,
 }
 
 #[derive(Clone)]
-pub struct DocumentFontData {
+pub(crate) struct DocumentFontData {
     blob: FontiqueBlob<u8>,
 }
 
+#[allow(dead_code)]
 impl DocumentFontData {
     pub(crate) fn from_blob(blob: FontiqueBlob<u8>) -> Self {
         Self { blob }
@@ -381,17 +714,17 @@ impl PartialEq for DocumentFontData {
 impl Eq for DocumentFontData {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocumentFont {
-    pub id: usize,
-    pub family: String,
-    pub post_script_name: String,
-    pub program_kind: FontProgramKind,
-    pub data: DocumentFontData,
-    pub face_index: u32,
-    pub units_per_em: u16,
-    pub ascender: i16,
-    pub descender: i16,
-    pub cap_height: i16,
-    pub italic_angle: i16,
-    pub bbox: [i16; 4],
+pub(crate) struct DocumentFont {
+    pub(crate) id: usize,
+    pub(crate) family: String,
+    pub(crate) post_script_name: String,
+    pub(crate) program_kind: FontProgramKind,
+    pub(crate) data: DocumentFontData,
+    pub(crate) face_index: u32,
+    pub(crate) units_per_em: u16,
+    pub(crate) ascender: i16,
+    pub(crate) descender: i16,
+    pub(crate) cap_height: i16,
+    pub(crate) italic_angle: i16,
+    pub(crate) bbox: [i16; 4],
 }

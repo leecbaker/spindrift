@@ -1,11 +1,279 @@
 use super::*;
+use crate::units::{LayoutLength, LayoutSize, layout_pt};
 
+/// The output medium used when evaluating CSS Media Queries.
+///
+/// Media Queries Level 4 media types select an output category; PDF rendering
+/// defaults to `print`, while callers that render a screen snapshot can select
+/// `screen`: <https://www.w3.org/TR/mediaqueries-4/#media-types>.
+///
+/// ```
+/// let medium = quire::MediaType::Print;
+/// assert_eq!(medium, quire::MediaType::Print);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MediaType {
+    /// A paged or print rendering medium.
+    #[default]
+    Print,
+    /// A screen rendering medium.
+    Screen,
+}
+
+/// CSS-pixel viewport coordinates used only by media-query evaluation.
+/// They are deliberately distinct from PDF-point layout viewport lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CssViewportSpace {}
+
+pub type CssViewportSize = euclid::Size2D<f32, CssViewportSpace>;
+
+/// Physical and logical viewport bases for resolving CSS viewport units.
+/// Physical dimensions are layout points; media-query CSS pixels use the
+/// separate [`CssViewportSize`] type above.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ViewportLengthBasis {
+    physical: LayoutSize,
+    writing_mode: WritingMode,
+}
+
+impl ViewportLengthBasis {
+    pub(crate) fn for_writing_mode(physical: LayoutSize, writing_mode: WritingMode) -> Self {
+        Self {
+            physical,
+            writing_mode,
+        }
+    }
+
+    pub(crate) fn vw(self, percentage: f32) -> LayoutLength {
+        layout_pt(percentage * self.physical.width / 100.0)
+    }
+
+    pub(crate) fn vh(self, percentage: f32) -> LayoutLength {
+        layout_pt(percentage * self.physical.height / 100.0)
+    }
+
+    pub(crate) fn vmin(self, percentage: f32) -> LayoutLength {
+        layout_pt(percentage * self.physical.width.min(self.physical.height) / 100.0)
+    }
+
+    pub(crate) fn vmax(self, percentage: f32) -> LayoutLength {
+        layout_pt(percentage * self.physical.width.max(self.physical.height) / 100.0)
+    }
+
+    pub(crate) fn vi(self, percentage: f32) -> LayoutLength {
+        match self.writing_mode {
+            WritingMode::HorizontalTb => self.vw(percentage),
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => self.vh(percentage),
+        }
+    }
+
+    pub(crate) fn vb(self, percentage: f32) -> LayoutLength {
+        match self.writing_mode {
+            WritingMode::HorizontalTb => self.vh(percentage),
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => self.vw(percentage),
+        }
+    }
+
+    /// CSS container units with no eligible container fall back to the small
+    /// viewport. Quire's fixed paged viewport makes that the active page area.
+    /// <https://www.w3.org/TR/css-contain-3/#container-lengths>
+    pub(crate) fn container_fallback(self) -> ContainerLengthBasis {
+        ContainerLengthBasis::for_writing_mode(self.physical, self.writing_mode)
+    }
+}
+
+/// Physical and logical bases for CSS container-relative length units.
+///
+/// Selection of the eligible ancestor is a layout concern. Once selected, the
+/// unit projection is purely a value operation and therefore stays typed here,
+/// alongside the viewport equivalent.
+/// <https://www.w3.org/TR/css-contain-3/#container-lengths>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ContainerLengthBasis {
+    physical: LayoutSize,
+    writing_mode: WritingMode,
+}
+
+impl ContainerLengthBasis {
+    pub(crate) fn for_writing_mode(physical: LayoutSize, writing_mode: WritingMode) -> Self {
+        Self {
+            physical,
+            writing_mode,
+        }
+    }
+
+    pub(crate) fn cqw(self, percentage: f32) -> LayoutLength {
+        layout_pt(percentage * self.physical.width / 100.0)
+    }
+
+    pub(crate) fn cqh(self, percentage: f32) -> LayoutLength {
+        layout_pt(percentage * self.physical.height / 100.0)
+    }
+
+    pub(crate) fn cqi(self, percentage: f32) -> LayoutLength {
+        match self.writing_mode {
+            WritingMode::HorizontalTb => self.cqw(percentage),
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => self.cqh(percentage),
+        }
+    }
+
+    pub(crate) fn cqb(self, percentage: f32) -> LayoutLength {
+        match self.writing_mode {
+            WritingMode::HorizontalTb => self.cqh(percentage),
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => self.cqw(percentage),
+        }
+    }
+}
+
+/// Used element-font bases for resolving `em` and `ch` components.
+///
+/// CSS Values resolves `em` against the element's used font size and `ch`
+/// against the selected font's zero-glyph advance:
+/// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FontRelativeLengthBasis {
+    font_size: LayoutLength,
+    ch_advance: LayoutLength,
+}
+
+impl FontRelativeLengthBasis {
+    pub(crate) const fn new(font_size: LayoutLength, ch_advance: LayoutLength) -> Self {
+        Self {
+            font_size,
+            ch_advance,
+        }
+    }
+
+    pub(crate) const fn font_size(self) -> LayoutLength {
+        self.font_size
+    }
+
+    pub(crate) const fn ch_advance(self) -> LayoutLength {
+        self.ch_advance
+    }
+}
+
+/// Used root-font metrics for CSS Values root-relative metric units.
+///
+/// The root-relative metric units are intentionally distinct from the
+/// element-font basis: the selected root font, its writing mode, and its
+/// computed line height remain the basis even in an orthogonal descendant.
+/// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RootFontMetricLengthBasis {
+    pub(crate) font_size: LayoutLength,
+    pub(crate) ch_advance: LayoutLength,
+    pub(crate) x_height: LayoutLength,
+    pub(crate) cap_height: LayoutLength,
+    pub(crate) ic_advance: LayoutLength,
+    pub(crate) line_height: LayoutLength,
+}
+
+/// Static capabilities used to evaluate CSS Media Queries for one rendering.
+///
+/// Viewport dimensions are CSS pixels. They are render inputs, rather than
+/// computed style values, because media conditions must be evaluated before
+/// their declarations enter the cascade:
+/// <https://www.w3.org/TR/mediaqueries-4/#media-features>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MediaEnvironment {
+    pub media_type: MediaType,
+    pub viewport: CssViewportSize,
+    pub resolution_dppx: f32,
+}
+
+impl MediaEnvironment {
+    pub const fn new(media_type: MediaType, viewport: CssViewportSize) -> Self {
+        Self {
+            media_type,
+            viewport,
+            resolution_dppx: 1.0,
+        }
+    }
+}
+
+impl Default for MediaEnvironment {
+    fn default() -> Self {
+        // CSS's initial A4 page box in Quire's default print environment.
+        Self::new(MediaType::Print, CssViewportSize::new(793.7008, 1122.5197))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_length_basis_keeps_physical_and_logical_axes_distinct() {
+        let physical = LayoutSize::new(300.0, 200.0);
+        let horizontal = ViewportLengthBasis::for_writing_mode(physical, WritingMode::HorizontalTb);
+        let vertical = ViewportLengthBasis::for_writing_mode(physical, WritingMode::VerticalRl);
+        let sideways = ViewportLengthBasis::for_writing_mode(physical, WritingMode::SidewaysLr);
+
+        assert_eq!(horizontal.vw(100.0), layout_pt(300.0));
+        assert_eq!(horizontal.vh(100.0), layout_pt(200.0));
+        assert_eq!(horizontal.vmin(100.0), layout_pt(200.0));
+        assert_eq!(horizontal.vmax(100.0), layout_pt(300.0));
+        assert_eq!(horizontal.vi(100.0), layout_pt(300.0));
+        assert_eq!(horizontal.vb(100.0), layout_pt(200.0));
+        assert_eq!(vertical.vi(100.0), layout_pt(200.0));
+        assert_eq!(vertical.vb(100.0), layout_pt(300.0));
+        assert_eq!(sideways.vi(100.0), layout_pt(200.0));
+        assert_eq!(sideways.vb(100.0), layout_pt(300.0));
+    }
+}
+
+/// The CSS color space in which a [`Color`] stores its three coordinates.
+///
+/// CSS Color 4 keeps colors in their specified space until they are used by a
+/// physical output device.  In particular, an out-of-sRGB Display-P3 color
+/// must not be clipped merely because Quire's layout engine is not itself a
+/// display device.  See <https://www.w3.org/TR/css-color-4/#color-conversion>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub(crate) enum ColorSpace {
+    Srgb,
+    DisplayP3,
+    A98Rgb,
+    ProphotoRgb,
+    Rec2020,
+    /// Device-independent CIE XYZ, chromatically adapted to D50.
+    XyzD50,
+}
+
+impl ColorSpace {
+    /// Stable discriminant for document-local cache keys.
+    pub(crate) const fn cache_key(self) -> u8 {
+        self as u8
+    }
+}
+
+/// A CSS color with independent alpha and color-space-tagged coordinates.
+///
+/// `r`, `g`, and `b` are historic field names retained while the renderer is
+/// migrated; they are generic three-component coordinates, not necessarily
+/// sRGB channels. Alpha is always clamped as required by CSS Color 4.
+///
+/// <https://www.w3.org/TR/css-color-4/#alpha-value>
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Color {
     pub r: f32,
     pub g: f32,
     pub b: f32,
     pub a: f32,
+    pub(crate) space: ColorSpace,
 }
 
 impl Color {
@@ -14,18 +282,21 @@ impl Color {
         g: 0.0,
         b: 0.0,
         a: 1.0,
+        space: ColorSpace::Srgb,
     };
     pub const WHITE: Self = Self {
         r: 1.0,
         g: 1.0,
         b: 1.0,
         a: 1.0,
+        space: ColorSpace::Srgb,
     };
     pub const TRANSPARENT: Self = Self {
         r: 0.0,
         g: 0.0,
         b: 0.0,
         a: 0.0,
+        space: ColorSpace::Srgb,
     };
 
     pub fn new(r: u8, g: u8, b: u8) -> Self {
@@ -43,6 +314,7 @@ impl Color {
             g: g as f32 / 255.0,
             b: b as f32 / 255.0,
             a: a.clamp(0.0, 1.0),
+            space: ColorSpace::Srgb,
         }
     }
 
@@ -57,6 +329,30 @@ impl Color {
             g: g.clamp(0.0, 1.0),
             b: b.clamp(0.0, 1.0),
             a: a.clamp(0.0, 1.0),
+            space: ColorSpace::Srgb,
+        }
+    }
+
+    /// Create a color in a CSS Color 4 predefined RGB space, retaining
+    /// out-of-gamut coordinates for the eventual output conversion.
+    pub(crate) fn in_space(space: ColorSpace, r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self {
+            r,
+            g,
+            b,
+            a: a.clamp(0.0, 1.0),
+            space,
+        }
+    }
+
+    pub(crate) const fn space(self) -> ColorSpace {
+        self.space
+    }
+
+    pub(crate) fn with_alpha(self, alpha: f32) -> Self {
+        Self {
+            a: alpha.clamp(0.0, 1.0),
+            ..self
         }
     }
 
@@ -93,8 +389,27 @@ pub(crate) struct Stylesheet {
     /// unlayered normal declarations ordered after all layered declarations:
     /// <https://www.w3.org/TR/css-cascade-5/#layer-order>.
     pub layer_names: Vec<String>,
+    /// Prefix bindings declared by CSS `@namespace` rules.
+    ///
+    /// Selector parsing consumes these bindings immediately, but declaration
+    /// values such as `attr(prefix|name)` also need the binding during
+    /// computed-value resolution:
+    /// <https://www.w3.org/TR/css-namespaces-3/#declaration> and
+    /// <https://drafts.csswg.org/css-values-5/#attr-notation>.
+    pub namespace_prefixes: HashMap<String, String>,
     pub rules: Vec<StyleRule>,
+    /// Rules retained from CSS size-container `@container` at-rules. They are
+    /// kept separate because matching depends on layout-time ancestor sizes.
+    /// <https://www.w3.org/TR/css-contain-3/#container-queries>
+    #[allow(
+        dead_code,
+        reason = "container-query matching is retained for layout-time implementation"
+    )]
+    pub container_rules: Vec<ContainerRule>,
+    pub keyframes: Vec<KeyframesRule>,
     pub marker_rules: Vec<StyleRule>,
+    pub before_marker_rules: Vec<StyleRule>,
+    pub after_marker_rules: Vec<StyleRule>,
     pub before_rules: Vec<StyleRule>,
     pub after_rules: Vec<StyleRule>,
     pub first_line_rules: Vec<StyleRule>,
@@ -102,9 +417,9 @@ pub(crate) struct Stylesheet {
     pub page_rules: Vec<PageRule>,
     pub page_declarations: Declarations,
     pub first_page_declarations: Declarations,
-    pub page_margin_boxes: HashMap<String, Declarations>,
     pub font_faces: Vec<CssFontFace>,
     pub font_feature_values: FontFeatureValues,
+    pub font_palette_values: FontPaletteValues,
     pub counter_styles: Vec<CounterStyleRule>,
 }
 
@@ -303,9 +618,19 @@ pub(crate) struct CssFontFace {
     pub family: String,
     pub sources: Vec<FontFaceSource>,
     pub unicode_range: Option<Vec<UnicodeRange>>,
+    /// Scale applied to this face before glyph selection and metrics use.
+    /// CSS Fonts Level 5 `size-adjust` is distinct from the element-level
+    /// `font-size-adjust` property and therefore remains face metadata.
+    pub size_adjust: Option<u32>,
     pub weight: FontWeight,
+    /// `font-weight: auto` (the descriptor initial value) or a variable range.
+    /// In both cases the registered face keeps its intrinsic `wght` axis.
+    pub weight_is_variable: bool,
     pub style: FontStyle,
     pub width: FontWidth,
+    /// `font-stretch: auto` (the descriptor initial value) or a variable range.
+    /// In both cases the registered face keeps its intrinsic `wdth` axis.
+    pub width_is_variable: bool,
     pub font_feature_settings: FontFeatureSettings,
     pub font_variant_ligatures: FontVariantLigatures,
     pub font_variant_position: FontVariantPosition,
@@ -342,20 +667,88 @@ impl UnicodeRange {
 pub(crate) enum FontFaceSource {
     Url {
         value: String,
-        base_url: Option<PathBuf>,
-        root_url: Option<PathBuf>,
+        base_url: Option<url::Url>,
+        root_url: Option<url::Url>,
     },
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct StyleRule {
     pub selector_text: String,
-    pub selector: SelectorList<ReasySelectorImpl>,
+    pub selector: SelectorList<QuireSelectorImpl>,
     pub declarations: Declarations,
     pub specificity: u32,
     pub order: usize,
     pub layer_name: Option<String>,
     pub scopes: Vec<ScopeRule>,
+}
+
+/// A conditional rule set selected by a layout-time query container.
+#[allow(
+    dead_code,
+    reason = "container-query matching is retained for layout-time implementation"
+)]
+#[derive(Debug, Clone)]
+pub(crate) struct ContainerRule {
+    /// Raw prelude retained until the selected container supplies its logical
+    /// axes and computed style for threshold resolution.
+    pub prelude: String,
+    pub rules: Vec<StyleRule>,
+}
+
+#[allow(
+    dead_code,
+    reason = "container-query matching is retained for layout-time implementation"
+)]
+impl ContainerRule {
+    /// Returns the optional query name followed by the parenthesized condition
+    /// text. CSS Containment evaluates this only after container selection.
+    /// <https://www.w3.org/TR/css-contain-3/#container-rule>
+    pub(crate) fn name_and_condition(&self) -> (Option<&str>, &str) {
+        let prelude = self.prelude.trim();
+        let Some(condition_start) = prelude.find('(') else {
+            return (None, prelude);
+        };
+        let name = prelude[..condition_start].trim();
+        (
+            (!name.is_empty()).then_some(name),
+            prelude[condition_start..].trim(),
+        )
+    }
+
+    pub(crate) fn rules(&self) -> &[StyleRule] {
+        &self.rules
+    }
+}
+
+impl Stylesheet {
+    #[allow(
+        dead_code,
+        reason = "container-query matching is retained for layout-time implementation"
+    )]
+    pub(crate) fn container_rules(&self) -> &[ContainerRule] {
+        &self.container_rules
+    }
+}
+
+/// One named CSS keyframes rule.
+///
+/// CSS Animations stores keyframes separately from ordinary style rules: a
+/// keyframe selector supplies declarations only when an animation instance
+/// selects an interval from this rule.
+/// <https://www.w3.org/TR/css-animations-1/#keyframes>
+#[derive(Debug, Clone)]
+pub(crate) struct KeyframesRule {
+    pub(crate) name: String,
+    pub(crate) steps: Vec<KeyframeStep>,
+}
+
+/// Declarations at one normalized keyframe offset in a [`KeyframesRule`].
+#[derive(Debug, Clone)]
+pub(crate) struct KeyframeStep {
+    /// The normalized offset in the inclusive interval `[0, 1]`.
+    pub(crate) offset: f32,
+    pub(crate) declarations: Declarations,
 }
 
 /// Parsed CSS `@scope` root and optional lower boundary selectors.
@@ -367,15 +760,15 @@ pub(crate) struct StyleRule {
 /// <https://www.w3.org/TR/css-cascade-5/#scoped-styles>.
 #[derive(Debug, Clone)]
 pub(crate) struct ScopeRule {
-    pub root: SelectorList<ReasySelectorImpl>,
-    pub limit: Option<SelectorList<ReasySelectorImpl>>,
+    pub root: SelectorList<QuireSelectorImpl>,
+    pub limit: Option<SelectorList<QuireSelectorImpl>>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Declarations {
     items: Vec<(String, String)>,
-    base_url: Option<PathBuf>,
-    root_url: Option<PathBuf>,
+    base_url: Option<url::Url>,
+    root_url: Option<url::Url>,
 }
 
 impl Declarations {
@@ -387,18 +780,18 @@ impl Declarations {
         }
     }
 
-    pub fn with_urls(mut self, base_url: Option<&Path>, root_url: Option<&Path>) -> Self {
-        self.base_url = base_url.map(Path::to_path_buf);
-        self.root_url = root_url.map(Path::to_path_buf);
+    pub fn with_urls(mut self, base_url: Option<&url::Url>, root_url: Option<&url::Url>) -> Self {
+        self.base_url = base_url.cloned();
+        self.root_url = root_url.cloned();
         self
     }
 
-    pub fn base_url(&self) -> Option<&Path> {
-        self.base_url.as_deref()
+    pub fn base_url(&self) -> Option<&url::Url> {
+        self.base_url.as_ref()
     }
 
-    pub fn root_url(&self) -> Option<&Path> {
-        self.root_url.as_deref()
+    pub fn root_url(&self) -> Option<&url::Url> {
+        self.root_url.as_ref()
     }
 
     pub fn is_empty(&self) -> bool {

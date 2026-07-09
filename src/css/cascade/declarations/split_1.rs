@@ -12,8 +12,8 @@ pub(crate) struct CascadedDeclaration<'a> {
     pub name: Cow<'a, str>,
     pub value: Cow<'a, str>,
     pub origin: StylesheetOrigin,
-    pub base_url: Option<&'a std::path::Path>,
-    pub root_url: Option<&'a std::path::Path>,
+    pub base_url: Option<&'a url::Url>,
+    pub root_url: Option<&'a url::Url>,
     pub important: bool,
     pub layer_order: Option<usize>,
     pub specificity: u32,
@@ -50,7 +50,7 @@ pub(in crate::css) fn cascaded_declarations_from(
 /// Sorts declarations into winning cascade order before computed-value resolution.
 ///
 /// CSS Cascade Level 5 sorts by origin/importance, layer order, specificity,
-/// scoped proximity, and source order. Reasyprint currently models UA, user,
+/// scoped proximity, and source order. Quire currently models UA, user,
 /// and author origins:
 /// <https://www.w3.org/TR/css-cascade-5/#cascade-sort>.
 pub(crate) fn sort_cascaded_declarations(declarations: &mut [CascadedDeclaration<'_>]) {
@@ -105,7 +105,7 @@ pub(crate) fn declaration_is_important(value: &str) -> bool {
 
 /// Returns the Cascade Level 5 origin/importance rank from weakest to strongest.
 ///
-/// Reasyprint currently has no transition or animation origin, so the modeled
+/// Quire currently has no transition or animation origin, so the modeled
 /// origin ladder is UA normal, user normal, author normal, author important,
 /// user important, then UA important:
 /// <https://www.w3.org/TR/css-cascade-5/#cascade-origin>.
@@ -133,7 +133,8 @@ pub(in crate::css) fn is_shadowed_by_later_var_declaration(
     name: &str,
 ) -> bool {
     declarations[index + 1..].iter().any(|declaration| {
-        declaration.name.as_ref() == name && trim_css_value(&declaration.value).contains("var(")
+        declaration.name.as_ref() == name
+            && contains_css_variable_reference(trim_css_value(&declaration.value))
     })
 }
 
@@ -192,7 +193,7 @@ pub(in crate::css) fn expand_modeled_shorthands<'a>(
 ) -> Vec<CascadedDeclaration<'a>> {
     let mut expanded = Vec::with_capacity(declarations.len());
     for declaration in declarations {
-        if declaration.value.contains("var(")
+        if contains_css_variable_reference(&declaration.value)
             || declaration_is_revert(&declaration.value)
             || declaration_is_revert_layer(&declaration.value)
         {
@@ -236,6 +237,18 @@ pub(in crate::css) fn expand_box_edge_shorthand(
             "padding-right",
             "padding-bottom",
             "padding-left",
+        ],
+        "scroll-padding" => [
+            "scroll-padding-top",
+            "scroll-padding-right",
+            "scroll-padding-bottom",
+            "scroll-padding-left",
+        ],
+        "scroll-margin" => [
+            "scroll-margin-top",
+            "scroll-margin-right",
+            "scroll-margin-bottom",
+            "scroll-margin-left",
         ],
         "inset" => ["top", "right", "bottom", "left"],
         _ => return None,
@@ -309,6 +322,9 @@ pub(in crate::css) fn expand_simple_modeled_shorthand(
         "list-style" => expand_list_style_shorthand(value),
         "inline-size" | "block-size" | "min-inline-size" | "max-inline-size" | "min-block-size"
         | "max-block-size" => expand_logical_size_value(name, value, writing_mode),
+        "contain-intrinsic-inline-size" | "contain-intrinsic-block-size" => {
+            expand_logical_contain_intrinsic_size_value(name, value, writing_mode)
+        }
         "margin-block"
         | "margin-inline"
         | "margin-block-start"
@@ -325,10 +341,27 @@ pub(in crate::css) fn expand_simple_modeled_shorthand(
         | "padding-inline-end" => {
             expand_logical_box_edge_values(name, value, "padding", direction, writing_mode)
         }
+        "scroll-padding-block"
+        | "scroll-padding-inline"
+        | "scroll-padding-block-start"
+        | "scroll-padding-block-end"
+        | "scroll-padding-inline-start"
+        | "scroll-padding-inline-end" => {
+            expand_logical_box_edge_values(name, value, "scroll-padding", direction, writing_mode)
+        }
+        "scroll-margin-block"
+        | "scroll-margin-inline"
+        | "scroll-margin-block-start"
+        | "scroll-margin-block-end"
+        | "scroll-margin-inline-start"
+        | "scroll-margin-inline-end" => {
+            expand_logical_box_edge_values(name, value, "scroll-margin", direction, writing_mode)
+        }
         "inset-block" | "inset-inline" | "inset-block-start" | "inset-block-end"
         | "inset-inline-start" | "inset-inline-end" => {
             expand_logical_box_edge_values(name, value, "inset", direction, writing_mode)
         }
+        "scroll-padding" | "scroll-margin" => expand_scroll_edge_shorthand(name, value),
         "border" => expand_border_shorthand(value),
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
             expand_border_side_shorthand(name, value)
@@ -367,6 +400,31 @@ pub(in crate::css) fn expand_logical_size_value(
     )])
 }
 
+/// Expand a logical intrinsic-size override to the physical component stored
+/// by the computed style.
+///
+/// CSS Containment's logical longhands follow the element's writing mode in
+/// the same way as CSS Logical Properties sizing longhands:
+/// <https://drafts.csswg.org/css-contain-3/#contain-intrinsic-size> and
+/// <https://www.w3.org/TR/css-logical-1/#dimension-properties>.
+fn expand_logical_contain_intrinsic_size_value(
+    name: &str,
+    value: &str,
+    writing_mode: WritingMode,
+) -> Option<Vec<(&'static str, String)>> {
+    let axes = WritingModeAxes::new(writing_mode, Direction::Ltr);
+    let axis = match name {
+        "contain-intrinsic-inline-size" => axes.physical_axis(LogicalAxis::Inline),
+        "contain-intrinsic-block-size" => axes.physical_axis(LogicalAxis::Block),
+        _ => return None,
+    };
+    let physical_name = match axis {
+        PhysicalAxis::Horizontal => "contain-intrinsic-width",
+        PhysicalAxis::Vertical => "contain-intrinsic-height",
+    };
+    Some(vec![(physical_name, trim_css_value(value).to_string())])
+}
+
 /// Return the physical sizing longhand addressed by a logical size property.
 ///
 /// CSS Logical Properties maps inline/block size longhands through the
@@ -376,8 +434,9 @@ pub(in crate::css) fn logical_size_physical_longhand(
     name: &str,
     writing_mode: WritingMode,
 ) -> Option<&'static str> {
-    let inline_axis = inline_start_side(writing_mode, Direction::Ltr).axis();
-    let block_axis = block_start_side(writing_mode).axis();
+    let axes = WritingModeAxes::new(writing_mode, Direction::Ltr);
+    let inline_axis = axes.physical_axis(LogicalAxis::Inline);
+    let block_axis = axes.physical_axis(LogicalAxis::Block);
     match name {
         "inline-size" => Some(size_longhand_for_axis(inline_axis)),
         "block-size" => Some(size_longhand_for_axis(block_axis)),
@@ -510,6 +569,8 @@ pub(in crate::css) fn expand_logical_box_edge_values(
         match property {
             "margin" => Some(physical_margin_side_longhand(side)),
             "padding" => Some(physical_padding_side_longhand(side)),
+            "scroll-padding" => Some(physical_scroll_padding_side_longhand(side)),
+            "scroll-margin" => Some(physical_scroll_margin_side_longhand(side)),
             "inset" => Some(physical_inset_side_longhand(side)),
             _ => None,
         }
@@ -520,6 +581,10 @@ pub(in crate::css) fn expand_logical_box_edge_values(
             | "margin-inline"
             | "padding-block"
             | "padding-inline"
+            | "scroll-padding-block"
+            | "scroll-padding-inline"
+            | "scroll-margin-block"
+            | "scroll-margin-inline"
             | "inset-block"
             | "inset-inline"
     ) {
@@ -536,6 +601,60 @@ pub(in crate::css) fn expand_logical_box_edge_values(
         ]);
     }
     Some(vec![(longhand(name)?, trim_css_value(value).to_string())])
+}
+
+/// Expand the physical scroll padding and margin shorthands exactly as the
+/// corresponding four-sided box shorthands.
+/// <https://www.w3.org/TR/css-scroll-snap-1/#propdef-scroll-padding>
+/// <https://www.w3.org/TR/css-scroll-snap-1/#propdef-scroll-margin>
+fn expand_scroll_edge_shorthand(name: &str, value: &str) -> Option<Vec<(&'static str, String)>> {
+    let values = split_css_component_values(trim_css_value(value));
+    let [top, right, bottom, left] = match values.as_slice() {
+        [all] => [*all, *all, *all, *all],
+        [vertical, horizontal] => [*vertical, *horizontal, *vertical, *horizontal],
+        [top, horizontal, bottom] => [*top, *horizontal, *bottom, *horizontal],
+        [top, right, bottom, left] => [*top, *right, *bottom, *left],
+        _ => return None,
+    };
+    let names = match name {
+        "scroll-padding" => [
+            "scroll-padding-top",
+            "scroll-padding-right",
+            "scroll-padding-bottom",
+            "scroll-padding-left",
+        ],
+        "scroll-margin" => [
+            "scroll-margin-top",
+            "scroll-margin-right",
+            "scroll-margin-bottom",
+            "scroll-margin-left",
+        ],
+        _ => return None,
+    };
+    Some(vec![
+        (names[0], top.to_string()),
+        (names[1], right.to_string()),
+        (names[2], bottom.to_string()),
+        (names[3], left.to_string()),
+    ])
+}
+
+pub(in crate::css) fn physical_scroll_padding_side_longhand(side: BoxSide) -> &'static str {
+    match side {
+        BoxSide::Top => "scroll-padding-top",
+        BoxSide::Right => "scroll-padding-right",
+        BoxSide::Bottom => "scroll-padding-bottom",
+        BoxSide::Left => "scroll-padding-left",
+    }
+}
+
+pub(in crate::css) fn physical_scroll_margin_side_longhand(side: BoxSide) -> &'static str {
+    match side {
+        BoxSide::Top => "scroll-margin-top",
+        BoxSide::Right => "scroll-margin-right",
+        BoxSide::Bottom => "scroll-margin-bottom",
+        BoxSide::Left => "scroll-margin-left",
+    }
 }
 
 pub(in crate::css) fn physical_inset_side_longhand(side: BoxSide) -> &'static str {

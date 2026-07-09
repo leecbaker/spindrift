@@ -7,6 +7,42 @@ pub(super) struct CollapsedBorderGrid {
     column_count: usize,
 }
 
+/// One collapsed-border grid-line segment in page top-edge coordinates.
+///
+/// CSS Tables centers collapsed borders on grid lines. A horizontal segment
+/// therefore has zero block extent at its physical top-edge coordinate, while
+/// a vertical segment has zero inline extent and an explicit downward block
+/// extent. Keeping this as [`PageTopRect`] prevents a horizontal line's `y`
+/// coordinate from being passed to paint APIs as though it were a bottom edge:
+/// <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CollapsedBorderSegment {
+    rect: PageTopRect,
+    orientation: CollapsedBorderOrientation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollapsedBorderOrientation {
+    Horizontal,
+    Vertical,
+}
+
+impl CollapsedBorderSegment {
+    fn horizontal(left: f32, line_y: f32, width: f32) -> Self {
+        Self {
+            rect: PageTopRect::new(left, line_y, width, 0.0),
+            orientation: CollapsedBorderOrientation::Horizontal,
+        }
+    }
+
+    fn vertical(center_x: f32, top: f32, height: f32) -> Self {
+        Self {
+            rect: PageTopRect::new(center_x, top, 0.0, height),
+            orientation: CollapsedBorderOrientation::Vertical,
+        }
+    }
+}
+
 impl CollapsedBorderGrid {
     pub(super) fn new(row_count: usize, column_count: usize, axes: TableAxes) -> Self {
         Self {
@@ -377,12 +413,12 @@ impl CollapsedBorderGrid {
         let mut paths = Vec::new();
         let mut painted_boundaries = Vec::new();
 
-        for (local_row, original_row) in original_rows.iter().copied().enumerate() {
+        for (local_row, original_row) in original_rows.iter().cloned().enumerate() {
             let (Some(top), Some(height), Some(offset), Some(original_height)) = (
-                row_tops.get(local_row).copied(),
-                row_heights.get(local_row).copied(),
-                row_offsets.get(local_row).copied(),
-                original_row_heights.get(local_row).copied(),
+                row_tops.get(local_row).cloned(),
+                row_heights.get(local_row).cloned(),
+                row_offsets.get(local_row).cloned(),
+                original_row_heights.get(local_row).cloned(),
             ) else {
                 continue;
             };
@@ -431,9 +467,11 @@ impl CollapsedBorderGrid {
                 border.paint_vertical(
                     &mut rects,
                     &mut paths,
-                    placement.x_for(column_plan.boundary_x(boundary)),
-                    top + top_extension,
-                    height + top_extension + bottom_extension,
+                    CollapsedBorderSegment::vertical(
+                        placement.x_for(column_plan.boundary_x(boundary)),
+                        top + top_extension,
+                        height + top_extension + bottom_extension,
+                    ),
                 );
             }
         }
@@ -471,10 +509,12 @@ impl CollapsedBorderGrid {
             border.paint_horizontal(
                 rects,
                 paths,
-                placement.x_for(column_plan.inline_bounds_for_span(column, 1).start)
-                    - before_extension,
-                y,
-                column_plan.width_for_span(column, 1) + before_extension + after_extension,
+                CollapsedBorderSegment::horizontal(
+                    placement.x_for(column_plan.inline_bounds_for_span(column, 1).start)
+                        - before_extension,
+                    y,
+                    column_plan.width_for_span(column, 1) + before_extension + after_extension,
+                ),
             );
         }
     }
@@ -710,48 +750,26 @@ impl CollapsedBorder {
         self,
         rects: &mut Vec<RenderedRect>,
         paths: &mut Vec<RenderedPath>,
-        x: f32,
-        y: f32,
-        width: f32,
+        segment: CollapsedBorderSegment,
     ) {
         let border = self.used_side();
         if !border.is_visible() {
             return;
         }
-        paint_collapsed_border_side(
-            rects,
-            paths,
-            self.side.border_edge(),
-            x,
-            width,
-            y - border.used_width / 2.0,
-            true,
-            border,
-        );
+        paint_collapsed_border_side(rects, paths, self.side.border_edge(), segment, border);
     }
 
     pub(super) fn paint_vertical(
         self,
         rects: &mut Vec<RenderedRect>,
         paths: &mut Vec<RenderedPath>,
-        x: f32,
-        top: f32,
-        height: f32,
+        segment: CollapsedBorderSegment,
     ) {
         let border = self.used_side();
         if !border.is_visible() {
             return;
         }
-        paint_collapsed_border_side(
-            rects,
-            paths,
-            self.side.border_edge(),
-            top - height,
-            height,
-            x - border.used_width / 2.0,
-            false,
-            border,
-        );
+        paint_collapsed_border_side(rects, paths, self.side.border_edge(), segment, border);
     }
 }
 
@@ -845,16 +863,27 @@ pub(super) fn paint_collapsed_border_side(
     rects: &mut Vec<RenderedRect>,
     paths: &mut Vec<RenderedPath>,
     edge: BorderEdge,
-    axis_start: f32,
-    axis_length: f32,
-    cross_start: f32,
-    horizontal: bool,
+    segment: CollapsedBorderSegment,
     border: UsedBorderSide,
 ) {
     if !border.is_visible() {
         return;
     }
     let cross_width = border.used_width;
+    let (axis_start, axis_length, cross_start, horizontal) = match segment.orientation {
+        CollapsedBorderOrientation::Horizontal => (
+            segment.rect.x(),
+            segment.rect.width(),
+            segment.rect.top_y() - cross_width / 2.0,
+            true,
+        ),
+        CollapsedBorderOrientation::Vertical => (
+            segment.rect.bottom_y(),
+            segment.rect.height(),
+            segment.rect.x() - cross_width / 2.0,
+            false,
+        ),
+    };
     let style = collapsed_border_paint_style(border.style);
     if style == BorderStyle::Double && cross_width >= 3.0 {
         let stripe = (border.used_width / 3.0).max(1.0);
@@ -1008,5 +1037,48 @@ mod tests {
         assert!((insets.right - expected_side).abs() < 0.01);
         assert!((insets.top - expected_side).abs() < 0.01);
         assert!((insets.bottom - expected_side).abs() < 0.01);
+    }
+
+    #[test]
+    fn collapsed_border_segments_project_horizontal_and_vertical_grid_lines() {
+        let border = UsedBorderSide::new(6.0, BorderStyle::Solid, Color::BLACK);
+        let mut rects = Vec::new();
+        let mut paths = Vec::new();
+
+        paint_collapsed_border_side(
+            &mut rects,
+            &mut paths,
+            BorderEdge::Top,
+            CollapsedBorderSegment::horizontal(10.0, 80.0, 30.0),
+            border,
+        );
+        paint_collapsed_border_side(
+            &mut rects,
+            &mut paths,
+            BorderEdge::Left,
+            CollapsedBorderSegment::vertical(50.0, 90.0, 40.0),
+            border,
+        );
+
+        assert!(paths.is_empty());
+        assert_eq!(rects.len(), 2);
+        assert_eq!(
+            (
+                rects[0].x(),
+                rects[0].y(),
+                rects[0].width(),
+                rects[0].height()
+            ),
+            (10.0, 77.0, 30.0, 6.0)
+        );
+        assert_eq!(
+            (
+                rects[1].x(),
+                rects[1].y(),
+                rects[1].width(),
+                rects[1].height()
+            ),
+            (47.0, 50.0, 6.0, 40.0)
+        );
     }
 }

@@ -17,6 +17,9 @@ pub(in crate::layout) fn constrain(mut value: f32, min: Option<f32>, max: Option
 }
 
 pub(in crate::layout) fn inline_text(element: &Element) -> String {
+    if element_suppresses_direct_text_children(element) {
+        return String::new();
+    }
     let mut output = String::new();
     for child in &element.children {
         collect_inline_text(child, &mut output);
@@ -47,6 +50,9 @@ pub(in crate::layout) fn inline_text_for_style(element: &Element, style: &Comput
 }
 
 pub(in crate::layout) fn own_inline_text(element: &Element) -> String {
+    if element_suppresses_direct_text_children(element) {
+        return String::new();
+    }
     let mut output = String::new();
     for child in &element.children {
         match &child.kind {
@@ -114,7 +120,11 @@ pub(in crate::layout) fn text_with_visible_control_characters(text: &str) -> Str
 
 pub(in crate::layout) fn is_visible_control_character(character: char) -> bool {
     character_is_unicode_control(character)
-        && !is_css_collapsible_whitespace(character)
+        // CSS Text treats TAB, LF, and CR as document white space. Form feed
+        // is a visible Cc character in the white-space processing tests and
+        // must not be discarded merely because generic CSS token whitespace
+        // handling recognizes it.
+        && !matches!(character, '\t' | '\n' | '\r')
         && character != INLINE_BREAK
 }
 
@@ -122,6 +132,9 @@ pub(in crate::layout) fn pre_wrap_inline_text_for_style(
     element: &Element,
     style: &ComputedStyle,
 ) -> String {
+    if element_suppresses_direct_text_children(element) {
+        return String::new();
+    }
     let mut output = String::new();
     for child in &element.children {
         collect_pre_wrap_inline_text(child, &mut output);
@@ -133,6 +146,9 @@ pub(in crate::layout) fn pre_line_inline_text_for_style(
     element: &Element,
     style: &ComputedStyle,
 ) -> String {
+    if element_suppresses_direct_text_children(element) {
+        return String::new();
+    }
     let mut output = String::new();
     for child in &element.children {
         collect_pre_wrap_inline_text(child, &mut output);
@@ -147,6 +163,7 @@ pub(in crate::layout) fn collect_inline_text(node: &Node, output: &mut String) {
             output.push(' ');
         }
         NodeKind::Element(element) if is_line_break_element(element) => output.push(INLINE_BREAK),
+        NodeKind::Element(element) if element_suppresses_direct_text_children(element) => {}
         NodeKind::Element(element) if is_default_block_container_tag(&element.tag) => {}
         NodeKind::Element(element) => {
             for child in &element.children {
@@ -160,6 +177,7 @@ pub(in crate::layout) fn collect_pre_wrap_inline_text(node: &Node, output: &mut 
     match &node.kind {
         NodeKind::Text(text) => output.push_str(text),
         NodeKind::Element(element) if is_line_break_element(element) => output.push('\n'),
+        NodeKind::Element(element) if element_suppresses_direct_text_children(element) => {}
         NodeKind::Element(element) if is_default_block_container_tag(&element.tag) => {}
         NodeKind::Element(element) => {
             for child in &element.children {
@@ -169,12 +187,18 @@ pub(in crate::layout) fn collect_pre_wrap_inline_text(node: &Node, output: &mut 
     }
 }
 
-pub(in crate::layout) const INLINE_BREAK: char = '\u{000B}';
+/// Private marker used while collecting HTML `<br>` boundaries.
+///
+/// U+000B is an authored Unicode control character and CSS Text requires it
+/// to remain visible, so it cannot also be Quire's internal break sentinel.
+/// U+FDD0 is a noncharacter and never arises from normal HTML/CSS text input.
+/// <https://drafts.csswg.org/css-text-3/#white-space-processing>
+pub(in crate::layout) const INLINE_BREAK: char = '\u{FDD0}';
 
 pub(in crate::layout) fn normalize_inline_text(text: &str) -> String {
     let mut output = String::new();
     let mut last_was_space = true;
-    for character in dom::decode_entities_public(text).chars() {
+    for character in text.chars() {
         if character == INLINE_BREAK {
             while output.ends_with(' ') {
                 output.pop();
@@ -198,9 +222,7 @@ pub(in crate::layout) fn normalize_pre_wrap_text_for_style(
     text: &str,
     _style: &ComputedStyle,
 ) -> String {
-    dom::decode_entities_public(text)
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 pub(in crate::layout) fn normalize_pre_line_text_for_style(

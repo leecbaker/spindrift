@@ -134,11 +134,12 @@ pub(crate) fn parse_symbols_function_symbols(mut value: &str) -> Vec<String> {
         if let Some((string, tail)) = parse_css_string_token(value) {
             symbols.push(string);
             value = tail.trim_start();
-        } else if let Some((token, tail)) = split_symbols_token(value) {
-            symbols.push(unescape_symbols_token(token));
-            value = tail.trim_start();
         } else {
-            break;
+            // CSS Counter Styles Level 3 only permits strings and images in
+            // symbols(). Unlike @counter-style's symbols descriptor, bare
+            // identifiers are not valid anonymous counter-style symbols.
+            // <https://drafts.csswg.org/css-counter-styles-3/#symbols-function>
+            return Vec::new();
         }
     }
     symbols
@@ -151,16 +152,6 @@ pub(crate) fn split_symbols_token(value: &str) -> Option<(&str, &str)> {
         .find_map(|(index, character)| character.is_whitespace().then_some(index))
         .unwrap_or(value.len());
     (end > 0).then_some((&value[..end], &value[end..]))
-}
-
-pub(crate) fn unescape_symbols_token(value: &str) -> String {
-    if let Some(hex) = value.strip_prefix('\\')
-        && let Ok(codepoint) = u32::from_str_radix(hex, 16)
-        && let Some(character) = char::from_u32(codepoint)
-    {
-        return character.to_string();
-    }
-    value.to_string()
 }
 
 pub(crate) fn is_counter_style_ident(value: &str) -> bool {
@@ -179,24 +170,82 @@ pub(crate) fn is_counter_style_ident(value: &str) -> bool {
 }
 
 pub(crate) fn parse_font_family_names(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(|part| part.trim().trim_matches('"').trim_matches('\'').to_string())
-        .filter(|part| !part.is_empty())
+    parse_font_family_components(value)
+        .into_iter()
+        .map(|(name, _)| name)
         .collect()
 }
 
 pub(crate) fn parse_font_family(value: &str) -> Option<FontFamily> {
-    let families = parse_font_family_names(value);
-    if families.is_empty() {
+    let components = parse_font_family_components(value);
+    if components.is_empty() {
         return None;
     }
-    if families.len() == 1
-        && let Some(generic) = generic_font_family(&families[0])
-    {
-        return Some(generic);
+    let families = components
+        .into_iter()
+        .map(|(name, quoted)| {
+            (!quoted)
+                .then(|| generic_font_family(&name))
+                .flatten()
+                .unwrap_or_else(|| FontFamily::Names(vec![name]))
+        })
+        .collect::<Vec<_>>();
+    if families.len() == 1 {
+        Some(families.into_iter().next().unwrap())
+    } else {
+        Some(FontFamily::List(families))
     }
-    Some(FontFamily::Names(families))
+}
+
+/// Parse the comma-separated `font-family` list while retaining whether each
+/// name was quoted. CSS generic-family keywords are keywords only when
+/// unquoted; quoted `"serif"` or `"ui-serif"` are ordinary family names.
+/// <https://www.w3.org/TR/css-fonts-4/#generic-font-families>
+fn parse_font_family_components(value: &str) -> Vec<(String, bool)> {
+    let mut components = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(open_quote) = quote {
+            if character == open_quote {
+                quote = None;
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == ',' {
+            parse_font_family_component(&value[start..index], &mut components);
+            start = index + character.len_utf8();
+        }
+    }
+    parse_font_family_component(&value[start..], &mut components);
+    components
+}
+
+fn parse_font_family_component(value: &str, components: &mut Vec<(String, bool)>) {
+    let value = value.trim();
+    let quoted = value
+        .chars()
+        .next()
+        .zip(value.chars().next_back())
+        .is_some_and(|(first, last)| matches!(first, '\'' | '"') && first == last)
+        && value.len() >= 2;
+    let name = if quoted {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    if !name.is_empty() {
+        components.push((name.to_string(), quoted));
+    }
 }
 
 /// Parsed CSS `font` shorthand components currently modeled by `ComputedStyle`.
@@ -213,6 +262,7 @@ pub(crate) struct ParsedFontShorthand {
     pub(crate) width: FontWidth,
     pub(crate) variant_caps: FontVariantCaps,
     pub(crate) size: f32,
+    pub(crate) deferred_size: DeferredFontSize,
     pub(crate) line_height: Option<ComputedLineHeight>,
     pub(crate) family: FontFamily,
 }
@@ -262,7 +312,7 @@ pub(crate) fn parse_font_shorthand(
     parse_font_shorthand_with_parent_ch_advance(
         value,
         inherited_font_size,
-        inherited_font_size * 0.5,
+        layout_pt(inherited_font_size * 0.5),
         inherited_font_weight,
     )
 }
@@ -270,7 +320,7 @@ pub(crate) fn parse_font_shorthand(
 pub(crate) fn parse_font_shorthand_with_parent_ch_advance(
     value: &str,
     inherited_font_size: f32,
-    inherited_ch_advance: f32,
+    inherited_ch_advance: LayoutLength,
     inherited_font_weight: FontWeight,
 ) -> Option<ParsedFontShorthand> {
     parse_font_shorthand_with_line_height_font_size(
@@ -294,7 +344,7 @@ pub(crate) fn parse_font_shorthand_with_parent_ch_advance(
 pub(crate) fn parse_font_shorthand_with_line_height_font_size(
     value: &str,
     inherited_font_size: f32,
-    inherited_ch_advance: f32,
+    inherited_ch_advance: LayoutLength,
     inherited_font_weight: FontWeight,
     line_height_font_size: Option<f32>,
 ) -> Option<ParsedFontShorthand> {
@@ -331,13 +381,17 @@ pub(crate) fn parse_font_shorthand_with_line_height_font_size(
         inherited_ch_advance,
         line_height_font_size,
     )?;
+    let size_token = split_font_token_on_slash(tokens[size_index])
+        .map(|(size, _)| size)
+        .unwrap_or(tokens[size_index]);
+    let deferred_size = parse_deferred_font_size(size_token)?;
     let mut family_start = size_index + 1;
     if line_height.is_none() && tokens.get(family_start).is_some_and(|token| *token == "/") {
         let line_height_font_size = line_height_font_size.unwrap_or(size);
         line_height = tokens
             .get(family_start + 1)
             .and_then(|token| parse_computed_line_height(token, line_height_font_size));
-        line_height?;
+        line_height.clone()?;
         family_start += 2;
     }
     let family = tokens.get(family_start..)?.join(" ");
@@ -349,6 +403,7 @@ pub(crate) fn parse_font_shorthand_with_line_height_font_size(
         width,
         variant_caps,
         size,
+        deferred_size,
         line_height,
         family,
     })
@@ -357,7 +412,7 @@ pub(crate) fn parse_font_shorthand_with_line_height_font_size(
 fn split_font_size_and_line_height(
     token: &str,
     inherited_font_size: f32,
-    inherited_ch_advance: f32,
+    inherited_ch_advance: LayoutLength,
 ) -> Option<(f32, Option<ComputedLineHeight>)> {
     split_font_size_and_line_height_with_line_height_font_size(
         token,
@@ -370,7 +425,7 @@ fn split_font_size_and_line_height(
 fn split_font_size_and_line_height_with_line_height_font_size(
     token: &str,
     inherited_font_size: f32,
-    inherited_ch_advance: f32,
+    inherited_ch_advance: LayoutLength,
     line_height_font_size: Option<f32>,
 ) -> Option<(f32, Option<ComputedLineHeight>)> {
     let Some((size, line_height)) = split_font_token_on_slash(token) else {
@@ -406,15 +461,16 @@ fn split_font_token_on_slash(token: &str) -> Option<(&str, &str)> {
         .then_some((size.trim(), line_height.trim()))
 }
 
-pub(crate) fn known_font_family(value: &str) -> Option<FontFamily> {
-    generic_font_family(value)
-}
-
 pub(crate) fn generic_font_family(value: &str) -> Option<FontFamily> {
     match value.trim().to_ascii_lowercase().as_str() {
         "serif" => Some(FontFamily::Serif),
         "monospace" => Some(FontFamily::Monospace),
         "sans-serif" | "sans serif" => Some(FontFamily::SansSerif),
+        "system-ui" => Some(FontFamily::SystemUi),
+        "ui-serif" => Some(FontFamily::UiSerif),
+        "ui-sans-serif" => Some(FontFamily::UiSansSerif),
+        "ui-monospace" => Some(FontFamily::UiMonospace),
+        "ui-rounded" => Some(FontFamily::UiRounded),
         _ => None,
     }
 }
@@ -439,7 +495,7 @@ pub(crate) fn parse_font_size_adjust(value: &str) -> Option<FontSizeAdjust> {
                 return None;
             }
         } else {
-            let value = token.parse::<f32>().ok()?;
+            let value = parse_font_size_adjust_number(token)?;
             if !value.is_finite() || value < 0.0 {
                 return None;
             }
@@ -455,6 +511,134 @@ pub(crate) fn parse_font_size_adjust(value: &str) -> Option<FontSizeAdjust> {
         metric: metric.unwrap_or(FontSizeAdjustMetric::ExHeight),
         value: adjust_value?,
     })
+}
+
+/// Parse the dimensionless numeric grammar accepted by `font-size-adjust`.
+///
+/// CSS Values permits a `<number>` in this property to be a `calc()` expression
+/// whose result is dimensionless. Keeping this separate from length math avoids
+/// silently accepting dimensions or percentages in the descriptor grammar.
+/// <https://www.w3.org/TR/css-fonts-5/#font-size-adjust-prop>
+/// <https://www.w3.org/TR/css-values-4/#calc-syntax>
+fn parse_font_size_adjust_number(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if let Some(inner) = value
+        .strip_prefix("calc(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let mut parser = FontSizeAdjustNumberParser::new(inner);
+        let result = parser.sum()?;
+        parser.skip_whitespace();
+        return parser
+            .input
+            .get(parser.position..)
+            .filter(|rest| rest.is_empty())
+            .map(|_| result);
+    }
+    value.parse().ok()
+}
+
+struct FontSizeAdjustNumberParser<'a> {
+    input: &'a str,
+    position: usize,
+}
+
+impl<'a> FontSizeAdjustNumberParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, position: 0 }
+    }
+
+    fn sum(&mut self) -> Option<f32> {
+        let mut result = self.product()?;
+        loop {
+            self.skip_whitespace();
+            let operator = self.next_byte();
+            match operator {
+                Some(b'+') => result += self.product()?,
+                Some(b'-') => result -= self.product()?,
+                Some(_) => {
+                    self.position = self.position.saturating_sub(1);
+                    return Some(result);
+                }
+                None => return Some(result),
+            }
+        }
+    }
+
+    fn product(&mut self) -> Option<f32> {
+        let mut result = self.factor()?;
+        loop {
+            self.skip_whitespace();
+            let operator = self.next_byte();
+            match operator {
+                Some(b'*') => result *= self.factor()?,
+                Some(b'/') => {
+                    let divisor = self.factor()?;
+                    if divisor == 0.0 {
+                        return None;
+                    }
+                    result /= divisor;
+                }
+                Some(_) => {
+                    self.position = self.position.saturating_sub(1);
+                    return Some(result);
+                }
+                None => return Some(result),
+            }
+        }
+    }
+
+    fn factor(&mut self) -> Option<f32> {
+        self.skip_whitespace();
+        let sign = match self.next_byte() {
+            Some(b'+') => 1.0,
+            Some(b'-') => -1.0,
+            Some(_) => {
+                self.position = self.position.saturating_sub(1);
+                1.0
+            }
+            None => return None,
+        };
+        self.skip_whitespace();
+        if self.peek_byte() == Some(b'(') {
+            self.position += 1;
+            let value = self.sum()?;
+            self.skip_whitespace();
+            if self.next_byte() != Some(b')') {
+                return None;
+            }
+            return Some(sign * value);
+        }
+        let start = self.position;
+        while self.peek_byte().is_some_and(|byte| {
+            byte.is_ascii_digit() || matches!(byte, b'.' | b'e' | b'E' | b'+' | b'-')
+        }) {
+            self.position += 1;
+        }
+        (start != self.position)
+            .then(|| self.input[start..self.position].parse::<f32>().ok())
+            .flatten()
+            .map(|value| sign * value)
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .peek_byte()
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            self.position += 1;
+        }
+    }
+
+    fn peek_byte(&self) -> Option<u8> {
+        self.input.as_bytes().get(self.position).cloned()
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        let byte = self.peek_byte()?;
+        self.position += 1;
+        Some(byte)
+    }
 }
 
 fn parse_font_size_adjust_metric(value: &str) -> Option<FontSizeAdjustMetric> {
@@ -501,6 +685,38 @@ pub(crate) fn parse_font_width(value: &str) -> Option<FontWidth> {
         value => {
             parse_percentage(value).and_then(|percent| FontWidth::from_percent(percent * 100.0))
         }
+    }
+}
+
+pub(crate) fn parse_font_synthesis(value: &str) -> Option<FontSynthesis> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("none") {
+        return Some(FontSynthesis::NONE);
+    }
+    let mut synthesis = FontSynthesis::NONE;
+    let mut seen = false;
+    for token in value.split_ascii_whitespace() {
+        let enabled = match token.to_ascii_lowercase().as_str() {
+            "weight" => &mut synthesis.weight,
+            "style" => &mut synthesis.style,
+            "small-caps" => &mut synthesis.small_caps,
+            "position" => &mut synthesis.position,
+            _ => return None,
+        };
+        if *enabled {
+            return None;
+        }
+        *enabled = true;
+        seen = true;
+    }
+    seen.then_some(synthesis)
+}
+
+pub(crate) fn parse_font_synthesis_subproperty(value: &str) -> Option<bool> {
+    match trim_css_value(value).to_ascii_lowercase().as_str() {
+        "auto" => Some(true),
+        "none" => Some(false),
+        _ => None,
     }
 }
 
@@ -783,6 +999,28 @@ pub(crate) fn parse_font_variant_emoji(value: &str) -> Option<FontVariantEmoji> 
         "emoji" => Some(FontVariantEmoji::Emoji),
         "unicode" => Some(FontVariantEmoji::Unicode),
         _ => None,
+    }
+}
+
+/// Parse CSS Fonts' `font-palette` property excluding the named palette
+/// definition lookup, which happens after the stylesheet has been loaded.
+/// <https://www.w3.org/TR/css-fonts-4/#font-palette-prop>
+pub(crate) fn parse_font_palette(value: &str) -> Option<FontPalette> {
+    let value = trim_css_value(value);
+    match value.to_ascii_lowercase().as_str() {
+        "normal" => Some(FontPalette::Normal),
+        "light" => Some(FontPalette::Light),
+        "dark" => Some(FontPalette::Dark),
+        _ => value
+            .strip_prefix("palette ")
+            .and_then(|index| index.trim().parse::<u16>().ok())
+            .map(FontPalette::Index)
+            .or_else(|| {
+                value
+                    .strip_prefix("--")
+                    .filter(|name| !name.is_empty())
+                    .map(|_| FontPalette::Named(value.to_string()))
+            }),
     }
 }
 

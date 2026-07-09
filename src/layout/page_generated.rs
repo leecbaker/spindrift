@@ -119,8 +119,8 @@ pub(super) struct PageContentResolveContext<'a> {
     pub page_number: usize,
     pub total_pages: usize,
     pub page_index: usize,
-    pub base_url: Option<&'a Path>,
-    pub root_url: Option<&'a Path>,
+    pub base_url: Option<&'a url::Url>,
+    pub root_url: Option<&'a url::Url>,
     pub page_named_strings: &'a [HashMap<String, Vec<NamedStringAssignment>>],
     pub page_running_elements: &'a [HashMap<String, Vec<NamedStringAssignment>>],
     pub page_anchors: &'a HashMap<String, usize>,
@@ -177,9 +177,14 @@ pub(super) fn resolve_page_content_parts(
                 GeneratedContentPart::Leader(text),
             )),
             PageContentPart::PageCounter { style } => {
+                let value = context
+                    .page_counters
+                    .get("page")
+                    .cloned()
+                    .unwrap_or(context.page_number as i32);
                 push_resolved_text(
                     &mut output,
-                    &format_page_counter_value(context.page_number, style, context.counter_styles),
+                    &format_page_counter_i32(value, style, context.counter_styles),
                 );
             }
             PageContentPart::PagesCounter { style } => {
@@ -189,7 +194,17 @@ pub(super) fn resolve_page_content_parts(
                 );
             }
             PageContentPart::Counter { name, style } => {
-                let value = context.page_counters.get(&name).copied().unwrap_or(0);
+                let value = if name.eq_ignore_ascii_case("page") {
+                    context
+                        .page_counters
+                        .get("page")
+                        .cloned()
+                        .unwrap_or(context.page_number as i32)
+                } else if name.eq_ignore_ascii_case("pages") {
+                    context.total_pages as i32
+                } else {
+                    context.page_counters.get(&name).cloned().unwrap_or(0)
+                };
                 push_resolved_text(
                     &mut output,
                     &format_page_counter_i32(value, style, context.counter_styles),
@@ -200,7 +215,17 @@ pub(super) fn resolve_page_content_parts(
                 separator,
                 style,
             } => {
-                let value = context.page_counters.get(&name).copied().unwrap_or(0);
+                let value = if name.eq_ignore_ascii_case("page") {
+                    context
+                        .page_counters
+                        .get("page")
+                        .cloned()
+                        .unwrap_or(context.page_number as i32)
+                } else if name.eq_ignore_ascii_case("pages") {
+                    context.total_pages as i32
+                } else {
+                    context.page_counters.get(&name).cloned().unwrap_or(0)
+                };
                 let counter = format_page_counter_i32(value, style, context.counter_styles);
                 if !counter.is_empty() {
                     push_resolved_text(&mut output, &counter);
@@ -339,7 +364,7 @@ fn append_resolved_items(
 }
 
 fn push_resolved_text(output: &mut Vec<PageMarginContentItem>, value: &str) {
-    let text = decode_css_escapes(&dom::decode_entities_public(value));
+    let text = decode_css_escapes(value);
     if text.is_empty() {
         return;
     }
@@ -355,20 +380,24 @@ fn push_resolved_text(output: &mut Vec<PageMarginContentItem>, value: &str) {
 
 fn page_content_image_with_context_urls(
     mut image: BackgroundImage,
-    base_url: Option<&Path>,
-    root_url: Option<&Path>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
 ) -> BackgroundImage {
+    let mut selected = &mut image;
+    while let BackgroundImage::ImageSet { image, .. } = selected {
+        selected = image;
+    }
     if let BackgroundImage::Url {
         base_url: image_base_url,
         root_url: image_root_url,
         ..
-    } = &mut image
+    } = selected
     {
         if image_base_url.is_none() {
-            *image_base_url = base_url.map(Path::to_path_buf);
+            *image_base_url = base_url.cloned();
         }
         if image_root_url.is_none() {
-            *image_root_url = root_url.map(Path::to_path_buf);
+            *image_root_url = root_url.cloned();
         }
     }
     image
@@ -512,6 +541,7 @@ fn parse_page_image_token(value: &str) -> Option<(BackgroundImage, &str)> {
                 src,
                 base_url: None,
                 root_url: None,
+                request_modifiers: css::RequestUrlModifiers::default(),
             },
             tail,
         ));
@@ -940,7 +970,7 @@ fn decode_css_escapes(value: &str) -> String {
         }
         let mut hex = String::new();
         while hex.len() < 6 {
-            let Some(next) = chars.peek().copied() else {
+            let Some(next) = chars.peek().cloned() else {
                 break;
             };
             if next.is_ascii_hexdigit() {
@@ -976,8 +1006,8 @@ fn decode_css_escapes(value: &str) -> String {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn parses_typed_page_content_parts() {
+    #[test]
+    fn parses_typed_page_content_parts() {
         assert_eq!(
             parse_page_content(r#""Page " counter(page) " / " counter(pages)"#).unwrap(),
             vec![

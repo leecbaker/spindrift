@@ -1,4 +1,7 @@
+use std::rc::Rc;
+
 use super::*;
+use crate::layout::inline_collect::{InlineBoxEdge, inline_box_edge_has_nonzero_component};
 
 pub(in crate::layout) fn char_boundary_slice(
     text: &str,
@@ -122,9 +125,9 @@ where
     line.iter()
         .rev()
         .find_map(|item| match item.as_ref() {
-            InlineLineItem::Fragment(fragment) if !fragment.text().is_empty() => Some(
-                line_end_letter_spacing_width(fragment.text(), fragment.style()),
-            ),
+            InlineLineItem::Fragment(fragment) if !fragment.text().is_empty() => {
+                Some(line_end_letter_spacing_width(fragment.text(), fragment.style()).points())
+            }
             InlineLineItem::Atom(_) => Some(0.0),
             _ => None,
         })
@@ -139,21 +142,77 @@ where
     T: AsRef<InlineLineItem>,
 {
     let mut width = 0.0;
+    let mut follows_hanging_separator = false;
     for item in line.iter().rev() {
-        let InlineLineItem::Fragment(fragment) = item.as_ref() else {
-            break;
+        let fragment = match item.as_ref() {
+            // Regular inline box edges are decoration ownership markers, not
+            // textual line content. CSS Text Phase II finds a trailing
+            // space-separator sequence through nested inline boxes.
+            // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+            InlineLineItem::Atom(atom)
+                if matches!(
+                    atom.content(),
+                    InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
+                ) =>
+            {
+                continue;
+            }
+            InlineLineItem::Fragment(fragment) => fragment,
+            InlineLineItem::Atom(_) | InlineLineItem::Float(_) => break,
         };
         if fragment.text().is_empty() {
             continue;
         }
-        let measured =
-            trim_trailing_css_hanging_space_separators(fragment.text(), fragment.style());
-        if measured.len() == fragment.text().len() {
-            break;
-        }
-        width += font_system.measure_text(&fragment.text()[measured.len()..], fragment.style());
-        if !measured.is_empty() {
-            break;
+        for character in fragment.text().chars().rev() {
+            // CSS Text Phase II first removes a collapsible document-space
+            // suffix. That removal exposes a preceding other-space separator
+            // sequence as the visual line edge, so it must not stop this
+            // reverse scan or be charged to the hanging sequence itself.
+            // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+            if fragment.style().white_space.collapses_spaces()
+                && is_css_collapsible_whitespace(character)
+                && !follows_hanging_separator
+            {
+                continue;
+            }
+            if character_is_css_other_space_separator(character)
+                && fragment
+                    .style()
+                    .white_space
+                    .hangs_trailing_space_separators()
+            {
+                width += font_system.measure_text(&character.to_string(), fragment.style());
+                follows_hanging_separator = true;
+                continue;
+            }
+            // A selected legacy line edge is one whitespace sequence, not a
+            // sequence of independently trimmed runs. An interleaved document
+            // space belongs to the unconditional hanging sequence once a
+            // following other space separator has selected that sequence.
+            // `pre-wrap` has a distinct conditional hanging effect, so it
+            // accounts for its preserved document-space advances separately.
+            // <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
+            if fragment.style().white_space == WhiteSpace::PreWrap
+                && fragment
+                    .style()
+                    .white_space
+                    .hangs_trailing_space_separators()
+                && is_css_preserved_document_space(character)
+            {
+                continue;
+            }
+            if fragment.style().white_space != WhiteSpace::PreWrap
+                && fragment
+                    .style()
+                    .white_space
+                    .hangs_trailing_space_separators()
+                && follows_hanging_separator
+                && is_css_preserved_document_space(character)
+            {
+                width += font_system.measure_text(&character.to_string(), fragment.style());
+                continue;
+            }
+            return width;
         }
     }
     width
@@ -171,8 +230,11 @@ pub(in crate::layout) fn inline_atom_logical_inline_size(
     containing_style: &ComputedStyle,
 ) -> f32 {
     match containing_style.writing_mode {
-        WritingMode::HorizontalTb => atom.width,
-        WritingMode::VerticalRl | WritingMode::VerticalLr => atom.height,
+        WritingMode::HorizontalTb => atom.size.width,
+        WritingMode::VerticalRl
+        | WritingMode::VerticalLr
+        | WritingMode::SidewaysRl
+        | WritingMode::SidewaysLr => atom.size.height,
     }
 }
 
@@ -188,8 +250,11 @@ pub(in crate::layout) fn inline_atom_logical_block_size(
     containing_style: &ComputedStyle,
 ) -> f32 {
     match containing_style.writing_mode {
-        WritingMode::HorizontalTb => atom.height,
-        WritingMode::VerticalRl | WritingMode::VerticalLr => atom.width,
+        WritingMode::HorizontalTb => atom.size.height,
+        WritingMode::VerticalRl
+        | WritingMode::VerticalLr
+        | WritingMode::SidewaysRl
+        | WritingMode::SidewaysLr => atom.size.width,
     }
 }
 
@@ -281,146 +346,6 @@ pub(in crate::layout) fn inline_atom_margin_for_side(atom: &InlineAtom, side: Ph
     }
 }
 
-impl<'a> LayoutBuilder<'a> {
-    /// Return graph-backed max-content width for text in inline contexts.
-    ///
-    /// CSS Sizing defines max-content inline size from CSS Text's transformed
-    /// text, white-space processing, tab advances, and hanging behavior. Use
-    /// the same `InlineOpportunityGraph` measurement as inline layout instead
-    /// of measuring a cleanup string directly:
-    /// <https://www.w3.org/TR/css-sizing-3/#max-content-inline-size> and
-    /// <https://www.w3.org/TR/css-text-3/#text-processing-order>.
-    pub(in crate::layout) fn graph_max_content_text_width(
-        &mut self,
-        text: &str,
-        style: &ComputedStyle,
-        available_width: f32,
-    ) -> f32 {
-        self.intrinsic_inline_measurement_for_text(text, style, available_width)
-            .contribution
-            .max_content
-    }
-
-    pub(in crate::layout) fn inline_boxes_max_content_width(
-        &mut self,
-        children: &[box_tree::FormattingBox<'_>],
-        stylesheets: &[Stylesheet],
-        available_width: f32,
-    ) -> f32 {
-        children.iter().fold(0.0_f32, |width, child| {
-            width.max(match child {
-                box_tree::FormattingBox::Text(box_) => {
-                    self.graph_max_content_text_width(&box_.text, &box_.style, available_width)
-                }
-                box_tree::FormattingBox::Inline(box_) => {
-                    let child_width = self
-                        .inline_boxes_max_content_width(
-                            &box_.children,
-                            stylesheets,
-                            available_width,
-                        )
-                        .max(self.graph_max_content_text_width(
-                            &inline_text_for_style(box_.element, &box_.style),
-                            &box_.style,
-                            available_width,
-                        ));
-                    child_width
-                        + box_.style.margin.left
-                        + box_.style.margin.right
-                        + box_.style.padding.left
-                        + box_.style.padding.right
-                        + horizontal_border_width(&box_.style)
-                }
-                box_tree::FormattingBox::AtomicInline(box_) => {
-                    if let Some(fragment) = box_.table_fragment.as_ref() {
-                        let (_, max_content) = self.table_outer_intrinsic_widths_from_fragment(
-                            box_.element,
-                            &box_.style,
-                            stylesheets,
-                            fragment,
-                            available_width,
-                        );
-                        return width.max(max_content);
-                    }
-                    let child_width = self
-                        .inline_boxes_max_content_width(
-                            &box_.children,
-                            stylesheets,
-                            available_width,
-                        )
-                        .max(self.graph_max_content_text_width(
-                            &inline_text_for_style(box_.element, &box_.style),
-                            &box_.style,
-                            available_width,
-                        ));
-                    child_width
-                        + box_.style.margin.left
-                        + box_.style.margin.right
-                        + box_.style.padding.left
-                        + box_.style.padding.right
-                        + horizontal_border_width(&box_.style)
-                }
-                box_tree::FormattingBox::AnonymousBlock(box_) => self
-                    .inline_boxes_max_content_width(&box_.children, stylesheets, available_width),
-                box_tree::FormattingBox::InlineSplitBlockContext(box_) => self
-                    .inline_boxes_max_content_width(&box_.children, stylesheets, available_width),
-                box_tree::FormattingBox::Block(box_) => {
-                    box_.style
-                        .box_values
-                        .width
-                        .length_if_no_percent()
-                        .unwrap_or_else(|| {
-                            self.inline_boxes_max_content_width(
-                                &box_.children,
-                                stylesheets,
-                                available_width,
-                            )
-                            .max(self.graph_max_content_text_width(
-                                &inline_text_for_style(box_.element, &box_.style),
-                                &box_.style,
-                                available_width,
-                            ))
-                        })
-                        + box_.style.margin.left
-                        + box_.style.margin.right
-                }
-                box_tree::FormattingBox::Table(box_) => {
-                    let (_, max_content) = self.table_outer_intrinsic_widths_from_fragment(
-                        box_.element,
-                        &box_.style,
-                        stylesheets,
-                        &box_.fragment,
-                        available_width,
-                    );
-                    max_content
-                }
-                box_tree::FormattingBox::Flex(box_) => box_
-                    .style
-                    .box_values
-                    .width
-                    .length_if_no_percent()
-                    .unwrap_or_else(|| {
-                        self.inline_boxes_max_content_width(
-                            &box_.children,
-                            stylesheets,
-                            available_width,
-                        )
-                        .max(box_.style.font_size)
-                    }),
-                box_tree::FormattingBox::Replaced(box_) => {
-                    box_.style
-                        .box_values
-                        .width
-                        .length_if_no_percent()
-                        .unwrap_or(box_.style.font_size)
-                        + box_.style.margin.left
-                        + box_.style.margin.right
-                }
-            })
-        })
-    }
-}
-
 /// Return whether adjacent inline text fragments can share one painted line.
 ///
 /// CSS Inline Layout creates line boxes from adjacent inline boxes, while PDF
@@ -451,6 +376,8 @@ pub(in crate::layout) fn inline_text_sources_are_paint_compatible(
     match (left, right) {
         (InlineTextSource::Marker, InlineTextSource::Marker) => true,
         (InlineTextSource::Marker, _) | (_, InlineTextSource::Marker) => false,
+        (InlineTextSource::RunIn, InlineTextSource::RunIn) => true,
+        (InlineTextSource::RunIn, _) | (_, InlineTextSource::RunIn) => false,
         (InlineTextSource::Normal | InlineTextSource::Generated, _) => true,
     }
 }
@@ -513,6 +440,47 @@ pub(in crate::layout) fn can_shape_inline_fragments_together(
         && !inline_box_edge_breaks_shaping(right.style())
         && !inline_box_bidi_isolation_breaks_shaping(left.style())
         && !inline_box_bidi_isolation_breaks_shaping(right.style())
+}
+
+/// Return whether two computed styles have the same text-shaping inputs after
+/// CSS Text's pre-shaping transformations have been applied.
+///
+/// `display` establishes the otherwise transparent inline-box boundary, while
+/// `text-transform` has already produced the source scalars passed to the
+/// shaper. Neither value changes the OpenType shaping result for those
+/// scalars, so a single styled shaping span may preserve cursive joining over
+/// such a boundary:
+/// <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
+/// <https://www.w3.org/TR/css-text-3/#order-operations>.
+pub(in crate::layout) fn styles_have_equivalent_text_shaping_inputs(
+    left: &ComputedStyle,
+    right: &ComputedStyle,
+) -> bool {
+    left.font_family == right.font_family
+        && left.font_size == right.font_size
+        && left.font_size_adjust == right.font_size_adjust
+        && left.line_height == right.line_height
+        && left.font_weight == right.font_weight
+        && left.font_style == right.font_style
+        && left.font_width == right.font_width
+        && left.font_synthesis == right.font_synthesis
+        && left.font_feature_settings == right.font_feature_settings
+        && left.font_kerning == right.font_kerning
+        && left.font_variant_ligatures == right.font_variant_ligatures
+        && left.font_variant_position == right.font_variant_position
+        && left.font_variant_caps == right.font_variant_caps
+        && left.font_variant_numeric == right.font_variant_numeric
+        && left.font_variant_alternates == right.font_variant_alternates
+        && left.font_variant_east_asian == right.font_variant_east_asian
+        && left.font_variant_emoji == right.font_variant_emoji
+        && left.word_break == right.word_break
+        && left.overflow_wrap == right.overflow_wrap
+        && left.text_wrap_mode == right.text_wrap_mode
+        && left.word_spacing == right.word_spacing
+        && left.letter_spacing == right.letter_spacing
+        && left.language == right.language
+        && left.writing_mode == right.writing_mode
+        && left.text_orientation == right.text_orientation
 }
 
 pub(in crate::layout) fn inline_fragment_is_join_control_only(
@@ -646,6 +614,7 @@ pub(in crate::layout) fn end_hanging_punctuation_width(
         is_last_line,
         line_overflows,
     )
+    .points()
 }
 
 pub(in crate::layout) fn end_hanging_punctuation_width_for_fragment(
@@ -654,15 +623,15 @@ pub(in crate::layout) fn end_hanging_punctuation_width_for_fragment(
     block_style: &ComputedStyle,
     is_last_line: bool,
     line_overflows: bool,
-) -> f32 {
+) -> LayoutLength {
     let Some(fragment) = fragment else {
-        return 0.0;
+        return layout_pt(0.0);
     };
     let Some(character) = trim_end_css_collapsible_whitespace(fragment.text())
         .chars()
         .next_back()
     else {
-        return 0.0;
+        return layout_pt(0.0);
     };
     let hangs_by_last = block_style.hanging_punctuation.last && is_last_line;
     let hangs_by_force_end =
@@ -674,10 +643,10 @@ pub(in crate::layout) fn end_hanging_punctuation_width_for_fragment(
         || hangs_by_force_end
         || hangs_by_allow_end)
     {
-        return 0.0;
+        return layout_pt(0.0);
     }
     if fragment.hanging_edges().blocks_end {
-        return 0.0;
+        return layout_pt(0.0);
     }
     intrinsic::hanging_punctuation_character_width(font_system, character, fragment.style())
 }
@@ -686,7 +655,7 @@ pub(in crate::layout) fn last_hanging_punctuation_width_for_line_items<T>(
     font_system: &mut FontSystem,
     items: &[T],
     block_style: &ComputedStyle,
-) -> f32
+) -> LayoutLength
 where
     T: AsRef<InlineLineItem>,
 {
@@ -705,7 +674,7 @@ pub(in crate::layout) fn end_hanging_punctuation_width_for_line_items<T>(
     block_style: &ComputedStyle,
     is_last_line: bool,
     line_overflows: bool,
-) -> f32
+) -> LayoutLength
 where
     T: AsRef<InlineLineItem>,
 {
@@ -771,7 +740,8 @@ where
             block_style,
             is_last_line,
             line_overflows,
-        ),
+        )
+        .points(),
     }
 }
 
@@ -808,14 +778,14 @@ pub(in crate::layout) fn last_hanging_punctuation_width_for_inline_items(
         font_system,
         std::slice::from_ref(&InlineFragment::new_shared_style(
             transform_text(&word.text, &word.style),
-            word.style.clone(),
+            Rc::clone(&word.style),
             word.baseline_shift,
             word.link_target.clone(),
             word.mergeable,
             word.source,
             false,
             word.hanging_edges,
-            word.ancestor_inline_decorations.clone(),
+            Rc::clone(&word.ancestor_inline_decorations),
         )),
         block_style,
     )
@@ -885,9 +855,8 @@ pub(in crate::layout) fn inline_content_style_without_block_isolate(
 /// <https://www.w3.org/TR/css-text-3/#boundary-shaping>.
 pub(in crate::layout) fn inline_box_edge_breaks_shaping(style: &ComputedStyle) -> bool {
     style.display.is_inline_level()
-        && (max_edge(style.margin) != 0.0
-            || max_edge(style.padding) != 0.0
-            || used_border_width(style) != 0.0)
+        && (inline_box_edge_has_nonzero_component(style, InlineBoxEdge::Start)
+            || inline_box_edge_has_nonzero_component(style, InlineBoxEdge::End))
 }
 
 /// Return whether an inline bidi-isolation boundary interrupts shaping.
@@ -904,17 +873,25 @@ pub(in crate::layout) fn inline_box_bidi_isolation_breaks_shaping(style: &Comput
         )
 }
 
-/// Return whether an inline fragment is an inter-word justification opportunity.
+/// Count the inter-word justification opportunities within an inline fragment.
 ///
-/// CSS Text defines justification expansion over text justification
-/// opportunities, while white-space processing decides which preserved edge
-/// spaces hang before alignment. Inter-word justification expands word
-/// separators that remain in the formatted line, including no-break and
-/// historical Unicode word separators:
-/// <https://www.w3.org/TR/css-text-3/#text-justify-property> and
-/// <https://www.w3.org/TR/css-text-3/#word-separator>.
-pub(in crate::layout) fn inline_fragment_is_inter_word_justification_space(
+/// A line fragment can contain unbreakable word separators (for example
+/// U+00A0 NO-BREAK SPACE) in the middle of otherwise ordinary text. CSS Text
+/// still allows those separators to expand under `text-justify: inter-word`;
+/// restricting opportunities to fragments consisting only of spaces loses
+/// final-line `text-align-last: justify` whenever line construction retains a
+/// no-break sequence as one source fragment:
+/// <https://www.w3.org/TR/css-text-3/#valdef-text-justify-inter-word>.
+pub(in crate::layout) fn inline_fragment_inter_word_justification_space_count(
     fragment: &(impl InlineFragmentAccess + ?Sized),
-) -> bool {
-    !fragment.generated_leader() && fragment.text().chars().all(character_is_css_word_separator)
+) -> usize {
+    if fragment.generated_leader() {
+        0
+    } else {
+        fragment
+            .text()
+            .chars()
+            .filter(|character| character_is_css_word_separator(*character))
+            .count()
+    }
 }

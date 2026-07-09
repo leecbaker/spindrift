@@ -8,7 +8,7 @@ use std::rc::Rc;
 /// layout mode computes used values:
 /// <https://www.w3.org/TR/css-align-3/#gaps> and
 /// <https://www.w3.org/TR/css-cascade-5/#computed>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ComputedGap {
     Normal,
     LengthPercentage(ComputedLengthPercentage),
@@ -17,27 +17,39 @@ pub(crate) enum ComputedGap {
 impl ComputedGap {
     pub(crate) const NORMAL: Self = Self::Normal;
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    /// Scale fixed gap components at the CSS `zoom` used-value boundary.
+    ///
+    /// The percentage coefficient remains unchanged so it resolves against
+    /// the already zoomed layout container.
+    /// <https://drafts.csswg.org/css-viewport/#zoom-property>
+    /// <https://drafts.csswg.org/css-align-3/#gap-shorthand>
+    pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
+        if let Self::LengthPercentage(value) = self {
+            value.scale_fixed_length_components(factor);
+        }
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Self::LengthPercentage(value) = self {
             value.resolve_font_metric_lengths(ch_advance);
         }
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
+    /// Reduces CSS Math comparisons whose percentage basis is non-negative.
+    ///
+    /// Gap percentages resolve against a content-box size, which cannot be
+    /// negative. This permits pure-percentage comparisons to reduce without
+    /// prematurely choosing a branch for mixed length-percentage values.
+    /// <https://www.w3.org/TR/css-align-3/#gaps> and
+    /// <https://www.w3.org/TR/css-values-4/#comp-func>
+    pub(crate) fn reduce_math_with_nonnegative_percentage_basis(&mut self) {
         if let Self::LengthPercentage(value) = self {
-            value.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
+            value.reduce_math_with_nonnegative_percentage_basis();
         }
+    }
+
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
     }
 }
 
@@ -103,8 +115,7 @@ impl<T: Clone> GapRuleList<T> {
         }
 
         let trailing_index = auto_index - auto_count;
-        let trailing_start = trailing_len.saturating_sub(trailing_count);
-        gap_rule_components_value_at(&self.trailing, trailing_start + trailing_index)
+        gap_rule_components_value_at(&self.trailing, trailing_index)
     }
 
     #[cfg(test)]
@@ -176,7 +187,7 @@ pub(crate) enum GapRuleOverlap {
     ColumnOverRow,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GapRuleInsetValue {
     LengthPercentage(ComputedLengthPercentage),
     OverlapJoin,
@@ -185,26 +196,19 @@ pub(crate) enum GapRuleInsetValue {
 impl GapRuleInsetValue {
     pub(crate) const ZERO: Self = Self::LengthPercentage(ComputedLengthPercentage::ZERO);
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Self::LengthPercentage(value) = self {
             value.resolve_font_metric_lengths(ch_advance);
         }
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
+    }
+
+    fn scale_fixed_length_components(&mut self, factor: f32) {
         if let Self::LengthPercentage(value) = self {
-            value.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
+            value.scale_fixed_length_components(factor);
         }
     }
 }
@@ -237,7 +241,7 @@ impl GapRuleAxis {
         }
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         resolve_gap_rule_width_list_font_lengths(&mut self.widths, ch_advance);
         self.inset_cap_start.resolve_font_metric_lengths(ch_advance);
         self.inset_cap_end.resolve_font_metric_lengths(ch_advance);
@@ -247,50 +251,57 @@ impl GapRuleAxis {
             .resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        resolve_gap_rule_width_list_viewport_lengths(
-            &mut self.widths,
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.inset_cap_start.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.inset_cap_end.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.inset_junction_start.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.inset_junction_end.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    /// Scale rule widths and fixed endpoint insets at the CSS `zoom`
+    /// used-value boundary. Percentage components remain relative to the
+    /// already zoomed decorated gap geometry.
+    /// <https://drafts.csswg.org/css-viewport/#zoom-property>
+    /// <https://drafts.csswg.org/css-gaps-1/#gap-decoration-properties>
+    pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
+        scale_gap_rule_width_list_fixed_components(&mut self.widths, factor);
+        self.inset_cap_start.scale_fixed_length_components(factor);
+        self.inset_cap_end.scale_fixed_length_components(factor);
+        self.inset_junction_start
+            .scale_fixed_length_components(factor);
+        self.inset_junction_end
+            .scale_fixed_length_components(factor);
+    }
+
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        gap_rule_width_list_requires_ch_advance(&self.widths)
+            || self.inset_cap_start.requires_ch_advance()
+            || self.inset_cap_end.requires_ch_advance()
+            || self.inset_junction_start.requires_ch_advance()
+            || self.inset_junction_end.requires_ch_advance()
+    }
+}
+
+fn scale_gap_rule_width_list_fixed_components(
+    list: &mut GapRuleList<ComputedLengthPercentage>,
+    factor: f32,
+) {
+    for component in Rc::make_mut(&mut list.leading)
+        .iter_mut()
+        .chain(Rc::make_mut(&mut list.trailing).iter_mut())
+    {
+        match component {
+            GapRuleListComponent::Value(value) => value.scale_fixed_length_components(factor),
+            GapRuleListComponent::Repeat { values, .. } => {
+                for value in values {
+                    value.scale_fixed_length_components(factor);
+                }
+            }
+        }
+    }
+    if let Some(values) = &mut list.auto {
+        for value in Rc::make_mut(values) {
+            value.scale_fixed_length_components(factor);
+        }
     }
 }
 
 fn resolve_gap_rule_width_list_font_lengths(
     list: &mut GapRuleList<ComputedLengthPercentage>,
-    ch_advance: f32,
+    ch_advance: LayoutLength,
 ) {
     for component in Rc::make_mut(&mut list.leading)
         .iter_mut()
@@ -312,44 +323,131 @@ fn resolve_gap_rule_width_list_font_lengths(
     }
 }
 
+fn gap_rule_width_list_requires_ch_advance(list: &GapRuleList<ComputedLengthPercentage>) -> bool {
+    list.leading
+        .iter()
+        .chain(list.trailing.iter())
+        .any(gap_rule_component_requires_ch_advance)
+        || list.auto.as_deref().is_some_and(|values| {
+            values
+                .iter()
+                .any(ComputedLengthPercentage::requires_ch_advance)
+        })
+}
+
+fn gap_rule_component_requires_ch_advance(
+    component: &GapRuleListComponent<ComputedLengthPercentage>,
+) -> bool {
+    match component {
+        GapRuleListComponent::Value(value) => value.requires_ch_advance(),
+        GapRuleListComponent::Repeat { values, .. } => values
+            .iter()
+            .any(ComputedLengthPercentage::requires_ch_advance),
+    }
+}
+
 fn resolve_gap_rule_width_list_viewport_lengths(
     list: &mut GapRuleList<ComputedLengthPercentage>,
-    viewport_width: f32,
-    viewport_height: f32,
-    viewport_inline: f32,
-    viewport_block: f32,
+    basis: ViewportLengthBasis,
 ) {
     for component in Rc::make_mut(&mut list.leading)
         .iter_mut()
         .chain(Rc::make_mut(&mut list.trailing).iter_mut())
     {
         match component {
-            GapRuleListComponent::Value(value) => value.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            ),
+            GapRuleListComponent::Value(value) => value.resolve_viewport_lengths(basis),
             GapRuleListComponent::Repeat { values, .. } => {
                 for value in values {
-                    value.resolve_viewport_lengths(
-                        viewport_width,
-                        viewport_height,
-                        viewport_inline,
-                        viewport_block,
-                    );
+                    value.resolve_viewport_lengths(basis);
                 }
             }
         }
     }
     if let Some(values) = &mut list.auto {
         for value in Rc::make_mut(values) {
-            value.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
+            value.resolve_viewport_lengths(basis);
         }
+    }
+}
+
+impl ResolveViewportLengths for ComputedGap {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_viewport_lengths(basis);
+        }
+    }
+}
+
+impl ResolveViewportLengths for GapRuleInsetValue {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_viewport_lengths(basis);
+        }
+    }
+}
+
+impl ResolveViewportLengths for GapRuleAxis {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        resolve_gap_rule_width_list_viewport_lengths(&mut self.widths, basis);
+        self.inset_cap_start.resolve_viewport_lengths(basis);
+        self.inset_cap_end.resolve_viewport_lengths(basis);
+        self.inset_junction_start.resolve_viewport_lengths(basis);
+        self.inset_junction_end.resolve_viewport_lengths(basis);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_gap_rule_list_truncates_excess_trailing_values_at_the_end() {
+        let list = GapRuleList::from_parts(
+            vec![
+                GapRuleListComponent::Value(1),
+                GapRuleListComponent::Value(2),
+            ],
+            Some(vec![3, 4]),
+            vec![
+                GapRuleListComponent::Value(5),
+                GapRuleListComponent::Value(6),
+                GapRuleListComponent::Value(7),
+            ],
+        );
+
+        assert_eq!(list.values_for_count(4), [1, 2, 5, 6]);
+        assert_eq!(list.values_for_count(7), [1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn auto_gap_rule_list_truncates_fixed_trailing_repeat_in_authored_order() {
+        let list = GapRuleList::from_parts(
+            vec![GapRuleListComponent::Value(1)],
+            Some(vec![2]),
+            vec![GapRuleListComponent::Repeat {
+                count: 2,
+                values: vec![3, 4],
+            }],
+        );
+
+        assert_eq!(list.values_for_count(3), [1, 3, 4]);
+        assert_eq!(list.values_for_count(6), [1, 2, 3, 4, 3, 4]);
+    }
+
+    #[test]
+    fn gap_rule_list_without_auto_repeater_keeps_cycling_leading_values() {
+        let list = GapRuleList::from_parts(
+            vec![
+                GapRuleListComponent::Value(1),
+                GapRuleListComponent::Repeat {
+                    count: 2,
+                    values: vec![2, 3],
+                },
+            ],
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(list.values_for_count(7), [1, 2, 3, 2, 3, 1, 2]);
     }
 }

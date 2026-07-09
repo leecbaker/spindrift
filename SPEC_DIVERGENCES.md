@@ -28,6 +28,8 @@ Primary references:
   <https://www.w3.org/TR/css-text-3/>
 - CSS Fonts Module Level 4:
   <https://www.w3.org/TR/css-fonts-4/>
+- CSS Fonts Module Level 5:
+  <https://www.w3.org/TR/css-fonts-5/>
 - CSS Backgrounds and Borders Module Level 3:
   <https://www.w3.org/TR/css-backgrounds-3/>
 - CSS Box Model Module Level 4:
@@ -49,6 +51,53 @@ Primary references:
 
 ## Open Divergences
 
+### CSS Viewport `zoom`
+
+- CSS `zoom` is not yet applied consistently in nested-frame layout. Background
+  and border-image intrinsic
+  sizing, shadows, filters, masks, transforms, and scrolling also remain
+  outside the current zoomed used-value boundary.
+  <https://drafts.csswg.org/css-viewport/#zoom-property>
+
+### CSS Text White-space and Wrapping
+
+- Spec area: CSS Text Level 3 white-space processing and line-edge processing.
+- Divergence: `break-spaces` still has unresolved mixed-inline and ideographic
+  space line-edge cases. Its per-space break ownership and advances are not
+  yet consistently distinct from hanging preserved-space behavior in every
+  inline, intrinsic, and float context.
+- Divergence: line-edge effects for `pre-wrap` leading spaces, bidi visual line
+  ends, floats, justification, and intrinsic sizing are incomplete. The graph
+  now records selected multi-run Unicode-space suffixes by source range and
+  preserves their paint ownership, but PDF extraction still needs a dedicated
+  source-range emission path and decoration ownership across complex
+  bidi/fragmented inline boundaries remains incomplete.
+  <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+- Divergence: tab stops use a shared logical cursor through text and atomic
+  inline content, but float-displaced lines do not yet carry their block
+  content-edge coordinate through graph fitting and painting.
+  <https://drafts.csswg.org/css-text-3/#tab-size-property>
+- Divergence: textarea and carriage-return transitions across mixed
+  white-space descendants do not yet use fully conformant shared CSS Text
+  whitespace processing.
+
+- Divergence: `word-space-transform` resolves explicit U+200B and `<wbr>`
+  separators after transparent-edge and forced-boundary context is known, but
+  does not yet preserve a non-selectable virtual-source range or implement
+  language-sensitive `auto-phrase` segmentation and placement.
+  <https://drafts.csswg.org/css-text-4/#word-space-transform>
+
+### CSS Text Level 4 Wrapping
+
+- Spec area: CSS Text Level 4 `text-wrap-style` and line clamping.
+- Divergence: `text-wrap: balance` uses the shared graph for float-free groups
+  of up to ten lines, but source-position inline floats are not yet modeled in
+  balance-candidate selection. Independently balanced pseudo-element block
+  groups and fragmentation boundaries remain incomplete. `line-clamp:auto`,
+  positioned/floated clamp boundaries, and clamp-before-balance handling at
+  pseudo-element and fragmentation boundaries remain incomplete.
+  <https://drafts.csswg.org/css-text-4/#text-wrap-style>
+
 ### HTML User-Agent Stylesheet
 
 - Spec area: HTML rendering defaults, presentational hints, CSS Cascade, CSS
@@ -64,15 +113,35 @@ Primary references:
 
 - Spec area: CSS Lists and Counters, CSS Counter Styles, generated content,
   tagged PDF.
-- Divergence: SVG/vector `list-style-image` values are not implemented.
 - Divergence: image marker sizing, baseline alignment, and marker box geometry
   do not fully follow CSS Lists.
-- Divergence: nested counters across fragmentation and re-layout have
-  unverified edge cases.
+- Divergence: inline generated-content evaluation still consumes the runtime
+  counter scope because normalized generated boxes do not yet retain a precise
+  logical counter origin for every nested-scope shape.
 - Divergence: vertical writing-mode geometry for outside markers is incomplete.
 - Divergence: PDF marker output lacks tagged marker semantics for PDF/UA.
+  Bitmap marker glyphs retain replacement text through PDF `/ActualText`, but
+  Quire does not yet emit the structure tree needed to associate them with a
+  PDF/UA list-label element.
 - Divergence: custom counter-style `speak-as` has no observable effect because
   speech output is not generated.
+
+### CSS Custom Properties
+
+- Spec area: CSS Custom Properties, CSS Properties and Values API, CSS Color.
+- Divergence: registered custom properties (`@property`) are not modeled, so
+  descriptor syntax, inheritance, initial values, and typed substitution are
+  unavailable.
+- Divergence: `light-dark()` resolves only Quire's fixed light print scheme;
+  `color-scheme`, dark-scheme selection, and interaction with registered
+  custom-property values are not implemented.
+- Divergence: variable substitution inside arbitrary balanced component blocks
+  is not fully preserved through stylesheet recovery and computed-value parsing.
+- Divergence: variable substitution in complex `background` and `font`
+  shorthands is incomplete.
+- Divergence: `@font-face` descriptor handling still needs full CSS Variables
+  and CSS Fonts conformance coverage, including invalid descriptor recovery and
+  font matching parity.
 
 ### CSS Display Model
 
@@ -87,19 +156,39 @@ Primary references:
 - Divergence: grid display values do not yet cover the full CSS Grid formatting
   context, layout participation, pagination behavior, and box tree fixup.
 
+### CSS Scroll Snap
+
+- Spec area: CSS Scroll Snap Level 1 and CSSOM View scrolling.
+- Divergence: Quire's static scroll-snap model covers container/area geometry,
+  target navigation, root handling, and iframe subdocuments, but atomic inline
+  and writing-mode replay still have two visual failures in the local
+  non-script `css/css-scroll-snap/` WPT selection.
+- Divergence: live DOM scrolling APIs, JavaScript-driven scrolling,
+  re-snapping after interactive relayout, and scroll-snap events are not
+  implemented in the static PDF renderer.
+  <https://www.w3.org/TR/css-scroll-snap-1/>
+
 ### CSS Float Layout
 
 - Spec area: CSS 2.2 floats and float-adjacent formatting contexts.
 - Divergence: table wrappers, flex/grid roots, and block-level replaced boxes
   need a complete audit against the CSS 2.2 border-box float avoidance rule.
-- Divergence: some float-adjacent root placement paths still risk using
+- Divergence: non-block float-adjacent root placement paths still risk using
   margin-box placement where CSS 2.2 requires border-box collision behavior.
+  Normal-flow horizontal block formatting context roots, including
+  `overflow:hidden` roots, use border-box fixed-point float avoidance,
+  including the resolved normal-flow border-box inline start. The remaining
+  audit still covers negative-margin, nested, and non-block root paths.
 
 ### CSS Writing Modes
 
 - Spec area: CSS Writing Modes, CSS Sizing, CSS Fragmentation.
 - Divergence: orthogonal-flow available inline sizing is incomplete for
-  scrollport-derived available sizes.
+  scrollport-derived available sizes. Normal block and flex paths now keep an
+  indefinite percentage basis distinct from the usable orthogonal fallback,
+  and normal block flow records whether that fallback came from the nearest
+  constrained scroll container or the initial containing block. The
+  distinction is not yet carried through every formatting context.
 - Divergence: orthogonal-flow available-size negotiation is incomplete across
   fragmentation.
 - Divergence: orthogonal available-size behavior for grid containers, table
@@ -110,24 +199,107 @@ Primary references:
 
 - Spec area: CSS Grid Layout Levels 1 and 2, CSS Box Alignment, CSS Writing
   Modes, CSS Sizing, CSS Fragmentation.
+- Spec area: CSS Grid Layout Level 3 Grid Lanes.
+- Divergence: Grid Lanes supports establishing `grid-lanes` and
+  `inline-grid-lanes` formatting contexts, basic fixed-track placement,
+  `flow-tolerance`, order-modified placement, simple dense backfilling,
+  `grid-lanes-direction` axis selection/reversal, basic grid-axis
+  self-alignment, and stacking-axis and track-axis content alignment
+  (including positional and space-distribution values). It does not yet fully
+  implement track stretching, safe-overflow, or writing-mode portions of
+  Level 3 alignment. It applies hypothetical min-content contributions and
+  positive free-space stretching for simple all-auto column lanes, but does
+  not yet generalize that track-sizing step to mixed, spanning, nested, or
+  non-column cases.
+  A single intrinsic auto-repeat track supports simple hypothetical
+  max/min-content contributions and spans, but mixed/multi-track repeats,
+  subgrids, fragmentation, and complete writing-mode behavior remain
+  incomplete.
+- Divergence: Grid Lanes-specific track and flow-tolerance quantities are not
+  yet included in the CSS `zoom` used-value boundary.
+  <https://drafts.csswg.org/css-viewport/#zoom-property>
 - Divergence: full CSS Grid placement behavior is incomplete, including unusual
-  `grid`, `grid-template`, and named-line parser edge cases.
+  `grid`, `grid-template`, and named-line parser edge cases beyond covered
+  escaped custom-ident, bracketed line-name tokenization and non-empty
+  validation, non-negative track breadth validation, and template-area string
+  decoding. Same-page placement for simple backward named spans from a
+  definite end line and negative named line placements into startward implicit
+  tracks works for non-repeat and finite numbered-repeat column and row grids,
+  including area-created explicit tracks, and for fixed-size definite
+  `auto-fill` column and row grids. Simple backward named spans and negative
+  named line placements also work before fixed-size definite `auto-fit`
+  column and row grids, including empty-track collapse after startward
+  implicit-track expansion. Positive named implicit line placement after
+  fixed-size definite `auto-fill` and `auto-fit` repeats is covered on both
+  axes with cycled auto tracks, including multi-track `auto-fill` repeat
+  fragments and forward named spans after single-track `auto-fill` fragments,
+  but writing modes, broader auto-repeat combinations, and broader
+  implicit-grid combinations remain incomplete.
 - Divergence: full grid track sizing is incomplete, including intrinsic tracks,
   flexible tracks in all sizing contexts, spanning item contributions, and
   auto-repeat behavior beyond simple cases.
 - Divergence: full grid intrinsic sizing is incomplete, including min-content
-  and max-content contributions from complex grid items and indefinite
-  container sizes.
-- Divergence: grid baseline alignment and exported baseline synthesis are
-  incomplete, including writing-mode-specific self-start/self-end behavior.
+  and max-content contributions from complex grid items, broader row-axis
+  spanning effects, and indefinite container sizes beyond simple cyclic
+  percentage explicit-column-as-auto and column-gap intrinsic-width handling,
+  simple cyclic percentage row-gap intrinsic sizing and final fixed-track
+  same-page layout handling, plus
+  simple indefinite percentage grid-item block-size handling for min-content rows.
+  Covered column intrinsic placement includes simple all-auto, numeric and
+  named-line definite-row constrained auto-flow, positive numeric and positive
+  named implicit column starts/ends, forward named implicit column spans on the
+  after-explicit side, simple backward named implicit spans from a definite end
+  line into the startward side, authored-grid extension, and area-created
+  explicit column sizing.
+- Divergence: grid baseline alignment, exported baseline synthesis, and
+  grid-specific self-alignment are incomplete beyond covered simple same-page
+  horizontal first- and last-baseline self-alignment for items in the same row,
+  same-page horizontal `justify-self`/`justify-items` `self-start`/`self-end`
+  physical inline placement for LTR/RTL grid items, same-page horizontal
+  `align-self`/`align-items` `self-start`/`self-end` physical block-axis
+  placement for LTR/RTL grid items, same-page horizontal
+  `justify-self` and `justify-items` `left`/`right` physical placement in
+  LTR/RTL grids, and
+  same-page horizontal grid container first/last exported baselines from
+  occupied grid rows for inline-grid, nested grid, and simple spanning row-edge
+  baseline-sharing cases, including fragmented baseline-sharing groups,
+  broader spanning synthesis, orthogonal writing modes, and broader
+  writing-mode-specific behavior.
 - Divergence: grid-aware absolute static positions are incomplete for complex
-  placement, intrinsic tracks, flexible tracks, template areas, writing modes,
-  and fragmented grids.
-- Divergence: grid child collection and anonymous grid item construction need
-  broader coverage for generated content, `display: contents`, out-of-flow
-  descendants, ordering, and text-node edge cases.
+  placement beyond covered same-page fixed explicit lines, simple template
+  areas, simple intrinsic/flexible tracks, fixed-size `auto-fill`,
+  start-aligned, positional content-aligned, and distributed content-aligned
+  numeric/named `auto-fit` collapsed repeated lines on both axes, and
+  template-area generated lines. Covered fixed-track explicit lines include
+  content alignment, and covered numeric/named implicit lines on either side
+  of the explicit grid can use definite cycled `grid-auto-*` tracks, including
+  after-explicit row and column lines outside the grid container with
+  line-edge offsets and covered horizontal static-rectangle end edges that do
+  not include the following implicit gutter.
+  Named explicit lines inside finite numbered repeats are covered on both
+  axes, and named fixed-size `auto-fill` and collapsed `auto-fit` repeated
+  lines, including multi-track repeated fragments and before-/after-explicit
+  named implicit-line offsets with definite `grid-auto-*` tracks, are covered
+  on both axes. Descendants whose effective containing block is the grid
+  container use the resolved grid area for covered explicit placement, while
+  all-auto grid lines retain the grid container's CSS containing block. The
+  covered orthogonal positioned-item automatic-height cases use the logical
+  inline measure rather than physical text advance; broader implicit-line
+  combinations, writing-mode alignment, and fragmented grid cases remain
+  incomplete.
 - Divergence: grid fragmentation in paged media is not implemented.
-- Divergence: `subgrid` is not implemented.
+- Divergence: Grid scroll-container geometry resolves axis longhands and
+  clips stretched item paint in the paged backend, but native scrollbar
+  tracks/thumbs and scrolling interaction are not painted or exposed by PDF.
+- Divergence: the legacy WPT references for `display-grid.html` and
+  `display-inline-grid.html` distribute CSS table row heights rather than
+  preserving the authored fixed Grid tracks; Quire intentionally keeps Grid
+  track sizing spec-conformant instead of matching that reference behavior.
+- Divergence: general `subgrid` track inheritance, parent sizing participation,
+  and line-name propagation are not implemented. Parsed subgrid axes resolve
+  to the required used value `none` when layout or paint containment creates
+  an independent formatting context; cyclic percentage items use automatic
+  intrinsic contributions before resolving against their final area.
 - Divergence: masonry layout is not implemented.
 
 ### CSS Content and Generated Content
@@ -135,9 +307,10 @@ Primary references:
 - Spec area: CSS Content Level 3, Generated Content for Paged Media, CSS
   Images, accessibility metadata.
 - Divergence: generated content cannot use all CSS Images values, including
-  conic gradients, SVG image sources, and `image-set()` forms.
+  conic gradients and `image-set()` forms.
 - Divergence: generated image alt text is not emitted into tagged PDF/PDF-UA
-  structure.
+  structure. Bitmap OpenType glyph images carry PDF `/ActualText` for text
+  extraction, but they are not full tagged-PDF image structure elements.
 - Divergence: target cross-reference behavior is incomplete outside the
   text-capture subset.
 - Divergence: `leader()` and generated content layout need broader conformance
@@ -185,14 +358,115 @@ Primary references:
 - Divergence: remaining flex fragmentation edge cases lack exact gap decoration
   clipping and replay semantics.
 
+### CSS Multi-column Layout
+
+- Spec area: CSS Multi-column Layout Level 1 and CSS Fragmentation.
+- Divergence: column balancing uses iterative snapshot layout and one committed
+  fragment pass, and deferred descendant/positioned fragments participate in
+  speculative used-column counts. Atomic inline boxes also impose their
+  monolithic outer block-size bound, while consecutive floats use
+  width-constrained shelf estimates and monolithic floats retain collapsed
+  sibling-margin offsets through transparent wrappers. More complex nested
+  formatting contexts, inline/floating content, parallel flows, and some
+  widows/orphans and forced-break matrices do not yet converge on the
+  specification's optimal height.
+- Divergence: `column-span: all` splits direct and eligible descendant boxes
+  into balanced column sets, slices ordinary intervening wrappers, and keeps a
+  fitting definite principal box's flow end independent from visible
+  descendant overflow. More complex parallel-flow boundaries, full spanner
+  margin collapsing, fragment-local wrapper decoration, and some spanner
+  continuations across page fragments are incomplete.
+- Divergence: vertical spanner auto sizing and single-root orthogonal overflow
+  replay are logical-axis aware, but general vertical column placement,
+  multi-fragment orthogonal replay, and column-rule geometry still use a
+  physically horizontal block-child canvas.
+- Divergence: future fragments captured by relative/effect containers retain
+  their fragmentainer assignment and positioned principal decoration spans are
+  materialized, but fixed-position, static-position, transformed-containing-
+  block, and spanner cases do not yet share one durable multicol containing
+  block across every nested fragment.
+- Divergence: auto-height sequential overflow rows can continue onto later
+  pages, and definite-height inline column rows can continue through an outer
+  column fragmentainer with final-row balancing. General block/flex/grid/table
+  nested rows, balanced `balance` versus `balance-all` page continuation,
+  spanner continuation, and named-page geometry changes are incomplete.
+- Divergence: named strings, running elements, anchors, links, bookmarks, and
+  other side effects produced inside speculative columns need complete
+  fragment-local remapping. Conceptual anonymous columns beyond the bounded
+  off-canvas replay horizon are represented arithmetically, so side effects
+  originating only in that unmaterialized tail are not yet remapped.
+
+### CSS Containment Level 1
+
+- Spec area: CSS Containment Level 1, CSS Sizing, CSS Positioned Layout, and CSS
+  Fragmentation.
+- Divergence: size containment implements empty intrinsic/used sizing, retains
+  authored empty-grid and empty-multicol geometry, applies the internal-table/
+  ruby/non-atomic-inline applicability exceptions, and separates a principal
+  box's definite fragmentainer consumption from visible descendant overflow.
+  Form controls, fieldsets, grid, and table descendants follow the
+  empty-principal-box sizing rule. Monolithic overflow through flex, table, and
+  positioned contexts plus remaining replaced/table sizing matrices is still
+  incomplete.
+- Divergence: size-contained principal block boxes and their descendant flow
+  retain monolithic placement in ordinary multicol flow while visible overflow
+  remains attached without contributing to the principal used size. Equivalent
+  behavior through flex, table, and positioned fragmentation contexts is still
+  incomplete.
+- Divergence: layout containment establishes an independent formatting context,
+  positioning containing blocks (including final table-cell grid geometry),
+  and a stacking context, and suppresses forced break propagation across the
+  containment boundary. Explicit fragmented-flow trapping beyond that
+  break-propagation rule is incomplete.
+- Divergence: paint containment clips at the used padding edge and establishes
+  formatting/positioning/stacking isolation, including degenerate zero-area
+  padding-box clips, rounded padding-edge clips, and resolved
+  table/table-cell/caption clip geometry. Fragmented effect-group semantics
+  remain incomplete.
+- Divergence: containment on `html` or `body` suppresses background, overflow,
+  and principal writing-mode propagation to the canvas. Viewport propagation
+  paths beyond the HTML root/first eligible body rules remain incomplete.
+
+### CSS Multi-column Layout Level 2
+
+- Spec area: CSS Multi-column Layout Level 2.
+- Divergence: `column-height` and `column-wrap` parsing, computed values, row
+  planning, row gaps, and nested row continuation are not implemented. This
+  includes the nested row behavior exercised by `column-height-008`; any prior
+  pass came from the old unbalanced Level 1 fallback rather than Level 2
+  semantics.
+
+### CSS Containment Level 2
+
+- Spec area: CSS Containment Level 2.
+- Divergence: `inline-size` containment has logical-axis intrinsic suppression
+  in normal-flow, Flexbox, Grid, and table measurement, but remaining
+  replaced-content, multicolumn, and fragmentation interactions are
+  incomplete. `style`, `content`, and `strict` parse with style containment;
+  style containment scopes counter mutation and generated-quote depth, while
+  its remaining fragmentation and generated-content edge cases are incomplete.
+  `content-visibility: hidden` skips HTML descendant layout and paint, while
+  `auto` is conservatively visible in static paged output; viewport lifecycle
+  skipping, SVG text, and full accessibility-tree behavior remain incomplete.
+  Container queries and later containment-level features are outside the
+  current Level 1 implementation.
+
 ### Inline Formatting and CSS Text
 
 - Spec area: CSS Inline Layout, CSS Text, CSS Text Decoration, CSS
   Pseudo-Elements.
 - Divergence: nested `::first-line` inheritance is incomplete.
-- Divergence: drop-cap layout for `::first-letter` is incomplete.
-- Divergence: generated-content interactions with `::first-letter` are
-  incomplete.
+- Divergence: CSS Inline 3 `initial-letter` is incomplete beyond basic
+  horizontal first-letter graph splitting, used-size calculation, line-height
+  isolation, and rectangular same-page exclusion. Missing areas include
+  `initial-letter-align` baseline precision, non-rectangular
+  `initial-letter-wrap` contours, `grid` wrapping, explicit offset geometry,
+  vertical writing modes, complex bidi start-position rejection, short
+  paragraph continuation, page-local replay, and clearing before subsequent
+  initial letters or block formatting context roots.
+- Divergence: generated-content interactions with `::first-letter` and
+  `initial-letter` need broader auditing for markers, nested pseudo-elements,
+  and fragmented generated inline content.
 - Divergence: `::first-line` and `::first-letter` fragmentation behavior is
   incomplete.
 - Divergence: the full CSS Pseudo-Elements first-letter typographic-unit model
@@ -221,7 +495,6 @@ Primary references:
   expansion, and annotation overlap avoidance are incomplete.
 - Divergence: CSS Text Decoration `text-shadow` blur, spread, and inset
   shadows are not rasterized as grouped text/decorator alpha masks.
-- Divergence: CSS `text-transform: math-auto` is not implemented.
 - Divergence: remaining locale-specific CSS Text Level 4 transforms are not
   implemented.
 - Divergence: residual CSS Text discrepancies remain in fragmented contexts
@@ -235,27 +508,35 @@ Primary references:
   outlines.
 - Divergence: variable-font axis instantiation and descriptor range matching
   are incomplete.
+- Divergence: `@font-face size-adjust` scales selected shaping runs, but its
+  line-metric, metric-override, and fallback interactions are incomplete.
+- Divergence: COLR v0 solid-layer glyphs and ordinary CPAL palette selection
+  are painted as PDF paths, but COLR v1 paint graphs (gradients, clips,
+  composites, and transforms), all `override-colors` edge cases, and palette
+  selection across separately styled prepared inline runs remain incomplete.
 - Divergence: `unicode-range` behavior has not been exhaustively audited
   against the full CSS Fonts descriptor matching model, invalid descriptors,
   collections, and variable-font instances.
+- Divergence: `@font-face` feature defaults are currently looked up by CSS
+  family before final face selection. Families with distinct feature
+  descriptors across weight, style, stretch, or unicode-range faces can apply
+  defaults from a sibling rather than the selected face.
 - Divergence: per-glyph synthetic fallback for missing small-caps and
   petite-caps feature glyphs is not implemented.
-- Divergence: PDF font subsetting retains glyph IDs for standalone font
-  programs, so generated PDFs can be larger than engines that remap subsets
-  densely.
-- Divergence: CFF/CFF2 embedding and subsetting are incomplete.
+- Divergence: CFF2 embedding and subsetting are incomplete.
 - Divergence: variable-font instance embedding and broad font collection
   coverage are incomplete.
 - Divergence: TTC/OTC extraction needs repo-local conformance fixtures beyond
   optional system-font smoke tests.
 - Divergence: OS/2 embedding permission failures are not exposed through a
   strict public PDF/A/PDF/UA render option.
-- Divergence: baseline and line-box metric mapping can diverge from
-  browser/Pango behavior in multi-font and fallback-font runs because Quire
-  relies on an em-box content-area policy in contexts CSS 2.2 leaves
-  underspecified.
+- Divergence: inline content-area metric mapping can still diverge from
+  browser/Pango behavior in underspecified multi-font cases because Quire
+  intentionally uses an em-box policy for non-replaced inline backgrounds and
+  borders.
 - Divergence: residual complex-script shaping mismatches may remain outside
-  known join-control and tatweel boundary cases.
+  retained selected-source ranges and known join-control/tatweel boundary
+  cases.
 
 ### Tables
 
@@ -263,12 +544,15 @@ Primary references:
   Overflow, CSS Fragmentation.
 - Divergence: anonymous table object construction is incomplete for malformed
   edge cases beyond common fixup cases, authored empty rows, inline wrappers,
-  `display: contents` descendants inside table rows, and HTML span parsing.
+  and HTML span parsing.
 - Divergence: rare auto table width edge cases need broader conformance
   coverage, especially column groups, collapsed-column interactions, and less
   common multi-span combinations.
 - Divergence: CSS Overflow 3 behavior for table cells and block descendants is
   incomplete, including scrollbar painting and viewport scrolling.
+- Divergence: CSS Tables 3 row-group structural backgrounds, and structural
+  backgrounds in fragmented or vertical-writing tables, do not yet consistently
+  use the required cell-derived positioning areas and clips for spans.
 - Divergence: table fragmentation is incomplete for full cloned decoration
   semantics.
 - Divergence: flex-specific descendant link handling inside nested table/flex
@@ -280,9 +564,25 @@ Primary references:
   formatting contexts.
 - Divergence: full horizontal-axis table baseline positioning for mixed writing
   modes needs broader conformance coverage.
+- Divergence: table-cell rectangles and vertical table-root intrinsic sizing
+  project logical row/column tracks through the table root's flow. Table
+  wrapper origin placement for RTL vertical roots, row-group/row and
+  structural backgrounds, collapsed borders, alignment, and fragmentation
+  still retain physical horizontal-grid assumptions. Complete logical
+  inline/block behavior for `vertical-rl`, `vertical-lr`, and sideways table
+  roots is therefore not yet implemented.
 - Divergence: table height distribution remains incomplete for complex floats
-  inside cells, large percentage/min-max matrices, and complex nested
-  formatting contexts.
+  inside cells, multi-level percentage/min-max matrices beyond direct replaced
+  descendants, and complex nested formatting contexts. In particular,
+  multi-level percentage-height descendants whose resolved block size transfers
+  through an aspect ratio do not yet feed their final inline contribution back
+  into auto-column sizing.
+- Divergence: `text-combine-upright` forms normalized tate-chu-yoko atoms from
+  contiguous compatible text words and replays their horizontally shaped
+  content through one compressed paint subtree. It does not yet track explicit
+  nested-inline scopes, apply the exact vertical baseline/alignment rules, or
+  preserve bidi isolation and source ranges through every synthetic atomic
+  boundary.
 
 ### Box Alignment
 
@@ -293,28 +593,33 @@ Primary references:
 - Divergence: `align-content` is incomplete for general multi-column
   containers.
 - Divergence: grid alignment is incomplete wherever grid layout itself is
-  incomplete.
-- Divergence: baseline content-alignment is incomplete for indefinite
-  percentage nested vertical exports.
-- Divergence: column-axis baseline sharing and remaining column-axis baseline
-  edge cases are incomplete.
+  incomplete; writing-mode-sensitive `self-start`/`self-end` is only covered
+  for same-page horizontal grid `justify-self`/`justify-items` inline-axis and
+  `align-self`/`align-items` block-axis placement of LTR/RTL items, and
+  physical `left`/`right` justify self-positioning from `justify-self` and
+  `justify-items` is only covered on the same-page horizontal grid path.
 - Divergence: block containers outside flex/table alignment paths use baseline
   fallback behavior rather than full baseline sharing semantics.
 
 ### Flex Layout and Fragmentation
 
 - Spec area: CSS Flexible Box Layout, CSS Box Alignment, CSS Fragmentation.
-- Divergence: paged flex fragmentation is partial and lacks complete cloned
-  decoration slicing.
+- Divergence: flex fragmentation does not yet apply the complete
+  `box-decoration-break: slice` model to padding, borders, backgrounds, and
+  outlines, particularly for empty flex containers and nested column
+  fragmentainers.
+- Divergence: positioned descendants of flex items do not consistently retain
+  their flex-container containing block across nested column/page fragments.
 - Divergence: flex fragment metadata is incomplete for links, running
   assignments, named pages, and other PDF side effects.
-- Divergence: `visibility: collapse` flex-item behavior needs broader
-  conformance coverage for column-axis cases, `wrap-reverse`, collapsed
-  replaced items, and rare writing-mode combinations.
-- Divergence: true column-axis baseline sharing is incomplete.
-- Divergence: indefinite percentage nested exported baselines are incomplete.
 - Divergence: remaining indefinite percentage cross-size interactions outside
   definite stretch sizing are incomplete.
+- Divergence: the Flexbox Level 2 `flex-wrap: balance` algorithm is only
+  partially implemented. It still needs complete intrinsic cross-size handling
+  for balanced column containers and full `flex-line-count` cross-axis
+  measurement/reflow behavior, including percentage-sized descendants and
+  available-size cases:
+  <https://drafts.csswg.org/css-flexbox-2/#algo-balance>.
 - Divergence: nested flex edge cases remain incomplete.
 - Divergence: exact child-height estimates are incomplete for flex items with
   column, complex multicolumn, or deeply nested descendants.
@@ -327,6 +632,9 @@ Primary references:
 - Spec area: CSS Fragmentation, CSS Paged Media.
 - Divergence: pagination is cursor-oriented rather than driven by durable
   fragment objects with available block-size negotiation.
+- Divergence: an in-flow box moved to a page with a different used page size
+  does not always restart its used-value resolution against the destination
+  page area, so percentage inline sizes can retain the preceding page's basis.
 - Divergence: general fragmentainer layout is incomplete.
 - Divergence: cloned decorations are incomplete across fragmented layout modes.
 - Divergence: multi-pass generated content is incomplete.
@@ -337,6 +645,13 @@ Primary references:
   and other non-block fragment paths.
 - Divergence: class A/B/C break handling is not uniformly represented across
   block, inline, table, flex, grid, floats, and generated content.
+- Divergence: root and body auto-height block flow can overestimate the final
+  in-flow extent after nested inline-block and flex descendants, causing a
+  fitting page-area sequence to fragment onto an extra page.
+- Divergence: oversized atomic line boxes consume page fragmentainers and
+  project continuous paint, but monolithic glyph/inline-atom ink that crosses a
+  slice boundary is not yet uniformly prebroken or kept atomic in every inline
+  formatting path.
 
 ### Page Margin Boxes and Generated Content
 
@@ -358,6 +673,17 @@ Primary references:
 - Divergence: background layer support for normal boxes, page boxes, and margin
   boxes lacks unsupported CSS Images features beyond URL raster images and
   Level 3 linear/radial gradients.
+- Divergence: page-margin variable-dimension sizing does not yet fully solve
+  genuinely indefinite or interdependent orthogonal cross-axis constraints, so
+  some center/middle distribution cases remain incorrect.
+- Divergence: CSS Page 3 leaves non-CSS2 properties, including
+  `writing-mode`, undefined in margin contexts. Quire preserves ordinary CSS
+  Writing Modes rendering there; three imported page-margin reftests
+  (`dimensions-004`, `dimensions-013`, and `dimensions-014`) expect a distinct
+  compatibility behavior for vertical generated content. The WPT runner
+  records their known visual differences through exact-path expected-difference
+  thresholds; this does not change Quire output.
+  <https://www.w3.org/TR/css-page-3/#page-properties>
 
 ### Bookmarks and PDF Outlines
 
@@ -372,8 +698,24 @@ Primary references:
 
 - Spec area: CSS Backgrounds and Borders, CSS Color, CSS Images, CSS
   Fragmentation.
-- Divergence: CSS Color parsing does not cover all color functions or
-  non-sRGB color spaces.
+- Divergence: direct vector paint and CSS gradients retain CSS Color 4
+  predefined RGB spaces and PCS-derived colors as ICCBased PDF color spaces.
+  PNG/JPEG raster images preserve valid embedded RGB ICC profiles in ordinary
+  PDF and convert them to sRGB for PDF/A. Non-gradient patterns, SVG image
+  decoding, unsupported/non-RGB image profiles, and advanced color operations
+  still convert through the legacy sRGB boundary. CSS Color 4 local-MINDE
+  gamut mapping is not implemented. Relative colors are limited to
+  `currentcolor` origins and the channel references presently modeled by the
+  CSS Color WPT coverage.
+- Divergence: CSS Color 5 `color-mix()` is limited to sRGB and LCH with two
+  concrete colors or `currentcolor`; component interpolation, other spaces,
+  hue modes, and general missing-component handling remain unavailable.
+  `contrast-color()` currently accepts one concrete color or `currentcolor`
+  and chooses black or white with WCAG relative luminance; configurable
+  user-agent contrast algorithms and wider argument support remain. Custom
+  `@color-profile` ICC spaces, print CMYK/spot output, non-RGB image-profile
+  conversion, and full system-color integration with the host platform are not
+  implemented.
 - Divergence: CSS Borders 4 `corner-shape` exact inset border offset behavior
   is incomplete.
 - Divergence: `corner-shape` integration with `box-shadow`, overflow clipping,
@@ -384,28 +726,90 @@ Primary references:
   distribution along curved corner arcs.
 - Divergence: antialias-equivalent side transitions and full corner conflict
   behavior are incomplete.
-- Divergence: border images do not support all CSS image sources, including
-  gradients and SVG.
-- Divergence: border-image repeat centering and partial-tile behavior are not
-  exact against the CSS Backgrounds and Borders requirements.
+- Divergence: border-image sources support URL images and generated CSS color,
+  linear, radial, and conic gradients, but unsupported CSS image functions and
+  exact vector-gradient sampling in nine-slice tiles remain incomplete.
+- Divergence: border-image `round` mode still has incomplete tile sizing in
+  some mixed-axis and subpixel cases.
 - Divergence: decoration fragmentation for borders is incomplete.
 
 ### Backgrounds, Images, and SVG
 
 - Spec area: CSS Backgrounds and Borders, CSS Images, SVG, compositing.
-- Divergence: general SVG parsing and rendering are incomplete.
-- Divergence: CSS Images object sizing, fallback, transforms, opacity,
-  compositing, and broader image source behavior are incomplete.
+- Divergence: inline and URL SVG supports normalized path geometry, solid
+  fills/strokes, `pad` linear/radial gradients (including coincident hard
+  stops and stop opacity), path-based `clipPath`, group opacity, isolation,
+  blend modes, and normalized solid-vector SVG pattern tiles. Pattern tiles
+  preserve their affine placement and can contain supported solid vector paths.
+  `repeat`/`reflect` spread methods, pattern tiles with nested paint servers,
+  transparency/effects, images, or text, SVG images, text, masks, filters,
+  nested SVG resource loading, SVG fonts, `<object>`, and `<embed>` remain
+  unsupported; affected SVG subtrees are omitted rather than approximated.
+- Divergence: inline SVG presentation-attribute `transform-origin` and
+  CSS-sourced affine transforms resolve basic `<rect>` fill boxes before SVG
+  scene construction, including percentage translation and origin values.
+  General SVG fill/stroke/view-box selection (especially paths, strokes, and
+  nested viewports) still needs typed scene metadata; font-relative,
+  viewport-relative, and math CSS transform values are not transferred into
+  the SVG scene.
+- Divergence: SVG path rendering does not yet preserve `stroke-linejoin:
+  miter-clip`, marker cases that depend on unsupported paints/effects, or SVG
+  text accessibility/selectability.
+- Divergence: URL SVG is supported by existing image consumers (`<img>`,
+  backgrounds, border images, list markers, and generated content), but only
+  for preloaded file/HTTP or `data:` resources; stylesheet and inline-style
+  background URLs are preloaded before layout. SVG resources nested through
+  SVG `<image>` are denied rather than recursively preloaded.
+- Divergence: SVG backgrounds retain omitted, percentage, and `viewBox` root
+  intrinsic-dimension metadata for `background-size`, including finite
+  painting of opaque uniform regions from extreme-ratio `cover`/`contain`
+  images. SVG `<view>` fragments select a viewBox for both sizing and vector
+  painting when the root has no viewBox. Replacing an existing root viewBox,
+  and scaled non-uniform vector backgrounds at opaque CSS border boundaries,
+  can still rasterize differently from the corresponding CSS reference
+  construction.
+- Divergence: raster and URL-SVG replaced images support the `fill`,
+  `contain`, `cover`, `none`, and `scale-down` concrete-object sizing modes
+  and a shared `object-position` model, but embedded-document fallback
+  behavior, transforms, opacity, compositing, and fragmentation remain
+  incomplete.
+- Divergence: physical `contain-intrinsic-size` and its logical inline/block
+  longhands supply fallback sizes for size-contained normal blocks, basic
+  intrinsic contributions, and basic replaced-image sizing without inventing
+  a natural aspect ratio. `auto`/remembered-size syntax and propagation
+  through all flex/grid/table, max-content, and normal-flow writing-mode
+  sizing paths remain incomplete.
+- Divergence: `image-orientation: from-image` and `none` select distinct raw
+  or EXIF-oriented raster resources for replaced elements and ordinary raster
+  backgrounds. Orientation handling remains incomplete for border images,
+  list markers, masks, generated images, SVG, and image documents.
 - Divergence: CSS Images Level 4 gradient color spaces and hue interpolation
   are unsupported.
-- Divergence: conic gradients are unsupported.
-- Divergence: `image-set()` is unsupported.
-- Divergence: SVG image sources are unsupported in CSS image-consuming
-  properties.
+- Divergence: CSS linear/radial backgrounds use native PDF shadings, including
+  repeated color lines, transition hints, hard stops, alpha masks, and
+  zero-period or physically unresolvable gradient-average colors; uniform
+  gradients use solid paths.
+  Conic gradients still use tile-sized raster fallbacks because a native
+  two-dimensional PDF shading representation is not yet implemented.
+- Divergence: conic gradients support ordinary/repeating color stops, `from`
+  angles, and `at` positions, but do not yet support interpolation methods,
+  mixed angle/percentage `calc()` expressions, or all relative-length
+  positions required by CSS Images Level 4.
+- Divergence: `image-set()` selects a supported 1dppx candidate for
+  background and generated-content images and applies the selected candidate's
+  intrinsic-resolution scaling, but nested image values, dynamic
+  output-resolution changes, complete `calc()` resolution arithmetic, MIME
+  negotiation, and the full Level 4 option grammar remain incomplete.
+- Divergence: CSS Values 5 request URL modifiers are retained and CORS and
+  integrity checks are enforced for decoded CSS URL images, but
+  `referrer-policy` request semantics and modifier enforcement for non-image
+  URL consumers remain incomplete.
 - Divergence: generated gradients are not shared across all image-consuming
   properties, including `border-image`, markers, and masks.
 - Divergence: `box-shadow` blur rasterization, rounded-corner shadow shaping,
   complete spread behavior, and fragmentation are incomplete.
+- Divergence: repeated raster background images are not yet raster-equivalent
+  to equivalent replaced-image painting at all scaled tile sizes.
 
 ### Positioning and Stacking
 
@@ -419,11 +823,25 @@ Primary references:
   fragmented paint/effect contexts.
 - Divergence: opacity, transforms, links, and effect groups are incomplete for
   some fragmented stacking-context combinations.
+- Divergence: HTML `transform-box: content-box` and `border-box` resolve the
+  2D transform reference rectangle, including reconstructible percentage
+  padding. SVG fill/stroke/view boxes, nested viewports, and non-reconstructible
+  layout percentage-padding cases remain incomplete.
+- Divergence: CSS `matrix3d`, three-axis translate/scale, axis-angle rotation,
+  z transform origins, and hidden-backface suppression use typed Euclid
+  homogeneous matrices when their flattened result is affine. Projective
+  `perspective`, `transform-style: preserve-3d` depth composition/sorting,
+  parent-derived backface orientation, and transform animations remain
+  unsupported. Independent transforms still support only their 2D forms.
 - Divergence: fragmented overflow clips need broader conformance coverage.
+- Divergence: `overflow-clip-margin` supports the CSS Overflow 3 shorthand
+  for non-negative lengths and visual boxes, but the Level 4 logical/physical
+  longhands, independent per-side offsets, and exact rounded spread geometry
+  are incomplete. Axis-selective deferred paint effects and several
+  SVG/replaced-element clip paths still use rectangular two-axis scopes.
+  <https://www.w3.org/TR/css-overflow-3/#overflow-clip-margin>
 - Divergence: fragmented floats do not fully let descendant stacking contexts
   escape into the ancestor context while preserving fragment-local coordinates.
-- Divergence: `position: fixed` replay is not fully page-context-specific when
-  later named pages use different page boxes.
 - Divergence: transformed ancestors capturing fixed containing blocks across
   fragments are incomplete.
 - Divergence: transformed containing-block behavior is incomplete in less
@@ -444,17 +862,52 @@ Primary references:
 
 - Spec area: CSS Values and Units, CSS Cascade, CSS Sizing.
 - Divergence: container query units (`cqw`, `cqh`, `cqi`, `cqb`, `cqmin`,
-  `cqmax`) are not implemented.
-- Divergence: additional font/line metric units such as `ex`, `cap`, `ic`,
-  `lh`, and `rlh` need property-wide support.
+  `cqmax`) parse, survive CSS math, and use the required small-viewport
+  fallback when no container is available, but layout does not yet select an
+  eligible ancestor container for them.
+- Divergence: `ex` and `cap` resolve from the selected font for box-model
+  `<length-percentage>` values (including CSS math), and `ic` resolves from
+  the WATER glyph advance for direct box-model values. `lh` resolves against
+  the inherited line height in `font-size` and `line-height`. These metric
+  units are not yet supported property-wide or throughout deferred math; `rlh`
+  remains incomplete.
+- Divergence: `rem` uses the document root's resolved font size for CSS sizing
+  properties, but this root-relative basis is not yet applied property-wide to
+  every computed `<length-percentage>` value.
+- Divergence: typed CSS `attr()` resolves basic `raw-string`, `type(*)`,
+  `<color>`, and `<length>` substitutions (including prefixed XML attributes),
+  but its remaining type grammars, unit keywords, tainting, and animation
+  behavior are not implemented.
+- Divergence: CSS Animations parses named `@keyframes` and snapshots one
+  negative-delay animation for interpolable box-size values. Multiple
+  animations, timing functions other than linear, fill/direction/iteration
+  behavior, animation events, compositor-time animation, and interpolation of
+  other property types remain incomplete.
+- Divergence: CSS Values Level 5 `calc-size()` retains only affine arithmetic
+  in `size` (`multiplier × size + <length-percentage>`) and has no complete
+  expression tree for nested `calc-size()`, `min()`, `max()`, `clamp()`, or
+  other non-linear CSS math. `interpolate-size` is also not implemented.
 - Divergence: many property-specific keywords and computed-value models are
   incomplete.
-- Divergence: CSS Sizing Level 4 `aspect-ratio` integration is incomplete
-  across block, table, grid, absolute positioning, and remaining non-raster
-  replaced-element edge cases.
+- Divergence: CSS Sizing Level 4 `aspect-ratio` transfers definite normal-flow
+  block dimensions (including constrained ratio-derived block sizes), handles
+  basic absolute-positioned non-replaced axes, and resolves basic grid
+  track/item dimensions after grid area sizing (including normal versus
+  explicit stretch alignment). Intrinsic inline collection also distinguishes
+  a cyclic percentage inline size from a definite block-size basis for atomic
+  canvas sizing, including explicitly-sized float intrinsic measurement.
+  Integration remains incomplete for wrapped/intrinsic grid and flex sizing,
+  table, nested percentage-height absolute containing blocks, and remaining
+  non-raster replaced-element edge cases.
 - Divergence: CSS Sizing Level 4 `stretch` integration is incomplete across
-  block, table, grid, absolute positioning, and intrinsic sizing contexts.
-- Divergence: multi-layer background lists are incomplete.
+  block-height, table, grid, absolute positioning, and intrinsic sizing
+  contexts. Normal-flow width min/max constraints now preserve margin-box
+  stretch-fit semantics.
+- Divergence: multi-layer backgrounds preserve and normalize the ordinary
+  image-layer count, but painting remains incomplete for `background-clip:
+  text`, per-layer fixed/local attachment geometry, and several table and
+  fragmented-box painting contexts. CSS Backgrounds and Borders Level 3
+  layering: <https://www.w3.org/TR/css-backgrounds-3/#layering>.
 - Divergence: full generated image values are incomplete.
 - Divergence: invalid-at-computed-value-time behavior is incomplete for
   not-yet-modeled shorthands and cross-property dependencies.
@@ -469,8 +922,9 @@ Primary references:
   Queries, HTML form state.
 - Divergence: CSS-wide defaulting is incomplete in page-context structural
   declarations.
-- Divergence: Media Queries support does not cover the full feature grammar or
-  all context-dependent features.
+- Divergence: Media Queries support captures a static renderer environment at
+  parse time; dynamic environment recascading, custom media queries, and the
+  remaining Media Queries feature set are incomplete.
 - Divergence: `@supports` support does not cover all CSS Conditional
   feature-query functions.
 - Divergence: form/input pseudo-classes are incomplete for custom element
@@ -484,6 +938,10 @@ Primary references:
 - Divergence: unmodeled UI/highlight pseudo-elements are not implemented.
 - Divergence: CSS nesting uses a narrow flattener rather than a full CSS
   Nesting implementation.
+- Divergence: HTML form-control rendering semantics are incomplete. In
+  particular, `button { display: grid }` with `button::first-letter` does not
+  yet model the control-specific anonymous display and pseudo-element behavior
+  required by CSS Display, CSS Pseudo-Elements, and HTML form controls.
 
 ### PDF Conformance and Accessibility
 

@@ -1,5 +1,7 @@
+//! Benchmarks for Quire's bundled WeasyPrint-compatible sample documents.
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use quire::{Html, RenderOptions};
+use quire::{Css, Html, PdfOptions, RenderOptions};
 use std::hint::black_box;
 use std::path::Path;
 use std::time::Duration;
@@ -8,38 +10,46 @@ use tokio::runtime::Runtime;
 struct Sample {
     name: &'static str,
     path: &'static str,
+    stylesheets: &'static [&'static str],
 }
 
 const SAMPLES: &[Sample] = &[
     Sample {
         name: "book",
         path: "weasyprint-samples/book/book.html",
+        stylesheets: &["weasyprint-samples/book/book.css"],
     },
     Sample {
         name: "invoice",
         path: "weasyprint-samples/invoice/invoice.html",
+        stylesheets: &[],
     },
     Sample {
         name: "letter",
         path: "weasyprint-samples/letter/letter.html",
+        stylesheets: &[],
     },
     Sample {
         name: "poster",
         path: "weasyprint-samples/poster/poster.html",
+        stylesheets: &["weasyprint-samples/poster/poster.css"],
     },
     Sample {
         name: "report",
         path: "weasyprint-samples/report/report.html",
+        stylesheets: &[],
     },
     Sample {
         name: "ticket",
         path: "weasyprint-samples/ticket/ticket.html",
+        stylesheets: &[],
     },
 ];
 
 fn benchmark_weasyprint_samples(c: &mut Criterion) {
     let runtime = Runtime::new().expect("create Tokio runtime for Criterion benchmarks");
     let options = RenderOptions::default();
+    let pdf_options = PdfOptions::default();
 
     let mut group = c.benchmark_group("render_pdf");
     group.sample_size(10);
@@ -48,7 +58,7 @@ fn benchmark_weasyprint_samples(c: &mut Criterion) {
 
     group.bench_function("empty_document", |b| {
         b.iter(|| {
-            let bytes = runtime.block_on(render_empty_pdf(&options));
+            let bytes = runtime.block_on(render_empty_pdf(&options, &pdf_options));
             black_box(bytes.len())
         });
     });
@@ -57,7 +67,7 @@ fn benchmark_weasyprint_samples(c: &mut Criterion) {
         let benchmark_id = BenchmarkId::from_parameter(format!("sample_{}", sample.name));
         group.bench_with_input(benchmark_id, sample, |b, sample| {
             b.iter(|| {
-                let bytes = runtime.block_on(render_sample_pdf(sample.path, &options));
+                let bytes = runtime.block_on(render_sample_pdf(sample, &options, &pdf_options));
                 black_box(bytes.len())
             });
         });
@@ -66,20 +76,30 @@ fn benchmark_weasyprint_samples(c: &mut Criterion) {
     group.finish();
 }
 
-async fn render_empty_pdf(options: &RenderOptions) -> Vec<u8> {
+async fn render_empty_pdf(options: &RenderOptions, pdf_options: &PdfOptions) -> Vec<u8> {
     Html::from_string("<!doctype html><meta charset=\"utf-8\"><title>empty</title>")
-        .write_pdf_bytes_async(options)
+        .write_pdf_bytes(options, pdf_options)
         .await
         .expect("render empty document to PDF")
 }
 
-async fn render_sample_pdf(path: &str, options: &RenderOptions) -> Vec<u8> {
-    Html::from_file_async(Path::new(path))
+async fn render_sample_pdf(
+    sample: &Sample,
+    options: &RenderOptions,
+    pdf_options: &PdfOptions,
+) -> Vec<u8> {
+    let mut html = Html::from_file(Path::new(sample.path))
         .await
-        .unwrap_or_else(|error| panic!("load sample {path}: {error}"))
-        .write_pdf_bytes_async(options)
+        .unwrap_or_else(|error| panic!("load sample {}: {error}", sample.path));
+    for stylesheet in sample.stylesheets {
+        let stylesheet = Css::from_file(Path::new(stylesheet))
+            .await
+            .unwrap_or_else(|error| panic!("load stylesheet {stylesheet}: {error}"));
+        html = html.with_stylesheet(stylesheet);
+    }
+    html.write_pdf_bytes(options, pdf_options)
         .await
-        .unwrap_or_else(|error| panic!("render sample {path} to PDF: {error}"))
+        .unwrap_or_else(|error| panic!("render sample {} to PDF: {error}", sample.path))
 }
 
 criterion_group!(benches, benchmark_weasyprint_samples);

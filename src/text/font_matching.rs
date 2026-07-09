@@ -1,4 +1,5 @@
 use super::*;
+use crate::units::SemanticLengthExt;
 
 pub(super) fn fontique_weight(weight: FontWeight) -> FontiqueFontWeight {
     FontiqueFontWeight::new(weight.0 as f32)
@@ -33,6 +34,16 @@ pub(super) fn parley_font_family_source(family: &FontFamily) -> String {
         FontFamily::SansSerif => "sans-serif".to_string(),
         FontFamily::Serif => "serif".to_string(),
         FontFamily::Monospace => "monospace".to_string(),
+        FontFamily::SystemUi => "system-ui".to_string(),
+        FontFamily::UiSerif => "ui-serif".to_string(),
+        FontFamily::UiSansSerif => "ui-sans-serif".to_string(),
+        FontFamily::UiMonospace => "ui-monospace".to_string(),
+        FontFamily::UiRounded => "ui-rounded".to_string(),
+        FontFamily::List(families) => families
+            .iter()
+            .map(parley_font_family_source)
+            .collect::<Vec<_>>()
+            .join(", "),
         FontFamily::Names(names) => names
             .iter()
             .map(|name| {
@@ -47,18 +58,19 @@ pub(super) fn parley_font_family_source(family: &FontFamily) -> String {
 pub(super) fn push_parley_default_style(
     builder: &mut parley::RangedBuilder<'_, [u8; 4]>,
     style: &ComputedStyle,
+    font_family_source: &str,
 ) {
-    push_parley_default_style_with_font_size(builder, style, style.font_size);
+    push_parley_default_style_with_font_size(builder, style, font_family_source, style.font_size);
 }
 
 pub(super) fn push_parley_default_style_with_font_size(
     builder: &mut parley::RangedBuilder<'_, [u8; 4]>,
     style: &ComputedStyle,
+    font_family_source: &str,
     font_size: f32,
 ) {
-    let font_family_source = parley_font_family_source(&style.font_family);
     builder.push_default(StyleProperty::FontFamily(ParleyFontFamily::from(
-        font_family_source.as_str(),
+        font_family_source,
     )));
     builder.push_default(StyleProperty::FontSize(font_size));
     builder.push_default(StyleProperty::LineHeight(ParleyLineHeight::Absolute(
@@ -79,10 +91,10 @@ pub(super) fn push_parley_default_style_with_font_size(
     builder.push_default(StyleProperty::OverflowWrap(parley_overflow_wrap(
         style.overflow_wrap,
     )));
-    builder.push_default(StyleProperty::TextWrapMode(parley_text_wrap_mode(
-        style.white_space,
-    )));
-    builder.push_default(StyleProperty::WordSpacing(style.used_word_spacing()));
+    builder.push_default(StyleProperty::TextWrapMode(parley_text_wrap_mode(style)));
+    builder.push_default(StyleProperty::WordSpacing(
+        style.used_word_spacing().points(),
+    ));
     builder.push_default(StyleProperty::Locale(parley_language(style)));
 }
 
@@ -92,7 +104,8 @@ pub(super) fn push_parley_text_spacing_default_with_context(
     style: &ComputedStyle,
     context: Option<&FontFeatureContext>,
 ) {
-    let used_letter_spacing = used_letter_spacing_for_text(text, style.used_letter_spacing());
+    let used_letter_spacing =
+        used_letter_spacing_for_text(text, style.used_letter_spacing().points());
     let vertical_form_ranges = vertical_form_feature_ranges(text, style);
     let default_feature_policy = FontFeaturePolicy {
         vertical_forms: vertical_form_ranges
@@ -125,7 +138,8 @@ pub(super) fn push_parley_text_spacing_range_with_context(
     range: Range<usize>,
     context: Option<&FontFeatureContext>,
 ) {
-    let used_letter_spacing = used_letter_spacing_for_text(text, style.used_letter_spacing());
+    let used_letter_spacing =
+        used_letter_spacing_for_text(text, style.used_letter_spacing().points());
     let vertical_form_ranges = vertical_form_feature_ranges(text, style);
     let default_feature_policy = FontFeaturePolicy {
         vertical_forms: vertical_form_ranges.first().is_some_and(|vertical_range| {
@@ -160,20 +174,27 @@ pub(super) fn push_parley_text_spacing_range_with_context(
 pub(super) fn push_parley_style_range(
     builder: &mut parley::RangedBuilder<'_, [u8; 4]>,
     style: &ComputedStyle,
+    font_family_source: &str,
     range: Range<usize>,
 ) {
-    push_parley_style_range_with_font_size(builder, style, range, style.font_size);
+    push_parley_style_range_with_font_size(
+        builder,
+        style,
+        font_family_source,
+        range,
+        style.font_size,
+    );
 }
 
 pub(super) fn push_parley_style_range_with_font_size(
     builder: &mut parley::RangedBuilder<'_, [u8; 4]>,
     style: &ComputedStyle,
+    font_family_source: &str,
     range: Range<usize>,
     font_size: f32,
 ) {
-    let font_family_source = parley_font_family_source(&style.font_family);
     builder.push(
-        StyleProperty::FontFamily(ParleyFontFamily::from(font_family_source.as_str())),
+        StyleProperty::FontFamily(ParleyFontFamily::from(font_family_source)),
         range.clone(),
     );
     builder.push(StyleProperty::FontSize(font_size), range.clone());
@@ -204,11 +225,11 @@ pub(super) fn push_parley_style_range_with_font_size(
         range.clone(),
     );
     builder.push(
-        StyleProperty::TextWrapMode(parley_text_wrap_mode(style.white_space)),
+        StyleProperty::TextWrapMode(parley_text_wrap_mode(style)),
         range.clone(),
     );
     builder.push(
-        StyleProperty::WordSpacing(style.used_word_spacing()),
+        StyleProperty::WordSpacing(style.used_word_spacing().points()),
         range.clone(),
     );
     builder.push(StyleProperty::Locale(parley_language(style)), range);
@@ -257,8 +278,14 @@ fn parley_font_features(
     push_font_variant_east_asian_features(&mut features, &style.font_variant_east_asian);
     push_vertical_form_features(&mut features, policy);
     if used_letter_spacing != 0.0 {
-        push_parley_font_feature(&mut features, *b"liga", 0);
-        push_parley_font_feature(&mut features, *b"clig", 0);
+        // Tracking is applied after font-variant controls. It disables every
+        // optional ligature or contextual substitution, while the later
+        // low-level `font-feature-settings` layer may explicitly re-enable
+        // one of them.
+        // <https://www.w3.org/TR/css-fonts-4/#feature-precedence>
+        for tag in [*b"liga", *b"clig", *b"dlig", *b"hlig", *b"calt"] {
+            push_parley_font_feature(&mut features, tag, 0);
+        }
     }
     for setting in &style.font_feature_settings.0 {
         push_parley_font_feature(&mut features, setting.tag, setting.value);
@@ -285,10 +312,13 @@ struct FontFeaturePolicy {
 /// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation> and
 /// <https://learn.microsoft.com/en-us/typography/opentype/spec/features_uz#tag-vert>.
 fn vertical_form_feature_ranges(text: &str, style: &ComputedStyle) -> Vec<Range<usize>> {
-    if text.is_empty() || style.writing_mode == WritingMode::HorizontalTb {
+    let TextLayoutPolicy::Vertical(text_orientation) = style.text_layout_policy() else {
+        return Vec::new();
+    };
+    if text.is_empty() {
         return Vec::new();
     }
-    match style.text_orientation {
+    match text_orientation {
         TextOrientation::Sideways => Vec::new(),
         TextOrientation::Upright => std::iter::once(0..text.len()).collect(),
         TextOrientation::Mixed => {
@@ -383,9 +413,9 @@ fn push_font_kerning_features(features: &mut Vec<ParleyFontFeature>, style: &Com
         FontKerning::Normal => 1,
         FontKerning::None => 0,
     };
-    let tag = match style.writing_mode {
-        WritingMode::HorizontalTb => *b"kern",
-        WritingMode::VerticalRl | WritingMode::VerticalLr => *b"vkrn",
+    let tag = match style.writing_mode.typographic_mode() {
+        TypographicMode::Horizontal => *b"kern",
+        TypographicMode::Vertical => *b"vkrn",
     };
     push_parley_font_feature(features, tag, value);
 }
@@ -523,25 +553,19 @@ fn push_font_variant_alternates_features(
                 }
             }
             for name in swash {
-                if resolver.get(FontFeatureValuesBlock::Swash, name).is_some() {
-                    push_parley_font_feature(features, *b"swsh", 1);
-                    push_parley_font_feature(features, *b"cswh", 1);
+                if let Some(value) = resolver.get(FontFeatureValuesBlock::Swash, name) {
+                    push_parley_font_feature(features, *b"swsh", value.feature_index);
+                    push_parley_font_feature(features, *b"cswh", value.feature_index);
                 }
             }
             for name in ornaments {
-                if resolver
-                    .get(FontFeatureValuesBlock::Ornaments, name)
-                    .is_some()
-                {
-                    push_parley_font_feature(features, *b"ornm", 1);
+                if let Some(value) = resolver.get(FontFeatureValuesBlock::Ornaments, name) {
+                    push_parley_font_feature(features, *b"ornm", value.feature_index);
                 }
             }
             for name in annotation {
-                if resolver
-                    .get(FontFeatureValuesBlock::Annotation, name)
-                    .is_some()
-                {
-                    push_parley_font_feature(features, *b"nalt", 1);
+                if let Some(value) = resolver.get(FontFeatureValuesBlock::Annotation, name) {
+                    push_parley_font_feature(features, *b"nalt", value.feature_index);
                 }
             }
         }
@@ -622,6 +646,8 @@ pub(super) fn parley_word_break(word_break: CssWordBreak) -> ParleyWordBreak {
         CssWordBreak::Normal => ParleyWordBreak::Normal,
         CssWordBreak::BreakAll => ParleyWordBreak::BreakAll,
         CssWordBreak::KeepAll => ParleyWordBreak::KeepAll,
+        CssWordBreak::Manual => ParleyWordBreak::Normal,
+        CssWordBreak::BreakWord => ParleyWordBreak::Normal,
     }
 }
 
@@ -633,8 +659,8 @@ pub(super) fn parley_overflow_wrap(overflow_wrap: CssOverflowWrap) -> ParleyOver
     }
 }
 
-pub(super) fn parley_text_wrap_mode(white_space: crate::css::WhiteSpace) -> ParleyTextWrapMode {
-    if white_space.allows_soft_wrap() {
+pub(super) fn parley_text_wrap_mode(style: &ComputedStyle) -> ParleyTextWrapMode {
+    if style.allows_soft_wrap() {
         ParleyTextWrapMode::Wrap
     } else {
         ParleyTextWrapMode::NoWrap
@@ -649,16 +675,19 @@ pub(super) fn parley_font_style(style: FontStyle) -> ParleyFontStyle {
     }
 }
 
-pub(super) fn family_query(name: &str) -> FontiqueQueryFamily<'_> {
+/// The CSS Fonts standard UI family names also identify platform font
+/// families when written as a quoted name. Unlike generic keywords such as
+/// `serif`, these names are specified aliases for the platform UI design
+/// system.
+/// <https://www.w3.org/TR/css-fonts-4/#standard-font-families>
+pub(super) fn standard_ui_family_alias(name: &str) -> Option<FontFamily> {
     match name.trim().to_ascii_lowercase().as_str() {
-        "serif" => FontiqueQueryFamily::Generic(FontiqueGenericFamily::Serif),
-        "sans-serif" | "sans serif" => {
-            FontiqueQueryFamily::Generic(FontiqueGenericFamily::SansSerif)
-        }
-        "monospace" => FontiqueQueryFamily::Generic(FontiqueGenericFamily::Monospace),
-        "cursive" => FontiqueQueryFamily::Generic(FontiqueGenericFamily::Cursive),
-        "fantasy" => FontiqueQueryFamily::Generic(FontiqueGenericFamily::Fantasy),
-        _ => FontiqueQueryFamily::Named(name),
+        "system-ui" => Some(FontFamily::SystemUi),
+        "ui-serif" => Some(FontFamily::UiSerif),
+        "ui-sans-serif" => Some(FontFamily::UiSansSerif),
+        "ui-monospace" => Some(FontFamily::UiMonospace),
+        "ui-rounded" => Some(FontFamily::UiRounded),
+        _ => None,
     }
 }
 
@@ -702,6 +731,35 @@ pub(super) fn generic_query_families(
         FontiqueQueryFamily::Named("Courier"),
         FontiqueQueryFamily::Generic(FontiqueGenericFamily::Monospace),
     ];
+    const SYSTEM_UI: &[FontiqueQueryFamily<'static>] = &[
+        FontiqueQueryFamily::Named(".SF NS"),
+        FontiqueQueryFamily::Named("System Font"),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::SystemUi),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::SansSerif),
+    ];
+    const UI_SERIF: &[FontiqueQueryFamily<'static>] = &[
+        FontiqueQueryFamily::Named(".AppleSystemUIFontSerif"),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::UiSerif),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::Serif),
+    ];
+    const UI_SANS_SERIF: &[FontiqueQueryFamily<'static>] = &[
+        FontiqueQueryFamily::Named(".AppleSystemUIFont"),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::UiSansSerif),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::SystemUi),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::SansSerif),
+    ];
+    const UI_MONOSPACE: &[FontiqueQueryFamily<'static>] = &[
+        FontiqueQueryFamily::Named(".SF NS Mono"),
+        FontiqueQueryFamily::Named(".SF UI Mono"),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::UiMonospace),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::Monospace),
+    ];
+    const UI_ROUNDED: &[FontiqueQueryFamily<'static>] = &[
+        FontiqueQueryFamily::Named(".AppleSystemUIFontRounded"),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::UiRounded),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::SystemUi),
+        FontiqueQueryFamily::Generic(FontiqueGenericFamily::SansSerif),
+    ];
 
     match family {
         FontFamily::SansSerif if weight.0 >= FontWeight::BOLD.0 => Some(SANS_SERIF_BOLD),
@@ -709,24 +767,14 @@ pub(super) fn generic_query_families(
         FontFamily::Serif => Some(SERIF),
         FontFamily::Monospace if weight.0 >= FontWeight::BOLD.0 => Some(MONOSPACE_BOLD),
         FontFamily::Monospace => Some(MONOSPACE),
+        FontFamily::SystemUi => Some(SYSTEM_UI),
+        FontFamily::UiSerif => Some(UI_SERIF),
+        FontFamily::UiSansSerif => Some(UI_SANS_SERIF),
+        FontFamily::UiMonospace => Some(UI_MONOSPACE),
+        FontFamily::UiRounded => Some(UI_ROUNDED),
+        FontFamily::List(_) => None,
         FontFamily::Names(_) => None,
     }
-}
-
-pub(super) fn fallback_family_score(family_name: &str) -> (u32, String) {
-    // CSS Fonts Level 4 fallback uses available fonts after failing the
-    // requested family list. Hidden platform UI fonts are implementation
-    // details and should not outrank normal document fonts just because their
-    // PostScript names sort earlier.
-    let normalized = family_name.to_ascii_lowercase();
-    let hidden_system_font_score = if family_name.starts_with('.') {
-        50_000
-    } else if normalized.contains("arial unicode") {
-        0
-    } else {
-        10_000
-    };
-    (hidden_system_font_score, normalized)
 }
 
 impl FontRequest {
@@ -735,24 +783,38 @@ impl FontRequest {
             FontFamily::SansSerif => Some(GenericFontRequest::SansSerif),
             FontFamily::Serif => Some(GenericFontRequest::Serif),
             FontFamily::Monospace => Some(GenericFontRequest::Monospace),
+            FontFamily::SystemUi => Some(GenericFontRequest::SystemUi),
+            FontFamily::UiSerif => Some(GenericFontRequest::UiSerif),
+            FontFamily::UiSansSerif => Some(GenericFontRequest::UiSansSerif),
+            FontFamily::UiMonospace => Some(GenericFontRequest::UiMonospace),
+            FontFamily::UiRounded => Some(GenericFontRequest::UiRounded),
+            FontFamily::List(_) => None,
             FontFamily::Names(_) => None,
         }
     }
 
-    fn from_normalized_names(
-        names: Vec<String>,
-        weight: FontWeight,
-        style: FontStyle,
-        width: FontWidth,
-    ) -> Self {
-        let family = if names.len() == 1 {
+    fn normalized_names_key(names: &[String]) -> FontRequestFamily {
+        let names = names
+            .iter()
+            .map(|name| normalize_family(name))
+            .collect::<Vec<_>>();
+        if names.len() == 1 {
             FontRequestFamily::Named(names.into_iter().next().unwrap())
         } else {
             FontRequestFamily::Names(names)
-        };
-        Self {
-            family,
-            attributes: font_request_attributes(weight, style, width),
+        }
+    }
+
+    fn family_key(family: &FontFamily) -> FontRequestFamily {
+        if let Some(generic) = Self::generic_family(family) {
+            return FontRequestFamily::Generic(generic);
+        }
+        match family {
+            FontFamily::Names(names) => Self::normalized_names_key(names),
+            FontFamily::List(families) => {
+                FontRequestFamily::List(families.iter().map(Self::family_key).collect())
+            }
+            _ => unreachable!("generic font families returned above"),
         }
     }
 
@@ -769,36 +831,10 @@ impl FontRequest {
             };
         }
 
-        let FontFamily::Names(names) = family else {
-            unreachable!("generic font families returned above");
-        };
-        Self::from_normalized_names(
-            names.iter().map(|name| normalize_family(name)).collect(),
-            weight,
-            style,
-            width,
-        )
-    }
-
-    pub(super) fn from_names<I>(
-        names: I,
-        weight: FontWeight,
-        style: FontStyle,
-        width: FontWidth,
-    ) -> Self
-    where
-        I: IntoIterator,
-        I::Item: AsRef<str>,
-    {
-        Self::from_normalized_names(
-            names
-                .into_iter()
-                .map(|name| normalize_family(name.as_ref()))
-                .collect(),
-            weight,
-            style,
-            width,
-        )
+        Self {
+            family: Self::family_key(family),
+            attributes: font_request_attributes(weight, style, width),
+        }
     }
 
     pub(super) fn single_name(
@@ -893,7 +929,7 @@ pub(super) fn standalone_font_program_kind(data: &[u8]) -> Option<FontProgramKin
     }
 }
 
-pub(super) fn opentype_name(face: &ttf_parser::Face<'_>, name_id: u16) -> Option<String> {
+pub(crate) fn opentype_name(face: &ttf_parser::Face<'_>, name_id: u16) -> Option<String> {
     face.names()
         .into_iter()
         .find(|name| name.name_id == name_id && name.is_unicode())
@@ -925,7 +961,7 @@ pub(super) fn sanitize_pdf_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::css::{FontFeatureSetting, FontFeatureSettings};
+    use crate::css::{FontFeatureSetting, FontFeatureSettings, WritingMode};
 
     fn vertical_range_texts<'a>(text: &'a str, style: &ComputedStyle) -> Vec<&'a str> {
         vertical_form_feature_ranges(text, style)
@@ -945,6 +981,65 @@ mod tests {
     }
 
     #[test]
+    fn font_feature_precedence_layers_face_defaults_variants_tracking_and_low_level_settings() {
+        let defaults = FontFaceFeatureDefaults {
+            font_feature_settings: FontFeatureSettings::NORMAL,
+            font_variant_ligatures: FontVariantLigatures::Values {
+                common: None,
+                discretionary: Some(true),
+                historical: None,
+                contextual: None,
+            },
+            font_variant_position: FontVariantPosition::Normal,
+            font_variant_caps: FontVariantCaps::Normal,
+            font_variant_numeric: FontVariantNumeric::Normal,
+            font_variant_alternates: FontVariantAlternates::Normal,
+            font_variant_east_asian: FontVariantEastAsian::Normal,
+        };
+        let context = FontFeatureContext {
+            family: Some("FeatureDefaults".to_string()),
+            face_defaults: Some(defaults),
+            font_feature_values: FontFeatureValues::default(),
+        };
+        let mut disabled_by_variant = ComputedStyle::initial();
+        disabled_by_variant.font_variant_ligatures = FontVariantLigatures::Values {
+            common: None,
+            discretionary: Some(false),
+            historical: None,
+            contextual: None,
+        };
+        let mut reenabled_by_low_level = disabled_by_variant.clone();
+        reenabled_by_low_level.font_feature_settings =
+            FontFeatureSettings(vec![FontFeatureSetting::new(*b"dlig", 1)]);
+
+        let cases = [
+            ("font-face default", ComputedStyle::initial(), 0.0, Some(1)),
+            ("element variant", disabled_by_variant.clone(), 0.0, Some(0)),
+            ("letter spacing", disabled_by_variant, 1.0, Some(0)),
+            ("low-level override", reenabled_by_low_level, 1.0, Some(1)),
+        ];
+        for (name, style, letter_spacing, expected_dlig) in cases {
+            let features = parley_font_features(
+                &style,
+                letter_spacing,
+                Some(&context),
+                FontFeaturePolicy::default(),
+            );
+            assert_eq!(feature_value(&features, *b"dlig"), expected_dlig, "{name}");
+        }
+
+        let tracking_features = parley_font_features(
+            &ComputedStyle::initial(),
+            1.0,
+            Some(&context),
+            FontFeaturePolicy::default(),
+        );
+        for tag in [*b"liga", *b"clig", *b"dlig", *b"hlig", *b"calt"] {
+            assert_eq!(feature_value(&tracking_features, tag), Some(0), "{tag:?}");
+        }
+    }
+
+    #[test]
     fn vertical_form_policy_enables_features_for_upright_vertical_units_only() {
         let mut style = ComputedStyle::initial();
         assert!(vertical_form_feature_ranges("中文", &style).is_empty());
@@ -958,6 +1053,10 @@ mod tests {
 
         style.text_orientation = TextOrientation::Mixed;
         assert_eq!(vertical_range_texts("a§、〈", &style), vec!["§、"]);
+
+        style.writing_mode = WritingMode::SidewaysLr;
+        style.text_orientation = TextOrientation::Upright;
+        assert!(vertical_form_feature_ranges("a中文", &style).is_empty());
     }
 
     #[test]
@@ -1013,5 +1112,16 @@ mod tests {
         );
         assert_eq!(feature_value(&features, *b"vert"), Some(0));
         assert_eq!(feature_value(&features, *b"vrt2"), Some(0));
+    }
+
+    #[test]
+    fn sideways_typography_uses_horizontal_kerning_features() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::SidewaysRl;
+        style.font_kerning = FontKerning::Normal;
+
+        let features = parley_font_features(&style, 0.0, None, FontFeaturePolicy::default());
+        assert_eq!(feature_value(&features, *b"kern"), Some(1));
+        assert_eq!(feature_value(&features, *b"vkrn"), None);
     }
 }

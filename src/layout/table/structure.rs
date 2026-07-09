@@ -9,14 +9,17 @@ pub(super) fn table_metrics(element: &Element, style: &ComputedStyle) -> TableMe
     }
 
     let spacing = if style.border_spacing_explicit {
-        style.border_spacing
+        style.border_spacing.clone()
     } else if is_html_table_element(element) {
         element
             .attrs
             .get("cellspacing")
             .and_then(|value| parse_html_length(value))
-            .map(|spacing| css::BorderSpacing::from_lengths(spacing.max(0.0), spacing.max(0.0)))
-            .unwrap_or(style.border_spacing)
+            .map(|spacing| {
+                let spacing = spacing.max(0.0) * style.effective_zoom.factor();
+                css::BorderSpacing::from_lengths(spacing, spacing)
+            })
+            .unwrap_or(style.border_spacing.clone())
     } else {
         // CSS Tables initial `border-spacing` is zero. The embedded HTML UA
         // stylesheet gives real `table` elements 2px spacing for compatibility,
@@ -146,7 +149,7 @@ pub(super) fn table_grid(rows: &[TableRow<'_>]) -> TableGrid {
         let mut placements = Vec::new();
         let mut column = 0usize;
         for (cell_index, cell) in row.cells.iter().enumerate() {
-            while active_rowspans.get(column).copied().unwrap_or(0) > 0 {
+            while active_rowspans.get(column).cloned().unwrap_or(0) > 0 {
                 column += 1;
             }
 
@@ -175,7 +178,7 @@ pub(super) fn table_grid(rows: &[TableRow<'_>]) -> TableGrid {
         for active in &mut active_rowspans {
             *active = active.saturating_sub(1);
         }
-        while active_rowspans.last().copied() == Some(0) {
+        while active_rowspans.last().cloned() == Some(0) {
             active_rowspans.pop();
         }
         grid_rows.push(placements);
@@ -362,6 +365,13 @@ pub(super) fn apply_table_cellpadding(style: &mut ComputedStyle, table_cellpaddi
             bottom: cellpadding,
             left: cellpadding,
         };
+        let cellpadding = css::ComputedLengthPercentage::from_points(cellpadding);
+        style.box_values.padding = css::CssEdges {
+            top: cellpadding.clone(),
+            right: cellpadding.clone(),
+            bottom: cellpadding.clone(),
+            left: cellpadding,
+        };
     }
 }
 
@@ -375,10 +385,10 @@ pub(super) fn apply_table_cellpadding(style: &mut ComputedStyle, table_cellpaddi
 pub(super) fn apply_table_cell_used_padding(
     style: &mut ComputedStyle,
     table_cellpadding: Option<f32>,
-    inline_basis: f32,
+    inline_basis: PercentageBasis<LayoutLength>,
 ) {
     apply_table_cellpadding(style, table_cellpadding);
-    style.padding = used_padding_edges(style, inline_basis.max(0.0)).to_css_edges();
+    style.padding = used_padding_edges(style, inline_basis).to_css_edges();
 }
 
 /// Collect the inline textual content used by anonymous and real table cells.
@@ -406,38 +416,44 @@ pub(super) fn table_cell_href<'a>(cell: &'a TableCell<'a>) -> Option<&'a str> {
 /// CSS table row height depends on the maximum minimum height of cells in the
 /// row, including replaced content:
 /// <https://www.w3.org/TR/CSS22/tables.html#height-layout>.
-pub(super) fn table_cell_replaced_content_height(cell: &TableCell<'_>) -> f32 {
+pub(super) fn table_cell_replaced_content_height(cell: &TableCell<'_>) -> LayoutLength {
     if let Some(children) = cell.children.as_deref() {
-        return children
-            .iter()
-            .filter_map(|child| match child {
-                box_tree::FormattingBox::Replaced(box_)
-                    if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Svg) =>
+        return layout_pt(
+            children
+                .iter()
+                .filter_map(|child| match child {
+                    box_tree::FormattingBox::Replaced(box_)
+                        if replaced_element_kind(box_.element)
+                            == Some(ReplacedElementKind::Svg) =>
+                    {
+                        svg_rect(box_.element).map(|(_width, height, _fill)| height)
+                    }
+                    box_tree::FormattingBox::AtomicInline(box_)
+                        if replaced_element_kind(box_.element)
+                            == Some(ReplacedElementKind::Svg) =>
+                    {
+                        svg_rect(box_.element).map(|(_width, height, _fill)| height)
+                    }
+                    _ => None,
+                })
+                .sum(),
+        );
+    }
+
+    layout_pt(
+        cell.element
+            .into_iter()
+            .flat_map(|element| element.children.iter())
+            .filter_map(|child| match &child.kind {
+                NodeKind::Element(child)
+                    if replaced_element_kind(child) == Some(ReplacedElementKind::Svg) =>
                 {
-                    svg_rect(box_.element).map(|(_width, height, _fill)| height)
-                }
-                box_tree::FormattingBox::AtomicInline(box_)
-                    if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Svg) =>
-                {
-                    svg_rect(box_.element).map(|(_width, height, _fill)| height)
+                    svg_rect(child).map(|(_width, height, _fill)| height)
                 }
                 _ => None,
             })
-            .sum();
-    }
-
-    cell.element
-        .into_iter()
-        .flat_map(|element| element.children.iter())
-        .filter_map(|child| match &child.kind {
-            NodeKind::Element(child)
-                if replaced_element_kind(child) == Some(ReplacedElementKind::Svg) =>
-            {
-                svg_rect(child).map(|(_width, height, _fill)| height)
-            }
-            _ => None,
-        })
-        .sum()
+            .sum(),
+    )
 }
 
 /// Measure non-text in-flow cell content for table row height and alignment.
@@ -446,13 +462,17 @@ pub(super) fn table_cell_replaced_content_height(cell: &TableCell<'_>) -> f32 {
 /// content, and cells establish block containers for normal-flow descendants:
 /// <https://www.w3.org/TR/CSS22/tables.html#height-layout> and
 /// <https://www.w3.org/TR/CSS22/tables.html#model>.
-pub(super) fn table_cell_non_text_content_height(cell: &TableCell<'_>) -> f32 {
-    table_cell_replaced_content_height(cell).max(table_cell_block_content_height(cell))
+pub(super) fn table_cell_non_text_content_height(cell: &TableCell<'_>) -> LayoutLength {
+    layout_pt(
+        table_cell_replaced_content_height(cell)
+            .points()
+            .max(table_cell_block_content_height(cell).points()),
+    )
 }
 
-fn table_cell_block_content_height(cell: &TableCell<'_>) -> f32 {
+fn table_cell_block_content_height(cell: &TableCell<'_>) -> LayoutLength {
     let Some(children) = cell.children.as_deref() else {
-        return 0.0;
+        return layout_pt(0.0);
     };
 
     table_cell_formatting_children_block_height(children)
@@ -466,18 +486,20 @@ fn table_cell_block_content_height(cell: &TableCell<'_>) -> f32 {
 /// than being ignored or stacked independently:
 /// <https://www.w3.org/TR/CSS22/tables.html#model> and
 /// <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>.
-fn table_cell_formatting_children_block_height(children: &[box_tree::FormattingBox<'_>]) -> f32 {
-    let mut height = 0.0_f32;
-    let mut inline_line_height = 0.0_f32;
+fn table_cell_formatting_children_block_height(
+    children: &[box_tree::FormattingBox<'_>],
+) -> LayoutLength {
+    let mut height = layout_pt(0.0);
+    let mut inline_line_height = layout_pt(0.0);
 
     for child in children {
         if let Some(inline_height) = table_cell_inline_level_outer_height(child) {
-            inline_line_height = inline_line_height.max(inline_height);
+            inline_line_height = layout_pt(inline_line_height.points().max(inline_height.points()));
             continue;
         }
-        if inline_line_height > 0.0 {
+        if inline_line_height.points() > 0.0 {
             height += inline_line_height;
-            inline_line_height = 0.0;
+            inline_line_height = layout_pt(0.0);
         }
         height += table_cell_block_child_height(child);
     }
@@ -491,12 +513,14 @@ fn table_cell_formatting_children_block_height(children: &[box_tree::FormattingB
 /// block descendants and their signed margins:
 /// <https://www.w3.org/TR/CSS22/tables.html#height-layout> and
 /// <https://www.w3.org/TR/CSS22/box.html#margin-properties>.
-pub(super) fn table_cell_formatting_child_outer_height(child: &box_tree::FormattingBox<'_>) -> f32 {
+pub(super) fn table_cell_formatting_child_outer_height(
+    child: &box_tree::FormattingBox<'_>,
+) -> LayoutLength {
     table_cell_inline_level_outer_height(child)
         .unwrap_or_else(|| table_cell_block_child_height(child))
 }
 
-fn table_cell_block_child_height(child: &box_tree::FormattingBox<'_>) -> f32 {
+fn table_cell_block_child_height(child: &box_tree::FormattingBox<'_>) -> LayoutLength {
     match child {
         box_tree::FormattingBox::Block(box_) => {
             table_cell_element_outer_height(&box_.style, &box_.children)
@@ -516,15 +540,34 @@ fn table_cell_block_child_height(child: &box_tree::FormattingBox<'_>) -> f32 {
         box_tree::FormattingBox::Inline(_)
         | box_tree::FormattingBox::AtomicInline(_)
         | box_tree::FormattingBox::Text(_)
-        | box_tree::FormattingBox::Replaced(_) => 0.0,
+        | box_tree::FormattingBox::Replaced(_) => layout_pt(0.0),
     }
 }
 
-fn table_cell_inline_level_outer_height(child: &box_tree::FormattingBox<'_>) -> Option<f32> {
+fn table_cell_inline_level_outer_height(
+    child: &box_tree::FormattingBox<'_>,
+) -> Option<LayoutLength> {
     match child {
         box_tree::FormattingBox::Inline(box_) => {
-            let height = table_cell_formatting_children_block_height(&box_.children);
-            (height > 0.0).then_some(height)
+            let height = if box_.style.float != Float::None {
+                used_content_box_height_or_auto(
+                    &box_.style,
+                    layout_pt(0.0),
+                    non_content_pt(
+                        box_.style.padding.top
+                            + box_.style.padding.bottom
+                            + vertical_border_width(&box_.style),
+                    ),
+                )
+                .map(SemanticLengthExt::points)
+                .unwrap_or_else(|| {
+                    table_cell_formatting_children_block_height(&box_.children).points()
+                }) + box_.style.margin.top
+                    + box_.style.margin.bottom
+            } else {
+                table_cell_formatting_children_block_height(&box_.children).points()
+            };
+            (height > 0.0).then_some(layout_pt(height))
         }
         box_tree::FormattingBox::AtomicInline(box_) => Some(table_cell_atomic_inline_outer_height(
             &box_.style,
@@ -553,39 +596,68 @@ fn table_cell_inline_level_outer_height(child: &box_tree::FormattingBox<'_>) -> 
 fn table_cell_atomic_inline_outer_height(
     style: &ComputedStyle,
     children: &[box_tree::FormattingBox<'_>],
-) -> f32 {
+) -> LayoutLength {
     if matches!(style.position, Position::Absolute | Position::Fixed) {
-        return 0.0;
+        return layout_pt(0.0);
     }
-    let nested_height = table_cell_formatting_children_block_height(children);
+    let nested_height = if style.contain.size {
+        0.0
+    } else {
+        table_cell_formatting_children_block_height(children).points()
+    };
     let vertical_non_content =
-        style.padding.top + style.padding.bottom + table_vertical_borders(style);
-    let preferred_content_height = nested_height.max(style.line_height);
-    let content_height =
-        used_content_height_or_auto(style, preferred_content_height, vertical_non_content)
-            .unwrap_or(preferred_content_height)
-            .max(nested_height);
-    (content_height + vertical_non_content + style.margin.top + style.margin.bottom).max(0.0)
+        non_content_pt(style.padding.top + style.padding.bottom) + table_vertical_borders(style);
+    let preferred_content_height = if style.contain.size {
+        0.0
+    } else {
+        nested_height.max(style.line_height)
+    };
+    let mut content_height = used_content_box_height_or_auto(
+        style,
+        layout_pt(preferred_content_height),
+        vertical_non_content,
+    )
+    .map(SemanticLengthExt::points)
+    .unwrap_or(preferred_content_height);
+    if !style.contain.size {
+        content_height = content_height.max(nested_height);
+    }
+    layout_pt(
+        (content_height + vertical_non_content.points() + style.margin.top + style.margin.bottom)
+            .max(0.0),
+    )
 }
 
 fn table_cell_element_outer_height(
     style: &ComputedStyle,
     children: &[box_tree::FormattingBox<'_>],
-) -> f32 {
+) -> LayoutLength {
     if matches!(style.position, Position::Absolute | Position::Fixed) {
-        return 0.0;
+        return layout_pt(0.0);
     }
-    let nested_height = table_cell_formatting_children_block_height(children);
+    let nested_height = if style.contain.size {
+        0.0
+    } else {
+        table_cell_formatting_children_block_height(children).points()
+    };
     let vertical_non_content =
-        style.padding.top + style.padding.bottom + table_vertical_borders(style);
-    let content_height = used_content_height_or_auto(style, nested_height, vertical_non_content)
-        .unwrap_or(nested_height)
-        .max(nested_height);
-    (content_height + vertical_non_content + style.margin.top + style.margin.bottom).max(0.0)
+        non_content_pt(style.padding.top + style.padding.bottom) + table_vertical_borders(style);
+    let mut content_height =
+        used_content_box_height_or_auto(style, layout_pt(nested_height), vertical_non_content)
+            .map(SemanticLengthExt::points)
+            .unwrap_or(nested_height);
+    if !style.contain.size {
+        content_height = content_height.max(nested_height);
+    }
+    layout_pt(
+        (content_height + vertical_non_content.points() + style.margin.top + style.margin.bottom)
+            .max(0.0),
+    )
 }
 
 pub(super) fn table_cell_content_offset(
     style: &ComputedStyle,
+    border_insets: css::Edges,
     content_height: f32,
     border_box_height: f32,
     row_baseline_offset: Option<f32>,
@@ -596,10 +668,9 @@ pub(super) fn table_cell_content_offset(
     // `align-content: normal`, while non-normal values align the table-cell
     // contents in the block axis:
     // <https://www.w3.org/TR/css-align-3/#align-content-property>.
-    let borders = table_cell_used_border_edges(style);
     let content_box_height = (border_box_height
-        - borders.top
-        - borders.bottom
+        - border_insets.top
+        - border_insets.bottom
         - style.padding.top
         - style.padding.bottom)
         .max(0.0);
@@ -654,6 +725,43 @@ pub(super) fn table_row_span_height(
     )
 }
 
+/// Return the logical block-start offset of a table row track.
+///
+/// Table row tracks are ordered in the table root's block direction.  The
+/// offset includes only the separated-border gaps between participating prior
+/// rows and the target row; outer edge spacing belongs to the table grid box,
+/// not to a row track.
+/// <https://drafts.csswg.org/css-tables-3/#row-layout>
+/// <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
+pub(super) fn table_row_block_start(
+    row_heights: &[f32],
+    row_occupancy: &[bool],
+    row: usize,
+    table_metrics: TableMetrics,
+) -> f32 {
+    let target_occupies_grid = row_occupancy
+        .get(row)
+        .copied()
+        .unwrap_or_else(|| row_heights.get(row).copied().unwrap_or(0.0) > 0.0);
+    let mut offset = 0.0;
+    let mut previous_occupies_grid = false;
+    for (index, height) in row_heights.iter().take(row).enumerate() {
+        let occupies_grid = row_occupancy.get(index).copied().unwrap_or(*height > 0.0);
+        if !occupies_grid {
+            continue;
+        }
+        if previous_occupies_grid {
+            offset += table_metrics.spacing.vertical.length_points();
+        }
+        offset += height.max(0.0);
+        previous_occupies_grid = true;
+    }
+    if target_occupies_grid && previous_occupies_grid {
+        offset += table_metrics.spacing.vertical.length_points();
+    }
+    offset
+}
+
 /// Return the block-axis size of the table row grid.
 ///
 /// CSS 2.2 separated borders add vertical `border-spacing` only between
@@ -673,7 +781,7 @@ pub(super) fn table_grid_height(
         .filter_map(|(index, height)| {
             row_occupancy
                 .get(index)
-                .copied()
+                .cloned()
                 .unwrap_or(*height > 0.0)
                 .then_some(*height)
         })
@@ -713,7 +821,7 @@ pub(super) fn table_content_height(
     row_occupancy: &[bool],
     table_metrics: TableMetrics,
 ) -> f32 {
-    table_grid_height(row_heights, row_occupancy, table_metrics)
+    table_grid_height(row_heights, row_occupancy, table_metrics.clone())
         + table_vertical_edge_spacing(row_occupancy, table_metrics) * 2.0
 }
 
@@ -735,10 +843,10 @@ pub(super) fn repeated_table_rows_height(
         .filter(|row_index| {
             row_occupancy
                 .get(**row_index)
-                .copied()
-                .unwrap_or_else(|| row_heights.get(**row_index).copied().unwrap_or(0.0) > 0.0)
+                .cloned()
+                .unwrap_or_else(|| row_heights.get(**row_index).cloned().unwrap_or(0.0) > 0.0)
         })
-        .map(|row_index| row_heights.get(*row_index).copied().unwrap_or(0.0))
+        .map(|row_index| row_heights.get(*row_index).cloned().unwrap_or(0.0))
         .collect::<Vec<_>>();
     table_grid_height(
         &occupied_heights,
@@ -761,7 +869,7 @@ pub(super) fn table_row_top(
         .filter_map(|(index, height)| {
             row_occupancy
                 .get(index)
-                .copied()
+                .cloned()
                 .unwrap_or(*height > 0.0)
                 .then_some(*height)
         })
@@ -788,14 +896,14 @@ pub(super) fn inline_table_first_occupying_row_range(
 ) -> Option<(f32, f32)> {
     let (row_index, row_height) = row_heights
         .iter()
-        .copied()
+        .cloned()
         .enumerate()
-        .find(|(index, _)| row_occupancy.get(*index).copied().unwrap_or(false))?;
+        .find(|(index, _)| row_occupancy.get(*index).cloned().unwrap_or(false))?;
     let grid_top = table_top
         - top_caption_height
         - table_border_widths.top
         - table_padding.top
-        - table_vertical_edge_spacing(row_occupancy, table_metrics);
+        - table_vertical_edge_spacing(row_occupancy, table_metrics.clone());
     let row_top = table_row_top(
         grid_top,
         row_heights,
@@ -839,14 +947,16 @@ pub(super) fn table_row_is_collapsed(style: &ComputedStyle) -> bool {
     style.visibility == Visibility::Collapse
 }
 
-pub(super) fn table_horizontal_borders(style: &ComputedStyle) -> f32 {
+/// Return the horizontal border contribution outside a table cell's content box.
+pub(super) fn table_horizontal_borders(style: &ComputedStyle) -> NonContentLength {
     let borders = table_cell_used_border_edges(style);
-    borders.left + borders.right
+    non_content_pt(borders.left + borders.right)
 }
 
-pub(super) fn table_vertical_borders(style: &ComputedStyle) -> f32 {
+/// Return the vertical border contribution outside a table cell's content box.
+pub(super) fn table_vertical_borders(style: &ComputedStyle) -> NonContentLength {
     let borders = table_cell_used_border_edges(style);
-    borders.top + borders.bottom
+    non_content_pt(borders.top + borders.bottom)
 }
 
 /// Return the cell border contribution used by table sizing.
@@ -871,11 +981,50 @@ pub(super) fn table_cell_used_border_edges(style: &ComputedStyle) -> css::Edges 
 pub(super) fn paint_table_border_edges(
     rects: &mut Vec<RenderedRect>,
     paths: &mut Vec<RenderedPath>,
-    x: f32,
-    top: f32,
-    width: f32,
-    height: f32,
+    rect: PageTopRect,
     style: &ComputedStyle,
 ) {
-    super::paint_border_edges(rects, paths, x, top, width, height, style);
+    super::paint_border_edges(rects, paths, rect, style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics(vertical_spacing: f32) -> TableMetrics {
+        TableMetrics {
+            border_collapse: css::BorderCollapse::Separate,
+            spacing: css::BorderSpacing::from_lengths(0.0, vertical_spacing),
+        }
+    }
+
+    #[test]
+    fn row_track_offsets_include_only_inter_row_spacing() {
+        let rows = [10.0, 20.0, 30.0];
+        let occupancy = [true, true, true];
+
+        assert_eq!(
+            table_row_block_start(&rows, &occupancy, 0, metrics(4.0)),
+            0.0
+        );
+        assert_eq!(
+            table_row_block_start(&rows, &occupancy, 1, metrics(4.0)),
+            14.0
+        );
+        assert_eq!(
+            table_row_block_start(&rows, &occupancy, 2, metrics(4.0)),
+            38.0
+        );
+    }
+
+    #[test]
+    fn collapsed_rows_do_not_create_logical_track_gaps() {
+        let rows = [10.0, 20.0, 30.0];
+        let occupancy = [true, false, true];
+
+        assert_eq!(
+            table_row_block_start(&rows, &occupancy, 2, metrics(4.0)),
+            14.0
+        );
+    }
 }

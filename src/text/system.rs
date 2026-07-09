@@ -8,4 +8,4 @@ mod font_registry;
 mod woff;
 
 #[cfg(test)]
-pub(super) use api::span_boundary_needs_join_control;
+pub(crate) use api::span_boundary_needs_join_control;

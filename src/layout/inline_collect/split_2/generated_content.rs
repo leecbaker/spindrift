@@ -34,6 +34,7 @@ impl<'a> LayoutBuilder<'a> {
                 element,
                 part,
                 style,
+                box_tree::CounterEventSource::Principal,
                 inherited_link.clone(),
                 placement.baseline_shift,
                 placement.visual_offset,
@@ -48,6 +49,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         element: &Element,
         style: &ComputedStyle,
+        source: box_tree::CounterEventSource,
         children: &[box_tree::FormattingBox<'_>],
         stylesheets: &[Stylesheet],
         inherited_link: Option<String>,
@@ -73,7 +75,7 @@ impl<'a> LayoutBuilder<'a> {
                         baseline_shift,
                         visual_offset,
                         block_style,
-                        propagated_decoration,
+                        propagated_decoration.clone(),
                         output,
                     );
                 }
@@ -83,6 +85,7 @@ impl<'a> LayoutBuilder<'a> {
                 element,
                 part,
                 style,
+                source,
                 inherited_link.clone(),
                 baseline_shift,
                 visual_offset,
@@ -106,6 +109,9 @@ impl<'a> LayoutBuilder<'a> {
         for child in &element.children {
             match &child.kind {
                 NodeKind::Text(text) => {
+                    if element_suppresses_direct_text_children(element) {
+                        continue;
+                    }
                     self.push_inline_words(
                         text,
                         style,
@@ -116,6 +122,11 @@ impl<'a> LayoutBuilder<'a> {
                     );
                 }
                 NodeKind::Element(child_element) => {
+                    if is_html_select_item_element(child_element)
+                        && !has_html_select_context(element, &self.ancestors)
+                    {
+                        continue;
+                    }
                     let child_signature = ElementSignature::with_sibling_list(
                         child_element.tag.clone(),
                         child_element.attrs.clone(),
@@ -134,8 +145,13 @@ impl<'a> LayoutBuilder<'a> {
                             child_element.clone(),
                             child_signature,
                             child_style,
-                            inline_style_establishes_positioning_containing_block(style)
-                                .then_some(style.clone()),
+                            false,
+                            inline_style_establishes_positioning_containing_block(style).then(
+                                || InlinePositioningContainingBlockSource {
+                                    id: InlinePositioningContainingBlockId(output.len()),
+                                    style: style.clone(),
+                                },
+                            ),
                         ))));
                         continue;
                     }
@@ -153,7 +169,7 @@ impl<'a> LayoutBuilder<'a> {
                     }
                     child_style.text_decoration = child_style
                         .text_decoration
-                        .with_propagated_lines(style.text_decoration);
+                        .with_propagated_lines(style.text_decoration.clone());
                     if child_style.display.is_none()
                         || child_style.display.is_block_level()
                         || child_style.display.is_table()
@@ -252,10 +268,10 @@ impl<'a> LayoutBuilder<'a> {
         visual_offset: InlineVisualOffset,
         block_style: &ComputedStyle,
         propagated_decoration: css::TextDecoration,
-        active_float_containing_block_style: Option<&ComputedStyle>,
+        active_float_containing_block: Option<&InlinePositioningContainingBlockSource>,
         output: &mut Vec<InlineItem>,
     ) {
-        for (child_index, child) in children.iter().enumerate() {
+        for child in children {
             if let Some((element, _, style, child_boxes)) = child.element_parts()
                 && matches!(style.position, Position::Absolute | Position::Fixed)
             {
@@ -282,7 +298,8 @@ impl<'a> LayoutBuilder<'a> {
                     element.clone(),
                     signature.clone(),
                     style.clone(),
-                    active_float_containing_block_style.cloned(),
+                    style.content.is_generated(),
+                    active_float_containing_block.cloned(),
                 ))));
                 continue;
             }
@@ -309,8 +326,9 @@ impl<'a> LayoutBuilder<'a> {
                     block_style,
                     box_.style
                         .text_decoration
-                        .with_propagated_lines(propagated_decoration),
-                    active_float_containing_block_style,
+                        .clone()
+                        .with_propagated_lines(propagated_decoration.clone()),
+                    active_float_containing_block,
                     output,
                 );
                 if formatting_box_has_inline_content(&box_.children)
@@ -328,14 +346,9 @@ impl<'a> LayoutBuilder<'a> {
                     let mut text_style = box_tree::owned_style(&box_.style);
                     text_style.text_decoration = text_style
                         .text_decoration
-                        .with_propagated_lines(propagated_decoration);
-                    let text = if child_index + 1 == children.len() {
-                        trim_terminal_preserved_segment_breaks(&box_.text, &text_style)
-                    } else {
-                        box_.text.as_str()
-                    };
+                        .with_propagated_lines(propagated_decoration.clone());
                     self.push_inline_words(
-                        text,
+                        &box_.text,
                         &text_style,
                         inherited_link.clone(),
                         baseline_shift,
@@ -349,14 +362,15 @@ impl<'a> LayoutBuilder<'a> {
                             box_.element.clone(),
                             box_.signature.clone(),
                             (*box_.style).clone(),
-                            active_float_containing_block_style.cloned(),
+                            box_.style.content.is_generated(),
+                            active_float_containing_block.cloned(),
                         ))));
                         continue;
                     }
                     let mut inline_style = box_tree::owned_style(&box_.style);
                     inline_style.text_decoration = inline_style
                         .text_decoration
-                        .with_propagated_lines(propagated_decoration);
+                        .with_propagated_lines(propagated_decoration.clone());
                     let link = box_
                         .element
                         .attrs
@@ -382,24 +396,44 @@ impl<'a> LayoutBuilder<'a> {
                             .with_fragment_edges(box_.fragment_edges),
                         output,
                     );
-                    let next_float_containing_block_style =
+                    let next_float_containing_block =
                         if inline_style_establishes_positioning_containing_block(&inline_style) {
-                            Some(&inline_style)
+                            Some(&scope.positioning_containing_block_source)
+                                .and_then(Option::as_ref)
                         } else {
-                            active_float_containing_block_style
+                            active_float_containing_block
                         };
                     if inline_style.content.is_generated() {
+                        let generated_pseudo_content_style =
+                            matches!(&box_.source, box_tree::BoxSource::GeneratedPseudo(_))
+                                .then(|| generated_pseudo_inline_content_style(&inline_style));
+                        let content_style = generated_pseudo_content_style
+                            .as_ref()
+                            .unwrap_or(&inline_style);
                         let start_len = output.len();
                         self.push_element_content_items_from_boxes(
                             box_.element,
-                            &inline_style,
+                            content_style,
+                            match &box_.source {
+                                box_tree::BoxSource::GeneratedPseudo(pseudo) => match pseudo.kind {
+                                    box_tree::GeneratedPseudoKind::Before => {
+                                        box_tree::CounterEventSource::Before
+                                    }
+                                    box_tree::GeneratedPseudoKind::After => {
+                                        box_tree::CounterEventSource::After
+                                    }
+                                },
+                                box_tree::BoxSource::Principal => {
+                                    box_tree::CounterEventSource::Principal
+                                }
+                            },
                             &box_.children,
                             stylesheets,
                             link.clone(),
                             child_placement.baseline_shift,
                             child_placement.visual_offset,
                             block_style,
-                            inline_style.text_decoration,
+                            inline_style.text_decoration.clone(),
                             output,
                         );
                         let clear = generated_content_originating_clear(&box_.source)
@@ -418,8 +452,8 @@ impl<'a> LayoutBuilder<'a> {
                             child_placement.baseline_shift,
                             child_placement.visual_offset,
                             block_style,
-                            inline_style.text_decoration,
-                            next_float_containing_block_style,
+                            inline_style.text_decoration.clone(),
+                            next_float_containing_block,
                             output,
                         );
                     }
@@ -431,7 +465,8 @@ impl<'a> LayoutBuilder<'a> {
                             box_.element.clone(),
                             box_.signature.clone(),
                             (*box_.style).clone(),
-                            active_float_containing_block_style.cloned(),
+                            box_.style.content.is_generated(),
+                            active_float_containing_block.cloned(),
                         ))));
                         continue;
                     }
@@ -443,7 +478,8 @@ impl<'a> LayoutBuilder<'a> {
                         .or_else(|| inherited_link.clone());
                     let atom_visual_offset =
                         visual_offset.plus(self.inline_visual_offset_for_style(&box_.style));
-                    if let Some(mut atom) = self.inline_atom_for_element(
+                    let counter_scope = self.begin_counter_scope(box_.element, &box_.style);
+                    let atom = self.inline_atom_for_element(
                         box_.element,
                         &box_.signature,
                         &box_.style,
@@ -453,7 +489,9 @@ impl<'a> LayoutBuilder<'a> {
                         baseline_shift,
                         atom_visual_offset,
                         link.clone(),
-                    ) {
+                    );
+                    self.end_counter_scope(counter_scope);
+                    if let Some(mut atom) = atom {
                         atom.baseline_shift +=
                             self.vertical_align_baseline_shift_for_atom(&atom, block_style);
                         output.push(InlineItem::Atom(Box::new(atom)));
@@ -479,8 +517,9 @@ impl<'a> LayoutBuilder<'a> {
                         block_style,
                         box_.style
                             .text_decoration
-                            .with_propagated_lines(propagated_decoration),
-                        active_float_containing_block_style,
+                            .clone()
+                            .with_propagated_lines(propagated_decoration.clone()),
+                        active_float_containing_block,
                         output,
                     ),
                 box_tree::FormattingBox::Block(_)
@@ -503,6 +542,9 @@ impl<'a> LayoutBuilder<'a> {
         block_style: &ComputedStyle,
         output: &[InlineItem],
     ) {
+        if self.positioned_inline_layout_suppression_depth > 0 {
+            return;
+        }
         let source_was_inline_level =
             style.abspos_static_source_was_inline_level || style.display.is_inline_level();
         if source_was_inline_level {
@@ -531,6 +573,36 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         let static_y_offset = self.block_static_position_y_offset_from_buffer(output, block_style);
+        if self.escaped_atom_positioning_depth == 0 && output.iter().all(|item| {
+            matches!(item, InlineItem::Word(word) if word.text.chars().all(|character| character == '\u{a0}'))
+        }) {
+            let inline_static = self.inline_static_position_from_hypothetical_placeholder(
+                element,
+                style,
+                stylesheets,
+                child_boxes,
+                table_fragment,
+                block_style,
+                output,
+            );
+            let previous = self.absolute_static_position;
+            self.absolute_static_position = Some(
+                AbsoluteStaticPosition::from_page_horizontal_position(
+                    inline_static.start_x,
+                    inline_static.end_x,
+                ),
+            );
+            self.layout_positioned_block_with_block_static_y_offset(
+                element,
+                style,
+                stylesheets,
+                child_boxes,
+                table_fragment,
+                static_y_offset,
+            );
+            self.absolute_static_position = previous;
+            return;
+        }
         self.layout_positioned_block_with_block_static_y_offset(
             element,
             style,
@@ -570,6 +642,13 @@ impl<'a> LayoutBuilder<'a> {
         // machinery used for real inline content:
         // https://www.w3.org/TR/css-position-3/#staticpos-rect
         // https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-height
+        // Static-position resolution is a hypothetical inline layout. Its
+        // float placement may build paint fragments and exclusions while
+        // fitting the placeholder, but none of those side effects belong to
+        // the real inline run that follows.
+        // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+        // <https://www.w3.org/TR/CSS22/visuren.html#abs-non-replaced-height>
+        let snapshot = self.snapshot();
         let sequence = self.collect_inline_line_sequence_with_text_box_trim(
             hypothetical_items,
             block_style,
@@ -577,6 +656,7 @@ impl<'a> LayoutBuilder<'a> {
             0.0,
             0.0,
         );
+        self.restore(snapshot);
         self.inline_static_position_from_placeholder_sequence(&sequence, block_style)
             .unwrap_or_else(|| InlineStaticPosition {
                 start_x: self.content_left,
@@ -598,33 +678,49 @@ impl<'a> LayoutBuilder<'a> {
     ) -> InlineAtom {
         let available_width = (self.content_right - self.content_left).max(style.font_size);
         let mut placeholder_style = self.style_with_current_viewport_lengths(style);
-        apply_used_box_metrics(&mut placeholder_style, available_width);
+        apply_used_box_metrics(
+            &mut placeholder_style,
+            PercentageBasis::definite(layout_pt(available_width)),
+        );
         let horizontal_non_content = placeholder_style.padding.left
             + placeholder_style.padding.right
             + horizontal_border_width(&placeholder_style);
         let positioned_available_outer_width =
             (available_width - placeholder_style.margin.left - placeholder_style.margin.right)
                 .max(placeholder_style.font_size);
-        let content_width = self.used_intrinsic_or_shrink_to_fit_width(
-            element,
-            &placeholder_style,
-            stylesheets,
-            positioned_available_outer_width,
-            horizontal_non_content,
-            child_boxes,
-            table_fragment,
-        );
+        let content_width = self
+            .used_intrinsic_or_shrink_to_fit_width(
+                element,
+                &placeholder_style,
+                stylesheets,
+                layout_pt(positioned_available_outer_width),
+                non_content_pt(horizontal_non_content),
+                child_boxes,
+                table_fragment,
+            )
+            .points();
         let border_box_width = content_width + horizontal_non_content;
         let vertical_non_content = placeholder_style.padding.top
             + placeholder_style.padding.bottom
             + vertical_border_width(&placeholder_style);
-        let containing_block_height = self.definite_block_size_stack.last().copied().flatten();
-        let content_height = used_content_height_or_auto_with_optional_basis(
+        let containing_block_height = self
+            .definite_block_size_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(PercentageBasis::indefinite);
+        let content_height = used_content_box_height_or_auto_with_basis(
             &placeholder_style,
             containing_block_height,
-            vertical_non_content,
+            non_content_pt(vertical_non_content),
         )
-        .map(|height| constrain_height(&placeholder_style, height, available_width))
+        .map(|height| {
+            constrain_content_height(
+                &placeholder_style,
+                height,
+                PercentageBasis::definite(layout_pt(available_width)),
+            )
+            .points()
+        })
         .unwrap_or(placeholder_style.line_height);
         let border_box_height = content_height + vertical_non_content;
         let line_baseline_offset = if placeholder_style.display.is_atomic_inline()
@@ -634,14 +730,17 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             self.font_system
                 .rendered_first_line_baseline_offset(&placeholder_style)
+                .points()
         };
 
         InlineAtom::new(
             InlineAtomContent::StaticPositionPlaceholder,
             placeholder_style.clone(),
             None,
-            border_box_width + placeholder_style.margin.left + placeholder_style.margin.right,
-            border_box_height + placeholder_style.margin.top + placeholder_style.margin.bottom,
+            InlineSize::new(
+                border_box_width + placeholder_style.margin.left + placeholder_style.margin.right,
+                border_box_height + placeholder_style.margin.top + placeholder_style.margin.bottom,
+            ),
             line_baseline_offset,
             0.0,
             None,
@@ -687,6 +786,11 @@ impl<'a> LayoutBuilder<'a> {
                                     + atom.content_rect.height()
                                     + atom.atom.style().margin.top,
                                 baseline_y: paint_line_top - prepared.metrics.baseline_offset,
+                                // Non-atomic inline sources align their first
+                                // line to the static-position baseline. An
+                                // atomic inline source has a margin box at
+                                // that position instead.
+                                // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
                                 use_margin_box_top: atom.atom.style().display.is_atomic_inline()
                                     || atom.atom.style().abspos_static_source_was_atomic_inline,
                             })
@@ -709,7 +813,7 @@ impl<'a> LayoutBuilder<'a> {
         context: IntrinsicInlineCollectionContext<'_>,
         output: &mut Vec<InlineItem>,
     ) {
-        for (child_index, child) in children.iter().enumerate() {
+        for child in children {
             if let Some((_, _, style, _)) = child.element_parts()
                 && (matches!(style.position, Position::Absolute | Position::Fixed)
                     || style.float != Float::None)
@@ -726,16 +830,19 @@ impl<'a> LayoutBuilder<'a> {
                     trim_trailing_inline_spaces(output);
                     output.push(InlineItem::Break(InlineBreak::default()));
                 }
+                let propagated_decoration = context.propagated_decoration.clone();
                 self.collect_intrinsic_inline_box_items(
                     &box_.children,
                     stylesheets,
                     inherited_link.clone(),
                     context
+                        .clone()
                         .with_block_style(&box_.style)
                         .with_propagated_decoration(
                             box_.style
                                 .text_decoration
-                                .with_propagated_lines(context.propagated_decoration),
+                                .clone()
+                                .with_propagated_lines(propagated_decoration),
                         ),
                     output,
                 );
@@ -754,14 +861,9 @@ impl<'a> LayoutBuilder<'a> {
                     let mut text_style = box_tree::owned_style(&box_.style);
                     text_style.text_decoration = text_style
                         .text_decoration
-                        .with_propagated_lines(context.propagated_decoration);
-                    let text = if child_index + 1 == children.len() {
-                        trim_terminal_preserved_segment_breaks(&box_.text, &text_style)
-                    } else {
-                        box_.text.as_str()
-                    };
+                        .with_propagated_lines(context.propagated_decoration.clone());
                     self.push_inline_words(
-                        text,
+                        &box_.text,
                         &text_style,
                         inherited_link.clone(),
                         context.baseline_shift,
@@ -773,7 +875,7 @@ impl<'a> LayoutBuilder<'a> {
                     let mut inline_style = box_tree::owned_style(&box_.style);
                     inline_style.text_decoration = inline_style
                         .text_decoration
-                        .with_propagated_lines(context.propagated_decoration);
+                        .with_propagated_lines(context.propagated_decoration.clone());
                     let link = box_
                         .element
                         .attrs
@@ -804,13 +906,13 @@ impl<'a> LayoutBuilder<'a> {
                         let start_len = output.len();
                         self.push_intrinsic_element_content_items_from_boxes(
                             box_.element,
-                            &inline_style,
+                            &inline_style.clone(),
                             &box_.children,
                             stylesheets,
                             link.clone(),
                             child_placement.baseline_shift,
                             child_placement.visual_offset,
-                            inline_style.text_decoration,
+                            inline_style.text_decoration.clone(),
                             output,
                         );
                         let clear = generated_content_originating_clear(&box_.source)
@@ -827,10 +929,11 @@ impl<'a> LayoutBuilder<'a> {
                             stylesheets,
                             link.clone(),
                             context
+                                .clone()
                                 .with_baseline_shift(child_placement.baseline_shift)
                                 .with_visual_offset(child_placement.visual_offset)
-                                .with_block_style(&inline_style)
-                                .with_propagated_decoration(inline_style.text_decoration),
+                                .with_block_style(&inline_style.clone())
+                                .with_propagated_decoration(inline_style.text_decoration.clone()),
                             output,
                         );
                     }
@@ -846,7 +949,9 @@ impl<'a> LayoutBuilder<'a> {
                     let atom_visual_offset = context
                         .visual_offset
                         .plus(self.inline_visual_offset_for_style(&box_.style));
-                    if let Some(mut atom) = self.intrinsic_inline_atom_for_element(
+                    let counter_snapshot = self.counter_set.clone();
+                    let counter_scope = self.begin_counter_scope(box_.element, &box_.style);
+                    let atom = self.intrinsic_inline_atom_for_element(
                         box_.element,
                         &box_.style,
                         &box_.children,
@@ -855,7 +960,10 @@ impl<'a> LayoutBuilder<'a> {
                         context.baseline_shift,
                         atom_visual_offset,
                         link,
-                    ) {
+                    );
+                    self.end_counter_scope(counter_scope);
+                    self.counter_set = counter_snapshot;
+                    if let Some(mut atom) = atom {
                         atom.baseline_shift +=
                             self.vertical_align_baseline_shift_for_atom(&atom, context.block_style);
                         output.push(InlineItem::Atom(Box::new(atom)));
@@ -877,11 +985,13 @@ impl<'a> LayoutBuilder<'a> {
                         stylesheets,
                         inherited_link.clone(),
                         context
+                            .clone()
                             .with_block_style(&box_.style)
                             .with_propagated_decoration(
                                 box_.style
                                     .text_decoration
-                                    .with_propagated_lines(context.propagated_decoration),
+                                    .clone()
+                                    .with_propagated_lines(context.propagated_decoration.clone()),
                             ),
                         output,
                     ),
@@ -893,6 +1003,35 @@ impl<'a> LayoutBuilder<'a> {
             }
         }
     }
+}
+
+/// Produce the anonymous replaced-content style inside an inline generated
+/// pseudo-element.
+///
+/// A `content: url(...)` item is the child of the tree-abiding pseudo-element,
+/// not a replacement of that pseudo-element itself. Its parent owns the
+/// pseudo's box decoration; copying those edges into the image atom would
+/// paint the border twice and size the image as the pseudo's border box:
+/// <https://www.w3.org/TR/css-content-3/#content-property> and
+/// <https://drafts.csswg.org/css-pseudo-4/#generated-content>.
+fn generated_pseudo_inline_content_style(style: &ComputedStyle) -> ComputedStyle {
+    let mut content_style = style.clone();
+    content_style.margin = css::Edges::ZERO;
+    content_style.ua_margin_em = css::OptionalEdges::NONE;
+    content_style.box_values.margin = css::CssEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
+    content_style.padding = css::Edges::ZERO;
+    content_style.box_values.padding = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
+    content_style.border_width = 0.0;
+    content_style.border_widths = css::Edges::ZERO;
+    content_style.border_width_values = css::CssEdges::all(css::ComputedLengthPercentage::ZERO);
+    content_style.border_styles = css::BorderStyles::NONE;
+    content_style.border_radius = css::BorderRadius::ZERO;
+    content_style.corner_shapes = css::CornerShapes::ROUND;
+    content_style.border_image = css::BorderImage::initial();
+    content_style.background_color = None;
+    content_style.background_image = None;
+    content_style.background_layers.clear();
+    content_style
 }
 
 pub(in crate::layout) fn annotate_line_break_element_breaks(
@@ -935,5 +1074,5 @@ fn inline_style_establishes_positioning_containing_block(style: &ComputedStyle) 
     matches!(
         style.position,
         Position::Absolute | Position::Fixed | Position::Relative | Position::Sticky
-    ) || !style.transform.is_empty()
+    ) || style.has_transform()
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::MediaEnvironment;
 
 /// Parses CSS Paged Media rules while preserving full raw `@page` bodies.
 ///
@@ -11,11 +12,12 @@ use super::*;
 /// <https://www.w3.org/TR/css-cascade-5/#layering>.
 pub(super) fn parse_page_rules(
     source: &str,
-    base_url: Option<&Path>,
-    root_url: Option<&Path>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
     origin: StylesheetOrigin,
     layer_names: &[String],
     initial_layer: Option<&str>,
+    media_environment: &MediaEnvironment,
 ) -> Vec<PageRule> {
     let layer_order = layer_names
         .iter()
@@ -34,6 +36,7 @@ pub(super) fn parse_page_rules(
             root_url,
             origin,
             layer_order: &layer_order,
+            media_environment,
         },
         initial_layer,
         &mut state,
@@ -44,10 +47,11 @@ pub(super) fn parse_page_rules(
 
 #[derive(Clone, Copy)]
 struct PageRuleScanContext<'a> {
-    base_url: Option<&'a Path>,
-    root_url: Option<&'a Path>,
+    base_url: Option<&'a url::Url>,
+    root_url: Option<&'a url::Url>,
     origin: StylesheetOrigin,
     layer_order: &'a HashMap<&'a str, usize>,
+    media_environment: &'a MediaEnvironment,
 }
 
 struct PageRuleScanState {
@@ -107,11 +111,11 @@ fn parse_page_at_rule<'a>(
             order: state.order,
             layer_order: current_layer
                 .and_then(|name| context.layer_order.get(name))
-                .copied(),
+                .cloned(),
         });
         state.order = state.order.saturating_add(1);
     } else if name.eq_ignore_ascii_case("media") {
-        if media_rule_applies(at_prelude) {
+        if media_rule_applies_in_environment(at_prelude, context.media_environment) {
             parse_page_rules_in_block(body, context, current_layer, state, rules);
         }
     } else if name.eq_ignore_ascii_case("supports") {
@@ -153,8 +157,8 @@ fn qualify_page_layer_name(parent: Option<&str>, name: &str) -> Option<String> {
 
 pub(super) fn parse_page_rule_margin_boxes(
     page_body: &str,
-    base_url: Option<&Path>,
-    root_url: Option<&Path>,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
 ) -> HashMap<String, Declarations> {
     let mut boxes = HashMap::new();
     for name in PAGE_MARGIN_BOX_NAMES {
@@ -333,32 +337,6 @@ pub(crate) fn cascade_page_declarations(
                 )
             })
     }))
-}
-
-pub(super) fn cascade_page_margin_boxes(
-    page_rules: &[PageRule],
-    page_number: usize,
-) -> HashMap<String, Declarations> {
-    let mut boxes = HashMap::new();
-    for name in PAGE_MARGIN_BOX_NAMES {
-        let declarations = cascade_page_rule_declarations(page_rules.iter().filter_map(|rule| {
-            let specificity =
-                rule.matching_specificity(page_number, None, false, Direction::Ltr)?;
-            rule.margin_boxes.get(*name).map(|declarations| {
-                (
-                    rule.origin,
-                    specificity,
-                    rule.layer_order,
-                    rule.order,
-                    declarations,
-                )
-            })
-        }));
-        if !declarations.is_empty() {
-            boxes.insert((*name).to_string(), declarations);
-        }
-    }
-    boxes
 }
 
 /// Cascades declarations in the CSS page context.

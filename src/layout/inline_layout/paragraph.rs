@@ -1,4 +1,5 @@
 use super::super::*;
+use super::InlineLayoutOutcome;
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn layout_inline_paragraph(
@@ -8,7 +9,7 @@ impl<'a> LayoutBuilder<'a> {
         line_index: usize,
         starts_after_forced_break: bool,
         plaintext_direction_state: &mut Option<Direction>,
-    ) -> usize {
+    ) -> InlineLayoutOutcome {
         // All inline paragraphs use the same CSS line-fitting engine. Parley
         // remains the text measurement, shaping, and fragment-splitting
         // backend, but layout-owned CSS policy decides where line boxes break:

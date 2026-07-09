@@ -45,22 +45,33 @@ pub(crate) fn parse_corner_shorthand(
         .map(|group| parse_corner_radius_and_shape(group, font_size))
         .collect::<Option<Vec<_>>>()?;
     let expanded = match parsed.as_slice() {
-        [all] => [*all, *all, *all, *all],
-        [vertical, horizontal] => [*vertical, *horizontal, *vertical, *horizontal],
-        [top_left, horizontal, bottom_right] => {
-            [*top_left, *horizontal, *bottom_right, *horizontal]
-        }
-        [top_left, top_right, bottom_right, bottom_left] => {
-            [*top_left, *top_right, *bottom_right, *bottom_left]
-        }
+        [all] => [all.clone(), all.clone(), all.clone(), all.clone()],
+        [vertical, horizontal] => [
+            vertical.clone(),
+            horizontal.clone(),
+            vertical.clone(),
+            horizontal.clone(),
+        ],
+        [top_left, horizontal, bottom_right] => [
+            top_left.clone(),
+            horizontal.clone(),
+            bottom_right.clone(),
+            horizontal.clone(),
+        ],
+        [top_left, top_right, bottom_right, bottom_left] => [
+            top_left.clone(),
+            top_right.clone(),
+            bottom_right.clone(),
+            bottom_left.clone(),
+        ],
         _ => return None,
     };
     Some((
         BorderRadius {
-            top_left: expanded[0].0,
-            top_right: expanded[1].0,
-            bottom_right: expanded[2].0,
-            bottom_left: expanded[3].0,
+            top_left: expanded[0].0.clone(),
+            top_right: expanded[1].0.clone(),
+            bottom_right: expanded[2].0.clone(),
+            bottom_left: expanded[3].0.clone(),
         },
         CornerShapes {
             top_left: expanded[0].1,
@@ -78,28 +89,28 @@ pub(crate) fn parse_radius_components(value: &str, font_size: f32) -> Option<Edg
         .collect::<Option<Vec<_>>>()?;
     match radii.as_slice() {
         [all] => Some(EdgesOf {
-            top: *all,
-            right: *all,
-            bottom: *all,
-            left: *all,
+            top: all.clone(),
+            right: all.clone(),
+            bottom: all.clone(),
+            left: all.clone(),
         }),
         [vertical, horizontal] => Some(EdgesOf {
-            top: *vertical,
-            right: *horizontal,
-            bottom: *vertical,
-            left: *horizontal,
+            top: vertical.clone(),
+            right: horizontal.clone(),
+            bottom: vertical.clone(),
+            left: horizontal.clone(),
         }),
         [top, horizontal, bottom] => Some(EdgesOf {
-            top: *top,
-            right: *horizontal,
-            bottom: *bottom,
-            left: *horizontal,
+            top: top.clone(),
+            right: horizontal.clone(),
+            bottom: bottom.clone(),
+            left: horizontal.clone(),
         }),
         [top, right, bottom, left] => Some(EdgesOf {
-            top: *top,
-            right: *right,
-            bottom: *bottom,
-            left: *left,
+            top: top.clone(),
+            right: right.clone(),
+            bottom: bottom.clone(),
+            left: left.clone(),
         }),
         _ => None,
     }
@@ -107,25 +118,13 @@ pub(crate) fn parse_radius_components(value: &str, font_size: f32) -> Option<Edg
 
 pub(crate) fn parse_radius_value(value: &str, font_size: f32) -> Option<CssRadius> {
     let value = parse_computed_length_percentage(value, font_size)?;
-    (!length_percentage_is_definitely_negative(value)).then_some(CssRadius { value })
+    (!length_percentage_is_definitely_negative(value.clone())).then_some(CssRadius { value })
 }
 
 pub(in crate::css) fn length_percentage_is_definitely_negative(
     value: ComputedLengthPercentage,
 ) -> bool {
-    let components = [
-        value.length_points(),
-        value.percent,
-        value.ch,
-        value.vw,
-        value.vh,
-        value.vmin,
-        value.vmax,
-        value.vi,
-        value.vb,
-    ];
-    components.iter().any(|component| *component < 0.0)
-        && components.iter().all(|component| *component <= 0.0)
+    value.is_definitely_negative()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,11 +135,8 @@ pub(crate) struct EdgesOf<T> {
     pub(in crate::css) left: T,
 }
 
-pub(in crate::css) fn used_nonnegative_length(value: ComputedLengthPercentage) -> f32 {
-    value
-        .length_if_no_percent()
-        .unwrap_or(value.length_points())
-        .max(0.0)
+pub(in crate::css) fn used_nonnegative_length(value: ComputedLengthPercentage) -> LayoutLength {
+    value.length_max_zero()
 }
 
 pub(crate) fn set_border_side_width(
@@ -148,7 +144,7 @@ pub(crate) fn set_border_side_width(
     side: BorderSide,
     length: ComputedLengthPercentage,
 ) {
-    let used = used_nonnegative_length(length);
+    let used = used_nonnegative_length(length.clone()).points();
     match side {
         BorderSide::Top => {
             style.border_width_values.top = length;

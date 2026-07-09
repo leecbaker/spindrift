@@ -8,6 +8,17 @@ pub(crate) enum BoxSide {
     Left,
 }
 
+impl From<PhysicalSide> for BoxSide {
+    fn from(side: PhysicalSide) -> Self {
+        match side {
+            PhysicalSide::Top => Self::Top,
+            PhysicalSide::Right => Self::Right,
+            PhysicalSide::Bottom => Self::Bottom,
+            PhysicalSide::Left => Self::Left,
+        }
+    }
+}
+
 /// Maps a logical box edge to a physical side.
 ///
 /// CSS Logical Properties defines flow-relative margin and padding properties
@@ -19,41 +30,32 @@ pub(crate) fn logical_box_side(
     direction: Direction,
     writing_mode: WritingMode,
 ) -> Option<BoxSide> {
-    let block_start = match writing_mode {
-        WritingMode::HorizontalTb => BoxSide::Top,
-        WritingMode::VerticalRl => BoxSide::Right,
-        WritingMode::VerticalLr => BoxSide::Left,
-    };
-    let block_end = match writing_mode {
-        WritingMode::HorizontalTb => BoxSide::Bottom,
-        WritingMode::VerticalRl => BoxSide::Left,
-        WritingMode::VerticalLr => BoxSide::Right,
-    };
-    let inline_start = match (writing_mode, direction) {
-        (WritingMode::HorizontalTb, Direction::Ltr) => BoxSide::Left,
-        (WritingMode::HorizontalTb, Direction::Rtl) => BoxSide::Right,
-        (_, Direction::Ltr) => BoxSide::Top,
-        (_, Direction::Rtl) => BoxSide::Bottom,
-    };
-    let inline_end = match (writing_mode, direction) {
-        (WritingMode::HorizontalTb, Direction::Ltr) => BoxSide::Right,
-        (WritingMode::HorizontalTb, Direction::Rtl) => BoxSide::Left,
-        (_, Direction::Ltr) => BoxSide::Bottom,
-        (_, Direction::Rtl) => BoxSide::Top,
-    };
+    let axes = WritingModeAxes::new(writing_mode, direction);
     match name {
-        "block-start" | "margin-block-start" | "padding-block-start" | "inset-block-start" => {
-            Some(block_start)
-        }
-        "block-end" | "margin-block-end" | "padding-block-end" | "inset-block-end" => {
-            Some(block_end)
-        }
-        "inline-start" | "margin-inline-start" | "padding-inline-start" | "inset-inline-start" => {
-            Some(inline_start)
-        }
-        "inline-end" | "margin-inline-end" | "padding-inline-end" | "inset-inline-end" => {
-            Some(inline_end)
-        }
+        "block-start"
+        | "margin-block-start"
+        | "padding-block-start"
+        | "scroll-padding-block-start"
+        | "scroll-margin-block-start"
+        | "inset-block-start" => Some(axes.physical_side(LogicalSide::BlockStart).into()),
+        "block-end"
+        | "margin-block-end"
+        | "padding-block-end"
+        | "scroll-padding-block-end"
+        | "scroll-margin-block-end"
+        | "inset-block-end" => Some(axes.physical_side(LogicalSide::BlockEnd).into()),
+        "inline-start"
+        | "margin-inline-start"
+        | "padding-inline-start"
+        | "scroll-padding-inline-start"
+        | "scroll-margin-inline-start"
+        | "inset-inline-start" => Some(axes.physical_side(LogicalSide::InlineStart).into()),
+        "inline-end"
+        | "margin-inline-end"
+        | "padding-inline-end"
+        | "scroll-padding-inline-end"
+        | "scroll-margin-inline-end"
+        | "inset-inline-end" => Some(axes.physical_side(LogicalSide::InlineEnd).into()),
         _ => None,
     }
 }
@@ -90,29 +92,29 @@ pub(crate) fn parse_edge_values(
     value: &str,
     font_size: f32,
 ) -> Option<CssEdges<ComputedLengthPercentage>> {
-    let values = value
-        .split_whitespace()
+    let values = split_css_component_values(value)
+        .into_iter()
         .map(|part| parse_computed_length_percentage(part, font_size))
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
-        [all] => Some(CssEdges::all(*all)),
+        [all] => Some(CssEdges::all(all.clone())),
         [vertical, horizontal] => Some(CssEdges {
-            top: *vertical,
-            right: *horizontal,
-            bottom: *vertical,
-            left: *horizontal,
+            top: vertical.clone(),
+            right: horizontal.clone(),
+            bottom: vertical.clone(),
+            left: horizontal.clone(),
         }),
         [top, horizontal, bottom] => Some(CssEdges {
-            top: *top,
-            right: *horizontal,
-            bottom: *bottom,
-            left: *horizontal,
+            top: top.clone(),
+            right: horizontal.clone(),
+            bottom: bottom.clone(),
+            left: horizontal.clone(),
         }),
         [top, right, bottom, left] => Some(CssEdges {
-            top: *top,
-            right: *right,
-            bottom: *bottom,
-            left: *left,
+            top: top.clone(),
+            right: right.clone(),
+            bottom: bottom.clone(),
+            left: left.clone(),
         }),
         _ => None,
     }
@@ -122,29 +124,29 @@ pub(crate) fn parse_margin_edge_values(
     value: &str,
     font_size: f32,
 ) -> Option<CssEdges<ComputedLengthPercentageOrAuto>> {
-    let values = value
-        .split_whitespace()
+    let values = split_css_component_values(value)
+        .into_iter()
         .map(|part| parse_computed_length_percentage_auto(part, font_size))
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
-        [all] => Some(CssEdges::all(*all)),
+        [all] => Some(CssEdges::all(all.clone())),
         [vertical, horizontal] => Some(CssEdges {
-            top: *vertical,
-            right: *horizontal,
-            bottom: *vertical,
-            left: *horizontal,
+            top: vertical.clone(),
+            right: horizontal.clone(),
+            bottom: vertical.clone(),
+            left: horizontal.clone(),
         }),
         [top, horizontal, bottom] => Some(CssEdges {
-            top: *top,
-            right: *horizontal,
-            bottom: *bottom,
-            left: *horizontal,
+            top: top.clone(),
+            right: horizontal.clone(),
+            bottom: bottom.clone(),
+            left: horizontal.clone(),
         }),
         [top, right, bottom, left] => Some(CssEdges {
-            top: *top,
-            right: *right,
-            bottom: *bottom,
-            left: *left,
+            top: top.clone(),
+            right: right.clone(),
+            bottom: bottom.clone(),
+            left: left.clone(),
         }),
         _ => None,
     }
@@ -157,12 +159,12 @@ pub(crate) fn parse_border_spacing(value: &str, font_size: f32) -> Option<Border
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
         [both] => Some(BorderSpacing {
-            horizontal: *both,
-            vertical: *both,
+            horizontal: both.clone(),
+            vertical: both.clone(),
         }),
         [horizontal, vertical] => Some(BorderSpacing {
-            horizontal: *horizontal,
-            vertical: *vertical,
+            horizontal: horizontal.clone(),
+            vertical: vertical.clone(),
         }),
         _ => None,
     }
@@ -170,23 +172,12 @@ pub(crate) fn parse_border_spacing(value: &str, font_size: f32) -> Option<Border
 
 fn parse_non_negative_length(value: &str, font_size: f32) -> Option<ComputedLengthPercentage> {
     let length = parse_computed_length_percentage(value, font_size)?;
-    (length.percent == 0.0 && !length_percentage_is_definitely_negative(length)).then_some(length)
+    (!length.contains_percentage() && !length_percentage_is_definitely_negative(&length))
+        .then_some(length)
 }
 
-fn length_percentage_is_definitely_negative(value: ComputedLengthPercentage) -> bool {
-    let components = [
-        value.length_points(),
-        value.percent,
-        value.ch,
-        value.vw,
-        value.vh,
-        value.vmin,
-        value.vmax,
-        value.vi,
-        value.vb,
-    ];
-    components.iter().any(|component| *component < 0.0)
-        && components.iter().all(|component| *component <= 0.0)
+fn length_percentage_is_definitely_negative(value: &ComputedLengthPercentage) -> bool {
+    value.is_definitely_absolute() && value.length_points() < 0.0
 }
 
 pub(crate) fn edge_all(value: f32) -> Edges {
@@ -213,5 +204,20 @@ pub(crate) fn border_styles_all(style: BorderStyle) -> BorderStyles {
         right: style,
         bottom: style,
         left: style,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_shorthand_keeps_calc_with_internal_whitespace_as_one_component() {
+        let edges = parse_edge_values("calc(20px * 2)", 12.0).expect("calc edge shorthand parses");
+
+        assert_eq!(edges.top.length_points(), 30.0);
+        assert_eq!(edges.right.length_points(), 30.0);
+        assert_eq!(edges.bottom.length_points(), 30.0);
+        assert_eq!(edges.left.length_points(), 30.0);
     }
 }

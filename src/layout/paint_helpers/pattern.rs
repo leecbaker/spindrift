@@ -65,13 +65,12 @@ pub(crate) fn paint_patterned_border_side(
     }
 }
 
-/// Paint a straight CSS dotted border side as round dot paths.
+/// Paint a straight CSS dotted border side as a native PDF round-cap dash stroke.
 ///
-/// CSS Backgrounds and Borders Level 3 defines `dotted` as a series of round
-/// dots and intentionally leaves exact spacing flexible. We mirror
-/// WeasyPrint's straight-edge placement: dot diameter equals border width,
-/// spaces are distributed between dot centers when possible, and each dot is a
-/// filled Bezier circle:
+/// CSS Backgrounds and Borders Level 3 defines `dotted` as a series of dots
+/// and intentionally leaves exact spacing flexible. PDF round caps turn a
+/// zero-length dash into a circular dot; the dash pitch is balanced so the
+/// outer dots touch the two ends of the side:
 /// <https://www.w3.org/TR/css-backgrounds-3/#valdef-border-style-dotted>.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_dotted_border_side(
@@ -97,11 +96,12 @@ pub(crate) fn paint_dotted_border_side(
 
 /// Paint a CSS dotted border side with an optional PDF clipping region.
 ///
-/// CSS Backgrounds and Borders defines dotted borders as round dots, while PDF
-/// clipping paths define the intersection needed for rounded border side
-/// transition areas:
+/// CSS Backgrounds and Borders defines dotted borders as a series of dots,
+/// while PDF's line-cap and dash graphics-state parameters provide native
+/// circular dots. Clipping paths constrain rounded-side dots to their border
+/// side transition region:
 /// <https://www.w3.org/TR/css-backgrounds-3/#valdef-border-style-dotted> and
-/// ISO 32000-1:2008, 8.5.4 "Clipping Path Operators".
+/// ISO 32000-1:2008, 8.4.3.3, 8.4.3.6, and 8.5.4.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_dotted_border_side_with_clip(
     paths: &mut Vec<RenderedPath>,
@@ -116,28 +116,53 @@ pub(crate) fn paint_dotted_border_side_with_clip(
     if axis_length <= 0.0 || cross_width <= 0.0 || !color.is_visible() {
         return;
     }
-    let diameter = cross_width.max(1.0);
-    let spaces = (axis_length / diameter / 2.0).floor();
-    let dots = spaces + 1.0;
-    let space = if spaces > 0.0 {
-        ((axis_length - dots * diameter) / spaces).max(0.0)
-    } else {
-        0.0
-    };
+    let diameter = cross_width;
+    let dot_count = (axis_length / (diameter * 2.0)).floor() as usize + 1;
+    let center_cross = cross_start + diameter / 2.0;
 
-    let mut index = 0.0;
-    while index < dots {
-        let advance = index * (space + diameter);
-        let center_axis = axis_start + advance + diameter / 2.0;
-        let center_cross = cross_start + cross_width / 2.0;
+    if dot_count == 1 {
+        let center_axis = axis_start + axis_length / 2.0;
         let (cx, cy) = if horizontal {
             (center_axis, center_cross)
         } else {
             (center_cross, center_axis)
         };
-        paths.push(circle_path(cx, cy, diameter / 2.0, color, clip.clone()));
-        index += 1.0;
+        paths.push(circle_path(cx, cy, diameter / 2.0, color, clip));
+        return;
     }
+
+    let first_center = axis_start + diameter / 2.0;
+    let last_center = axis_start + axis_length - diameter / 2.0;
+    let pitch = (last_center - first_center) / (dot_count - 1) as f32;
+    let (start, end) = if horizontal {
+        (
+            paint_space_point(first_center, center_cross),
+            paint_space_point(last_center, center_cross),
+        )
+    } else {
+        (
+            paint_space_point(center_cross, first_center),
+            paint_space_point(center_cross, last_center),
+        )
+    };
+    paths.push(
+        RenderedPath::new(
+            vec![
+                RenderedPathCommand::move_to(start),
+                RenderedPathCommand::line_to(end),
+            ],
+            None,
+            RenderedPathFillRule::NonZero,
+            Some(color),
+            diameter,
+            clip,
+        )
+        .with_stroke_style(RenderedPathStrokeStyle {
+            line_cap: RenderedPathLineCap::Round,
+            dash_array: vec![0.0, pitch],
+            ..RenderedPathStrokeStyle::default()
+        }),
+    );
 }
 
 /// Paint a CSS dashed border side as filled rectangular path segments.
@@ -172,21 +197,20 @@ pub(crate) fn paint_dashed_border_side_with_clip(
             break;
         }
         let length = dash.min(axis_length - offset);
-        let (x, y, width, height) = if horizontal {
-            (axis_start + offset, cross_start, length, cross_width)
+        let rect = if horizontal {
+            paint_space_rect(axis_start + offset, cross_start, length, cross_width)
         } else {
-            (cross_start, axis_start + offset, cross_width, length)
+            paint_space_rect(cross_start, axis_start + offset, cross_width, length)
         };
-        paths.push(rect_path(x, y, width, height, color, clip.clone()));
+        paths.push(rect_path(rect, color, clip.clone()));
         index += 1.0;
     }
 }
 
 /// Build a filled circle path for a CSS dotted border dot.
 ///
-/// PDF has no circle primitive, so paths approximate dots with four cubic
-/// Bezier curves. The control-point ratio mirrors WeasyPrint's dotted-border
-/// drawing for raster parity.
+/// PDF has no circle primitive, so the single-dot fallback uses four cubic
+/// Bezier curves with the standard quarter-circle control-point ratio.
 pub(crate) fn circle_path(
     cx: f32,
     cy: f32,
@@ -194,7 +218,7 @@ pub(crate) fn circle_path(
     color: Color,
     clip: Option<RenderedPathClip>,
 ) -> RenderedPath {
-    let ratio = radius / std::f32::consts::PI.sqrt();
+    let ratio = radius * 0.552_284_8;
     RenderedPath::new(
         vec![
             RenderedPathCommand::move_to(paint_space_point(cx + radius, cy)),
@@ -234,21 +258,12 @@ pub(crate) fn circle_path(
 /// optimized as rectangles can also be represented as filled path rectangles:
 /// ISO 32000-1:2008, 8.5 "Path Construction and Painting".
 pub(crate) fn rect_path(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     color: Color,
     clip: Option<RenderedPathClip>,
 ) -> RenderedPath {
     RenderedPath::new(
-        vec![
-            RenderedPathCommand::move_to(paint_space_point(x, y)),
-            RenderedPathCommand::line_to(paint_space_point(x + width, y)),
-            RenderedPathCommand::line_to(paint_space_point(x + width, y + height)),
-            RenderedPathCommand::line_to(paint_space_point(x, y + height)),
-            RenderedPathCommand::Close,
-        ],
+        paint_rect_path_commands(rect),
         Some(color),
         RenderedPathFillRule::NonZero,
         None,
@@ -275,4 +290,113 @@ pub(crate) fn push_border_rect(
         paint_space_rect(x, y, width, height),
         Some(color),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::RenderedPathCommandPoints;
+
+    fn rectangular_clip() -> RenderedPathClip {
+        RenderedPathClip::new(
+            vec![
+                RenderedPathCommand::move_to(paint_space_point(0.0, 0.0)),
+                RenderedPathCommand::line_to(paint_space_point(10.0, 0.0)),
+                RenderedPathCommand::line_to(paint_space_point(10.0, 10.0)),
+                RenderedPathCommand::Close,
+            ],
+            RenderedPathFillRule::NonZero,
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn dotted_horizontal_side_uses_balanced_round_cap_dash_stroke() {
+        let mut paths = Vec::new();
+        paint_dotted_border_side_with_clip(
+            &mut paths,
+            10.0,
+            20.0,
+            30.0,
+            2.0,
+            true,
+            Color::BLACK,
+            Some(rectangular_clip()),
+        );
+
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+        assert_eq!(path.fill, None);
+        assert_eq!(path.stroke, Some(Color::BLACK));
+        assert_eq!(path.stroke_width, 2.0);
+        assert!(path.clip.is_some());
+        assert_eq!(path.stroke_style.line_cap, RenderedPathLineCap::Round);
+        assert_eq!(path.stroke_style.dash_array, vec![0.0, 3.6]);
+        assert_eq!(path.commands.len(), 2);
+        assert_eq!(
+            path.commands[0].typed_points(),
+            RenderedPathCommandPoints::MoveTo(paint_space_point(11.0, 31.0))
+        );
+        assert_eq!(
+            path.commands[1].typed_points(),
+            RenderedPathCommandPoints::LineTo(paint_space_point(29.0, 31.0))
+        );
+    }
+
+    #[test]
+    fn dotted_vertical_side_uses_vertical_centerline() {
+        let mut paths = Vec::new();
+        paint_dotted_border_side(&mut paths, 10.0, 20.0, 30.0, 2.0, false, Color::BLACK);
+
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+        assert_eq!(
+            path.commands[0].typed_points(),
+            RenderedPathCommandPoints::MoveTo(paint_space_point(31.0, 11.0))
+        );
+        assert_eq!(
+            path.commands[1].typed_points(),
+            RenderedPathCommandPoints::LineTo(paint_space_point(31.0, 29.0))
+        );
+    }
+
+    #[test]
+    fn short_dotted_side_uses_one_filled_circle() {
+        let mut paths = Vec::new();
+        paint_dotted_border_side(&mut paths, 10.0, 3.0, 30.0, 2.0, true, Color::BLACK);
+
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+        assert_eq!(path.fill, Some(Color::BLACK));
+        assert_eq!(path.stroke, None);
+        assert_eq!(path.commands.len(), 6);
+    }
+
+    #[test]
+    fn dotted_side_skips_empty_or_invisible_paint() {
+        let mut paths = Vec::new();
+        paint_dotted_border_side(&mut paths, 0.0, 0.0, 0.0, 2.0, true, Color::BLACK);
+        paint_dotted_border_side(&mut paths, 0.0, 10.0, 0.0, 2.0, true, Color::TRANSPARENT);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn rect_path_preserves_a_nonzero_paint_rect() {
+        let path = rect_path(paint_space_rect(10.0, 20.0, 30.0, 40.0), Color::BLACK, None);
+
+        assert_eq!(
+            path.commands
+                .iter()
+                .cloned()
+                .map(RenderedPathCommand::typed_points)
+                .collect::<Vec<_>>(),
+            vec![
+                RenderedPathCommandPoints::MoveTo(paint_space_point(10.0, 20.0)),
+                RenderedPathCommandPoints::LineTo(paint_space_point(40.0, 20.0)),
+                RenderedPathCommandPoints::LineTo(paint_space_point(40.0, 60.0)),
+                RenderedPathCommandPoints::LineTo(paint_space_point(10.0, 60.0)),
+                RenderedPathCommandPoints::Close,
+            ]
+        );
+    }
 }

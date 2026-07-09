@@ -1,10 +1,11 @@
 use super::*;
+use crate::css::is_custom_property_name;
 
 pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_parent_ch_advance(
     style: &mut ComputedStyle,
     declarations: &[CascadedDeclaration<'_>],
     inheritance_source: &ComputedStyle,
-    parent_ch_advance: f32,
+    parent_ch_advance: LayoutLength,
 ) {
     let (direction, writing_mode) =
         logical_mapping_context(style, declarations, inheritance_source);
@@ -20,7 +21,7 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
 
     for (index, declaration) in declarations.iter().enumerate() {
         let name = declaration.name.as_ref();
-        if name.starts_with("--") || name == "font-size" {
+        if is_custom_property_name(name) || name == "font-size" {
             continue;
         }
         if is_shadowed_by_later_var_declaration(&declarations, index, name) {
@@ -28,7 +29,7 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
         }
         let resolved_value;
         let value = trim_css_value(&declaration.value);
-        let value = if value.contains("var(") {
+        let value = if contains_css_variable_reference(value) {
             let Some(resolved) = resolve_css_variables(value, &style.custom_properties) else {
                 continue;
             };
@@ -47,9 +48,41 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
                     style.color = color;
                 }
             }
+            "-webkit-text-fill-color" => {
+                if value.eq_ignore_ascii_case("currentcolor") {
+                    style.text_fill_color = None;
+                } else if let Some(color) = parse_color(value) {
+                    style.text_fill_color = Some(color);
+                }
+            }
             "font-family" => {
                 style.font_family =
                     parse_font_family(value).unwrap_or_else(|| style.font_family.clone());
+            }
+            "font-synthesis" => {
+                if let Some(font_synthesis) = parse_font_synthesis(value) {
+                    style.font_synthesis = font_synthesis;
+                }
+            }
+            "font-synthesis-weight" => {
+                if let Some(value) = parse_font_synthesis_subproperty(value) {
+                    style.font_synthesis.weight = value;
+                }
+            }
+            "font-synthesis-style" => {
+                if let Some(value) = parse_font_synthesis_subproperty(value) {
+                    style.font_synthesis.style = value;
+                }
+            }
+            "font-synthesis-small-caps" => {
+                if let Some(value) = parse_font_synthesis_subproperty(value) {
+                    style.font_synthesis.small_caps = value;
+                }
+            }
+            "font-synthesis-position" => {
+                if let Some(value) = parse_font_synthesis_subproperty(value) {
+                    style.font_synthesis.position = value;
+                }
             }
             "font-feature-settings" => {
                 if let Some(font_feature_settings) = parse_font_feature_settings(value) {
@@ -112,6 +145,11 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
                     style.font_variant_emoji = font_variant_emoji;
                 }
             }
+            "font-palette" => {
+                if let Some(font_palette) = parse_font_palette(value) {
+                    style.font_palette = font_palette;
+                }
+            }
             "font-weight" => {
                 if let Some(weight) = parse_font_weight(value, style.font_weight) {
                     style.font_weight = weight;
@@ -128,15 +166,76 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
                 }
             }
             "white-space" => {
-                style.white_space = match value.to_ascii_lowercase().as_str() {
-                    "normal" => WhiteSpace::Normal,
-                    "nowrap" => WhiteSpace::NoWrap,
-                    "pre" => WhiteSpace::Pre,
-                    "pre-wrap" => WhiteSpace::PreWrap,
-                    "pre-line" => WhiteSpace::PreLine,
-                    "break-spaces" => WhiteSpace::BreakSpaces,
-                    _ => style.white_space,
+                let parsed = match value.to_ascii_lowercase().as_str() {
+                    "normal" => Some((WhiteSpace::Normal, TextWrapMode::Wrap)),
+                    "nowrap" => Some((WhiteSpace::NoWrap, TextWrapMode::NoWrap)),
+                    "pre" => Some((WhiteSpace::Pre, TextWrapMode::NoWrap)),
+                    "pre-wrap" => Some((WhiteSpace::PreWrap, TextWrapMode::Wrap)),
+                    "pre-line" => Some((WhiteSpace::PreLine, TextWrapMode::Wrap)),
+                    "break-spaces" => Some((WhiteSpace::BreakSpaces, TextWrapMode::Wrap)),
+                    _ => None,
                 };
+                if let Some((white_space, text_wrap_mode)) = parsed {
+                    style.white_space = white_space;
+                    style.text_wrap_mode = text_wrap_mode;
+                }
+            }
+            "text-wrap" => {
+                let mut mode = TextWrapMode::Wrap;
+                let mut wrap_style = TextWrapStyle::Auto;
+                let mut saw_mode = false;
+                let mut saw_style = false;
+                let mut valid = true;
+                for component in value.split_ascii_whitespace() {
+                    match component.to_ascii_lowercase().as_str() {
+                        "wrap" if !saw_mode => {
+                            mode = TextWrapMode::Wrap;
+                            saw_mode = true;
+                        }
+                        "nowrap" if !saw_mode => {
+                            mode = TextWrapMode::NoWrap;
+                            saw_mode = true;
+                        }
+                        "auto" if !saw_style => {
+                            wrap_style = TextWrapStyle::Auto;
+                            saw_style = true;
+                        }
+                        "balance" if !saw_style => {
+                            wrap_style = TextWrapStyle::Balance;
+                            saw_style = true;
+                        }
+                        "stable" if !saw_style => {
+                            wrap_style = TextWrapStyle::Stable;
+                            saw_style = true;
+                        }
+                        _ => valid = false,
+                    }
+                }
+                if valid && (saw_mode || saw_style) {
+                    style.text_wrap_mode = mode;
+                    style.text_wrap_style = wrap_style;
+                }
+            }
+            "text-wrap-mode" => match value.trim().to_ascii_lowercase().as_str() {
+                "wrap" => style.text_wrap_mode = TextWrapMode::Wrap,
+                "nowrap" => style.text_wrap_mode = TextWrapMode::NoWrap,
+                _ => {}
+            },
+            "text-wrap-style" => match value.trim().to_ascii_lowercase().as_str() {
+                "auto" => style.text_wrap_style = TextWrapStyle::Auto,
+                "balance" => style.text_wrap_style = TextWrapStyle::Balance,
+                "stable" => style.text_wrap_style = TextWrapStyle::Stable,
+                _ => {}
+            },
+            "line-clamp" | "-webkit-line-clamp" => {
+                let value = value.trim().to_ascii_lowercase();
+                if value == "none" {
+                    style.line_clamp = None;
+                } else if let Ok(value) = value.parse::<usize>()
+                    && value > 0
+                {
+                    style.line_clamp = Some(LineClamp::new(value, name == "-webkit-line-clamp"));
+                }
             }
             "text-transform" => {
                 if let Some(transform) = parse_text_transform(value) {
@@ -154,6 +253,25 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
                     parse_content_property(value, declaration.base_url, declaration.root_url)
                 {
                     style.content = content;
+                }
+            }
+            "counter-reset" => {
+                if let Some(values) = parse_counter_resets(value) {
+                    style.counter_resets = values;
+                }
+            }
+            "counter-increment" => {
+                if let Some(values) =
+                    parse_counter_changes(value, 1, CounterDuplicatePolicy::KeepAll)
+                {
+                    style.counter_increments = values;
+                }
+            }
+            "counter-set" => {
+                if let Some(values) =
+                    parse_counter_changes(value, 0, CounterDuplicatePolicy::KeepLast)
+                {
+                    style.counter_sets = values;
                 }
             }
             "quotes" => {

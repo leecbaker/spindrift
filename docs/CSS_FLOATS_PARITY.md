@@ -1,6 +1,6 @@
 # CSS Floats Parity
 
-Last updated: 2026-07-08
+Last updated: 2026-07-18
 
 CSS 2.2 is the conformance target for float placement, exclusion, and
 clearance. WeasyPrint is used as a compatibility reference for paged-output
@@ -15,8 +15,15 @@ behavior where the specs leave implementation details ambiguous.
   min/max-content sizes, percentage and specified float widths are replayed
   from their resolved used sizes, and float margin boxes are recorded as
   page-local exclusions for later flow.
+- A float following an adjoining normal-flow block inherits that block's
+  pending block-end margin in its hypothetical block-start position; this is
+  additive, including negative margins, because the float itself is outside
+  the preceding margin-collapse set.
 - Empty auto-height floats record zero-height margin-box exclusions, so they
   preserve source-order float placement without shortening same-top line boxes.
+- Auto-height float exclusions and page-prebreak decisions use an isolated
+  replay of the final blockified flow-root style with its frozen used width,
+  rather than a descendant-height estimate that can diverge from final layout.
 - Shrink-to-fit preferred width accounts for floats that share an inline run
   with following inline content, so the unconstrained line width includes the
   same-line float margin boxes plus the inline max-content contribution.
@@ -100,6 +107,10 @@ behavior where the specs leave implementation details ambiguous.
 - Vertical logical floats now expose top/bottom exclusion bands to vertical
   inline line selection, paint-time line adjustment, and basic BFC-root
   placement.
+- Vertical inline line selection advances float-band queries through each
+  physical block-axis slab. Source-order logical floats therefore move with
+  their line in `vertical-rl`, `vertical-lr`, and sideways writing modes,
+  rather than repeatedly excluding every later column from the first slab.
 - Vertical BFC roots, table wrappers, flex containers, and orthogonal
   formatting-context roots move to the next physical block-axis slab when a
   top/bottom logical float leaves too little inline span in the current slab.

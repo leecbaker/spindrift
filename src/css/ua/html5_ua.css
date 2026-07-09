@@ -86,6 +86,10 @@ html { color-scheme: light }
 address, cite, dfn, em, i, var { font-style: italic }
 b, strong, th { font-weight: bold }
 code, kbd, listing, plaintext, pre, samp, tt, xmp { font-family: monospace }
+/* CSS Text Level 4's default UA stylesheet preserves preformatted character
+   grids by disabling automatic inter-script spacing. Quire does not yet
+   implement the accompanying text-spacing-trim shorthand effect. */
+code, kbd, listing, plaintext, pre, samp, tt, xmp { text-autospace: no-autospace }
 h1 { font-size: 2em; font-weight: bold }
 h2 { font-size: 1.5em; font-weight: bold }
 h3 { font-size: 1.17em; font-weight: bold }
@@ -102,6 +106,10 @@ mark { background: yellow; color: black }
 table, td, th { border-color: gray }
 thead, tbody, tfoot, tr { border-color: inherit }
 table:is([rules], [frame]):is([frame=above i], [frame=below i], [frame=border i], [frame=box i], [frame=hsides i], [frame=lhs i], [frame=rhs i], [frame=void i], [frame=vsides i], [rules=all i], [rules=cols i], [rules=groups i], [rules=none i], [rules=rows i]), table[rules]:is([rules=all i], [rules=cols i], [rules=groups i], [rules=none i], [rules=rows i]) > tr > :is(td, th), table[rules]:is([rules=all i], [rules=cols i], [rules=groups i], [rules=none i], [rules=rows i]) > :is(thead, tbody, tfoot) > tr > :is(td, th) { border-color: black }
+table[rules=groups i] { border-style: hidden; border-collapse: collapse }
+table[rules=groups i] > tr > :is(td, th), table[rules=groups i] > :is(thead, tbody, tfoot) > tr > :is(td, th) { border-width: 1px; border-style: none }
+table[rules=groups i] > colgroup { border-left-width: 1px; border-left-style: solid; border-left-color: gray; border-right-width: 1px; border-right-style: solid; border-right-color: gray }
+table[rules=groups i] > :is(thead, tbody, tfoot) { border-top-width: 1px; border-top-style: solid; border-top-color: gray; border-bottom-width: 1px; border-bottom-style: solid; border-bottom-color: gray }
 
 /* Punctuation and decorations */
 
@@ -111,6 +119,10 @@ table:is([rules], [frame]):is([frame=above i], [frame=below i], [frame=border i]
 :root:lang(mn), [lang|=mn],
 :root:lang(ko), [lang|=ko] { text-underline-position: right }
 :root:lang(zh), [lang|=zh] { text-underline-position: left }
+[lang]:lang(zh, ja, ko, ii) { initial-letter-align: ideographic }
+[lang]:lang(hi, mr, ne, pi, kok, brx, mai, sd, sa) { initial-letter-align: hanging }
+[lang]:lang("*-Latn", "*-Cyrl") { initial-letter-align: alphabetic }
+[lang]:lang("*-Hani", "*-Hant", "*-Hans") { initial-letter-align: ideographic }
 blink { text-decoration-line: blink }
 :link, :visited, ins, u { text-decoration: underline }
 abbr[title], acronym[title] { text-decoration: dotted underline }
@@ -131,7 +143,7 @@ dir, menu, ul { list-style-type: disc }
 :is(dir, menu, ol, ul) ul { list-style-type: circle }
 :is(dir, menu, ol, ul) :is(dir, menu, ol, ul) ul { list-style-type: square }
 
-::marker { unicode-bidi: isolate; font-variant-numeric: tabular-nums; white-space: pre; text-transform: none }
+::marker, ::before::marker, ::after::marker { unicode-bidi: isolate; font-variant-numeric: tabular-nums; white-space: pre; text-transform: none }
 
 [dir=ltr i] { direction: ltr }
 [dir=rtl i] { direction: rtl }
@@ -177,7 +189,8 @@ ol, ul { break-before: avoid }
 
 /* Form fields */
 
-button, input, select, textarea { border: 1px solid black; font-size: .85em; height: 1.2em; padding: .2em; white-space: pre; width: 20em }
+button, input, select, textarea { border: 1px solid black; font-size: .85em; padding: .2em; white-space: pre }
+input, select, textarea { height: 1.2em; width: 20em }
 input:is([type=button i], [type=reset i], [type=submit i]), button { background: lightgrey; border-radius: .25em; text-align: center }
 input:is([type=button i], [type=reset i], [type=submit i])[value], button[value] { max-width: 100%; width: auto }
 input[type=submit i]:not([value])::before { content: "Submit" }
@@ -187,12 +200,12 @@ input:is([type=checkbox i], [type=radio i])[checked]::before { background: black
 input[type=radio i], input[type=radio][checked]:before { border-radius: 50% }
 input[value]:not([type=checkbox i], [type=radio i])::before { content: attr(value); display: block; overflow: hidden }
 :is(input, input[value=""], input[type=checkbox i], input[type=radio i]) { content: ""; display: block }
-select { background: lightgrey; border-radius: .25em .25em; position: relative; white-space: normal }
+select { background: lightgrey; border-radius: .25em .25em; overflow: hidden; position: relative; white-space: normal }
 select[multiple] { height: 3.6em }
-select:not([multiple])::before { content: "˅"; position: absolute; right: 0; text-align: center; width: 1.5em }
+select:not([multiple]):is(:not([size]), [size="1"])::before { content: "˅"; position: absolute; right: 0; text-align: center; width: 1.5em }
 select option { padding-right: 1.5em; white-space: nowrap }
-select:not([multiple]) option { display: none }
-select[multiple] option, select:not(:has(option[selected])) option:first-of-type, select option[selected]:not(option[selected] ~ option[selected]) { display: block; overflow: hidden }
+select:not([multiple]):is(:not([size]), [size="1"]) option { display: none }
+select[multiple] option, select:not([multiple]):is(:not([size]), [size="1"]):not(:has(option[selected])) option:first-of-type, select:not([multiple]):is(:not([size]), [size="1"]) option[selected]:not(option[selected] ~ option[selected]) { display: block; overflow: hidden }
 textarea { height: 3em; margin: .1em 0; overflow: hidden; overflow-wrap: break-word; padding: .2em; white-space: pre-wrap }
 textarea:empty { height: 3em }
 fieldset { border: groove 2px; margin-left: 2px; margin-right: 2px; padding: .35em .625em .75em }
@@ -200,7 +213,6 @@ fieldset { border: groove 2px; margin-left: 2px; margin-right: 2px; padding: .35
 /* Pages */
 
 @page {
-  margin: 75px;
   @footnote { margin-top: 1em }
   @top-left-corner     { text-align: right;  vertical-align:  middle }
   @top-left            { text-align: left;   vertical-align:  middle }

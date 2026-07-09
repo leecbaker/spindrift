@@ -11,11 +11,12 @@ pub(in crate::layout::table) fn table_cell_percentage_height_basis(
     table_style: &ComputedStyle,
     final_content_height: f32,
     border_insets: css::Edges,
-) -> Option<f32> {
-    if table_cell_content_relayout_policy(cell_style, table_style)
+    table_height_is_definite: bool,
+) -> BlockSizePercentageBasis {
+    if table_cell_content_relayout_policy(cell_style, table_style, table_height_is_definite)
         != TableCellContentSizingPolicy::FinalRelayout
     {
-        return None;
+        return PercentageBasis::indefinite();
     }
     if cell_style
         .box_values
@@ -23,22 +24,40 @@ pub(in crate::layout::table) fn table_cell_percentage_height_basis(
         .length_if_no_percent()
         .is_some()
     {
-        let vertical_non_content = cell_style.padding.top
-            + cell_style.padding.bottom
-            + border_insets.top
-            + border_insets.bottom;
-        return used_content_height_or_auto_with_optional_basis(
-            cell_style,
-            None,
-            vertical_non_content,
-        );
+        return table_cell_explicit_content_height_basis(cell_style, border_insets);
     }
-    Some(final_content_height)
+    PercentageBasis::definite_from(
+        content_box_pt(final_content_height),
+        BlockSizeBasisSource::TableCell,
+    )
+}
+
+/// Return a table cell's own explicit content-box height as a percentage basis.
+///
+/// A length-sized cell establishes a definite block-size containing block for
+/// its contents even while row sizing is measuring its intrinsic minimum.
+/// <https://drafts.csswg.org/css-tables-3/#table-cell-content-relayout>
+pub(in crate::layout::table) fn table_cell_explicit_content_height_basis(
+    cell_style: &ComputedStyle,
+    border_insets: css::Edges,
+) -> BlockSizePercentageBasis {
+    let vertical_non_content = cell_style.padding.top
+        + cell_style.padding.bottom
+        + border_insets.top
+        + border_insets.bottom;
+    used_content_box_height_or_auto_with_basis(
+        cell_style,
+        percentage_basis_from_points(None),
+        non_content_pt(vertical_non_content),
+    )
+    .map(|height| PercentageBasis::definite_from(height, BlockSizeBasisSource::TableCell))
+    .unwrap_or_else(PercentageBasis::indefinite)
 }
 
 pub(in crate::layout::table) fn table_cell_content_relayout_policy(
     cell_style: &ComputedStyle,
     table_style: &ComputedStyle,
+    table_height_is_definite: bool,
 ) -> TableCellContentSizingPolicy {
     if cell_style
         .box_values
@@ -48,13 +67,15 @@ pub(in crate::layout::table) fn table_cell_content_relayout_policy(
     {
         return TableCellContentSizingPolicy::FinalRelayout;
     }
-    if matches!(
-        table_style.box_values.height,
-        css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
-    ) || matches!(
-        table_style.box_values.min_height,
-        css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
-    ) {
+    if table_height_is_definite
+        && (matches!(
+            table_style.box_values.height.clone(),
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+        ) || matches!(
+            table_style.box_values.min_height.clone(),
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(_)
+        ))
+    {
         return TableCellContentSizingPolicy::FinalRelayout;
     }
     TableCellContentSizingPolicy::RowMinimum
@@ -67,13 +88,13 @@ pub(in crate::layout::table) fn apply_table_cell_content_sizing_policy(
     if policy != TableCellContentSizingPolicy::RowMinimum {
         return;
     }
-    if table_cell_block_size_depends_on_parent_percentage(style.box_values.height) {
+    if table_cell_block_size_depends_on_parent_percentage(style.box_values.height.clone()) {
         set_style_auto_height(style);
     }
-    if table_cell_block_size_depends_on_parent_percentage(style.box_values.min_height) {
+    if table_cell_block_size_depends_on_parent_percentage(style.box_values.min_height.clone()) {
         style.box_values.min_height = css::ComputedLengthPercentageOrAuto::Auto;
     }
-    if table_cell_block_size_depends_on_parent_percentage(style.box_values.max_height) {
+    if table_cell_block_size_depends_on_parent_percentage(style.box_values.max_height.clone()) {
         style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
     }
 }
@@ -83,21 +104,24 @@ pub(in crate::layout::table) fn table_cell_block_size_depends_on_parent_percenta
 ) -> bool {
     match value {
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value)
-        | css::ComputedLengthPercentageOrAuto::FitContent(Some(value)) => value.percent != 0.0,
+        | css::ComputedLengthPercentageOrAuto::FitContent(Some(value)) => {
+            value.needs_percentage_basis()
+        }
         css::ComputedLengthPercentageOrAuto::Auto
         | css::ComputedLengthPercentageOrAuto::MinContent
         | css::ComputedLengthPercentageOrAuto::MaxContent
         | css::ComputedLengthPercentageOrAuto::FitContent(None)
-        | css::ComputedLengthPercentageOrAuto::Stretch => false,
+        | css::ComputedLengthPercentageOrAuto::Stretch
+        | css::ComputedLengthPercentageOrAuto::CalcSize(_) => false,
     }
 }
 
 pub(in crate::layout::table) fn table_cell_style_has_parent_percentage_block_size(
     style: &ComputedStyle,
 ) -> bool {
-    table_cell_block_size_depends_on_parent_percentage(style.box_values.height)
-        || table_cell_block_size_depends_on_parent_percentage(style.box_values.min_height)
-        || table_cell_block_size_depends_on_parent_percentage(style.box_values.max_height)
+    table_cell_block_size_depends_on_parent_percentage(style.box_values.height.clone())
+        || table_cell_block_size_depends_on_parent_percentage(style.box_values.min_height.clone())
+        || table_cell_block_size_depends_on_parent_percentage(style.box_values.max_height.clone())
 }
 
 pub(in crate::layout::table) fn table_cell_formatting_child_has_parent_percentage_block_size(
@@ -442,45 +466,6 @@ pub(in crate::layout::table) fn table_cell_child_is_in_flow_float(
     })
 }
 
-pub(in crate::layout::table) fn table_cell_formatting_child_slice_height(
-    child: &box_tree::FormattingBox<'_>,
-) -> f32 {
-    let outer_height = table_cell_formatting_child_outer_height(child);
-    let descendant_visual_height = match child {
-        box_tree::FormattingBox::AtomicInline(box_)
-            if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Svg) =>
-        {
-            svg_rect(box_.element)
-                .map(|(_, height, _)| height + box_.style.margin.top + box_.style.margin.bottom)
-                .unwrap_or(0.0)
-        }
-        box_tree::FormattingBox::Replaced(box_)
-            if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Svg) =>
-        {
-            svg_rect(box_.element)
-                .map(|(_, height, _)| height + box_.style.margin.top + box_.style.margin.bottom)
-                .unwrap_or(0.0)
-        }
-        box_tree::FormattingBox::Inline(box_) => box_
-            .children
-            .iter()
-            .map(table_cell_formatting_child_slice_height)
-            .fold(0.0_f32, f32::max),
-        box_tree::FormattingBox::AnonymousBlock(box_) => box_
-            .children
-            .iter()
-            .map(table_cell_formatting_child_slice_height)
-            .fold(0.0_f32, f32::max),
-        box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
-            .children
-            .iter()
-            .map(table_cell_formatting_child_slice_height)
-            .fold(0.0_f32, f32::max),
-        _ => 0.0,
-    };
-    outer_height.max(descendant_visual_height)
-}
-
 pub(in crate::layout::table) fn table_cell_measured_inline_outer_height_without_policy(
     child: &box_tree::FormattingBox<'_>,
     available_width: f32,
@@ -490,7 +475,7 @@ pub(in crate::layout::table) fn table_cell_measured_inline_outer_height_without_
             if matches!(box_.style.position, Position::Absolute | Position::Fixed) {
                 Some(0.0)
             } else {
-                Some(table_cell_formatting_child_outer_height(child))
+                Some(table_cell_formatting_child_outer_height(child).points())
             }
         }
         box_tree::FormattingBox::AtomicInline(box_)
@@ -512,7 +497,7 @@ pub(in crate::layout::table) fn table_cell_measured_inline_outer_height_without_
             ))
         }
         box_tree::FormattingBox::AtomicInline(_) | box_tree::FormattingBox::Replaced(_) => {
-            Some(table_cell_formatting_child_outer_height(child))
+            Some(table_cell_formatting_child_outer_height(child).points())
         }
         box_tree::FormattingBox::AnonymousBlock(_)
         | box_tree::FormattingBox::InlineSplitBlockContext(_)
@@ -534,9 +519,13 @@ pub(in crate::layout::table) fn table_cell_canvas_first_pass_outer_height(
     style: &ComputedStyle,
     available_width: f32,
 ) -> f32 {
-    let (_width, height) =
-        used_canvas_size_with_height_basis(element, style, available_width, None);
-    height + style.margin.top + style.margin.bottom
+    let canvas = used_canvas(
+        element,
+        style,
+        available_width,
+        BlockSizePercentageBasis::indefinite(),
+    );
+    canvas.border_box_size.height + style.margin.top + style.margin.bottom
 }
 
 pub(in crate::layout::table) fn table_cell_child_fragment_kind(
@@ -616,7 +605,8 @@ mod tests {
                 }
                 tr { font-size: 2ch }"#,
             )
-            .with_base_url(Some(std::path::PathBuf::from("."))),
+            .with_base_path(".")
+            .expect("current directory should be a valid file URL"),
         );
         let font_system = FontSystem::start_loading()
             .load_stylesheet_fonts(std::slice::from_ref(&stylesheet))
@@ -625,12 +615,15 @@ mod tests {
         let options = RenderOptions::default();
         let stylesheets = vec![stylesheet];
         let resource_cache = ResourceCache::default();
+        let iframe_documents = HashMap::new();
         let mut builder = LayoutBuilder::new(LayoutBuilderConfig {
             options: &options,
             stylesheets: &stylesheets,
             base_url: None,
             root_url: None,
             resource_cache: &resource_cache,
+            iframe_documents: &iframe_documents,
+            iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
             font_system,
@@ -644,7 +637,7 @@ mod tests {
         table_style.line_height_value = css::ComputedLineHeight::from_points(40.0);
         let parent_ch_advance = builder.font_system.ch_advance(&table_style);
         assert!(
-            (parent_ch_advance - table_style.font_size * 0.5).abs() > 0.01,
+            (parent_ch_advance.points() - table_style.font_size * 0.5).abs() > 0.01,
             "fixture must differ from the generic 0.5em ch fallback"
         );
         let row = TableRow {
@@ -659,6 +652,6 @@ mod tests {
 
         let row_style = builder.style_for_table_row(&row, &table_style, &stylesheets);
 
-        assert!((row_style.font_size - parent_ch_advance * 2.0).abs() < 0.01);
+        assert!((row_style.font_size - parent_ch_advance.points() * 2.0).abs() < 0.01);
     }
 }

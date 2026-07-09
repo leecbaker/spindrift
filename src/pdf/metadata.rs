@@ -1,13 +1,18 @@
-use crate::{DocumentMetadata, PdfVariant};
-use pdf_writer::{Pdf, Ref, TextStr};
+use crate::{DocumentMetadata, PdfCompression, PdfProfile};
+use pdf_writer::{Filter, Pdf, Ref, TextStr};
 
 /// Writes synchronized PDF document information and XMP metadata.
 ///
 /// PDF 1.4 metadata streams are defined by ISO 32000-1:2008, 14.3.2. PDF/A-1
 /// additionally requires document information dictionary entries and their
 /// analogous XMP properties to be equivalent when both are present.
-pub(super) fn write_document_info(pdf: &mut Pdf, info_id: Ref, metadata: &DocumentMetadata) {
-    let metadata = PdfDocumentMetadata::from(metadata);
+pub(super) fn write_document_info(
+    pdf: &mut Pdf,
+    info_id: Ref,
+    metadata: &DocumentMetadata,
+    producer: &str,
+) {
+    let metadata = PdfDocumentMetadata::new(metadata, producer);
     let mut info = pdf.document_info(info_id);
     info.producer(TextStr(metadata.producer));
     if let Some(title) = metadata.title {
@@ -24,17 +29,23 @@ pub(super) fn write_document_info(pdf: &mut Pdf, info_id: Ref, metadata: &Docume
 /// Writes the catalog metadata stream mirrored from the PDF information fields.
 ///
 /// PDF/A identification properties are defined by ISO 19005's PDF/A extension
-/// schema. When a PDF/A variant is selected, the stream includes the required
+/// schema. When a PDF/A profile is selected, the stream includes the required
 /// `pdfaid:*` identification fields but does not claim that unrelated archival
 /// requirements such as output intents or color restrictions are complete.
 pub(super) fn write_document_xmp_metadata(
     pdf: &mut Pdf,
     metadata_id: Ref,
     metadata: &DocumentMetadata,
-    variant: PdfVariant,
+    profile: PdfProfile,
+    compression: PdfCompression,
+    producer: &str,
 ) {
-    let packet = PdfDocumentMetadata::from(metadata).xmp_packet(variant);
-    pdf.metadata(metadata_id, packet.as_bytes());
+    let packet = PdfDocumentMetadata::new(metadata, producer).xmp_packet(profile);
+    let stream = super::encode_pdf_stream(compression, packet.as_bytes());
+    let mut metadata_writer = pdf.metadata(metadata_id, stream.bytes());
+    if stream.uses_flate() {
+        metadata_writer.filter(Filter::FlateDecode);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,31 +56,28 @@ struct PdfDocumentMetadata<'a> {
     producer: &'a str,
 }
 
-impl<'a> From<&'a DocumentMetadata> for PdfDocumentMetadata<'a> {
-    fn from(metadata: &'a DocumentMetadata) -> Self {
+impl<'a> PdfDocumentMetadata<'a> {
+    fn new(metadata: &'a DocumentMetadata, producer: &'a str) -> Self {
         Self {
             title: metadata.title.as_deref(),
             author: metadata.author.as_deref(),
             creator: metadata.creator.as_deref(),
-            producer: &metadata.producer,
+            producer,
         }
     }
-}
-
-impl PdfDocumentMetadata<'_> {
-    fn xmp_packet(self, variant: PdfVariant) -> String {
+    fn xmp_packet(self, profile: PdfProfile) -> String {
         let mut packet = String::new();
         packet.push_str(r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>"#);
         packet.push('\n');
         packet.push_str(r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">"#);
         packet.push('\n');
         packet.push_str(r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:pdf="http://ns.adobe.com/pdf/1.3/""#);
-        if variant.is_pdfa() {
+        if profile.is_pdfa() {
             packet.push_str(r#" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/""#);
         }
         packet.push('>');
         packet.push('\n');
-        if let Some(identification) = variant.pdfa_identification() {
+        if let Some(identification) = profile.pdfa_identification() {
             packet.push_str(r#"<rdf:Description rdf:about="" pdfaid:part=""#);
             packet.push_str(&identification.part.to_string());
             packet.push_str(r#"" pdfaid:conformance=""#);

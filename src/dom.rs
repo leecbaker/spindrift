@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use html5ever::parse_document as parse_html_document;
 use html5ever::tendril::TendrilSink;
@@ -24,6 +26,7 @@ pub(crate) enum NodeKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Element {
+    pub id: ElementId,
     pub tag: String,
     pub namespace_url: String,
     pub document_syntax: DocumentSyntax,
@@ -31,6 +34,17 @@ pub(crate) struct Element {
     pub namespace_attrs: Vec<NamespacedAttribute>,
     pub children: Vec<Node>,
     pub is_target: bool,
+}
+
+/// Stable identity for a source DOM element, preserved by layout clones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ElementId(u64);
+
+impl ElementId {
+    pub(crate) fn next() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +58,7 @@ impl Node {
     pub fn element(tag: impl Into<String>) -> Self {
         Self {
             kind: NodeKind::Element(Element {
+                id: ElementId::next(),
                 tag: tag.into(),
                 namespace_url: String::new(),
                 document_syntax: DocumentSyntax::Html,
@@ -87,7 +102,13 @@ fn parse_html(source: &str) -> Node {
 }
 
 fn parse_xml(source: &str) -> crate::Result<Node> {
-    let dom = parse_xml_document(RcDom::default(), Default::default()).one(source);
+    // xml5ever currently stops building the document after an external DTD
+    // declaration.  XHTML reftests commonly carry the XHTML 1.0 external DTD,
+    // although Quire deliberately does not fetch document-external entities.
+    // Drop that declaration before parsing so the XML tree (and its XHTML
+    // namespace/case information) remains available to CSS and layout.
+    let source = without_xml_doctype(source);
+    let dom = parse_xml_document(RcDom::default(), Default::default()).one(source.as_ref());
     let errors = dom.errors.borrow();
     if let Some(error) = errors.first() {
         return Err(crate::Error::InvalidInput(format!(
@@ -95,6 +116,39 @@ fn parse_xml(source: &str) -> crate::Result<Node> {
         )));
     }
     Ok(convert_document(&dom.document, DocumentSyntax::Xml))
+}
+
+/// Remove the optional XML document type declaration before tree construction.
+///
+/// The declaration may contain an internal subset, where `>` is not the end of
+/// the declaration, so scanning tracks quotes and square brackets.  This only
+/// affects a declaration at the start of the XML prolog; a textual `DOCTYPE`
+/// later in document content is left untouched.
+fn without_xml_doctype(source: &str) -> Cow<'_, str> {
+    let leading = source.len() - source.trim_start().len();
+    let Some(rest) = source.get(leading..) else {
+        return Cow::Borrowed(source);
+    };
+    let Some(doctype) = rest.strip_prefix("<!DOCTYPE") else {
+        return Cow::Borrowed(source);
+    };
+    let mut quote = None;
+    let mut internal_subset_depth = 0usize;
+    for (index, character) in doctype.char_indices() {
+        match (quote, character) {
+            (Some(delimiter), character) if character == delimiter => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '[') => internal_subset_depth += 1,
+            (None, ']') => internal_subset_depth = internal_subset_depth.saturating_sub(1),
+            (None, '>') if internal_subset_depth == 0 => {
+                let end = leading + "<!DOCTYPE".len() + index + character.len_utf8();
+                return Cow::Owned(format!("{}{}", &source[..leading], &source[end..]));
+            }
+            (None, _) => {}
+        }
+    }
+    Cow::Borrowed(source)
 }
 
 fn convert_document(handle: &Handle, syntax: DocumentSyntax) -> Node {
@@ -190,18 +244,14 @@ fn element_matches_fragment(element: &Element, fragment: &str) -> bool {
                 .is_some_and(|name| name == fragment))
 }
 
-pub(crate) fn text_content(node: &Node) -> String {
-    let mut output = String::new();
-    collect_text(node, &mut output);
-    normalize_text(&output)
-}
-
 pub(crate) fn first_element_text(node: &Node, tag: &str) -> Option<String> {
     match &node.kind {
         NodeKind::Text(_) => None,
         NodeKind::Element(element) => {
             if element.tag == tag {
-                let text = text_content(node);
+                let mut text = String::new();
+                collect_descendant_text(node, &mut text);
+                let text = collapse_whitespace(&text);
                 if !text.is_empty() {
                     return Some(text);
                 }
@@ -235,55 +285,59 @@ pub(crate) fn first_meta_content(node: &Node, name: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn stylesheet_links(node: &Node) -> Vec<String> {
-    let mut links = Vec::new();
-    collect_stylesheet_links(node, &mut links);
-    links
+/// An author stylesheet source in document order.
+///
+/// CSS Cascade orders author stylesheets by their position in the document;
+/// embedded `<style>` elements and external stylesheet links therefore cannot
+/// be collected in separate batches:
+/// <https://www.w3.org/TR/css-cascade-5/#cascade-order>.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StylesheetSource {
+    Embedded(String),
+    Link(String),
 }
 
-pub(crate) fn normalize_text(text: &str) -> String {
-    decode_entities(&collapse_whitespace(text))
+pub(crate) fn stylesheet_sources_in_document_order(node: &Node) -> Vec<StylesheetSource> {
+    let mut sources = Vec::new();
+    collect_stylesheet_sources_in_document_order(node, &mut sources);
+    sources
 }
 
-fn collect_stylesheet_links(node: &Node, links: &mut Vec<String>) {
-    match &node.kind {
-        NodeKind::Text(_) => {}
-        NodeKind::Element(element) => {
-            if element.tag == "link"
-                && element.attrs.contains_key("href")
-                && element.attrs.get("rel").is_some_and(|rel| {
-                    rel.split_whitespace()
-                        .any(|part| part.eq_ignore_ascii_case("stylesheet"))
-                })
-                && let Some(href) = element.attrs.get("href")
-            {
-                links.push(href.clone());
-            }
-            for child in &element.children {
-                collect_stylesheet_links(child, links);
-            }
-        }
+fn collect_stylesheet_sources_in_document_order(node: &Node, output: &mut Vec<StylesheetSource>) {
+    let NodeKind::Element(element) = &node.kind else {
+        return;
+    };
+    if element.tag == "style" {
+        let mut css = String::new();
+        collect_descendant_text(node, &mut css);
+        output.push(StylesheetSource::Embedded(css));
+        return;
+    }
+    if element.tag == "link"
+        && element.attrs.get("rel").is_some_and(|rel| {
+            rel.split_whitespace()
+                .any(|part| part.eq_ignore_ascii_case("stylesheet"))
+        })
+        && let Some(href) = element.attrs.get("href")
+    {
+        output.push(StylesheetSource::Link(href.clone()));
+    }
+    for child in &element.children {
+        collect_stylesheet_sources_in_document_order(child, output);
     }
 }
 
-fn collect_text(node: &Node, output: &mut String) {
+/// Collect text-node descendants without applying HTML or CSS rendering rules.
+///
+/// HTML and XML parsing resolves character references before this DOM is built,
+/// so callers must consume these values directly rather than decode them again.
+/// <https://html.spec.whatwg.org/multipage/parsing.html#tokenizing-character-references>
+fn collect_descendant_text(node: &Node, output: &mut String) {
     match &node.kind {
         NodeKind::Text(text) => output.push_str(text),
         NodeKind::Element(element) => {
-            if matches!(element.tag.as_str(), "style" | "script" | "head") {
-                return;
-            }
-            if matches!(
-                element.tag.as_str(),
-                "p" | "div" | "h1" | "h2" | "h3" | "br"
-            ) {
-                output.push('\n');
-            }
             for child in &element.children {
-                collect_text(child, output);
-            }
-            if matches!(element.tag.as_str(), "p" | "div" | "h1" | "h2" | "h3") {
-                output.push('\n');
+                collect_descendant_text(child, output);
             }
         }
     }
@@ -306,65 +360,67 @@ fn collapse_whitespace(text: &str) -> String {
     output.trim().to_string()
 }
 
-fn decode_entities(text: &str) -> String {
-    decode_entities_public(text)
-}
-
-pub(crate) fn decode_entities_public(text: &str) -> String {
-    decode_numeric_entities(
-        &text
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&#39;", "'")
-            .replace("&nbsp;", " "),
-    )
-}
-
-fn decode_numeric_entities(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("&#") {
-        output.push_str(&rest[..start]);
-        let entity = &rest[start + 2..];
-        let Some(end) = entity.find(';') else {
-            output.push_str(&rest[start..]);
-            return output;
-        };
-        let number = &entity[..end];
-        let codepoint = number
-            .strip_prefix('x')
-            .or_else(|| number.strip_prefix('X'))
-            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-            .or_else(|| number.parse::<u32>().ok());
-        if let Some(character) = codepoint.and_then(char::from_u32) {
-            output.push(character);
-        } else {
-            output.push_str(&rest[start..start + end + 3]);
-        }
-        rest = &entity[end + 1..];
-    }
-    output.push_str(rest);
-    output
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DocumentSyntax, NodeKind, parse, parse_with_syntax, text_content};
+    use super::{
+        DocumentSyntax, NodeKind, first_element_text, parse, parse_with_syntax, without_xml_doctype,
+    };
 
-    #[tokio::test]
-    async fn parses_nested_elements() {
+    #[test]
+    fn parses_nested_elements() {
         let root = parse("<div style=\"color: red\"><p>Hello &amp; PDF</p></div>");
-        assert_eq!(text_content(&root), "Hello & PDF");
+        assert_eq!(
+            first_element_text(&root, "div"),
+            Some("Hello & PDF".to_string())
+        );
         let NodeKind::Element(root) = root.kind else {
             panic!("expected element");
         };
         assert_eq!(root.children.len(), 1);
     }
 
-    #[tokio::test]
-    async fn parses_xml_with_case_and_namespace_preserved() {
+    #[test]
+    fn block_start_implicitly_closes_paragraph() {
+        let implicit = parse("<p>before<div>after</div>");
+        let NodeKind::Element(document) = implicit.kind else {
+            panic!("expected document");
+        };
+        let NodeKind::Element(html) = &document.children[0].kind else {
+            panic!("expected html element");
+        };
+        let NodeKind::Element(body) = &html.children[1].kind else {
+            panic!("expected body element");
+        };
+        let tags = body
+            .children
+            .iter()
+            .filter_map(|child| match &child.kind {
+                NodeKind::Element(element) => Some(element.tag.as_str()),
+                NodeKind::Text(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tags, ["p", "div"]);
+    }
+
+    #[test]
+    fn title_text_uses_parser_decoded_character_references_once() {
+        let root = parse("<title>&copy; &#x1f642; &amp;lt;</title>");
+
+        assert_eq!(
+            first_element_text(&root, "title"),
+            Some("© 🙂 &lt;".to_string())
+        );
+    }
+
+    #[test]
+    fn xml_text_uses_parser_decoded_character_references_once() {
+        let root = parse_with_syntax("<Root>&amp;lt;</Root>", DocumentSyntax::Xml).unwrap();
+
+        assert_eq!(first_element_text(&root, "Root"), Some("&lt;".to_string()));
+    }
+
+    #[test]
+    fn parses_xml_with_case_and_namespace_preserved() {
         let root = parse_with_syntax(
             r#"<Root xmlns="urn:test"><Child id="a">Hello</Child></Root>"#,
             DocumentSyntax::Xml,
@@ -387,8 +443,42 @@ mod tests {
         assert_eq!(child_element.namespace_url, "urn:test");
     }
 
-    #[tokio::test]
-    async fn reports_xml_parse_errors() {
+    #[test]
+    fn parses_xhtml_after_ignoring_external_doctype() {
+        let root = parse_with_syntax(
+            "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \\
+             \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">\
+             <html xmlns=\"http://www.w3.org/1999/xhtml\"><body><img src=\"image.png\"/></body></html>",
+            DocumentSyntax::Xml,
+        )
+        .unwrap();
+        let NodeKind::Element(document) = root.kind else {
+            panic!("expected document element");
+        };
+        let NodeKind::Element(html) = &document.children[0].kind else {
+            panic!("expected XHTML root element");
+        };
+        let NodeKind::Element(body) = &html.children[0].kind else {
+            panic!("expected XHTML body element");
+        };
+        let NodeKind::Element(image) = &body.children[0].kind else {
+            panic!("expected XHTML image element");
+        };
+
+        assert_eq!(html.namespace_url, "http://www.w3.org/1999/xhtml");
+        assert_eq!(image.tag, "img");
+        assert_eq!(image.attrs.get("src"), Some(&"image.png".to_string()));
+    }
+
+    #[test]
+    fn doctype_strip_keeps_internal_subset_boundaries_intact() {
+        let source = "<!DOCTYPE root [<!ENTITY label \"a > b\">]><root/>";
+
+        assert_eq!(without_xml_doctype(source), "<root/>");
+    }
+
+    #[test]
+    fn reports_xml_parse_errors() {
         let error = parse_with_syntax("<root><child></root>", DocumentSyntax::Xml)
             .unwrap_err()
             .to_string();

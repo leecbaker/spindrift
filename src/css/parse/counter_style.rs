@@ -134,7 +134,7 @@ pub(super) fn parse_counter_symbols(value: &str) -> Vec<String> {
     let mut symbols = Vec::new();
     let mut rest = value.trim();
     while !rest.is_empty() {
-        if let Some((string, tail)) = parse_counter_string_token(rest) {
+        if let Some((string, tail)) = parse_css_string_token(rest) {
             symbols.push(string);
             rest = tail.trim_start();
         } else {
@@ -217,29 +217,6 @@ fn parse_counter_range_bound(value: &str) -> Option<i64> {
 
 pub(super) fn parse_counter_string(value: &str) -> Option<String> {
     parse_counter_symbols(value).into_iter().next()
-}
-
-pub(super) fn parse_counter_string_token(value: &str) -> Option<(String, &str)> {
-    let quote = value.as_bytes().first().copied()?;
-    if quote != b'\'' && quote != b'"' {
-        return None;
-    }
-    let mut output = String::new();
-    let mut escaped = false;
-    for (index, character) in value[1..].char_indices() {
-        if escaped {
-            output.push(character);
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character as u8 == quote {
-            let tail = &value[index + 2..];
-            return Some((output, tail));
-        } else {
-            output.push(character);
-        }
-    }
-    None
 }
 
 pub(super) fn split_counter_token(value: &str) -> (&str, &str) {

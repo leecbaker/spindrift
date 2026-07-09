@@ -54,7 +54,7 @@ pub(crate) fn text_without_bidi_format_controls(text: &str) -> Cow<'_, str> {
 /// CSS `direction` sets the base direction for bidi paragraph resolution,
 /// while `unicode-bidi` can add embeddings, overrides, isolates, or plaintext
 /// behavior. Parley 0.10 resolves paragraph base direction from the text, so
-/// Reasyprint prefixes a directional mark before the CSS `unicode-bidi`
+/// Quire prefixes a directional mark before the CSS `unicode-bidi`
 /// controls and records where the caller's original payload lives:
 /// <https://www.w3.org/TR/css-writing-modes-4/#direction>,
 /// <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>, and

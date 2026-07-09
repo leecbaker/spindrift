@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::Color;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FontWeight(pub u16);
 
@@ -74,7 +76,44 @@ pub(crate) enum FontFamily {
     SansSerif,
     Serif,
     Monospace,
+    SystemUi,
+    UiSerif,
+    UiSansSerif,
+    UiMonospace,
+    UiRounded,
+    /// An ordered `font-family` fallback list. Each entry retains whether it
+    /// was an unquoted generic keyword or a quoted family name.
+    List(Vec<FontFamily>),
     Names(Vec<String>),
+}
+
+/// Controls which missing typographic forms the UA may synthesize.
+///
+/// CSS Fonts defines these inherited permissions for face matching and
+/// shaping; `font-synthesis: none` disables every form.
+/// <https://www.w3.org/TR/css-fonts-4/#font-synthesis-intro>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FontSynthesis {
+    pub(crate) weight: bool,
+    pub(crate) style: bool,
+    pub(crate) small_caps: bool,
+    pub(crate) position: bool,
+}
+
+impl FontSynthesis {
+    pub(crate) const ALL: Self = Self {
+        weight: true,
+        style: true,
+        small_caps: true,
+        position: true,
+    };
+
+    pub(crate) const NONE: Self = Self {
+        weight: false,
+        style: false,
+        small_caps: false,
+        position: false,
+    };
 }
 
 /// Computed `font-size-adjust`.
@@ -246,6 +285,58 @@ pub(crate) enum FontVariantEmoji {
     Text,
     Emoji,
     Unicode,
+}
+
+/// The selected color palette for a COLR font.
+///
+/// CSS Fonts Level 4 resolves `light` and `dark` through CPAL palette-type
+/// flags, while numeric and named selections refer to author-visible palette
+/// entries and `@font-palette-values` rules respectively.
+/// <https://www.w3.org/TR/css-fonts-4/#font-palette-prop>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FontPalette {
+    Normal,
+    Light,
+    Dark,
+    Index(u16),
+    Named(String),
+}
+
+/// A named `@font-palette-values` rule after descriptor parsing.
+///
+/// Palette overrides are retained separately because they replace individual
+/// CPAL entries during COLR paint evaluation rather than changing font
+/// matching or OpenType shaping.
+/// <https://www.w3.org/TR/css-fonts-4/#font-palette-values>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FontPaletteDefinition {
+    pub(crate) families: Vec<String>,
+    pub(crate) base: FontPalette,
+    pub(crate) overrides: HashMap<u16, Color>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct FontPaletteValues {
+    pub(crate) values: HashMap<String, Vec<FontPaletteDefinition>>,
+}
+
+impl FontPaletteValues {
+    pub(crate) fn insert(&mut self, name: String, definition: FontPaletteDefinition) {
+        self.values
+            .entry(name.trim().to_string())
+            .or_default()
+            .push(definition);
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&[FontPaletteDefinition]> {
+        self.values.get(name.trim()).map(Vec::as_slice)
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        for (name, definitions) in other.values {
+            self.values.entry(name).or_default().extend(definitions);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

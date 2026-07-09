@@ -4,6 +4,27 @@ use std::rc::Rc;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PageBoxWith<'a, S = MutableStyle> {
     pub children: Vec<FormattingBoxWith<'a, S>>,
+    pub counter_events: Vec<CounterEventNode<'a>>,
+}
+
+/// A box-generating element or tree-abiding pseudo-element in CSS tree order.
+///
+/// This sidecar is captured before anonymous-box and table normalization, so
+/// counter scope is independent of formatting fragments and pagination replay.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CounterEventNode<'a> {
+    pub element: &'a Element,
+    pub source: CounterEventSource,
+    pub style: ComputedStyle,
+    pub children: Vec<CounterEventNode<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CounterEventSource {
+    Principal,
+    Marker,
+    Before,
+    After,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +93,7 @@ pub(crate) fn freeze_page_box<'a>(page_box: MutablePageBox<'a>) -> FrozenPageBox
     let mut freezer = StyleFreezer::default();
     FrozenPageBox {
         children: freezer.freeze_child_boxes(page_box.children),
+        counter_events: page_box.counter_events,
     }
 }
 

@@ -7,6 +7,12 @@ Alignment.
 
 ## Current Support
 
+### WPT snapshot
+
+The local renderable `css/css-gaps/grid/` WPT run currently passes 77 of 171
+tests. The remaining failures are primarily fragmented and subgridded grid
+decorations, plus complex intersection and writing-mode cases.
+
 - `row-gap`, `column-gap`, `gap`, and the legacy `grid-row-gap`,
   `grid-column-gap`, and `grid-gap` aliases are computed properties used by
   flex, grid, and the current definition-list multicolumn path. The parser
@@ -17,19 +23,27 @@ Alignment.
   inset longhands and shorthands.
 - Rule width/style/color values support comma lists and `repeat(<integer>, ...)`
   plus one `repeat(auto, ...)` segment for assignment to the resolved gutter
-  count.
+  count. When that assignment truncates an authored trailing expansion, its
+  first values are retained in authored order.
 - Same-page block and inline flex containers emit row and column rule strokes
   from resolved flex line/item gutter metadata. Same-page block and inline grid
   containers emit row and column rule strokes from Taffy's resolved
   track/gutter metadata, including empty tracks, and explicit grid intersection
-  joins use opposing-side item areas that span the perpendicular gap. Grid
-  `rule-break: normal` continues through cross intersections detected from
-  resolved grid item line spans, and grid `rule-visibility-items` segment
-  filtering uses the same metadata. Grid endpoints at empty junctions are
+  joins use the final grid extent derived from both resolved line offsets and
+  placed grid areas, rather than extending fixed-track rules through unused
+  container free space. Intersection joins use opposing-side item areas that
+  span the perpendicular gap. Grid
+  `rule-break: normal` discards discontiguous rule portions that cross a
+  spanning item, while still joining contiguous portions. Grid
+  `rule-visibility-items` filters atomic portions before empty areas can be
+  absorbed by a joined segment, then rejoins contiguous visible portions.
+  Grid endpoints at empty junctions are
   classified as caps when the crossing segment is suppressed by grid
   visibility metadata or by the crossing rule's own width/style/color.
   Definition-list and collected inline-sequence multicolumn paths emit column
   rules between resolved columns.
+- Flex gap-decoration painting does not apply the grid/multicolumn-only
+  `*-rule-visibility-items` filter to resolved flex gutters.
 - Normal-flow fragmented flex containers project gap decorations into
   page-local fragments, clipping physical row-axis rule extent to the visible
   fragment block range. Block grid containers also replay gap decorations into
@@ -39,7 +53,8 @@ Alignment.
   crossing gaps for `rule-break: intersection`, applies cap and junction
   insets including `overlap-join`, filters segments for
   `*-rule-visibility-items`, honors `rule-overlap`, and paints the CSS line
-  styles used by borders.
+  styles used by borders. Double gap rules paint two symmetric stripes around
+  the gap-rule centerline rather than reusing a box-edge border orientation.
 
 ## Remaining Gaps
 

@@ -110,8 +110,15 @@ pub(crate) fn used_border_side_width(width: f32, style: BorderStyle) -> f32 {
     }
 }
 
-pub(crate) fn used_border_width(style: &ComputedStyle) -> f32 {
-    max_edge(used_border_widths(style))
+/// Return the maximum used border width as a semantic layout length.
+///
+/// CSS Backgrounds and Borders suppresses the used width of `none` and
+/// `hidden` border styles. Callers use this to decide whether a box has a
+/// visible border, but the value remains a CSS length until a paint or
+/// geometry boundary explicitly needs points:
+/// <https://www.w3.org/TR/css-backgrounds-3/#border-style>.
+pub(crate) fn used_border_width(style: &ComputedStyle) -> LayoutLength {
+    layout_pt(max_edge(used_border_widths(style)))
 }
 
 pub(crate) fn max_edge(edges: css::Edges) -> f32 {
@@ -126,4 +133,20 @@ pub(crate) fn horizontal_border_width(style: &ComputedStyle) -> f32 {
 pub(crate) fn vertical_border_width(style: &ComputedStyle) -> f32 {
     let borders = used_border_widths(style);
     borders.top + borders.bottom
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn used_border_width_preserves_layout_length_type() {
+        let mut style = ComputedStyle::initial();
+        style.border_widths.left = 3.0;
+        style.border_styles.left = BorderStyle::Solid;
+
+        let width: LayoutLength = used_border_width(&style);
+
+        assert_eq!(width, layout_pt(3.0));
+    }
 }

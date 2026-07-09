@@ -7,9 +7,9 @@ use super::*;
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-images>.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BorderImage {
-    pub source: Option<String>,
-    pub source_base_url: Option<PathBuf>,
-    pub source_root_url: Option<PathBuf>,
+    pub source: Option<BackgroundImage>,
+    pub source_base_url: Option<url::Url>,
+    pub source_root_url: Option<url::Url>,
     pub slice: BorderImageSlice,
     pub width: BorderImageWidth,
     pub outset: BorderImageOutset,
@@ -29,30 +29,13 @@ impl BorderImage {
         }
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.width.resolve_font_metric_lengths(ch_advance);
         self.outset.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.width.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.outset.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.width.requires_ch_advance() || self.outset.requires_ch_advance()
     }
 }
 
@@ -101,7 +84,7 @@ pub(crate) enum BorderImageSliceValue {
 /// length/percentage values and `auto` are kept for later used-value
 /// resolution:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-image-width>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BorderImageWidth {
     pub top: BorderImageWidthValue,
     pub right: BorderImageWidthValue,
@@ -119,48 +102,22 @@ impl BorderImageWidth {
         }
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.top.resolve_font_metric_lengths(ch_advance);
         self.right.resolve_font_metric_lengths(ch_advance);
         self.bottom.resolve_font_metric_lengths(ch_advance);
         self.left.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.top.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.right.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.bottom.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.left.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.top.requires_ch_advance()
+            || self.right.requires_ch_advance()
+            || self.bottom.requires_ch_advance()
+            || self.left.requires_ch_advance()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BorderImageWidthValue {
     Auto,
     Number(f32),
@@ -168,27 +125,14 @@ pub(crate) enum BorderImageWidthValue {
 }
 
 impl BorderImageWidthValue {
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Self::LengthPercentage(value) = self {
             value.resolve_font_metric_lengths(ch_advance);
         }
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        if let Self::LengthPercentage(value) = self {
-            value.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
-        }
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        matches!(self, Self::LengthPercentage(value) if value.requires_ch_advance())
     }
 }
 
@@ -197,7 +141,7 @@ impl BorderImageWidthValue {
 /// Numeric values multiply the corresponding `border-width`; lengths are used
 /// directly:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-image-outset>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BorderImageOutset {
     pub top: BorderImageOutsetValue,
     pub right: BorderImageOutsetValue,
@@ -215,75 +159,36 @@ impl BorderImageOutset {
         }
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         self.top.resolve_font_metric_lengths(ch_advance);
         self.right.resolve_font_metric_lengths(ch_advance);
         self.bottom.resolve_font_metric_lengths(ch_advance);
         self.left.resolve_font_metric_lengths(ch_advance);
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        self.top.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.right.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.bottom.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
-        self.left.resolve_viewport_lengths(
-            viewport_width,
-            viewport_height,
-            viewport_inline,
-            viewport_block,
-        );
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        self.top.requires_ch_advance()
+            || self.right.requires_ch_advance()
+            || self.bottom.requires_ch_advance()
+            || self.left.requires_ch_advance()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BorderImageOutsetValue {
     Number(f32),
     Length(ComputedLengthPercentage),
 }
 
 impl BorderImageOutsetValue {
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Self::Length(value) = self {
             value.resolve_font_metric_lengths(ch_advance);
         }
     }
 
-    pub(crate) fn resolve_viewport_lengths(
-        &mut self,
-        viewport_width: f32,
-        viewport_height: f32,
-        viewport_inline: f32,
-        viewport_block: f32,
-    ) {
-        if let Self::Length(value) = self {
-            value.resolve_viewport_lengths(
-                viewport_width,
-                viewport_height,
-                viewport_inline,
-                viewport_block,
-            );
-        }
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        matches!(self, Self::Length(value) if value.requires_ch_advance())
     }
 }
 
@@ -313,4 +218,45 @@ pub(crate) enum BorderImageRepeatKeyword {
     Repeat,
     Round,
     Space,
+}
+
+impl ResolveViewportLengths for BorderImage {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.width.resolve_viewport_lengths(basis);
+        self.outset.resolve_viewport_lengths(basis);
+    }
+}
+
+impl ResolveViewportLengths for BorderImageWidth {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.top.resolve_viewport_lengths(basis);
+        self.right.resolve_viewport_lengths(basis);
+        self.bottom.resolve_viewport_lengths(basis);
+        self.left.resolve_viewport_lengths(basis);
+    }
+}
+
+impl ResolveViewportLengths for BorderImageWidthValue {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        if let Self::LengthPercentage(value) = self {
+            value.resolve_viewport_lengths(basis);
+        }
+    }
+}
+
+impl ResolveViewportLengths for BorderImageOutset {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        self.top.resolve_viewport_lengths(basis);
+        self.right.resolve_viewport_lengths(basis);
+        self.bottom.resolve_viewport_lengths(basis);
+        self.left.resolve_viewport_lengths(basis);
+    }
+}
+
+impl ResolveViewportLengths for BorderImageOutsetValue {
+    fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
+        if let Self::Length(value) = self {
+            value.resolve_viewport_lengths(basis);
+        }
+    }
 }

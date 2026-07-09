@@ -1,6 +1,6 @@
 use super::paint_helpers::{
-    FixedGradientStop, angled_gradient_line, fixed_gradient_is_hard_stop, fixed_gradient_stops,
-    gradient_axis_position, linear_gradient_can_paint_as_vector, rounded_background_clip_for_box,
+    FixedGradientStop, angled_gradient_line, fixed_gradient_stops, gradient_axis_position,
+    rounded_background_clip_for_box,
 };
 use super::*;
 

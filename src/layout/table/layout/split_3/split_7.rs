@@ -16,7 +16,7 @@ impl<'a> LayoutBuilder<'a> {
                 if matches!(box_.style.position, Position::Absolute | Position::Fixed) {
                     Some(0.0)
                 } else {
-                    Some(table_cell_formatting_child_outer_height(child))
+                    Some(table_cell_formatting_child_outer_height(child).points())
                 }
             }
             box_tree::FormattingBox::AtomicInline(box_)
@@ -70,6 +70,58 @@ impl<'a> LayoutBuilder<'a> {
         }
     }
 
+    /// Measure an atomic inline after CSS Tables has committed the table-cell
+    /// content-box block size for its second layout pass.
+    ///
+    /// CSS Tables resolves percentage block sizes against that committed cell
+    /// size, whereas first-pass row minimum sizing must keep them indefinite:
+    /// <https://drafts.csswg.org/css-tables-3/#table-cell-content-relayout>.
+    pub(in crate::layout::table) fn table_cell_measured_inline_outer_height_with_basis(
+        &mut self,
+        child: &box_tree::FormattingBox<'_>,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        percentage_height_basis: BlockSizePercentageBasis,
+    ) -> Option<f32> {
+        let (element, style) = match child {
+            box_tree::FormattingBox::AtomicInline(box_) => (box_.element, &box_.style),
+            box_tree::FormattingBox::Replaced(box_) => (box_.element, &box_.style),
+            _ => {
+                return self.table_cell_measured_inline_outer_height(
+                    child,
+                    stylesheets,
+                    available_width,
+                );
+            }
+        };
+        if replaced_element_kind(element) != Some(ReplacedElementKind::Canvas) {
+            return self.table_cell_measured_inline_outer_height(
+                child,
+                stylesheets,
+                available_width,
+            );
+        }
+
+        let mut style = self
+            .table_cell_content_sizing_style(style, TableCellContentSizingPolicy::FinalRelayout);
+        let box_metrics = apply_used_box_metrics(
+            &mut style,
+            PercentageBasis::definite(layout_pt(available_width.max(0.0))),
+        );
+        let (_width, height) = used_canvas_size_with_height_basis(
+            element,
+            &style,
+            available_width,
+            percentage_height_basis,
+        );
+        Some(
+            height
+                + box_metrics.vertical_non_content_length().points()
+                + style.margin.top
+                + style.margin.bottom,
+        )
+    }
+
     pub(in crate::layout::table) fn table_cell_row_minimum_atomic_inline_outer_height(
         &mut self,
         style: &ComputedStyle,
@@ -87,14 +139,19 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             available_width,
         );
-        let vertical_non_content =
-            style.padding.top + style.padding.bottom + table_vertical_borders(&style);
+        let vertical_non_content = non_content_pt(style.padding.top + style.padding.bottom)
+            + table_vertical_borders(&style);
         let preferred_content_height = nested_height.max(style.line_height);
-        let content_height =
-            used_content_height_or_auto(&style, preferred_content_height, vertical_non_content)
-                .unwrap_or(preferred_content_height)
-                .max(nested_height);
-        (content_height + vertical_non_content + style.margin.top + style.margin.bottom).max(0.0)
+        let content_height = used_content_box_height_or_auto(
+            &style,
+            layout_pt(preferred_content_height),
+            vertical_non_content,
+        )
+        .map(SemanticLengthExt::points)
+        .unwrap_or(preferred_content_height)
+        .max(nested_height);
+        (content_height + vertical_non_content.points() + style.margin.top + style.margin.bottom)
+            .max(0.0)
     }
 
     pub(in crate::layout::table) fn table_cell_content_sizing_style(
@@ -127,6 +184,12 @@ impl<'a> LayoutBuilder<'a> {
         measured_style.box_values.min_height = css::ComputedLengthPercentageOrAuto::Auto;
         measured_style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
 
+        // The root/body canvas special case is an anonymous table-cell
+        // wrapper, not a text run. Its row contribution is the contained
+        // boxes' outer geometry; appending inherited line descent beneath an
+        // atomic inline would make `html { display: table }` taller than its
+        // shrink-wrapped contents.
+        // <https://www.w3.org/TR/css-tables-3/#row-layout>
         let structural_content_height = self.table_cell_children_non_text_content_height(
             children,
             stylesheets,
@@ -147,7 +210,7 @@ impl<'a> LayoutBuilder<'a> {
         structural_content_height.max(text_height)
             + measured_style.padding.top
             + measured_style.padding.bottom
-            + table_vertical_borders(&measured_style)
+            + table_vertical_borders(&measured_style).points()
             + measured_style.margin.top
             + measured_style.margin.bottom
     }
@@ -169,6 +232,9 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         border_insets: css::Edges,
     ) -> Option<f32> {
+        if cell_style.contain.layout {
+            return None;
+        }
         if let Some(children) = cell.children.as_deref() {
             return self
                 .table_cell_children_first_baseline_offset(
@@ -218,6 +284,9 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         border_insets: css::Edges,
     ) -> Option<f32> {
+        if cell_style.contain.layout {
+            return None;
+        }
         if let Some(children) = cell.children.as_deref() {
             return self
                 .table_cell_children_baseline_offset(
@@ -306,7 +375,7 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 last_baseline = Some(baseline);
             }
-            block_offset += table_cell_formatting_child_outer_height(child);
+            block_offset += table_cell_formatting_child_outer_height(child).points();
         }
 
         last_baseline
@@ -388,6 +457,15 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         baseline_set: TableCellBaselineSet,
     ) -> Option<f32> {
+        // CSS table-cell baselines come from in-flow line-box baselines; an
+        // inline wrapper that only contains atomic/replaced content should
+        // expose no textual baseline so the cell can fall back to its bottom
+        // content edge.
+        // <https://www.w3.org/TR/CSS22/tables.html#height-layout>
+        if !formatting_boxes_have_textual_baseline(children) {
+            return None;
+        }
+
         self.table_cell_inline_content_baseline_offset(
             children,
             inline_style,
@@ -432,18 +510,23 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         let mut items = Vec::new();
-        self.with_table_cell_inline_planning_scope(style, available_width, |layout| {
-            layout.collect_inline_box_items(
-                children,
-                stylesheets,
-                None,
-                0.0,
-                InlineVisualOffset::zero(),
-                style,
-                style.text_decoration,
-                &mut items,
-            );
-        });
+        self.with_table_cell_inline_planning_scope(
+            style,
+            available_width,
+            PercentageBasis::indefinite(),
+            |layout| {
+                layout.collect_inline_box_items(
+                    children,
+                    stylesheets,
+                    None,
+                    0.0,
+                    InlineVisualOffset::zero(),
+                    style,
+                    style.text_decoration.clone(),
+                    &mut items,
+                );
+            },
+        );
         if items.is_empty() {
             return None;
         }
@@ -515,10 +598,10 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             &input.columns,
-            table_width.content_width_points(),
+            table_width.content_width.points(),
             !style.box_values.width.is_auto(),
             table_cellpadding,
-            table_metrics,
+            table_metrics.clone(),
             collapsed_geometry.as_ref(),
         );
         let top_caption_height = self.estimate_table_captions_height(
@@ -528,15 +611,18 @@ impl<'a> LayoutBuilder<'a> {
             column_plan.total_width(),
             CaptionSide::Top,
         );
+        let table_used_style = self.table_used_style(style);
         let table_context = TableGridLayoutContext {
             rows,
             grid: &grid,
-            table_style: style,
+            table_style: &table_used_style,
             stylesheets,
             table_cellpadding,
             column_plan: &column_plan,
-            table_metrics,
+            table_metrics: table_metrics.clone(),
             collapsed_geometry: collapsed_geometry.as_ref(),
+            wrapper_border_box_block_size: None,
+            wrapper_non_grid_block_size: layout_pt(0.0),
         };
 
         let Some(row_index) = rows.iter().enumerate().find_map(|(index, row)| {
@@ -551,7 +637,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 table_cellpadding,
                 &column_plan,
-                table_metrics,
+                table_metrics.clone(),
             ) {
                 return None;
             }
@@ -572,7 +658,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 table_cellpadding,
                 &column_plan,
-                table_metrics,
+                table_metrics.clone(),
                 collapsed_geometry.as_ref(),
             )
             .unwrap_or_else(|| {
@@ -656,36 +742,41 @@ impl<'a> LayoutBuilder<'a> {
     ) -> Option<f32> {
         let mut items = Vec::new();
         let link_target = link_target.map(str::to_string);
-        self.with_table_cell_inline_planning_scope(style, available_width, |layout| {
-            layout.push_generated_pseudo_items(
-                element,
-                style,
-                style.before_style.as_deref(),
-                link_target.clone(),
-                0.0,
-                InlineVisualOffset::zero(),
-                GeneratedPseudoCounterMode::Commit,
-                &mut items,
-            );
-            layout.collect_element_content_or_inline_items(
-                element,
-                style,
-                stylesheets,
-                link_target.clone(),
-                InlinePlacement::zero(),
-                &mut items,
-            );
-            layout.push_generated_pseudo_items(
-                element,
-                style,
-                style.after_style.as_deref(),
-                link_target,
-                0.0,
-                InlineVisualOffset::zero(),
-                GeneratedPseudoCounterMode::Commit,
-                &mut items,
-            );
-        });
+        self.with_table_cell_inline_planning_scope(
+            style,
+            available_width,
+            PercentageBasis::indefinite(),
+            |layout| {
+                layout.push_generated_pseudo_items(
+                    element,
+                    style,
+                    style.before_style.as_deref(),
+                    link_target.clone(),
+                    0.0,
+                    InlineVisualOffset::zero(),
+                    GeneratedPseudoCounterMode::Commit,
+                    &mut items,
+                );
+                layout.collect_element_content_or_inline_items(
+                    element,
+                    style,
+                    stylesheets,
+                    link_target.clone(),
+                    InlinePlacement::zero(),
+                    &mut items,
+                );
+                layout.push_generated_pseudo_items(
+                    element,
+                    style,
+                    style.after_style.as_deref(),
+                    link_target,
+                    0.0,
+                    InlineVisualOffset::zero(),
+                    GeneratedPseudoCounterMode::Commit,
+                    &mut items,
+                );
+            },
+        );
         if items.is_empty() {
             return None;
         }
@@ -812,7 +903,7 @@ impl<'a> LayoutBuilder<'a> {
             .filter_map(|(offset, height)| {
                 row_occupancy
                     .get(row_index + offset)
-                    .copied()
+                    .cloned()
                     .unwrap_or(!collapsed_rows[offset])
                     .then_some(*height)
             })
@@ -824,11 +915,29 @@ impl<'a> LayoutBuilder<'a> {
             border_box.rect().origin,
             TableGridSize::new(border_box.width(), visible_height.max(0.0)),
         );
-        Some(
-            placement
-                .overflow_clip_for(rect)
-                .with_line_mode(OverflowClipLineMode::Contain),
-        )
+        Some(placement.overflow_clip_for(rect))
+    }
+
+    /// Return the padding-edge clip established by paint containment on a
+    /// table cell.
+    ///
+    /// A table cell's used height is determined by row layout rather than by
+    /// its specified height. Paint containment clips at the resulting padding
+    /// edge after the table border model resolves cell borders:
+    /// <https://www.w3.org/TR/CSS22/tables.html#height-layout>
+    /// <https://www.w3.org/TR/css-contain-1/#containment-paint>.
+    pub(in crate::layout::table) fn table_cell_content_clip(
+        &self,
+        cell_style: &ComputedStyle,
+        border_box: TableCellBorderBox,
+        placement: TableGridPlacement,
+        cell_borders: css::Edges,
+    ) -> Option<OverflowClip> {
+        let padding_box = placement.containing_block_for(border_box, cell_borders);
+        cell_style
+            .contain
+            .paint
+            .then(|| OverflowClip::from_page_top_rect(padding_box.rect))
     }
 
     pub(in crate::layout::table) fn layout_table_captions(
@@ -846,15 +955,64 @@ impl<'a> LayoutBuilder<'a> {
                 continue;
             }
             let caption_available_width = if has_auto_width(&caption_style) {
-                set_style_used_width(&mut caption_style, table_width);
+                // An auto-width caption uses the table measure for its outer
+                // border box. `width` itself sizes the content box, so remove
+                // the caption's padding and borders before freezing that used
+                // value; otherwise thick caption borders spuriously widen the
+                // table wrapper.
+                // <https://www.w3.org/TR/CSS22/tables.html#model>
+                let horizontal_non_content = caption_style.padding.left
+                    + caption_style.padding.right
+                    + horizontal_border_width(&caption_style);
+                set_style_used_width(
+                    &mut caption_style,
+                    (table_width - horizontal_non_content).max(0.0),
+                );
+                if caption_style.contain.size
+                    && caption_style.writing_mode == WritingMode::HorizontalTb
+                {
+                    // Size containment fixes the caption's principal used
+                    // size independently of its descendants. Those
+                    // descendants still format as visual overflow, anchored
+                    // at the principal border edge rather than after a
+                    // zero-extent side border. Preserve the same outer table
+                    // measure by transferring that start inset from the
+                    // internal overflow origin to the used content width.
+                    // <https://www.w3.org/TR/css-contain-1/#containment-size>
+                    let start_border = used_border_widths(&caption_style).left;
+                    if start_border != 0.0 {
+                        // The principal block has zero used block extent, so
+                        // this side has no visible block-axis edge. Removing
+                        // it from descendant layout exposes the border-box
+                        // overflow origin without changing the painted top
+                        // and bottom edges.
+                        // `style_with_current_used_lengths` resolves the
+                        // durable border length values again before block
+                        // geometry is built. Keep that source value in sync
+                        // with this temporary used-edge adjustment instead of
+                        // letting late font-metric resolution restore the
+                        // authored left border for descendant overflow.
+                        caption_style.border_width_values.left =
+                            css::ComputedLengthPercentage::from_points(0.0);
+                        caption_style.border_widths.left = 0.0;
+                        set_style_used_width(
+                            &mut caption_style,
+                            (table_width - horizontal_non_content + start_border).max(0.0),
+                        );
+                    }
+                }
                 table_width
             } else {
                 let horizontal_non_content = caption_style.padding.left
                     + caption_style.padding.right
                     + horizontal_border_width(&caption_style);
-                let caption_content_width =
-                    used_content_width_or_auto(&caption_style, table_width, horizontal_non_content)
-                        .unwrap_or(table_width);
+                let caption_content_width = used_content_box_width_or_auto(
+                    &caption_style,
+                    layout_pt(table_width),
+                    non_content_pt(horizontal_non_content),
+                )
+                .map(SemanticLengthExt::points)
+                .unwrap_or(table_width);
                 table_width.max(
                     caption_style.margin.left
                         + caption_content_width
@@ -1020,6 +1178,10 @@ mod tests {
             base_url: None,
             root_url: None,
             resource_cache,
+            // The builder retains this reference for its lifetime; tests that do
+            // not exercise iframes use one immutable empty fixture.
+            iframe_documents: Box::leak(Box::new(HashMap::new())),
+            iframe_viewport: None,
             page_progression_direction: Direction::Ltr,
             page_counter_initial_values: HashMap::new(),
             font_system: FontSystem::new(),

@@ -8,10 +8,7 @@ use super::*;
 /// <https://www.w3.org/TR/css-backgrounds-3/#the-background> and
 /// <https://www.w3.org/TR/css-backgrounds-3/#borders>.
 pub(crate) fn block_paint_ops(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
 ) -> (
     Vec<RenderedRect>,
@@ -19,7 +16,7 @@ pub(crate) fn block_paint_ops(
     Vec<RenderedPath>,
     Vec<RenderedStroke>,
 ) {
-    block_paint_ops_with_border_insets(x, y, width, height, style, used_border_widths(style), true)
+    block_paint_ops_with_border_insets(rect, style, used_border_widths(style), true)
 }
 
 /// Builds PDF paint primitives for a CSS block with caller-supplied border
@@ -30,12 +27,34 @@ pub(crate) fn block_paint_ops(
 /// border grid:
 /// <https://drafts.csswg.org/css-tables-3/#in-collapsed-borders-mode>.
 pub(crate) fn block_paint_ops_with_border_insets(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     border_insets: css::Edges,
+    paint_borders: bool,
+) -> (
+    Vec<RenderedRect>,
+    Vec<RenderedRoundedRect>,
+    Vec<RenderedPath>,
+    Vec<RenderedStroke>,
+) {
+    block_paint_ops_with_phases(rect, style, border_insets, true, true, true, paint_borders)
+}
+
+/// Builds one or more ordered phases of a CSS box decoration.
+///
+/// CSS Backgrounds paints outer shadows, background color/images, inset
+/// shadows, and borders as separate layers. Keeping the phases selectable lets
+/// URL/SVG background images be inserted between the generated background
+/// fills and the border without changing the established primitive types:
+/// <https://www.w3.org/TR/css-backgrounds-3/#layering>.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::layout) fn block_paint_ops_with_phases(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+    paint_outer_shadows: bool,
+    paint_backgrounds: bool,
+    paint_inset_shadows: bool,
     paint_borders: bool,
 ) -> (
     Vec<RenderedRect>,
@@ -47,54 +66,38 @@ pub(crate) fn block_paint_ops_with_border_insets(
     let mut rounded_rects = Vec::new();
     let mut paths = Vec::new();
     let strokes = Vec::new();
-    if width <= 0.0 || height <= 0.0 {
+    if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
         return (rects, rounded_rects, paths, strokes);
     }
     let geometry = BoxPaintGeometry {
-        x,
-        y,
-        width,
-        height,
+        rect,
         border_insets,
     };
-    paint_box_shadows(&mut rects, geometry, style, false);
-    if let Some(fill) = style.background_color
+    if paint_outer_shadows {
+        paint_box_shadows(&mut rects, geometry, style, false);
+    }
+    if paint_backgrounds
+        && let Some(fill) = style.background_color
         && fill.is_visible()
     {
-        let area = background_rect_area_for_box(
-            x,
-            y,
-            width,
-            height,
-            style,
-            border_insets,
-            style.background_clip,
-        );
-        if area.width <= 0.0 || area.height <= 0.0 {
+        let color_clip = style.background_color_clip();
+        let area = background_rect_area_for_box(rect, style, border_insets, color_clip);
+        if area.size.width <= 0.0 || area.size.height <= 0.0 {
             // Nothing to paint for the solid color layer after clipping.
-        } else if style.border_radius.is_zero() {
-            rects.push(RenderedRect::from_paint_rect(
-                paint_space_rect(area.x, area.y, area.width, area.height),
-                Some(fill),
-            ));
+        } else if style.border_radius.clone().is_zero() {
+            rects.push(RenderedRect::from_paint_rect(area, Some(fill)));
         } else if style.corner_shapes.all_round() {
-            if style.background_clip == css::BackgroundBox::Border {
+            if color_clip == css::BackgroundBox::Border {
                 rounded_rects.push(RenderedRoundedRect::from_paint_rect(
-                    paint_space_rect(area.x, area.y, area.width, area.height),
-                    used_rounded_rect_radii(style.border_radius, width, height),
+                    area,
+                    used_rounded_rect_radii(style.border_radius.clone(), rect.size),
                     Some(fill),
                     None,
                     0.0,
                 ));
-            } else if let Some(clip) = rounded_background_clip_for_box(
-                x,
-                y,
-                width,
-                height,
-                style,
-                border_insets,
-                style.background_clip,
-            ) {
+            } else if let Some(clip) =
+                rounded_background_clip_for_box(rect, style, border_insets, color_clip)
+            {
                 paths.push(RenderedPath::new(
                     clip.commands,
                     Some(fill),
@@ -104,21 +107,12 @@ pub(crate) fn block_paint_ops_with_border_insets(
                     None,
                 ));
             } else {
-                rects.push(RenderedRect::from_paint_rect(
-                    paint_space_rect(area.x, area.y, area.width, area.height),
-                    Some(fill),
-                ));
+                rects.push(RenderedRect::from_paint_rect(area, Some(fill)));
             }
         } else {
-            if let Some(clip) = rounded_background_clip_for_box(
-                x,
-                y,
-                width,
-                height,
-                style,
-                border_insets,
-                style.background_clip,
-            ) {
+            if let Some(clip) =
+                rounded_background_clip_for_box(rect, style, border_insets, color_clip)
+            {
                 paths.push(RenderedPath::new(
                     clip.commands,
                     Some(fill),
@@ -128,51 +122,41 @@ pub(crate) fn block_paint_ops_with_border_insets(
                     None,
                 ));
             } else {
-                rects.push(RenderedRect::from_paint_rect(
-                    paint_space_rect(area.x, area.y, area.width, area.height),
-                    Some(fill),
-                ));
+                rects.push(RenderedRect::from_paint_rect(area, Some(fill)));
             }
         }
     }
-    if style.border_radius.is_zero() {
-        rects.extend(linear_gradient_rects(
-            x,
-            y,
-            width,
-            height,
-            style,
-            border_insets,
-        ));
-    } else {
-        paths.extend(linear_gradient_rect_paths(
-            x,
-            y,
-            width,
-            height,
-            style,
-            border_insets,
-        ));
+    if paint_backgrounds {
+        if style.border_radius.clone().is_zero() {
+            rects.extend(linear_gradient_rects(rect, style, border_insets));
+        } else {
+            paths.extend(linear_gradient_rect_paths(rect, style, border_insets));
+        }
+        paths.extend(linear_gradient_paths(rect, style, border_insets));
     }
-    paths.extend(linear_gradient_paths(
-        x,
-        y,
-        width,
-        height,
-        style,
-        border_insets,
-    ));
-    paint_box_shadows(&mut rects, geometry, style, true);
+    if paint_inset_shadows {
+        paint_box_shadows(&mut rects, geometry, style, true);
+    }
     if !paint_borders || style.border_image.source.is_some() {
         return (rects, rounded_rects, paths, strokes);
     }
-    if !paint_uniform_rounded_border(&mut rounded_rects, x, y, width, height, style)
-        && !paint_uniform_double_rounded_border(&mut paths, x, y, width, height, style)
-        && !paint_solid_rounded_border_ring(&mut paths, x, y, width, height, style)
-        && !paint_patterned_rounded_border_sides(&mut paths, x, y, width, height, style)
-        && !paint_clipped_rounded_border_sides(&mut paths, x, y, width, height, style)
+    if !paint_uniform_rounded_border(&mut rounded_rects, rect, style)
+        && !paint_uniform_double_rounded_border(&mut paths, rect, style)
+        && !paint_solid_rounded_border_ring(&mut paths, rect, style)
+        && !paint_patterned_rounded_border_sides(&mut paths, rect, style)
+        && !paint_clipped_rounded_border_sides(&mut paths, rect, style)
     {
-        paint_border_edges(&mut rects, &mut paths, x, y + height, width, height, style);
+        paint_border_edges(
+            &mut rects,
+            &mut paths,
+            PageTopRect::new(
+                rect.origin.x,
+                rect.max_y(),
+                rect.size.width,
+                rect.size.height,
+            ),
+            style,
+        );
     }
     (rects, rounded_rects, paths, strokes)
 }
@@ -184,14 +168,11 @@ pub(crate) fn block_paint_ops_with_border_insets(
 /// colors and stop positions exactly in PDF output:
 /// <https://www.w3.org/TR/css-images-3/#linear-gradients>.
 pub(in crate::layout) fn linear_gradient_rects(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     border_insets: css::Edges,
 ) -> Vec<RenderedRect> {
-    linear_gradient_rects_with_clip(x, y, width, height, style, border_insets, None)
+    linear_gradient_rects_with_clip(rect, style, border_insets, None)
 }
 
 /// Converts axis-aligned hard-stop linear gradients with an extra clip.
@@ -202,13 +183,10 @@ pub(in crate::layout) fn linear_gradient_rects(
 /// <https://www.w3.org/TR/css-images-3/#linear-gradients> and
 /// <https://www.w3.org/TR/css-backgrounds-3/#backgrounds>.
 pub(in crate::layout) fn linear_gradient_rects_with_clip(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     border_insets: css::Edges,
-    extra_clip: Option<BackgroundRectArea>,
+    extra_clip: Option<PaintRect>,
 ) -> Vec<RenderedRect> {
     let mut rects = Vec::new();
     for layer in background_layers_for_gradient_paint(style).iter().rev() {
@@ -218,18 +196,9 @@ pub(in crate::layout) fn linear_gradient_rects_with_clip(
         if !linear_gradient_can_paint_as_vector(gradient, layer) {
             continue;
         }
-        let area =
-            background_rect_area_for_box(x, y, width, height, style, border_insets, layer.origin);
-        let clip = background_rect_clip_area_for_box(
-            x,
-            y,
-            width,
-            height,
-            style,
-            border_insets,
-            layer.clip,
-            extra_clip,
-        );
+        let area = background_rect_area_for_box(rect, style, border_insets, layer.origin);
+        let clip =
+            background_rect_clip_area_for_box(rect, style, border_insets, layer.clip, extra_clip);
         let Some(axis_direction) = axis_aligned_gradient_direction(gradient.direction) else {
             continue;
         };
@@ -246,10 +215,7 @@ pub(in crate::layout) fn linear_gradient_rects_with_clip(
         push_gradient_band(
             &mut rects,
             axis_direction,
-            area.x,
-            area.y,
-            area.width,
-            area.height,
+            area,
             0.0,
             first.position,
             first.color,
@@ -258,10 +224,7 @@ pub(in crate::layout) fn linear_gradient_rects_with_clip(
             push_gradient_band(
                 &mut rects,
                 axis_direction,
-                area.x,
-                area.y,
-                area.width,
-                area.height,
+                area,
                 pair[0].position,
                 pair[1].position,
                 pair[0].color,
@@ -271,10 +234,7 @@ pub(in crate::layout) fn linear_gradient_rects_with_clip(
         push_gradient_band(
             &mut rects,
             axis_direction,
-            area.x,
-            area.y,
-            area.width,
-            area.height,
+            area,
             last.position,
             axis_length,
             last.color,
@@ -295,14 +255,11 @@ pub(in crate::layout) fn linear_gradient_rects_with_clip(
 /// <https://www.w3.org/TR/css-backgrounds-3/#corner-clipping> and
 /// <https://www.w3.org/TR/css-images-3/#linear-gradients>.
 pub(in crate::layout) fn linear_gradient_rect_paths(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     border_insets: css::Edges,
 ) -> Vec<RenderedPath> {
-    linear_gradient_rect_paths_with_clip(x, y, width, height, style, border_insets, None)
+    linear_gradient_rect_paths_with_clip(rect, style, border_insets, None)
 }
 
 /// Converts rounded axis-aligned hard-stop gradients with an extra clip.
@@ -311,13 +268,10 @@ pub(in crate::layout) fn linear_gradient_rect_paths(
 /// may intersect that clip with a fragment-local exposed area:
 /// <https://www.w3.org/TR/css-backgrounds-3/#background-clip>.
 pub(in crate::layout) fn linear_gradient_rect_paths_with_clip(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     border_insets: css::Edges,
-    extra_clip: Option<BackgroundRectArea>,
+    extra_clip: Option<PaintRect>,
 ) -> Vec<RenderedPath> {
     let mut paths = Vec::new();
     for layer in background_layers_for_gradient_paint(style).iter().rev() {
@@ -330,20 +284,11 @@ pub(in crate::layout) fn linear_gradient_rect_paths_with_clip(
         let Some(axis_direction) = axis_aligned_gradient_direction(gradient.direction) else {
             continue;
         };
-        let area =
-            background_rect_area_for_box(x, y, width, height, style, border_insets, layer.origin);
-        let clip = background_rect_clip_area_for_box(
-            x,
-            y,
-            width,
-            height,
-            style,
-            border_insets,
-            layer.clip,
-            extra_clip,
-        );
+        let area = background_rect_area_for_box(rect, style, border_insets, layer.origin);
+        let clip =
+            background_rect_clip_area_for_box(rect, style, border_insets, layer.clip, extra_clip);
         let Some(rounded_clip) =
-            rounded_background_clip_for_box(x, y, width, height, style, border_insets, layer.clip)
+            rounded_background_clip_for_box(rect, style, border_insets, layer.clip)
         else {
             continue;
         };
@@ -360,10 +305,7 @@ pub(in crate::layout) fn linear_gradient_rect_paths_with_clip(
         push_gradient_band(
             &mut rects,
             axis_direction,
-            area.x,
-            area.y,
-            area.width,
-            area.height,
+            area,
             0.0,
             first.position,
             first.color,
@@ -372,10 +314,7 @@ pub(in crate::layout) fn linear_gradient_rect_paths_with_clip(
             push_gradient_band(
                 &mut rects,
                 axis_direction,
-                area.x,
-                area.y,
-                area.width,
-                area.height,
+                area,
                 pair[0].position,
                 pair[1].position,
                 pair[0].color,
@@ -385,10 +324,7 @@ pub(in crate::layout) fn linear_gradient_rect_paths_with_clip(
         push_gradient_band(
             &mut rects,
             axis_direction,
-            area.x,
-            area.y,
-            area.width,
-            area.height,
+            area,
             last.position,
             axis_length,
             last.color,
@@ -414,14 +350,11 @@ pub(in crate::layout) fn linear_gradient_rect_paths_with_clip(
 /// perpendicular half-planes:
 /// <https://www.w3.org/TR/css-images-3/#linear-gradients>.
 pub(in crate::layout) fn linear_gradient_paths(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     border_insets: css::Edges,
 ) -> Vec<RenderedPath> {
-    linear_gradient_paths_with_clip(x, y, width, height, style, border_insets, None)
+    linear_gradient_paths_with_clip(rect, style, border_insets, None)
 }
 
 /// Converts angled hard-stop linear gradients with an extra clip.
@@ -430,80 +363,85 @@ pub(in crate::layout) fn linear_gradient_paths(
 /// clip only constrains the painted polygon, preserving that coordinate space:
 /// <https://www.w3.org/TR/css-images-3/#linear-gradients>.
 pub(in crate::layout) fn linear_gradient_paths_with_clip(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     border_insets: css::Edges,
-    extra_clip: Option<BackgroundRectArea>,
+    extra_clip: Option<PaintRect>,
 ) -> Vec<RenderedPath> {
     let mut paths = Vec::new();
     for layer in background_layers_for_gradient_paint(style).iter().rev() {
         let Some(BackgroundImage::LinearGradient(gradient)) = &layer.image else {
             continue;
         };
-        if !linear_gradient_can_paint_as_vector(gradient, layer)
-            || axis_aligned_gradient_direction(gradient.direction).is_some()
+        let area = background_rect_area_for_box(rect, style, border_insets, layer.origin);
+        let clip =
+            background_rect_clip_area_for_box(rect, style, border_insets, layer.clip, extra_clip);
+        let rounded_clip = rounded_background_clip_for_box(rect, style, border_insets, layer.clip);
+        if let Some(layer_paths) =
+            linear_gradient_hard_stop_paths(gradient, layer, area, clip, rounded_clip)
         {
-            continue;
+            paths.extend(layer_paths);
         }
-        let area =
-            background_rect_area_for_box(x, y, width, height, style, border_insets, layer.origin);
-        let clip = background_rect_clip_area_for_box(
-            x,
-            y,
-            width,
-            height,
-            style,
-            border_insets,
-            layer.clip,
-            extra_clip,
-        );
-        let line = angled_gradient_line(gradient.direction, area);
-        let Some(stops) = fixed_gradient_stops(gradient, line.axis_length) else {
-            continue;
-        };
-        if !fixed_gradient_is_hard_stop(&stops) {
-            continue;
-        }
-
-        let rounded_clip =
-            rounded_background_clip_for_box(x, y, width, height, style, border_insets, layer.clip);
-
-        let first = stops[0];
-        push_gradient_polygon_band(
-            &mut paths,
-            line,
-            clip,
-            0.0,
-            first.position,
-            first.color,
-            rounded_clip.clone(),
-        );
-        for pair in stops.windows(2) {
-            push_gradient_polygon_band(
-                &mut paths,
-                line,
-                clip,
-                pair[0].position,
-                pair[1].position,
-                pair[0].color,
-                rounded_clip.clone(),
-            );
-        }
-        let last = *stops.last().expect("checked length above");
-        push_gradient_polygon_band(
-            &mut paths,
-            line,
-            clip,
-            last.position,
-            line.axis_length,
-            last.color,
-            rounded_clip,
-        );
     }
     paths
+}
+
+/// Paint a non-repeating, angled, hard-stop gradient as CSS image-space
+/// polygons. The positioning and clip rectangles are supplied independently
+/// so table structural backgrounds can preserve their full column image box
+/// while exposing only row-fragment slices.
+/// <https://www.w3.org/TR/css-images-3/#linear-gradients>
+pub(in crate::layout) fn linear_gradient_hard_stop_paths(
+    gradient: &css::LinearGradient,
+    layer: &css::BackgroundLayer,
+    area: PaintRect,
+    clip: PaintRect,
+    rounded_clip: Option<RenderedPathClip>,
+) -> Option<Vec<RenderedPath>> {
+    if !linear_gradient_can_paint_as_vector(gradient, layer)
+        || axis_aligned_gradient_direction(gradient.direction).is_some()
+    {
+        return None;
+    }
+    let line = angled_gradient_line(gradient.direction, area);
+    let stops = fixed_gradient_stops(gradient, line.axis_length)?;
+    if !fixed_gradient_is_hard_stop(&stops) {
+        return None;
+    }
+
+    let mut paths = Vec::new();
+    let first = stops[0];
+    push_gradient_polygon_band(
+        &mut paths,
+        line,
+        clip,
+        0.0,
+        first.position,
+        first.color,
+        rounded_clip.clone(),
+    );
+    for pair in stops.windows(2) {
+        push_gradient_polygon_band(
+            &mut paths,
+            line,
+            clip,
+            pair[0].position,
+            pair[1].position,
+            pair[0].color,
+            rounded_clip.clone(),
+        );
+    }
+    let last = *stops.last().expect("checked length above");
+    push_gradient_polygon_band(
+        &mut paths,
+        line,
+        clip,
+        last.position,
+        line.axis_length,
+        last.color,
+        rounded_clip,
+    );
+    Some(paths)
 }
 
 pub(in crate::layout) fn linear_gradient_can_paint_as_vector(
@@ -516,6 +454,29 @@ pub(in crate::layout) fn linear_gradient_can_paint_as_vector(
         && layer.position == css::BackgroundPosition::INITIAL
 }
 
+/// Whether [`block_paint_ops_with_phases`] emits this layer as exact
+/// axis-aligned hard-stop vector bands rather than delegating it to the
+/// generic generated-image painter.
+pub(in crate::layout) fn linear_gradient_is_painted_by_box_decoration(
+    gradient: &css::LinearGradient,
+    layer: &css::BackgroundLayer,
+    size: PaintSize,
+) -> bool {
+    let Some(direction) = axis_aligned_gradient_direction(gradient.direction) else {
+        return false;
+    };
+    linear_gradient_can_paint_as_vector(gradient, layer)
+        && gradient.stops.iter().all(|stop| stop.color.is_opaque())
+        && fixed_gradient_stops(
+            gradient,
+            axis_aligned_gradient_length(
+                direction,
+                PaintRect::new(PaintPoint::new(0.0, 0.0), size),
+            ),
+        )
+        .is_some_and(|stops| fixed_gradient_is_hard_stop(&stops))
+}
+
 pub(in crate::layout) fn gradient_stop_position(
     stop: css::GradientColorStop,
     axis_length: f32,
@@ -523,8 +484,9 @@ pub(in crate::layout) fn gradient_stop_position(
     let position = stop.position?;
     Some(
         position
-            .used_length_with_percentage_basis(axis_length)
-            .unwrap_or(position.length_with_percentage_basis(axis_length)),
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(axis_length)))
+            .map(layout_points)
+            .unwrap_or(position.length_points()),
     )
 }
 
@@ -550,8 +512,8 @@ pub(in crate::layout) fn fixed_gradient_stops(
     let mut positions = gradient
         .stops
         .iter()
-        .copied()
-        .map(|stop| gradient_stop_position(stop, axis_length))
+        .cloned()
+        .map(|stop| gradient_stop_position(stop, axis_length).map(canonical_gradient_stop_position))
         .collect::<Vec<_>>();
     positions[0].get_or_insert(0.0);
     let last_index = positions.len() - 1;
@@ -597,6 +559,22 @@ pub(in crate::layout) fn fixed_gradient_stops(
     )
 }
 
+/// Canonicalize a used gradient coordinate before color-stop fixup and raster
+/// sampling.
+///
+/// CSS calculations such as `calc(10% + 20px)` and an equivalent `30px`
+/// position may arrive through distinct floating-point operation sequences.
+/// Generated images sample those coordinates many times, so retaining a
+/// sub-ULP difference can produce a one-channel raster discrepancy despite
+/// identical CSS used values. One 1/4096-point quantum is far below the
+/// generated-image sampling grid while making equivalent used coordinates
+/// stable across expression forms:
+/// <https://www.w3.org/TR/css-images-3/#color-stop-fixup>.
+fn canonical_gradient_stop_position(position: f32) -> f32 {
+    const QUANTA_PER_POINT: f32 = 4096.0;
+    (position * QUANTA_PER_POINT).round() / QUANTA_PER_POINT
+}
+
 pub(in crate::layout) fn fixed_gradient_is_hard_stop(stops: &[FixedGradientStop]) -> bool {
     stops.windows(2).all(|pair| {
         (pair[0].position - pair[1].position).abs() <= 0.001 || pair[0].color == pair[1].color
@@ -611,9 +589,10 @@ pub(in crate::layout) fn background_layers_for_gradient_paint(
     }
     vec![css::BackgroundLayer {
         image: style.background_image.clone(),
-        position: style.background_position,
-        size: style.background_size,
+        position: style.background_position.clone(),
+        size: style.background_size.clone(),
         repeat: style.background_repeat,
+        attachment: style.background_attachment,
         origin: style.background_origin,
         clip: style.background_clip,
     }]
@@ -639,57 +618,93 @@ fn axis_aligned_gradient_direction(
     }
 }
 
-fn axis_aligned_gradient_length(
-    direction: LinearGradientDirection,
-    area: BackgroundRectArea,
-) -> f32 {
+fn axis_aligned_gradient_length(direction: LinearGradientDirection, area: PaintRect) -> f32 {
     match direction {
         LinearGradientDirection::Angle(angle)
             if (angle.rem_euclid(360.0) - 0.0).abs() < 0.001
                 || (angle.rem_euclid(360.0) - 180.0).abs() < 0.001 =>
         {
-            area.height
+            area.size.height
         }
         LinearGradientDirection::Angle(angle)
             if (angle.rem_euclid(360.0) - 90.0).abs() < 0.001
                 || (angle.rem_euclid(360.0) - 270.0).abs() < 0.001 =>
         {
-            area.width
+            area.size.width
         }
         _ => 0.0,
     }
 }
 
+/// Unitless normalized direction of a gradient axis.
+///
+/// Gradient direction components are not page-local distances. Keeping them
+/// separate from [`PaintDisplacement`] prevents using a direction where a
+/// physical paint offset is required.
+#[derive(Debug, Clone, Copy)]
+struct PaintDirection(euclid::Vector2D<f32, GradientDirectionSpace>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GradientDirectionSpace {}
+
+impl PaintDirection {
+    fn from_components(x: f32, y: f32) -> Self {
+        debug_assert!(((x * x + y * y).sqrt() - 1.0).abs() <= 0.001);
+        Self(euclid::Vector2D::new(x, y))
+    }
+
+    fn project(self, displacement: PaintDisplacement) -> f32 {
+        displacement.x * self.0.x + displacement.y * self.0.y
+    }
+
+    fn scaled(self, length: f32) -> PaintDisplacement {
+        PaintDisplacement::new(self.0.x * length, self.0.y * length)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct AngledGradientLine {
-    pub(in crate::layout) center_x: f32,
-    pub(in crate::layout) center_y: f32,
-    pub(in crate::layout) dir_x: f32,
-    pub(in crate::layout) dir_y: f32,
+    pub(in crate::layout) center: PaintPoint,
+    direction: PaintDirection,
     pub(in crate::layout) axis_length: f32,
+}
+
+impl AngledGradientLine {
+    /// Returns the start and end of the gradient axis in paint space.
+    ///
+    /// The unitless direction remains private so callers cannot mistake it
+    /// for a physical [`PaintDisplacement`].
+    pub(in crate::layout) fn endpoints(self) -> (PaintPoint, PaintPoint) {
+        let half_length = self.axis_length / 2.0;
+        (
+            self.center - self.direction.scaled(half_length),
+            self.center + self.direction.scaled(half_length),
+        )
+    }
 }
 
 pub(in crate::layout) fn angled_gradient_line(
     direction: LinearGradientDirection,
-    area: BackgroundRectArea,
+    area: PaintRect,
 ) -> AngledGradientLine {
     let angle = gradient_direction_angle_for_area(direction, area);
     let radians = angle.to_radians();
     let dir_x = radians.sin();
     let dir_y = radians.cos();
-    let axis_length = area.width * dir_x.abs() + area.height * dir_y.abs();
+    let axis_length = area.size.width * dir_x.abs() + area.size.height * dir_y.abs();
     AngledGradientLine {
-        center_x: area.x + area.width / 2.0,
-        center_y: area.y + area.height / 2.0,
-        dir_x,
-        dir_y,
+        center: PaintPoint::new(
+            area.origin.x + area.size.width / 2.0,
+            area.origin.y + area.size.height / 2.0,
+        ),
+        direction: PaintDirection::from_components(dir_x, dir_y),
         axis_length,
     }
 }
 
 pub(in crate::layout) fn gradient_direction_angle_for_area(
     direction: LinearGradientDirection,
-    area: BackgroundRectArea,
+    area: PaintRect,
 ) -> f32 {
     match direction {
         LinearGradientDirection::Angle(angle) => angle,
@@ -698,12 +713,12 @@ pub(in crate::layout) fn gradient_direction_angle_for_area(
             vertical,
         } => {
             let x = match horizontal {
-                css::GradientHorizontalDirection::Left => -area.width,
-                css::GradientHorizontalDirection::Right => area.width,
+                css::GradientHorizontalDirection::Left => -area.size.width,
+                css::GradientHorizontalDirection::Right => area.size.width,
             };
             let y = match vertical {
-                css::GradientVerticalDirection::Top => area.height,
-                css::GradientVerticalDirection::Bottom => -area.height,
+                css::GradientVerticalDirection::Top => area.size.height,
+                css::GradientVerticalDirection::Bottom => -area.size.height,
             };
             x.atan2(y).to_degrees().rem_euclid(360.0)
         }
@@ -717,23 +732,82 @@ pub(in crate::layout) fn gradient_direction_angle_for_area(
 /// border contour painting rather than changing the background fill clip:
 /// <https://www.w3.org/TR/css-backgrounds-3/#corner-clipping>.
 pub(in crate::layout) fn rounded_background_clip_for_box(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     border_insets: css::Edges,
     clip_box: css::BackgroundBox,
 ) -> Option<RenderedPathClip> {
-    if style.border_radius.is_zero() || width <= 0.0 || height <= 0.0 {
+    if clip_box == css::BackgroundBox::BorderArea {
+        let outer_radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
+        let inner =
+            background_rect_area_for_box(rect, style, border_insets, css::BackgroundBox::Padding);
+        let mut commands = shaped_rect_path_commands(rect, outer_radii, style.corner_shapes);
+        if inner.size.width > 0.0 && inner.size.height > 0.0 {
+            let inner_radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
+            commands.extend(shaped_rect_path_commands(
+                inner,
+                RenderedRoundedRectRadii {
+                    top_left: RenderedCornerRadius::new(
+                        inner_radii.top_left.x() - border_insets.left,
+                        inner_radii.top_left.y() - border_insets.top,
+                    ),
+                    top_right: RenderedCornerRadius::new(
+                        inner_radii.top_right.x() - border_insets.right,
+                        inner_radii.top_right.y() - border_insets.top,
+                    ),
+                    bottom_right: RenderedCornerRadius::new(
+                        inner_radii.bottom_right.x() - border_insets.right,
+                        inner_radii.bottom_right.y() - border_insets.bottom,
+                    ),
+                    bottom_left: RenderedCornerRadius::new(
+                        inner_radii.bottom_left.x() - border_insets.left,
+                        inner_radii.bottom_left.y() - border_insets.bottom,
+                    ),
+                },
+                style.corner_shapes,
+            ));
+        }
+        return Some(RenderedPathClip::new(
+            commands,
+            RenderedPathFillRule::EvenOdd,
+            Vec::new(),
+        ));
+    }
+    let rounded_rect = rounded_clip_rect_for_box(rect, style, border_insets, clip_box)?;
+    Some(RenderedPathClip::new(
+        shaped_rect_path_commands(
+            rounded_rect.paint_rect(),
+            rounded_rect.radii,
+            css::CornerShapes::ROUND,
+        ),
+        RenderedPathFillRule::NonZero,
+        Vec::new(),
+    ))
+}
+
+/// Build the rounded used clip area for a CSS box edge.
+///
+/// Paint containment clips descendants at the padding edge, including the
+/// curve derived from the principal box's border radii. Returning geometry
+/// separately lets both background primitives and whole captured paint
+/// fragments share the same used-radius calculation:
+/// <https://www.w3.org/TR/css-contain-1/#containment-paint> and
+/// <https://www.w3.org/TR/css-backgrounds-3/#corner-clipping>.
+pub(in crate::layout) fn rounded_clip_rect_for_box(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+    clip_box: css::BackgroundBox,
+) -> Option<RenderedRoundedRect> {
+    if style.border_radius.clone().is_zero() || rect.size.width <= 0.0 || rect.size.height <= 0.0 {
         return None;
     }
-    let area = background_rect_area_for_box(x, y, width, height, style, border_insets, clip_box);
-    if area.width <= 0.0 || area.height <= 0.0 {
+    let area = background_rect_area_for_box(rect, style, border_insets, clip_box);
+    if area.size.width <= 0.0 || area.size.height <= 0.0 {
         return None;
     }
     let insets = background_clip_edge_insets(style, border_insets, clip_box);
-    let mut radii = used_rounded_rect_radii(style.border_radius, width, height);
+    let mut radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
     radii.top_left = RenderedCornerRadius::new(
         radii.top_left.x() - insets.left,
         radii.top_left.y() - insets.top,
@@ -750,21 +824,25 @@ pub(in crate::layout) fn rounded_background_clip_for_box(
         radii.bottom_left.x() - insets.left,
         radii.bottom_left.y() - insets.bottom,
     );
-    scale_rounded_radii_to_area(&mut radii, area.width, area.height);
+    // The outer radii were already reduced together against the border box by
+    // `used_rounded_rect_radii`.  CSS derives each inner edge by subtracting
+    // its corresponding border (and, for the content edge, padding) width,
+    // clamping at zero.  Reducing those derived radii a second time against
+    // the smaller inner rectangle changes the curve, notably for a single
+    // `100%` corner.
+    // <https://www.w3.org/TR/css-backgrounds-3/#corner-shaping>.
     if rounded_radii_are_zero(radii) {
         return None;
     }
-    Some(RenderedPathClip::new(
-        shaped_rect_path_commands(
-            area.x,
-            area.y,
-            area.width,
-            area.height,
-            radii,
-            css::CornerShapes::ROUND,
-        ),
-        RenderedPathFillRule::NonZero,
-        Vec::new(),
+    Some(RenderedRoundedRect::new(
+        area.origin.x,
+        area.origin.y,
+        area.size.width,
+        area.size.height,
+        radii,
+        None,
+        None,
+        0.0,
     ))
 }
 
@@ -774,7 +852,7 @@ fn background_clip_edge_insets(
     clip_box: css::BackgroundBox,
 ) -> css::Edges {
     match clip_box {
-        css::BackgroundBox::Border => css::Edges::ZERO,
+        css::BackgroundBox::Border | css::BackgroundBox::BorderArea => css::Edges::ZERO,
         css::BackgroundBox::Padding => border_insets,
         css::BackgroundBox::Content => css::Edges {
             top: border_insets.top + style.padding.top,
@@ -782,23 +860,6 @@ fn background_clip_edge_insets(
             bottom: border_insets.bottom + style.padding.bottom,
             left: border_insets.left + style.padding.left,
         },
-    }
-}
-
-fn scale_rounded_radii_to_area(radii: &mut RenderedRoundedRectRadii, width: f32, height: f32) {
-    let scale = [
-        edge_radius_scale(width, radii.top_left.x() + radii.top_right.x()),
-        edge_radius_scale(height, radii.top_right.y() + radii.bottom_right.y()),
-        edge_radius_scale(width, radii.bottom_left.x() + radii.bottom_right.x()),
-        edge_radius_scale(height, radii.top_left.y() + radii.bottom_left.y()),
-    ]
-    .into_iter()
-    .fold(1.0_f32, f32::min);
-    if scale < 1.0 {
-        radii.top_left.scale(scale);
-        radii.top_right.scale(scale);
-        radii.bottom_right.scale(scale);
-        radii.bottom_left.scale(scale);
     }
 }
 
@@ -841,7 +902,7 @@ fn gradient_rect_path(rect: RenderedRect, clip: RenderedPathClip) -> Option<Rend
 fn push_gradient_polygon_band(
     paths: &mut Vec<RenderedPath>,
     line: AngledGradientLine,
-    clip: BackgroundRectArea,
+    clip: PaintRect,
     start: f32,
     end: f32,
     color: Color,
@@ -852,14 +913,17 @@ fn push_gradient_polygon_band(
     }
     let start = start.clamp(0.0, line.axis_length);
     let end = end.clamp(0.0, line.axis_length);
-    if end <= start || clip.width <= 0.0 || clip.height <= 0.0 {
+    if end <= start || clip.size.width <= 0.0 || clip.size.height <= 0.0 {
         return;
     }
     let mut polygon = vec![
-        (clip.x, clip.y),
-        (clip.x + clip.width, clip.y),
-        (clip.x + clip.width, clip.y + clip.height),
-        (clip.x, clip.y + clip.height),
+        clip.origin,
+        PaintPoint::new(clip.origin.x + clip.size.width, clip.origin.y),
+        PaintPoint::new(
+            clip.origin.x + clip.size.width,
+            clip.origin.y + clip.size.height,
+        ),
+        PaintPoint::new(clip.origin.x, clip.origin.y + clip.size.height),
     ];
     polygon = clip_gradient_polygon(polygon, line, start, true);
     polygon = clip_gradient_polygon(polygon, line, end, false);
@@ -867,14 +931,9 @@ fn push_gradient_polygon_band(
         return;
     }
     let mut commands = Vec::with_capacity(polygon.len() + 1);
-    commands.push(RenderedPathCommand::move_to(paint_space_point(
-        polygon[0].0,
-        polygon[0].1,
-    )));
+    commands.push(RenderedPathCommand::move_to(polygon[0]));
     for point in &polygon[1..] {
-        commands.push(RenderedPathCommand::line_to(paint_space_point(
-            point.0, point.1,
-        )));
+        commands.push(RenderedPathCommand::line_to(*point));
     }
     commands.push(RenderedPathCommand::Close);
     paths.push(RenderedPath::new(
@@ -888,11 +947,11 @@ fn push_gradient_polygon_band(
 }
 
 fn clip_gradient_polygon(
-    polygon: Vec<(f32, f32)>,
+    polygon: Vec<PaintPoint>,
     line: AngledGradientLine,
     boundary: f32,
     keep_after: bool,
-) -> Vec<(f32, f32)> {
+) -> Vec<PaintPoint> {
     if polygon.is_empty() {
         return polygon;
     }
@@ -928,50 +987,42 @@ fn clip_gradient_polygon(
 }
 
 pub(in crate::layout) fn gradient_axis_position(
-    point: (f32, f32),
+    point: PaintPoint,
     line: AngledGradientLine,
 ) -> f32 {
-    (point.0 - line.center_x) * line.dir_x
-        + (point.1 - line.center_y) * line.dir_y
-        + line.axis_length / 2.0
+    line.direction.project(point - line.center) + line.axis_length / 2.0
 }
 
 fn gradient_boundary_intersection(
-    start: (f32, f32),
-    end: (f32, f32),
+    start: PaintPoint,
+    end: PaintPoint,
     start_value: f32,
     end_value: f32,
-) -> Option<(f32, f32)> {
+) -> Option<PaintPoint> {
     let denominator = start_value - end_value;
     if denominator.abs() <= f32::EPSILON {
         return None;
     }
     let t = (start_value / denominator).clamp(0.0, 1.0);
-    Some((
-        start.0 + (end.0 - start.0) * t,
-        start.1 + (end.1 - start.1) * t,
+    Some(PaintPoint::new(
+        start.x + (end.x - start.x) * t,
+        start.y + (end.y - start.y) * t,
     ))
 }
 
 pub(in crate::layout) fn background_rect_area_for_box(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     border: css::Edges,
     box_: css::BackgroundBox,
-) -> BackgroundRectArea {
-    let area = BackgroundRectArea {
-        x,
-        y,
-        width,
-        height,
-    };
+) -> PaintRect {
+    let area = rect;
     match box_ {
-        css::BackgroundBox::Border => area,
-        css::BackgroundBox::Padding => area.inset(border),
-        css::BackgroundBox::Content => area.inset(border).inset(style.padding),
+        css::BackgroundBox::Border | css::BackgroundBox::BorderArea => area,
+        css::BackgroundBox::Padding => inset_paint_rect(area, border),
+        css::BackgroundBox::Content => {
+            inset_paint_rect(inset_paint_rect(area, border), style.padding)
+        }
     }
 }
 
@@ -983,58 +1034,22 @@ pub(in crate::layout) fn background_rect_area_for_box(
 /// portion without changing the background positioning area:
 /// <https://www.w3.org/TR/css-backgrounds-3/#background-clip>.
 pub(in crate::layout) fn background_rect_clip_area_for_box(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
     border: css::Edges,
     box_: css::BackgroundBox,
-    extra_clip: Option<BackgroundRectArea>,
-) -> BackgroundRectArea {
-    let clip = background_rect_area_for_box(x, y, width, height, style, border, box_);
-    extra_clip.map_or(clip, |extra_clip| clip.intersection(extra_clip))
+    extra_clip: Option<PaintRect>,
+) -> PaintRect {
+    let clip = background_rect_area_for_box(rect, style, border, box_);
+    extra_clip.map_or(clip, |extra_clip| {
+        intersect_paint_rect_or_empty(clip, extra_clip)
+    })
 }
 
 #[derive(Clone, Copy)]
 pub(in crate::layout) struct BoxPaintGeometry {
-    pub(in crate::layout) x: f32,
-    pub(in crate::layout) y: f32,
-    pub(in crate::layout) width: f32,
-    pub(in crate::layout) height: f32,
+    pub(in crate::layout) rect: PaintRect,
     pub(in crate::layout) border_insets: css::Edges,
-}
-
-#[derive(Clone, Copy)]
-pub(in crate::layout) struct BackgroundRectArea {
-    pub(in crate::layout) x: f32,
-    pub(in crate::layout) y: f32,
-    pub(in crate::layout) width: f32,
-    pub(in crate::layout) height: f32,
-}
-
-impl BackgroundRectArea {
-    pub(in crate::layout) fn inset(self, edges: css::Edges) -> Self {
-        Self {
-            x: self.x + edges.left,
-            y: self.y + edges.bottom,
-            width: (self.width - edges.left - edges.right).max(0.0),
-            height: (self.height - edges.top - edges.bottom).max(0.0),
-        }
-    }
-
-    pub(in crate::layout) fn intersection(self, other: Self) -> Self {
-        let left = self.x.max(other.x);
-        let bottom = self.y.max(other.y);
-        let right = (self.x + self.width).min(other.x + other.width);
-        let top = (self.y + self.height).min(other.y + other.height);
-        Self {
-            x: left,
-            y: bottom,
-            width: (right - left).max(0.0),
-            height: (top - bottom).max(0.0),
-        }
-    }
 }
 
 pub(in crate::layout) fn paint_box_shadows(
@@ -1052,14 +1067,14 @@ pub(in crate::layout) fn paint_box_shadows(
         let color = shadow.color.resolve(style.color);
         if !color.is_visible()
             || shadow.blur_radius.length_points() > 0.0
-            || !style.border_radius.is_zero()
+            || !style.border_radius.clone().is_zero()
         {
             continue;
         }
         if shadow.inset {
-            paint_inset_box_shadow(rects, geometry, *shadow, color);
+            paint_inset_box_shadow(rects, geometry, shadow.clone(), color);
         } else {
-            paint_outer_box_shadow(rects, geometry, *shadow, color);
+            paint_outer_box_shadow(rects, geometry, shadow.clone(), color);
         }
     }
 }
@@ -1070,31 +1085,21 @@ pub(in crate::layout) fn paint_outer_box_shadow(
     shadow: css::BoxShadow,
     color: Color,
 ) {
-    let offset_x = shadow.offset_x.length_points();
-    let offset_y = shadow.offset_y.length_points();
+    let offset = box_shadow_paint_offset(shadow.clone());
     let spread = shadow.spread.length_points();
-    let shadow_x = geometry.x + offset_x - spread;
-    let shadow_y = geometry.y - offset_y - spread;
-    let shadow_width = geometry.width + spread * 2.0;
-    let shadow_height = geometry.height + spread * 2.0;
+    let shadow_width = geometry.rect.size.width + spread * 2.0;
+    let shadow_height = geometry.rect.size.height + spread * 2.0;
     if shadow_width <= 0.0 || shadow_height <= 0.0 {
         return;
     }
 
     push_rect_difference(
         rects,
-        BackgroundRectArea {
-            x: shadow_x,
-            y: shadow_y,
-            width: shadow_width,
-            height: shadow_height,
-        },
-        BackgroundRectArea {
-            x: geometry.x,
-            y: geometry.y,
-            width: geometry.width,
-            height: geometry.height,
-        },
+        PaintRect::new(
+            geometry.rect.origin + offset - PaintDisplacement::new(spread, spread),
+            PaintSize::new(shadow_width, shadow_height),
+        ),
+        geometry.rect,
         color,
     );
 }
@@ -1105,137 +1110,97 @@ pub(in crate::layout) fn paint_inset_box_shadow(
     shadow: css::BoxShadow,
     color: Color,
 ) {
-    let padding = BackgroundRectArea {
-        x: geometry.x,
-        y: geometry.y,
-        width: geometry.width,
-        height: geometry.height,
-    }
-    .inset(geometry.border_insets);
-    if padding.width <= 0.0 || padding.height <= 0.0 {
+    let padding = inset_paint_rect(geometry.rect, geometry.border_insets);
+    if padding.size.width <= 0.0 || padding.size.height <= 0.0 {
         return;
     }
 
-    let spread = shadow.spread.length_points_max_zero();
-    let offset_x = shadow.offset_x.length_points();
-    let offset_y = shadow.offset_y.length_points();
-    let left = inset_shadow_edge_width(offset_x, spread, true).min(padding.width);
-    let right = inset_shadow_edge_width(offset_x, spread, false).min(padding.width);
-    let top = inset_shadow_edge_width(offset_y, spread, true).min(padding.height);
-    let bottom = inset_shadow_edge_width(offset_y, spread, false).min(padding.height);
-
-    push_shadow_rect(rects, padding.x, padding.y, left, padding.height, color);
-    push_shadow_rect(
-        rects,
-        padding.x + padding.width - right,
-        padding.y,
-        right,
-        padding.height,
-        color,
+    let spread = shadow.spread.length_points();
+    let offset = box_shadow_paint_offset(shadow);
+    // An inset shadow paints the padding box outside the shifted shadow
+    // perimeter.  Its spread contracts that perimeter for a positive value
+    // and expands it for a negative value; only after that adjustment is the
+    // perimeter shifted by the shadow offsets.  Paint-space Y grows upward,
+    // hence CSS's downward-positive Y offset is negated here.
+    // <https://www.w3.org/TR/css-backgrounds-3/#shadow-shape>
+    let perimeter_width = (padding.size.width - spread * 2.0).max(0.0);
+    let perimeter_height = (padding.size.height - spread * 2.0).max(0.0);
+    let perimeter = PaintRect::new(
+        padding.origin + PaintDisplacement::new(spread, spread) + offset,
+        PaintSize::new(perimeter_width, perimeter_height),
     );
-    push_shadow_rect(
-        rects,
-        padding.x,
-        padding.y + padding.height - top,
-        padding.width,
-        top,
-        color,
-    );
-    push_shadow_rect(rects, padding.x, padding.y, padding.width, bottom, color);
+    push_rect_difference(rects, padding, perimeter, color);
 }
 
-pub(in crate::layout) fn inset_shadow_edge_width(
-    offset: f32,
-    spread: f32,
-    start_edge: bool,
-) -> f32 {
-    match (offset > 0.0, offset < 0.0, offset == 0.0 && spread > 0.0) {
-        (true, _, _) if start_edge => offset + spread,
-        (_, true, _) if !start_edge => -offset + spread,
-        (_, _, true) => spread,
-        _ => 0.0,
-    }
+/// Resolve CSS's right/down shadow offset into bottom-left paint space.
+fn box_shadow_paint_offset(shadow: css::BoxShadow) -> PaintDisplacement {
+    PaintDisplacement::new(
+        shadow.offset_x.length_points(),
+        -shadow.offset_y.length_points(),
+    )
 }
 
 pub(in crate::layout) fn push_rect_difference(
     rects: &mut Vec<RenderedRect>,
-    subject: BackgroundRectArea,
-    cutout: BackgroundRectArea,
+    subject: PaintRect,
+    cutout: PaintRect,
     color: Color,
 ) {
-    let left = subject.x;
-    let right = subject.x + subject.width;
-    let bottom = subject.y;
-    let top = subject.y + subject.height;
-    let cut_left = cutout.x.max(left).min(right);
-    let cut_right = (cutout.x + cutout.width).max(left).min(right);
-    let cut_bottom = cutout.y.max(bottom).min(top);
-    let cut_top = (cutout.y + cutout.height).max(bottom).min(top);
+    let left = subject.origin.x;
+    let right = subject.origin.x + subject.size.width;
+    let bottom = subject.origin.y;
+    let top = subject.origin.y + subject.size.height;
+    let cut_left = cutout.origin.x.max(left).min(right);
+    let cut_right = (cutout.origin.x + cutout.size.width).max(left).min(right);
+    let cut_bottom = cutout.origin.y.max(bottom).min(top);
+    let cut_top = (cutout.origin.y + cutout.size.height).max(bottom).min(top);
 
     push_shadow_rect(
         rects,
-        left,
-        bottom,
-        subject.width,
-        cut_bottom - bottom,
-        color,
-    );
-    push_shadow_rect(rects, left, cut_top, subject.width, top - cut_top, color);
-    push_shadow_rect(
-        rects,
-        left,
-        cut_bottom,
-        cut_left - left,
-        cut_top - cut_bottom,
+        paint_space_rect(left, bottom, subject.size.width, cut_bottom - bottom),
         color,
     );
     push_shadow_rect(
         rects,
-        cut_right,
-        cut_bottom,
-        right - cut_right,
-        cut_top - cut_bottom,
+        paint_space_rect(left, cut_top, subject.size.width, top - cut_top),
+        color,
+    );
+    push_shadow_rect(
+        rects,
+        paint_space_rect(left, cut_bottom, cut_left - left, cut_top - cut_bottom),
+        color,
+    );
+    push_shadow_rect(
+        rects,
+        paint_space_rect(
+            cut_right,
+            cut_bottom,
+            right - cut_right,
+            cut_top - cut_bottom,
+        ),
         color,
     );
 }
 
 pub(in crate::layout) fn push_shadow_rect(
     rects: &mut Vec<RenderedRect>,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     color: Color,
 ) {
-    if width > 0.0 && height > 0.0 {
-        rects.push(RenderedRect::from_paint_rect(
-            paint_space_rect(x, y, width, height),
-            Some(color),
-        ));
+    if rect.size.width > 0.0 && rect.size.height > 0.0 {
+        rects.push(RenderedRect::from_paint_rect(rect, Some(color)));
     }
 }
 
-pub(in crate::layout) fn clip_gradient_rect(rect: &mut RenderedRect, clip: BackgroundRectArea) {
-    let x1 = rect.x().max(clip.x);
-    let y1 = rect.y().max(clip.y);
-    let x2 = (rect.x() + rect.width()).min(clip.x + clip.width);
-    let y2 = (rect.y() + rect.height()).min(clip.y + clip.height);
-    rect.set_paint_rect(paint_space_rect(
-        x1,
-        y1,
-        (x2 - x1).max(0.0),
-        (y2 - y1).max(0.0),
-    ));
+pub(in crate::layout) fn clip_gradient_rect(rect: &mut RenderedRect, clip: PaintRect) {
+    rect.set_paint_rect(intersect_paint_rect_or_empty(rect.paint_rect(), clip));
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::layout) fn push_gradient_band(
     rects: &mut Vec<RenderedRect>,
     direction: LinearGradientDirection,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     start: f32,
     end: f32,
     color: Color,
@@ -1248,9 +1213,9 @@ pub(in crate::layout) fn push_gradient_band(
         LinearGradientDirection::Corner { .. } => return,
     };
     let axis_length = if (angle - 0.0).abs() < 0.001 || (angle - 180.0).abs() < 0.001 {
-        height
+        rect.size.height
     } else if (angle - 90.0).abs() < 0.001 || (angle - 270.0).abs() < 0.001 {
-        width
+        rect.size.width
     } else {
         return;
     };
@@ -1261,22 +1226,42 @@ pub(in crate::layout) fn push_gradient_band(
     }
     let rect = if (angle - 180.0).abs() < 0.001 {
         RenderedRect::from_paint_rect(
-            paint_space_rect(x, y + height - end, width, end - start),
+            paint_space_rect(
+                rect.origin.x,
+                rect.origin.y + rect.size.height - end,
+                rect.size.width,
+                end - start,
+            ),
             Some(color),
         )
     } else if (angle - 0.0).abs() < 0.001 {
         RenderedRect::from_paint_rect(
-            paint_space_rect(x, y + start, width, end - start),
+            paint_space_rect(
+                rect.origin.x,
+                rect.origin.y + start,
+                rect.size.width,
+                end - start,
+            ),
             Some(color),
         )
     } else if (angle - 90.0).abs() < 0.001 {
         RenderedRect::from_paint_rect(
-            paint_space_rect(x + start, y, end - start, height),
+            paint_space_rect(
+                rect.origin.x + start,
+                rect.origin.y,
+                end - start,
+                rect.size.height,
+            ),
             Some(color),
         )
     } else {
         RenderedRect::from_paint_rect(
-            paint_space_rect(x + width - end, y, end - start, height),
+            paint_space_rect(
+                rect.origin.x + rect.size.width - end,
+                rect.origin.y,
+                end - start,
+                rect.size.height,
+            ),
             Some(color),
         )
     };
@@ -1294,13 +1279,10 @@ pub(in crate::layout) fn push_gradient_band(
 /// <https://www.w3.org/TR/css-backgrounds-3/#corner-shaping>.
 pub(crate) fn paint_uniform_rounded_border(
     rounded_rects: &mut Vec<RenderedRoundedRect>,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
 ) -> bool {
-    if style.border_radius.is_zero() || !style.corner_shapes.all_round() {
+    if style.border_radius.clone().is_zero() || !style.corner_shapes.all_round() {
         return false;
     }
 
@@ -1326,20 +1308,20 @@ pub(crate) fn paint_uniform_rounded_border(
         return false;
     }
 
-    let border_width = top.used_width.min(width).min(height);
+    let border_width = top.used_width.min(rect.size.width).min(rect.size.height);
     if border_width <= 0.0 {
         return true;
     }
 
     let inset = border_width / 2.0;
-    let mut radii = used_rounded_rect_radii(style.border_radius, width, height);
+    let mut radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
     inset_rounded_rect_radii(&mut radii, inset);
     rounded_rects.push(RenderedRoundedRect::from_paint_rect(
         paint_space_rect(
-            x + inset,
-            y + inset,
-            width - border_width,
-            height - border_width,
+            rect.origin.x + inset,
+            rect.origin.y + inset,
+            rect.size.width - border_width,
+            rect.size.height - border_width,
         ),
         radii,
         None,
@@ -1359,13 +1341,10 @@ pub(crate) fn paint_uniform_rounded_border(
 /// <https://www.w3.org/TR/css-backgrounds-3/#valdef-border-style-double>.
 pub(crate) fn paint_uniform_double_rounded_border(
     paths: &mut Vec<RenderedPath>,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
 ) -> bool {
-    if style.border_radius.is_zero() {
+    if style.border_radius.clone().is_zero() {
         return false;
     }
 
@@ -1391,17 +1370,14 @@ pub(crate) fn paint_uniform_double_rounded_border(
         return false;
     }
 
-    let border_width = top.used_width.min(width).min(height);
+    let border_width = top.used_width.min(rect.size.width).min(rect.size.height);
     if border_width <= 0.0 || !top.color.is_visible() {
         return true;
     }
     if border_width < 3.0 {
-        let outer_radii = used_rounded_rect_radii(style.border_radius, width, height);
+        let outer_radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
         paths.push(uniform_rounded_ring_path(
-            x,
-            y,
-            width,
-            height,
+            rect,
             outer_radii,
             border_width,
             top.color,
@@ -1410,28 +1386,29 @@ pub(crate) fn paint_uniform_double_rounded_border(
     }
 
     let stripe = (border_width / 3.0).max(1.0);
-    let outer_radii = used_rounded_rect_radii(style.border_radius, width, height);
+    let outer_radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
     paths.push(uniform_rounded_ring_path(
-        x,
-        y,
-        width,
-        height,
+        rect,
         outer_radii,
         stripe,
         top.color,
     ));
 
     let inner_outer_inset = border_width - stripe;
-    let inner_width = (width - 2.0 * inner_outer_inset).max(0.0);
-    let inner_height = (height - 2.0 * inner_outer_inset).max(0.0);
-    if inner_width > 0.0 && inner_height > 0.0 {
+    let inner_rect = inset_paint_rect(
+        rect,
+        css::Edges {
+            top: inner_outer_inset,
+            right: inner_outer_inset,
+            bottom: inner_outer_inset,
+            left: inner_outer_inset,
+        },
+    );
+    if inner_rect.size.width > 0.0 && inner_rect.size.height > 0.0 {
         let mut inner_outer_radii = outer_radii;
         inset_rounded_rect_radii(&mut inner_outer_radii, inner_outer_inset);
         paths.push(uniform_rounded_ring_path(
-            x + inner_outer_inset,
-            y + inner_outer_inset,
-            inner_width,
-            inner_height,
+            inner_rect,
             inner_outer_radii,
             stripe,
             top.color,
@@ -1450,13 +1427,10 @@ pub(crate) fn paint_uniform_double_rounded_border(
 /// <https://www.w3.org/TR/css-backgrounds-3/#corner-shaping>.
 pub(crate) fn paint_solid_rounded_border_ring(
     paths: &mut Vec<RenderedPath>,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
 ) -> bool {
-    if style.border_radius.is_zero() {
+    if style.border_radius.clone().is_zero() {
         return false;
     }
 
@@ -1476,13 +1450,13 @@ pub(crate) fn paint_solid_rounded_border_ring(
         return false;
     }
 
-    let inner_width = (width - left.used_width - right.used_width).max(0.0);
-    let inner_height = (height - top.used_width - bottom.used_width).max(0.0);
-    if width <= 0.0 || height <= 0.0 || !top.color.is_visible() {
+    let inner_width = (rect.size.width - left.used_width - right.used_width).max(0.0);
+    let inner_height = (rect.size.height - top.used_width - bottom.used_width).max(0.0);
+    if rect.size.width <= 0.0 || rect.size.height <= 0.0 || !top.color.is_visible() {
         return true;
     }
 
-    let outer_radii = used_rounded_rect_radii(style.border_radius, width, height);
+    let outer_radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
     let inner_radii = RenderedRoundedRectRadii {
         top_left: RenderedCornerRadius::new(
             outer_radii.top_left.x() - left.used_width,
@@ -1502,14 +1476,19 @@ pub(crate) fn paint_solid_rounded_border_ring(
         ),
     };
 
-    let mut commands =
-        shaped_rect_path_commands(x, y, width, height, outer_radii, style.corner_shapes);
+    let mut commands = shaped_rect_path_commands(rect, outer_radii, style.corner_shapes);
     if inner_width > 0.0 && inner_height > 0.0 {
+        let inner_rect = inset_paint_rect(
+            rect,
+            css::Edges {
+                top: top.used_width,
+                right: right.used_width,
+                bottom: bottom.used_width,
+                left: left.used_width,
+            },
+        );
         commands.extend(shaped_rect_path_commands(
-            x + left.used_width,
-            y + bottom.used_width,
-            inner_width,
-            inner_height,
+            inner_rect,
             inner_radii,
             style.corner_shapes,
         ));
@@ -1535,13 +1514,10 @@ pub(crate) fn paint_solid_rounded_border_ring(
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-style>.
 pub(crate) fn paint_patterned_rounded_border_sides(
     paths: &mut Vec<RenderedPath>,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: PaintRect,
     style: &ComputedStyle,
 ) -> bool {
-    if style.border_radius.is_zero() {
+    if style.border_radius.clone().is_zero() {
         return false;
     }
 
@@ -1561,7 +1537,7 @@ pub(crate) fn paint_patterned_rounded_border_sides(
     {
         return false;
     }
-    if width <= 0.0 || height <= 0.0 {
+    if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
         return true;
     }
 
@@ -1569,9 +1545,22 @@ pub(crate) fn paint_patterned_rounded_border_sides(
         if !side.is_visible() {
             continue;
         }
-        let clip = rounded_border_pattern_clip(edge, x, y, width, height, style, borders);
-        let (axis_start, axis_length, cross_start, cross_width, horizontal) =
-            border_side_geometry(edge, x, y + height, width, height, side.used_width);
+        let clip = rounded_border_pattern_clip(edge, rect, style, borders);
+        let geometry = border_side_geometry(
+            edge,
+            PageTopRect::new(
+                rect.origin.x,
+                rect.max_y(),
+                rect.size.width,
+                rect.size.height,
+            ),
+            side.used_width,
+        );
+        let axis_start = geometry.axis_start();
+        let axis_length = geometry.axis_length();
+        let cross_start = geometry.cross_start();
+        let cross_width = geometry.cross_width();
+        let horizontal = geometry.horizontal;
         match side.style {
             BorderStyle::Dotted => paint_dotted_border_side_with_clip(
                 paths,
@@ -1661,5 +1650,23 @@ mod tests {
         assert_eq!(stops[0].position, 75.0);
         assert_eq!(stops[1].position, 75.0);
         assert_eq!(stops[2].position, 100.0);
+    }
+
+    #[test]
+    fn non_axis_aligned_gradient_direction_projects_paint_displacements() {
+        let line = AngledGradientLine {
+            center: PaintPoint::new(10.0, 20.0),
+            direction: PaintDirection::from_components(0.6, 0.8),
+            axis_length: 20.0,
+        };
+
+        assert_eq!(
+            gradient_axis_position(PaintPoint::new(13.0, 24.0), line),
+            15.0
+        );
+        assert_eq!(
+            line.endpoints(),
+            (PaintPoint::new(4.0, 12.0), PaintPoint::new(16.0, 28.0))
+        );
     }
 }

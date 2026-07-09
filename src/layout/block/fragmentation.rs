@@ -10,11 +10,20 @@ impl<'a> LayoutBuilder<'a> {
     /// empty but still below the fragmentainer top because ancestor fragment
     /// offsets are preserved; that state must still protect descendant breaks:
     /// <https://www.w3.org/TR/css-break-3/#break-within>.
-    pub(in crate::layout) fn should_try_avoid_break_inside(&self, style: &ComputedStyle) -> bool {
-        style.break_inside_avoid
+    pub(in crate::layout) fn should_try_avoid_break_inside(
+        &self,
+        style: &ComputedStyle,
+        fragmentainer_kind: FragmentainerKind,
+    ) -> bool {
+        let break_context = FragmentBreakContext::for_standalone_box(style);
+        fragmentainer_kind.avoids_break_inside(style)
             && self.avoid_inside_retry_depth == 0
-            && !style.break_before.is_forced()
-            && !style.break_after.is_forced()
+            && break_context
+                .forced_break_before_in(fragmentainer_kind)
+                .is_none()
+            && break_context
+                .forced_break_after_in(fragmentainer_kind)
+                .is_none()
             && !style.display.is_none()
             && !style.display.is_inline_level()
             && !matches!(style.position, Position::Absolute | Position::Fixed)
@@ -34,11 +43,17 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        fragmentainer_kind: FragmentainerKind,
     ) -> bool {
-        if !style.break_inside_avoid
+        let break_context = FragmentBreakContext::for_standalone_box(style);
+        if !fragmentainer_kind.avoids_break_inside(style)
             || self.avoid_inside_retry_depth > 0
-            || style.break_before.is_forced()
-            || style.break_after.is_forced()
+            || break_context
+                .forced_break_before_in(fragmentainer_kind)
+                .is_some()
+            || break_context
+                .forced_break_after_in(fragmentainer_kind)
+                .is_some()
             || style.display.is_none()
             || style.display.is_inline_level()
             || matches!(style.position, Position::Absolute | Position::Fixed)
@@ -59,16 +74,25 @@ impl<'a> LayoutBuilder<'a> {
         else {
             return false;
         };
-        let usable_page_height = self.page_area_height();
-        let remaining_height = self.cursor_y - self.page_bottom();
-        let should_break =
-            estimated_height <= usable_page_height + 0.01 && estimated_height > remaining_height;
+        let current_fragmentainer = Fragmentainer::from_cursor_bounds(
+            self.page_area_height(),
+            self.cursor_y,
+            self.page_bottom(),
+        );
+        let should_break = FragmentPrebreakDecision::choose(FragmentPrebreakInput {
+            can_advance: true,
+            current_fragmentainer,
+            required_block_size: estimated_height,
+            empty_fragmentainer: current_fragmentainer,
+            empty_fit_block_size: estimated_height,
+        })
+        .should_break;
         if should_break {
             log::debug!(
                 "moving break-inside: avoid <{}> to next page: estimated height {:.2}, remaining {:.2}",
                 element.tag,
                 estimated_height,
-                remaining_height
+                current_fragmentainer.available_block_size()
             );
         }
         should_break
@@ -112,13 +136,19 @@ impl<'a> LayoutBuilder<'a> {
             .estimate_element_height(element, style, stylesheets, available_width, child_boxes)
             .is_some_and(|height| {
                 let inner_height = (height - style.margin.top - style.margin.bottom).max(0.0);
-                inner_height <= self.page_area_height() + 0.01
+                Fragmentainer::from_cursor_bounds(
+                    self.page_area_height(),
+                    self.cursor_y,
+                    self.page_bottom(),
+                )
+                .block_size_fits_empty(inner_height)
             });
 
         self.restore(snapshot);
         self.push_page_if_nonempty();
         let mut retry_style = style.clone();
         retry_style.break_inside_avoid = false;
+        retry_style.break_inside_avoid_column = false;
         // CSS Fragmentation treats `break-inside: avoid` as a constraint to
         // keep a box unfragmented when possible. Once an ancestor avoid box has
         // been moved to a fresh fragmentainer for a retry, nested avoid boxes
@@ -138,7 +168,9 @@ impl<'a> LayoutBuilder<'a> {
         if avoid_box_fits_empty_page {
             self.avoid_inside_retry_depth -= 1;
         }
-        if self.pages.len() > split_page_count {
+        let retry_uses_larger_destination = self.current_page_context.area_height()
+            > split_layout.current_page_context.area_height() + 0.01;
+        if self.pages.len() > split_page_count && !retry_uses_larger_destination {
             self.restore(split_layout);
         }
     }

@@ -22,11 +22,14 @@ pub(in crate::layout::flex) fn estimate_row_flex_container_line_metrics(
     }
 
     let physical_direction = physical_flex_direction(style);
-    let (physical_gap_width, physical_gap_height) = physical_flex_gaps(style);
+    let PhysicalFlexGaps {
+        horizontal: physical_gap_width,
+        vertical: physical_gap_height,
+    } = physical_flex_gaps(style);
     let main_gap_value = if physical_direction.is_row_axis() {
-        physical_gap_width
+        physical_gap_width.clone()
     } else {
-        physical_gap_height
+        physical_gap_height.clone()
     };
     let cross_gap_value = if physical_direction.is_row_axis() {
         physical_gap_height
@@ -34,20 +37,34 @@ pub(in crate::layout::flex) fn estimate_row_flex_container_line_metrics(
         physical_gap_width
     };
     let available_main_size = if physical_direction.is_row_axis() {
-        available.width
+        available.width.points()
     } else {
-        available.height.unwrap_or(available.width)
+        available
+            .height
+            .map(PhysicalContentHeight::points)
+            .unwrap_or_else(|| available.width.points())
     };
     let available_cross_size = if physical_direction.is_row_axis() {
-        available.height.unwrap_or(0.0)
+        available
+            .height
+            .map(PhysicalContentHeight::points)
+            .unwrap_or(0.0)
     } else {
-        available.width
+        available.width.points()
     };
-    let intrinsic_main_gap = estimated_intrinsic_flex_gap(main_gap_value);
+    let intrinsic_main_gap = estimated_intrinsic_flex_gap(main_gap_value.clone()).points();
     let main_size =
         estimated_row_flex_container_main_size(style, available, items, intrinsic_main_gap);
-    let main_gap = used_flex_gap(main_gap_value, main_size.unwrap_or(available_main_size));
-    let cross_gap = used_flex_gap(cross_gap_value, available_cross_size);
+    let main_gap = used_flex_gap(
+        main_gap_value,
+        PercentageBasis::definite(content_box_pt(main_size.unwrap_or(available_main_size))),
+    )
+    .points();
+    let cross_gap = used_flex_gap(
+        cross_gap_value,
+        PercentageBasis::definite(content_box_pt(available_cross_size)),
+    )
+    .points();
     let mut lines = if style.flex_wrap == FlexWrap::NoWrap {
         vec![estimated_flex_line(0, items.len(), 0.0, items)]
     } else if let Some(main_size) = main_size {
@@ -55,13 +72,14 @@ pub(in crate::layout::flex) fn estimate_row_flex_container_line_metrics(
     } else {
         vec![estimated_flex_line(0, items.len(), 0.0, items)]
     };
-    if style.flex_wrap != FlexWrap::NoWrap
+    let container_cross_size =
+        estimated_row_flex_container_cross_size(style, available, physical_direction);
+    if style.flex_wrap.wraps()
         && matches!(
             style.align_content.keyword,
             ContentAlignmentKeyword::Normal | ContentAlignmentKeyword::Stretch
         )
-        && let Some(container_cross_size) =
-            estimated_row_flex_container_cross_size(style, available, physical_direction)
+        && let Some(container_cross_size) = container_cross_size
     {
         stretch_estimated_flex_line_cross_positions(
             &mut lines,
@@ -69,8 +87,8 @@ pub(in crate::layout::flex) fn estimate_row_flex_container_line_metrics(
             cross_gap,
         );
     }
-    if style.flex_wrap == FlexWrap::WrapReverse {
-        reverse_estimated_flex_line_cross_positions(&mut lines);
+    if style.flex_wrap.reverses_cross_axis() {
+        reverse_estimated_flex_line_cross_positions(&mut lines, container_cross_size);
     }
     let first_line = lines.first()?;
     let last_line = lines.last()?;
@@ -144,17 +162,17 @@ pub(in crate::layout::flex) fn estimated_row_flex_container_main_size(
     let (size_property, min_size_property, max_size_property, percentage_basis) =
         if physical_direction.is_row_axis() {
             (
-                style.box_values.width,
-                style.box_values.min_width,
-                style.box_values.max_width,
-                available.width_is_definite.then_some(available.width),
+                style.box_values.width.clone(),
+                style.box_values.min_width.clone(),
+                style.box_values.max_width.clone(),
+                available.width_basis,
             )
         } else {
             (
-                style.box_values.height,
-                style.box_values.min_height,
-                style.box_values.max_height,
-                available.height.filter(|_| available.height_is_definite),
+                style.box_values.height.clone(),
+                style.box_values.min_height.clone(),
+                style.box_values.max_height.clone(),
+                available.height_basis,
             )
         };
     let (min_content, max_content) =
@@ -165,7 +183,7 @@ pub(in crate::layout::flex) fn estimated_row_flex_container_main_size(
         min_content,
         max_content,
     )
-    .or(percentage_basis);
+    .or_else(|| percentage_basis.points());
     let max_size = estimated_intrinsic_length_percentage_or_auto(
         max_size_property,
         percentage_basis,
@@ -198,22 +216,48 @@ pub(in crate::layout::flex) fn estimated_row_flex_container_cross_size(
     available: FlexAvailableSpace,
     physical_direction: FlexDirection,
 ) -> Option<f32> {
+    // Intrinsic flex measurement may already have resolved the container's
+    // cross size and replaced that axis with a `DefiniteCrossSize` basis.
+    // Reapplying a percentage preferred size to that replacement would resolve
+    // the percentage against itself (for example, a 50% width of 60pt becoming
+    // 30pt), which moves wrapped lines and exports the wrong baseline.
+    // https://www.w3.org/TR/css-flexbox-1/#definite-sizes
+    let resolved_cross_size = if physical_direction.is_row_axis() {
+        match available.height_basis {
+            PercentageBasis::Definite {
+                source: FlexAvailableSizeSource::DefiniteCrossSize,
+                ..
+            } => available.height.map(PhysicalContentHeight::points),
+            _ => None,
+        }
+    } else {
+        match available.width_basis {
+            PercentageBasis::Definite {
+                source: FlexAvailableSizeSource::DefiniteCrossSize,
+                ..
+            } => Some(available.width.points()),
+            _ => None,
+        }
+    };
+    if resolved_cross_size.is_some() {
+        return resolved_cross_size;
+    }
     if physical_direction.is_row_axis() {
         estimated_intrinsic_length_percentage_or_auto(
-            style.box_values.height,
-            available.height.filter(|_| available.height_is_definite),
+            style.box_values.height.clone(),
+            available.height_basis,
             0.0,
             0.0,
         )
-        .or_else(|| available.height.filter(|_| available.height_is_definite))
+        .or_else(|| available.height_basis_points())
     } else {
         estimated_intrinsic_length_percentage_or_auto(
-            style.box_values.width,
-            available.width_is_definite.then_some(available.width),
+            style.box_values.width.clone(),
+            available.width_basis,
             0.0,
             0.0,
         )
-        .or_else(|| available.width_is_definite.then_some(available.width))
+        .or_else(|| available.width_basis_points())
     }
 }
 
@@ -240,29 +284,37 @@ pub(in crate::layout::flex) fn estimated_row_flex_container_intrinsic_main_sizes
 /// intrinsic size contributions, while preserving any non-percentage length
 /// component:
 /// <https://www.w3.org/TR/css-align-3/#gaps>.
-pub(in crate::layout::flex) fn estimated_intrinsic_flex_gap(value: css::ComputedGap) -> f32 {
+pub(in crate::layout::flex) fn estimated_intrinsic_flex_gap(
+    value: css::ComputedGap,
+) -> LayoutLength {
     match value {
-        css::ComputedGap::Normal => 0.0,
-        css::ComputedGap::LengthPercentage(value) => value.length_points_max_zero(),
+        css::ComputedGap::Normal => layout_pt(0.0),
+        css::ComputedGap::LengthPercentage(value) => value.length_max_zero(),
     }
 }
 
 pub(in crate::layout::flex) fn estimated_intrinsic_length_percentage_or_auto(
     value: css::ComputedLengthPercentageOrAuto,
-    percentage_basis: Option<f32>,
+    percentage_basis: FlexAvailablePercentageBasis,
     min_content: f32,
     max_content: f32,
 ) -> Option<f32> {
+    let percentage_basis = percentage_basis.points();
     match value {
         css::ComputedLengthPercentageOrAuto::Auto => None,
         css::ComputedLengthPercentageOrAuto::Stretch => {
             percentage_basis.map(|basis| basis.max(0.0))
         }
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
-            if value.percent == 0.0 {
-                Some(value.length_points_max_zero())
+            if value.is_definitely_absolute() {
+                Some(value.length_max_zero().points())
             } else {
-                percentage_basis.map(|basis| used_length_percentage(value, basis).max(0.0))
+                let basis = percentage_basis?;
+                value
+                    .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                        basis.max(0.0),
+                    )))
+                    .map(|length| length.points().max(0.0))
             }
         }
         css::ComputedLengthPercentageOrAuto::MinContent => Some(min_content.max(0.0)),
@@ -271,12 +323,16 @@ pub(in crate::layout::flex) fn estimated_intrinsic_length_percentage_or_auto(
         }
         css::ComputedLengthPercentageOrAuto::FitContent(limit) => {
             let stretch = limit
+                .clone()
                 .and_then(|limit| {
-                    percentage_basis.map(|basis| used_length_percentage(limit, basis))
+                    percentage_basis.map(|basis| {
+                        used_length_percentage(limit, PercentageBasis::definite(layout_pt(basis)))
+                            .points()
+                    })
                 })
                 .or_else(|| {
                     limit
-                        .filter(|limit| limit.percent == 0.0)
+                        .filter(|limit| !limit.needs_percentage_basis())
                         .map(|limit| limit.length_points())
                 })
                 .or(percentage_basis)
@@ -288,19 +344,55 @@ pub(in crate::layout::flex) fn estimated_intrinsic_length_percentage_or_auto(
                     .min(min_content.max(0.0).max(stretch.max(0.0))),
             )
         }
+        css::ComputedLengthPercentageOrAuto::CalcSize(value) => {
+            let percentage_basis = percentage_basis.unwrap_or(0.0);
+            let stretch = percentage_basis.max(0.0);
+            let fit_content = max_content.max(min_content).min(min_content.max(stretch));
+            Some(
+                value
+                    .used_value(
+                        max_content,
+                        min_content,
+                        max_content,
+                        fit_content,
+                        stretch,
+                        PercentageBasis::definite(layout_pt(percentage_basis)),
+                    )
+                    .max(layout_pt(0.0))
+                    .points(),
+            )
+        }
     }
 }
 
+/// Reverse estimated wrapped line positions for `flex-wrap: wrap-reverse`.
+///
+/// CSS Flexbox swaps cross-start and cross-end for `wrap-reverse`. If a
+/// definite cross size is available, overflowed line stacks reverse against
+/// that container size and may fall outside the flex container's cross-start
+/// edge; otherwise intrinsic exports reverse against the line stack itself:
+/// <https://www.w3.org/TR/css-flexbox-1/#flex-wrap-property> and
+/// <https://www.w3.org/TR/css-flexbox-1/#align-content-property>.
 pub(in crate::layout::flex) fn reverse_estimated_flex_line_cross_positions(
     lines: &mut [EstimatedFlexLine],
+    container_cross_size: Option<f32>,
 ) {
-    let cross_size = lines
+    let line_stack_cross_size = estimated_flex_line_stack_cross_size(lines);
+    let cross_size = container_cross_size
+        .unwrap_or(line_stack_cross_size)
+        .max(0.0);
+    for line in lines {
+        line.cross_start = cross_size - line.cross_start - line.cross_size;
+    }
+}
+
+pub(in crate::layout::flex) fn estimated_flex_line_stack_cross_size(
+    lines: &[EstimatedFlexLine],
+) -> f32 {
+    lines
         .iter()
         .map(|line| line.cross_start + line.cross_size)
-        .fold(0.0f32, f32::max);
-    for line in lines {
-        line.cross_start = (cross_size - line.cross_start - line.cross_size).max(0.0);
-    }
+        .fold(0.0f32, f32::max)
 }
 
 pub(in crate::layout::flex) fn stretch_estimated_flex_line_cross_positions(
@@ -342,7 +434,7 @@ pub(in crate::layout::flex) fn estimated_flex_line(
     let item_indices = (start..end).collect::<Vec<_>>();
     let cross_size = item_indices
         .iter()
-        .copied()
+        .cloned()
         .map(|index| items[index].outer_cross_size)
         .fold(0.0f32, f32::max);
     EstimatedFlexLine {
@@ -451,13 +543,21 @@ pub(in crate::layout::flex) fn estimated_flex_item_available_space(
     };
 
     if physical_direction.is_row_axis() {
-        item_available.height = Some(stretched_cross_size);
-        item_available.height_is_definite = true;
-        item_available.stretched_height = Some(stretched_cross_size);
+        item_available.set_definite_height(
+            PhysicalContentHeight::new(content_box_pt(stretched_cross_size)),
+            FlexAvailableSizeSource::DefiniteCrossSize,
+        );
+        item_available.stretched_height = Some(PhysicalContentHeight::new(content_box_pt(
+            stretched_cross_size,
+        )));
     } else {
-        item_available.width = stretched_cross_size;
-        item_available.width_is_definite = true;
-        item_available.stretched_width = Some(stretched_cross_size);
+        item_available.set_definite_width(
+            PhysicalContentWidth::new(content_box_pt(stretched_cross_size)),
+            FlexAvailableSizeSource::DefiniteCrossSize,
+        );
+        item_available.stretched_width = Some(PhysicalContentWidth::new(content_box_pt(
+            stretched_cross_size,
+        )));
     }
     item_available
 }
@@ -480,13 +580,13 @@ pub(in crate::layout::flex) fn estimated_stretched_flex_item_cross_size(
         if !child_style.box_values.height.is_auto() {
             return None;
         }
-        let container_cross_size = available.height.filter(|_| available.height_is_definite)?;
+        let container_cross_size = available.height_basis_points()?;
         Some((container_cross_size - child_style.margin.top - child_style.margin.bottom).max(0.0))
     } else {
         if !child_style.box_values.width.is_auto() {
             return None;
         }
-        let container_cross_size = available.width_is_definite.then_some(available.width)?;
+        let container_cross_size = available.width_basis_points()?;
         Some((container_cross_size - child_style.margin.left - child_style.margin.right).max(0.0))
     }
 }
@@ -525,7 +625,7 @@ pub(in crate::layout::flex) fn estimated_flex_base_cross_end_side(
 pub(in crate::layout::flex) fn estimated_flex_cross_start_side(
     style: &ComputedStyle,
 ) -> PhysicalSide {
-    if style.flex_wrap == FlexWrap::WrapReverse {
+    if style.flex_wrap.reverses_cross_axis() {
         estimated_flex_base_cross_end_side(style)
     } else {
         estimated_flex_base_cross_start_side(style)
@@ -535,7 +635,7 @@ pub(in crate::layout::flex) fn estimated_flex_cross_start_side(
 pub(in crate::layout::flex) fn estimated_flex_cross_end_side(
     style: &ComputedStyle,
 ) -> PhysicalSide {
-    if style.flex_wrap == FlexWrap::WrapReverse {
+    if style.flex_wrap.reverses_cross_axis() {
         estimated_flex_base_cross_start_side(style)
     } else {
         estimated_flex_base_cross_end_side(style)
@@ -575,22 +675,22 @@ pub(in crate::layout::flex) fn estimated_flex_line_baseline_item_index(
 ) -> Option<usize> {
     match (baseline_set, direction) {
         (EstimatedFlexBaselineSet::First, FlexDirection::Row | FlexDirection::RowReverse) => {
-            line.item_indices.first().copied()
+            line.item_indices.first().cloned()
         }
         (EstimatedFlexBaselineSet::First, FlexDirection::Column) => {
-            line.item_indices.first().copied()
+            line.item_indices.first().cloned()
         }
         (EstimatedFlexBaselineSet::First, FlexDirection::ColumnReverse) => {
-            line.item_indices.last().copied()
+            line.item_indices.last().cloned()
         }
         (EstimatedFlexBaselineSet::Last, FlexDirection::Row | FlexDirection::RowReverse) => {
-            line.item_indices.last().copied()
+            line.item_indices.last().cloned()
         }
         (EstimatedFlexBaselineSet::Last, FlexDirection::Column) => {
-            line.item_indices.last().copied()
+            line.item_indices.last().cloned()
         }
         (EstimatedFlexBaselineSet::Last, FlexDirection::ColumnReverse) => {
-            line.item_indices.first().copied()
+            line.item_indices.first().cloned()
         }
     }
 }
@@ -599,24 +699,33 @@ pub(in crate::layout::flex) fn estimated_flex_main_content_size(
     style: &ComputedStyle,
     size: FlexItemEstimate,
     direction: FlexDirection,
-    percentage_basis: Option<f32>,
+    percentage_basis: FlexAvailablePercentageBasis,
 ) -> f32 {
+    let percentage_basis_points = percentage_basis.points();
     let (preferred_size, min_size, specified_size) = if direction.is_row_axis() {
-        (size.content_width, size.min_width, style.box_values.width)
+        (
+            size.content_width,
+            size.min_width,
+            style.box_values.width.clone(),
+        )
     } else {
         (
             size.content_height,
             size.min_height,
-            style.box_values.height,
+            style.box_values.height.clone(),
         )
     };
 
-    match style.flex_basis {
+    match &style.flex_basis {
         css::ComputedFlexBasis::LengthPercentage(length) => {
-            if length.has_percentage && percentage_basis.is_none() {
+            if length.contains_percentage() && percentage_basis_points.is_none() {
                 preferred_size.points()
             } else {
-                used_length_percentage(length.value, percentage_basis.unwrap_or(0.0))
+                used_length_percentage(
+                    length.value.clone(),
+                    PercentageBasis::definite(layout_pt(percentage_basis_points.unwrap_or(0.0))),
+                )
+                .points()
             }
         }
         css::ComputedFlexBasis::Content | css::ComputedFlexBasis::MaxContent => {
@@ -625,8 +734,17 @@ pub(in crate::layout::flex) fn estimated_flex_main_content_size(
         css::ComputedFlexBasis::MinContent => min_size.points(),
         css::ComputedFlexBasis::FitContent(limit) => {
             let limit = limit
-                .map(|limit| used_length_percentage(limit, percentage_basis.unwrap_or(0.0)))
-                .or(percentage_basis)
+                .clone()
+                .map(|limit| {
+                    used_length_percentage(
+                        limit,
+                        PercentageBasis::definite(layout_pt(
+                            percentage_basis_points.unwrap_or(0.0),
+                        )),
+                    )
+                    .points()
+                })
+                .or(percentage_basis_points)
                 .unwrap_or_else(|| preferred_size.points());
             preferred_size
                 .points()
@@ -634,7 +752,8 @@ pub(in crate::layout::flex) fn estimated_flex_main_content_size(
                 .min(min_size.points().max(0.0).max(limit.max(0.0)))
         }
         css::ComputedFlexBasis::Auto => {
-            used_length_percentage_or_auto_with_optional_basis(specified_size, percentage_basis)
+            used_length_percentage_or_auto_with_basis(specified_size, percentage_basis)
+                .map(|size| size.points())
                 .unwrap_or_else(|| preferred_size.points())
         }
     }

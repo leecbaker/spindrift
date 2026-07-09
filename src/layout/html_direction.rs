@@ -31,7 +31,7 @@ pub(super) fn style_for_layout_element_with_parent_ch_advance(
     stylesheets: &[Stylesheet],
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
-    parent_ch_advance: f32,
+    parent_ch_advance: LayoutLength,
 ) -> ComputedStyle {
     style_for_layout_element_with_signature_transform(
         element,
@@ -49,7 +49,7 @@ fn style_for_layout_element_with_signature_transform(
     stylesheets: &[Stylesheet],
     parent: Option<&ComputedStyle>,
     ancestors: &[ElementSignature],
-    parent_ch_advance: Option<f32>,
+    parent_ch_advance: Option<LayoutLength>,
 ) -> ComputedStyle {
     let signature = layout_element_signature(element, signature, parent);
     let inline_style = element.attrs.get("style").map(String::as_str);

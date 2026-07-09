@@ -1,5 +1,5 @@
-use super::split_2::length_percentage_is_definitely_negative;
 use super::*;
+use crate::css::parse_background_image;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum BorderSide {
@@ -7,6 +7,17 @@ pub(crate) enum BorderSide {
     Right,
     Bottom,
     Left,
+}
+
+impl From<PhysicalSide> for BorderSide {
+    fn from(side: PhysicalSide) -> Self {
+        match side {
+            PhysicalSide::Top => Self::Top,
+            PhysicalSide::Right => Self::Right,
+            PhysicalSide::Bottom => Self::Bottom,
+            PhysicalSide::Left => Self::Left,
+        }
+    }
 }
 
 /// Maps a logical border side to a physical side.
@@ -19,45 +30,24 @@ pub(crate) fn logical_border_side(
     direction: Direction,
     writing_mode: WritingMode,
 ) -> Option<BorderSide> {
-    let block_start = match writing_mode {
-        WritingMode::HorizontalTb => BorderSide::Top,
-        WritingMode::VerticalRl => BorderSide::Right,
-        WritingMode::VerticalLr => BorderSide::Left,
-    };
-    let block_end = match writing_mode {
-        WritingMode::HorizontalTb => BorderSide::Bottom,
-        WritingMode::VerticalRl => BorderSide::Left,
-        WritingMode::VerticalLr => BorderSide::Right,
-    };
-    let inline_start = match (writing_mode, direction) {
-        (WritingMode::HorizontalTb, Direction::Ltr) => BorderSide::Left,
-        (WritingMode::HorizontalTb, Direction::Rtl) => BorderSide::Right,
-        (_, Direction::Ltr) => BorderSide::Top,
-        (_, Direction::Rtl) => BorderSide::Bottom,
-    };
-    let inline_end = match (writing_mode, direction) {
-        (WritingMode::HorizontalTb, Direction::Ltr) => BorderSide::Right,
-        (WritingMode::HorizontalTb, Direction::Rtl) => BorderSide::Left,
-        (_, Direction::Ltr) => BorderSide::Bottom,
-        (_, Direction::Rtl) => BorderSide::Top,
-    };
+    let axes = WritingModeAxes::new(writing_mode, direction);
     match name {
         "border-block-start"
         | "border-block-start-width"
         | "border-block-start-style"
-        | "border-block-start-color" => Some(block_start),
+        | "border-block-start-color" => Some(axes.physical_side(LogicalSide::BlockStart).into()),
         "border-block-end"
         | "border-block-end-width"
         | "border-block-end-style"
-        | "border-block-end-color" => Some(block_end),
+        | "border-block-end-color" => Some(axes.physical_side(LogicalSide::BlockEnd).into()),
         "border-inline-start"
         | "border-inline-start-width"
         | "border-inline-start-style"
-        | "border-inline-start-color" => Some(inline_start),
+        | "border-inline-start-color" => Some(axes.physical_side(LogicalSide::InlineStart).into()),
         "border-inline-end"
         | "border-inline-end-width"
         | "border-inline-end-style"
-        | "border-inline-end-color" => Some(inline_end),
+        | "border-inline-end-color" => Some(axes.physical_side(LogicalSide::InlineEnd).into()),
         _ => None,
     }
 }
@@ -139,7 +129,7 @@ pub(crate) fn apply_border(value: &str, style: &mut ComputedStyle, side: Option<
         set_border_side_style_value(style, side, border_style);
         set_border_side_color(style, side, color);
     } else {
-        let used_width = used_nonnegative_length(width);
+        let used_width = used_nonnegative_length(width.clone()).points();
         style.border_width = used_width;
         style.border_widths = edge_all(used_width);
         style.border_width_values = CssEdges::all(width);
@@ -193,8 +183,7 @@ pub(crate) fn parse_computed_border_width(
         "thick" => Some(ComputedLengthPercentage::from_points(5.0 * CSS_PX_TO_PT)),
         _ => {
             let length = parse_computed_length_percentage(value, font_size)?;
-            (length.percent == 0.0 && !length_percentage_is_definitely_negative(length))
-                .then_some(length)
+            (!length.needs_percentage_basis() && !length.is_definitely_negative()).then_some(length)
         }
     }
 }
@@ -208,24 +197,24 @@ pub(crate) fn parse_border_width_edges(
         .map(|part| parse_computed_border_width(part, font_size))
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
-        [all] => Some(CssEdges::all(*all)),
+        [all] => Some(CssEdges::all(all.clone())),
         [vertical, horizontal] => Some(CssEdges {
-            top: *vertical,
-            right: *horizontal,
-            bottom: *vertical,
-            left: *horizontal,
+            top: vertical.clone(),
+            right: horizontal.clone(),
+            bottom: vertical.clone(),
+            left: horizontal.clone(),
         }),
         [top, horizontal, bottom] => Some(CssEdges {
-            top: *top,
-            right: *horizontal,
-            bottom: *bottom,
-            left: *horizontal,
+            top: top.clone(),
+            right: horizontal.clone(),
+            bottom: bottom.clone(),
+            left: horizontal.clone(),
         }),
         [top, right, bottom, left] => Some(CssEdges {
-            top: *top,
-            right: *right,
-            bottom: *bottom,
-            left: *left,
+            top: top.clone(),
+            right: right.clone(),
+            bottom: bottom.clone(),
+            left: left.clone(),
         }),
         _ => None,
     }
@@ -245,8 +234,8 @@ pub(crate) fn parse_logical_border_widths(
         .map(|part| parse_computed_border_width(part, font_size))
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
-        [all] => Some([*all, *all]),
-        [start, end] => Some([*start, *end]),
+        [all] => Some([all.clone(), all.clone()]),
+        [start, end] => Some([start.clone(), end.clone()]),
         _ => None,
     }
 }
@@ -389,14 +378,14 @@ pub(crate) fn parse_border_styles(value: &str) -> Option<BorderStyles> {
 /// Parse `border-image-source`.
 ///
 /// CSS Backgrounds and Borders defines the initial value as `none` and accepts
-/// image values. This implementation currently supports URL image sources:
+/// image values:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-image-source>.
-pub(crate) fn parse_border_image_source(value: &str) -> Option<Option<String>> {
+pub(crate) fn parse_border_image_source(value: &str) -> Option<Option<BackgroundImage>> {
     let value = trim_css_value(value);
     if value.eq_ignore_ascii_case("none") {
         Some(None)
     } else {
-        parse_first_css_url(value).map(Some)
+        parse_background_image(value, None, None).map(Some)
     }
 }
 
@@ -572,28 +561,28 @@ pub(crate) fn parse_border_image_width(value: &str, font_size: f32) -> Option<Bo
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
         [all] => Some(BorderImageWidth {
-            top: *all,
-            right: *all,
-            bottom: *all,
-            left: *all,
+            top: all.clone(),
+            right: all.clone(),
+            bottom: all.clone(),
+            left: all.clone(),
         }),
         [vertical, horizontal] => Some(BorderImageWidth {
-            top: *vertical,
-            right: *horizontal,
-            bottom: *vertical,
-            left: *horizontal,
+            top: vertical.clone(),
+            right: horizontal.clone(),
+            bottom: vertical.clone(),
+            left: horizontal.clone(),
         }),
         [top, horizontal, bottom] => Some(BorderImageWidth {
-            top: *top,
-            right: *horizontal,
-            bottom: *bottom,
-            left: *horizontal,
+            top: top.clone(),
+            right: horizontal.clone(),
+            bottom: bottom.clone(),
+            left: horizontal.clone(),
         }),
         [top, right, bottom, left] => Some(BorderImageWidth {
-            top: *top,
-            right: *right,
-            bottom: *bottom,
-            left: *left,
+            top: top.clone(),
+            right: right.clone(),
+            bottom: bottom.clone(),
+            left: left.clone(),
         }),
         _ => None,
     }
@@ -625,28 +614,28 @@ pub(crate) fn parse_border_image_outset(value: &str, font_size: f32) -> Option<B
         .collect::<Option<Vec<_>>>()?;
     match values.as_slice() {
         [all] => Some(BorderImageOutset {
-            top: *all,
-            right: *all,
-            bottom: *all,
-            left: *all,
+            top: all.clone(),
+            right: all.clone(),
+            bottom: all.clone(),
+            left: all.clone(),
         }),
         [vertical, horizontal] => Some(BorderImageOutset {
-            top: *vertical,
-            right: *horizontal,
-            bottom: *vertical,
-            left: *horizontal,
+            top: vertical.clone(),
+            right: horizontal.clone(),
+            bottom: vertical.clone(),
+            left: horizontal.clone(),
         }),
         [top, horizontal, bottom] => Some(BorderImageOutset {
-            top: *top,
-            right: *horizontal,
-            bottom: *bottom,
-            left: *horizontal,
+            top: top.clone(),
+            right: horizontal.clone(),
+            bottom: bottom.clone(),
+            left: horizontal.clone(),
         }),
         [top, right, bottom, left] => Some(BorderImageOutset {
-            top: *top,
-            right: *right,
-            bottom: *bottom,
-            left: *left,
+            top: top.clone(),
+            right: right.clone(),
+            bottom: bottom.clone(),
+            left: left.clone(),
         }),
         _ => None,
     }
@@ -660,7 +649,7 @@ pub(in crate::css) fn parse_border_image_outset_value(
         .map(BorderImageOutsetValue::Number)
         .or_else(|| {
             parse_computed_length_percentage(value, font_size).and_then(|value| {
-                (value.percent == 0.0 && !length_percentage_is_definitely_negative(value))
+                (!value.needs_percentage_basis() && !value.is_definitely_negative())
                     .then_some(BorderImageOutsetValue::Length(value))
             })
         })
@@ -799,7 +788,7 @@ pub(crate) fn parse_border_radius(value: &str, font_size: f32) -> Option<BorderR
     let vertical = if let Some(group) = groups.next() {
         parse_radius_components(group.trim(), font_size)?
     } else {
-        horizontal
+        horizontal.clone()
     };
     Some(BorderRadius {
         top_left: CornerRadius {
@@ -834,8 +823,14 @@ pub(crate) fn parse_corner_radius(value: &str, font_size: f32) -> Option<CornerR
         .map(|part| parse_radius_value(part, font_size))
         .collect::<Option<Vec<_>>>()?;
     match radii.as_slice() {
-        [all] => Some(CornerRadius { x: *all, y: *all }),
-        [x, y] => Some(CornerRadius { x: *x, y: *y }),
+        [all] => Some(CornerRadius {
+            x: all.clone(),
+            y: all.clone(),
+        }),
+        [x, y] => Some(CornerRadius {
+            x: x.clone(),
+            y: y.clone(),
+        }),
         _ => None,
     }
 }

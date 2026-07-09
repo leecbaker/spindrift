@@ -132,12 +132,16 @@ pub(in crate::layout::table) fn apply_table_column_style_measures(
     }
     let declared_width = declared_table_column_width(style);
     let width_floor = declared_width
+        .clone()
         .map(declared_table_width_length_floor)
-        .unwrap_or(0.0);
+        // Intrinsic table-width constraint distribution is scalar arithmetic.
+        .unwrap_or_else(|| layout_pt(0.0))
+        .points();
     let min_width = constrain_table_intrinsic_width_with_floor(style, 0.0, width_floor);
     let max_width = constrain_table_intrinsic_width_with_floor(style, min_width, width_floor);
     let percentage = intrinsic_percentage_contribution(style).max(
         declared_width
+            .clone()
             .map(declared_table_width_percentage)
             .unwrap_or(0.0),
     );
@@ -146,7 +150,10 @@ pub(in crate::layout::table) fn apply_table_column_style_measures(
         measures.max_content_widths[index] = measures.max_content_widths[index].max(max_width);
         measures.intrinsic_percentages[index] =
             measures.intrinsic_percentages[index].max(percentage);
-        if declared_width.is_some_and(declared_table_width_is_non_percentage) {
+        if declared_width
+            .clone()
+            .is_some_and(declared_table_width_is_non_percentage)
+        {
             measures.constrained[index] = true;
         }
     }
@@ -201,21 +208,75 @@ pub(in crate::layout::table) fn distribute_spanned_measure(
     if target_width <= 0.0 || start >= end {
         return;
     }
-    let current = if min_content {
+    let baseline_max_content = measures.max_content_widths[start..end].iter().sum::<f32>();
+    let baseline_measure = if min_content {
         measures.min_content_widths[start..end].iter().sum::<f32>()
     } else {
-        measures.max_content_widths[start..end].iter().sum::<f32>()
+        baseline_max_content
     };
-    if target_width <= current {
+    if target_width <= baseline_measure {
         return;
     }
-    let snapshot = measures.clone();
-    let widths = if min_content {
-        &mut measures.min_content_widths
-    } else {
-        &mut measures.max_content_widths
-    };
-    distribute_table_excess_width(&snapshot, widths, target_width - current, start..end);
+
+    let has_percentage_column = measures.intrinsic_percentages[start..end]
+        .iter()
+        .any(|percentage| *percentage > 0.0);
+    if !has_percentage_column {
+        let snapshot = measures.clone();
+        let widths = if min_content {
+            &mut measures.min_content_widths
+        } else {
+            &mut measures.max_content_widths
+        };
+        distribute_table_excess_width(
+            &snapshot,
+            widths,
+            target_width - baseline_measure,
+            start..end,
+        );
+        return;
+    }
+
+    // A spanning cell contributes to intrinsic measures through the measures
+    // that existed before that span is considered. In particular, percentage
+    // columns must retain their proportional share: applying the used-width
+    // excess-distribution rules would transfer all of a spanning cell's
+    // intrinsic width to an auto column beside a percentage column.
+    //
+    // CSS Tables 3 § 3.8.3, “min-content width of a column based on cells of
+    // span up to N” and “max-content width of a column based on cells of span
+    // up to N”: <https://drafts.csswg.org/css-tables-3/#computing-column-measures>
+    let baseline_min_content = measures.min_content_widths[start..end].iter().sum::<f32>();
+    let additional_above_max = (target_width - baseline_max_content).max(0.0);
+    let within_min_to_max = (target_width - baseline_min_content)
+        .clamp(0.0, (baseline_max_content - baseline_min_content).max(0.0));
+    let column_count = (end - start) as f32;
+
+    for index in start..end {
+        let prior_max = measures.max_content_widths[index];
+        let ratio_of_max = if baseline_max_content > 0.0 {
+            prior_max / baseline_max_content
+        } else {
+            1.0 / column_count
+        };
+        if min_content {
+            let prior_min = measures.min_content_widths[index];
+            let ratio_within_range = if baseline_max_content > baseline_min_content {
+                (prior_max - prior_min) / (baseline_max_content - baseline_min_content)
+            } else {
+                0.0
+            };
+            let contribution = prior_min
+                + ratio_within_range * within_min_to_max
+                + ratio_of_max * additional_above_max;
+            measures.min_content_widths[index] =
+                measures.min_content_widths[index].max(contribution);
+        } else {
+            let contribution = prior_max + ratio_of_max * additional_above_max;
+            measures.max_content_widths[index] =
+                measures.max_content_widths[index].max(contribution);
+        }
+    }
 }
 
 pub(in crate::layout::table) fn cap_intrinsic_percentages(percentages: &mut [f32]) {

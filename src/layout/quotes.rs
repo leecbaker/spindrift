@@ -650,7 +650,7 @@ fn lang_quotes_for_language(language: &str) -> Option<LangQuotes> {
         .iter()
         .filter(|quotes| language_matches_parent(&normalized, quotes.language))
         .max_by_key(|quotes| quotes.language.len())
-        .copied()
+        .cloned()
 }
 
 fn language_matches_parent(normalized: &str, candidate: &str) -> bool {
@@ -664,13 +664,13 @@ fn quote_pair_at_depth(quotes: LangQuotes, depth: usize) -> (&'static str, &'sta
         .open
         .get(depth)
         .or_else(|| quotes.open.last())
-        .copied()
+        .cloned()
         .unwrap_or(DEFAULT_QUOTES.open[0]);
     let close = quotes
         .close
         .get(depth)
         .or_else(|| quotes.close.last())
-        .copied()
+        .cloned()
         .unwrap_or(DEFAULT_QUOTES.close[0]);
     (open, close)
 }

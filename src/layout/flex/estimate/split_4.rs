@@ -196,9 +196,7 @@ impl<'a> LayoutBuilder<'a> {
                 if box_tree::formatting_box_is_collapsible_space(child) {
                     return FlexItemBaselineEstimate::default();
                 }
-                let baseline = self
-                    .font_system
-                    .rendered_first_line_baseline_offset(&box_.style);
+                let baseline = self.inline_box_text_line_layout_baseline_offset(&box_.style);
                 FlexItemBaselineEstimate {
                     first_baseline: Some(baseline),
                     last_baseline: Some(baseline),
@@ -337,17 +335,33 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     stylesheets,
                     FlexAvailableSpace {
-                        width: available_width,
-                        width_is_definite: used_length_percentage_or_auto_with_optional_basis(
-                            style.box_values.width,
-                            Some(available_width),
-                        )
-                        .is_some(),
-                        height: used_length_percentage_or_auto(
-                            style.box_values.height,
-                            available_width,
+                        width: PhysicalContentWidth::new(content_box_pt(available_width)),
+                        width_basis: flex_available_percentage_basis_from_points(
+                            used_length_percentage_or_auto_with_basis(
+                                style.box_values.width.clone(),
+                                PercentageBasis::definite(content_box_pt(available_width)),
+                            )
+                            .map(|width| width.points())
+                            .map(|_| available_width),
+                            FlexAvailableSizeSource::IntrinsicContainerSize,
                         ),
-                        height_is_definite: !style.box_values.height.is_auto(),
+                        height: used_length_percentage_or_auto(
+                            style.box_values.height.clone(),
+                            PercentageBasis::definite(layout_pt(available_width)),
+                        )
+                        .map(|height| {
+                            PhysicalContentHeight::new(crate::units::layout_to_content_box_length(
+                                height,
+                            ))
+                        }),
+                        height_basis: flex_available_percentage_basis_from_points(
+                            used_length_percentage_or_auto(
+                                style.box_values.height.clone(),
+                                PercentageBasis::definite(layout_pt(available_width)),
+                            )
+                            .map(|height| height.points()),
+                            FlexAvailableSizeSource::IntrinsicContainerSize,
+                        ),
                     },
                 )
             })
@@ -389,7 +403,7 @@ impl<'a> LayoutBuilder<'a> {
             return FlexItemBaselineEstimate::default();
         }
 
-        let first_baseline = self.font_system.rendered_first_line_baseline_offset(style);
+        let first_baseline = self.inline_box_text_line_layout_baseline_offset(style);
         let last_baseline =
             first_baseline + measurement.line_count().saturating_sub(1) as f32 * style.line_height;
         let fallback_line_baseline_offset = self.inline_box_text_line_layout_baseline_offset(style);
@@ -525,7 +539,12 @@ pub(in crate::layout::flex) fn flex_estimated_content_width(
     let borders = used_border_widths(style);
     let horizontal_non_content =
         borders.left + borders.right + style.padding.left + style.padding.right;
-    used_content_width_or_auto(style, available_width, horizontal_non_content)
-        .unwrap_or_else(|| (available_width - horizontal_non_content).max(1.0))
-        .max(1.0)
+    used_content_box_width_or_auto(
+        style,
+        layout_pt(available_width),
+        non_content_pt(horizontal_non_content),
+    )
+    .map(SemanticLengthExt::points)
+    .unwrap_or_else(|| (available_width - horizontal_non_content).max(1.0))
+    .max(1.0)
 }

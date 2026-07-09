@@ -1,18 +1,8 @@
 use super::*;
+use crate::text::is_css_preserved_document_space;
+use std::rc::Rc;
 
 impl<'a> LayoutBuilder<'a> {
-    pub(in crate::layout) fn push_list_context(
-        &mut self,
-        element: &Element,
-        style: &ComputedStyle,
-    ) -> bool {
-        let Some(state) = list_context_for_element(element, style) else {
-            return false;
-        };
-        self.list_stack.push(state);
-        true
-    }
-
     pub(in crate::layout) fn marker_for_list_item(
         &mut self,
         _element: &Element,
@@ -28,37 +18,70 @@ impl<'a> LayoutBuilder<'a> {
         // same ordinal counter for `ol`/`li`.
         // https://www.w3.org/TR/css-lists-3/#markers
         // https://html.spec.whatwg.org/multipage/grouping-content.html#the-ol-element
-        let ordinal = self
-            .counter_set
-            .current(LIST_ITEM_COUNTER_NAME)
-            .unwrap_or_default();
-
         let marker_style = style
             .marker_style
             .as_deref()
             .cloned()
             .unwrap_or_else(|| style.clone());
+        let planned_stacks = self
+            .counter_plan
+            .values_at_origin
+            .get(&CounterOriginKey::new(
+                _element,
+                box_tree::CounterEventSource::Marker,
+            ))
+            .or_else(|| {
+                self.counter_plan
+                    .values_at_origin
+                    .get(&CounterOriginKey::new(
+                        _element,
+                        box_tree::CounterEventSource::Principal,
+                    ))
+            });
+        let ordinal = planned_stacks
+            .and_then(|stacks| stacks.get(LIST_ITEM_COUNTER_NAME))
+            .and_then(|values| values.last())
+            .cloned()
+            .or_else(|| self.counter_set.current(LIST_ITEM_COUNTER_NAME))
+            .unwrap_or_default();
         // CSS Lists 3: for automatic markers, `list-style-image` is tried
         // before falling back to the textual `list-style-type`.
         // Explicit `::marker { content: ... }` bypasses automatic markers.
         let image = self
             .marker_image_for_style(style)
             .filter(|_| marker_style.marker_content == MarkerContent::Auto);
-        let (text, suffix_space) = if image.is_some() {
-            (String::new(), true)
+        let runtime_stacks;
+        let counter_stacks = if let Some(planned_stacks) = planned_stacks {
+            planned_stacks
+        } else {
+            runtime_stacks = self.counter_set.stacks();
+            &runtime_stacks
+        };
+        let marker = if image.is_some() {
+            Some((String::new(), true))
         } else {
             marker_text(
                 &marker_style,
                 ordinal,
                 &self.counter_styles,
-                self.counter_set.stacks(),
-            )?
+                counter_stacks,
+                &mut self.quote_depth,
+            )
         };
+        let (text, suffix_space) = marker?;
         Some(ListMarker {
             text,
             image,
             style: marker_style,
-            position: style.list_style_position,
+            // A non-atomic inline list item has no block marker gutter, so an
+            // `outside` marker participates as `inside`. An inline flow-root
+            // is atomic and retains its own outside marker box.
+            // <https://drafts.csswg.org/css-lists-3/#list-style-position-property>
+            position: if style.display.is_inline_level() && !style.display.is_atomic_inline() {
+                ListStylePosition::Inside
+            } else {
+                style.list_style_position
+            },
             positioning_direction: match style.marker_side {
                 MarkerSide::MatchSelf => style.direction,
                 MarkerSide::MatchParent => parent_direction,
@@ -75,47 +98,86 @@ impl<'a> LayoutBuilder<'a> {
         content_inline_end: f32,
         row_top: f32,
     ) {
-        if marker.position != ListStylePosition::Outside
+        if !marker.paints_outside()
             || style.visibility != Visibility::Visible
             || (marker.text.is_empty() && marker.image.is_none())
         {
             return;
         }
         if let Some(image) = &marker.image {
-            let gap = self.marker_gap_width(&marker.style);
+            let gap = if marker.suffix_space {
+                self.marker_gap_width(&marker.style).points()
+            } else {
+                0.0
+            };
             let x = match marker.positioning_direction {
                 Direction::Ltr => content_inline_start - image.width - gap,
                 Direction::Rtl => content_inline_end + gap,
             };
-            self.push_image(RenderedImage::from_paint_rect(
-                PageTopRect::new(x, row_top, image.width, image.height).paint_rect(),
-                false,
-                image.decoded.pixel_width,
-                image.decoded.pixel_height,
-                None,
-                false,
-                image.decoded.rgb.clone(),
-                image.decoded.alpha.clone(),
-                None,
-            ));
+            let rect = PageTopRect::new(x, row_top, image.width, image.height).paint_rect();
+            if let Some(asset) = &image.svg {
+                for path in asset.paint_paths(rect) {
+                    self.push_path_in_band(PaintBand::Inline, path);
+                }
+            } else {
+                self.push_image(
+                    RenderedImage::from_paint_rect(
+                        rect,
+                        false,
+                        image.decoded.pixel_width,
+                        image.decoded.pixel_height,
+                        None,
+                        false,
+                        Rc::clone(&image.decoded.rgb),
+                        image.decoded.alpha.clone(),
+                        None,
+                    )
+                    .with_raster_color_space(image.decoded.color_space.clone())
+                    .with_image_id(image.decoded.image_id),
+                );
+            }
             return;
         }
-        let marker_width = self.font_system.measure_text(&marker.text, &marker.style);
-        let gap = self.marker_gap_width(&marker.style);
-        let x = match marker.positioning_direction {
-            Direction::Ltr => content_inline_start - marker_width - gap,
-            Direction::Rtl => content_inline_end + gap,
+        let mut items = Vec::new();
+        self.push_inside_marker_items(marker, style, None, &mut items);
+        let measurement =
+            self.intrinsic_inline_measurement_for_items(items.clone(), &marker.style, f32::MAX);
+        let marker_width = measurement.contribution.max_content;
+        let sequence = if marker
+            .text
+            .chars()
+            .last()
+            .is_some_and(is_css_preserved_document_space)
+        {
+            measurement.sequence
+        } else {
+            self.collect_inline_line_sequence_with_text_box_trim(
+                items,
+                &marker.style,
+                marker_width,
+                0.0,
+                0.0,
+            )
         };
-        self.paint_text_runs(
-            &marker.text,
-            x,
-            row_top - marker.style.font_size,
+        let marker_left = match marker.positioning_direction {
+            Direction::Ltr => content_inline_start - marker_width,
+            Direction::Rtl => content_inline_end,
+        };
+        self.paint_inline_box_sequence(
+            &sequence,
             &marker.style,
+            marker_left,
+            marker_width,
+            row_top,
         );
     }
 
-    pub(in crate::layout) fn marker_gap_width(&mut self, style: &ComputedStyle) -> f32 {
-        self.inline_space_width(style).max(style.font_size * 0.5)
+    pub(in crate::layout) fn marker_gap_width(&mut self, style: &ComputedStyle) -> LayoutLength {
+        // The automatic textual marker suffix ends in U+0020.  Its advance is
+        // therefore the selected font's space advance, not a synthesized
+        // half-em gutter.
+        // <https://drafts.csswg.org/css-counter-styles-3/#generate-a-counter>
+        self.inline_space_width(style)
     }
 
     pub(in crate::layout) fn push_inside_marker_items(
@@ -136,11 +198,17 @@ impl<'a> LayoutBuilder<'a> {
         );
         if let Some(image) = &marker.image {
             items.push(InlineItem::Atom(Box::new(InlineAtom::new(
-                InlineAtomContent::Image(image.decoded.clone()),
+                image
+                    .svg
+                    .clone()
+                    .map(|asset| InlineAtomContent::Svg { asset: Some(asset) })
+                    .unwrap_or_else(|| InlineAtomContent::Image(image.decoded.clone())),
                 marker.style.clone(),
                 None,
-                image.width,
-                image.height + inline_replaced_descent(&marker.style),
+                InlineSize::new(
+                    image.width,
+                    image.height + inline_replaced_descent(&marker.style).points(),
+                ),
                 image.height,
                 0.0,
                 link_target.clone(),
@@ -152,11 +220,11 @@ impl<'a> LayoutBuilder<'a> {
                 style: inline_style(&marker.style),
                 baseline_shift: 0.0,
                 visual_offset: InlineVisualOffset::zero(),
-                link_target: link_target.clone(),
+                link_target: link_target.clone().map(Rc::from),
                 mergeable: true,
                 source: InlineTextSource::Marker,
                 hanging_edges: InlineHangingEdges::default(),
-                ancestor_inline_decorations: Vec::new(),
+                ancestor_inline_decorations: Vec::new().into(),
             })));
         }
         if marker.suffix_space {
@@ -165,11 +233,11 @@ impl<'a> LayoutBuilder<'a> {
                 style: inline_style(&marker.style),
                 baseline_shift: 0.0,
                 visual_offset: InlineVisualOffset::zero(),
-                link_target: link_target.clone(),
+                link_target: link_target.clone().map(Rc::from),
                 mergeable: true,
                 source: InlineTextSource::Normal,
                 hanging_edges: InlineHangingEdges::default(),
-                ancestor_inline_decorations: Vec::new(),
+                ancestor_inline_decorations: Vec::new().into(),
             })));
         }
         self.push_bidi_scope_end_with_source(
@@ -187,22 +255,29 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
     ) -> Option<MarkerImage> {
         let src = style.list_style_image.as_ref()?;
-        let decoded = load_image_source(
+        let asset = load_resolved_image_source(
             src,
-            style.list_style_image_base_url.as_deref().or(self.base_url),
-            style.list_style_image_root_url.as_deref(),
+            style.list_style_image_base_url.as_ref().or(self.base_url),
+            style.list_style_image_root_url.as_ref(),
             self.resource_cache,
+            true,
         )?;
-        let natural_size = decoded.natural_layout_size();
-        let intrinsic_width = natural_size.width;
-        let intrinsic_height = natural_size.height;
-        if intrinsic_width <= 0.0 || intrinsic_height <= 0.0 {
+        let intrinsic_size = asset.intrinsic_size();
+        if intrinsic_size.width <= 0.0 || intrinsic_size.height <= 0.0 {
             return None;
         }
+        let (decoded, svg) = match asset {
+            ResolvedImageAsset::Raster(decoded) => (decoded, None),
+            ResolvedImageAsset::Svg(svg) => (
+                DecodedPngImage::new(1, 1, vec![0, 0, 0], Some(vec![0])),
+                Some(svg),
+            ),
+        };
         Some(MarkerImage {
             decoded,
-            width: intrinsic_width,
-            height: intrinsic_height,
+            svg,
+            width: intrinsic_size.width,
+            height: intrinsic_size.height,
         })
     }
 }
@@ -213,79 +288,12 @@ pub(in crate::layout) fn marker_inline_scope_style(style: &ComputedStyle) -> Com
     style
 }
 
-pub(in crate::layout) fn list_context_for_element(
-    element: &Element,
-    _style: &ComputedStyle,
-) -> Option<ListState> {
-    match list_container_kind(element) {
-        ListContainerKind::Ordered => {
-            let reversed = element.attrs.contains_key("reversed");
-            let step = if reversed { -1 } else { 1 };
-            Some(ListState { step })
-        }
-        ListContainerKind::Unordered | ListContainerKind::Other => Some(ListState { step: 1 }),
-    }
-}
-
-pub(in crate::layout) fn ordered_list_start(element: &Element) -> Option<i32> {
-    element
-        .attrs
-        .get("start")
-        .and_then(|value| value.trim().parse::<i32>().ok())
-}
-
-pub(in crate::layout) fn list_item_value(element: &Element) -> Option<i32> {
-    if !is_list_item_element(element) {
-        return None;
-    }
-    element
-        .attrs
-        .get("value")
-        .and_then(|value| value.trim().parse::<i32>().ok())
-}
-
-pub(in crate::layout) fn direct_li_child_count(element: &Element) -> i32 {
-    element
-        .children
-        .iter()
-        .filter(|child| {
-            matches!(
-                &child.kind,
-                NodeKind::Element(child_element) if is_list_item_element(child_element)
-            )
-        })
-        .count()
-        .try_into()
-        .unwrap_or(i32::MAX)
-}
-
-pub(in crate::layout) fn list_container_counter_reset(element: &Element) -> Option<(i32, bool)> {
-    match list_container_kind(element) {
-        ListContainerKind::Ordered => {
-            let reversed = element.attrs.contains_key("reversed");
-            let step = if reversed { -1 } else { 1 };
-            let start = ordered_list_start(element).unwrap_or_else(|| {
-                if reversed {
-                    direct_li_child_count(element).max(1)
-                } else {
-                    1
-                }
-            });
-            Some((
-                start - step,
-                reversed || element.attrs.contains_key("start"),
-            ))
-        }
-        ListContainerKind::Unordered => Some((0, false)),
-        ListContainerKind::Other => None,
-    }
-}
-
 pub(in crate::layout) fn marker_text(
     style: &ComputedStyle,
     ordinal: i32,
     counter_styles: &HashMap<String, CounterStyleRule>,
     counter_stack: &HashMap<String, Vec<i32>>,
+    quote_depth: &mut usize,
 ) -> Option<(String, bool)> {
     match &style.marker_content {
         MarkerContent::Auto => {
@@ -297,6 +305,24 @@ pub(in crate::layout) fn marker_text(
             for part in parts {
                 match part {
                     MarkerContentPart::Text(part) => text.push_str(part),
+                    MarkerContentPart::Quote(quote) => match quote {
+                        GeneratedQuote::Open => {
+                            text.push_str(
+                                &crate::layout::inline_collect::quote_pair(style, *quote_depth).0,
+                            );
+                            *quote_depth += 1;
+                        }
+                        GeneratedQuote::Close => {
+                            *quote_depth = quote_depth.saturating_sub(1);
+                            text.push_str(
+                                &crate::layout::inline_collect::quote_pair(style, *quote_depth).1,
+                            );
+                        }
+                        GeneratedQuote::NoOpen => *quote_depth += 1,
+                        GeneratedQuote::NoClose => {
+                            *quote_depth = quote_depth.saturating_sub(1);
+                        }
+                    },
                     MarkerContentPart::Counter {
                         name,
                         style: counter_style,
@@ -306,7 +332,7 @@ pub(in crate::layout) fn marker_text(
                         } else {
                             counter_stack
                                 .get(name)
-                                .and_then(|values| values.last().copied())
+                                .and_then(|values| values.last().cloned())
                                 .unwrap_or(0)
                         };
                         if let Some(counter) = counter_text(
@@ -642,7 +668,7 @@ pub(in crate::layout) fn alphabetic_counter_text(index: i32, symbols: &[String])
         output.push(symbols[value % base].as_str());
         value /= base;
     }
-    Some(output.iter().rev().copied().collect::<String>())
+    Some(output.iter().rev().cloned().collect::<String>())
 }
 
 pub(in crate::layout) fn numeric_counter_text(index: i32, symbols: &[String]) -> Option<String> {
@@ -663,7 +689,7 @@ pub(in crate::layout) fn numeric_counter_text(index: i32, symbols: &[String]) ->
     }
     Some(format!(
         "{sign}{}",
-        output.iter().rev().copied().collect::<String>()
+        output.iter().rev().cloned().collect::<String>()
     ))
 }
 

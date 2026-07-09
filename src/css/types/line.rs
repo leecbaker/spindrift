@@ -1,4 +1,7 @@
-use super::ComputedLengthPercentage;
+use super::{
+    ComputedLengthPercentage, PercentageBasis, RootFontMetricLengthBasis, layout_points, layout_pt,
+};
+use crate::units::LayoutLength;
 
 /// Computed CSS value for `line-height`.
 ///
@@ -8,7 +11,7 @@ use super::ComputedLengthPercentage;
 /// unresolved until the selected font face is known:
 /// <https://www.w3.org/TR/CSS22/visudet.html#propdef-line-height>.
 /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ComputedLineHeight {
     Normal,
     Number(f32),
@@ -22,9 +25,56 @@ impl ComputedLineHeight {
         Self::Length(ComputedLengthPercentage::from_points(points))
     }
 
-    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: f32) {
+    /// Scale an explicit length while preserving unitless and `normal`
+    /// line-heights, whose used values follow the zoomed font size.
+    pub(crate) fn scale_fixed_length_components(&mut self, factor: f32) {
+        if let Self::Length(value) = self {
+            value.scale_fixed_length_components(factor);
+        }
+    }
+
+    pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
         if let Self::Length(value) = self {
             value.resolve_font_metric_lengths(ch_advance);
+        }
+    }
+
+    /// Resolves `em` components after the element's used font size is known.
+    /// <https://www.w3.org/TR/css-values-4/#em>
+    pub(crate) fn resolve_em_relative_lengths(&mut self, font_size: LayoutLength) {
+        if let Self::Length(value) = self {
+            value.resolve_em_relative_lengths(font_size);
+        }
+    }
+
+    pub(crate) fn requires_ch_advance(&self) -> bool {
+        matches!(self, Self::Length(value) if value.requires_ch_advance())
+    }
+
+    /// Resolves root-font metric units against the document root's selected
+    /// font and computed line height.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn resolve_root_font_metric_lengths(&mut self, basis: RootFontMetricLengthBasis) {
+        if let Self::Length(value) = self {
+            value.resolve_root_font_metric_lengths(basis);
+        }
+    }
+
+    pub(crate) fn resolve_ic_relative_lengths(&mut self, ic_advance: LayoutLength) {
+        if let Self::Length(value) = self {
+            value.resolve_ic_relative_lengths(ic_advance);
+        }
+    }
+
+    pub(crate) fn resolve_ex_relative_lengths(&mut self, x_height: f32) {
+        if let Self::Length(value) = self {
+            value.resolve_ex_relative_lengths(x_height);
+        }
+    }
+
+    pub(crate) fn resolve_cap_relative_lengths(&mut self, cap_height: f32) {
+        if let Self::Length(value) = self {
+            value.resolve_cap_relative_lengths(cap_height);
         }
     }
 
@@ -32,15 +82,23 @@ impl ComputedLineHeight {
         match self {
             Self::Normal => (font_size * 1.2, Some(1.2), true),
             Self::Number(multiplier) => (font_size * multiplier, Some(multiplier), false),
-            Self::Length(length) => (
-                length
-                    .used_length_with_percentage_basis(font_size)
-                    .unwrap_or(
-                        length.length_with_percentage_basis(font_size) + length.ch * font_size,
-                    ),
-                None,
-                false,
-            ),
+            Self::Length(length) => {
+                let mut fallback = length;
+                // Until the selected font is available, retain the historic
+                // computed-value fallback for `ch` in line-height. Layout
+                // replaces it with the selected-font advance later.
+                fallback.resolve_font_metric_lengths(layout_pt(font_size));
+                (
+                    fallback
+                        .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                            font_size,
+                        )))
+                        .map(layout_points)
+                        .unwrap_or(fallback.length_points()),
+                    None,
+                    false,
+                )
+            }
         }
     }
 }
@@ -51,7 +109,7 @@ impl ComputedLineHeight {
 /// `<length-percentage> && hanging? && each-line?` value whose percentage is
 /// resolved against the containing block's inline size during layout:
 /// <https://www.w3.org/TR/css-text-3/#text-indent-property>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedTextIndent {
     pub(crate) amount: ComputedLengthPercentage,
     pub(crate) hanging: bool,

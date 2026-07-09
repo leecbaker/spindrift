@@ -1,14 +1,28 @@
 use super::*;
 
 pub(super) fn apply_columns(value: &str, style: &mut ComputedStyle) {
-    for part in value.split_whitespace() {
-        if part.eq_ignore_ascii_case("auto") {
-            continue;
-        }
-        if let Some(count) = parse_column_count(part) {
-            style.column_count = Some(count);
-        } else if let Some(width) = parse_column_width(part, style.font_size) {
-            style.column_width = width;
+    let Some(longhands) = crate::css::cascade::declarations::expand_columns_shorthand(value) else {
+        return;
+    };
+    for (name, value) in longhands {
+        match name {
+            "column-count" => style.column_count = parse_column_count(&value),
+            "column-width" => {
+                if let Some(width) = parse_column_width(&value, style.font_size) {
+                    style.column_width = width;
+                }
+            }
+            "column-height" => {
+                if let Some(height) = parse_column_height(&value, style.font_size) {
+                    style.column_height = height;
+                }
+            }
+            "column-wrap" => {
+                if let Some(wrap) = parse_column_wrap(&value) {
+                    style.column_wrap = wrap;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -36,9 +50,32 @@ pub(super) fn parse_column_width(value: &str, font_size: f32) -> Option<Computed
         Some(ComputedColumnWidth::Auto)
     } else {
         parse_computed_length_percentage(value, font_size)
-            .filter(|length| length.percent == 0.0)
-            .filter(|length| !length_percentage_is_definitely_negative(*length))
+            .filter(|length| !length.contains_percentage())
+            .filter(|length| !length_percentage_is_definitely_negative(length))
             .map(ComputedColumnWidth::Length)
+    }
+}
+
+/// Parses CSS Multi-column Level 2 `column-height`.
+/// <https://drafts.csswg.org/css-multicol-2/#column-height>
+pub(super) fn parse_column_height(value: &str, font_size: f32) -> Option<ComputedColumnHeight> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("auto") {
+        Some(ComputedColumnHeight::Auto)
+    } else {
+        parse_computed_length_percentage(value, font_size)
+            .filter(|length| !length.contains_percentage())
+            .filter(|length| !length_percentage_is_definitely_negative(length))
+            .map(ComputedColumnHeight::Length)
+    }
+}
+
+pub(super) fn parse_column_wrap(value: &str) -> Option<ColumnWrap> {
+    match trim_css_value(value).to_ascii_lowercase().as_str() {
+        "auto" => Some(ColumnWrap::Auto),
+        "nowrap" => Some(ColumnWrap::Nowrap),
+        "wrap" => Some(ColumnWrap::Wrap),
+        _ => None,
     }
 }
 
@@ -55,8 +92,25 @@ pub(super) fn parse_column_gap(value: &str, font_size: f32) -> Option<ComputedGa
     } else {
         let gap = parse_computed_border_width(value, font_size)
             .or_else(|| parse_computed_length_percentage(value, font_size))?;
-        (!length_percentage_is_definitely_negative(gap))
+        (!length_percentage_is_definitely_negative(&gap))
             .then_some(ComputedGap::LengthPercentage(gap))
+    }
+}
+
+pub(super) fn parse_column_fill(value: &str) -> Option<ColumnFill> {
+    match trim_css_value(value).to_ascii_lowercase().as_str() {
+        "balance" => Some(ColumnFill::Balance),
+        "balance-all" => Some(ColumnFill::BalanceAll),
+        "auto" => Some(ColumnFill::Auto),
+        _ => None,
+    }
+}
+
+pub(super) fn parse_column_span(value: &str) -> Option<ColumnSpan> {
+    match trim_css_value(value).to_ascii_lowercase().as_str() {
+        "none" => Some(ColumnSpan::None),
+        "all" => Some(ColumnSpan::All),
+        _ => None,
     }
 }
 
@@ -71,7 +125,7 @@ pub(super) fn parse_gap(value: &str, font_size: f32) -> Option<ComputedGap> {
     } else {
         let gap = parse_computed_border_width(value, font_size)
             .or_else(|| parse_computed_length_percentage(value, font_size))?;
-        (!length_percentage_is_definitely_negative(gap))
+        (!length_percentage_is_definitely_negative(&gap))
             .then_some(ComputedGap::LengthPercentage(gap))
     }
 }
@@ -84,8 +138,6 @@ pub(super) fn parse_gap(value: &str, font_size: f32) -> Option<ComputedGap> {
 /// invalid:
 /// <https://www.w3.org/TR/css-align-3/#gaps> and
 /// <https://www.w3.org/TR/css-values-4/#calc-range>.
-fn length_percentage_is_definitely_negative(value: ComputedLengthPercentage) -> bool {
-    let components = [value.length_points(), value.percent, value.ch];
-    components.iter().any(|component| *component < 0.0)
-        && components.iter().all(|component| *component <= 0.0)
+fn length_percentage_is_definitely_negative(value: &ComputedLengthPercentage) -> bool {
+    value.is_definitely_absolute() && value.length_points() < 0.0
 }
