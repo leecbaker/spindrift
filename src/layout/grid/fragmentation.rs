@@ -2,6 +2,66 @@ use super::*;
 
 const GRID_FRAGMENT_EPSILON: f32 = 0.01;
 
+/// A physical block-axis offset within the unfragmented grid container.
+///
+/// Grid fragmentation replays source layout into page fragmentainers, so this
+/// coordinate must not be exchanged with page positions or Flex source offsets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd)]
+pub(in crate::layout::grid) struct GridFragmentBlockOffset(f32);
+
+impl GridFragmentBlockOffset {
+    pub(in crate::layout::grid) const fn new(points: f32) -> Self {
+        Self(points)
+    }
+
+    pub(in crate::layout::grid) const fn points(self) -> f32 {
+        self.0
+    }
+
+    /// Project this physical source offset into a page-layout displacement.
+    pub(in crate::layout::grid) fn layout_length(self) -> LayoutLength {
+        layout_pt(self.0)
+    }
+}
+
+/// A non-negative physical block-axis extent within a grid fragment.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(in crate::layout::grid) struct GridFragmentBlockSize(f32);
+
+impl GridFragmentBlockSize {
+    pub(in crate::layout::grid) fn new(points: f32) -> Self {
+        Self(points.max(0.0))
+    }
+
+    pub(in crate::layout::grid) const fn points(self) -> f32 {
+        self.0
+    }
+
+    /// Project this physical grid-source extent into page-layout length space.
+    ///
+    /// Grid source offsets stay distinct from page positions, but a committed
+    /// fragment cursor advances through the same physical CSS length.
+    pub(in crate::layout::grid) fn layout_length(self) -> LayoutLength {
+        layout_pt(self.0)
+    }
+}
+
+impl std::ops::Add<GridFragmentBlockSize> for GridFragmentBlockOffset {
+    type Output = Self;
+
+    fn add(self, size: GridFragmentBlockSize) -> Self {
+        Self::new(self.0 + size.0)
+    }
+}
+
+impl std::ops::Sub for GridFragmentBlockOffset {
+    type Output = GridFragmentBlockSize;
+
+    fn sub(self, other: Self) -> Self::Output {
+        GridFragmentBlockSize::new(self.0 - other.0)
+    }
+}
+
 /// Committed fragment slices for a grid container.
 ///
 /// CSS Fragmentation fragments grid containers across fragmentainers and
@@ -22,8 +82,8 @@ pub(in crate::layout::grid) struct GridFragmentPlan {
 /// One source-range slice of a fragmented grid container.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout::grid) struct GridFragmentSlice {
-    pub(in crate::layout::grid) source_block_start: f32,
-    pub(in crate::layout::grid) source_block_end: f32,
+    pub(in crate::layout::grid) source_block_start: GridFragmentBlockOffset,
+    pub(in crate::layout::grid) source_block_end: GridFragmentBlockOffset,
     pub(in crate::layout::grid) break_after: GridFragmentBreak,
 }
 
@@ -37,7 +97,7 @@ pub(in crate::layout::grid) struct GridFragmentSlice {
 /// <https://www.w3.org/TR/css-break-3/#break-between>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout::grid) struct GridRowBreakBoundary {
-    pub(in crate::layout::grid) source_block_offset: f32,
+    pub(in crate::layout::grid) source_block_offset: GridFragmentBlockOffset,
     pub(in crate::layout::grid) break_before: PageBreak,
     pub(in crate::layout::grid) break_after: PageBreak,
     pub(in crate::layout::grid) break_inside_avoid: bool,
@@ -66,8 +126,8 @@ pub(in crate::layout::grid) struct GridFragmentRecord {
 /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout::grid) struct GridFragmentCursor {
-    pub(in crate::layout::grid) content_top: f32,
-    pub(in crate::layout::grid) block_offset: f32,
+    pub(in crate::layout::grid) content_top: PageTopBlockPosition,
+    pub(in crate::layout::grid) block_offset: GridFragmentBlockOffset,
 }
 
 /// A grid item clipped to one committed grid fragment slice.
@@ -83,8 +143,8 @@ pub(in crate::layout::grid) struct GridItemFragment {
 /// Source-block range of a grid item visible in one grid fragment.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout::grid) struct GridFragmentItemContentSlice {
-    pub(in crate::layout::grid) block_start: f32,
-    pub(in crate::layout::grid) block_end: f32,
+    pub(in crate::layout::grid) block_start: GridFragmentBlockOffset,
+    pub(in crate::layout::grid) block_end: GridFragmentBlockOffset,
 }
 
 /// The break mode used after a grid slice.
@@ -113,7 +173,7 @@ pub(in crate::layout::grid) enum GridFragmentTransitionReason {
 pub(in crate::layout::grid) struct GridFragmentTransition {
     pub(in crate::layout::grid) fragmentainer_kind: FragmentainerKind,
     pub(in crate::layout::grid) reason: GridFragmentTransitionReason,
-    pub(in crate::layout::grid) next_block_offset: f32,
+    pub(in crate::layout::grid) next_block_offset: GridFragmentBlockOffset,
 }
 
 impl GridFragmentPlan {
@@ -132,8 +192,8 @@ impl GridFragmentPlan {
             fragmentainer_kind,
             slices: (content_block_size > GRID_FRAGMENT_EPSILON)
                 .then_some(GridFragmentSlice {
-                    source_block_start: 0.0,
-                    source_block_end: content_block_size,
+                    source_block_start: GridFragmentBlockOffset::new(0.0),
+                    source_block_end: GridFragmentBlockOffset::new(content_block_size),
                     break_after: GridFragmentBreak::None,
                 })
                 .into_iter()
@@ -184,8 +244,8 @@ impl GridFragmentPlan {
         content_block_size: f32,
         row_boundaries: &[GridRowBreakBoundary],
     ) -> Self {
-        let content_block_size = content_block_size.max(0.0);
-        if content_block_size <= GRID_FRAGMENT_EPSILON {
+        let content_block_end = GridFragmentBlockOffset::new(content_block_size.max(0.0));
+        if content_block_end.points() <= GRID_FRAGMENT_EPSILON {
             return Self {
                 fragmentainer_kind,
                 slices: Vec::new(),
@@ -194,10 +254,11 @@ impl GridFragmentPlan {
         }
 
         let mut slices = Vec::new();
-        let mut source_block_start = 0.0;
-        let mut available_block_end =
-            current_fragmentainer.available_block_end_from(source_block_start);
-        let empty_fragmentainer_block_size = current_fragmentainer.fragmentainer_block_size();
+        let mut source_block_start = GridFragmentBlockOffset::new(0.0);
+        let mut available_block_end = source_block_start
+            + GridFragmentBlockSize::new(current_fragmentainer.available_block_size().points());
+        let empty_fragmentainer_block_size =
+            GridFragmentBlockSize::new(current_fragmentainer.fragmentainer_block_size().points());
         let mut starts_after_fragmentainer_break = false;
         let break_opportunities = row_boundaries
             .iter()
@@ -205,30 +266,32 @@ impl GridFragmentPlan {
             .map(GridRowBreakBoundary::break_opportunity)
             .collect::<Vec<_>>();
 
-        while source_block_start < content_block_size - GRID_FRAGMENT_EPSILON {
+        while source_block_start.points() < content_block_end.points() - GRID_FRAGMENT_EPSILON {
             if let Some(row_boundary) =
                 FragmentBreakOpportunity::first_forced_in(FragmentBreakOpportunitySearch {
                     fragmentainer_kind,
                     opportunities: &break_opportunities,
-                    source_block_start,
-                    available_block_end,
-                    content_block_end: content_block_size,
+                    source_block_start: source_block_start.points(),
+                    available_block_end: available_block_end.points(),
+                    content_block_end: content_block_end.points(),
                 })
             {
                 slices.push(GridFragmentSlice {
                     source_block_start,
-                    source_block_end: row_boundary.source_block_offset,
+                    source_block_end: GridFragmentBlockOffset::new(
+                        row_boundary.source_block_offset,
+                    ),
                     break_after: GridFragmentBreak::ForcedRowBoundary,
                 });
-                source_block_start = row_boundary.source_block_offset;
+                source_block_start = GridFragmentBlockOffset::new(row_boundary.source_block_offset);
                 available_block_end = source_block_start + empty_fragmentainer_block_size;
                 continue;
             }
 
-            if content_block_size <= available_block_end + GRID_FRAGMENT_EPSILON {
+            if content_block_end.points() <= available_block_end.points() + GRID_FRAGMENT_EPSILON {
                 slices.push(GridFragmentSlice {
                     source_block_start,
-                    source_block_end: content_block_size,
+                    source_block_end: content_block_end,
                     break_after: GridFragmentBreak::None,
                 });
                 break;
@@ -239,18 +302,20 @@ impl GridFragmentPlan {
                     FragmentBreakOpportunitySearch {
                         fragmentainer_kind,
                         opportunities: &break_opportunities,
-                        source_block_start,
-                        available_block_end,
-                        content_block_end: content_block_size,
+                        source_block_start: source_block_start.points(),
+                        available_block_end: available_block_end.points(),
+                        content_block_end: content_block_end.points(),
                     },
                 )
             {
                 slices.push(GridFragmentSlice {
                     source_block_start,
-                    source_block_end: row_boundary.source_block_offset,
+                    source_block_end: GridFragmentBlockOffset::new(
+                        row_boundary.source_block_offset,
+                    ),
                     break_after: GridFragmentBreak::RowBoundary,
                 });
-                source_block_start = row_boundary.source_block_offset;
+                source_block_start = GridFragmentBlockOffset::new(row_boundary.source_block_offset);
                 available_block_end = source_block_start + empty_fragmentainer_block_size;
                 continue;
             }
@@ -258,17 +323,17 @@ impl GridFragmentPlan {
             let slice = FragmentSourceSliceDecision::choose(FragmentSourceSliceInput {
                 break_is_applicable: true,
                 source_is_oversized: true,
-                source_block_end: content_block_size,
-                slice_start: source_block_start,
-                available_block_end,
+                source_block_end: content_block_end.points(),
+                slice_start: source_block_start.points(),
+                available_block_end: available_block_end.points(),
             });
             if slice.advance_before_slice {
                 starts_after_fragmentainer_break |= slices.is_empty();
                 available_block_end = source_block_start + empty_fragmentainer_block_size;
-                if empty_fragmentainer_block_size <= GRID_FRAGMENT_EPSILON {
+                if empty_fragmentainer_block_size.points() <= GRID_FRAGMENT_EPSILON {
                     slices.push(GridFragmentSlice {
                         source_block_start,
-                        source_block_end: content_block_size,
+                        source_block_end: content_block_end,
                         break_after: GridFragmentBreak::None,
                     });
                     break;
@@ -277,11 +342,11 @@ impl GridFragmentPlan {
             }
 
             slices.push(GridFragmentSlice {
-                source_block_start: slice.slice_start,
-                source_block_end: slice.slice_end,
+                source_block_start: GridFragmentBlockOffset::new(slice.slice_start),
+                source_block_end: GridFragmentBlockOffset::new(slice.slice_end),
                 break_after: GridFragmentBreak::SlicedRowBand,
             });
-            source_block_start = slice.slice_end;
+            source_block_start = GridFragmentBlockOffset::new(slice.slice_end);
             available_block_end = source_block_start + empty_fragmentainer_block_size;
         }
 
@@ -345,7 +410,10 @@ impl GridFragmentPlan {
 }
 
 impl GridFragmentRecord {
-    pub(in crate::layout::grid) fn cursor(self, content_top: f32) -> GridFragmentCursor {
+    pub(in crate::layout::grid) fn cursor(
+        self,
+        content_top: PageTopBlockPosition,
+    ) -> GridFragmentCursor {
         GridFragmentCursor::new(content_top, self.slice.source_block_start)
     }
 
@@ -358,14 +426,15 @@ impl GridFragmentRecord {
 
     pub(in crate::layout::grid) fn paint_clip(
         self,
-        outer_x: f32,
-        outer_width: f32,
+        border_box_inline_span: PageInlineSpan,
         cursor: GridFragmentCursor,
     ) -> PaintClip {
-        cursor.slice_paint_clip(self.slice, outer_x, outer_width)
+        cursor.slice_paint_clip(self.slice, border_box_inline_span)
     }
 
-    pub(in crate::layout::grid) fn source_range(self) -> (f32, f32) {
+    pub(in crate::layout::grid) fn source_range(
+        self,
+    ) -> (GridFragmentBlockOffset, GridFragmentBlockOffset) {
         (self.slice.source_block_start, self.slice.source_block_end)
     }
 }
@@ -373,7 +442,7 @@ impl GridFragmentRecord {
 impl GridFragmentTransition {
     pub(in crate::layout::grid) fn initial_overflow(
         fragmentainer_kind: FragmentainerKind,
-        next_block_offset: f32,
+        next_block_offset: GridFragmentBlockOffset,
     ) -> Self {
         Self {
             fragmentainer_kind,
@@ -384,7 +453,7 @@ impl GridFragmentTransition {
 
     pub(in crate::layout::grid) fn slice_continuation(
         fragmentainer_kind: FragmentainerKind,
-        next_block_offset: f32,
+        next_block_offset: GridFragmentBlockOffset,
     ) -> Self {
         Self {
             fragmentainer_kind,
@@ -400,36 +469,51 @@ impl GridFragmentTransition {
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
     pub(in crate::layout::grid) fn cursor_after_fragmentainer_advance(
         self,
-        content_top: f32,
+        content_top: PageTopBlockPosition,
     ) -> GridFragmentCursor {
         GridFragmentCursor::new(content_top, self.next_block_offset)
     }
 }
 
 impl GridFragmentCursor {
-    pub(in crate::layout::grid) fn new(content_top: f32, block_offset: f32) -> Self {
+    pub(in crate::layout::grid) fn new(
+        content_top: PageTopBlockPosition,
+        block_offset: GridFragmentBlockOffset,
+    ) -> Self {
         Self {
             content_top,
             block_offset,
         }
     }
 
-    pub(in crate::layout::grid) fn source_block_y(self, source_block_offset: f32) -> f32 {
-        self.content_top - (source_block_offset - self.block_offset)
+    pub(in crate::layout::grid) fn source_block_y(
+        self,
+        source_block_offset: GridFragmentBlockOffset,
+    ) -> PageTopBlockPosition {
+        self.content_top
+            .toward_block_end((source_block_offset - self.block_offset).layout_length())
+    }
+
+    /// Return the page-top origin for grid-local rectangles in this fragment.
+    pub(in crate::layout::grid) fn grid_container_origin(self, inline_x: f32) -> PageTopPoint {
+        PageTopPoint::from_inline_x_and_block_position(
+            inline_x,
+            self.content_top
+                .toward_block_start(self.block_offset.layout_length()),
+        )
     }
 
     pub(in crate::layout::grid) fn slice_paint_clip(
         self,
         slice: GridFragmentSlice,
-        outer_x: f32,
-        outer_width: f32,
+        border_box_inline_span: PageInlineSpan,
     ) -> PaintClip {
-        let slice_height = (slice.source_block_end - slice.source_block_start).max(0.0);
+        let slice_height = (slice.source_block_end - slice.source_block_start).layout_length();
         PaintClip::from_paint_rect(paint_space_rect(
-            outer_x,
-            self.source_block_y(slice.source_block_end),
-            outer_width,
-            slice_height,
+            border_box_inline_span.left_x(),
+            self.source_block_y(slice.source_block_end).points(),
+            border_box_inline_span.width(),
+            slice_height.points(),
         ))
     }
 }
@@ -442,8 +526,8 @@ impl GridItemFragment {
     /// <https://www.w3.org/TR/css-break-3/#box-splitting> and
     /// <https://www.w3.org/TR/css-grid-1/#pagination>.
     pub(in crate::layout::grid) fn requires_split_replay(&self) -> bool {
-        self.content_slice.block_start > GRID_FRAGMENT_EPSILON
-            || self.content_slice.block_end
+        self.content_slice.block_start.points() > GRID_FRAGMENT_EPSILON
+            || self.content_slice.block_end.points()
                 < self.original.height().max(0.0) - GRID_FRAGMENT_EPSILON
     }
 }
@@ -460,8 +544,8 @@ impl GridFragmentSlice {
     fn item_fragment(self, item_index: usize, item: &GridItemLayout) -> Option<GridItemFragment> {
         let item_block_start = item.y();
         let item_block_end = item.y() + item.height().max(0.0);
-        let slice_block_start = item_block_start.max(self.source_block_start);
-        let slice_block_end = item_block_end.min(self.source_block_end);
+        let slice_block_start = item_block_start.max(self.source_block_start.points());
+        let slice_block_end = item_block_end.min(self.source_block_end.points());
         if slice_block_end <= slice_block_start + GRID_FRAGMENT_EPSILON {
             return None;
         }
@@ -472,8 +556,12 @@ impl GridFragmentSlice {
             original: item.clone(),
             visible,
             content_slice: GridFragmentItemContentSlice {
-                block_start: (slice_block_start - item_block_start).max(0.0),
-                block_end: (slice_block_end - item_block_start).min(item.height().max(0.0)),
+                block_start: GridFragmentBlockOffset::new(
+                    (slice_block_start - item_block_start).max(0.0),
+                ),
+                block_end: GridFragmentBlockOffset::new(
+                    (slice_block_end - item_block_start).min(item.height().max(0.0)),
+                ),
             },
             metadata: FragmentPageMetadata::empty(0),
         })
@@ -522,7 +610,7 @@ impl GridRowBreakBoundary {
 
     fn neutral(source_block_offset: f32) -> Self {
         Self {
-            source_block_offset,
+            source_block_offset: GridFragmentBlockOffset::new(source_block_offset),
             break_before: PageBreak::Auto,
             break_after: PageBreak::Auto,
             break_inside_avoid: false,
@@ -531,7 +619,7 @@ impl GridRowBreakBoundary {
 
     fn break_opportunity(self) -> FragmentBreakOpportunity {
         FragmentBreakOpportunity {
-            source_block_offset: self.source_block_offset,
+            source_block_offset: self.source_block_offset.points(),
             break_before: self.break_before,
             break_after: self.break_after,
             break_inside_avoid: self.break_inside_avoid,
@@ -559,11 +647,19 @@ fn grid_item_row_line_range(item: &GridItemLayout, line_base: u16) -> Option<(us
 mod tests {
     use super::*;
 
+    fn fragmentainer(block_size: f32, available_size: f32) -> Fragmentainer {
+        Fragmentainer::new(layout_pt(block_size), layout_pt(available_size))
+    }
+
+    const fn offset(points: f32) -> GridFragmentBlockOffset {
+        GridFragmentBlockOffset::new(points)
+    }
+
     #[test]
     fn grid_fragment_plan_prefers_row_boundaries() {
         let plan = GridFragmentPlan::from_row_boundaries(
             FragmentainerKind::Page,
-            Fragmentainer::new(200.0, 150.0),
+            fragmentainer(200.0, 150.0),
             300.0,
             &[0.0, 80.0, 160.0, 300.0],
         );
@@ -574,21 +670,40 @@ mod tests {
             plan.slices(),
             &[
                 GridFragmentSlice {
-                    source_block_start: 0.0,
-                    source_block_end: 80.0,
+                    source_block_start: offset(0.0),
+                    source_block_end: offset(80.0),
                     break_after: GridFragmentBreak::RowBoundary,
                 },
                 GridFragmentSlice {
-                    source_block_start: 80.0,
-                    source_block_end: 160.0,
+                    source_block_start: offset(80.0),
+                    source_block_end: offset(160.0),
                     break_after: GridFragmentBreak::RowBoundary,
                 },
                 GridFragmentSlice {
-                    source_block_start: 160.0,
-                    source_block_end: 300.0,
+                    source_block_start: offset(160.0),
+                    source_block_end: offset(300.0),
                     break_after: GridFragmentBreak::None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn grid_fragment_plan_uses_typed_remaining_capacity_at_source_boundary() {
+        let plan = GridFragmentPlan::from_row_boundaries(
+            FragmentainerKind::Page,
+            fragmentainer(120.0, 30.0),
+            100.0,
+            &[0.0, 100.0],
+        );
+
+        assert_eq!(
+            plan.slices()[0],
+            GridFragmentSlice {
+                source_block_start: offset(0.0),
+                source_block_end: offset(30.0),
+                break_after: GridFragmentBreak::SlicedRowBand,
+            }
         );
     }
 
@@ -598,7 +713,7 @@ mod tests {
         boundaries[1].break_before = PageBreak::Page;
         let plan = GridFragmentPlan::from_break_boundaries(
             FragmentainerKind::Page,
-            Fragmentainer::new(300.0, 300.0),
+            fragmentainer(300.0, 300.0),
             240.0,
             &boundaries,
         );
@@ -607,13 +722,13 @@ mod tests {
             plan.slices(),
             &[
                 GridFragmentSlice {
-                    source_block_start: 0.0,
-                    source_block_end: 80.0,
+                    source_block_start: offset(0.0),
+                    source_block_end: offset(80.0),
                     break_after: GridFragmentBreak::ForcedRowBoundary,
                 },
                 GridFragmentSlice {
-                    source_block_start: 80.0,
-                    source_block_end: 240.0,
+                    source_block_start: offset(80.0),
+                    source_block_end: offset(240.0),
                     break_after: GridFragmentBreak::None,
                 },
             ]
@@ -627,13 +742,13 @@ mod tests {
 
         let page_plan = GridFragmentPlan::from_break_boundaries(
             FragmentainerKind::Page,
-            Fragmentainer::new(300.0, 300.0),
+            fragmentainer(300.0, 300.0),
             240.0,
             &boundaries,
         );
         let column_plan = GridFragmentPlan::from_break_boundaries(
             FragmentainerKind::Column,
-            Fragmentainer::new(300.0, 300.0),
+            fragmentainer(300.0, 300.0),
             240.0,
             &boundaries,
         );
@@ -641,8 +756,8 @@ mod tests {
         assert_eq!(
             page_plan.slices(),
             &[GridFragmentSlice {
-                source_block_start: 0.0,
-                source_block_end: 240.0,
+                source_block_start: offset(0.0),
+                source_block_end: offset(240.0),
                 break_after: GridFragmentBreak::None,
             }]
         );
@@ -650,13 +765,13 @@ mod tests {
             column_plan.slices(),
             &[
                 GridFragmentSlice {
-                    source_block_start: 0.0,
-                    source_block_end: 80.0,
+                    source_block_start: offset(0.0),
+                    source_block_end: offset(80.0),
                     break_after: GridFragmentBreak::ForcedRowBoundary,
                 },
                 GridFragmentSlice {
-                    source_block_start: 80.0,
-                    source_block_end: 240.0,
+                    source_block_start: offset(80.0),
+                    source_block_end: offset(240.0),
                     break_after: GridFragmentBreak::None,
                 },
             ]
@@ -670,7 +785,7 @@ mod tests {
         boundaries[1].break_inside_avoid = true;
         let plan = GridFragmentPlan::from_break_boundaries(
             FragmentainerKind::Page,
-            Fragmentainer::new(300.0, 150.0),
+            fragmentainer(300.0, 150.0),
             300.0,
             &boundaries,
         );
@@ -678,8 +793,8 @@ mod tests {
         assert_eq!(
             plan.slices()[0],
             GridFragmentSlice {
-                source_block_start: 0.0,
-                source_block_end: 140.0,
+                source_block_start: offset(0.0),
+                source_block_end: offset(140.0),
                 break_after: GridFragmentBreak::RowBoundary,
             }
         );
@@ -689,7 +804,7 @@ mod tests {
     fn grid_fragment_plan_maps_fragments_to_fragmentainer_offsets() {
         let plan = GridFragmentPlan::from_row_boundaries(
             FragmentainerKind::Page,
-            Fragmentainer::new(100.0, 0.0),
+            fragmentainer(100.0, 0.0),
             180.0,
             &[0.0, 90.0, 180.0],
         );
@@ -700,13 +815,13 @@ mod tests {
             Some(GridFragmentRecord {
                 fragmentainer_offset: 1,
                 slice: GridFragmentSlice {
-                    source_block_start: 0.0,
-                    source_block_end: 90.0,
+                    source_block_start: offset(0.0),
+                    source_block_end: offset(90.0),
                     break_after: GridFragmentBreak::RowBoundary,
                 },
                 transition_before_fragment: Some(GridFragmentTransition::initial_overflow(
                     FragmentainerKind::Page,
-                    0.0,
+                    offset(0.0),
                 )),
             })
         );
@@ -715,13 +830,13 @@ mod tests {
             Some(GridFragmentRecord {
                 fragmentainer_offset: 2,
                 slice: GridFragmentSlice {
-                    source_block_start: 90.0,
-                    source_block_end: 180.0,
+                    source_block_start: offset(90.0),
+                    source_block_end: offset(180.0),
                     break_after: GridFragmentBreak::None,
                 },
                 transition_before_fragment: Some(GridFragmentTransition::slice_continuation(
                     FragmentainerKind::Page,
-                    90.0,
+                    offset(90.0),
                 ),),
             })
         );
@@ -731,7 +846,7 @@ mod tests {
     fn grid_fragment_plan_commits_fragment_records_and_transitions() {
         let plan = GridFragmentPlan::from_row_boundaries(
             FragmentainerKind::Page,
-            Fragmentainer::new(120.0, 100.0),
+            fragmentainer(120.0, 100.0),
             260.0,
             &[0.0, 260.0],
         );
@@ -742,8 +857,8 @@ mod tests {
                 GridFragmentRecord {
                     fragmentainer_offset: 0,
                     slice: GridFragmentSlice {
-                        source_block_start: 0.0,
-                        source_block_end: 100.0,
+                        source_block_start: offset(0.0),
+                        source_block_end: offset(100.0),
                         break_after: GridFragmentBreak::SlicedRowBand,
                     },
                     transition_before_fragment: None,
@@ -751,25 +866,25 @@ mod tests {
                 GridFragmentRecord {
                     fragmentainer_offset: 1,
                     slice: GridFragmentSlice {
-                        source_block_start: 100.0,
-                        source_block_end: 220.0,
+                        source_block_start: offset(100.0),
+                        source_block_end: offset(220.0),
                         break_after: GridFragmentBreak::SlicedRowBand,
                     },
                     transition_before_fragment: Some(GridFragmentTransition::slice_continuation(
                         FragmentainerKind::Page,
-                        100.0,
+                        offset(100.0),
                     ),),
                 },
                 GridFragmentRecord {
                     fragmentainer_offset: 2,
                     slice: GridFragmentSlice {
-                        source_block_start: 220.0,
-                        source_block_end: 260.0,
+                        source_block_start: offset(220.0),
+                        source_block_end: offset(260.0),
                         break_after: GridFragmentBreak::None,
                     },
                     transition_before_fragment: Some(GridFragmentTransition::slice_continuation(
                         FragmentainerKind::Page,
-                        220.0,
+                        offset(220.0),
                     ),),
                 },
             ]
@@ -780,7 +895,7 @@ mod tests {
     fn grid_fragment_plan_commits_initial_overflow_transition() {
         let plan = GridFragmentPlan::from_row_boundaries(
             FragmentainerKind::Page,
-            Fragmentainer::new(100.0, 0.0),
+            fragmentainer(100.0, 0.0),
             60.0,
             &[0.0, 60.0],
         );
@@ -790,13 +905,13 @@ mod tests {
             Some(GridFragmentRecord {
                 fragmentainer_offset: 1,
                 slice: GridFragmentSlice {
-                    source_block_start: 0.0,
-                    source_block_end: 60.0,
+                    source_block_start: offset(0.0),
+                    source_block_end: offset(60.0),
                     break_after: GridFragmentBreak::None,
                 },
                 transition_before_fragment: Some(GridFragmentTransition::initial_overflow(
                     FragmentainerKind::Page,
-                    0.0,
+                    offset(0.0),
                 )),
             })
         );
@@ -806,7 +921,7 @@ mod tests {
     fn grid_fragment_transitions_preserve_fragmentainer_kind() {
         let plan = GridFragmentPlan::from_row_boundaries(
             FragmentainerKind::Column,
-            Fragmentainer::new(100.0, 0.0),
+            fragmentainer(100.0, 0.0),
             180.0,
             &[0.0, 90.0, 180.0],
         );
@@ -817,14 +932,14 @@ mod tests {
             fragments[0].transition_before_fragment,
             Some(GridFragmentTransition::initial_overflow(
                 FragmentainerKind::Column,
-                0.0,
+                offset(0.0),
             ))
         );
         assert_eq!(
             fragments[1].transition_before_fragment,
             Some(GridFragmentTransition::slice_continuation(
                 FragmentainerKind::Column,
-                90.0,
+                offset(90.0),
             ))
         );
     }
@@ -834,23 +949,31 @@ mod tests {
         let fragment_record = GridFragmentRecord {
             fragmentainer_offset: 1,
             slice: GridFragmentSlice {
-                source_block_start: 25.0,
-                source_block_end: 75.0,
+                source_block_start: offset(25.0),
+                source_block_end: offset(75.0),
                 break_after: GridFragmentBreak::RowBoundary,
             },
             transition_before_fragment: Some(GridFragmentTransition::slice_continuation(
                 FragmentainerKind::Page,
-                25.0,
+                offset(25.0),
             )),
         };
-        let cursor = fragment_record.cursor(300.0);
-        let clip = fragment_record.paint_clip(10.0, 120.0, cursor);
+        let cursor = fragment_record.cursor(PageTopBlockPosition::new(300.0));
+        let clip = fragment_record.paint_clip(PageInlineSpan::new(10.0, 120.0), cursor);
 
         assert_eq!(clip.x(), 10.0);
         assert_eq!(clip.y(), 250.0);
         assert_eq!(clip.width(), 120.0);
         assert_eq!(clip.height(), 50.0);
-        assert_eq!(fragment_record.source_range(), (25.0, 75.0));
+        assert_eq!(
+            cursor.source_block_y(offset(75.0)),
+            PageTopBlockPosition::new(250.0)
+        );
+        assert_eq!(
+            cursor.grid_container_origin(10.0),
+            PageTopPoint::new(10.0, 325.0)
+        );
+        assert_eq!(fragment_record.source_range(), (offset(25.0), offset(75.0)));
     }
 
     #[test]
@@ -858,13 +981,13 @@ mod tests {
         let fragment_record = GridFragmentRecord {
             fragmentainer_offset: 1,
             slice: GridFragmentSlice {
-                source_block_start: 50.0,
-                source_block_end: 150.0,
+                source_block_start: offset(50.0),
+                source_block_end: offset(150.0),
                 break_after: GridFragmentBreak::RowBoundary,
             },
             transition_before_fragment: Some(GridFragmentTransition::slice_continuation(
                 FragmentainerKind::Page,
-                50.0,
+                offset(50.0),
             )),
         };
         let items = [
@@ -895,14 +1018,16 @@ mod tests {
         assert_eq!(fragments[0].visible.y(), 50.0);
         assert_eq!(fragments[0].visible.height(), 75.0);
         assert_eq!(
-            fragments[0].visible.page_top_rect(100.0, 300.0),
+            fragments[0]
+                .visible
+                .page_top_rect(PageTopPoint::new(100.0, 300.0)),
             PageTopRect::new(110.0, 250.0, 60.0, 75.0)
         );
         assert_eq!(
             fragments[0].content_slice,
             GridFragmentItemContentSlice {
-                block_start: 25.0,
-                block_end: 100.0,
+                block_start: offset(25.0),
+                block_end: offset(100.0),
             }
         );
         let area = fragments[0]
@@ -919,8 +1044,8 @@ mod tests {
         assert_eq!(
             fragments[1].content_slice,
             GridFragmentItemContentSlice {
-                block_start: 0.0,
-                block_end: 10.0,
+                block_start: offset(0.0),
+                block_end: offset(10.0),
             }
         );
 
@@ -936,13 +1061,13 @@ mod tests {
         let fragment_record = GridFragmentRecord {
             fragmentainer_offset: 1,
             slice: GridFragmentSlice {
-                source_block_start: 40.0,
-                source_block_end: 100.0,
+                source_block_start: offset(40.0),
+                source_block_end: offset(100.0),
                 break_after: GridFragmentBreak::RowBoundary,
             },
             transition_before_fragment: Some(GridFragmentTransition::slice_continuation(
                 FragmentainerKind::Page,
-                40.0,
+                offset(40.0),
             )),
         };
         let items = [
@@ -968,7 +1093,7 @@ mod tests {
     fn grid_fragment_plan_slices_oversized_row_band() {
         let plan = GridFragmentPlan::from_row_boundaries(
             FragmentainerKind::Page,
-            Fragmentainer::new(120.0, 100.0),
+            fragmentainer(120.0, 100.0),
             260.0,
             &[0.0, 260.0],
         );
@@ -977,18 +1102,18 @@ mod tests {
             plan.slices(),
             &[
                 GridFragmentSlice {
-                    source_block_start: 0.0,
-                    source_block_end: 100.0,
+                    source_block_start: offset(0.0),
+                    source_block_end: offset(100.0),
                     break_after: GridFragmentBreak::SlicedRowBand,
                 },
                 GridFragmentSlice {
-                    source_block_start: 100.0,
-                    source_block_end: 220.0,
+                    source_block_start: offset(100.0),
+                    source_block_end: offset(220.0),
                     break_after: GridFragmentBreak::SlicedRowBand,
                 },
                 GridFragmentSlice {
-                    source_block_start: 220.0,
-                    source_block_end: 260.0,
+                    source_block_start: offset(220.0),
+                    source_block_end: offset(260.0),
                     break_after: GridFragmentBreak::None,
                 },
             ]
@@ -999,7 +1124,7 @@ mod tests {
     fn grid_fragment_plan_advances_when_current_fragmentainer_has_no_space() {
         let plan = GridFragmentPlan::from_row_boundaries(
             FragmentainerKind::Page,
-            Fragmentainer::new(100.0, 0.0),
+            fragmentainer(100.0, 0.0),
             60.0,
             &[0.0, 60.0],
         );
@@ -1008,8 +1133,8 @@ mod tests {
         assert_eq!(
             plan.slices(),
             &[GridFragmentSlice {
-                source_block_start: 0.0,
-                source_block_end: 60.0,
+                source_block_start: offset(0.0),
+                source_block_end: offset(60.0),
                 break_after: GridFragmentBreak::None,
             }]
         );

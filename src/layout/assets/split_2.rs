@@ -1,4 +1,5 @@
 use super::*;
+use crate::document::PaintPatternTiling;
 use std::rc::Rc;
 
 /// A CSS background positioning or clipping area in one bottom-left-origin
@@ -17,8 +18,6 @@ pub(in crate::layout) struct BackgroundArea<Space>(euclid::Rect<f32, Space>);
 pub(in crate::layout) type PaintBackgroundArea = BackgroundArea<PaintSpace>;
 /// A background area positioned on the assembled document canvas.
 pub(in crate::layout) type DocumentCanvasBackgroundArea = BackgroundArea<DocumentCanvasSpace>;
-/// High-precision tile displacement in page-local paint space.
-type PaintBackgroundOffset = euclid::Vector2D<f64, PaintSpace>;
 
 impl<Space> BackgroundArea<Space> {
     pub(in crate::layout) fn new(
@@ -45,6 +44,10 @@ impl<Space> BackgroundArea<Space> {
 
     pub(in crate::layout) fn height(&self) -> f32 {
         self.0.size.height
+    }
+
+    pub(in crate::layout) fn size(&self) -> euclid::Size2D<f32, Space> {
+        self.0.size
     }
 
     pub(in crate::layout) fn inset(self, edges: css::Edges) -> Self {
@@ -102,6 +105,7 @@ struct BackgroundPaintAreas<Space> {
     positioning_border_area: BackgroundArea<Space>,
     clip_border_area: BackgroundArea<Space>,
     fixed_positioning_area: Option<BackgroundArea<Space>>,
+    fixed_attachment_is_scrolled_by_transform: bool,
 }
 
 /// Fully resolved geometry for one CSS background layer.
@@ -128,19 +132,13 @@ impl ResolvedBackgroundTile {
         layer: &css::BackgroundLayer,
         size: PaintSize,
     ) -> Self {
-        let (offset_x, offset_y) = background_position(
-            layer.position.clone(),
-            positioning_area.width(),
-            positioning_area.height(),
-            size.width,
-            size.height,
-        );
+        let offset = background_position(layer.position.clone(), positioning_area.size(), size);
         Self {
             positioning_area,
             clip_area,
             rounded_clip,
             size,
-            offset: PaintBackgroundOffset::new(offset_x, offset_y),
+            offset,
             repeat: layer.repeat,
         }
     }
@@ -210,6 +208,7 @@ pub(in crate::layout) fn background_image_primitives_for_style(
         area,
         area,
         None,
+        style.has_transform(),
         style,
         fallback_base_url,
         fallback_root_url,
@@ -229,6 +228,7 @@ pub(in crate::layout) fn background_image_primitives_for_style_with_paint_areas(
         positioning_border_area,
         clip_border_area,
         None,
+        style.has_transform(),
         style,
         fallback_base_url,
         fallback_root_url,
@@ -244,10 +244,12 @@ pub(in crate::layout) fn background_image_primitives_for_style_with_paint_areas(
 /// containing block supplied by the caller). This keeps attachment separate
 /// from origin and clip geometry.
 /// <https://www.w3.org/TR/css-backgrounds-3/#the-background-attachment>
+#[allow(clippy::too_many_arguments)]
 pub(in crate::layout) fn background_image_primitives_for_style_with_paint_areas_and_fixed_positioning_area(
     positioning_border_area: PaintBackgroundArea,
     clip_border_area: PaintBackgroundArea,
     fixed_positioning_area: Option<PaintBackgroundArea>,
+    fixed_attachment_is_scrolled_by_transform: bool,
     style: &ComputedStyle,
     fallback_base_url: Option<&url::Url>,
     fallback_root_url: Option<&url::Url>,
@@ -258,6 +260,7 @@ pub(in crate::layout) fn background_image_primitives_for_style_with_paint_areas_
             positioning_border_area,
             clip_border_area,
             fixed_positioning_area,
+            fixed_attachment_is_scrolled_by_transform,
         },
         style,
         fallback_base_url,
@@ -279,12 +282,14 @@ fn background_image_primitives_for_style_impl(
         positioning_border_area,
         clip_border_area,
         fixed_positioning_area,
+        fixed_attachment_is_scrolled_by_transform,
     } = paint_areas;
     let mut primitives = Vec::new();
     for layer in background_layers_for_paint(style).iter().rev() {
         let positioning_area = background_positioning_area_for_layer(
             positioning_border_area,
             fixed_positioning_area,
+            fixed_attachment_is_scrolled_by_transform,
             style,
             layer,
         );
@@ -305,8 +310,8 @@ fn background_image_primitives_for_style_impl(
             used_border_widths(style),
             clip_box,
         );
-        let color_image = match layer.image.as_ref().map(BackgroundImage::selected_image) {
-            Some(BackgroundImage::Color(color)) => Some(color.resolve(style.color)),
+        let color_image = match layer.image.as_image().map(BackgroundImage::selected_image) {
+            Some(BackgroundImage::CssColor(color)) => Some(color.resolve(style.color)),
             _ => None,
         };
         if let Some(BackgroundImage::Url {
@@ -314,27 +319,21 @@ fn background_image_primitives_for_style_impl(
             base_url,
             root_url,
             request_modifiers,
-        }) = layer.image.as_ref().map(BackgroundImage::selected_image)
+        }) = layer.image.as_image().map(BackgroundImage::selected_image)
             && let Some(ResolvedImageAsset::Svg(asset)) = load_resolved_image_source_with_request(
                 src,
                 base_url.as_ref().or(fallback_base_url),
                 root_url.as_ref().or(fallback_root_url),
                 resource_cache,
-                style.image_rendering != css::ImageRendering::Pixelated,
+                raster_image_interpolation(style),
                 request_modifiers,
             )
         {
-            let image_size = used_svg_background_layer_size(
-                &asset,
-                layer,
-                positioning_area.width(),
-                positioning_area.height(),
-            );
+            let image_size = used_svg_background_layer_size(&asset, layer, positioning_area.size());
             if image_size.width <= 0.0 || image_size.height <= 0.0 {
                 continue;
             }
-            let asset =
-                Rc::new(asset.with_background_viewport(image_size.width, image_size.height));
+            let asset = Rc::new(asset.with_background_viewport(image_size));
             let tile = ResolvedBackgroundTile::new(
                 positioning_area,
                 clip_area,
@@ -399,11 +398,11 @@ fn background_image_primitives_for_style_impl(
                 if step_width > 0.0 && step_height > 0.0 && !paths.is_empty() {
                     primitives.push(PaintPrimitive::SvgPattern(RenderedSvgPattern::new(
                         area.paint_rect(),
-                        tile.size.width,
-                        tile.size.height,
-                        step_width,
-                        step_height,
-                        PaintPoint::new(origin_x, origin_y),
+                        PaintPatternTiling::new(
+                            tile.size,
+                            PaintSize::new(step_width, step_height),
+                            PaintPoint::new(origin_x, origin_y),
+                        ),
                         paths,
                         tile.rounded_clip.clone(),
                     )));
@@ -429,7 +428,8 @@ fn background_image_primitives_for_style_impl(
             }
             continue;
         }
-        let Some(selected_image) = layer.image.as_ref().map(BackgroundImage::selected_image) else {
+        let Some(selected_image) = layer.image.as_image().map(BackgroundImage::selected_image)
+        else {
             continue;
         };
         let generated_image = matches!(
@@ -437,7 +437,7 @@ fn background_image_primitives_for_style_impl(
             BackgroundImage::LinearGradient(_)
                 | BackgroundImage::RadialGradient(_)
                 | BackgroundImage::ConicGradient(_)
-                | BackgroundImage::Color(_)
+                | BackgroundImage::CssColor(_)
         );
         // Generated CSS images have no intrinsic dimensions, so their used
         // background size is known before a raster recipe exists. This is the
@@ -452,25 +452,17 @@ fn background_image_primitives_for_style_impl(
                     fallback_root_url,
                     resource_cache,
                     style.image_orientation == css::ImageOrientation::FromImage,
+                    style.color,
                 )
             })
             .flatten();
         let image_size = if generated_image {
-            used_generated_background_layer_size(
-                layer,
-                positioning_area.width(),
-                positioning_area.height(),
-            )
+            used_generated_background_layer_size(layer, positioning_area.size())
         } else {
             let Some(decoded) = decoded_for_size.as_ref() else {
                 continue;
             };
-            used_background_layer_size(
-                decoded,
-                layer,
-                positioning_area.width(),
-                positioning_area.height(),
-            )
+            used_background_layer_size(decoded, layer, positioning_area.size())
         };
         if image_size.width <= 0.0 || image_size.height <= 0.0 {
             continue;
@@ -495,11 +487,16 @@ fn background_image_primitives_for_style_impl(
             append_color_image_primitives(&mut primitives, color, &tile);
             continue;
         }
-        if let Some(color) = uniform_gradient_color(selected_image) {
+        if let Some(color) = uniform_gradient_color(selected_image, style.color) {
             append_color_image_primitives(&mut primitives, color, &tile);
             continue;
         }
-        if let BackgroundImage::LinearGradient(gradient) = selected_image {
+        if let BackgroundImage::LinearGradient(gradient) = selected_image
+            && !gradient
+                .stops
+                .iter()
+                .any(|stop| stop.color.is_current_color())
+        {
             let mut hard_stop_paths = Vec::new();
             let mut all_tiles_are_vector_hard_stops = true;
             for tile_area in tile.tiles() {
@@ -523,7 +520,12 @@ fn background_image_primitives_for_style_impl(
                 continue;
             }
         }
-        if append_native_css_gradient_primitives(&mut primitives, selected_image, &tile) {
+        if append_native_css_gradient_primitives(
+            &mut primitives,
+            selected_image,
+            &tile,
+            style.color,
+        ) {
             continue;
         }
         let Some(decoded) = decoded_for_size.or_else(|| {
@@ -534,6 +536,7 @@ fn background_image_primitives_for_style_impl(
                 fallback_root_url,
                 resource_cache,
                 style.image_orientation == css::ImageOrientation::FromImage,
+                style.color,
             )
         }) else {
             continue;
@@ -550,7 +553,7 @@ fn background_image_primitives_for_style_impl(
         let can_emit_pattern = use_pdf_patterns_for_repeated_images
             && layer
                 .image
-                .as_ref()
+                .as_image()
                 .is_some_and(background_image_can_use_pdf_pattern)
             && (layer.repeat.repeats_x() || layer.repeat.repeats_y());
         if can_emit_pattern {
@@ -593,15 +596,15 @@ fn background_image_primitives_for_style_impl(
             let mut pattern = RenderedImagePattern::from_paint_rect(
                 pattern_area.paint_rect(),
                 true,
-                tile.size.width,
-                tile.size.height,
-                step_width,
-                step_height,
-                PaintPoint::new(origin_x, origin_y),
+                PaintPatternTiling::new(
+                    tile.size,
+                    PaintSize::new(step_width, step_height),
+                    PaintPoint::new(origin_x, origin_y),
+                ),
                 decoded.pixel_width,
                 decoded.pixel_height,
-                background_raster_interpolation(style),
-                Rc::clone(&decoded.rgb),
+                raster_image_interpolation(style),
+                decoded.rgb.shared(),
                 decoded.alpha.clone(),
             )
             .with_raster_color_space(decoded.color_space.clone())
@@ -619,17 +622,18 @@ fn background_image_primitives_for_style_impl(
                 decoded.pixel_width,
                 decoded.pixel_height,
                 None,
-                background_raster_interpolation(style),
-                Rc::clone(&decoded.rgb),
+                raster_image_interpolation(style),
+                decoded.rgb.shared(),
                 decoded.alpha.clone(),
                 None,
             )
             .with_raster_color_space(decoded.color_space.clone())
             .with_image_id(decoded.image_id);
-            if let Some(mut image) = crop_image_to_paint_area(image, tile.clip_area) {
-                if let Some(clip) = tile.rounded_clip.clone() {
-                    image = image.with_clip(clip);
-                }
+            if let Some(image) = clip_background_image_to_paint_area(
+                image,
+                tile.clip_area,
+                tile.rounded_clip.clone(),
+            ) {
                 primitives.push(PaintPrimitive::Image(image));
             }
         }
@@ -645,32 +649,30 @@ fn background_image_primitives_for_style_impl(
 /// has identical sampling at the same used CSS size. `pixelated` likewise
 /// forbids interpolation.
 /// <https://drafts.csswg.org/css-images-4/#propdef-image-rendering>
-pub(in crate::layout) fn background_raster_interpolation(_style: &ComputedStyle) -> bool {
+pub(in crate::layout) fn raster_image_interpolation(_style: &ComputedStyle) -> bool {
     false
 }
 
 fn used_svg_background_layer_size(
     asset: &SharedSvgAsset,
     layer: &css::BackgroundLayer,
-    area_width: f32,
-    area_height: f32,
+    positioning_area: PaintSize,
 ) -> PaintSize {
     if asset.has_degenerate_view_box() {
         return PaintSize::new(0.0, 0.0);
     }
     let intrinsic = asset.intrinsic_dimensions();
     let mut size = used_background_size_from_intrinsic_dimensions(
-        area_width,
-        area_height,
+        positioning_area,
         layer.size.clone(),
-        BackgroundIntrinsicDimensions {
-            width: intrinsic.width,
-            height: intrinsic.height,
-            aspect_ratio: intrinsic.aspect_ratio,
-        },
+        CssImageNaturalDimensions::from_layout_axes(
+            intrinsic.width,
+            intrinsic.height,
+            intrinsic.aspect_ratio,
+        ),
     );
     if layer.repeat.x_axis() == css::BackgroundRepeatAxis::Round {
-        size.width = rounded_background_tile_size(size.width, area_width);
+        size.width = rounded_background_tile_size(size.width, positioning_area.width);
         if matches!(
             layer.size,
             css::BackgroundSize::Auto
@@ -684,7 +686,7 @@ fn used_svg_background_layer_size(
         }
     }
     if layer.repeat.y_axis() == css::BackgroundRepeatAxis::Round {
-        size.height = rounded_background_tile_size(size.height, area_height);
+        size.height = rounded_background_tile_size(size.height, positioning_area.height);
         if matches!(
             layer.size,
             css::BackgroundSize::Auto
@@ -707,7 +709,7 @@ fn used_svg_background_layer_size(
 /// <https://drafts.csswg.org/css-images-4/#image-notation>
 fn append_color_image_primitives(
     primitives: &mut Vec<PaintPrimitive>,
-    color: Color,
+    color: CssColor,
     resolved: &ResolvedBackgroundTile,
 ) {
     let x_tiles = color_image_axis_tiles(
@@ -764,7 +766,7 @@ fn append_color_image_primitives(
 /// a general path clipping scope.
 fn uniform_background_rect_primitive(
     area: PaintBackgroundArea,
-    color: Color,
+    color: CssColor,
     rounded_clip: Option<RenderedPathClip>,
 ) -> PaintPrimitive {
     if rounded_clip.is_none() {
@@ -778,7 +780,7 @@ fn uniform_background_rect_primitive(
             Some(color),
             RenderedPathFillRule::NonZero,
             None,
-            0.0,
+            PaintStrokeWidth::ZERO,
             rounded_clip,
         ))
     }
@@ -892,23 +894,90 @@ fn non_repeating_svg_visible_area(
 
 /// Returns the exact paint for a spatially uniform generated gradient.
 ///
-/// Color-stop fixup changes positions but not stop colors, so identical source
+/// CssColor-stop fixup changes positions but not stop colors, so identical source
 /// colors are uniform irrespective of omitted positions, hints, or direction.
 /// <https://www.w3.org/TR/css-images-3/#coloring-gradient-line>
-fn uniform_gradient_color(image: &BackgroundImage) -> Option<Color> {
-    let stops = match image {
-        BackgroundImage::LinearGradient(gradient) => &gradient.stops,
-        BackgroundImage::RadialGradient(gradient) => &gradient.stops,
+fn uniform_gradient_color(image: &BackgroundImage, current_color: CssColor) -> Option<CssColor> {
+    let (stops, interpolation) = match image {
+        BackgroundImage::LinearGradient(gradient) => (
+            gradient
+                .stops
+                .iter()
+                .map(|stop| stop.color)
+                .collect::<Vec<_>>(),
+            gradient.interpolation,
+        ),
+        BackgroundImage::RadialGradient(gradient) => (
+            gradient
+                .stops
+                .iter()
+                .map(|stop| stop.color)
+                .collect::<Vec<_>>(),
+            gradient.interpolation,
+        ),
+        BackgroundImage::ConicGradient(gradient) => (
+            gradient
+                .stops
+                .iter()
+                .map(|stop| stop.color)
+                .collect::<Vec<_>>(),
+            gradient.interpolation,
+        ),
         BackgroundImage::ImageSet { .. }
         | BackgroundImage::Url { .. }
-        | BackgroundImage::ConicGradient(_)
-        | BackgroundImage::Color(_) => return None,
+        | BackgroundImage::CssColor(_) => {
+            return None;
+        }
     };
-    let first = stops.first()?.color;
-    stops
-        .iter()
-        .all(|stop| stop.color == first)
-        .then_some(first)
+    uniform_gradient_stop_color(&stops, interpolation, current_color)
+}
+
+/// Determines whether a color line is constant after CSS CssColor's
+/// missing-component and analogous-component fixup. Comparing specified stop
+/// colors alone is insufficient: `rgb(none 255 none), yellow` is a uniform
+/// yellow gradient even though its computed stop coordinates differ.
+fn uniform_gradient_stop_color(
+    stops: &[css::GradientColor],
+    interpolation: css::GradientInterpolationMethod,
+    current_color: CssColor,
+) -> Option<CssColor> {
+    let first = *stops.first()?;
+    if stops.len() == 1 {
+        return Some(first.resolve(current_color));
+    }
+    let first_color = first.resolve(current_color);
+    if stops.iter().all(|stop| {
+        stop.missing_components_for(interpolation).is_empty()
+            && stop.resolve(current_color) == first_color
+    }) {
+        return Some(first_color);
+    }
+    let mut uniform = None;
+    for pair in stops.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        let start_color = crate::color::interpolate_color_with_missing(
+            start.resolve(current_color),
+            end.resolve(current_color),
+            interpolation,
+            0.0,
+            start.missing_components_for(interpolation).bits(),
+            end.missing_components_for(interpolation).bits(),
+        );
+        let end_color = crate::color::interpolate_color_with_missing(
+            start.resolve(current_color),
+            end.resolve(current_color),
+            interpolation,
+            1.0,
+            start.missing_components_for(interpolation).bits(),
+            end.missing_components_for(interpolation).bits(),
+        );
+        if start_color != end_color || uniform.is_some_and(|color| color != start_color) {
+            return None;
+        }
+        uniform = Some(start_color);
+    }
+    uniform
 }
 
 /// Emits CSS linear and radial gradients as PDF shading patterns. Repeating
@@ -920,10 +989,20 @@ fn append_native_css_gradient_primitives(
     primitives: &mut Vec<PaintPrimitive>,
     image: &BackgroundImage,
     resolved: &ResolvedBackgroundTile,
+    current_color: CssColor,
 ) -> bool {
+    if !gradient_interpolation_can_use_native_shading(image) {
+        return false;
+    }
     let gradient = match image {
-        BackgroundImage::LinearGradient(gradient) => linear_gradient_paint(gradient, resolved.size),
-        BackgroundImage::RadialGradient(gradient) => radial_gradient_paint(gradient, resolved.size),
+        BackgroundImage::LinearGradient(gradient) => linear_gradient_paint(
+            &gradient.resolve_current_color(current_color),
+            resolved.size,
+        ),
+        BackgroundImage::RadialGradient(gradient) => radial_gradient_paint(
+            &gradient.resolve_current_color(current_color),
+            resolved.size,
+        ),
         _ => None,
     };
     let Some(gradient) = gradient else {
@@ -962,11 +1041,11 @@ fn append_native_css_gradient_primitives(
             primitives.push(PaintPrimitive::GradientPattern(
                 RenderedGradientPattern::new(
                     area.paint_rect(),
-                    resolved.size.width,
-                    resolved.size.height,
-                    step_width,
-                    step_height,
-                    PaintPoint::new(origin_x, origin_y),
+                    PaintPatternTiling::new(
+                        resolved.size,
+                        PaintSize::new(step_width, step_height),
+                        PaintPoint::new(origin_x, origin_y),
+                    ),
                     gradient,
                     resolved.rounded_clip.clone(),
                 ),
@@ -986,11 +1065,11 @@ fn append_native_css_gradient_primitives(
         primitives.push(PaintPrimitive::GradientPattern(
             RenderedGradientPattern::new(
                 tile.paint_rect(),
-                resolved.size.width,
-                resolved.size.height,
-                resolved.size.width,
-                resolved.size.height,
-                PaintPoint::new(tile_area.x(), tile_area.y()),
+                PaintPatternTiling::new(
+                    resolved.size,
+                    resolved.size,
+                    PaintPoint::new(tile_area.x(), tile_area.y()),
+                ),
                 gradient.clone(),
                 resolved.rounded_clip.clone(),
             ),
@@ -1008,12 +1087,13 @@ fn linear_gradient_paint(
         PaintRect::new(PaintPoint::new(0.0, 0.0), size),
     );
     let mut fixed_stops = fixed_gradient_stops(gradient, line.axis_length)?;
-    let color_space = resolve_fixed_gradient_colors(&mut fixed_stops);
+    let color_space = resolve_fixed_gradient_colors(&mut fixed_stops, gradient.interpolation);
     let program = resolve_gradient_program(
         fixed_stops,
         &gradient.hints,
         line.axis_length,
         gradient.repeating,
+        gradient.interpolation,
     )?;
     let periodic = periodic_pdf_gradient(&program, line.axis_length);
     let stops = repeating_gradient_average_color(&program, line.axis_length).map_or_else(
@@ -1054,7 +1134,7 @@ fn radial_gradient_paint(
 ) -> Option<RenderedGradient> {
     let geometry = used_radial_gradient_geometry(gradient, size)?;
     let mut fixed_stops = fixed_radial_gradient_stops(gradient, geometry.axis_length)?;
-    let color_space = resolve_fixed_gradient_colors(&mut fixed_stops);
+    let color_space = resolve_fixed_gradient_colors(&mut fixed_stops, gradient.interpolation);
     let domain_scale = if gradient.repeating {
         radial_gradient_paint_domain_scale(geometry, size)
     } else {
@@ -1066,6 +1146,7 @@ fn radial_gradient_paint(
         &gradient.hints,
         geometry.axis_length,
         gradient.repeating,
+        gradient.interpolation,
     )?;
     let periodic = periodic_pdf_gradient(&program, domain_length);
     let stops = repeating_gradient_average_color(&program, domain_length).map_or_else(
@@ -1125,6 +1206,7 @@ struct ResolvedGradientProgram {
     stops: Vec<FixedGradientStop>,
     interval_exponents: Vec<f32>,
     repeat_period: Option<f32>,
+    interpolation: css::GradientInterpolationMethod,
 }
 
 fn resolve_gradient_program(
@@ -1132,6 +1214,7 @@ fn resolve_gradient_program(
     hints: &[css::GradientColorHint],
     color_line_length: f32,
     repeating: bool,
+    interpolation: css::GradientInterpolationMethod,
 ) -> Option<ResolvedGradientProgram> {
     let first = stops.first()?;
     let last = stops.last()?;
@@ -1140,6 +1223,7 @@ fn resolve_gradient_program(
         interval_exponents: gradient_interval_exponents(&stops, hints, color_line_length),
         stops,
         repeat_period,
+        interpolation,
     })
 }
 
@@ -1171,7 +1255,7 @@ fn periodic_pdf_gradient(
 fn repeating_gradient_average_color(
     program: &ResolvedGradientProgram,
     domain_length: f32,
-) -> Option<Color> {
+) -> Option<CssColor> {
     if program.repeat_period.is_none() || program.stops.len() < 2 {
         return None;
     }
@@ -1214,26 +1298,26 @@ fn repeating_gradient_average_color(
                 |start: f32, end: f32| (start + (end - start) * progress_average) * weight;
             (
                 red + interpolate(
-                    pair[0].color.r * pair[0].color.a,
-                    pair[1].color.r * pair[1].color.a,
+                    pair[0].color.components()[0] * pair[0].color.alpha(),
+                    pair[1].color.components()[0] * pair[1].color.alpha(),
                 ),
                 green
                     + interpolate(
-                        pair[0].color.g * pair[0].color.a,
-                        pair[1].color.g * pair[1].color.a,
+                        pair[0].color.components()[1] * pair[0].color.alpha(),
+                        pair[1].color.components()[1] * pair[1].color.alpha(),
                     ),
                 blue + interpolate(
-                    pair[0].color.b * pair[0].color.a,
-                    pair[1].color.b * pair[1].color.a,
+                    pair[0].color.components()[2] * pair[0].color.alpha(),
+                    pair[1].color.components()[2] * pair[1].color.alpha(),
                 ),
-                alpha + interpolate(pair[0].color.a, pair[1].color.a),
+                alpha + interpolate(pair[0].color.alpha(), pair[1].color.alpha()),
             )
         },
     );
     Some(if alpha <= 0.0 {
-        Color::in_space(first.color.space(), 0.0, 0.0, 0.0, 0.0)
+        CssColor::in_space(first.color.space(), 0.0, 0.0, 0.0, 0.0)
     } else {
-        Color::in_space(
+        CssColor::in_space(
             first.color.space(),
             red / alpha,
             green / alpha,
@@ -1355,7 +1439,10 @@ fn gradient_interval_exponents(
         .collect()
 }
 
-fn sampled_gradient_program_color(program: &ResolvedGradientProgram, mut position: f32) -> Color {
+fn sampled_gradient_program_color(
+    program: &ResolvedGradientProgram,
+    mut position: f32,
+) -> CssColor {
     let stops = &program.stops;
     if let Some(period) = program.repeat_period {
         if period <= 0.001 {
@@ -1376,7 +1463,14 @@ fn sampled_gradient_program_color(program: &ResolvedGradientProgram, mut positio
             let progress = ((position - pair[0].position) / span)
                 .clamp(0.0, 1.0)
                 .powf(program.interval_exponents[index]);
-            return interpolate_gradient_color(pair[0].color, pair[1].color, progress);
+            return crate::color::interpolate_color_with_missing(
+                pair[0].color,
+                pair[1].color,
+                program.interpolation,
+                progress,
+                pair[0].missing_components.bits(),
+                pair[1].missing_components.bits(),
+            );
         }
     }
     stops.last().expect("non-empty stops").color
@@ -1415,7 +1509,7 @@ fn background_image_can_use_pdf_pattern(image: &BackgroundImage) -> bool {
         BackgroundImage::LinearGradient(gradient) => &gradient.stops,
         BackgroundImage::RadialGradient(gradient) => &gradient.stops,
         BackgroundImage::ConicGradient(_) => return false,
-        BackgroundImage::Color(_) => return true,
+        BackgroundImage::CssColor(_) => return true,
     };
     stops
         .first()
@@ -1429,8 +1523,9 @@ fn background_layer_decoded_image(
     fallback_root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
     apply_orientation: bool,
+    current_color: CssColor,
 ) -> Option<DecodedPngImage> {
-    match layer.image.as_ref()?.selected_image() {
+    match layer.image.as_image()?.selected_image() {
         BackgroundImage::ImageSet { .. } => unreachable!("selected image-set source is unwrapped"),
         BackgroundImage::Url {
             src,
@@ -1446,20 +1541,22 @@ fn background_layer_decoded_image(
             request_modifiers,
         ),
         BackgroundImage::LinearGradient(gradient) => {
-            generated_linear_gradient_image(gradient, size, resource_cache)
+            generated_linear_gradient_image(gradient, size, resource_cache, current_color)
         }
         BackgroundImage::RadialGradient(gradient) => {
-            generated_radial_gradient_image(gradient, size, resource_cache)
+            generated_radial_gradient_image(gradient, size, resource_cache, current_color)
         }
-        BackgroundImage::ConicGradient(gradient) => rasterize_conic_gradient(gradient, size),
-        BackgroundImage::Color(_) => None,
+        BackgroundImage::ConicGradient(gradient) => {
+            rasterize_conic_gradient(gradient, size, current_color)
+        }
+        BackgroundImage::CssColor(_) => None,
     }
 }
 
 pub(in crate::layout) fn rasterize_generated_css_image(
     image: &BackgroundImage,
     size: PaintSize,
-    current_color: Color,
+    current_color: CssColor,
     fallback_base_url: Option<&url::Url>,
     fallback_root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
@@ -1480,38 +1577,41 @@ pub(in crate::layout) fn rasterize_generated_css_image(
             request_modifiers,
         ),
         BackgroundImage::LinearGradient(gradient) => {
-            generated_linear_gradient_image(gradient, size, resource_cache)
+            generated_linear_gradient_image(gradient, size, resource_cache, current_color)
         }
         BackgroundImage::RadialGradient(gradient) => {
-            generated_radial_gradient_image(gradient, size, resource_cache)
+            generated_radial_gradient_image(gradient, size, resource_cache, current_color)
         }
-        BackgroundImage::ConicGradient(gradient) => rasterize_conic_gradient(gradient, size),
-        BackgroundImage::Color(color) => Some(solid_color_image(color.resolve(current_color))),
+        BackgroundImage::ConicGradient(gradient) => {
+            rasterize_conic_gradient(gradient, size, current_color)
+        }
+        BackgroundImage::CssColor(color) => Some(solid_color_image(color.resolve(current_color))),
     }
 }
 
-fn solid_color_image(color: Color) -> DecodedPngImage {
-    // Generated PNGs have an explicit sRGB boundary in this milestone.
-    let color = crate::css::color_to_srgb(color);
+fn solid_color_image(color: CssColor) -> DecodedPngImage {
+    // Generated PNGs are an explicit sRGB encoding boundary.
+    let color = crate::css::color_to_predefined_rgb(color, crate::css::CssColorSpace::Srgb)
+        .expect("sRGB is a predefined CSS RGB space");
     DecodedPngImage::new(
         1,
         1,
         vec![
-            (color.r * 255.0).round().clamp(0.0, 255.0) as u8,
-            (color.g * 255.0).round().clamp(0.0, 255.0) as u8,
-            (color.b * 255.0).round().clamp(0.0, 255.0) as u8,
+            (color.components()[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (color.components()[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (color.components()[2] * 255.0).round().clamp(0.0, 255.0) as u8,
         ],
-        (color.a < 1.0).then_some(vec![(color.a * 255.0).round().clamp(0.0, 255.0) as u8]),
+        (color.alpha() < 1.0)
+            .then_some(vec![(color.alpha() * 255.0).round().clamp(0.0, 255.0) as u8]),
     )
 }
 
 fn used_background_layer_size(
     decoded: &DecodedPngImage,
     layer: &css::BackgroundLayer,
-    area_width: f32,
-    area_height: f32,
+    positioning_area: PaintSize,
 ) -> PaintSize {
-    let Some(image) = layer.image.as_ref() else {
+    let Some(image) = layer.image.as_image() else {
         return PaintSize::new(0.0, 0.0);
     };
     let selected_image = image.selected_image();
@@ -1520,15 +1620,14 @@ fn used_background_layer_size(
         BackgroundImage::LinearGradient(_)
             | BackgroundImage::RadialGradient(_)
             | BackgroundImage::ConicGradient(_)
-            | BackgroundImage::Color(_)
+            | BackgroundImage::CssColor(_)
     );
     let mut size = if generated_image {
-        used_generated_background_size(area_width, area_height, layer.size.clone())
+        used_generated_background_size(positioning_area, layer.size.clone())
     } else {
         used_background_size(
             decoded,
-            area_width,
-            area_height,
+            positioning_area,
             layer.size.clone(),
             image.intrinsic_resolution(),
         )
@@ -1545,13 +1644,13 @@ fn used_background_layer_size(
     let aspect_ratio = (!generated_image && decoded.pixel_height > 0)
         .then(|| decoded.pixel_width as f32 / decoded.pixel_height as f32);
     if layer.repeat.x_axis() == css::BackgroundRepeatAxis::Round {
-        size.width = rounded_background_tile_size(size.width, area_width);
+        size.width = rounded_background_tile_size(size.width, positioning_area.width);
         if height_is_auto && let Some(aspect_ratio) = aspect_ratio {
             size.height = size.width / aspect_ratio;
         }
     }
     if layer.repeat.y_axis() == css::BackgroundRepeatAxis::Round {
-        size.height = rounded_background_tile_size(size.height, area_height);
+        size.height = rounded_background_tile_size(size.height, positioning_area.height);
         if width_is_auto && let Some(aspect_ratio) = aspect_ratio {
             size.width = size.height * aspect_ratio;
         }
@@ -1561,15 +1660,14 @@ fn used_background_layer_size(
 
 fn used_generated_background_layer_size(
     layer: &css::BackgroundLayer,
-    area_width: f32,
-    area_height: f32,
+    positioning_area: PaintSize,
 ) -> PaintSize {
-    let mut size = used_generated_background_size(area_width, area_height, layer.size.clone());
+    let mut size = used_generated_background_size(positioning_area, layer.size.clone());
     if layer.repeat.x_axis() == css::BackgroundRepeatAxis::Round {
-        size.width = rounded_background_tile_size(size.width, area_width);
+        size.width = rounded_background_tile_size(size.width, positioning_area.width);
     }
     if layer.repeat.y_axis() == css::BackgroundRepeatAxis::Round {
-        size.height = rounded_background_tile_size(size.height, area_height);
+        size.height = rounded_background_tile_size(size.height, positioning_area.height);
     }
     size
 }
@@ -1583,17 +1681,18 @@ fn rounded_background_tile_size(tile_size: f32, area_size: f32) -> f32 {
 }
 
 fn used_generated_background_size(
-    area_width: f32,
-    area_height: f32,
+    positioning_area: PaintSize,
     value: css::BackgroundSize,
 ) -> PaintSize {
     match value {
         css::BackgroundSize::Auto | css::BackgroundSize::Cover | css::BackgroundSize::Contain => {
-            PaintSize::new(area_width, area_height)
+            positioning_area
         }
         css::BackgroundSize::Explicit { width, height } => {
-            let used_width = used_background_size_axis(width, area_width).unwrap_or(area_width);
-            let used_height = used_background_size_axis(height, area_height).unwrap_or(area_height);
+            let used_width = used_background_size_axis(width, positioning_area.width)
+                .unwrap_or(positioning_area.width);
+            let used_height = used_background_size_axis(height, positioning_area.height)
+                .unwrap_or(positioning_area.height);
             PaintSize::new(used_width, used_height)
         }
     }
@@ -1603,13 +1702,15 @@ fn generated_linear_gradient_image(
     gradient: &css::LinearGradient,
     size: PaintSize,
     resource_cache: &ResourceCache,
+    current_color: CssColor,
 ) -> Option<DecodedPngImage> {
+    let gradient = gradient.resolve_current_color(current_color);
     let pixel_size = generated_image_pixel_size(size);
     (size.width > 0.0 && size.height > 0.0 && pixel_size.width > 0 && pixel_size.height > 0).then(
         || {
             let image_id = resource_cache.register_generated_image_recipe(
                 crate::image_store::GeneratedRasterImage::Linear {
-                    gradient: gradient.clone(),
+                    gradient,
                     size,
                     metadata: crate::image_store::ImageMetadata {
                         pixel_width: pixel_size.width,
@@ -1621,7 +1722,7 @@ fn generated_linear_gradient_image(
                 image_id: Some(image_id),
                 pixel_width: pixel_size.width,
                 pixel_height: pixel_size.height,
-                rgb: resource_cache.image_placeholder_rgb(),
+                rgb: EncodedRasterRgbSamples::from_shared(resource_cache.image_placeholder_rgb()),
                 alpha: None,
                 color_space: crate::color::RasterColorSpace::SRGB,
             }
@@ -1633,13 +1734,15 @@ fn generated_radial_gradient_image(
     gradient: &css::RadialGradient,
     size: PaintSize,
     resource_cache: &ResourceCache,
+    current_color: CssColor,
 ) -> Option<DecodedPngImage> {
+    let gradient = gradient.resolve_current_color(current_color);
     let pixel_size = generated_image_pixel_size(size);
     (size.width > 0.0 && size.height > 0.0 && pixel_size.width > 0 && pixel_size.height > 0).then(
         || {
             let image_id = resource_cache.register_generated_image_recipe(
                 crate::image_store::GeneratedRasterImage::Radial {
-                    gradient: gradient.clone(),
+                    gradient,
                     size,
                     metadata: crate::image_store::ImageMetadata {
                         pixel_width: pixel_size.width,
@@ -1651,7 +1754,7 @@ fn generated_radial_gradient_image(
                 image_id: Some(image_id),
                 pixel_width: pixel_size.width,
                 pixel_height: pixel_size.height,
-                rgb: resource_cache.image_placeholder_rgb(),
+                rgb: EncodedRasterRgbSamples::from_shared(resource_cache.image_placeholder_rgb()),
                 alpha: None,
                 color_space: crate::color::RasterColorSpace::SRGB,
             }
@@ -1663,14 +1766,16 @@ fn generated_radial_gradient_image(
 ///
 /// Gradients are generated images with no intrinsic dimensions. The caller
 /// supplies the concrete object size after CSS Backgrounds sizing, then this
-/// samples the gradient in a resolved common CSS Color 4 space. CSS Images 3
+/// samples the gradient in a resolved common CSS CssColor 4 space. CSS Images 3
 /// stop positions, hints, and premultiplied-component interpolation are
 /// otherwise unchanged:
 /// <https://www.w3.org/TR/css-images-3/#coloring-gradient-line>.
 pub(crate) fn rasterize_linear_gradient(
     gradient: &css::LinearGradient,
     size: PaintSize,
+    current_color: CssColor,
 ) -> Option<DecodedPngImage> {
+    let gradient = gradient.resolve_current_color(current_color);
     let width = size.width;
     let height = size.height;
     if width <= 0.0 || height <= 0.0 {
@@ -1683,10 +1788,15 @@ pub(crate) fn rasterize_linear_gradient(
     }
     let area = paint_space_rect(0.0, 0.0, width, height);
     let line = angled_gradient_line(gradient.direction, area);
-    let mut stops = fixed_gradient_stops(gradient, line.axis_length)?;
-    let color_space = resolve_fixed_gradient_colors(&mut stops);
-    let program =
-        resolve_gradient_program(stops, &gradient.hints, line.axis_length, gradient.repeating)?;
+    let mut stops = fixed_gradient_stops(&gradient, line.axis_length)?;
+    let color_space = resolve_fixed_gradient_colors(&mut stops, gradient.interpolation);
+    let program = resolve_gradient_program(
+        stops,
+        &gradient.hints,
+        line.axis_length,
+        gradient.repeating,
+        gradient.interpolation,
+    )?;
     let mut rgb = Vec::with_capacity(pixel_width as usize * pixel_height as usize * 3);
     let mut alpha = Vec::with_capacity(pixel_width as usize * pixel_height as usize);
     let mut has_alpha = false;
@@ -1696,10 +1806,10 @@ pub(crate) fn rasterize_linear_gradient(
             let x = (column as f32 + 0.5) * width / pixel_width as f32;
             let position = gradient_axis_position(PaintPoint::new(x, y), line);
             let color = sampled_gradient_program_color(&program, position);
-            let a = (color.a * 255.0).round().clamp(0.0, 255.0) as u8;
-            rgb.push((color.r * 255.0).round().clamp(0.0, 255.0) as u8);
-            rgb.push((color.g * 255.0).round().clamp(0.0, 255.0) as u8);
-            rgb.push((color.b * 255.0).round().clamp(0.0, 255.0) as u8);
+            let a = (color.alpha() * 255.0).round().clamp(0.0, 255.0) as u8;
+            rgb.push((color.components()[0] * 255.0).round().clamp(0.0, 255.0) as u8);
+            rgb.push((color.components()[1] * 255.0).round().clamp(0.0, 255.0) as u8);
+            rgb.push((color.components()[2] * 255.0).round().clamp(0.0, 255.0) as u8);
             alpha.push(a);
             has_alpha |= a < 255;
         }
@@ -1719,7 +1829,9 @@ pub(crate) fn rasterize_linear_gradient(
 pub(crate) fn rasterize_radial_gradient(
     gradient: &css::RadialGradient,
     size: PaintSize,
+    current_color: CssColor,
 ) -> Option<DecodedPngImage> {
+    let gradient = gradient.resolve_current_color(current_color);
     let width = size.width;
     let height = size.height;
     if width <= 0.0 || height <= 0.0 {
@@ -1730,14 +1842,15 @@ pub(crate) fn rasterize_radial_gradient(
     if pixel_width == 0 || pixel_height == 0 {
         return None;
     }
-    let geometry = used_radial_gradient_geometry(gradient, size)?;
-    let mut stops = fixed_radial_gradient_stops(gradient, geometry.axis_length)?;
-    let color_space = resolve_fixed_gradient_colors(&mut stops);
+    let geometry = used_radial_gradient_geometry(&gradient, size)?;
+    let mut stops = fixed_radial_gradient_stops(&gradient, geometry.axis_length)?;
+    let color_space = resolve_fixed_gradient_colors(&mut stops, gradient.interpolation);
     let program = resolve_gradient_program(
         stops,
         &gradient.hints,
         geometry.axis_length,
         gradient.repeating,
+        gradient.interpolation,
     )?;
     let mut rgb = Vec::with_capacity(pixel_width as usize * pixel_height as usize * 3);
     let mut alpha = Vec::with_capacity(pixel_width as usize * pixel_height as usize);
@@ -1748,10 +1861,10 @@ pub(crate) fn rasterize_radial_gradient(
             let x = (column as f32 + 0.5) * width / pixel_width as f32;
             let position = radial_gradient_axis_position(PaintPoint::new(x, y), geometry);
             let color = sampled_gradient_program_color(&program, position);
-            let a = (color.a * 255.0).round().clamp(0.0, 255.0) as u8;
-            rgb.push((color.r * 255.0).round().clamp(0.0, 255.0) as u8);
-            rgb.push((color.g * 255.0).round().clamp(0.0, 255.0) as u8);
-            rgb.push((color.b * 255.0).round().clamp(0.0, 255.0) as u8);
+            let a = (color.alpha() * 255.0).round().clamp(0.0, 255.0) as u8;
+            rgb.push((color.components()[0] * 255.0).round().clamp(0.0, 255.0) as u8);
+            rgb.push((color.components()[1] * 255.0).round().clamp(0.0, 255.0) as u8);
+            rgb.push((color.components()[2] * 255.0).round().clamp(0.0, 255.0) as u8);
             alpha.push(a);
             has_alpha |= a < 255;
         }
@@ -1769,7 +1882,9 @@ pub(crate) fn rasterize_radial_gradient(
 pub(crate) fn rasterize_conic_gradient(
     gradient: &css::ConicGradient,
     size: PaintSize,
+    current_color: CssColor,
 ) -> Option<DecodedPngImage> {
+    let gradient = gradient.resolve_current_color(current_color);
     let width = size.width;
     let height = size.height;
     if width <= 0.0 || height <= 0.0 {
@@ -1777,8 +1892,8 @@ pub(crate) fn rasterize_conic_gradient(
     }
     let pixel_size = generated_image_pixel_size(size);
     let (pixel_width, pixel_height) = (pixel_size.width, pixel_size.height);
-    let mut stops = fixed_conic_gradient_stops(gradient)?;
-    let color_space = resolve_fixed_gradient_colors(&mut stops);
+    let mut stops = fixed_conic_gradient_stops(&gradient)?;
+    let color_space = resolve_fixed_gradient_colors(&mut stops, gradient.interpolation);
     let center_x = used_background_position_axis(gradient.position.x.clone(), width, false);
     let center_y = used_background_position_axis(gradient.position.y.clone(), height, true);
     let mut rgb = Vec::with_capacity(pixel_width as usize * pixel_height as usize * 3);
@@ -1790,13 +1905,18 @@ pub(crate) fn rasterize_conic_gradient(
             let x = (column as f32 + 0.5) * width / pixel_width as f32;
             let angle = ((x - center_x).atan2(y - center_y).to_degrees() - gradient.start_angle)
                 .rem_euclid(360.0);
-            let color = sampled_conic_gradient_color(gradient.repeating, &stops, angle);
+            let color = sampled_conic_gradient_color(
+                gradient.repeating,
+                &stops,
+                angle,
+                gradient.interpolation,
+            );
             rgb.extend([
-                (color.r * 255.0).round().clamp(0.0, 255.0) as u8,
-                (color.g * 255.0).round().clamp(0.0, 255.0) as u8,
-                (color.b * 255.0).round().clamp(0.0, 255.0) as u8,
+                (color.components()[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+                (color.components()[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+                (color.components()[2] * 255.0).round().clamp(0.0, 255.0) as u8,
             ]);
-            let opacity = (color.a * 255.0).round().clamp(0.0, 255.0) as u8;
+            let opacity = (color.alpha() * 255.0).round().clamp(0.0, 255.0) as u8;
             alpha.push(opacity);
             has_alpha |= opacity < 255;
         }
@@ -1809,8 +1929,71 @@ pub(crate) fn rasterize_conic_gradient(
 
 /// Apply the same common-space selection used by vector PDF gradients before
 /// sampling generated CSS-gradient images.
-fn resolve_fixed_gradient_colors(stops: &mut [FixedGradientStop]) -> crate::css::ColorSpace {
-    let space = crate::color::common_color_space(stops.iter().map(|stop| stop.color));
+fn gradient_interpolation_can_use_native_shading(image: &BackgroundImage) -> bool {
+    let (method, has_missing_components) = match image {
+        BackgroundImage::LinearGradient(gradient) => (
+            gradient.interpolation,
+            gradient.stops.iter().any(|stop| {
+                !stop
+                    .color
+                    .missing_components_for(gradient.interpolation)
+                    .is_empty()
+            }),
+        ),
+        BackgroundImage::RadialGradient(gradient) => (
+            gradient.interpolation,
+            gradient.stops.iter().any(|stop| {
+                !stop
+                    .color
+                    .missing_components_for(gradient.interpolation)
+                    .is_empty()
+            }),
+        ),
+        _ => return false,
+    };
+    // PDF Type 2 functions interpolate encoded components directly. That is
+    // exact only for CSS's encoded rectangular spaces (and D50 XYZ); all
+    // perceptual, polar, and linear-light methods must go through the shared
+    // raster sampler.
+    !has_missing_components
+        && matches!(
+            method.space,
+            css::GradientInterpolationSpace::Srgb
+                | css::GradientInterpolationSpace::DisplayP3
+                | css::GradientInterpolationSpace::A98Rgb
+                | css::GradientInterpolationSpace::ProphotoRgb
+                | css::GradientInterpolationSpace::Rec2020
+                | css::GradientInterpolationSpace::XyzD50
+        )
+}
+
+fn gradient_interpolation_output_space(
+    method: css::GradientInterpolationMethod,
+) -> crate::css::CssColorSpace {
+    match method.space {
+        css::GradientInterpolationSpace::Srgb
+        | css::GradientInterpolationSpace::SrgbLinear
+        | css::GradientInterpolationSpace::Hsl
+        | css::GradientInterpolationSpace::Hwb => crate::css::CssColorSpace::Srgb,
+        css::GradientInterpolationSpace::DisplayP3
+        | css::GradientInterpolationSpace::DisplayP3Linear => crate::css::CssColorSpace::DisplayP3,
+        css::GradientInterpolationSpace::A98Rgb => crate::css::CssColorSpace::A98Rgb,
+        css::GradientInterpolationSpace::ProphotoRgb => crate::css::CssColorSpace::ProphotoRgb,
+        css::GradientInterpolationSpace::Rec2020 => crate::css::CssColorSpace::Rec2020,
+        css::GradientInterpolationSpace::XyzD50
+        | css::GradientInterpolationSpace::XyzD65
+        | css::GradientInterpolationSpace::Lab
+        | css::GradientInterpolationSpace::Oklab
+        | css::GradientInterpolationSpace::Lch
+        | css::GradientInterpolationSpace::Oklch => crate::css::CssColorSpace::XyzD50,
+    }
+}
+
+fn resolve_fixed_gradient_colors(
+    stops: &mut [FixedGradientStop],
+    interpolation: css::GradientInterpolationMethod,
+) -> crate::css::CssColorSpace {
+    let space = gradient_interpolation_output_space(interpolation);
     if stops.iter().all(|stop| stop.color.space() == space) {
         return space;
     }
@@ -1825,9 +2008,11 @@ fn resolve_fixed_gradient_colors(stops: &mut [FixedGradientStop]) -> crate::css:
         space
     } else {
         for stop in stops {
-            stop.color = crate::css::color_to_srgb(stop.color);
+            stop.color =
+                crate::css::color_to_predefined_rgb(stop.color, crate::css::CssColorSpace::Srgb)
+                    .expect("sRGB is a predefined CSS RGB space");
         }
-        crate::css::ColorSpace::Srgb
+        crate::css::CssColorSpace::Srgb
     }
 }
 
@@ -1865,24 +2050,26 @@ fn fixed_conic_gradient_stops(gradient: &css::ConicGradient) -> Option<Vec<Fixed
             *position = Some(before + (after - before) * (offset + 1) as f32 / slots);
         }
     }
-    Some(
-        gradient
-            .stops
-            .iter()
-            .zip(positions)
-            .map(|(stop, position)| FixedGradientStop {
-                color: stop.color,
+    gradient
+        .stops
+        .iter()
+        .zip(positions)
+        .map(|(stop, position)| {
+            Some(FixedGradientStop {
+                color: stop.color.as_color()?,
+                missing_components: stop.color.missing_components_for(gradient.interpolation),
                 position: position.unwrap_or(0.0),
             })
-            .collect(),
-    )
+        })
+        .collect()
 }
 
 fn sampled_conic_gradient_color(
     repeating: bool,
     stops: &[FixedGradientStop],
     mut position: f32,
-) -> Color {
+    interpolation: css::GradientInterpolationMethod,
+) -> CssColor {
     let first = stops.first().expect("non-empty conic stops");
     let last = stops.last().expect("non-empty conic stops");
     if repeating {
@@ -1901,10 +2088,13 @@ fn sampled_conic_gradient_color(
             if span.abs() <= 0.001 {
                 return pair[1].color;
             }
-            return interpolate_gradient_color(
+            return crate::color::interpolate_color_with_missing(
                 pair[0].color,
                 pair[1].color,
+                interpolation,
                 (position - pair[0].position) / span,
+                pair[0].missing_components.bits(),
+                pair[1].missing_components.bits(),
             );
         }
     }
@@ -2054,12 +2244,13 @@ fn fixed_radial_gradient_stops(
     gradient: &css::RadialGradient,
     axis_length: f32,
 ) -> Option<Vec<FixedGradientStop>> {
-    fixed_gradient_stops_from_color_stops(&gradient.stops, axis_length)
+    fixed_gradient_stops_from_color_stops(&gradient.stops, axis_length, gradient.interpolation)
 }
 
 fn fixed_gradient_stops_from_color_stops(
     stops: &[css::GradientColorStop],
     axis_length: f32,
+    interpolation: css::GradientInterpolationMethod,
 ) -> Option<Vec<FixedGradientStop>> {
     if axis_length <= 0.0 || stops.len() < 2 {
         return None;
@@ -2114,16 +2305,17 @@ fn fixed_gradient_stops_from_color_stops(
         }
     }
 
-    Some(
-        stops
-            .iter()
-            .zip(positions)
-            .map(|(stop, position)| FixedGradientStop {
-                color: stop.color,
+    stops
+        .iter()
+        .zip(positions)
+        .map(|(stop, position)| {
+            Some(FixedGradientStop {
+                color: stop.color.as_color()?,
+                missing_components: stop.color.missing_components_for(interpolation),
                 position: position.expect("all positions fixed up"),
             })
-            .collect(),
-    )
+        })
+        .collect()
 }
 
 fn generated_image_pixel_size(size: PaintSize) -> RasterPixelSize {
@@ -2135,27 +2327,6 @@ fn generated_image_pixel_size(size: PaintSize) -> RasterPixelSize {
     pixel_width = (pixel_width * scale).ceil().max(1.0);
     pixel_height = (pixel_height * scale).ceil().max(1.0);
     RasterPixelSize::new(pixel_width as u32, pixel_height as u32)
-}
-
-fn interpolate_gradient_color(start: Color, end: Color, progress: f32) -> Color {
-    let t = progress.clamp(0.0, 1.0);
-    let start_r = start.r * start.a;
-    let start_g = start.g * start.a;
-    let start_b = start.b * start.a;
-    let end_r = end.r * end.a;
-    let end_g = end.g * end.a;
-    let end_b = end.b * end.a;
-    let alpha = start.a + (end.a - start.a) * t;
-    if alpha <= 0.0 {
-        return Color::in_space(start.space(), 0.0, 0.0, 0.0, 0.0);
-    }
-    Color::in_space(
-        start.space(),
-        (start_r + (end_r - start_r) * t) / alpha,
-        (start_g + (end_g - start_g) * t) / alpha,
-        (start_b + (end_b - start_b) * t) / alpha,
-        alpha,
-    )
 }
 
 pub(in crate::layout) fn background_layers_for_paint(
@@ -2198,10 +2369,18 @@ pub(in crate::layout) fn background_paint_area_for_box<Space>(
 fn background_positioning_area_for_layer<Space>(
     positioning_border_area: BackgroundArea<Space>,
     fixed_positioning_area: Option<BackgroundArea<Space>>,
+    fixed_attachment_is_scrolled_by_transform: bool,
     style: &ComputedStyle,
     layer: &css::BackgroundLayer,
 ) -> BackgroundArea<Space> {
     match (layer.attachment, fixed_positioning_area) {
+        // A transform turns a non-root fixed background into a scroll
+        // background. Its image is part of the transformed element's paint
+        // subtree rather than a viewport-fixed source.
+        // <https://drafts.csswg.org/css-transforms-1/#transform-rendering>
+        (css::BackgroundAttachment::Fixed, _) if fixed_attachment_is_scrolled_by_transform => {
+            background_paint_area_for_box(positioning_border_area, style, layer.origin)
+        }
         (css::BackgroundAttachment::Fixed, Some(area)) => area,
         _ => background_paint_area_for_box(positioning_border_area, style, layer.origin),
     }
@@ -2224,7 +2403,7 @@ fn background_border_box_paint_is_occluded(
 ) -> bool {
     if clip_box != css::BackgroundBox::Border
         || !style.border_radius.clone().is_zero()
-        || style.border_image.source.is_some()
+        || style.border_image.source.is_image()
     {
         return false;
     }
@@ -2246,45 +2425,45 @@ fn background_border_box_paint_is_occluded(
         && colors.left.is_opaque()
 }
 
-/// Crop a raster image to a destination-space paint area.
+/// Clip a raster background image to its destination-space paint area.
 ///
-/// CSS image consumers such as background layers and replaced elements share
-/// this conversion so source pixels, including partially exposed edge pixels,
-/// use one mapping before PDF image-resource emission.
-pub(in crate::layout) fn crop_image_to_paint_area(
+/// A CSS clip constrains the image's output; it must not change the mapping
+/// between source pixels and its original destination tile. In particular,
+/// converting a fractional source-pixel edge to an integer PDF source rect
+/// would rescale the retained pixels. Keep the image geometry intact and
+/// express any partial tile through a PDF destination clip instead.
+/// <https://www.w3.org/TR/css-backgrounds-3/#the-background-clip>
+fn clip_background_image_to_paint_area(
     mut image: RenderedImage,
     clip: PaintBackgroundArea,
+    rounded_clip: Option<RenderedPathClip>,
 ) -> Option<RenderedImage> {
     let image_rect = image.paint_rect();
-    let image_width = image_rect.size.width;
-    let image_height = image_rect.size.height;
-    if image_width <= 0.0 || image_height <= 0.0 {
-        return None;
-    }
     let visible = image_rect.intersection(&clip.paint_rect())?;
-    let source = image.source_rect().or_else(|| {
-        image
-            .inline_pixel_size()
-            .map(|(width, height)| RenderedImageSourceRect {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            })
-    })?;
-    let source_x = source.x as f32
-        + ((visible.origin.x - image_rect.origin.x) / image_width) * source.width as f32;
-    let source_y = source.y as f32
-        + ((visible.origin.y - image_rect.origin.y) / image_height) * source.height as f32;
-    let source_width = (visible.size.width / image_width) * source.width as f32;
-    let source_height = (visible.size.height / image_height) * source.height as f32;
-    image.set_paint_rect(visible);
-    image.set_source_rect(RenderedImageSourceRect {
-        x: source_x.floor().max(0.0) as u32,
-        y: source_y.floor().max(0.0) as u32,
-        width: source_width.ceil().max(1.0) as u32,
-        height: source_height.ceil().max(1.0) as u32,
-    });
+    let clip = if visible != image_rect {
+        let mut rectangular_clip = RenderedPathClip::new(
+            paint_rect_path_commands(visible),
+            RenderedPathFillRule::NonZero,
+            Vec::new(),
+        );
+        if let Some(rounded_clip) = rounded_clip {
+            rectangular_clip
+                .additional_clips
+                .push(RenderedPathClipPath::new(
+                    rounded_clip.commands,
+                    rounded_clip.fill_rule,
+                ));
+            rectangular_clip
+                .additional_clips
+                .extend(rounded_clip.additional_clips);
+        }
+        Some(rectangular_clip)
+    } else {
+        rounded_clip
+    };
+    if let Some(clip) = clip {
+        image = image.with_clip(clip);
+    }
     Some(image)
 }
 
@@ -2386,7 +2565,7 @@ pub(in crate::layout) fn push_border_image_tiles(
                         height: y_segment.source_size,
                     }),
                     interpolate,
-                    Rc::clone(&decoded.rgb),
+                    decoded.rgb.shared(),
                     decoded.alpha.clone(),
                     None,
                 )
@@ -2798,6 +2977,12 @@ pub(in crate::layout) fn resolve_absolute_horizontal(
 /// the table wrapper's CSS sizing conversion.
 /// <https://www.w3.org/TR/CSS22/visudet.html#abs-non-replaced-width>
 /// <https://www.w3.org/TR/css-tables-3/#table-wrapper-box>
+///
+/// `containing_direction` names the physical start side of the containing
+/// block's horizontal axis. In a vertical writing mode that axis is the
+/// logical block axis, so it is determined by `vertical-rl` versus
+/// `vertical-lr`, not the inline `direction` value.
+/// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
 pub(in crate::layout) fn resolve_absolute_horizontal_with_non_content(
     style: &ComputedStyle,
     containing_block: ContainingBlock,
@@ -2897,6 +3082,31 @@ pub(in crate::layout) fn resolve_absolute_horizontal_with_non_content(
         (Some(start), Some(size), None) => {
             PositionedAxis::new(start, size, margin_start, margin_end)
         }
+        (Some(start), None, Some(end)) if style.display.is_table() => {
+            let axis = AbsoluteDefiniteAxis {
+                start,
+                size: shrink_to_fit_width,
+                end,
+                margin_start,
+                margin_end,
+                non_content,
+                containing_size: containing_block.width(),
+            };
+            match containing_direction {
+                Direction::Ltr => resolve_absolute_definite_axis_auto_margins(
+                    style.box_values.margin.left.is_auto(),
+                    style.box_values.margin.right.is_auto(),
+                    axis,
+                    AbsoluteAxisDirection::HorizontalLtr,
+                ),
+                Direction::Rtl => resolve_absolute_definite_axis_auto_margins(
+                    style.box_values.margin.left.is_auto(),
+                    style.box_values.margin.right.is_auto(),
+                    axis,
+                    AbsoluteAxisDirection::HorizontalRtl,
+                ),
+            }
+        }
         (Some(start), None, Some(end)) => PositionedAxis::new(
             start,
             constrain_content_width(
@@ -2940,6 +3150,24 @@ pub(in crate::layout) fn resolve_absolute_horizontal_with_non_content(
                 margin_end,
             ),
         },
+    }
+}
+
+/// Return the start direction for physical horizontal inset equations.
+///
+/// CSS `left` and `right` are physical, while `direction` reverses only a
+/// horizontal writing mode's inline axis. Vertical writing modes project the
+/// logical block axis onto physical horizontal, whose start side is fixed by
+/// the writing mode.
+/// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+pub(in crate::layout) fn physical_horizontal_axis_direction(
+    writing_mode: WritingMode,
+    direction: Direction,
+) -> Direction {
+    match block_start_side(writing_mode) {
+        PhysicalSide::Left => Direction::Ltr,
+        PhysicalSide::Right => Direction::Rtl,
+        PhysicalSide::Top | PhysicalSide::Bottom => direction,
     }
 }
 
@@ -3060,6 +3288,22 @@ pub(in crate::layout) fn resolve_absolute_vertical(
         (Some(start), Some(size), None) => {
             PositionedAxis::new(start, size, margin_start, margin_end)
         }
+        (Some(start), None, Some(end)) if style.display.is_table() => {
+            resolve_absolute_definite_axis_auto_margins(
+                style.box_values.margin.top.is_auto(),
+                style.box_values.margin.bottom.is_auto(),
+                AbsoluteDefiniteAxis {
+                    start,
+                    size: auto_height,
+                    end,
+                    margin_start,
+                    margin_end,
+                    non_content,
+                    containing_size: containing_block.height(),
+                },
+                AbsoluteAxisDirection::Vertical,
+            )
+        }
         (Some(start), None, Some(end)) => PositionedAxis::new(
             start,
             constrain_content_height(
@@ -3135,6 +3379,7 @@ pub(in crate::layout) fn paint_effects_for_box_with_overflow_clip(
             border_box.width() - borders.left - borders.right,
             border_box.height() - borders.top - borders.bottom,
         ))),
+        overflow_clip_union: None,
         rounded_overflow_clip: clips_overflow
             .then(|| {
                 rounded_clip_rect_for_box(
@@ -3151,7 +3396,7 @@ pub(in crate::layout) fn paint_effects_for_box_with_overflow_clip(
             })
             .flatten(),
         absolute_clip: None,
-        clip_path: paint_clip_path_effect(style),
+        clip_path: paint_clip_path_effect(style, border_box),
         mask: paint_mask_effect(style),
         filter: paint_filter_effect(style),
         blend_mode: paint_blend_mode(style.mix_blend_mode),
@@ -3159,11 +3404,67 @@ pub(in crate::layout) fn paint_effects_for_box_with_overflow_clip(
     }
 }
 
-pub(in crate::layout) fn paint_clip_path_effect(style: &ComputedStyle) -> PaintClipPathEffect {
-    match style.clip_path {
+pub(in crate::layout) fn paint_clip_path_effect(
+    style: &ComputedStyle,
+    border_box: PaintClip,
+) -> PaintClipPathEffect {
+    match &style.clip_path {
         ClipPath::None if style.will_change.clip_path => PaintClipPathEffect::WillChange,
         ClipPath::None => PaintClipPathEffect::None,
-        ClipPath::Inset => PaintClipPathEffect::Inset,
+        ClipPath::Polygon(points) => {
+            let border_box = border_box.paint_rect();
+            let resolve = |value: &css::ComputedLengthPercentage, basis: f32| {
+                value
+                    .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(basis)))
+                    .map(layout_points)
+                    .unwrap_or_else(|| value.length_points())
+            };
+            let points = points
+                .iter()
+                .map(|point| {
+                    PaintPoint::new(
+                        border_box.min_x() + resolve(&point.x, border_box.width()),
+                        // CSS basic-shape coordinates use the geometry box's
+                        // top-left origin, while page paint coordinates use a
+                        // bottom-left origin.
+                        border_box.max_y() - resolve(&point.y, border_box.height()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            RenderedClipPathPolygon::new(&points)
+                .map(|polygon| PaintClipPathEffect::Polygon(Box::new(polygon)))
+                .unwrap_or(PaintClipPathEffect::Shape)
+        }
+        ClipPath::Inset {
+            top,
+            right,
+            bottom,
+            left,
+        } => {
+            let border_box = border_box.paint_rect();
+            let resolve = |value: &css::ComputedLengthPercentage, basis: f32| {
+                value
+                    .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(basis)))
+                    .map(layout_points)
+                    .unwrap_or_else(|| value.length_points())
+            };
+            let left = resolve(left, border_box.width());
+            let right = resolve(right, border_box.width());
+            let top = resolve(top, border_box.height());
+            let bottom = resolve(bottom, border_box.height());
+            let min_x = border_box.min_x() + left;
+            let max_x = border_box.max_x() - right;
+            let min_y = border_box.min_y() + bottom;
+            let max_y = border_box.max_y() - top;
+            RenderedClipPathPolygon::new(&[
+                PaintPoint::new(min_x, min_y),
+                PaintPoint::new(max_x, min_y),
+                PaintPoint::new(max_x, max_y),
+                PaintPoint::new(min_x, max_y),
+            ])
+            .map(|polygon| PaintClipPathEffect::Polygon(Box::new(polygon)))
+            .unwrap_or(PaintClipPathEffect::Shape)
+        }
         ClipPath::Shape => PaintClipPathEffect::Shape,
         ClipPath::Url => PaintClipPathEffect::Url,
     }
@@ -3244,14 +3545,6 @@ pub(in crate::layout) fn paint_rect_contains(outer: PaintRect, inner: PaintRect)
         && outer_top + EPSILON >= inner_top
 }
 
-pub(in crate::layout) fn positioned_box_is_orthogonal_to_containing_block(
-    containing: WritingMode,
-    positioned: WritingMode,
-) -> bool {
-    WritingModeAxes::new(containing, Direction::Ltr).swaps_physical_axes()
-        != WritingModeAxes::new(positioned, Direction::Ltr).swaps_physical_axes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3265,7 +3558,7 @@ mod tests {
     }
 
     #[test]
-    fn image_crop_uses_typed_visible_destination_rect() {
+    fn fractional_background_clip_preserves_source_mapping_and_intersects_rounded_clip() {
         let image = RenderedImage::from_paint_rect(
             paint_space_rect(10.0, 20.0, 100.0, 50.0),
             true,
@@ -3283,25 +3576,82 @@ mod tests {
             None,
         );
 
-        let cropped = crop_image_to_paint_area(
+        let rounded_clip = RenderedPathClip::new(
+            paint_rect_path_commands(paint_space_rect(35.0, 35.0, 40.0, 10.0)),
+            RenderedPathFillRule::EvenOdd,
+            vec![RenderedPathClipPath::new(
+                paint_rect_path_commands(paint_space_rect(40.0, 35.0, 20.0, 10.0)),
+                RenderedPathFillRule::NonZero,
+            )],
+        );
+
+        let clipped = clip_background_image_to_paint_area(
             image,
             PaintBackgroundArea::from_paint_rect(paint_space_rect(30.0, 30.0, 50.0, 20.0)),
+            Some(rounded_clip.clone()),
         )
-        .expect("overlapping paint rectangles should produce an image crop");
+        .expect("overlapping paint rectangles should retain an image");
 
         assert_eq!(
-            cropped.paint_rect(),
-            paint_space_rect(30.0, 30.0, 50.0, 20.0)
+            clipped.paint_rect(),
+            paint_space_rect(10.0, 20.0, 100.0, 50.0)
         );
         assert_eq!(
-            cropped.source_rect(),
+            clipped.source_rect(),
             Some(RenderedImageSourceRect {
-                x: 50,
-                y: 40,
-                width: 100,
-                height: 40,
+                x: 10,
+                y: 20,
+                width: 200,
+                height: 100,
             }),
         );
+        let clip = clipped
+            .clip()
+            .expect("partial tile installs a destination clip");
+        assert_eq!(
+            clip.commands,
+            paint_rect_path_commands(paint_space_rect(30.0, 30.0, 50.0, 20.0))
+        );
+        assert_eq!(
+            clip.additional_clips,
+            vec![
+                RenderedPathClipPath::new(rounded_clip.commands, rounded_clip.fill_rule),
+                rounded_clip.additional_clips.into_iter().next().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn contained_background_tile_keeps_only_its_rounded_clip() {
+        let image = RenderedImage::from_paint_rect(
+            paint_space_rect(30.0, 30.0, 20.0, 20.0),
+            true,
+            20,
+            20,
+            None,
+            true,
+            Rc::from(Vec::new().into_boxed_slice()),
+            None,
+            None,
+        );
+        let rounded_clip = RenderedPathClip::new(
+            paint_rect_path_commands(paint_space_rect(30.0, 30.0, 20.0, 20.0)),
+            RenderedPathFillRule::NonZero,
+            Vec::new(),
+        );
+
+        let clipped = clip_background_image_to_paint_area(
+            image,
+            PaintBackgroundArea::from_paint_rect(paint_space_rect(20.0, 20.0, 40.0, 40.0)),
+            Some(rounded_clip.clone()),
+        )
+        .expect("contained tile remains paintable");
+
+        assert_eq!(
+            clipped.paint_rect(),
+            paint_space_rect(30.0, 30.0, 20.0, 20.0)
+        );
+        assert_eq!(clipped.clip(), Some(&rounded_clip));
     }
 
     fn containing_block(width: f32) -> ContainingBlock {
@@ -3312,6 +3662,22 @@ mod tests {
         css::ComputedLengthPercentageOrAuto::LengthPercentage(
             css::ComputedLengthPercentage::from_points(value),
         )
+    }
+
+    #[test]
+    fn physical_horizontal_axis_uses_block_start_for_vertical_writing_modes() {
+        assert_eq!(
+            physical_horizontal_axis_direction(WritingMode::HorizontalTb, Direction::Rtl),
+            Direction::Rtl
+        );
+        assert_eq!(
+            physical_horizontal_axis_direction(WritingMode::VerticalLr, Direction::Rtl),
+            Direction::Ltr
+        );
+        assert_eq!(
+            physical_horizontal_axis_direction(WritingMode::VerticalRl, Direction::Ltr),
+            Direction::Rtl
+        );
     }
 
     #[test]
@@ -3459,7 +3825,7 @@ mod tests {
     fn round_repeat_rescales_an_auto_opposite_background_size_axis() {
         let decoded = DecodedPngImage::new(100, 100, vec![0; 100 * 100 * 3], None);
         let mut layer = css::BackgroundLayer::initial();
-        layer.image = Some(css::BackgroundImage::Url {
+        layer.image = css::ComputedImage::image(css::BackgroundImage::Url {
             src: "image.png".to_string(),
             base_url: None,
             root_url: None,
@@ -3476,7 +3842,7 @@ mod tests {
             css::BackgroundRepeatAxis::Repeat,
         );
 
-        let size = used_background_layer_size(&decoded, &layer, 180.0, 180.0);
+        let size = used_background_layer_size(&decoded, &layer, PaintSize::new(180.0, 180.0));
 
         assert!((size.width - 60.0).abs() < 0.01, "{}", size.width);
         assert!((size.height - 60.0).abs() < 0.01, "{}", size.height);
@@ -3518,13 +3884,43 @@ mod tests {
         layer.attachment = css::BackgroundAttachment::Fixed;
 
         assert_eq!(
-            background_positioning_area_for_layer(border_area, Some(viewport), &style, &layer),
+            background_positioning_area_for_layer(
+                border_area,
+                Some(viewport),
+                false,
+                &style,
+                &layer,
+            ),
             viewport,
         );
 
+        style
+            .transform
+            .push(css::TransformFunction::Scale(css::CssScaleFactors {
+                x: 1.0,
+                y: 1.0,
+            }));
+        assert_eq!(
+            background_positioning_area_for_layer(
+                border_area,
+                Some(viewport),
+                true,
+                &style,
+                &layer,
+            ),
+            PaintBackgroundArea::new(PaintPoint::new(110.0, 60.0), PaintSize::new(60.0, 40.0),),
+        );
+        style.transform.clear();
+
         layer.attachment = css::BackgroundAttachment::Scroll;
         assert_eq!(
-            background_positioning_area_for_layer(border_area, Some(viewport), &style, &layer),
+            background_positioning_area_for_layer(
+                border_area,
+                Some(viewport),
+                false,
+                &style,
+                &layer,
+            ),
             PaintBackgroundArea::new(PaintPoint::new(110.0, 60.0), PaintSize::new(60.0, 40.0),),
         );
     }
@@ -3621,5 +4017,63 @@ mod tests {
 
         assert!((axis.start + 60.0).abs() < 0.01, "{axis:?}");
         assert!((axis.size - 30.0).abs() < 0.01, "{axis:?}");
+    }
+
+    #[test]
+    fn raster_hsl_decreasing_matches_longer_hue() {
+        let gradient = |hue| css::LinearGradient {
+            direction: css::LinearGradientDirection::Angle(90.0),
+            interpolation: css::GradientInterpolationMethod {
+                space: css::GradientInterpolationSpace::Hsl,
+                hue,
+            },
+            repeating: false,
+            stops: vec![
+                css::GradientColorStop {
+                    color: css::GradientColor::CssColor(CssColor::new(255, 0, 0)),
+                    position: Some(css::ComputedLengthPercentage::from_percent(0.0)),
+                },
+                css::GradientColorStop {
+                    color: css::GradientColor::CssColor(CssColor::new(255, 165, 0)),
+                    position: Some(css::ComputedLengthPercentage::from_percent(1.0)),
+                },
+            ],
+            hints: Vec::new(),
+        };
+        let size = PaintSize::new(100.0, 20.0);
+        let decreasing = rasterize_linear_gradient(
+            &gradient(css::HueInterpolationMethod::Decreasing),
+            size,
+            CssColor::TRANSPARENT,
+        )
+        .unwrap();
+        let longer = rasterize_linear_gradient(
+            &gradient(css::HueInterpolationMethod::Longer),
+            size,
+            CssColor::TRANSPARENT,
+        )
+        .unwrap();
+        assert_eq!(decreasing.rgb, longer.rgb);
+    }
+
+    #[test]
+    fn uniform_gradient_detection_resolves_missing_srgb_components() {
+        let yellow = CssColor::new(255, 255, 0);
+        let uniform = uniform_gradient_stop_color(
+            &[
+                css::GradientColor::ColorWithMissing {
+                    color: CssColor::new(0, 255, 0),
+                    missing: css::GradientMissingComponents::new(0b0101),
+                    source: css::GradientMissingComponentSpace::Rgb,
+                },
+                css::GradientColor::CssColor(yellow),
+            ],
+            css::GradientInterpolationMethod {
+                space: css::GradientInterpolationSpace::Srgb,
+                hue: css::HueInterpolationMethod::Shorter,
+            },
+            CssColor::BLACK,
+        );
+        assert_eq!(uniform, Some(yellow));
     }
 }

@@ -1,11 +1,12 @@
 # Taffy Shortcomings
 
-Last updated: 2026-07-07
+Last updated: 2026-07-29
 
 This document tracks limitations and impedance mismatches around Quire's use
-of Taffy 0.11.0. Entries here are implementation notes for adapter work and
-future dependency audits; they are not automatically spec divergences. Actual
-CSS/PDF conformance gaps should still be recorded in `SPEC_DIVERGENCES.md`.
+of Taffy 0.12.2, as resolved by `Cargo.lock`. Entries here are implementation
+notes for adapter work and future dependency audits; they are not automatically
+spec divergences. Actual CSS/PDF conformance gaps should still be recorded in
+`SPEC_DIVERGENCES.md`.
 
 ## Entry Criteria
 
@@ -17,21 +18,22 @@ CSS/PDF conformance gaps should still be recorded in `SPEC_DIVERGENCES.md`.
 
 ## Known Limitations and Workarounds
 
-- Mixed length-percentage dimensions: Taffy 0.11 exposes length-only or
-  percentage-only dimensions in places where CSS accepts mixed
-  `<length-percentage>` math. Quire resolves mixed values at the adapter
-  boundary when the relevant percentage basis is definite.
+- Mixed length-percentage dimensions: the `TaffyTree` style interface Quire
+  uses accepts a length, percentage, or (when enabled) an opaque `calc`
+  handle. It cannot carry Quire's owned CSS math representation or its
+  percentage-definiteness semantics. Quire resolves mixed values at the
+  adapter boundary when the relevant percentage basis is definite.
 - `self-start` and `self-end` alignment: CSS Box Alignment maps these keywords
   through the alignment subject's own writing mode. Taffy's flex alignment
   model only carries the container-axis keyword, so Quire lets Taffy perform
   sizing and line construction, then corrects final cross-axis offsets.
-- `align-content: baseline`: Taffy 0.11 maps baseline content alignment to
-  start packing. Quire records flex line metadata and applies baseline packing
-  in post-processing.
+- `align-content: baseline`: Taffy's public `AlignContentKeyword` has no
+  baseline keywords, so Quire maps them to start packing, records flex line
+  metadata, and applies baseline packing in post-processing.
 - `align-content: stretch` overflow fallback: CSS Align says stretch falls
-  back to `flex-start` when stretched flex lines overflow. Taffy 0.11 applies
-  an older generic distribution fallback, so Quire corrects the overflow case
-  after recovering flex line metadata.
+  back to `flex-start` when stretched flex lines overflow. Taffy's flex
+  algorithm applies its generic distribution fallback, so Quire corrects the
+  overflow case after recovering flex line metadata.
 - Flex item `aspect-ratio`: Taffy's generic flex item `aspect_ratio` field can
   impose final main/cross geometry that does not match CSS Flexbox's interaction
   between stretched cross sizes, transferred flex-basis suggestions, and
@@ -40,21 +42,23 @@ CSS/PDF conformance gaps should still be recorded in `SPEC_DIVERGENCES.md`.
   basis and auto-minimum adapter logic. That adapter uses semantic content-box
   and non-content typed lengths before converting to Taffy scalars, so padding
   and borders are not counted twice.
-- Leaf measurement baselines: Taffy's public measure callback returns sizes
-  but not first/last baseline metadata. Quire computes and stores baseline
-  information separately for flex items and nested flex containers.
+- Leaf measurement baselines: Taffy internally carries first baselines for
+  layouts, but `TaffyTree::compute_layout_with_measure` accepts a callback
+  that returns only a size. It cannot receive Quire's first/last baseline
+  metadata, so Quire computes and stores that information separately for flex
+  items and nested flex containers.
 - Physical row/column model: Taffy operates in physical row/column axes plus
   an LTR/RTL switch. Quire adapts CSS flex directions, writing modes, logical
   dimensions, and gaps into that model, then converts raw Taffy coordinates
   back to Quire's layout coordinate spaces.
 - Rounding: Taffy's default layout rounding is appropriate for screen-pixel
   UI layout, but PDF output must preserve real-valued CSS lengths. Quire
-  disables Taffy rounding for flex layout.
+  disables Taffy rounding for flex and Grid layout.
 
 ## Not Taffy
 
 - Auto-height row flex containers with `min-height` larger than `max-height`
-  should resolve to the minimum size. Taffy 0.11 has explicit flex logic for
+  should resolve to the minimum size. Taffy 0.12.2 has explicit flex logic for
   `max <= min` and chooses the min size. If Quire paints or returns the smaller
   height for this case, treat it as a Quire adapter or final-height
   preservation bug rather than a Taffy shortcoming.

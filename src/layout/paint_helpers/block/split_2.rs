@@ -75,7 +75,7 @@ pub(crate) fn paint_clipped_rounded_border_sides(
                 ));
             }
             BorderStyle::Double => {
-                if side.used_width < 3.0 {
+                if DoubleBorderBands::for_used_width(side.used_width).is_none() {
                     paths.push(solid_rounded_border_ring_path(
                         rect, style, side.color, clip,
                     ));
@@ -113,7 +113,7 @@ pub(in crate::layout) fn uniform_rounded_ring_path(
     rect: PaintRect,
     outer_radii: RenderedRoundedRectRadii,
     inset: f32,
-    color: Color,
+    color: CssColor,
 ) -> RenderedPath {
     let inner = inset_paint_rect(
         rect,
@@ -139,7 +139,7 @@ pub(in crate::layout) fn uniform_rounded_ring_path(
         Some(color),
         RenderedPathFillRule::EvenOdd,
         None,
-        0.0,
+        PaintStrokeWidth::ZERO,
         None,
     )
 }
@@ -147,7 +147,7 @@ pub(in crate::layout) fn uniform_rounded_ring_path(
 pub(in crate::layout) fn solid_rounded_border_ring_path(
     rect: PaintRect,
     style: &ComputedStyle,
-    color: Color,
+    color: CssColor,
     clip: Option<RenderedPathClip>,
 ) -> RenderedPath {
     rounded_border_ring_between_path(
@@ -163,7 +163,7 @@ pub(in crate::layout) fn solid_rounded_border_ring_path(
 pub(in crate::layout) fn rounded_border_ring_between_path(
     rect: PaintRect,
     style: &ComputedStyle,
-    color: Color,
+    color: CssColor,
     clip: Option<RenderedPathClip>,
     outer_inset: css::Edges,
     inner_inset: css::Edges,
@@ -182,7 +182,7 @@ pub(in crate::layout) fn rounded_border_ring_between_path(
         Some(color),
         RenderedPathFillRule::EvenOdd,
         None,
-        0.0,
+        PaintStrokeWidth::ZERO,
         clip,
     )
 }
@@ -224,10 +224,10 @@ pub(in crate::layout) fn rounded_border_side_clip(
     let x1 = rect.max_x();
     let y0 = rect.origin.y;
     let y1 = rect.max_y();
-    let inner_left = x0 + borders.left.used_width;
-    let inner_right = x1 - borders.right.used_width;
-    let inner_bottom = y0 + borders.bottom.used_width;
-    let inner_top = y1 - borders.top.used_width;
+    let inner_left = x0 + borders.left.used_width.get();
+    let inner_right = x1 - borders.right.used_width.get();
+    let inner_bottom = y0 + borders.bottom.used_width.get();
+    let inner_top = y1 - borders.top.used_width.get();
     let points = match edge {
         BorderEdge::Top => [
             (x0, y1),
@@ -294,7 +294,7 @@ pub(in crate::layout) fn rounded_border_ring_clip_path(
 }
 
 pub(in crate::layout) fn border_side_has_area(side: UsedBorderSide) -> bool {
-    side.used_width > 0.0 && !side.style.suppresses_used_width()
+    side.used_width > layout_pt(0.0) && !side.style.suppresses_used_width()
 }
 
 pub(in crate::layout) fn is_clipped_rounded_side_style(style: BorderStyle) -> bool {
@@ -315,10 +315,10 @@ pub(in crate::layout) fn is_patterned_side_style(style: BorderStyle) -> bool {
 
 pub(in crate::layout) fn border_insets(borders: UsedBorder) -> css::Edges {
     css::Edges {
-        top: borders.top.used_width,
-        right: borders.right.used_width,
-        bottom: borders.bottom.used_width,
-        left: borders.left.used_width,
+        top: borders.top.used_width.get(),
+        right: borders.right.used_width.get(),
+        bottom: borders.bottom.used_width.get(),
+        left: borders.left.used_width.get(),
     }
 }
 
@@ -351,8 +351,11 @@ pub(in crate::layout) fn double_inner_outer_insets(borders: UsedBorder) -> css::
     }
 }
 
-pub(in crate::layout) fn double_stripe_width(border_width: f32) -> f32 {
-    (border_width / 3.0).max(1.0)
+pub(in crate::layout) fn double_stripe_width(border_width: LayoutLength) -> f32 {
+    DoubleBorderBands::for_used_width(border_width)
+        .expect("double border stripe requires a double-band width")
+        .stripe
+        .get()
 }
 
 /// Build a PDF-compatible rounded rectangle subpath for CSS border geometry.
@@ -379,10 +382,7 @@ pub(crate) fn rounded_rect_path_commands(
         x0 + bl.x(),
         y0,
     )));
-    commands.push(RenderedPathCommand::line_to(paint_space_point(
-        x1 - br.x(),
-        y0,
-    )));
+    push_line_to_if_distinct(&mut commands, paint_space_point(x1 - br.x(), y0));
     if br.x() > 0.0 || br.y() > 0.0 {
         commands.push(RenderedPathCommand::curve_to(
             paint_space_point(x1 - br.x() + br.x() * KAPPA, y0),
@@ -390,10 +390,7 @@ pub(crate) fn rounded_rect_path_commands(
             paint_space_point(x1, y0 + br.y()),
         ));
     }
-    commands.push(RenderedPathCommand::line_to(paint_space_point(
-        x1,
-        y1 - tr.y(),
-    )));
+    push_line_to_if_distinct(&mut commands, paint_space_point(x1, y1 - tr.y()));
     if tr.x() > 0.0 || tr.y() > 0.0 {
         commands.push(RenderedPathCommand::curve_to(
             paint_space_point(x1, y1 - tr.y() + tr.y() * KAPPA),
@@ -401,10 +398,7 @@ pub(crate) fn rounded_rect_path_commands(
             paint_space_point(x1 - tr.x(), y1),
         ));
     }
-    commands.push(RenderedPathCommand::line_to(paint_space_point(
-        x0 + tl.x(),
-        y1,
-    )));
+    push_line_to_if_distinct(&mut commands, paint_space_point(x0 + tl.x(), y1));
     if tl.x() > 0.0 || tl.y() > 0.0 {
         commands.push(RenderedPathCommand::curve_to(
             paint_space_point(x0 + tl.x() - tl.x() * KAPPA, y1),
@@ -412,10 +406,7 @@ pub(crate) fn rounded_rect_path_commands(
             paint_space_point(x0, y1 - tl.y()),
         ));
     }
-    commands.push(RenderedPathCommand::line_to(paint_space_point(
-        x0,
-        y0 + bl.y(),
-    )));
+    push_line_to_if_distinct(&mut commands, paint_space_point(x0, y0 + bl.y()));
     if bl.x() > 0.0 || bl.y() > 0.0 {
         commands.push(RenderedPathCommand::curve_to(
             paint_space_point(x0, y0 + bl.y() - bl.y() * KAPPA),
@@ -425,6 +416,23 @@ pub(crate) fn rounded_rect_path_commands(
     }
     commands.push(RenderedPathCommand::Close);
     commands
+}
+
+/// Append a straight segment unless the current subpath is already at its end.
+///
+/// Fully saturated adjacent corner radii meet at a shared tangent point.  A
+/// path must not add a zero-length side there: although it does not change the
+/// mathematical contour, PDF viewers can rasterize an extra endpoint coverage
+/// sample when the path is used as a clip.
+fn push_line_to_if_distinct(commands: &mut Vec<RenderedPathCommand>, point: PaintPoint) {
+    let current = commands.last().and_then(|command| match *command {
+        RenderedPathCommand::MoveTo(point) | RenderedPathCommand::LineTo(point) => Some(point),
+        RenderedPathCommand::CurveTo { end, .. } => Some(end),
+        RenderedPathCommand::Close => None,
+    });
+    if current != Some(point) {
+        commands.push(RenderedPathCommand::line_to(point));
+    }
 }
 
 /// Build a border contour path for CSS Borders 4 shaped corners.
@@ -458,10 +466,7 @@ pub(crate) fn shaped_rect_path_commands(
         x0 + bl.x(),
         y0,
     )));
-    commands.push(RenderedPathCommand::line_to(paint_space_point(
-        x1 - br.x(),
-        y0,
-    )));
+    push_line_to_if_distinct(&mut commands, paint_space_point(x1 - br.x(), y0));
     append_corner_shape(
         &mut commands,
         shapes.bottom_right,
@@ -471,10 +476,7 @@ pub(crate) fn shaped_rect_path_commands(
         br,
         CornerPathKind::BottomRight,
     );
-    commands.push(RenderedPathCommand::line_to(paint_space_point(
-        x1,
-        y1 - tr.y(),
-    )));
+    push_line_to_if_distinct(&mut commands, paint_space_point(x1, y1 - tr.y()));
     append_corner_shape(
         &mut commands,
         shapes.top_right,
@@ -484,10 +486,7 @@ pub(crate) fn shaped_rect_path_commands(
         tr,
         CornerPathKind::TopRight,
     );
-    commands.push(RenderedPathCommand::line_to(paint_space_point(
-        x0 + tl.x(),
-        y1,
-    )));
+    push_line_to_if_distinct(&mut commands, paint_space_point(x0 + tl.x(), y1));
     append_corner_shape(
         &mut commands,
         shapes.top_left,
@@ -497,10 +496,7 @@ pub(crate) fn shaped_rect_path_commands(
         tl,
         CornerPathKind::TopLeft,
     );
-    commands.push(RenderedPathCommand::line_to(paint_space_point(
-        x0,
-        y0 + bl.y(),
-    )));
+    push_line_to_if_distinct(&mut commands, paint_space_point(x0, y0 + bl.y()));
     append_corner_shape(
         &mut commands,
         shapes.bottom_left,
@@ -611,12 +607,11 @@ fn append_sampled_superellipse_corner(
         return;
     }
 
-    for segment in 1..=SEGMENTS {
+    commands.extend((1..=SEGMENTS).map(|segment| {
         let theta = std::f32::consts::FRAC_PI_2 * segment as f32 / SEGMENTS as f32;
         let (u, v) = sampled_superellipse_unit_point(theta, value);
-        let point = corner_point_from_unit(start, end, outer, u, v);
-        commands.push(RenderedPathCommand::line_to(point));
-    }
+        RenderedPathCommand::line_to(corner_point_from_unit(start, end, outer, u, v))
+    }));
 }
 
 fn sampled_superellipse_unit_point(theta: f32, value: f32) -> (f32, f32) {
@@ -876,6 +871,35 @@ mod tests {
     }
 
     #[test]
+    fn fully_saturated_bevel_path_has_no_zero_length_sides() {
+        let radius = RenderedCornerRadius::new(5.0, 5.0);
+        let radii = RenderedRoundedRectRadii {
+            top_left: radius,
+            top_right: radius,
+            bottom_right: radius,
+            bottom_left: radius,
+        };
+        let bevel = css::CornerShapes {
+            top_left: css::CornerShape::BEVEL,
+            top_right: css::CornerShape::BEVEL,
+            bottom_right: css::CornerShape::BEVEL,
+            bottom_left: css::CornerShape::BEVEL,
+        };
+
+        assert_eq!(
+            shaped_rect_path_commands(test_rect(), radii, bevel),
+            vec![
+                RenderedPathCommand::move_to(paint_space_point(5.0, 0.0)),
+                RenderedPathCommand::line_to(paint_space_point(10.0, 5.0)),
+                RenderedPathCommand::line_to(paint_space_point(5.0, 10.0)),
+                RenderedPathCommand::line_to(paint_space_point(0.0, 5.0)),
+                RenderedPathCommand::line_to(paint_space_point(5.0, 0.0)),
+                RenderedPathCommand::Close,
+            ]
+        );
+    }
+
+    #[test]
     fn shaped_corner_path_preserves_nonzero_paint_rect_origin() {
         let commands = shaped_rect_path_commands(
             paint_space_rect(10.0, 20.0, 10.0, 10.0),
@@ -888,7 +912,7 @@ mod tests {
 
     #[test]
     fn border_side_clip_uses_the_paint_rect_edges() {
-        let side = UsedBorderSide::new(2.0, BorderStyle::Solid, Color::new(0, 0, 0));
+        let side = UsedBorderSide::new(layout_pt(2.0), BorderStyle::Solid, CssColor::new(0, 0, 0));
         let borders = UsedBorder {
             top: side,
             right: side,
@@ -919,7 +943,7 @@ mod tests {
             paint_space_rect(10.0, 20.0, 30.0, 40.0),
             test_radii(),
             2.0,
-            Color::new(0, 0, 0),
+            CssColor::new(0, 0, 0),
         );
 
         assert!(

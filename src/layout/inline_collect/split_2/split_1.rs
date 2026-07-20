@@ -1,6 +1,25 @@
 use super::*;
 
 impl<'a> LayoutBuilder<'a> {
+    /// Run a speculative measurement without materializing positioned
+    /// descendants.
+    ///
+    /// Absolutely positioned boxes have no in-flow intrinsic contribution.
+    /// Their static-position geometry is only available during the committed
+    /// formatting pass, so an intrinsic probe must not leave a provisional
+    /// page-relative paint layer behind.
+    /// <https://www.w3.org/TR/css-sizing-3/#intrinsic>
+    /// <https://www.w3.org/TR/css-position-3/#absolute-positioning>
+    pub(in crate::layout) fn with_positioned_layout_suppressed<R>(
+        &mut self,
+        measure: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.positioned_inline_layout_suppression_depth += 1;
+        let result = measure(self);
+        self.positioned_inline_layout_suppression_depth -= 1;
+        result
+    }
+
     /// Scope the percentage basis visible while collecting an intrinsic inline
     /// contribution. The available line width can remain a layout constraint
     /// even when it is cyclic and therefore unusable for percentage sizing.
@@ -79,9 +98,11 @@ impl<'a> LayoutBuilder<'a> {
         {
             return inline_layout::InlineIntrinsicMeasurement::default();
         }
-        let items =
-            self.intrinsic_inline_items_for_element(element, style, stylesheets, child_boxes);
-        self.intrinsic_inline_measurement_for_items(items, style, available_width)
+        self.with_positioned_layout_suppressed(|layout| {
+            let items =
+                layout.intrinsic_inline_items_for_element(element, style, stylesheets, child_boxes);
+            layout.intrinsic_inline_measurement_for_items(items, style, available_width)
+        })
     }
 
     pub(in crate::layout) fn intrinsic_inline_measurement_for_boxes(
@@ -91,8 +112,10 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
         available_width: f32,
     ) -> inline_layout::InlineIntrinsicMeasurement {
-        let items = self.intrinsic_inline_items_for_boxes(children, style, stylesheets);
-        self.intrinsic_inline_measurement_for_items(items, style, available_width)
+        self.with_positioned_layout_suppressed(|layout| {
+            let items = layout.intrinsic_inline_items_for_boxes(children, style, stylesheets);
+            layout.intrinsic_inline_measurement_for_items(items, style, available_width)
+        })
     }
 
     pub(in crate::layout) fn intrinsic_inline_measurement_for_boxes_with_marker(
@@ -103,21 +126,23 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
         available_width: f32,
     ) -> inline_layout::InlineIntrinsicMeasurement {
-        let mut items = Vec::new();
-        self.push_inside_marker_items(marker, style, None, &mut items);
-        self.collect_intrinsic_inline_box_items(
-            children,
-            stylesheets,
-            None,
-            IntrinsicInlineCollectionContext {
-                baseline_shift: 0.0,
-                visual_offset: InlineVisualOffset::zero(),
-                block_style: style,
-                propagated_decoration: style.text_decoration.clone(),
-            },
-            &mut items,
-        );
-        self.intrinsic_inline_measurement_for_items(items, style, available_width)
+        self.with_positioned_layout_suppressed(|layout| {
+            let mut items = Vec::new();
+            layout.push_inside_marker_items(marker, style, None, &mut items);
+            layout.collect_intrinsic_inline_box_items(
+                children,
+                stylesheets,
+                None,
+                IntrinsicInlineCollectionContext {
+                    baseline_shift: 0.0,
+                    visual_offset: InlineVisualOffset::zero(),
+                    block_style: style,
+                    propagated_decoration: style.text_decoration.clone(),
+                },
+                &mut items,
+            );
+            layout.intrinsic_inline_measurement_for_items(items, style, available_width)
+        })
     }
 
     pub(in crate::layout) fn intrinsic_inline_measurement_for_text(
@@ -279,6 +304,7 @@ impl<'a> LayoutBuilder<'a> {
         let context = InlineParagraphContext {
             block_style,
             stylesheets: &[],
+            initial_first_formatted_line: true,
             available_width: available_width.max(0.0),
             padding_left: 0.0,
             hanging_indent: 0.0,
@@ -398,6 +424,7 @@ impl<'a> LayoutBuilder<'a> {
                         is_forced_empty: true,
                         starts_after_preserved_segment_break: false,
                         clear_after: Clear::None,
+                        block_before: 0.0,
                         block_start_trim: 0.0,
                         block_end_trim: 0.0,
                         paragraph_last_hanging_width: 0.0,
@@ -420,10 +447,12 @@ impl<'a> LayoutBuilder<'a> {
         let graph = self.build_inline_opportunity_graph(paragraph.iter(), context.block_style);
         let mut contribution =
             graph.intrinsic_contribution(&mut self.font_system, context.block_style);
-        // Intrinsic inline sizing includes the first formatted line's
+        // The max-content contribution includes the first formatted line's
         // `text-indent`. Its percentage component is cyclic in this query and
         // therefore resolves against zero, while any absolute component still
-        // changes the line's required inline extent.
+        // changes that line's unwrapped inline extent. The min-content
+        // contribution instead measures the longest unbreakable segment: an
+        // indent does not make that segment wider.
         // <https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes> and
         // <https://www.w3.org/TR/css-text-3/#text-indent-property>.
         let intrinsic_indent = used_line_indent_for_formatted_line(
@@ -433,8 +462,9 @@ impl<'a> LayoutBuilder<'a> {
             context.block_style,
             0.0,
         );
-        contribution.min_content = (contribution.min_content + intrinsic_indent).max(0.0);
-        contribution.max_content = (contribution.max_content + intrinsic_indent).max(0.0);
+        contribution.max_content = LogicalInlineContentSize::new(content_box_pt(
+            (contribution.max_content.points() + intrinsic_indent).max(0.0),
+        ));
         let selected_lines = self.select_inline_lines_from_graph(
             &graph,
             context,
@@ -444,14 +474,51 @@ impl<'a> LayoutBuilder<'a> {
         let lines = selected_lines.fragments;
         let next_line_count = selected_lines.next_line_index;
         output.sequence.has_flow_side_effects |= selected_lines.has_float_side_effects;
-        output.contribution.min_content = output
-            .contribution
-            .min_content
-            .max(contribution.min_content);
-        output.contribution.max_content = output
-            .contribution
-            .max_content
-            .max(contribution.max_content);
+        output.contribution.include_max(contribution);
+        // Floats do not supply an in-flow line fragment, but an explicit
+        // forced break after a float-only range still contributes one empty
+        // line to intrinsic block-size. Keep intrinsic measurement aligned
+        // with the collected paint-time line sequence.
+        // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+        // <https://drafts.csswg.org/css-inline-3/#line-boxes>
+        if force_empty_line && lines.is_empty() {
+            output
+                .sequence
+                .records
+                .push(inline_layout::InlineLineRecord {
+                    paragraph_index,
+                    block_line_index: next_line_count,
+                    paragraph_line_index: 0,
+                    fragment: None,
+                    is_phantom: false,
+                    is_first_formatted_line: next_line_count == 0,
+                    is_last_line_in_paragraph: true,
+                    is_forced_empty: true,
+                    starts_after_preserved_segment_break: false,
+                    clear_after: Clear::None,
+                    block_before: 0.0,
+                    block_start_trim: 0.0,
+                    block_end_trim: 0.0,
+                    paragraph_last_hanging_width: 0.0,
+                    used_indent: used_line_indent(
+                        next_line_count,
+                        starts_after_forced_break,
+                        context.hanging_indent,
+                        context.block_style,
+                        context.available_width,
+                    ),
+                    available_width: context.available_width,
+                    line_height: context.block_style.line_height,
+                });
+            output
+                .paragraphs
+                .push(inline_layout::InlineMeasuredParagraph {
+                    graph,
+                    contribution,
+                });
+            paragraph.clear();
+            return true;
+        }
         let paragraph_last_hanging_width = lines
             .last()
             .map(|line| {
@@ -484,6 +551,7 @@ impl<'a> LayoutBuilder<'a> {
                         is_forced_empty: true,
                         starts_after_preserved_segment_break: false,
                         clear_after: Clear::None,
+                        block_before: 0.0,
                         block_start_trim: 0.0,
                         block_end_trim: 0.0,
                         paragraph_last_hanging_width,
@@ -509,6 +577,7 @@ impl<'a> LayoutBuilder<'a> {
                     is_forced_empty: false,
                     starts_after_preserved_segment_break: false,
                     clear_after: Clear::None,
+                    block_before: 0.0,
                     block_start_trim: 0.0,
                     block_end_trim: 0.0,
                     paragraph_last_hanging_width,
@@ -736,9 +805,14 @@ impl<'a> LayoutBuilder<'a> {
             (self.cursor_y - self.page_bottom() - repeated_block_end_decoration)
                 .max(css::CSS_PX_TO_PT);
         let balanced_height = sequence.balanced_multicolumn_height(column_count, style);
-        let natural_column_height = content_height
-            .or(auto_fill_max_height)
-            .unwrap_or(balanced_height);
+        let sequential_auto_height = sequence.total_height().max(style.line_height);
+        let natural_column_height =
+            content_height
+                .or(auto_fill_max_height)
+                .unwrap_or_else(|| match style.column_fill {
+                    css::ColumnFill::Auto => sequential_auto_height,
+                    css::ColumnFill::Balance | css::ColumnFill::BalanceAll => balanced_height,
+                });
         let fragmented_by_parent = self.active_fragmentainer_kind() == FragmentainerKind::Column
             && natural_column_height > remaining_parent_height + 0.01;
         let definite_fragment_height = content_height.map(|height| {
@@ -751,7 +825,7 @@ impl<'a> LayoutBuilder<'a> {
         let unconstrained_column_height = match style.column_fill {
             css::ColumnFill::Auto => definite_fragment_height
                 .or(auto_fill_max_height)
-                .unwrap_or(balanced_height),
+                .unwrap_or(sequential_auto_height),
             css::ColumnFill::Balance | css::ColumnFill::BalanceAll => definite_fragment_height
                 .map(|limit| balanced_height.min(limit))
                 .unwrap_or(balanced_height),
@@ -878,6 +952,14 @@ impl<'a> LayoutBuilder<'a> {
                 InlineVisualOffset::zero(),
                 &mut items,
             );
+        }
+        // A DOM fallback can be selected from descendant features while all
+        // of its source children are owned by frozen block formatting boxes.
+        // Do not turn that empty collection into a phantom line box before
+        // the block children are laid out.
+        // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+        if items.is_empty() {
+            return;
         }
         let _ = self.layout_inline_items(
             items,
@@ -1267,9 +1349,14 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         // Inline atom advance is a line-coordinate input.
         let width = inline_box_edge_width(style, edge).points();
-        if !inline_box_edge_has_nonzero_component(style, edge) {
-            return;
-        }
+        // Retain zero-advance edges as lexical scope markers. CSS Text gives
+        // a visual tracking boundary to the innermost inline ancestor shared
+        // by its two typographic units; eliding an undecorated `span` loses
+        // that ancestry even though it has no box geometry. Positioned
+        // inlines additionally use the same marker for their containing
+        // block, so one durable representation serves both concerns.
+        // <https://www.w3.org/TR/css-text-3/#letter-spacing> and
+        // <https://www.w3.org/TR/CSS22/visudet.html#containing-block-details>
         let (_, border, padding) = inline_box_edge_components(style, edge);
         let edge_fragment = InlineBoxEdgeFragment {
             logical_edge: match edge {
@@ -1425,7 +1512,14 @@ impl<'a> LayoutBuilder<'a> {
         if mark_hanging_edges {
             mark_inline_box_hanging_edges(output, inline_box_start, &edge_style, fragment_edges);
         }
-        mark_inline_box_ancestor_decorations(output, inline_box_start, &edge_style);
+        mark_inline_box_ancestor_decorations(
+            output,
+            inline_box_start,
+            &edge_style,
+            positioning_containing_block_source
+                .as_ref()
+                .map(|source| source.id),
+        );
         self.end_counter_scope(counter_scope);
         if let Some(counter_snapshot) = counter_snapshot {
             self.counter_set = counter_snapshot;

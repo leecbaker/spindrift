@@ -35,10 +35,10 @@ pub(in crate::css) fn selector_matches_with_scope_proximity_in_chain<'a>(
     chain: &Rc<Vec<Cow<'a, ElementSignature>>>,
     current_index: usize,
     caches: &mut SelectorCaches,
-) -> Option<usize> {
+) -> Option<(usize, u32)> {
     if scopes.is_empty() {
-        return selector_matches_at(selector, chain, current_index, None, caches)
-            .then_some(usize::MAX);
+        return selector_matching_specificity_at(selector, chain, current_index, None, caches)
+            .map(|specificity| (usize::MAX, specificity));
     }
     let mut proximity = usize::MAX;
     let mut scope_root_index = None;
@@ -47,8 +47,8 @@ pub(in crate::css) fn selector_matches_with_scope_proximity_in_chain<'a>(
         scope_root_index = Some(root_index);
         proximity = distance;
     }
-    selector_matches_at(selector, chain, current_index, scope_root_index, caches)
-        .then_some(proximity)
+    selector_matching_specificity_at(selector, chain, current_index, scope_root_index, caches)
+        .map(|specificity| (proximity, specificity))
 }
 
 pub(in crate::css) fn selector_chain<'a>(
@@ -83,6 +83,41 @@ pub(in crate::css) fn selector_matches_at<'a>(
     );
     context.scope_element = scope_element;
     matches_selector_list(selector, &element, &mut context)
+}
+
+/// Return the specificity of the matching branch of a selector list.
+///
+/// CSS selector lists are an `:is()`-like disjunction only for matching; the
+/// cascade uses the specificity of the particular selector that matched, not
+/// the maximum specificity declared elsewhere in the comma-separated list.
+/// <https://www.w3.org/TR/css-cascade-5/#cascade-sort>
+fn selector_matching_specificity_at<'a>(
+    selector: &SelectorList<QuireSelectorImpl>,
+    chain: &Rc<Vec<Cow<'a, ElementSignature>>>,
+    index: usize,
+    scope_index: Option<usize>,
+    caches: &mut SelectorCaches,
+) -> Option<u32> {
+    let element = StyleElement {
+        chain: Rc::clone(chain),
+        index,
+    };
+    let scope_element = scope_index.map(|index| OpaqueElement::new(&*chain[index].opaque_id));
+    let mut context = MatchingContext::new(
+        MatchingMode::Normal,
+        None,
+        caches,
+        QuirksMode::NoQuirks,
+        NeedsSelectorFlags::No,
+        MatchingForInvalidation::No,
+    );
+    context.scope_element = scope_element;
+    selector
+        .slice()
+        .iter()
+        .filter(|branch| matches_selector(*branch, 0, None, &element, &mut context))
+        .map(|branch| branch.specificity())
+        .max()
 }
 
 pub(in crate::css) fn scope_rule_distance<'a>(
@@ -573,7 +608,9 @@ impl SelectorElement for StyleElement<'_> {
         _context: &mut MatchingContext<QuireSelectorImpl>,
     ) -> bool {
         match pc {
-            QuirePseudoClass::AnyLink | QuirePseudoClass::Link => self.is_link(),
+            QuirePseudoClass::AnyLink | QuirePseudoClass::Link | QuirePseudoClass::Visited => {
+                self.is_link()
+            }
             QuirePseudoClass::Dir(direction) => self.directionality() == Some(*direction),
             QuirePseudoClass::Lang(ranges) => language_matches_any_range(&self.language(), ranges),
             QuirePseudoClass::StaticFalse(_) => false,
@@ -740,7 +777,10 @@ impl<'i> SelectorParser<'i> for QuireSelectorParser {
         match name.as_ref().to_ascii_lowercase().as_str() {
             "link" => Ok(QuirePseudoClass::Link),
             "any-link" => Ok(QuirePseudoClass::AnyLink),
-            "visited" => Ok(QuirePseudoClass::StaticFalse("visited")),
+            // A static document renderer has no browser history. Treat links
+            // as visited so the print rendering environment has a stable
+            // visited-link used style rather than depending on host history.
+            "visited" => Ok(QuirePseudoClass::Visited),
             "target" => Ok(QuirePseudoClass::Target),
             "target-within" => Ok(QuirePseudoClass::TargetWithin),
             "hover" => Ok(QuirePseudoClass::StaticFalse("hover")),
@@ -847,6 +887,10 @@ impl<'i> SelectorParser<'i> for QuireSelectorParser {
             Ok(QuirePseudoElement::Before)
         } else if name.eq_ignore_ascii_case("after") {
             Ok(QuirePseudoElement::After)
+        } else if name.eq_ignore_ascii_case("footnote-call") {
+            Ok(QuirePseudoElement::FootnoteCall)
+        } else if name.eq_ignore_ascii_case("footnote-marker") {
+            Ok(QuirePseudoElement::FootnoteMarker)
         } else if name.eq_ignore_ascii_case("marker") {
             Ok(QuirePseudoElement::Marker)
         } else if name.eq_ignore_ascii_case("first-line") {
@@ -867,6 +911,7 @@ impl<'i> SelectorParser<'i> for QuireSelectorParser {
 pub(crate) enum QuirePseudoClass {
     Link,
     AnyLink,
+    Visited,
     Dir(Direction),
     Lang(Vec<LanguageRange>),
     StaticFalse(&'static str),
@@ -899,6 +944,7 @@ impl ToCss for QuirePseudoClass {
         match self {
             QuirePseudoClass::Link => dest.write_str(":link"),
             QuirePseudoClass::AnyLink => dest.write_str(":any-link"),
+            QuirePseudoClass::Visited => dest.write_str(":visited"),
             QuirePseudoClass::Dir(Direction::Ltr) => dest.write_str(":dir(ltr)"),
             QuirePseudoClass::Dir(Direction::Rtl) => dest.write_str(":dir(rtl)"),
             QuirePseudoClass::StaticFalse(name) => write!(dest, ":{name}"),

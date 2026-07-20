@@ -6,17 +6,16 @@ use std::rc::Rc;
 /// HTML's UA stylesheet sets `unicode-bidi: isolate` on many block containers,
 /// but a block formatting context already separates its inline formatting
 /// context from surrounding inline content. Literal UAX #9 controls are still
-/// needed for block-level overrides and plaintext paragraph direction because
-/// those values affect the inline content inside the block:
+/// needed for block-level embeddings and overrides. `plaintext` instead
+/// selects the base direction of each selected bidi paragraph, so it is
+/// resolved by the line bidi pass rather than by one control scope spanning
+/// every paragraph in the block:
 /// <https://html.spec.whatwg.org/multipage/rendering.html#bidi-rendering> and
 /// <https://www.w3.org/TR/css-writing-modes-4/#unicode-bidi>.
 pub(in crate::layout) fn block_bidi_scope_needs_inline_controls(style: &ComputedStyle) -> bool {
     matches!(
         style.unicode_bidi,
-        UnicodeBidi::Embed
-            | UnicodeBidi::BidiOverride
-            | UnicodeBidi::IsolateOverride
-            | UnicodeBidi::Plaintext
+        UnicodeBidi::Embed | UnicodeBidi::BidiOverride | UnicodeBidi::IsolateOverride
     )
 }
 
@@ -127,8 +126,8 @@ pub(in crate::layout) fn inline_box_edge_physical_side(
     edge: InlineBoxEdge,
 ) -> PhysicalSide {
     match edge {
-        InlineBoxEdge::Start => inline_start_side(style.writing_mode, style.direction),
-        InlineBoxEdge::End => inline_end_side(style.writing_mode, style.direction),
+        InlineBoxEdge::Start => inline_start_side(style.writing_mode, style.used_direction()),
+        InlineBoxEdge::End => inline_end_side(style.writing_mode, style.used_direction()),
     }
 }
 
@@ -196,21 +195,45 @@ pub(in crate::layout) fn mark_inline_box_ancestor_decorations(
     output: &mut [InlineItem],
     inline_box_start: usize,
     style: &ComputedStyle,
+    positioning_containing_block_id: Option<InlinePositioningContainingBlockId>,
 ) {
-    if !inline_box_has_paintable_decoration(style) {
+    if !inline_box_has_paintable_decoration(style) && positioning_containing_block_id.is_none() {
         return;
     }
-    for word in output[inline_box_start..]
-        .iter_mut()
-        .filter_map(visible_hanging_edge_word_mut)
-    {
-        if word.style.as_ref() == style {
+    // Scope edges carry lexical nesting independently of the computed-style
+    // snapshots used for painting. Use the edge nesting to distinguish the
+    // scope's direct words (which already paint their own background) from
+    // descendants (which need this ancestor decoration).
+    // <https://www.w3.org/TR/CSS22/visuren.html#relative-positioning>
+    let mut scope_depth = 0usize;
+    for item in &mut output[inline_box_start..] {
+        if let InlineItem::Atom(atom) = item
+            && let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) = atom.content()
+        {
+            match edge.logical_edge {
+                InlineLogicalEdge::Start => {
+                    scope_depth += 1;
+                    continue;
+                }
+                InlineLogicalEdge::End => {
+                    scope_depth = scope_depth.saturating_sub(1);
+                    continue;
+                }
+            }
+        }
+        let Some(word) = visible_hanging_edge_word_mut(item) else {
+            continue;
+        };
+        let paints_background_or_border = scope_depth > 1;
+        if !paints_background_or_border && positioning_containing_block_id.is_none() {
             continue;
         }
         let mut decorations = word.ancestor_inline_decorations.to_vec();
         decorations.push(InlineAncestorDecoration {
             style: style.clone(),
             hanging_edges: InlineHangingEdges::default(),
+            paints_background_or_border,
+            positioning_containing_block_id,
         });
         word.ancestor_inline_decorations = Rc::from(decorations.into_boxed_slice());
     }
@@ -218,7 +241,7 @@ pub(in crate::layout) fn mark_inline_box_ancestor_decorations(
 
 pub(in crate::layout) fn inline_box_has_paintable_decoration(style: &ComputedStyle) -> bool {
     style.background_color.is_some()
-        || style.background_image.is_some()
+        || style.background_image.is_image()
         || used_border_width(style).points() > 0.0
 }
 
@@ -543,8 +566,8 @@ pub(in crate::layout) fn has_inline_container_formatting_box(
     children: &[box_tree::FormattingBox<'_>],
 ) -> bool {
     children.iter().any(|child| match child {
-        box_tree::FormattingBox::Inline(box_) if box_.element.tag == "br" => {
-            has_inline_container_formatting_box(&box_.children)
+        box_tree::FormattingBox::Inline(box_) if box_.core.element.tag == "br" => {
+            has_inline_container_formatting_box(&box_.core.children)
         }
         box_tree::FormattingBox::Inline(_) => true,
         box_tree::FormattingBox::Text(_) | box_tree::FormattingBox::Replaced(_) => false,
@@ -573,6 +596,29 @@ pub(in crate::layout) fn has_out_of_flow_formatting_box(
 mod tests {
     use super::*;
     use std::rc::Rc;
+
+    #[test]
+    fn block_plaintext_uses_per_paragraph_bidi_resolution_without_controls() {
+        let mut plaintext = ComputedStyle::initial();
+        plaintext.unicode_bidi = UnicodeBidi::Plaintext;
+        assert!(
+            !block_bidi_scope_needs_inline_controls(&plaintext),
+            "block plaintext must not wrap multiple forced paragraphs in one FSI/PDI scope"
+        );
+
+        let mut inline_plaintext = ComputedStyle::initial();
+        inline_plaintext.display = Display::INLINE;
+        inline_plaintext.unicode_bidi = UnicodeBidi::Plaintext;
+        assert_eq!(
+            bidi_control_scope_for_style(&inline_plaintext),
+            Some(("\u{2068}", "\u{2069}")),
+            "inline plaintext remains an isolate"
+        );
+
+        let mut override_style = ComputedStyle::initial();
+        override_style.unicode_bidi = UnicodeBidi::BidiOverride;
+        assert!(block_bidi_scope_needs_inline_controls(&override_style));
+    }
 
     #[test]
     fn autospace_splitting_reuses_inline_word_style_handles() {

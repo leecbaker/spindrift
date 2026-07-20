@@ -1,5 +1,38 @@
 use super::*;
 
+/// Returns whether an unresolved percentage height computes as `auto` for a
+/// margin-collapse predicate.
+///
+/// CSS 2.2 treats a percentage height as `auto` when its containing block's
+/// height is not explicitly specified. The computed percentage remains useful
+/// elsewhere, so normalize only at this used-value boundary.
+/// <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>
+pub(in crate::layout) fn percentage_height_is_auto_for_margin_collapse(
+    style: &ComputedStyle,
+    basis: BlockSizePercentageBasis,
+) -> bool {
+    matches!(basis, PercentageBasis::Indefinite)
+        && matches!(
+            &style.box_values.height,
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(value)
+                if value.needs_percentage_basis()
+        )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) enum AdjoiningFloatReplaySeparation {
+    None,
+    Clearance {
+        border_top: PageTopBlockPosition,
+    },
+    /// A BFC root that cannot occupy the adjoining float band gets the same
+    /// margin-separating treatment as clearance.
+    MarginSeparation {
+        border_top: PageTopBlockPosition,
+    },
+    IndependentFormattingContext,
+}
+
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn split_inline_static_position_y_offset_before_child(
         &mut self,
@@ -44,14 +77,32 @@ impl<'a> LayoutBuilder<'a> {
 
     pub(in crate::layout) fn block_static_position_y_offset_from_split_inline_items(
         &mut self,
+        items: Vec<InlineItem>,
+        block_style: &ComputedStyle,
+    ) -> f32 {
+        self.block_static_position_y_offset_from_split_inline_items_with_placeholder_inline_size(
+            items,
+            block_style,
+            0.0,
+        )
+    }
+
+    /// Selects a split block's static-position line using a non-painting atom
+    /// whose inline size matches the source box's normal-flow footprint.
+    pub(in crate::layout) fn block_static_position_y_offset_from_split_inline_items_with_placeholder_inline_size(
+        &mut self,
         mut items: Vec<InlineItem>,
         block_style: &ComputedStyle,
+        placeholder_inline_size: f32,
     ) -> f32 {
         if !matches!(items.last(), Some(InlineItem::Break(_))) {
             items.push(InlineItem::Break(InlineBreak::default()));
         }
         items.push(InlineItem::Atom(Box::new(
-            self.block_static_position_placeholder_atom(block_style),
+            self.block_static_position_placeholder_atom_with_inline_size(
+                block_style,
+                placeholder_inline_size,
+            ),
         )));
         let sequence = self.collect_inline_line_sequence_with_text_box_trim(
             items,
@@ -124,24 +175,6 @@ impl<'a> LayoutBuilder<'a> {
     }
 }
 
-/// Consume pending normal-flow spacing when the next generated box is a float.
-///
-/// A float is out of flow, so its margins do not collapse with the preceding
-/// block's adjoining margin. The pending block margin still contributes to the
-/// float's hypothetical block-start position and is therefore added to the
-/// float's own block-start margin.
-/// <https://www.w3.org/TR/CSS22/visuren.html#float-position>
-pub(in crate::layout) fn apply_pending_normal_flow_margin_before_float(
-    style: &mut ComputedStyle,
-    pending_margin: Option<f32>,
-) {
-    if style.float != Float::None
-        && let Some(pending_margin) = pending_margin
-    {
-        style.margin.top += pending_margin;
-    }
-}
-
 /// Preserve block-axis margins that this flow pass has already resolved.
 ///
 /// The child pass adjusts the used margins for collapsing, trimming, and
@@ -175,10 +208,40 @@ pub(in crate::layout) fn block_avoid_break_flow_child(
         || is_replaced_element(child_element)
 }
 
+/// Returns the class-A break values a formatting box exposes to its block-flow
+/// siblings.
+///
+/// A flex container propagates the first and last order-modified in-flow
+/// item's break values to its own outer boundaries.  Keeping that projection
+/// at the formatting-box boundary lets parent avoid-run planning use the same
+/// values as the flex fragmentation algorithm.
+/// <https://www.w3.org/TR/css-flexbox-1/#pagination>
+pub(in crate::layout) fn formatting_box_fragment_boundary_breaks(
+    box_: &box_tree::FormattingBox<'_>,
+    fragmentainer_kind: FragmentainerKind,
+) -> (PageBreak, PageBreak) {
+    let Some((element, signature, style, children)) = box_.element_parts() else {
+        return (PageBreak::Auto, PageBreak::Auto);
+    };
+    if matches!(box_, box_tree::FormattingBox::Flex(_)) {
+        let breaks = crate::layout::flex::flex_container_fragment_boundary_breaks(
+            element,
+            signature,
+            style,
+            children,
+            fragmentainer_kind,
+        );
+        (breaks.before, breaks.after)
+    } else {
+        (style.break_before, style.break_after)
+    }
+}
+
 pub(in crate::layout) fn next_formatting_box_flow_child_break_before(
     parent_element: &Element,
     child_boxes: &[box_tree::FormattingBox<'_>],
     current_index: usize,
+    fragmentainer_kind: FragmentainerKind,
 ) -> Option<PageBreak> {
     for child in child_boxes.iter().skip(current_index + 1) {
         if matches!(child, box_tree::FormattingBox::AnonymousBlock(_)) {
@@ -188,7 +251,7 @@ pub(in crate::layout) fn next_formatting_box_flow_child_break_before(
             continue;
         };
         if block_avoid_break_flow_child(parent_element, child_element, child_style) {
-            return Some(child_style.break_before);
+            return Some(formatting_box_fragment_boundary_breaks(child, fragmentainer_kind).0);
         }
         if !style_is_in_normal_flow(child_style) {
             // Floats and positioned boxes do not participate in the class A
@@ -240,16 +303,18 @@ impl<'a> LayoutBuilder<'a> {
         Some(PageBreak::Auto)
     }
 
-    /// Return whether a following BFC root separates an adjoining float replay.
+    /// Return whether a following flow child separates an adjoining float replay.
     ///
     /// CSS 2.2 makes block formatting context roots avoid earlier float margin
     /// boxes. If an adjoining-margin replay would put the next BFC root beside
     /// floats that leave no fitting band, the BFC root is separated in the
     /// same spirit as clearance and the collapsed margin must not drag those
-    /// floats downward:
+    /// floats downward. A matching `clear` also separates the relationship:
+    /// replaying an adjoining float at the following collapsed-margin origin
+    /// would otherwise erase the clearance that keeps the float in place.
     /// <https://www.w3.org/TR/CSS22/visuren.html#floats> and
     /// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>.
-    pub(in crate::layout) fn adjoining_float_replay_separated_by_bfc_root(
+    pub(in crate::layout) fn adjoining_float_replay_separated_by_following_child(
         &mut self,
         replay: &AdjoiningFloatReplayCandidate,
         child_element: &Element,
@@ -257,41 +322,61 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         replay_origin_y: f32,
-    ) -> bool {
+    ) -> AdjoiningFloatReplaySeparation {
         let establishes_independent_bfc =
             child_style.display.establishes_block_formatting_context()
                 || self.element_used_overflow_clips(child_element, child_style)
                 || block_align_content_establishes_independent_formatting_context(
                     child_style.align_content,
                 );
-        if !establishes_independent_bfc
-            || child_style.float != Float::None
+        if child_style.float != Float::None
             || matches!(child_style.position, Position::Absolute | Position::Fixed)
         {
-            return false;
+            return AdjoiningFloatReplaySeparation::None;
         }
 
         let snapshot = replay.snapshot();
         if snapshot.pages.len() != self.pages.len()
             || snapshot.float_contexts.len() != self.float_contexts.len()
         {
-            return true;
+            return AdjoiningFloatReplaySeparation::IndependentFormattingContext;
         }
 
         let Some(snapshot_context) = snapshot.float_contexts.last() else {
-            return true;
+            return AdjoiningFloatReplaySeparation::IndependentFormattingContext;
         };
         let Some(current_context) = self.float_contexts.last() else {
-            return true;
+            return AdjoiningFloatReplaySeparation::IndependentFormattingContext;
         };
         if current_context.shapes.len() <= snapshot_context.shapes.len() {
-            return false;
+            return AdjoiningFloatReplaySeparation::None;
+        }
+        if child_style.clear != Clear::None
+            && let Some(border_top) = current_context.shapes[snapshot_context.shapes.len()..]
+                .iter()
+                .filter(|shape| {
+                    shape.side.matches_clear(
+                        child_style.clear,
+                        child_style.writing_mode,
+                        child_style.direction,
+                    )
+                })
+                .map(|shape| shape.margin_box_block_span().bottom_y())
+                .reduce(f32::min)
+        {
+            return AdjoiningFloatReplaySeparation::Clearance {
+                border_top: PageTopBlockPosition::new(border_top),
+            };
+        }
+
+        if !establishes_independent_bfc {
+            return AdjoiningFloatReplaySeparation::None;
         }
 
         if snapshot.containing_block_writing_mode != WritingMode::HorizontalTb
             || child_style.writing_mode != WritingMode::HorizontalTb
         {
-            return true;
+            return AdjoiningFloatReplaySeparation::IndependentFormattingContext;
         }
 
         let delta_y = replay_origin_y - snapshot.cursor_y;
@@ -300,7 +385,7 @@ impl<'a> LayoutBuilder<'a> {
             current_context.shapes[snapshot_context.shapes.len()..]
                 .iter()
                 .cloned()
-                .map(|shape| shape.translated_block(delta_y)),
+                .map(|shape| shape.translated_block(layout_pt(delta_y))),
         );
 
         let containing_left = snapshot.content_left;
@@ -309,13 +394,15 @@ impl<'a> LayoutBuilder<'a> {
         let page_index = snapshot.pages.len();
         let placement = replayed_context.avoiding_bfc_root_position(
             page_index,
-            replay_origin_y,
+            PageTopBlockPosition::new(replay_origin_y),
             child_style.clear,
             child_style.writing_mode,
             child_style.direction,
             containing_left,
             containing_right,
-            |band_left, band_width, _candidate_top| {
+            |band, _candidate_top| {
+                let band_left = band.left();
+                let band_width = band.width();
                 let band_right = band_left + band_width;
                 let avoidance_left = if band_left > containing_left + FLOAT_EPSILON {
                     band_left
@@ -333,8 +420,10 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     child_boxes,
                     BlockLayoutInlineConstraint {
-                        containing_left: avoidance_left,
-                        containing_right: avoidance_right,
+                        containing_inline_span: PageInlineSpan::from_edges(
+                            avoidance_left,
+                            avoidance_right,
+                        ),
                         percentage_basis: PercentageBasis::definite(LogicalInlineContentSize::new(
                             content_box_pt(containing_inline_size),
                         )),
@@ -343,9 +432,11 @@ impl<'a> LayoutBuilder<'a> {
                         )),
                         auto_border_box_width: (band_width
                             < containing_inline_size - FLOAT_EPSILON)
-                            .then_some(border_box_pt(
-                                (band_width - child_style.margin.left - child_style.margin.right)
-                                    .max(0.0),
+                            .then_some(float_avoiding_auto_border_box_width(
+                                PageInlineSpan::new(band_left, band_width),
+                                PageInlineSpan::from_edges(containing_left, containing_right),
+                                child_style.margin.left,
+                                child_style.margin.right,
                             )),
                     },
                 );
@@ -355,7 +446,7 @@ impl<'a> LayoutBuilder<'a> {
                         child_element,
                         candidate_style,
                         stylesheets,
-                        candidate_geometry.outer_width(),
+                        candidate_geometry.outer_inline().width().points(),
                         child_boxes,
                     )
                     .unwrap_or(
@@ -368,15 +459,36 @@ impl<'a> LayoutBuilder<'a> {
                     - candidate_style.margin.bottom)
                     .max(0.0);
                 FloatAvoidingBfcMeasurement {
-                    border_box_left: candidate_geometry.outer_inline().start()
-                        - candidate_geometry.relative_offset.x(),
-                    border_box_width: candidate_geometry.outer_width(),
-                    border_box_height,
+                    border_box_inline_span: PageInlineSpan::new(
+                        candidate_geometry.outer_inline().span().left_x()
+                            - candidate_geometry.relative_offset.x(),
+                        candidate_geometry.outer_inline().span().width(),
+                    ),
+                    border_box_block_size: border_box_pt(border_box_height),
+                    permits_inline_start_overflow: match candidate_style.direction {
+                        Direction::Ltr => candidate_style.margin.left < -FLOAT_EPSILON,
+                        Direction::Rtl => candidate_style.margin.right < -FLOAT_EPSILON,
+                    },
+                    permits_inline_end_overflow: match candidate_style.direction {
+                        Direction::Ltr => candidate_style.margin.right < -FLOAT_EPSILON,
+                        Direction::Rtl => candidate_style.margin.left < -FLOAT_EPSILON,
+                    },
                 }
             },
         );
 
-        placement.top < replay_origin_y - FLOAT_EPSILON
+        if placement.placement.origin.top_y() < replay_origin_y - FLOAT_EPSILON {
+            // `placement.top` is the hypothetical border top after the
+            // child's start margin has been applied. Restoring that start
+            // margin yields the float boundary that the normal-flow child
+            // must clear without dragging the adjoining float along.
+            AdjoiningFloatReplaySeparation::MarginSeparation {
+                border_top: PageTopBlockPosition::new(placement.placement.origin.top_y())
+                    .toward_block_end(layout_pt(-child_style.margin.top)),
+            }
+        } else {
+            AdjoiningFloatReplaySeparation::None
+        }
     }
 }
 
@@ -413,15 +525,15 @@ pub(in crate::layout) fn text_box_trim_formatting_box_reach(
     match box_ {
         box_tree::FormattingBox::AnonymousBlock(_) => Some(true),
         box_tree::FormattingBox::InlineSplitBlockContext(context)
-            if context.children.len() == 1 =>
+            if context.core.children.len() == 1 =>
         {
-            text_box_trim_formatting_box_reach(&context.children[0], block_start)
+            text_box_trim_formatting_box_reach(&context.core.children[0], block_start)
         }
         box_tree::FormattingBox::Block(box_) => Some(
             matches!(
-                element_layout_kind(box_.element, &box_.style),
+                element_layout_kind(box_.core.element, &box_.core.style),
                 ElementLayoutKind::BlockFlow
-            ) && style_allows_text_box_trim_propagation(&box_.style, block_start),
+            ) && style_allows_text_box_trim_propagation(&box_.core.style, block_start),
         ),
         box_tree::FormattingBox::Inline(_)
         | box_tree::FormattingBox::InlineSplitBlockContext(_)

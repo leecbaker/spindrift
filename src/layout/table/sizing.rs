@@ -56,6 +56,47 @@ pub(super) fn table_root_inline_size(style: &ComputedStyle) -> css::ComputedLeng
     }
 }
 
+/// Return whether the table wrapper supplies a definite lower bound for the
+/// grid's logical inline size.
+///
+/// An `auto` table width ordinarily uses its intrinsic maximum rather than
+/// distributing unused available width to tracks. A non-zero logical
+/// `min-inline-size` is different: after CSS Sizing resolves that wrapper
+/// constraint in content-box space, CSS Tables must preserve it while it
+/// distributes the column grid.  This is `min-height` in vertical writing
+/// modes and `min-width` otherwise:
+/// <https://drafts.csswg.org/css-sizing-3/#min-size-properties> and
+/// <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>.
+pub(super) fn table_root_distributes_extra_inline_space(style: &ComputedStyle) -> bool {
+    if !table_root_inline_size(style).is_auto() {
+        return true;
+    }
+    let min_inline_size = table_root_min_inline_size(style);
+    match min_inline_size {
+        css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
+            !value.length_is_zero() || value.percentage_coefficient_or_zero() != 0.0
+        }
+        css::ComputedLengthPercentageOrAuto::Auto => false,
+        css::ComputedLengthPercentageOrAuto::MinContent
+        | css::ComputedLengthPercentageOrAuto::MaxContent
+        | css::ComputedLengthPercentageOrAuto::FitContent(_)
+        | css::ComputedLengthPercentageOrAuto::Stretch
+        | css::ComputedLengthPercentageOrAuto::CalcSize(_) => true,
+    }
+}
+
+/// Return the wrapper min-size property that constrains the table grid's
+/// logical inline axis.
+pub(super) fn table_root_min_inline_size(
+    style: &ComputedStyle,
+) -> css::ComputedLengthPercentageOrAuto {
+    if style.writing_mode.has_vertical_lines() {
+        style.box_values.min_height.clone()
+    } else {
+        style.box_values.min_width.clone()
+    }
+}
+
 /// Return the physical CSS property that controls a table root's logical block
 /// axis. CSS Tables distributes row tracks on that axis, which is physical
 /// width in vertical writing modes.
@@ -263,11 +304,14 @@ fn table_wrapper_size_to_grid_content_height(
 }
 
 pub(super) fn declared_table_cell_width(
-    cell: &Element,
+    _cell: &Element,
     style: &ComputedStyle,
 ) -> Option<DeclaredTableWidth> {
     match style.box_values.width.clone() {
-        css::ComputedLengthPercentageOrAuto::Auto => html_width_for_table_cell(cell),
+        // Legacy HTML `width` is converted into a presentational hint during
+        // cascade.  Reading it again here would turn `width=0` back into a
+        // fixed zero-width column after the hint correctly computed to auto.
+        css::ComputedLengthPercentageOrAuto::Auto => None,
         css::ComputedLengthPercentageOrAuto::LengthPercentage(value) => {
             if let Some(percent) = value
                 .pure_percentage_coefficient()
@@ -327,18 +371,6 @@ fn declared_table_width_from_computed(
         | css::ComputedLengthPercentageOrAuto::Stretch
         | css::ComputedLengthPercentageOrAuto::CalcSize(_) => None,
     }
-}
-
-pub(super) fn html_width_for_table_cell(cell: &Element) -> Option<DeclaredTableWidth> {
-    let value = cell.attrs.get("width")?.trim();
-    if let Some(percent) = value.strip_suffix('%') {
-        return percent
-            .trim()
-            .parse::<f32>()
-            .ok()
-            .map(|percent| DeclaredTableWidth::Percent(percent / 100.0));
-    }
-    parse_html_length(value).map(DeclaredTableWidth::Fixed)
 }
 
 pub(super) fn resolve_declared_table_width(
@@ -773,6 +805,7 @@ pub(super) fn table_cell_content_min_width(
 
     inline_contribution
         .min_content
+        .points()
         .max(replaced_width)
         .max(block_min_width)
         + padding.left
@@ -799,11 +832,69 @@ pub(super) fn table_cell_content_max_width(
 
     inline_contribution
         .max_content
+        .points()
         .max(block_max_width)
         .max(replaced_width)
         + padding.left
         + padding.right
         + border_width
+}
+
+/// Return a cell's minimum outer contribution on the physical horizontal axis.
+///
+/// A vertical or sideways table root uses physical width for its row tracks.
+/// That is not the cell's max-content width alone: an authored `width`,
+/// `min-width`, or logical `inline-size` resolved to `width` must also keep
+/// the root block track wide enough for the cell border box.  This is kept
+/// separate from column measure collection, where a preferred cell width is
+/// intentionally not a min-content floor:
+/// <https://drafts.csswg.org/css-tables-3/#row-layout> and
+/// <https://drafts.csswg.org/css-sizing-3/#intrinsic-contribution>.
+pub(super) fn table_cell_physical_width_minimum(
+    style: &ComputedStyle,
+    border_insets: Option<css::Edges>,
+) -> f32 {
+    let border_width = border_insets
+        .map(|borders| borders.left + borders.right)
+        .unwrap_or_else(|| table_horizontal_borders(style).points());
+    let padding = intrinsic_padding_edges(style).to_css_edges();
+    let non_content = non_content_pt(padding.left + padding.right + border_width);
+    let specified = used_content_box_width_or_auto(style, layout_pt(0.0), non_content)
+        .map(SemanticLengthExt::points)
+        .unwrap_or(0.0);
+    let minimum = used_length_percentage_or_auto(
+        style.box_values.min_width.clone(),
+        PercentageBasis::definite(layout_pt(0.0)),
+    )
+    .map(SemanticLengthExt::points)
+    .unwrap_or(0.0);
+    (specified.max(minimum) + non_content.points()).max(0.0)
+}
+
+/// Return a cell's intrinsic contribution to the root table's block track.
+///
+/// The table root chooses the physical track axis.  For horizontal roots the
+/// existing row-layout metric is already a physical-height border box.  For
+/// vertical and sideways roots the track is physical width, where the cell's
+/// intrinsic content and explicit physical width both participate:
+/// <https://drafts.csswg.org/css-writing-modes-4/#dimension-mapping> and
+/// <https://drafts.csswg.org/css-tables-3/#row-layout>.
+pub(super) fn table_cell_root_block_track_contribution(
+    layout: &mut LayoutBuilder<'_>,
+    cell: &TableCell<'_>,
+    cell_style: &ComputedStyle,
+    table_style: &ComputedStyle,
+    stylesheets: &[Stylesheet],
+    border_insets: Option<css::Edges>,
+    physical_height_border_box: f32,
+) -> f32 {
+    let axes = TableCellAxisAdapter::for_table(table_style);
+    if axes.root_track_uses_physical_width(TableRootTrackAxis::Block) {
+        table_cell_content_max_width(layout, cell, cell_style, stylesheets, border_insets)
+            .max(table_cell_physical_width_minimum(cell_style, border_insets))
+    } else {
+        physical_height_border_box
+    }
 }
 
 /// Return a cell's intrinsic contribution along the table root inline axis.
@@ -822,24 +913,24 @@ pub(super) fn table_cell_content_table_inline_size(
     stylesheets: &[Stylesheet],
     border_insets: Option<css::Edges>,
 ) -> inline_layout::InlineIntrinsicContribution {
-    if !WritingModeAxes::new(table_style.writing_mode, table_style.direction).swaps_physical_axes()
-    {
-        return inline_layout::InlineIntrinsicContribution {
-            min_content: table_cell_content_min_width(
+    let axes = TableCellAxisAdapter::for_table(table_style);
+    if axes.root_track_uses_physical_width(TableRootTrackAxis::Inline) {
+        return inline_layout::InlineIntrinsicContribution::new(
+            LogicalInlineContentSize::new(content_box_pt(table_cell_content_min_width(
                 layout,
                 cell,
                 cell_style,
                 stylesheets,
                 border_insets,
-            ),
-            max_content: table_cell_content_max_width(
+            ))),
+            LogicalInlineContentSize::new(content_box_pt(table_cell_content_max_width(
                 layout,
                 cell,
                 cell_style,
                 stylesheets,
                 border_insets,
-            ),
-        };
+            ))),
+        );
     }
 
     let physical_height = if let Some(children) = cell.children.as_deref() {
@@ -875,10 +966,10 @@ pub(super) fn table_cell_content_table_inline_size(
     .map(|height| height.points() + vertical_non_content)
     .unwrap_or(0.0);
     let inline_size = (physical_height + vertical_non_content).max(declared_physical_height);
-    inline_layout::InlineIntrinsicContribution {
-        min_content: inline_size,
-        max_content: inline_size,
-    }
+    inline_layout::InlineIntrinsicContribution::new(
+        LogicalInlineContentSize::new(content_box_pt(inline_size)),
+        LogicalInlineContentSize::new(content_box_pt(inline_size)),
+    )
 }
 
 fn table_cell_inline_intrinsic_contribution(
@@ -887,10 +978,24 @@ fn table_cell_inline_intrinsic_contribution(
     style: &ComputedStyle,
     stylesheets: &[Stylesheet],
 ) -> inline_layout::InlineIntrinsicContribution {
+    let available_inline_size = table_cell_inline_intrinsic_measure(style)
+        .map(LogicalInlineContentSize::points)
+        .unwrap_or(f32::MAX);
     let measurement = if let Some(children) = cell.children.as_deref() {
-        layout.intrinsic_inline_measurement_for_boxes(children, style, stylesheets, f32::MAX)
+        layout.intrinsic_inline_measurement_for_boxes(
+            children,
+            style,
+            stylesheets,
+            available_inline_size,
+        )
     } else if let Some(element) = cell.element {
-        layout.intrinsic_inline_measurement_for_element(element, style, stylesheets, None, f32::MAX)
+        layout.intrinsic_inline_measurement_for_element(
+            element,
+            style,
+            stylesheets,
+            None,
+            available_inline_size,
+        )
     } else {
         return inline_layout::InlineIntrinsicContribution::default();
     };
@@ -900,10 +1005,46 @@ fn table_cell_inline_intrinsic_contribution(
     }
 
     let physical_width = measurement.physical_width(style);
-    inline_layout::InlineIntrinsicContribution {
-        min_content: physical_width,
-        max_content: physical_width,
+    inline_layout::InlineIntrinsicContribution::new(
+        LogicalInlineContentSize::new(content_box_pt(physical_width)),
+        LogicalInlineContentSize::new(content_box_pt(physical_width)),
+    )
+}
+
+/// Return the definite intrinsic measurement span on a cell's own inline
+/// axis, if the authored cell establishes one.
+///
+/// The intrinsic-measurement backend accepts a scalar at this boundary, but
+/// it still represents the cell's logical inline content size.  In a vertical
+/// cell that axis is physical height, so `height` and `max-height` constrain
+/// wrapping before the resulting physical width is offered to a horizontal
+/// table column.  This is not a table-track constraint and is intentionally
+/// independent of the root table writing mode:
+/// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows> and
+/// <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>.
+pub(super) fn table_cell_inline_intrinsic_measure(
+    style: &ComputedStyle,
+) -> Option<LogicalInlineContentSize> {
+    if !WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes() {
+        return None;
     }
+
+    let non_content =
+        non_content_pt(style.padding.top + style.padding.bottom) + table_vertical_borders(style);
+    let specified = used_content_box_height_or_auto(style, layout_pt(0.0), non_content)
+        .map(SemanticLengthExt::points);
+    let maximum = used_length_percentage_or_auto(
+        style.box_values.max_height.clone(),
+        PercentageBasis::<LayoutLength>::indefinite(),
+    )
+    .map(SemanticLengthExt::points);
+    match (specified, maximum) {
+        (Some(specified), Some(maximum)) => Some(specified.min(maximum)),
+        (Some(specified), None) => Some(specified),
+        (None, Some(maximum)) => Some(maximum),
+        (None, None) => None,
+    }
+    .map(|value| LogicalInlineContentSize::new(content_box_pt(value.max(1.0))))
 }
 
 /// Return min/max-content width contributions from block-level and floated cell children.
@@ -946,14 +1087,16 @@ fn table_cell_formatting_child_intrinsic_widths(
             table_cell_formatting_box_intrinsic_width(
                 layout,
                 child,
-                &box_.style,
-                &box_.children,
+                &box_.core.style,
+                &box_.core.children,
                 stylesheets,
             )
         }
-        box_tree::FormattingBox::Inline(box_) => {
-            table_cell_formatting_children_intrinsic_widths(layout, &box_.children, stylesheets)
-        }
+        box_tree::FormattingBox::Inline(box_) => table_cell_formatting_children_intrinsic_widths(
+            layout,
+            &box_.core.children,
+            stylesheets,
+        ),
         _ => {
             let Some((_, _, style, child_children)) = child.element_parts() else {
                 return (0.0, 0.0);
@@ -1021,7 +1164,7 @@ fn table_cell_formatting_box_intrinsic_width(
     let style = layout.style_with_current_viewport_lengths(style);
     if let box_tree::FormattingBox::Table(box_) = child {
         return layout.table_outer_intrinsic_widths_from_fragment(
-            box_.element,
+            box_.core.element,
             &style,
             stylesheets,
             &box_.fragment,
@@ -1058,10 +1201,14 @@ fn table_cell_formatting_box_intrinsic_width(
     };
     let intrinsic_min = inline_contribution
         .min_content
-        .min(inline_contribution.max_content)
+        .points()
+        .min(inline_contribution.max_content.points())
         .max(block_min_width)
         .max(0.0);
-    let intrinsic_max = inline_contribution.max_content.max(block_max_width);
+    let intrinsic_max = inline_contribution
+        .max_content
+        .points()
+        .max(block_max_width);
     let preferred_min = explicit_width.unwrap_or(intrinsic_min);
     let preferred = explicit_width.unwrap_or(intrinsic_max.max(preferred_min));
     let min = constrain_content_width(
@@ -1121,22 +1268,30 @@ fn replaced_box_intrinsic_widths(
     cell_style: &ComputedStyle,
 ) -> Vec<f32> {
     match box_ {
-        box_tree::FormattingBox::Replaced(box_) => {
-            replaced_intrinsic_width_with_table_cell_height(box_.element, &box_.style, cell_style)
-                .into_iter()
-                .collect()
-        }
+        box_tree::FormattingBox::Replaced(box_) => replaced_intrinsic_width_with_table_cell_height(
+            box_.core.element,
+            &box_.core.style,
+            cell_style,
+        )
+        .into_iter()
+        .collect(),
         box_tree::FormattingBox::AtomicInline(box_) => {
-            replaced_intrinsic_width_with_table_cell_height(box_.element, &box_.style, cell_style)
-                .into_iter()
-                .collect()
+            replaced_intrinsic_width_with_table_cell_height(
+                box_.core.element,
+                &box_.core.style,
+                cell_style,
+            )
+            .into_iter()
+            .collect()
         }
         box_tree::FormattingBox::Block(box_) => box_
+            .core
             .children
             .iter()
             .flat_map(|child| replaced_box_intrinsic_widths(child, cell_style))
             .collect(),
         box_tree::FormattingBox::Inline(box_) => box_
+            .core
             .children
             .iter()
             .flat_map(|child| replaced_box_intrinsic_widths(child, cell_style))
@@ -1147,16 +1302,19 @@ fn replaced_box_intrinsic_widths(
             .flat_map(|child| replaced_box_intrinsic_widths(child, cell_style))
             .collect(),
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
+            .core
             .children
             .iter()
             .flat_map(|child| replaced_box_intrinsic_widths(child, cell_style))
             .collect(),
         box_tree::FormattingBox::Table(box_) => box_
+            .core
             .children
             .iter()
             .flat_map(|child| replaced_box_intrinsic_widths(child, cell_style))
             .collect(),
         box_tree::FormattingBox::Flex(box_) => box_
+            .core
             .children
             .iter()
             .flat_map(|child| replaced_box_intrinsic_widths(child, cell_style))
@@ -1184,8 +1342,8 @@ fn replaced_intrinsic_width_with_table_cell_height(
         Some(ReplacedElementKind::Canvas) => Some(intrinsic_canvas_size(element)),
         Some(ReplacedElementKind::Image) | None => None,
     }?;
-    if !style.box_values.width.clone().is_auto() || intrinsic_size.height <= 0.0 {
-        return Some(intrinsic_size.width);
+    if !style.box_values.width.clone().is_auto() || intrinsic_size.height <= content_box_pt(0.0) {
+        return Some(intrinsic_size.width.points());
     }
     let cell_height = cell_style
         .box_values
@@ -1197,7 +1355,10 @@ fn replaced_intrinsic_width_with_table_cell_height(
         PercentageBasis::definite(content_box_pt(cell_height)),
         non_content_pt(0.0),
     )?;
-    Some((used_height.points() * intrinsic_size.width / intrinsic_size.height).max(0.0))
+    Some(
+        (used_height.points() * intrinsic_size.width.points() / intrinsic_size.height.points())
+            .max(0.0),
+    )
 }
 
 fn replaced_descendant_intrinsic_widths(element: &Element) -> Vec<f32> {
@@ -1213,8 +1374,10 @@ fn replaced_descendant_intrinsic_widths(element: &Element) -> Vec<f32> {
 
 fn replaced_element_intrinsic_width(element: &Element) -> Option<f32> {
     match replaced_element_kind(element) {
-        Some(ReplacedElementKind::Svg) => intrinsic_svg_size(element).map(|size| size.width),
-        Some(ReplacedElementKind::Canvas) => Some(intrinsic_canvas_size(element).width),
+        Some(ReplacedElementKind::Svg) => {
+            intrinsic_svg_size(element).map(|size| size.width.points())
+        }
+        Some(ReplacedElementKind::Canvas) => Some(intrinsic_canvas_size(element).width.points()),
         Some(ReplacedElementKind::Image) | None => None,
     }
 }

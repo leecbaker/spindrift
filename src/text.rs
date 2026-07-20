@@ -1,13 +1,16 @@
 use crate::css::{
     ComputedStyle, CssFontFace, Direction, FontFaceSource, FontFamily, FontFeatureValue,
-    FontFeatureValues, FontFeatureValuesBlock, FontKerning, FontPaletteValues, FontStyle,
-    FontVariantAlternates, FontVariantCaps, FontVariantEastAsian, FontVariantEastAsianValue,
-    FontVariantEmoji, FontVariantLigatures, FontVariantNumeric, FontVariantNumericValue,
-    FontVariantPosition, FontWeight, FontWidth, HyphenateLimitChars, Hyphens,
-    LineBreak as CssLineBreak, OverflowWrap as CssOverflowWrap, Stylesheet, TextLayoutPolicy,
-    TextOrientation, TypographicMode, UnicodeBidi, UnicodeRange, WordBreak as CssWordBreak,
+    FontFeatureValues, FontFeatureValuesBlock, FontKerning, FontPalette, FontPaletteValues,
+    FontStyle, FontVariantAlternates, FontVariantCaps, FontVariantEastAsian,
+    FontVariantEastAsianValue, FontVariantEmoji, FontVariantLigatures, FontVariantNumeric,
+    FontVariantNumericValue, FontVariantPosition, FontVariationSettings, FontWeight, FontWidth,
+    HyphenateLimitChars, Hyphens, LineBreak as CssLineBreak, OverflowWrap as CssOverflowWrap,
+    Stylesheet, TextLayoutPolicy, TextOrientation, UnicodeBidi, UnicodeRange,
+    WordBreak as CssWordBreak,
 };
-use crate::document::{DocumentFont, FontProgramKind, RenderedGlyph, RenderedTextRun};
+use crate::document::{
+    DocumentFont, FontProgramKind, RenderedGlyph, RenderedGlyphKind, RenderedTextRun,
+};
 use crate::units::{LayoutLength, SemanticLengthExt, layout_points, layout_pt};
 use base64::Engine as _;
 use fontique::{
@@ -23,8 +26,8 @@ use icu_properties::{
     PropertyNamesShort,
     props::{
         BidiClass, BidiControl, BidiMirroringGlyph, DefaultIgnorableCodePoint, EastAsianWidth,
-        Emoji, GeneralCategory, GeneralCategoryGroup, JoinControl, JoiningType, LineBreak,
-        Script as IcuScript, VerticalOrientation, WordBreak as IcuWordBreak,
+        Emoji, EmojiPresentation, GeneralCategory, GeneralCategoryGroup, JoinControl, JoiningType,
+        LineBreak, Script as IcuScript, VerticalOrientation, WordBreak as IcuWordBreak,
     },
 };
 use icu_segmenter::options::{
@@ -36,11 +39,13 @@ use parley::style::FontFeature as ParleyFontFeature;
 use parley::{
     FontContext as ParleyFontContext, FontFamily as ParleyFontFamily,
     FontFeatures as ParleyFontFeatures, FontStyle as ParleyFontStyle,
+    FontVariation as ParleyFontVariation, FontVariations as ParleyFontVariations,
     FontWeight as ParleyFontWeight, FontWidth as ParleyFontWidth, Language as ParleyLanguage,
     Layout as ParleyLayout, LayoutContext as ParleyLayoutContext, LineHeight as ParleyLineHeight,
     OverflowWrap as ParleyOverflowWrap, StyleProperty, TextWrapMode as ParleyTextWrapMode,
     WordBreak as ParleyWordBreak,
 };
+use read_fonts::types::Tag as OpenTypeTag;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -49,19 +54,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) struct FontSystem {
     parley_font_context: ParleyFontContext,
-    parley_layout_context: ParleyLayoutContext,
+    parley_layout_context: ParleyLayoutContext<FontPalette>,
     /// Reused temporary layout storage for Parley shaping passes.
     ///
     /// Each pass extracts owned glyph data before returning, so retaining this
     /// layout only keeps Parley's internal vectors available for the next
     /// shape in the same document.
-    parley_layout_scratch: ParleyLayout<[u8; 4]>,
+    parley_layout_scratch: ParleyLayout<FontPalette>,
     document_fonts: DocumentFontRegistry,
     family_cache: HashMap<FontRequest, usize>,
     fallback_cache: HashMap<FallbackRequest, Option<usize>>,
     font_feature_values: FontFeatureValues,
     font_palette_values: FontPaletteValues,
-    font_feature_defaults_by_family: HashMap<String, FontFaceFeatureDefaults>,
 }
 
 impl Clone for FontSystem {
@@ -77,18 +81,28 @@ impl Clone for FontSystem {
             fallback_cache: self.fallback_cache.clone(),
             font_feature_values: self.font_feature_values.clone(),
             font_palette_values: self.font_palette_values.clone(),
-            font_feature_defaults_by_family: self.font_feature_defaults_by_family.clone(),
         }
     }
 }
 
 pub(crate) struct FontSystemLoad {
+    #[cfg(not(target_arch = "wasm32"))]
     parley_font_context: tokio::task::JoinHandle<LoadedParleyFontContext>,
+    #[cfg(target_arch = "wasm32")]
+    parley_font_context: LoadedParleyFontContext,
 }
 
 pub(crate) struct FontSystemSeedLoad {
+    #[cfg(not(target_arch = "wasm32"))]
     parley_font_context: tokio::task::JoinHandle<LoadedParleyFontContext>,
+    #[cfg(target_arch = "wasm32")]
+    parley_font_context: LoadedParleyFontContext,
+    #[cfg(not(target_arch = "wasm32"))]
     font_faces: tokio::task::JoinHandle<crate::Result<Vec<LoadedFontFace>>>,
+    #[cfg(target_arch = "wasm32")]
+    font_faces: Vec<CssFontFace>,
+    #[cfg(target_arch = "wasm32")]
+    resource_fetcher: crate::resource::ResourceFetcher,
     font_feature_values: FontFeatureValues,
     font_palette_values: FontPaletteValues,
 }
@@ -98,7 +112,6 @@ struct FontSystemSeed {
     registered_font_faces: HashMap<RegisteredFontFaceKey, RegisteredFontFaceMetadata>,
     font_feature_values: FontFeatureValues,
     font_palette_values: FontPaletteValues,
-    font_feature_defaults_by_family: HashMap<String, FontFaceFeatureDefaults>,
 }
 
 struct LoadedParleyFontContext {
@@ -132,16 +145,6 @@ impl FontFaceFeatureDefaults {
             font_variant_alternates: font_face.font_variant_alternates.clone(),
             font_variant_east_asian: font_face.font_variant_east_asian.clone(),
         }
-    }
-
-    fn is_normal(&self) -> bool {
-        self.font_feature_settings.0.is_empty()
-            && self.font_variant_ligatures == FontVariantLigatures::Normal
-            && self.font_variant_position == FontVariantPosition::Normal
-            && self.font_variant_caps == FontVariantCaps::Normal
-            && self.font_variant_numeric == FontVariantNumeric::Normal
-            && self.font_variant_alternates == FontVariantAlternates::Normal
-            && self.font_variant_east_asian == FontVariantEastAsian::Normal
     }
 }
 
@@ -290,6 +293,40 @@ impl ShapedInlineLine {
             .fold(0.0, f32::max)
     }
 
+    /// Remove the shaper-owned terminal tracking advance from this fragment.
+    ///
+    /// CSS Text applies `letter-spacing` only between typographic character
+    /// units. Graph inline layout resolves those boundaries after UAX #9
+    /// reordering, so any advance supplied by the shaping backend at a
+    /// fragment's logical end must be removed from the glyph record as well
+    /// as from its measured width. Leaving it in the glyph would make paint
+    /// disagree with fitting and intrinsic sizing.
+    /// <https://drafts.csswg.org/css-text-3/#letter-spacing-property>
+    pub(crate) fn remove_terminal_letter_spacing(&mut self, spacing: f32) {
+        if spacing == 0.0 {
+            return;
+        }
+
+        // Format and bidi controls can be retained in the source summary but
+        // do not paint. The backend assigns their zero-width cluster after
+        // the preceding visible glyph, so select the final paintable glyph
+        // rather than assuming the final source range owns the advance.
+        // Re-homed fallback glyphs do not necessarily retain source
+        // provenance, but still carry the backend terminal advance.
+        let mut terminal = None;
+        for (run_index, run) in self.runs.iter().enumerate() {
+            for (glyph_index, glyph) in run.glyphs.iter().enumerate() {
+                if glyph.paints {
+                    terminal = Some((run_index, glyph_index));
+                }
+            }
+        }
+        if let Some((run_index, glyph_index)) = terminal {
+            self.runs[run_index].glyphs[glyph_index].rendered.x_advance -= spacing;
+            self.width = self.advance_width();
+        }
+    }
+
     /// Extract a selected source range without re-running contextual shaping.
     ///
     /// CSS Text soft wrapping selects source ranges after text shaping
@@ -309,6 +346,7 @@ impl ShapedInlineLine {
         }
 
         let mut runs = Vec::new();
+        let mut selected_source_ranges = Vec::new();
         for run in &self.runs {
             let mut prefix_advance = 0.0;
             let mut glyphs = Vec::new();
@@ -325,6 +363,7 @@ impl ShapedInlineLine {
                     return None;
                 }
                 if glyph_range.start >= range.start && glyph_range.end <= range.end {
+                    selected_source_ranges.push(glyph_range.clone());
                     source_start = Some(source_start.map_or(glyph_range.start, |start: usize| {
                         start.min(glyph_range.start)
                     }));
@@ -357,6 +396,26 @@ impl ShapedInlineLine {
             selected.x_offset += prefix_advance;
             selected.glyphs = glyphs;
             runs.push(selected);
+        }
+        // Source shaping is only reusable when its glyph provenance covers
+        // every paintable character in the selected CSS Text range. A
+        // default-ignorable control (notably a soft hyphen) may cause a
+        // backend to report discontinuous or truncated cluster ranges. Using
+        // such a partial slice would under-measure the selected line and can
+        // make later content incorrectly fit after a hyphenation break.
+        // Re-shaping is the conservative fallback; normal complete slices
+        // retain the original contextual shaping.
+        // <https://www.w3.org/TR/css-text-3/#line-breaking>
+        for (offset, character) in self.text[range.clone()].char_indices() {
+            if character_is_default_ignorable_code_point(character) {
+                continue;
+            }
+            let character_range = range.start + offset..range.start + offset + character.len_utf8();
+            if !selected_source_ranges.iter().any(|glyph_range| {
+                glyph_range.start <= character_range.start && glyph_range.end >= character_range.end
+            }) {
+                return None;
+            }
         }
         let left_edge = runs.iter().map(|run| run.x_offset).min_by(f32::total_cmp)?;
         for run in &mut runs {
@@ -552,7 +611,7 @@ impl ShapedInlineRun {
         let actual_text = self
             .glyphs
             .iter()
-            .any(|glyph| glyph.rendered.unicode.is_empty())
+            .any(|glyph| glyph.rendered.unicode.is_empty() || glyph.rendered.is_advance_only())
             .then(|| Rc::clone(&self.text))
             .filter(|text| !text.is_empty());
         RenderedTextRun {
@@ -721,7 +780,11 @@ pub(crate) fn trim_trailing_css_hanging_space_separators<'a>(
 /// <https://www.w3.org/TR/css-text-3/#letter-spacing-property>.
 pub(crate) fn line_end_letter_spacing_width(text: &str, style: &ComputedStyle) -> LayoutLength {
     let letter_spacing = style.used_letter_spacing().points();
-    if letter_spacing == 0.0 || text.is_empty() || text.chars().any(character_has_joining_behavior)
+    if letter_spacing == 0.0
+        || text.is_empty()
+        || text.chars().any(|character| {
+            character_has_joining_behavior(character) && !character_is_join_control(character)
+        })
     {
         return layout_pt(0.0);
     }
@@ -857,9 +920,16 @@ struct RegisteredFontFace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RegisteredFontFaceMetadata {
     family: String,
+    weight: FontWeight,
+    style: FontStyle,
+    weight_is_variable: bool,
     feature_defaults: FontFaceFeatureDefaults,
     unicode_range: Option<Vec<UnicodeRange>>,
     size_adjust: Option<u32>,
+    ascent_override: Option<u32>,
+    descent_override: Option<u32>,
+    line_gap_override: Option<u32>,
+    font_variation_settings: FontVariationSettings,
 }
 
 mod bidi;
@@ -875,15 +945,19 @@ pub(crate) use bidi::{
 };
 pub(crate) use breaking::contains_bidi_text;
 pub(crate) use breaking::{
+    DiscretionaryOpportunity, LanguageDiscretionaryReplacement,
+    automatic_hyphenation_opportunities, hyphenator_for_language, manual_hyphenation_opportunities,
+    text_with_hyphenation_controls,
+};
+pub(crate) use breaking::{
     TextBreakPolicy, collect_grapheme_cluster_inner_boundaries,
     collect_measured_break_opportunities, manual_suppresses_break_between,
 };
-pub(crate) use breaking::{
-    hyphenator_for_language, text_with_auto_hyphenation, text_with_css_line_breaks,
-    text_with_hyphenation_controls,
-};
 #[cfg(test)]
-pub(crate) use breaking::{inline_atomic_boundary_allows_soft_wrap, measured_break_opportunities};
+pub(crate) use breaking::{
+    inline_atomic_boundary_allows_soft_wrap, measured_break_opportunities,
+    text_with_auto_hyphenation,
+};
 use font_matching::*;
 use shaping::*;
 pub(crate) use shaping::{BidiVisualRange, ResolvedBidiDirection};
@@ -896,23 +970,27 @@ pub(crate) fn font_program_opentype_name(
 }
 pub(crate) use typographic_units::{
     inter_character_gap_allowed_between_text, keep_all_suppresses_break_between,
-    text_break_is_min_content_eligible, typographic_unit_count, typographic_unit_ranges,
+    text_break_is_min_content_eligible, text_is_inter_character_control_only,
+    typographic_unit_count, typographic_unit_ranges,
 };
 use unicode_properties::*;
 pub(crate) use unicode_properties::{
-    SegmentBreakContext, character_has_joining_behavior, character_is_arabic_tatweel,
-    character_is_autospace_alpha, character_is_autospace_ideograph, character_is_autospace_numeric,
-    character_is_bidi_format_control, character_is_css_other_space_separator,
-    character_is_css_word_separator, character_is_currency_symbol,
-    character_is_default_ignorable_code_point, character_is_first_hangable_punctuation,
-    character_is_font_neutral_default_ignorable, character_is_hangable_stop_or_comma,
-    character_is_join_control, character_is_last_hangable_punctuation,
-    character_is_mandatory_line_break, character_is_text_decoration_spacer,
-    character_is_unicode_alphanumeric, character_is_unicode_control, character_is_unicode_letter,
-    character_is_unicode_mark, character_is_unicode_punctuation, character_is_unicode_symbol,
+    SegmentBreakContext, TextSpacingPunctuationClass, character_has_joining_behavior,
+    character_is_arabic_tatweel, character_is_autospace_alpha, character_is_autospace_ideograph,
+    character_is_autospace_numeric, character_is_bidi_format_control,
+    character_is_css_other_space_separator, character_is_css_word_separator,
+    character_is_currency_symbol, character_is_default_ignorable_code_point,
+    character_is_first_hangable_punctuation, character_is_font_neutral_default_ignorable,
+    character_is_hangable_stop_or_comma, character_is_join_control,
+    character_is_last_hangable_punctuation, character_is_mandatory_line_break,
+    character_is_text_decoration_spacer, character_is_unicode_alphanumeric,
+    character_is_unicode_control, character_is_unicode_letter, character_is_unicode_mark,
+    character_is_unicode_punctuation, character_is_unicode_symbol,
     character_is_unicode_typographic_letter, character_preserves_word_boundary_context,
     character_receives_text_emphasis_mark, plaintext_direction_for_text,
-    segment_break_is_removable, typographic_unit_is_upright_in_mixed_orientation,
+    segment_break_is_removable, text_spacing_punctuation_class,
+    typographic_unit_is_upright_in_mixed_orientation,
+    typographic_unit_uses_vertical_forms_in_mixed_orientation,
 };
 
 #[cfg(test)]

@@ -1,4 +1,26 @@
 use super::system::span_boundary_needs_join_control;
+use crate::CssColor;
+use crate::css::WritingMode;
+use crate::document::{PaintDisplacement, RenderedLine};
+
+#[test]
+fn rendered_line_alignment_reverses_the_stored_glyph_origin_adjustment() {
+    let line = RenderedLine::new(
+        "X".to_string(),
+        10.0,
+        20.0,
+        12.0,
+        // The legacy line-level font metadata deliberately does not identify
+        // a loaded font. Baseline recovery must use the conversion recorded at
+        // paint time instead of deriving a new one from this field.
+        Some(usize::MAX),
+        CssColor::BLACK,
+        Vec::new(),
+    )
+    .with_glyph_origin_adjustment(PaintDisplacement::new(0.0, 3.5));
+
+    assert!((FontSystem::new().rendered_line_alignment_y(&line).points() - 28.5).abs() < 0.01);
+}
 
 #[test]
 fn arabic_visual_ranges_are_emitted_in_reverse_cluster_order() {
@@ -33,8 +55,9 @@ fn arabic_visual_ranges_are_emitted_in_reverse_cluster_order() {
 }
 use super::*;
 use crate::css::{
-    ComputedLengthPercentage, Css, FontFeatureSetting, FontFeatureSettings, FontSizeAdjust,
-    FontSizeAdjustMetric, FontSizeAdjustValue, WhiteSpace, parse_stylesheet,
+    ComputedLengthPercentage, Css, FontFeatureSetting, FontFeatureSettings, FontPalette,
+    FontSizeAdjust, FontSizeAdjustMetric, FontSizeAdjustValue, FontVariationSetting, WhiteSpace,
+    parse_stylesheet,
 };
 use crate::units::{LayoutLength, SemanticLengthExt, layout_pt};
 
@@ -150,7 +173,7 @@ fn shaped_glyph_ids(system: &mut FontSystem, text: &str, style: &ComputedStyle) 
         .shape_text_runs_with_parley(text, style)
         .into_iter()
         .flat_map(|run| run.glyphs)
-        .map(|glyph| glyph.id)
+        .map(|glyph| glyph.painted_id().expect("paintable glyph"))
         .collect()
 }
 
@@ -167,7 +190,7 @@ async fn font_neutral_cgj_does_not_change_visible_glyph_selection() {
         }])
         .into_iter()
         .flat_map(|run| run.glyphs)
-        .map(|glyph| glyph.id)
+        .map(|glyph| glyph.painted_id().expect("paintable glyph"))
         .collect::<Vec<_>>();
     let styled_with_cgj = system
         .shape_styled_text_runs_with_parley(&[StyledTextSpan {
@@ -176,7 +199,7 @@ async fn font_neutral_cgj_does_not_change_visible_glyph_selection() {
         }])
         .into_iter()
         .flat_map(|run| run.glyphs)
-        .map(|glyph| glyph.id)
+        .map(|glyph| glyph.painted_id().expect("paintable glyph"))
         .collect::<Vec<_>>();
 
     // CGJ affects UAX #14 boundaries but is font-neutral: it must not make a
@@ -250,9 +273,99 @@ fn rtl_visual_slice_mirrors_glyph_without_rewriting_source_text() {
         .find(|glyph| glyph.source_text() == ">")
         .expect("LTR source punctuation should emit a glyph");
 
-    assert_eq!(rtl_glyph.rendered.id, mirrored_glyph.rendered.id);
-    assert_ne!(rtl_glyph.rendered.id, ltr_glyph.rendered.id);
+    assert_eq!(
+        rtl_glyph.rendered.painted_id(),
+        mirrored_glyph.rendered.painted_id()
+    );
+    assert_ne!(
+        rtl_glyph.rendered.painted_id(),
+        ltr_glyph.rendered.painted_id()
+    );
     assert_eq!(rtl_glyph.source_text(), ">");
+}
+
+#[test]
+fn isolate_override_uses_first_strong_isolate_controls() {
+    let mut style = ComputedStyle::initial();
+    style.unicode_bidi = UnicodeBidi::IsolateOverride;
+
+    style.direction = Direction::Ltr;
+    assert_eq!(
+        bidi_control_scope_for_style(&style),
+        Some(("\u{2068}\u{202d}", "\u{202c}\u{2069}"))
+    );
+
+    style.direction = Direction::Rtl;
+    assert_eq!(
+        bidi_control_scope_for_style(&style),
+        Some(("\u{2068}\u{202e}", "\u{202c}\u{2069}"))
+    );
+}
+
+#[test]
+fn upright_vertical_inline_scope_forces_ltr_bidi() {
+    let mut style = ComputedStyle::initial();
+    style.writing_mode = WritingMode::VerticalRl;
+    style.direction = Direction::Rtl;
+    style.text_orientation = TextOrientation::Upright;
+
+    assert_eq!(
+        bidi_control_scope_for_style(&style),
+        Some(("\u{202d}", "\u{202c}"))
+    );
+}
+
+#[test]
+fn isolate_override_resolves_the_full_line_before_visual_paint_shaping() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.direction = Direction::Ltr;
+    let text = "> \u{2068}\u{202e}אבגד > abcd\u{202c}\u{2069} >";
+
+    let visual_text = system
+        .visual_ranges_for_unwrapped_text(text, &style)
+        .into_iter()
+        .map(|range| text_without_bidi_format_controls(&text[range.range]).into_owned())
+        .collect::<String>();
+
+    assert_eq!(visual_text, "> dcba > דגבא >");
+}
+
+#[test]
+fn cached_rtl_visual_slice_mirrors_glyph_without_rewriting_source_text() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::SansSerif;
+    style.font_size = 12.0;
+    style.line_height = 14.4;
+
+    let mut cached = system
+        .shape_unwrapped_line(">", &style, style.line_height)
+        .and_then(|shaped| shaped.source_slice(0..1))
+        .expect("logical source slice should shape");
+    system.apply_resolved_bidi_glyph_mirroring(&mut cached, ResolvedBidiDirection::Rtl);
+    let mirrored = system
+        .shape_visual_ordered_line("<", &style, style.line_height, ResolvedBidiDirection::Ltr)
+        .expect("mirrored LTR punctuation should shape");
+
+    let cached_glyph = cached
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .find(|glyph| glyph.source_text() == ">")
+        .expect("cached RTL source punctuation should emit a glyph");
+    let mirrored_glyph = mirrored
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .find(|glyph| glyph.source_text() == "<")
+        .expect("mirrored LTR punctuation should emit a glyph");
+
+    assert_eq!(
+        cached_glyph.rendered.painted_id(),
+        mirrored_glyph.rendered.painted_id()
+    );
+    assert_eq!(cached_glyph.source_text(), ">");
 }
 
 #[test]
@@ -430,6 +543,43 @@ async fn font_face_feature_descriptors_participate_in_shaping_precedence() {
 }
 
 #[tokio::test]
+async fn font_face_variation_descriptor_is_merged_into_the_selected_shaping_style() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: VariationFaceDefaults;
+                src: url("WeasyPrint/tests/resources/weasyprint.otf");
+                font-variation-settings: "wdth" 125, "wght" 600.7;
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::Names(vec!["VariationFaceDefaults".to_string()]);
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+
+    let resolved = system.style_with_selected_face_variations(&style);
+
+    assert_eq!(
+        resolved.font_variation_settings,
+        FontVariationSettings(vec![
+            FontVariationSetting {
+                tag: *b"wdth",
+                value: 125.0_f32.to_bits(),
+            },
+            FontVariationSetting {
+                tag: *b"wght",
+                value: 600.7_f32.to_bits(),
+            },
+        ])
+    );
+}
+
+#[tokio::test]
 async fn font_variant_emoji_selectors_do_not_leak_to_emitted_text() {
     let mut system = FontSystem::new();
     let mut style = ComputedStyle::initial();
@@ -581,7 +731,7 @@ async fn inter_word_justification_mutates_shaped_separator_advances() {
         .runs
         .iter()
         .flat_map(|run| &run.glyphs)
-        .map(|glyph| glyph.rendered.id)
+        .map(|glyph| glyph.rendered.painted_id().expect("paintable glyph"))
         .collect::<Vec<_>>();
     let original_space_advance = shaped
         .runs
@@ -617,7 +767,7 @@ async fn inter_word_justification_mutates_shaped_separator_advances() {
             .runs
             .iter()
             .flat_map(|run| &run.glyphs)
-            .map(|glyph| glyph.rendered.id)
+            .map(|glyph| glyph.rendered.painted_id().expect("paintable glyph"))
             .collect::<Vec<_>>(),
         original_glyph_ids
     );
@@ -933,7 +1083,7 @@ async fn shared_font_program_keeps_each_css_face_metadata() {
         )
         .expect("first shared face resolves");
     let mut oblique = style;
-    oblique.font_style = FontStyle::Oblique;
+    oblique.font_style = FontStyle::DEFAULT_OBLIQUE;
     let face_b = system
         .resolve_font_family(
             &FontFamily::Names(vec!["SharedFaceA".to_string()]),
@@ -951,8 +1101,140 @@ async fn shared_font_program_keeps_each_css_face_metadata() {
     assert_eq!(system.document_fonts.font_size_adjust(face_b), Some(0.75));
     assert!(system.document_fonts.font_has_character(face_a, '\u{0627}'));
     assert!(!system.document_fonts.font_has_character(face_a, '\u{0628}'));
+    assert!(!system.document_fonts.font_has_character(face_a, ' '));
     assert!(system.document_fonts.font_has_character(face_b, '\u{0628}'));
     assert!(!system.document_fonts.font_has_character(face_b, '\u{0627}'));
+}
+
+#[tokio::test]
+async fn unicode_range_excludes_a_face_from_first_available_font_metrics() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: NoSpace;
+                src: url("tests/resources/fonts/NotoNaskhArabic-regular.woff2");
+                unicode-range: U+0627;
+            }
+            @font-face {
+                font-family: WithSpace;
+                src: url("tests/resources/fonts/NotoNaskhArabic-regular.woff2");
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::List(vec![
+        FontFamily::Names(vec!["NoSpace".to_string()]),
+        FontFamily::Names(vec!["WithSpace".to_string()]),
+    ]);
+
+    let first_available = system
+        .resolve_metric_font_for_style(&style)
+        .expect("the second face provides U+0020");
+    assert_eq!(
+        system.document_fonts.get(first_available).unwrap().family,
+        "WithSpace"
+    );
+}
+
+#[tokio::test]
+async fn missing_glyph_zero_does_not_cover_tab_space_metrics_or_paint_tabs() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: NoSpace;
+                src: url("tests/resources/fonts/CanvasTest-nospace.ttf");
+            }
+            @font-face {
+                font-family: WithSpace;
+                src: url("tests/resources/fonts/noto-sans-v8-latin-regular.woff");
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::Names(vec!["NoSpace".to_string(), "WithSpace".to_string()]);
+    style.white_space = WhiteSpace::Pre;
+
+    let no_space = system
+        .resolve_font_family(
+            &FontFamily::Names(vec!["NoSpace".to_string()]),
+            style.font_weight,
+            style.font_style,
+            style.font_width,
+        )
+        .expect("the no-space test face resolves");
+    assert!(
+        !system.document_fonts.font_has_character(no_space, ' '),
+        "a cmap mapping to `.notdef` must not count as U+0020 coverage"
+    );
+    let matched = system
+        .character_font_match(&style, ' ')
+        .expect("the later stack face supplies U+0020");
+    assert_eq!(
+        system.document_fonts.get(matched.font_id).unwrap().family,
+        "WithSpace"
+    );
+    assert_ne!(matched.glyph_id.raw().0, 0);
+
+    let shaped = system
+        .shape_unwrapped_line("\t", &style, style.line_height)
+        .expect("a preserved tab shapes as a layout advance");
+    let tab = shaped
+        .runs
+        .iter()
+        .flat_map(|run| &run.glyphs)
+        .find(|glyph| glyph.source_text() == "\t")
+        .expect("tab source remains in the shaped line");
+    assert!(tab.rendered.is_advance_only());
+    assert!(tab.rendered.x_advance > 0.0);
+    assert!(!tab.paints);
+}
+
+#[tokio::test]
+async fn font_face_feature_defaults_retain_each_declared_tag() {
+    let stylesheet = parse_stylesheet(
+        &Css::from_string(
+            r#"@font-face {
+                font-family: FeatureDefaults;
+                src: url("WeasyPrint/tests/resources/weasyprint.otf");
+                font-feature-settings: "liga" on, "clig" on, "calt" on, "hlig" on,
+                    "dlig" on, "onum" on, "smcp" on, "jp90" on;
+            }"#,
+        )
+        .with_base_path(".")
+        .expect("current directory should be a valid file URL"),
+    );
+    assert_eq!(stylesheet.font_faces[0].font_feature_settings.0.len(), 8);
+
+    let mut system = FontSystem::start_loading()
+        .load_stylesheet_fonts(&[stylesheet])
+        .finish()
+        .await;
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::Names(vec!["FeatureDefaults".to_string()]);
+    let context = system
+        .font_feature_context_for_style(&style)
+        .expect("@font-face descriptor creates a shaping context");
+    assert_eq!(
+        context
+            .face_defaults
+            .expect("selected face keeps its descriptor defaults")
+            .font_feature_settings
+            .0
+            .len(),
+        8
+    );
 }
 
 #[tokio::test]
@@ -998,7 +1280,7 @@ async fn styled_tatweel_fragment_shapes_adjacent_arabic_letter() {
         .into_iter()
         .flat_map(|run| run.glyphs)
         .filter(|glyph| glyph.x_advance != 0.0)
-        .map(|glyph| glyph.id)
+        .map(|glyph| glyph.painted_id().expect("paintable glyph"))
         .collect::<Vec<_>>();
 
     assert_ne!(glyph_ids.first(), isolated_beh.first(), "{glyph_ids:?}");
@@ -1033,7 +1315,7 @@ async fn other_space_separators_emit_blank_glyphs_with_original_unicode() {
         .next()
         .unwrap();
 
-    assert_eq!(en_space_glyph.id, space_glyph.id);
+    assert_eq!(en_space_glyph.painted_id(), space_glyph.painted_id());
     assert_eq!(en_space_glyph.unicode, "\u{2002}");
     assert!(en_space_glyph.x_advance > 0.0);
 }
@@ -1185,6 +1467,40 @@ async fn measured_line_breaks_do_not_leave_closing_punctuation_at_line_start() {
     let breaks = measured_break_opportunities(text, &style);
 
     assert!(!breaks.contains(&closing_punctuation));
+}
+
+#[tokio::test]
+async fn measured_line_breaks_do_not_leave_nonstarters_at_line_start() {
+    // The CSS Text i18n NS reftests exercise all of these scalars. The CJK
+    // ideograph/word fallback must not reintroduce a boundary that UAX #14
+    // forbids before the Nonstarter class.
+    // <https://www.unicode.org/reports/tr14/#LB13>
+    const NONSTARTERS: [char; 9] = [
+        '\u{3005}', '\u{303b}', '\u{303c}', '\u{309d}', '\u{309e}', '\u{30fd}', '\u{30fe}',
+        '\u{ff9e}', '\u{ff9f}',
+    ];
+
+    for nonstarter in NONSTARTERS {
+        let text = format!("中中中{nonstarter}文");
+        let prohibited_boundary = text.find(nonstarter).unwrap();
+        let ordinary_boundary = "中中".len();
+
+        for word_break in [CssWordBreak::Normal, CssWordBreak::BreakAll] {
+            let mut style = ComputedStyle::initial();
+            style.font_family = FontFamily::SansSerif;
+            style.word_break = word_break;
+            let breaks = measured_break_opportunities(&text, &style);
+
+            assert!(
+                breaks.contains(&ordinary_boundary),
+                "{nonstarter:?}: {breaks:?}"
+            );
+            assert!(
+                !breaks.contains(&prohibited_boundary),
+                "{nonstarter:?}: {breaks:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1402,6 +1718,33 @@ async fn hyphenate_limit_chars_filters_automatic_hyphenation_breaks() {
 }
 
 #[test]
+fn soft_hyphen_does_not_suppress_a_later_space_wrap() {
+    let style = ComputedStyle::initial();
+    let text = "Deoxy\u{00ad}ribo\u{00ad}nucleic acid";
+
+    let opportunities = measured_break_opportunities(text, &style);
+
+    assert!(
+        opportunities
+            .binary_search(&"Deoxy\u{00ad}ribo\u{00ad}nucleic ".len())
+            .is_ok(),
+        "a later ordinary space remains a line-break opportunity after a soft hyphen"
+    );
+}
+
+#[test]
+fn soft_hyphen_remains_a_break_before_line_start_prohibited_punctuation() {
+    let style = ComputedStyle::initial();
+    let text = "tú\u{00ad}’àn";
+
+    assert!(
+        measured_break_opportunities(text, &style)
+            .binary_search(&"tú\u{00ad}".len())
+            .is_ok()
+    );
+}
+
+#[test]
 fn unicode_space_separators_hang_in_preserved_white_space_modes() {
     let mut pre = ComputedStyle::initial();
     pre.white_space = WhiteSpace::Pre;
@@ -1423,4 +1766,70 @@ fn unicode_space_separators_hang_in_preserved_white_space_modes() {
         trim_trailing_css_hanging_space_separators("x\u{3000}", &break_spaces),
         "x\u{3000}"
     );
+}
+
+#[test]
+fn shaped_terminal_tracking_is_removed_from_the_glyph_advance() {
+    let mut system = FontSystem::new();
+    let mut style = ComputedStyle::initial();
+    style.font_family = FontFamily::Monospace;
+    style.font_size = 12.0;
+    style.letter_spacing = ComputedLengthPercentage::from_points(10.0);
+    let mut shaped = system
+        .shape_unwrapped_line("ab", &style, style.line_height)
+        .expect("text shapes");
+    let tracked_width = shaped.advance_width();
+
+    shaped.remove_terminal_letter_spacing(style.used_letter_spacing().points());
+
+    assert!(
+        (shaped.advance_width() - (tracked_width - 10.0)).abs() < 0.01,
+        "terminal tracking must be removed from the durable glyph artifact"
+    );
+}
+
+#[test]
+fn zero_width_space_is_font_neutral_during_tracked_shaping() {
+    let mut system = FontSystem::new();
+    let mut tracked = ComputedStyle::initial();
+    tracked.font_family = FontFamily::Monospace;
+    tracked.font_size = 12.0;
+    tracked.letter_spacing = ComputedLengthPercentage::from_points(10.0);
+    let mut untracked = tracked.clone();
+    untracked.letter_spacing = ComputedLengthPercentage::ZERO;
+
+    let mut shaped = system
+        .shape_unwrapped_line("2\u{200b}", &tracked, tracked.line_height)
+        .expect("text shapes");
+    shaped.remove_terminal_letter_spacing(tracked.used_letter_spacing().points());
+
+    let base = system
+        .shape_unwrapped_line("2", &untracked, untracked.line_height)
+        .expect("base text shapes");
+    assert!((shaped.advance_width() - base.advance_width()).abs() < 0.01);
+}
+
+#[test]
+fn styled_palette_boundaries_remain_separate_paint_runs() {
+    let mut system = FontSystem::new();
+    let mut first = ComputedStyle::initial();
+    first.font_family = FontFamily::Monospace;
+    first.font_palette = FontPalette::Named("--first".to_string());
+    let mut second = first.clone();
+    second.font_palette = FontPalette::Named("--second".to_string());
+
+    let runs = system.shape_styled_text_runs_with_parley(&[
+        StyledTextSpan {
+            text: "A",
+            style: &first,
+        },
+        StyledTextSpan {
+            text: "B",
+            style: &second,
+        },
+    ]);
+
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].font_palette, first.font_palette);
+    assert_eq!(runs[1].font_palette, second.font_palette);
 }

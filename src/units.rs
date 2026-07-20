@@ -50,6 +50,15 @@ pub(crate) enum BorderBoxUnit {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NonContentUnit {}
 
+/// Marker for a CSS margin-box extent.
+///
+/// Margin boxes include the border box and used margins. They are useful for
+/// float placement, where CSS 2.2 positions the margin box but collision and
+/// painting still refer to the border box:
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarginBoxUnit {}
+
 /// A CSS computed absolute length in Quire's canonical layout unit.
 pub(crate) type LayoutLength = euclid::Length<f32, LayoutUnit>;
 
@@ -67,6 +76,16 @@ pub(crate) type BorderBoxLength = euclid::Length<f32, BorderBoxUnit>;
 
 /// Padding plus border extent in Quire's PDF-point layout scalar.
 pub(crate) type NonContentLength = euclid::Length<f32, NonContentUnit>;
+
+/// A CSS margin-box extent in Quire's PDF-point layout scalar.
+pub(crate) type MarginBoxLength = euclid::Length<f32, MarginBoxUnit>;
+
+/// A physical CSS margin-box size in Quire's PDF-point layout coordinates.
+///
+/// Float placement uses both physical dimensions of the margin box, while
+/// collision of BFC roots continues to use their border boxes:
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+pub(crate) type MarginBoxSize = euclid::Size2D<f32, MarginBoxUnit>;
 
 /// A CSS content-box size in Quire's PDF-point layout scalar.
 pub(crate) type ContentBoxSize = euclid::Size2D<f32, ContentBoxUnit>;
@@ -97,6 +116,16 @@ pub(crate) const fn border_box_pt(value: f32) -> BorderBoxLength {
 /// Construct a padding-plus-border length from PDF points.
 pub(crate) const fn non_content_pt(value: f32) -> NonContentLength {
     NonContentLength::new(value)
+}
+
+/// Construct a margin-box extent from PDF points.
+pub(crate) const fn margin_box_pt(value: f32) -> MarginBoxLength {
+    MarginBoxLength::new(value)
+}
+
+/// Construct a physical CSS margin-box size from PDF points.
+pub(crate) const fn margin_box_size_pt(width: f32, height: f32) -> MarginBoxSize {
+    MarginBoxSize::new(width, height)
 }
 
 /// Construct a content-box size from PDF points.
@@ -179,6 +208,12 @@ impl IntoLayoutLength for NonContentLength {
     }
 }
 
+impl IntoLayoutLength for MarginBoxLength {
+    fn into_layout_length(self) -> LayoutLength {
+        self.cast_unit()
+    }
+}
+
 /// A CSS percentage-resolution basis that may or may not be definite.
 ///
 /// CSS Sizing resolves percentage components only when the relevant containing
@@ -226,6 +261,26 @@ impl<T, Source> PercentageBasis<T, Source> {
             Self::Indefinite => PercentageBasis::Indefinite,
         }
     }
+
+    /// Preserve this basis's value and definiteness while changing the
+    /// provenance carried at a formatting-context boundary.
+    ///
+    /// Percentage-basis provenance is meaningful to layout algorithms, but a
+    /// child formatting context may need to record the same definite value in
+    /// its own source domain. This avoids extracting and reconstructing the
+    /// value merely to change that metadata.
+    pub(crate) fn map_source<NewSource>(
+        self,
+        map: impl FnOnce(Source) -> NewSource,
+    ) -> PercentageBasis<T, NewSource> {
+        match self {
+            Self::Definite { value, source } => PercentageBasis::Definite {
+                value,
+                source: map(source),
+            },
+            Self::Indefinite => PercentageBasis::Indefinite,
+        }
+    }
 }
 
 impl<T, Source> PercentageBasis<T, Source>
@@ -243,6 +298,20 @@ pub(crate) fn content_box_to_border_box_length(
     extras: NonContentLength,
 ) -> BorderBoxLength {
     border_box_pt((content.points() + extras.points()).max(0.0))
+}
+
+/// Expand a content-box length through its border box to its margin box.
+///
+/// The margin contribution remains a signed generic layout length because CSS
+/// margins can be negative. Callers must construct it at the CSS used-value
+/// boundary; this helper is the only box-model conversion step that relabels
+/// the result as a margin-box extent.
+pub(crate) fn content_box_to_margin_box_length(
+    content: ContentBoxLength,
+    non_content: NonContentLength,
+    margins: LayoutLength,
+) -> MarginBoxLength {
+    margin_box_pt(content.points() + non_content.points() + margins.points())
 }
 
 /// Shrink a border-box length by padding and border extents, clamping at zero.
@@ -328,5 +397,39 @@ mod tests {
         );
         assert_eq!(content.width, 0.0);
         assert_eq!(content.height, 0.0);
+    }
+
+    #[test]
+    fn content_box_to_margin_box_keeps_signed_used_margins_explicit() {
+        assert_eq!(
+            content_box_to_margin_box_length(
+                content_box_pt(40.0),
+                non_content_pt(10.0),
+                layout_pt(-15.0),
+            ),
+            margin_box_pt(35.0)
+        );
+    }
+
+    #[test]
+    fn percentage_basis_map_source_preserves_value_and_indefiniteness() {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Source {
+            Parent,
+            Child,
+        }
+
+        let definite = PercentageBasis::definite_from(content_box_pt(42.0), Source::Parent)
+            .map_source(|_| Source::Child);
+        assert_eq!(
+            definite,
+            PercentageBasis::definite_from(content_box_pt(42.0), Source::Child)
+        );
+
+        let indefinite: PercentageBasis<ContentBoxLength, Source> = PercentageBasis::indefinite();
+        assert_eq!(
+            indefinite.map_source(|_| Source::Child),
+            PercentageBasis::indefinite()
+        );
     }
 }

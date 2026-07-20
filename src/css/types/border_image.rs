@@ -7,7 +7,7 @@ use super::*;
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-images>.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BorderImage {
-    pub source: Option<BackgroundImage>,
+    pub source: ComputedImage,
     pub source_base_url: Option<url::Url>,
     pub source_root_url: Option<url::Url>,
     pub slice: BorderImageSlice,
@@ -19,7 +19,7 @@ pub(crate) struct BorderImage {
 impl BorderImage {
     pub(crate) fn initial() -> Self {
         Self {
-            source: None,
+            source: ComputedImage::None,
             source_base_url: None,
             source_root_url: None,
             slice: BorderImageSlice::initial(),

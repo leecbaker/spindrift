@@ -441,23 +441,28 @@ fn parse_generated_image_token<'a>(
     if let Some((url, tail)) = parse_css_url_token(value) {
         return Some((
             GeneratedContentPart::Image {
-                image: BackgroundImage::Url {
+                image: ComputedImage::image(BackgroundImage::Url {
                     src: url,
                     base_url: base_url.cloned(),
                     root_url: root_url.cloned(),
                     request_modifiers: RequestUrlModifiers::default(),
-                },
+                }),
             },
             tail,
         ));
     }
     if let Some(body) = strip_ascii_function(value, "image-set") {
         let (argument, tail) = split_function_argument(body)?;
-        let image = crate::css::parse_background_image(
+        let image = match crate::css::parse_css_image(
             &format!("image-set({argument})"),
             base_url,
             root_url,
-        )?;
+        ) {
+            crate::css::ParsedImage::Image(image) => image,
+            crate::css::ParsedImage::NotAnImage | crate::css::ParsedImage::SyntaxError => {
+                return None;
+            }
+        };
         return Some((GeneratedContentPart::Image { image }, tail));
     }
     for name in [
@@ -471,7 +476,12 @@ fn parse_generated_image_token<'a>(
         };
         let (argument, tail) = split_function_argument(body)?;
         let image_text = format!("{name}({argument})");
-        let image = crate::css::parse_background_image(&image_text, base_url, root_url)?;
+        let image = match crate::css::parse_css_image(&image_text, base_url, root_url) {
+            crate::css::ParsedImage::Image(image) => image,
+            crate::css::ParsedImage::NotAnImage | crate::css::ParsedImage::SyntaxError => {
+                return None;
+            }
+        };
         return Some((GeneratedContentPart::Image { image }, tail));
     }
     None
@@ -653,65 +663,13 @@ pub(crate) fn split_leading_ident(value: &str) -> Option<(&str, &str)> {
 }
 
 pub(crate) fn split_top_level_commas(value: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in value.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if quote.is_some() {
-            if character == '\\' {
-                escaped = true;
-            } else if Some(character) == quote {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '"' | '\'' => quote = Some(character),
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&value[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&value[start..]);
-    parts
+    crate::css::component_values::split_css_top_level_delimiter(value, ',')
 }
 
 fn split_top_level_slash(value: &str) -> (&str, Option<&str>) {
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in value.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if quote.is_some() {
-            if character == '\\' {
-                escaped = true;
-            } else if Some(character) == quote {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '"' | '\'' => quote = Some(character),
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            '/' if depth == 0 => return (&value[..index], Some(&value[index + 1..])),
-            _ => {}
-        }
-    }
-    (value, None)
+    crate::css::component_values::split_css_top_level_once(value, '/')
+        .map(|(left, right)| (left, Some(right)))
+        .unwrap_or((value, None))
 }
 
 pub(crate) fn is_css_ident_start(character: char) -> bool {

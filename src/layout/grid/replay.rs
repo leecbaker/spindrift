@@ -11,7 +11,7 @@ pub(in crate::layout::grid) struct SplitGridItemPaintContext {
     pub(in crate::layout::grid) item_width: BorderBoxLength,
     pub(in crate::layout::grid) item_height: BorderBoxLength,
     pub(in crate::layout::grid) slice_border_box: PaintClip,
-    pub(in crate::layout::grid) source_item_top: f32,
+    pub(in crate::layout::grid) source_item_top: PageTopBlockPosition,
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -24,9 +24,12 @@ impl<'a> LayoutBuilder<'a> {
     /// selected page-local slice:
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model> and
     /// <https://www.w3.org/TR/css-grid-1/#pagination>.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn replay_grid_fragment_record_items(
         &mut self,
         fragment_record: GridFragmentRecord,
+        parent_style: &ComputedStyle,
+        parent_layout: &GridLayout,
         children: &[GridChild<'_>],
         items: &[GridItemLayout],
         stylesheets: &[Stylesheet],
@@ -46,41 +49,81 @@ impl<'a> LayoutBuilder<'a> {
                     cursor,
                 );
             } else {
-                self.replay_grid_item_at_fragment_cursor(
-                    child,
-                    &item_fragment.original,
-                    stylesheets,
-                    inner_x,
-                    cursor,
-                    Some(&mut item_fragment.metadata),
-                );
+                let mut replay = |layout: &mut Self| {
+                    layout.replay_grid_item_at_fragment_cursor(
+                        child,
+                        &item_fragment.original,
+                        stylesheets,
+                        inner_x,
+                        cursor,
+                        Some(&mut item_fragment.metadata),
+                        None,
+                    );
+                };
+                if let Some(area) = item_fragment.original.area
+                    && child.element_parts().is_none_or(|(element, _, _)| {
+                        !layout_containment_applies_to_element(element, &child.style)
+                            && !paint_containment_applies_to_element(element, &child.style)
+                    })
+                    && let Some(context) = ResolvedSubgridContext::from_parent(
+                        parent_style,
+                        parent_layout,
+                        &child.style,
+                        area,
+                    )
+                {
+                    self.with_resolved_subgrid_context(context, replay);
+                } else {
+                    replay(self);
+                }
             }
         }
     }
 
-    /// Replay one laid-out grid item through Quire's existing child layout path.
+    /// Replay one grid item with a scoped view of its parent's resolved axes.
     ///
-    /// CSS Grid computes a grid area's geometry, then the grid item establishes
-    /// its own formatting context inside that area:
-    /// <https://www.w3.org/TR/css-grid-1/#grid-items>.
-    pub(super) fn replay_grid_item(
+    /// Taffy has no subgrid API. The child grid therefore consumes the shared
+    /// axis context at its own sizing boundary; replay never rewrites the
+    /// child style into a synthetic standalone grid. Nested subgrids derive a
+    /// fresh context from their immediately enclosing final grid geometry.
+    /// <https://drafts.csswg.org/css-grid-2/#subgrids>
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn replay_grid_item_with_resolved_axes(
         &mut self,
+        parent_style: &ComputedStyle,
+        parent_layout: &GridLayout,
         child: &GridChild<'_>,
         item: &GridItemLayout,
         stylesheets: &[Stylesheet],
         inner_x: f32,
-        content_top: f32,
+        content_top: PageTopBlockPosition,
     ) {
-        self.replay_grid_item_at_fragment_cursor(
-            child,
-            item,
-            stylesheets,
-            inner_x,
-            GridFragmentCursor::new(content_top, 0.0),
-            None,
-        );
+        let replay = |layout: &mut Self| {
+            layout.replay_grid_item_at_fragment_cursor(
+                child,
+                item,
+                stylesheets,
+                inner_x,
+                GridFragmentCursor::new(content_top, GridFragmentBlockOffset::new(0.0)),
+                None,
+                None,
+            );
+        };
+        if let Some(area) = item.area
+            && child.element_parts().is_none_or(|(element, _, _)| {
+                !layout_containment_applies_to_element(element, &child.style)
+                    && !paint_containment_applies_to_element(element, &child.style)
+            })
+            && let Some(context) =
+                ResolvedSubgridContext::from_parent(parent_style, parent_layout, &child.style, area)
+        {
+            self.with_resolved_subgrid_context(context, replay);
+        } else {
+            replay(self);
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replay_grid_item_at_fragment_cursor(
         &mut self,
         child: &GridChild<'_>,
@@ -89,11 +132,18 @@ impl<'a> LayoutBuilder<'a> {
         inner_x: f32,
         cursor: GridFragmentCursor,
         metadata: Option<&mut FragmentPageMetadata>,
+        materialized_style: Option<&ComputedStyle>,
     ) {
         let item_width = item.width().max(0.0);
         let item_height = item.height().max(0.0);
 
-        let placed_style = grid_placed_item_style(&child.style, item_width, item_height);
+        let owned_placed_style;
+        let placed_style = if let Some(style) = materialized_style {
+            style
+        } else {
+            owned_placed_style = grid_placed_item_style(&child.style, item_width, item_height);
+            &owned_placed_style
+        };
         let item_paint_checkpoint = self.current_page.paint_checkpoint();
         let item_positioned_layer_start = self.positioned_layers.len();
         let item_page_index = self.pages.len();
@@ -107,15 +157,22 @@ impl<'a> LayoutBuilder<'a> {
                     border_box_pt(item_height),
                 ),
                 writing_mode: placed_style.writing_mode,
-                scope_content_logical_inline_size: false,
-                cursor_y: cursor.source_block_y(item.y()),
+                // Anonymous grid items need the grid-assigned content box as
+                // their inline formatting context; unlike element items they
+                // have no principal-box dispatch to install that basis.
+                // <https://www.w3.org/TR/css-grid-1/#grid-items>.
+                scope_content_logical_inline_size: child.anonymous_content().is_some(),
+                cursor_y: cursor
+                    .source_block_y(GridFragmentBlockOffset::new(item.y()))
+                    .points(),
                 page_start_margin_policy: PageStartMarginPolicy::Suppress,
             },
+            placed_style,
             |layout| {
                 if metadata.is_some() {
                     layout.begin_assignment_capture_frame();
                 }
-                layout.layout_formatting_context_item_contents(child, &placed_style, stylesheets);
+                layout.layout_formatting_context_item_contents(child, placed_style, stylesheets);
                 if let Some(metadata) = metadata {
                     metadata.assignment_ids = layout.end_assignment_capture_frame();
                     if !metadata.assignment_ids.is_empty() {
@@ -134,14 +191,14 @@ impl<'a> LayoutBuilder<'a> {
         // level:
         // <https://www.w3.org/TR/css-grid-1/#z-order>.
         let item_border_box = item
-            .page_top_rect(inner_x, cursor.content_top + cursor.block_offset)
+            .page_top_rect(cursor.grid_container_origin(inner_x))
             .paint_clip();
-        let policy = StackingContextPolicy::for_grid_item(&placed_style, item_border_box);
+        let policy = StackingContextPolicy::for_grid_item(placed_style, item_border_box);
         if !matches!(policy.context_kind, StackingContextKind::None) {
             let child_contexts = self.positioned_child_contexts_since(
                 item_positioned_layer_start,
                 item_page_index,
-                policy,
+                &policy,
             );
             self.scope_current_page_paint_since_with_policy(
                 &item_paint_checkpoint,
@@ -162,16 +219,17 @@ impl<'a> LayoutBuilder<'a> {
         let visible = &item_fragment.visible;
         let item_height = item.height().max(0.0);
         let item_border_box = visible
-            .page_top_rect(inner_x, cursor.content_top + cursor.block_offset)
+            .page_top_rect(cursor.grid_container_origin(inner_x))
             .paint_clip();
         let mut metadata = FragmentPageMetadata::new(
             self.pages.len(),
             Some(item_border_box),
             !self.current_page_has_content(),
         );
-        metadata.continues_from_previous_page = item_fragment.content_slice.block_start > 0.01;
+        metadata.continues_from_previous_page =
+            item_fragment.content_slice.block_start.points() > 0.01;
         metadata.continues_to_next_page =
-            item_fragment.content_slice.block_end < item_height - 0.01;
+            item_fragment.content_slice.block_end.points() < item_height - 0.01;
         metadata
     }
 
@@ -194,9 +252,9 @@ impl<'a> LayoutBuilder<'a> {
 
         let placed_style = grid_placed_item_style(&child.style, item_width, item_height);
         let slice_border_box = visible
-            .page_top_rect(inner_x, cursor.content_top + cursor.block_offset)
+            .page_top_rect(cursor.grid_container_origin(inner_x))
             .paint_clip();
-        let source_item_top = cursor.source_block_y(item.y());
+        let source_item_top = cursor.source_block_y(GridFragmentBlockOffset::new(item.y()));
         self.paint_split_grid_item_fragment(
             child,
             &placed_style,
@@ -250,10 +308,11 @@ impl<'a> LayoutBuilder<'a> {
                     border_box_pt(item_height),
                 ),
                 writing_mode: placed_style.writing_mode,
-                scope_content_logical_inline_size: false,
+                scope_content_logical_inline_size: child.anonymous_content().is_some(),
                 cursor_y: offpage_top,
                 page_start_margin_policy: PageStartMarginPolicy::Suppress,
             },
+            placed_style,
             |layout| {
                 layout.layout_formatting_context_item_contents(child, placed_style, stylesheets);
                 layout.flush_positioned_layers_since(positioned_layer_start);
@@ -265,7 +324,7 @@ impl<'a> LayoutBuilder<'a> {
             .paint_fragment()
             .translated(PaintTranslation::new(
                 slice_border_box.x(),
-                source_item_top - offpage_top,
+                source_item_top.points() - offpage_top,
             ))
             .clipped_to_rect(slice_border_box);
         self.restore(snapshot);
@@ -280,7 +339,7 @@ impl<'a> LayoutBuilder<'a> {
         effects.absolute_clip = Some(slice_border_box);
         let source_bounds = PageTopRect::new(
             slice_border_box.x(),
-            source_item_top,
+            source_item_top.points(),
             slice_border_box.width(),
             item_height,
         )

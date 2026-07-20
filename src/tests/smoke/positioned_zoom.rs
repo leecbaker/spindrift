@@ -1,6 +1,6 @@
 use super::*;
 
-fn rect_with_fill(page: &quire::Page, fill: Color) -> &quire::RenderedRect {
+fn rect_with_fill(page: &quire::Page, fill: CssColor) -> &quire::RenderedRect {
     page.rects()
         .iter()
         .find(|rect| rect.fill == Some(fill))
@@ -27,9 +27,9 @@ async fn zoomed_relative_absolute_and_fixed_boxes_use_one_positioned_scale() {
     .unwrap();
 
     let page = &document.pages[0];
-    let relative = rect_with_fill(page, Color::new(255, 0, 0));
-    let absolute = rect_with_fill(page, Color::new(0, 255, 0));
-    let fixed = rect_with_fill(page, Color::new(0, 0, 255));
+    let relative = rect_with_fill(page, CssColor::new(255, 0, 0));
+    let absolute = rect_with_fill(page, CssColor::new(0, 255, 0));
+    let fixed = rect_with_fill(page, CssColor::new(0, 0, 255));
     for rect in [relative, absolute, fixed] {
         assert!((rect.width() - 10.0).abs() < 0.01, "rect={rect:?}");
         assert!((rect.height() - 10.0).abs() < 0.01, "rect={rect:?}");

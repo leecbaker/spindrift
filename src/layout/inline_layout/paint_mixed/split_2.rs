@@ -281,7 +281,7 @@ pub(in crate::layout) fn inline_atom_content_preserves_adjacent_space_summary(
             | InlineAtomContent::Svg { .. }
             | InlineAtomContent::InlineBox { .. }
             | InlineAtomContent::TextCombineUpright { .. }
-            | InlineAtomContent::InlineFragment(_)
+            | InlineAtomContent::InlineFragment { .. }
             | InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(_))
     )
 }
@@ -437,6 +437,7 @@ pub(in crate::layout) fn visual_leading_inline_end_box_edge_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
 
     fn test_text_group() -> PreparedInlineTextGroup {
         PreparedInlineTextGroup {
@@ -455,6 +456,7 @@ mod tests {
                 runs: Vec::new(),
             },
             source: InlineTextSource::Normal,
+            source_run: Rc::new(()),
         }
     }
 

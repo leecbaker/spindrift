@@ -1,4 +1,16 @@
 use super::*;
+use crate::css::cascade::declarations::affected_longhands;
+
+/// Whether the cascade owns the named property or shorthand.
+///
+/// This is the property identity boundary shared by declaration application
+/// and CSS Conditional feature queries.  It deliberately uses the cascade's
+/// longhand and shorthand model instead of a second hand-maintained list.
+pub(in crate::css) fn is_modeled_property_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("all")
+        || ALL_MODELED_LONGHANDS.contains(&name)
+        || affected_longhands(name, Direction::Ltr, WritingMode::HorizontalTb).is_some()
+}
 
 /// Returns whether a modeled property inherits by default.
 ///
@@ -12,12 +24,17 @@ pub(super) fn property_is_inherited(name: &str) -> bool {
             | "border-spacing"
             | "caption-side"
             | "color"
+            | "forced-color-adjust"
+            | "fill"
+            | "stroke"
+            | "stroke-width"
             | "-webkit-text-fill-color"
             | "direction"
             | "dominant-baseline"
             | "empty-cells"
             | "font-family"
             | "font-feature-settings"
+            | "font-variation-settings"
             | "font-palette"
             | "font-synthesis"
             | "font-synthesis-weight"
@@ -59,6 +76,7 @@ pub(super) fn property_is_inherited(name: &str) -> bool {
             | "text-align-last"
             | "text-justify"
             | "text-autospace"
+            | "text-spacing-trim"
             | "word-space-transform"
             | "initial-letter-align"
             | "initial-letter-wrap"
@@ -93,7 +111,7 @@ pub(super) fn property_is_inherited(name: &str) -> bool {
     )
 }
 
-pub(super) const ALL_MODELED_LONGHANDS: &[&str] = &[
+pub(in crate::css) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "zoom",
     "display",
     "flex-direction",
@@ -177,6 +195,10 @@ pub(super) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "corner-top-right-shape",
     "corner-bottom-right-shape",
     "corner-bottom-left-shape",
+    "shape-outside",
+    "shape-margin",
+    "shape-image-threshold",
+    "border-shape",
     "border-image-source",
     "border-image-slice",
     "border-image-width",
@@ -202,13 +224,19 @@ pub(super) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "image-rendering",
     "image-orientation",
     "box-decoration-break",
+    "outline-offset",
     "box-shadow",
     "color",
+    "forced-color-adjust",
+    "fill",
+    "stroke",
+    "stroke-width",
     "-webkit-text-fill-color",
     "direction",
     "unicode-bidi",
     "writing-mode",
     "text-orientation",
+    "text-combine-upright",
     "line-fit-edge",
     "text-box-trim",
     "text-box-edge",
@@ -248,6 +276,8 @@ pub(super) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "bottom",
     "position",
     "float",
+    "footnote-display",
+    "footnote-policy",
     "clear",
     "z-index",
     "opacity",
@@ -273,6 +303,7 @@ pub(super) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "text-align-last",
     "text-justify",
     "text-autospace",
+    "text-spacing-trim",
     "word-space-transform",
     "text-indent",
     "hanging-punctuation",
@@ -284,8 +315,10 @@ pub(super) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "font-weight",
     "font-style",
     "font-width",
+    "font-stretch",
     "font-family",
     "font-feature-settings",
+    "font-variation-settings",
     "font-palette",
     "font-synthesis",
     "font-synthesis-weight",
@@ -338,8 +371,10 @@ pub(super) const ALL_MODELED_LONGHANDS: &[&str] = &[
     "text-emphasis-skip",
     "text-shadow",
     "white-space",
+    "text-wrap",
     "text-wrap-mode",
     "text-wrap-style",
+    "wrap-inside",
     "line-clamp",
     "-webkit-line-clamp",
     "word-break",
@@ -667,6 +702,10 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "corner-bottom-left-shape" => {
             style.corner_shapes.bottom_left = source.corner_shapes.bottom_left;
         }
+        "border-shape" => style.border_shape = source.border_shape.clone(),
+        "shape-outside" => style.shape_outside = source.shape_outside.clone(),
+        "shape-margin" => style.shape_margin = source.shape_margin.clone(),
+        "shape-image-threshold" => style.shape_image_threshold = source.shape_image_threshold,
         "border-image-source" => {
             style.border_image.source = source.border_image.clone().source;
             style.border_image.source_base_url = source.border_image.clone().source_base_url;
@@ -771,6 +810,21 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
             }
         }
         "color" => style.color = source.color,
+        "forced-color-adjust" => style.forced_color_adjust = source.forced_color_adjust,
+        "fill" => {
+            style.svg_fill = source.svg_fill;
+            style.svg_fill_is_current_color = source.svg_fill_is_current_color;
+            style.svg_fill_overridden = source.svg_fill_overridden;
+        }
+        "stroke" => {
+            style.svg_stroke = source.svg_stroke;
+            style.svg_stroke_is_current_color = source.svg_stroke_is_current_color;
+            style.svg_stroke_overridden = source.svg_stroke_overridden;
+        }
+        "stroke-width" => {
+            style.svg_stroke_width = source.svg_stroke_width.clone();
+            style.svg_stroke_width_overridden = source.svg_stroke_width_overridden;
+        }
         "-webkit-text-fill-color" => style.text_fill_color = source.text_fill_color,
         "direction" => style.direction = source.direction,
         "unicode-bidi" => style.unicode_bidi = source.unicode_bidi,
@@ -799,7 +853,10 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "letter-spacing" => style.letter_spacing = source.letter_spacing.clone(),
         "word-spacing" => style.word_spacing = source.word_spacing.clone(),
         "width" => style.box_values.width = source.box_values.clone().width,
-        "height" => style.box_values.height = source.box_values.clone().height,
+        "height" => {
+            style.box_values.height = source.box_values.clone().height;
+            style.physical_height_has_font_metric = source.physical_height_has_font_metric;
+        }
         "min-width" => style.box_values.min_width = source.box_values.clone().min_width,
         "max-width" => style.box_values.max_width = source.box_values.clone().max_width,
         "min-height" => style.box_values.min_height = source.box_values.clone().min_height,
@@ -811,6 +868,8 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "bottom" => style.box_values.inset_bottom = source.box_values.clone().inset_bottom,
         "position" => style.position = source.position,
         "float" => style.float = source.float,
+        "footnote-display" => style.footnote_display = source.footnote_display,
+        "footnote-policy" => style.footnote_policy = source.footnote_policy,
         "clear" => style.clear = source.clear,
         "z-index" => style.z_index = source.z_index,
         "opacity" => style.opacity = source.opacity,
@@ -828,7 +887,7 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "isolation" => style.isolation = source.isolation,
         "mix-blend-mode" => style.mix_blend_mode = source.mix_blend_mode,
         "filter" => style.filter = source.filter.clone(),
-        "clip-path" => style.clip_path = source.clip_path,
+        "clip-path" => style.clip_path = source.clip_path.clone(),
         "mask" | "mask-image" => style.mask = source.mask.clone(),
         "contain" => style.contain = source.contain,
         "container-type" => style.container_type = source.container_type,
@@ -843,6 +902,7 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "text-align-last" => style.text_align_last = source.text_align_last,
         "text-justify" => style.text_justify = source.text_justify,
         "text-autospace" => style.text_autospace = source.text_autospace,
+        "text-spacing-trim" => style.text_spacing_trim = source.text_spacing_trim,
         "word-space-transform" => style.word_space_transform = source.word_space_transform,
         "initial-letter" => style.initial_letter = source.initial_letter,
         "initial-letter-align" => style.initial_letter_align = source.initial_letter_align,
@@ -874,6 +934,9 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "font-family" => style.font_family = source.font_family.clone(),
         "font-feature-settings" => {
             style.font_feature_settings = source.font_feature_settings.clone();
+        }
+        "font-variation-settings" => {
+            style.font_variation_settings = source.font_variation_settings.clone();
         }
         "font-palette" => style.font_palette = source.font_palette.clone(),
         "font-kerning" => style.font_kerning = source.font_kerning,
@@ -911,8 +974,6 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         "list-style-position" => style.list_style_position = source.list_style_position,
         "list-style-image" => {
             style.list_style_image = source.list_style_image.clone();
-            style.list_style_image_base_url = source.list_style_image_base_url.clone();
-            style.list_style_image_root_url = source.list_style_image_root_url.clone();
         }
         "marker-side" => style.marker_side = source.marker_side,
         "counter-reset" => style.counter_resets = source.counter_resets.clone(),
@@ -995,6 +1056,7 @@ pub(super) fn copy_modeled_property(style: &mut ComputedStyle, source: &Computed
         }
         "text-wrap-mode" => style.text_wrap_mode = source.text_wrap_mode,
         "text-wrap-style" => style.text_wrap_style = source.text_wrap_style,
+        "wrap-inside" => style.wrap_inside = source.wrap_inside,
         "line-clamp" | "-webkit-line-clamp" => style.line_clamp = source.line_clamp.clone(),
         "word-break" => style.word_break = source.word_break,
         "overflow" => {

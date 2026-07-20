@@ -3,7 +3,10 @@ use super::*;
 pub(super) struct CollapsedBorderGrid {
     horizontal: Vec<Vec<Option<CollapsedBorder>>>,
     vertical: Vec<Vec<Option<CollapsedBorder>>>,
-    axes: TableAxes,
+    /// The table root alone determines how physical border sides map to
+    /// logical grid edges.  Descendant `direction` values do not reorder the
+    /// table's column grid.
+    direction: Direction,
     column_count: usize,
 }
 
@@ -28,6 +31,7 @@ enum CollapsedBorderOrientation {
 }
 
 impl CollapsedBorderSegment {
+    #[cfg(test)]
     fn horizontal(left: f32, line_y: f32, width: f32) -> Self {
         Self {
             rect: PageTopRect::new(left, line_y, width, 0.0),
@@ -35,20 +39,35 @@ impl CollapsedBorderSegment {
         }
     }
 
+    #[cfg(test)]
     fn vertical(center_x: f32, top: f32, height: f32) -> Self {
         Self {
             rect: PageTopRect::new(center_x, top, 0.0, height),
             orientation: CollapsedBorderOrientation::Vertical,
         }
     }
+
+    /// Classify a zero-thickness projected grid line by its physical span.
+    ///
+    /// The table grid stays logical until this final adapter. A logical column
+    /// boundary is vertical in horizontal writing but horizontal in vertical
+    /// writing, so callers must not select the paint orientation themselves.
+    pub(super) fn from_projected_line(rect: PageTopRect) -> Self {
+        let orientation = if rect.width() >= rect.height() {
+            CollapsedBorderOrientation::Horizontal
+        } else {
+            CollapsedBorderOrientation::Vertical
+        };
+        Self { rect, orientation }
+    }
 }
 
 impl CollapsedBorderGrid {
-    pub(super) fn new(row_count: usize, column_count: usize, axes: TableAxes) -> Self {
+    pub(super) fn new(row_count: usize, column_count: usize, direction: Direction) -> Self {
         Self {
             horizontal: vec![vec![None; column_count]; row_count + 1],
             vertical: vec![vec![None; column_count + 1]; row_count],
-            axes,
+            direction,
             column_count,
         }
     }
@@ -371,28 +390,28 @@ impl CollapsedBorderGrid {
     }
 
     fn inline_left_boundary(&self, start_column: usize, end_column: usize) -> usize {
-        match self.axes.direction {
+        match self.direction {
             Direction::Ltr => start_column,
             Direction::Rtl => end_column,
         }
     }
 
     fn inline_right_boundary(&self, start_column: usize, end_column: usize) -> usize {
-        match self.axes.direction {
+        match self.direction {
             Direction::Ltr => end_column,
             Direction::Rtl => start_column,
         }
     }
 
     fn physical_boundary_position(&self, boundary: usize) -> usize {
-        match self.axes.direction {
+        match self.direction {
             Direction::Ltr => boundary,
             Direction::Rtl => self.column_count.saturating_sub(boundary),
         }
     }
 
     fn physical_column_position(&self, column: usize) -> usize {
-        match self.axes.direction {
+        match self.direction {
             Direction::Ltr => column,
             Direction::Rtl => self.column_count.saturating_sub(column + 1),
         }
@@ -402,16 +421,19 @@ impl CollapsedBorderGrid {
     pub(super) fn paint_fragment_rows(
         &self,
         placement: TableGridPlacement,
+        horizontal_page_placement: TableGridPlacement,
         column_plan: &TableColumnPlan,
         original_rows: &[usize],
         row_tops: &[f32],
         row_heights: &[f32],
         row_offsets: &[f32],
         original_row_heights: &[f32],
+        row_bounds: Option<&[TableRowBounds]>,
     ) -> (Vec<RenderedRect>, Vec<RenderedPath>) {
         let mut rects = Vec::new();
         let mut paths = Vec::new();
         let mut painted_boundaries = Vec::new();
+        let vertical_root = placement.writing_mode().has_vertical_lines();
 
         for (local_row, original_row) in original_rows.iter().cloned().enumerate() {
             let (Some(top), Some(height), Some(offset), Some(original_height)) = (
@@ -424,14 +446,36 @@ impl CollapsedBorderGrid {
             };
             let real_top = offset <= 0.01;
             let real_bottom = offset + height >= original_height - 0.01;
+            let segment_placement = if vertical_root {
+                placement
+            } else {
+                horizontal_page_placement
+            };
+            let source_block_start = if vertical_root {
+                let Some(source_row) = row_bounds
+                    .and_then(|bounds| bounds.get(original_row))
+                    .copied()
+                else {
+                    continue;
+                };
+                source_row.start + offset
+            } else {
+                // Fragment row tops are already committed page geometry for
+                // horizontal tables. Re-label their page-top coordinate as a
+                // logical block offset only at the line projection boundary.
+                horizontal_page_placement
+                    .block_offset_from_page_top(top)
+                    .length()
+                    .get()
+            };
             if real_top {
                 self.paint_horizontal_boundary(
                     &mut rects,
                     &mut paths,
-                    placement,
+                    segment_placement,
                     column_plan,
                     original_row,
-                    top,
+                    TableGridBlockOffset::new(TableGridLength::new(source_block_start)),
                     &mut painted_boundaries,
                 );
             }
@@ -439,10 +483,10 @@ impl CollapsedBorderGrid {
                 self.paint_horizontal_boundary(
                     &mut rects,
                     &mut paths,
-                    placement,
+                    segment_placement,
                     column_plan,
                     original_row + 1,
-                    top - height,
+                    TableGridBlockOffset::new(TableGridLength::new(source_block_start + height)),
                     &mut painted_boundaries,
                 );
             }
@@ -464,13 +508,16 @@ impl CollapsedBorderGrid {
                 } else {
                     0.0
                 };
+                let block_start = source_block_start - top_extension;
                 border.paint_vertical(
                     &mut rects,
                     &mut paths,
-                    CollapsedBorderSegment::vertical(
-                        placement.x_for(column_plan.boundary_x(boundary)),
-                        top + top_extension,
-                        height + top_extension + bottom_extension,
+                    segment_placement.project_inline_line(
+                        TableGridInlineOffset::new(column_plan.boundary_x(boundary)),
+                        TableGridBlockOffset::new(TableGridLength::new(block_start)),
+                        TableGridBlockOffset::new(TableGridLength::new(
+                            height + top_extension + bottom_extension,
+                        )),
                     ),
                 );
             }
@@ -487,7 +534,7 @@ impl CollapsedBorderGrid {
         placement: TableGridPlacement,
         column_plan: &TableColumnPlan,
         boundary: usize,
-        y: f32,
+        block: TableGridBlockOffset,
         painted_boundaries: &mut Vec<usize>,
     ) {
         if painted_boundaries.contains(&boundary) {
@@ -506,14 +553,36 @@ impl CollapsedBorderGrid {
                 self.vertical_intersection_half_width(boundary, column, row_count);
             let after_extension =
                 self.vertical_intersection_half_width(boundary, column + 1, row_count);
+            // `TableInlineBounds` describes the cell border box after its
+            // resolved collapsed insets. A collapsed horizontal rule instead
+            // runs between the underlying grid lines, just like its vertical
+            // counterpart. Starting from the boundary positions keeps outer
+            // corner joins aligned with the centered vertical rules.
+            // <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>
+            let first_boundary = column_plan.boundary_x(column);
+            let second_boundary = column_plan.boundary_x(column + 1);
+            let (inline_start, inline_end) = if first_boundary <= second_boundary {
+                (
+                    first_boundary - TableGridLength::new(before_extension),
+                    second_boundary + TableGridLength::new(after_extension),
+                )
+            } else {
+                // Column-plan boundaries are physical and decrease for RTL.
+                // The logical start edge is therefore the physical right edge;
+                // preserve the border-joint extensions while emitting the
+                // non-negative physical line span required by page paint.
+                (
+                    second_boundary - TableGridLength::new(after_extension),
+                    first_boundary + TableGridLength::new(before_extension),
+                )
+            };
             border.paint_horizontal(
                 rects,
                 paths,
-                CollapsedBorderSegment::horizontal(
-                    placement.x_for(column_plan.inline_bounds_for_span(column, 1).start)
-                        - before_extension,
-                    y,
-                    column_plan.width_for_span(column, 1) + before_extension + after_extension,
+                placement.project_block_line(
+                    TableGridInlineOffset::new(inline_start),
+                    TableGridInlineOffset::new(inline_end - inline_start),
+                    block,
                 ),
             );
         }
@@ -562,14 +631,14 @@ impl CollapsedBorderGrid {
         self.vertical
             .get(row)?
             .get(boundary)?
-            .map(|border| border.used_side().used_width)
+            .map(|border| border.used_side().used_width.get())
     }
 
     fn horizontal_border_width(&self, boundary: usize, column: usize) -> Option<f32> {
         self.horizontal
             .get(boundary)?
             .get(column)?
-            .map(|border| border.used_side().used_width)
+            .map(|border| border.used_side().used_width.get())
     }
 
     /// Return the cell border insets contributed by the resolved collapsed grid.
@@ -629,7 +698,7 @@ impl CollapsedBorderGrid {
             .first()
             .into_iter()
             .flat_map(|row| row.iter())
-            .filter_map(|border| border.map(|border| border.used_side().used_width))
+            .filter_map(|border| border.map(|border| border.used_side().used_width.get()))
             .fold(0.0_f32, f32::max)
             / 2.0;
         let bottom = self
@@ -637,21 +706,29 @@ impl CollapsedBorderGrid {
             .last()
             .into_iter()
             .flat_map(|row| row.iter())
-            .filter_map(|border| border.map(|border| border.used_side().used_width))
+            .filter_map(|border| border.map(|border| border.used_side().used_width.get()))
             .fold(0.0_f32, f32::max)
             / 2.0;
+        // The grid is indexed in logical column order, while these insets are
+        // physical box-model edges.  `direction: rtl` reverses the physical
+        // placement of column zero, so using `first`/`last` directly here
+        // would apply the outer borders to the wrong physical sides and shift
+        // every collapsed border join.
+        // <https://www.w3.org/TR/css-writing-modes-4/#direction>
+        let left_boundary = self.inline_left_boundary(0, self.column_count);
+        let right_boundary = self.inline_right_boundary(0, self.column_count);
         let left = self
             .vertical
             .iter()
-            .filter_map(|row| row.first())
-            .filter_map(|border| border.map(|border| border.used_side().used_width))
+            .filter_map(|row| row.get(left_boundary))
+            .filter_map(|border| border.map(|border| border.used_side().used_width.get()))
             .fold(0.0_f32, f32::max)
             / 2.0;
         let right = self
             .vertical
             .iter()
-            .filter_map(|row| row.last())
-            .filter_map(|border| border.map(|border| border.used_side().used_width))
+            .filter_map(|row| row.get(right_boundary))
+            .filter_map(|border| border.map(|border| border.used_side().used_width.get()))
             .fold(0.0_f32, f32::max)
             / 2.0;
 
@@ -684,9 +761,9 @@ pub(super) enum BorderOrigin {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CollapsedBorder {
-    width: f32,
+    width: LayoutLength,
     style: BorderStyle,
-    color: Color,
+    color: CssColor,
     side: BorderSide,
     origin: BorderOrigin,
     tie_position: usize,
@@ -722,7 +799,7 @@ impl CollapsedBorder {
             ),
         };
         Self {
-            width: width.max(0.0),
+            width: layout_pt(width.max(0.0)),
             style: border_style,
             color,
             side,
@@ -733,9 +810,9 @@ impl CollapsedBorder {
 
     fn strong_null(origin: BorderOrigin, tie_position: usize) -> Self {
         Self {
-            width: 0.0,
+            width: layout_pt(0.0),
             style: BorderStyle::Hidden,
-            color: Color::TRANSPARENT,
+            color: CssColor::TRANSPARENT,
             side: BorderSide::Top,
             origin,
             tie_position,
@@ -806,8 +883,9 @@ pub(super) fn collapsed_border_wins(candidate: CollapsedBorder, current: Collaps
         return false;
     }
 
-    let candidate_none = candidate.style.suppresses_used_width() || candidate.width <= 0.0;
-    let current_none = current.style.suppresses_used_width() || current.width <= 0.0;
+    let candidate_none =
+        candidate.style.suppresses_used_width() || candidate.width <= layout_pt(0.0);
+    let current_none = current.style.suppresses_used_width() || current.width <= layout_pt(0.0);
     if candidate_none != current_none {
         return !candidate_none;
     }
@@ -839,8 +917,8 @@ pub(super) fn collapsed_border_wins(candidate: CollapsedBorder, current: Collaps
 /// floor those CSS-pixel widths before comparing specificity.
 /// <https://www.w3.org/TR/CSS22/tables.html#border-conflict-resolution> and
 /// <https://drafts.csswg.org/css-tables-3/#border-conflict-resolution-algorithm>
-fn collapsed_border_width_priority(width: f32) -> i32 {
-    (width.max(0.0) / css::CSS_PX_TO_PT).floor() as i32
+fn collapsed_border_width_priority(width: LayoutLength) -> i32 {
+    (width.get().max(0.0) / css::CSS_PX_TO_PT).floor() as i32
 }
 
 pub(super) fn collapsed_border_style_priority(style: BorderStyle) -> u8 {
@@ -869,7 +947,7 @@ pub(super) fn paint_collapsed_border_side(
     if !border.is_visible() {
         return;
     }
-    let cross_width = border.used_width;
+    let cross_width = border.used_width.get();
     let (axis_start, axis_length, cross_start, horizontal) = match segment.orientation {
         CollapsedBorderOrientation::Horizontal => (
             segment.rect.x(),
@@ -885,8 +963,10 @@ pub(super) fn paint_collapsed_border_side(
         ),
     };
     let style = collapsed_border_paint_style(border.style);
-    if style == BorderStyle::Double && cross_width >= 3.0 {
-        let stripe = (border.used_width / 3.0).max(1.0);
+    if style == BorderStyle::Double
+        && let Some(bands) = DoubleBorderBands::for_used_width(border.used_width)
+    {
+        let stripe = bands.stripe.get();
         super::push_border_rect(
             rects,
             axis_start,
@@ -925,7 +1005,7 @@ pub(super) fn paint_collapsed_border_side(
             axis_start,
             axis_length,
             cross_start,
-            cross_width,
+            PaintStrokeWidth::new(cross_width),
             horizontal,
             border.color,
         ),
@@ -969,7 +1049,7 @@ fn collapsed_border_paint_style(style: BorderStyle) -> BorderStyle {
 mod tests {
     use super::*;
 
-    fn style_with_solid_border(width_css_px: f32, color: Color) -> ComputedStyle {
+    fn style_with_solid_border(width_css_px: f32, color: CssColor) -> ComputedStyle {
         let mut style = ComputedStyle::initial();
         let width = width_css_px * css::CSS_PX_TO_PT;
         style.border_width = width;
@@ -996,9 +1076,9 @@ mod tests {
 
     fn solid_border(width_css_px: f32, origin: BorderOrigin) -> CollapsedBorder {
         CollapsedBorder {
-            width: width_css_px * css::CSS_PX_TO_PT,
+            width: layout_pt(width_css_px * css::CSS_PX_TO_PT),
             style: BorderStyle::Solid,
-            color: Color::BLACK,
+            color: CssColor::BLACK,
             side: BorderSide::Top,
             origin,
             tie_position: 0,
@@ -1024,9 +1104,9 @@ mod tests {
 
     #[test]
     fn equal_width_group_loser_does_not_expand_resolved_cell_insets() {
-        let mut grid = CollapsedBorderGrid::new(1, 1, TableAxes::for_direction(Direction::Ltr));
-        let loser = style_with_solid_border(25.0, Color::new(255, 0, 0));
-        let winner = style_with_solid_border(25.0, Color::new(0, 128, 0));
+        let mut grid = CollapsedBorderGrid::new(1, 1, Direction::Ltr);
+        let loser = style_with_solid_border(25.0, CssColor::new(255, 0, 0));
+        let winner = style_with_solid_border(25.0, CssColor::new(0, 128, 0));
 
         grid.add_cell(0, 0, 1, 1, &winner);
         grid.add_row_group(0, 1, 1, &loser);
@@ -1041,7 +1121,7 @@ mod tests {
 
     #[test]
     fn collapsed_border_segments_project_horizontal_and_vertical_grid_lines() {
-        let border = UsedBorderSide::new(6.0, BorderStyle::Solid, Color::BLACK);
+        let border = UsedBorderSide::new(layout_pt(6.0), BorderStyle::Solid, CssColor::BLACK);
         let mut rects = Vec::new();
         let mut paths = Vec::new();
 
@@ -1079,6 +1159,51 @@ mod tests {
                 rects[1].height()
             ),
             (47.0, 50.0, 6.0, 40.0)
+        );
+    }
+
+    #[test]
+    fn medium_double_collapsed_border_paints_equal_stripes_on_both_grid_axes() {
+        let border = UsedBorderSide::new(
+            layout_pt(3.0 * css::CSS_PX_TO_PT),
+            BorderStyle::Double,
+            CssColor::BLACK,
+        );
+        let mut rects = Vec::new();
+        let mut paths = Vec::new();
+
+        paint_collapsed_border_side(
+            &mut rects,
+            &mut paths,
+            BorderEdge::Top,
+            CollapsedBorderSegment::horizontal(10.0, 80.0, 30.0),
+            border,
+        );
+        paint_collapsed_border_side(
+            &mut rects,
+            &mut paths,
+            BorderEdge::Left,
+            CollapsedBorderSegment::vertical(50.0, 90.0, 40.0),
+            border,
+        );
+
+        assert!(paths.is_empty());
+        assert_eq!(rects.len(), 4);
+        assert_eq!(
+            rects[0].paint_rect(),
+            paint_space_rect(10.0, 78.875, 30.0, 0.75)
+        );
+        assert_eq!(
+            rects[1].paint_rect(),
+            paint_space_rect(10.0, 80.375, 30.0, 0.75)
+        );
+        assert_eq!(
+            rects[2].paint_rect(),
+            paint_space_rect(48.875, 50.0, 0.75, 40.0)
+        );
+        assert_eq!(
+            rects[3].paint_rect(),
+            paint_space_rect(50.375, 50.0, 0.75, 40.0)
         );
     }
 }

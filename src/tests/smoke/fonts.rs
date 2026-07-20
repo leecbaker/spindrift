@@ -1,5 +1,149 @@
 use super::*;
 
+const ASCENT_DESCENT_OVERRIDE_WPT: &str =
+    "tests/fixtures/wpt/css/css-fonts/ascent-descent-override.html";
+const NON_EM_ASCENDER_PAINT_FIXTURE: &str =
+    "tests/fixtures/wpt/css/css-fonts/non-em-ascender-paint.html";
+const NON_EM_ASCENDER_PREPARED_PAINT_FIXTURE: &str =
+    "tests/fixtures/wpt/css/css-fonts/non-em-ascender-prepared-paint.html";
+const FONT_SIZE_ADJUST_MIXED_FALLBACK_BASELINE_FIXTURE: &str =
+    "tests/fixtures/wpt/css/css-fonts/font-size-adjust-mixed-fallback-baseline.html";
+
+#[tokio::test]
+async fn native_non_em_ascender_does_not_raise_a_following_block_into_the_previous_one() {
+    assert_non_em_ascender_paint_stays_in_its_following_background(NON_EM_ASCENDER_PAINT_FIXTURE)
+        .await;
+}
+
+#[tokio::test]
+async fn native_non_em_ascender_does_not_raise_prepared_inline_text_into_the_previous_line() {
+    assert_non_em_ascender_paint_stays_in_its_following_background(
+        NON_EM_ASCENDER_PREPARED_PAINT_FIXTURE,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn font_size_adjust_mixed_fallback_preserves_the_painted_baseline_conversion() {
+    let document = Html::from_file(FONT_SIZE_ADJUST_MIXED_FALLBACK_BASELINE_FIXTURE)
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let line = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "XY")
+        .expect("mixed fallback text line");
+    let mut run_sizes = line
+        .runs
+        .iter()
+        .filter(|run| !run.text.is_empty())
+        .map(|run| run.font_size);
+    let first_size = run_sizes.next().expect("first fallback run");
+    let second_size = run_sizes.next().expect("second fallback run");
+    assert!(
+        (first_size - second_size).abs() > 0.01,
+        "font-size-adjust should produce distinct used sizes for the selected faces: {line:?}"
+    );
+    let first_font = line_font(&document, line);
+    let expected_adjustment = (first_font.layout_metrics.ascender
+        - first_font.program_metrics.ascender) as f32
+        * first_size
+        / first_font.units_per_em as f32;
+    assert!(
+        (line.glyph_origin_adjustment.y - expected_adjustment).abs() < 0.01,
+        "the rendered line must retain the primary metric font's applied CSS-layout-to-program conversion: {line:?}"
+    );
+}
+
+async fn assert_non_em_ascender_paint_stays_in_its_following_background(fixture: &str) {
+    let document = Html::from_file(fixture)
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let page = &document.pages[0];
+    let following_line = page
+        .lines()
+        .iter()
+        .find(|line| line.text == "Y")
+        .expect("following Ahem block should paint its glyph");
+    let following_background = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+        .expect("following block background");
+    let font = line_font(&document, following_line);
+    let native_descent =
+        font.program_metrics.descender as f32 * following_line.font_size / font.units_per_em as f32;
+
+    assert!(
+        (following_line.y() - (following_background.y() - native_descent)).abs() < 0.01,
+        "following glyph must use its native baseline inside its own block, not rise into the preceding block: line={following_line:?}, background={following_background:?}, native_descent={native_descent}"
+    );
+}
+
+/// Regression derived from WPT `css/css-fonts/ascent-descent-override.html`.
+///
+/// CSS metric override descriptors alter line layout, but their face's native
+/// OpenType metrics must still position the embedded glyph program.
+#[tokio::test]
+async fn font_metric_overrides_keep_native_glyph_paint_baseline() {
+    let document = Html::from_file(ASCENT_DESCENT_OVERRIDE_WPT)
+        .await
+        .unwrap()
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let page = &document.pages[0];
+    let line = page
+        .lines()
+        .iter()
+        .find(|line| line.text == "X")
+        .expect("the Ahem glyph should be emitted as text");
+    let font = line_font(&document, line);
+
+    assert_eq!(font.program_metrics.ascender, 800);
+    assert_eq!(font.program_metrics.descender, -200);
+    assert_eq!(font.layout_metrics.ascender, 1000);
+    assert_eq!(font.layout_metrics.descender, -500);
+
+    let top_aligned = page
+        .rects()
+        .iter()
+        .find(|rect| {
+            rect.fill == Some(CssColor::new(0, 128, 0))
+                && (rect.width() - line.font_size).abs() < 0.01
+                && (rect.height() - line.font_size).abs() < 0.01
+        })
+        .expect("top-aligned Ahem-sized box");
+    let bottom_aligned = page
+        .rects()
+        .iter()
+        .find(|rect| {
+            rect.fill == Some(CssColor::new(0, 128, 0))
+                && (rect.width() - line.font_size).abs() < 0.01
+                && (rect.height() - line.font_size * 0.5).abs() < 0.01
+        })
+        .expect("bottom-aligned half-em Ahem-sized box");
+    assert!(
+        (line.x() - (top_aligned.x() + top_aligned.width())).abs() < 0.01,
+        "glyph should follow the top-aligned box"
+    );
+    let native_ascent =
+        font.program_metrics.ascender as f32 * line.font_size / font.units_per_em as f32;
+    let native_descent =
+        font.program_metrics.descender as f32 * line.font_size / font.units_per_em as f32;
+    assert!(
+        line.y() + native_ascent <= top_aligned.y() + top_aligned.height() + 0.01
+            && line.y() + native_descent >= bottom_aligned.y() - 0.01,
+        "native Ahem glyph extents must remain inside the line box established by overridden CSS metrics"
+    );
+}
+
 #[tokio::test]
 async fn visibility_hidden_preserves_layout_space() {
     let options = RenderOptions::default();
@@ -346,10 +490,17 @@ async fn ticket_airplane_fallback_prefers_visible_unicode_text_font() {
         .and_then(|font_id| document.fonts.get(font_id))
         .expect("ticket airplane should be emitted as a fallback run");
 
-    assert!(font_label_contains_any(
-        airplane_run_font,
-        &["arial unicode"]
-    ));
+    // The fixture requests Arial Unicode MS, but font discovery is permitted
+    // to substitute an equivalent Unicode text face. What matters here is
+    // that the fallback run remains a real, embeddable text font rather than
+    // a missing-glyph placeholder.
+    assert!(
+        ttf_parser::Face::parse(&airplane_run_font.data, airplane_run_font.face_index).is_ok_and(
+            |face| { face.glyph_index('✈').is_some() && face.is_outline_embedding_allowed() }
+        ),
+        "ticket airplane fallback must be an embeddable font with a visible airplane glyph: {}",
+        font_label(airplane_run_font),
+    );
 }
 
 #[tokio::test]
@@ -440,41 +591,46 @@ fn system_ttc_text_face_fixture(text: &str) -> Option<SystemTtcTextFaceFixture> 
 }
 
 fn system_ttc_text_face_fixture_attributes() -> Vec<FontQueryAttributes> {
-    let mut attributes = Vec::new();
-    for (style, style_css) in [
+    [
         (fontique::FontStyle::Normal, "normal"),
         (fontique::FontStyle::Italic, "italic"),
         (fontique::FontStyle::Oblique(Some(14.0)), "oblique"),
-    ] {
-        for (weight, weight_css) in [(400.0, 400), (700.0, 700), (300.0, 300), (500.0, 500)] {
-            for (width_ratio, width_css) in [
-                (1.0, "normal"),
-                (0.75, "condensed"),
-                (1.25, "expanded"),
-                (0.875, "semi-condensed"),
-                (1.125, "semi-expanded"),
-            ] {
-                attributes.push(FontQueryAttributes {
+    ]
+    .into_iter()
+    .flat_map(|(style, style_css)| {
+        [(400.0, 400), (700.0, 700), (300.0, 300), (500.0, 500)]
+            .into_iter()
+            .flat_map(move |(weight, weight_css)| {
+                [
+                    (1.0, "normal"),
+                    (0.75, "condensed"),
+                    (1.25, "expanded"),
+                    (0.875, "semi-condensed"),
+                    (1.125, "semi-expanded"),
+                ]
+                .into_iter()
+                .map(move |(width_ratio, width_css)| FontQueryAttributes {
                     style,
                     style_css,
                     weight,
                     weight_css,
                     width_ratio,
                     width_css,
-                });
-            }
-        }
-    }
-    attributes
+                })
+            })
+    })
+    .collect()
 }
 
 fn ttc_text_query_font_can_shape(font: &fontique::QueryFont, text: &str) -> bool {
     let Ok(face) = ttf_parser::Face::parse(font.blob.as_ref(), font.index) else {
         return false;
     };
-    text.chars()
-        .filter(|character| !character.is_whitespace())
-        .all(|character| face.glyph_index(character).is_some())
+    face.is_outline_embedding_allowed()
+        && text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .all(|character| face.glyph_index(character).is_some())
 }
 
 fn css_string_escape(value: &str) -> String {
@@ -588,7 +744,12 @@ fn arabic_line_geometry(document: &quire::Document) -> Vec<ArabicLineGeometry> {
                 .iter()
                 .flat_map(|run| run.glyphs.as_deref().unwrap_or_default())
                 .filter(|glyph| glyph.unicode.contains('ع'))
-                .map(|glyph| (glyph.id, (glyph.x_advance * 1_000.0).round() as i32))
+                .map(|glyph| {
+                    (
+                        glyph.painted_id().expect("paintable glyph"),
+                        (glyph.x_advance * 1_000.0).round() as i32,
+                    )
+                })
                 .collect::<Vec<_>>();
             (!glyphs.is_empty()).then(|| {
                 (
@@ -631,7 +792,7 @@ async fn font_style_boundary_preserves_arabic_shaping_context() {
                 .iter()
                 .flat_map(|run| run.glyphs.as_deref().unwrap_or_default())
                 .filter(|glyph| glyph.unicode.contains('ع'))
-                .map(|glyph| glyph.id)
+                .map(|glyph| glyph.painted_id().expect("paintable glyph"))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -868,12 +1029,12 @@ async fn explicit_line_height_baseline_ignores_fallback_font_runs() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("red fallback-baseline probe should paint");
     let white = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::WHITE))
+        .find(|rect| rect.fill == Some(CssColor::WHITE))
         .expect("white reference probe should paint");
 
     assert!(
@@ -893,8 +1054,8 @@ async fn explicit_line_height_baseline_ignores_fallback_font_runs() {
         "red={red:?} white={white:?}"
     );
     assert!(
-        first_rect_paint_operation_index(page, Color::WHITE)
-            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+        first_rect_paint_operation_index(page, CssColor::WHITE)
+            > first_rect_paint_operation_index(page, CssColor::new(255, 0, 0)),
         "white reference should paint over the red fallback-baseline probe"
     );
 }
@@ -971,12 +1132,12 @@ async fn css2_explicit_line_height_baseline_wpt_overlay_hides_fallback_probe() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("red fallback-baseline probe should paint");
     let white = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::WHITE))
+        .find(|rect| rect.fill == Some(CssColor::WHITE))
         .expect("white reference probe should paint");
 
     assert!(
@@ -996,23 +1157,26 @@ async fn css2_explicit_line_height_baseline_wpt_overlay_hides_fallback_probe() {
         "red={red:?} white={white:?}"
     );
     assert!(
-        first_rect_paint_operation_index(page, Color::WHITE)
-            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+        first_rect_paint_operation_index(page, CssColor::WHITE)
+            > first_rect_paint_operation_index(page, CssColor::new(255, 0, 0)),
         "white reference should paint over the red fallback-baseline probe"
     );
 }
 
 fn woff1_from_sfnt(sfnt: &[u8]) -> Vec<u8> {
     let table_count = u16::from_be_bytes(sfnt[4..6].try_into().unwrap()) as usize;
-    let mut tables = Vec::new();
-    for index in 0..table_count {
-        let record = 12 + index * 16;
-        let tag = sfnt[record..record + 4].to_vec();
-        let checksum = u32::from_be_bytes(sfnt[record + 4..record + 8].try_into().unwrap());
-        let offset = u32::from_be_bytes(sfnt[record + 8..record + 12].try_into().unwrap()) as usize;
-        let len = u32::from_be_bytes(sfnt[record + 12..record + 16].try_into().unwrap()) as usize;
-        tables.push((tag, checksum, sfnt[offset..offset + len].to_vec()));
-    }
+    let tables = (0..table_count)
+        .map(|index| {
+            let record = 12 + index * 16;
+            let tag = sfnt[record..record + 4].to_vec();
+            let checksum = u32::from_be_bytes(sfnt[record + 4..record + 8].try_into().unwrap());
+            let offset =
+                u32::from_be_bytes(sfnt[record + 8..record + 12].try_into().unwrap()) as usize;
+            let len =
+                u32::from_be_bytes(sfnt[record + 12..record + 16].try_into().unwrap()) as usize;
+            (tag, checksum, sfnt[offset..offset + len].to_vec())
+        })
+        .collect::<Vec<_>>();
 
     let mut output = vec![0; 44 + table_count * 20];
     output[0..4].copy_from_slice(b"wOFF");
@@ -1274,7 +1438,7 @@ fn alreq_first_line_glyphs(document: &quire::Document) -> Option<AlreqLineGlyphs
                         .unwrap_or_default()
                         .iter()
                         .filter(|glyph| glyph.x_advance != 0.0)
-                        .map(|glyph| glyph.id)
+                        .map(|glyph| glyph.painted_id().expect("paintable glyph"))
                 })
                 .collect(),
             unicode: line

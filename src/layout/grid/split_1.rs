@@ -38,7 +38,9 @@ impl<'a> LayoutBuilder<'a> {
         let containing_inline_size = (self.content_right - self.content_left).max(0.0);
         let mut used_style =
             GridUsedStyle::from_normalized(self.style_with_current_viewport_lengths(style));
-        if used_style.contain.layout || used_style.contain.paint {
+        if layout_containment_applies_to_element(element, &used_style)
+            || paint_containment_applies_to_element(element, &used_style)
+        {
             used_style.grid_template_rows.resolve_contained_subgrid();
             used_style.grid_template_columns.resolve_contained_subgrid();
         }
@@ -53,17 +55,16 @@ impl<'a> LayoutBuilder<'a> {
 
         let available_outer_width =
             normal_flow_block_available_outer_width(&used_style, layout_pt(containing_inline_size));
-        let border_widths = box_metrics.border;
+        let border_widths = box_metrics.border.to_css_edges();
         let horizontal_extras = box_metrics.horizontal_non_content_length().points();
         let vertical_extras = box_metrics.vertical_non_content_length().points();
-        let current_fragmentainer = Fragmentainer::from_cursor_bounds(
-            self.page_area_height(),
-            self.cursor_y,
-            self.page_bottom(),
-        );
-        let available_outer_height = current_fragmentainer.available_block_size_after_reservation(
-            used_style.margin.top + used_style.margin.bottom,
-        );
+        let current_fragmentainer =
+            self.fragmentainer_from_page_cursor(PageTopBlockPosition::new(self.cursor_y));
+        let available_outer_height = current_fragmentainer
+            .available_block_size_after_reservation(layout_pt(
+                used_style.margin.top + used_style.margin.bottom,
+            ))
+            .points();
         let explicit_content_height = descendant_percentage_height_basis
             .map(PercentageBasis::points)
             .unwrap_or_else(|| {
@@ -75,12 +76,11 @@ impl<'a> LayoutBuilder<'a> {
                 .map(SemanticLengthExt::points)
             })
             .map(|height| {
-                constrain_content_height(
+                PhysicalContentHeight::new(constrain_content_height(
                     &used_style,
                     content_box_pt(height),
                     PercentageBasis::definite(layout_pt(available_outer_height)),
-                )
-                .points()
+                ))
             });
         let requested_content_width = self.used_block_physical_content_width(
             element,
@@ -91,6 +91,7 @@ impl<'a> LayoutBuilder<'a> {
                 available_outer_width,
                 percentage_basis: PercentageBasis::definite(layout_pt(containing_inline_size)),
                 horizontal_non_content: non_content_pt(horizontal_extras),
+                definite_content_height: explicit_content_height,
             },
         );
         // A grid container participates in normal block sizing before its
@@ -105,7 +106,7 @@ impl<'a> LayoutBuilder<'a> {
             .and_then(|height| {
                 non_replaced_aspect_ratio_content_width(
                     &used_style,
-                    height,
+                    height.points(),
                     horizontal_extras,
                     vertical_extras,
                 )
@@ -113,19 +114,18 @@ impl<'a> LayoutBuilder<'a> {
             .map(|width| PhysicalContentWidth::new(content_box_pt(width)))
             .unwrap_or(requested_content_width);
         let resolve_auto_margins = used_style.float == Float::None;
-        let width = resolve_normal_flow_block_width(
+        let width = resolve_normal_flow_block_inline_geometry(
             &mut used_style,
-            self.content_left,
-            self.content_right,
+            PageInlineSpan::from_edges(self.content_left, self.content_right),
             requested_content_width,
             non_content_pt(horizontal_extras),
             self.containing_block_direction,
             resolve_auto_margins,
         );
         let content_width = width.content_width.points();
-        let outer_width = width.border_box_width.points();
+        let outer_width = width.border_box_width().points();
         let style = &used_style;
-        let mut outer_x = width.border_box_x + relative_offset.x();
+        let mut outer_x = width.border_box_inline_span.left_x() + relative_offset.x();
         let mut inner_x = outer_x + border_widths.left + style.padding.left;
         let inner_width = content_width.max(0.0);
         let definite_content_height = explicit_content_height
@@ -136,14 +136,14 @@ impl<'a> LayoutBuilder<'a> {
                     horizontal_extras,
                     vertical_extras,
                 )
+                .map(|height| PhysicalContentHeight::new(content_box_pt(height)))
             })
             .map(|height| {
-                constrain_content_height(
+                PhysicalContentHeight::new(constrain_content_height(
                     style,
-                    content_box_pt(height),
+                    height.content_box_length(),
                     PercentageBasis::definite(layout_pt(available_outer_height)),
-                )
-                .points()
+                ))
             });
 
         // A definite-size grid container is a normal-flow block before Grid
@@ -155,7 +155,10 @@ impl<'a> LayoutBuilder<'a> {
         let empty_destination_fragmentainer = match fragmentainer_kind {
             FragmentainerKind::Page => {
                 let next_context = self.resolved_page_context(self.pages.len() + 2, false);
-                Fragmentainer::new(next_context.area_height(), next_context.area_height())
+                Fragmentainer::new(
+                    layout_pt(next_context.area_height()),
+                    layout_pt(next_context.area_height()),
+                )
             }
             FragmentainerKind::Column => {
                 let next_capacity = self
@@ -166,12 +169,12 @@ impl<'a> LayoutBuilder<'a> {
                             .area_height()
                     })
                     .unwrap_or_else(|| self.page_area_height());
-                Fragmentainer::new(next_capacity, next_capacity)
+                Fragmentainer::new(layout_pt(next_capacity), layout_pt(next_capacity))
             }
         };
         if should_prebreak_definite_block(DefiniteBlockBreakContext {
-            definite_content_height,
-            vertical_extras,
+            definite_content_height: definite_content_height.map(PhysicalContentHeight::points),
+            vertical_non_content: box_metrics.vertical_non_content_length(),
             style,
             current_fragmentainer,
             empty_destination_fragmentainer,
@@ -217,19 +220,18 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     &[],
                     stylesheets,
-                    inner_width,
+                    PhysicalContentWidth::new(content_box_pt(inner_width)),
                     definite_content_height,
                     GridLayoutPurpose::IntrinsicProbe,
                 )
                 .map(|layout| layout.height)
-                .unwrap_or(0.0);
+                .unwrap_or_else(|| PhysicalContentHeight::new(content_box_pt(0.0)));
             Some(definite_content_height.unwrap_or_else(|| {
-                constrain_content_height(
+                PhysicalContentHeight::new(constrain_content_height(
                     style,
-                    content_box_pt(empty_grid_height),
+                    empty_grid_height.content_box_length(),
                     PercentageBasis::definite(layout_pt(available_outer_height)),
-                )
-                .points()
+                ))
             }))
         } else {
             None
@@ -248,30 +250,35 @@ impl<'a> LayoutBuilder<'a> {
         self.cursor_y -= style.margin.top;
         if style.float == Float::None {
             let margin_box_width = style.margin.left + outer_width + style.margin.right;
-            let collision_height = grid_content_height_basis.unwrap_or(style.line_height)
+            let collision_height = grid_content_height_basis
+                .map(PhysicalContentHeight::points)
+                .unwrap_or(style.line_height)
                 + vertical_extras
                 + style.margin.top
                 + style.margin.bottom;
-            let (margin_box_left, avoided_top, _) = self.place_float_avoiding_margin_box(
-                self.cursor_y,
-                PageTopSize::new(margin_box_width, collision_height),
+            let placement = self.place_float_avoiding_margin_box(
+                PageTopBlockPosition::new(self.cursor_y),
+                margin_box_size_pt(margin_box_width, collision_height),
                 style.clear,
                 style.writing_mode,
                 style.direction,
                 self.containing_block_direction,
             );
-            self.cursor_y = avoided_top;
-            outer_x = margin_box_left + style.margin.left + relative_offset.x();
+            self.cursor_y = placement.origin.top_y();
+            outer_x = placement.origin.x() + style.margin.left + relative_offset.x();
             inner_x = outer_x + border_widths.left + style.padding.left;
         } else {
-            self.cursor_y = self.clear_active_floats_top(
-                style.clear,
-                style.writing_mode,
-                style.direction,
-                self.cursor_y,
-            );
+            self.cursor_y = self
+                .clear_active_floats_top(
+                    style.clear,
+                    style.writing_mode,
+                    style.direction,
+                    PageTopBlockPosition::new(self.cursor_y),
+                )
+                .points();
         }
 
+        let border_box_inline_span = PageInlineSpan::new(outer_x, outer_width);
         let block_top = self.cursor_y;
         let paint_page_index = self.pages.len();
         let paint_checkpoint = self.current_page.paint_checkpoint();
@@ -281,7 +288,7 @@ impl<'a> LayoutBuilder<'a> {
             style,
             &children,
             stylesheets,
-            inner_width,
+            PhysicalContentWidth::new(content_box_pt(inner_width)),
             grid_item_layout_height_basis,
             GridLayoutPurpose::FinalLayout,
         ) else {
@@ -291,14 +298,16 @@ impl<'a> LayoutBuilder<'a> {
             self.layout_block(element, &flow_style, stylesheets, &[], Some(child_boxes));
             return;
         };
-        let total_content_height = size_contained_content_height.unwrap_or_else(|| {
-            constrain_content_height(
-                style,
-                content_box_pt(grid_layout.height),
-                PercentageBasis::definite(layout_pt(available_outer_height)),
-            )
-            .points()
-        });
+        let total_content_height = size_contained_content_height
+            .map(PhysicalContentHeight::points)
+            .unwrap_or_else(|| {
+                constrain_content_height(
+                    style,
+                    grid_layout.height.content_box_length(),
+                    PercentageBasis::definite(layout_pt(available_outer_height)),
+                )
+                .points()
+            });
         let overflow_clip_active = if self.element_used_overflow_clips(element, style) {
             self.push_padding_box_overflow_clip(
                 style,
@@ -353,8 +362,9 @@ impl<'a> LayoutBuilder<'a> {
                                 && item.visible.height() >= -FRAGMENT_COORDINATE_EPSILON
                                 && item.original.height() + FRAGMENT_COORDINATE_EPSILON
                                     >= item.visible.height()
-                                && item.content_slice.block_end + FRAGMENT_COORDINATE_EPSILON
-                                    >= item.content_slice.block_start
+                                && item.content_slice.block_end.points()
+                                    + FRAGMENT_COORDINATE_EPSILON
+                                    >= item.content_slice.block_start.points()
                         })
                 })
         );
@@ -367,8 +377,8 @@ impl<'a> LayoutBuilder<'a> {
                         .transition_before_fragment
                         .is_none_or(|transition| {
                             fragment.fragmentainer_offset > 0
-                                && transition.next_block_offset
-                                    <= fragment.slice.source_block_start + 0.01
+                                && transition.next_block_offset.points()
+                                    <= fragment.slice.source_block_start.points() + 0.01
                                 && matches!(
                                     transition.reason,
                                     GridFragmentTransitionReason::InitialOverflow
@@ -385,7 +395,8 @@ impl<'a> LayoutBuilder<'a> {
             + total_content_height
             + style.padding.bottom
             + border_widths.bottom;
-        let positioning_containing_block_mode = PositionedContainingBlockMode::for_style(style);
+        let positioning_containing_block_mode =
+            PositionedContainingBlockMode::for_element(element, style);
         let establishes_positioning_containing_block = positioning_containing_block_mode.is_some();
         let positioned_containing_block_scope =
             if let Some(mode) = positioning_containing_block_mode {
@@ -409,9 +420,11 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 GridPositioningGeometry {
                     inner_x,
-                    inner_width,
+                    inner_width: PhysicalContentWidth::new(content_box_pt(inner_width)),
                     content_top,
-                    content_height: total_content_height,
+                    content_height: PhysicalContentHeight::new(content_box_pt(
+                        total_content_height,
+                    )),
                     column_line_offsets: &grid_layout.column_line_offsets,
                     row_line_offsets: &grid_layout.row_line_offsets,
                 },
@@ -432,7 +445,7 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-position-3/#abspos-insets>
         let previous_containing_block_direction = self.containing_block_direction;
         let previous_containing_block_writing_mode = self.containing_block_writing_mode;
-        self.containing_block_direction = style.direction;
+        self.containing_block_direction = style.used_direction();
         self.containing_block_writing_mode = style.writing_mode;
         if suppresses_descendant_fragmentation {
             // Size containment makes the grid principal box monolithic while
@@ -446,7 +459,10 @@ impl<'a> LayoutBuilder<'a> {
         }
         let mut committed_gap_fragment_paint_bounds = Vec::new();
         let committed_replay_end_cursor = if can_replay_committed_fragment_records {
-            let mut fragment_cursor = GridFragmentCursor::new(content_top, 0.0);
+            let mut fragment_cursor = GridFragmentCursor::new(
+                PageTopBlockPosition::new(content_top),
+                GridFragmentBlockOffset::new(0.0),
+            );
             self.push_float_context();
             for fragment_record in &grid_fragment_records {
                 if let Some(transition) = fragment_record.transition_before_fragment
@@ -455,11 +471,14 @@ impl<'a> LayoutBuilder<'a> {
                         FragmentainerAdvance::Unforced,
                     )
                 {
-                    fragment_cursor = transition.cursor_after_fragmentainer_advance(content_top);
+                    fragment_cursor = transition
+                        .cursor_after_fragmentainer_advance(PageTopBlockPosition::new(content_top));
                 }
                 let paint_checkpoint = self.current_page.paint_checkpoint();
                 self.replay_grid_fragment_record_items(
                     *fragment_record,
+                    style,
+                    &grid_layout,
                     &children,
                     &grid_layout.items,
                     stylesheets,
@@ -479,7 +498,15 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             self.push_float_context();
             for (child, item) in children.iter().zip(&grid_layout.items) {
-                self.replay_grid_item(child, item, stylesheets, inner_x, content_top);
+                self.replay_grid_item_with_resolved_axes(
+                    style,
+                    &grid_layout,
+                    child,
+                    item,
+                    stylesheets,
+                    inner_x,
+                    PageTopBlockPosition::new(content_top),
+                );
             }
             self.pop_float_context();
             None
@@ -492,10 +519,12 @@ impl<'a> LayoutBuilder<'a> {
                     container_style: style,
                     stylesheets,
                     inner_x,
-                    inner_width,
+                    inner_width: PhysicalContentWidth::new(content_box_pt(inner_width)),
                     content_top,
                     definite_content_height: grid_content_height_basis,
-                    content_height: total_content_height,
+                    content_height: PhysicalContentHeight::new(content_box_pt(
+                        total_content_height,
+                    )),
                     column_line_offsets: &grid_layout.column_line_offsets,
                     row_line_offsets: &grid_layout.row_line_offsets,
                     establishes_positioning_containing_block,
@@ -515,7 +544,11 @@ impl<'a> LayoutBuilder<'a> {
         self.containing_block_writing_mode = previous_containing_block_writing_mode;
 
         self.cursor_y = committed_replay_end_cursor
-            .map(|cursor| cursor.source_block_y(total_content_height))
+            .map(|cursor| {
+                cursor
+                    .source_block_y(GridFragmentBlockOffset::new(total_content_height))
+                    .points()
+            })
             .unwrap_or(content_top - total_content_height);
         self.cursor_y -= style.padding.bottom + border_widths.bottom;
         let block_bottom = self.cursor_y;
@@ -584,9 +617,8 @@ impl<'a> LayoutBuilder<'a> {
                 if let Some(fragment_bounds) = planned_fragment_record
                     .map(|fragment_record| {
                         fragment_record.paint_clip(
-                            outer_x,
-                            outer_width,
-                            fragment_record.cursor(content_top),
+                            border_box_inline_span,
+                            fragment_record.cursor(PageTopBlockPosition::new(content_top)),
                         )
                     })
                     .or_else(fallback_fragment_bounds)
@@ -596,14 +628,14 @@ impl<'a> LayoutBuilder<'a> {
                         .unwrap_or_else(|| {
                             grid_fragment_source_range_from_bounds(
                                 fragment_bounds,
-                                content_top,
+                                PageTopBlockPosition::new(content_top),
                                 total_content_height,
                             )
                         });
                     if style.visibility == Visibility::Visible
                         && (style.background_color.is_some()
-                            || style.background_image.is_some()
-                            || style.border_image.source.is_some()
+                            || style.background_image.is_image()
+                            || style.border_image.source.is_image()
                             || used_border_width(style) > layout_pt(0.0))
                     {
                         let page_background_primitives = self.box_background_primitives(
@@ -625,9 +657,8 @@ impl<'a> LayoutBuilder<'a> {
                             PaintBand::BackgroundBorder,
                             grid_gap_decoration_primitives_for_page(GridGapFragmentProjection {
                                 style,
-                                inner_x,
-                                content_top,
-                                inner_width,
+                                content_origin: PageTopPoint::new(inner_x, content_top),
+                                inner_width: PhysicalContentWidth::new(content_box_pt(inner_width)),
                                 total_content_height,
                                 // Gap-rule segmentation is defined in the grid's
                                 // source block coordinate space.  The committed
@@ -704,9 +735,10 @@ impl<'a> LayoutBuilder<'a> {
                                 grid_gap_decoration_primitives_for_page(
                                     GridGapFragmentProjection {
                                         style,
-                                        inner_x: bounds.x(),
-                                        content_top,
-                                        inner_width,
+                                        content_origin: PageTopPoint::new(bounds.x(), content_top),
+                                        inner_width: PhysicalContentWidth::new(content_box_pt(
+                                            inner_width,
+                                        )),
                                         total_content_height,
                                         items: &grid_gap_items,
                                         gutters: &grid_layout.gap_gutters,
@@ -771,18 +803,20 @@ impl<'a> LayoutBuilder<'a> {
     ) -> InlineAtom {
         let mut used_style =
             GridUsedStyle::from_normalized(self.style_with_current_viewport_lengths(style));
-        if used_style.contain.layout || used_style.contain.paint {
+        if layout_containment_applies_to_element(element, &used_style)
+            || paint_containment_applies_to_element(element, &used_style)
+        {
             used_style.grid_template_rows.resolve_contained_subgrid();
             used_style.grid_template_columns.resolve_contained_subgrid();
         }
         let box_metrics = intrinsic_box_metrics(&used_style);
-        used_style.margin = box_metrics.margin;
-        used_style.padding = box_metrics.padding;
+        used_style.margin = box_metrics.margin.to_css_edges();
+        used_style.padding = box_metrics.padding.to_css_edges();
         let available_width = (self.content_right
             - self.content_left
-            - box_metrics.margin.left
-            - box_metrics.margin.right)
-            .max(used_style.font_size);
+            - box_metrics.margin.left.points()
+            - box_metrics.margin.right.points())
+        .max(used_style.font_size);
         let style = &used_style;
         let horizontal_extras = box_metrics.horizontal_non_content_length().points();
         let vertical_extras = box_metrics.vertical_non_content_length().points();
@@ -821,12 +855,11 @@ impl<'a> LayoutBuilder<'a> {
         )
         .map(SemanticLengthExt::points)
         .map(|height| {
-            constrain_content_height(
+            PhysicalContentHeight::new(constrain_content_height(
                 style,
                 content_box_pt(height),
                 PercentageBasis::definite(layout_pt(available_width)),
-            )
-            .points()
+            ))
         });
         let size_contained_content_height = if style.contain.size {
             let empty_grid_height = self
@@ -834,19 +867,18 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     &[],
                     stylesheets,
-                    content_width,
+                    PhysicalContentWidth::new(content_box_pt(content_width)),
                     definite_content_height,
                     GridLayoutPurpose::IntrinsicProbe,
                 )
                 .map(|layout| layout.height)
-                .unwrap_or(0.0);
+                .unwrap_or_else(|| PhysicalContentHeight::new(content_box_pt(0.0)));
             Some(definite_content_height.unwrap_or_else(|| {
-                constrain_content_height(
+                PhysicalContentHeight::new(constrain_content_height(
                     style,
-                    content_box_pt(empty_grid_height),
+                    empty_grid_height.content_box_length(),
                     PercentageBasis::definite(layout_pt(available_width)),
-                )
-                .points()
+                ))
             }))
         } else {
             None
@@ -855,28 +887,30 @@ impl<'a> LayoutBuilder<'a> {
             style,
             &children,
             stylesheets,
-            content_width,
+            PhysicalContentWidth::new(content_box_pt(content_width)),
             size_contained_content_height.or(definite_content_height),
             GridLayoutPurpose::IntrinsicProbe,
         );
-        let content_height = size_contained_content_height.unwrap_or_else(|| {
-            let measured = grid_layout
-                .as_ref()
-                .map(|layout| layout.height)
-                .unwrap_or(style.line_height)
-                .max(style.line_height);
-            constrain_content_height(
-                style,
-                content_box_pt(measured),
-                PercentageBasis::definite(layout_pt(available_width)),
-            )
-            .points()
-        });
+        let content_height = size_contained_content_height
+            .map(PhysicalContentHeight::points)
+            .unwrap_or_else(|| {
+                let measured = grid_layout
+                    .as_ref()
+                    .map(|layout| layout.height.points())
+                    .unwrap_or(style.line_height)
+                    .max(style.line_height);
+                constrain_content_height(
+                    style,
+                    content_box_pt(measured),
+                    PercentageBasis::definite(layout_pt(available_width)),
+                )
+                .points()
+            });
         let border_box_height = content_height + vertical_extras;
         let baseline_offset = grid_layout
             .as_ref()
             .and_then(|layout| layout.first_baseline)
-            .map(|baseline| box_metrics.border.top + style.padding.top + baseline)
+            .map(|baseline| box_metrics.border.top.points() + style.padding.top + baseline)
             .unwrap_or(border_box_height);
 
         InlineAtom::new(
@@ -912,7 +946,9 @@ impl<'a> LayoutBuilder<'a> {
     ) -> InlineAtom {
         let mut used_style =
             GridUsedStyle::from_normalized(self.style_with_current_viewport_lengths(style));
-        if used_style.contain.layout || used_style.contain.paint {
+        if layout_containment_applies_to_element(element, &used_style)
+            || paint_containment_applies_to_element(element, &used_style)
+        {
             used_style.grid_template_rows.resolve_contained_subgrid();
             used_style.grid_template_columns.resolve_contained_subgrid();
         }
@@ -926,7 +962,7 @@ impl<'a> LayoutBuilder<'a> {
             PercentageBasis::definite(layout_pt(available_width)),
         );
         let style = &used_style;
-        let border_widths = box_metrics.border;
+        let border_widths = box_metrics.border.to_css_edges();
         let horizontal_extras = box_metrics.horizontal_non_content_length().points();
         let vertical_extras = box_metrics.vertical_non_content_length().points();
         let (children, positioned_children) = grid_child_lists_from_boxes(child_boxes);
@@ -965,12 +1001,11 @@ impl<'a> LayoutBuilder<'a> {
         )
         .map(SemanticLengthExt::points)
         .map(|height| {
-            constrain_content_height(
+            PhysicalContentHeight::new(constrain_content_height(
                 style,
                 content_box_pt(height),
                 PercentageBasis::definite(layout_pt(available_width)),
-            )
-            .points()
+            ))
         });
         let size_contained_content_height = if style.contain.size {
             let empty_grid_height = self
@@ -978,19 +1013,18 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     &[],
                     stylesheets,
-                    content_width,
+                    PhysicalContentWidth::new(content_box_pt(content_width)),
                     definite_content_height,
                     GridLayoutPurpose::IntrinsicProbe,
                 )
                 .map(|layout| layout.height)
-                .unwrap_or(0.0);
+                .unwrap_or_else(|| PhysicalContentHeight::new(content_box_pt(0.0)));
             Some(definite_content_height.unwrap_or_else(|| {
-                constrain_content_height(
+                PhysicalContentHeight::new(constrain_content_height(
                     style,
-                    content_box_pt(empty_grid_height),
+                    empty_grid_height.content_box_length(),
                     PercentageBasis::definite(layout_pt(available_width)),
-                )
-                .points()
+                ))
             }))
         } else {
             None
@@ -1000,7 +1034,7 @@ impl<'a> LayoutBuilder<'a> {
             style,
             &children,
             stylesheets,
-            content_width,
+            PhysicalContentWidth::new(content_box_pt(content_width)),
             grid_content_height_basis,
             GridLayoutPurpose::FinalLayout,
         ) else {
@@ -1014,14 +1048,16 @@ impl<'a> LayoutBuilder<'a> {
             );
         };
 
-        let total_content_height = size_contained_content_height.unwrap_or_else(|| {
-            constrain_content_height(
-                style,
-                content_box_pt(grid_layout.height),
-                PercentageBasis::definite(layout_pt(available_width)),
-            )
-            .points()
-        });
+        let total_content_height = size_contained_content_height
+            .map(PhysicalContentHeight::points)
+            .unwrap_or_else(|| {
+                constrain_content_height(
+                    style,
+                    grid_layout.height.content_box_length(),
+                    PercentageBasis::definite(layout_pt(available_width)),
+                )
+                .points()
+            });
         let border_box_height = total_content_height + vertical_extras;
         let snapshot = self.snapshot();
         let positioned_layer_start = self.positioned_layers.len();
@@ -1040,7 +1076,8 @@ impl<'a> LayoutBuilder<'a> {
         self.cursor_y = content_top;
         self.truncate_page_start_margins = false;
 
-        let positioning_containing_block_mode = PositionedContainingBlockMode::for_style(style);
+        let positioning_containing_block_mode =
+            PositionedContainingBlockMode::for_element(element, style);
         let establishes_positioning_containing_block = positioning_containing_block_mode.is_some();
         let positioned_containing_block_scope =
             if let Some(mode) = positioning_containing_block_mode {
@@ -1064,9 +1101,11 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 GridPositioningGeometry {
                     inner_x,
-                    inner_width,
+                    inner_width: PhysicalContentWidth::new(content_box_pt(inner_width)),
                     content_top,
-                    content_height: total_content_height,
+                    content_height: PhysicalContentHeight::new(content_box_pt(
+                        total_content_height,
+                    )),
                     column_line_offsets: &grid_layout.column_line_offsets,
                     row_line_offsets: &grid_layout.row_line_offsets,
                 },
@@ -1084,7 +1123,15 @@ impl<'a> LayoutBuilder<'a> {
         }
         self.push_float_context();
         for (child, item) in children.iter().zip(&grid_layout.items) {
-            self.replay_grid_item(child, item, stylesheets, inner_x, content_top);
+            self.replay_grid_item_with_resolved_axes(
+                style,
+                &grid_layout,
+                child,
+                item,
+                stylesheets,
+                inner_x,
+                PageTopBlockPosition::new(content_top),
+            );
         }
         self.pop_float_context();
 
@@ -1096,10 +1143,12 @@ impl<'a> LayoutBuilder<'a> {
                     container_style: style,
                     stylesheets,
                     inner_x,
-                    inner_width,
+                    inner_width: PhysicalContentWidth::new(content_box_pt(inner_width)),
                     content_top,
                     definite_content_height: grid_content_height_basis,
-                    content_height: total_content_height,
+                    content_height: PhysicalContentHeight::new(content_box_pt(
+                        total_content_height,
+                    )),
                     column_line_offsets: &grid_layout.column_line_offsets,
                     row_line_offsets: &grid_layout.row_line_offsets,
                     establishes_positioning_containing_block,
@@ -1166,7 +1215,10 @@ impl<'a> LayoutBuilder<'a> {
         self.fixed_layers.extend(fixed_layers);
 
         InlineAtom::new(
-            InlineAtomContent::InlineFragment(Box::new(fragment)),
+            InlineAtomContent::InlineFragment {
+                fragment: Box::new(fragment),
+                table_cell_context: None,
+            },
             style.as_computed().clone(),
             None,
             InlineSize::new(
@@ -1181,27 +1233,28 @@ impl<'a> LayoutBuilder<'a> {
     }
 }
 
-pub(in crate::layout) struct GridGapFragmentProjection<'a> {
-    pub(in crate::layout) style: &'a ComputedStyle,
-    pub(in crate::layout) inner_x: f32,
-    pub(in crate::layout) content_top: f32,
-    pub(in crate::layout) inner_width: f32,
-    pub(in crate::layout) total_content_height: f32,
-    pub(in crate::layout) items: &'a [GapDecorationItem],
-    pub(in crate::layout) gutters: &'a GapDecorationGridGutters,
-    pub(in crate::layout) source_block_start: f32,
-    pub(in crate::layout) source_block_end: f32,
-    pub(in crate::layout) ends_at_fragment_break: bool,
+pub(in crate::layout::grid) struct GridGapFragmentProjection<'a> {
+    pub(in crate::layout::grid) style: &'a ComputedStyle,
+    pub(in crate::layout::grid) content_origin: PageTopPoint,
+    pub(in crate::layout::grid) inner_width: PhysicalContentWidth,
+    pub(in crate::layout::grid) total_content_height: f32,
+    pub(in crate::layout::grid) items: &'a [GapDecorationItem],
+    pub(in crate::layout::grid) gutters: &'a GapDecorationGridGutters,
+    pub(in crate::layout::grid) source_block_start: GridFragmentBlockOffset,
+    pub(in crate::layout::grid) source_block_end: GridFragmentBlockOffset,
+    pub(in crate::layout::grid) ends_at_fragment_break: bool,
 }
 
-pub(in crate::layout) fn grid_gap_decoration_primitives_for_page(
+pub(in crate::layout::grid) fn grid_gap_decoration_primitives_for_page(
     projection: GridGapFragmentProjection<'_>,
 ) -> Vec<PaintPrimitive> {
     let block_start = projection
         .source_block_start
+        .points()
         .clamp(0.0, projection.total_content_height);
     let block_end = projection
         .source_block_end
+        .points()
         .clamp(block_start, projection.total_content_height);
     let fragment_height = (block_end - block_start).max(0.0);
     if fragment_height <= 0.01 {
@@ -1215,18 +1268,18 @@ pub(in crate::layout) fn grid_gap_decoration_primitives_for_page(
     let source_segments = grid_gap_rule_paint_segments(
         projection.style,
         GapDecorationContainer::new(
-            projection.inner_x,
-            projection.content_top,
-            projection.inner_width,
+            projection.content_origin.x(),
+            projection.content_origin.top_y(),
+            projection.inner_width.points(),
             projection.total_content_height,
         ),
         projection.items,
         projection.gutters,
     );
     let page_container = GapDecorationContainer::new(
-        projection.inner_x,
-        projection.content_top,
-        projection.inner_width,
+        projection.content_origin.x(),
+        projection.content_origin.top_y(),
+        projection.inner_width.points(),
         fragment_height,
     );
     source_segments
@@ -1327,7 +1380,7 @@ fn grid_fragment_terminal_rule_cap_end(
     source_segment_end: f32,
     projected_segment_end: f32,
     fragment_boundary: f32,
-    rule_width: f32,
+    rule_width: GapRuleWidth,
     ends_at_fragment_break: bool,
     crossing_gaps: &[GapDecorationGutter],
 ) -> Option<f32> {
@@ -1339,23 +1392,27 @@ fn grid_fragment_terminal_rule_cap_end(
     (ends_at_fragment_break
         && (projected_segment_end - fragment_boundary).abs() <= GAP_RULE_EPSILON
         && (source_segment_crosses_boundary || boundary_splits_cross_gap))
-        .then(|| projected_segment_end + rule_width.max(0.0))
+        .then(|| rule_width.extend_axis_position(projected_segment_end))
 }
 
 fn grid_fragment_source_range_from_bounds(
     fragment_bounds: PaintClip,
-    content_top: f32,
+    content_top: PageTopBlockPosition,
     total_content_height: f32,
-) -> (f32, f32) {
+) -> (GridFragmentBlockOffset, GridFragmentBlockOffset) {
     let fragment_top = fragment_bounds.y() + fragment_bounds.height();
-    let block_start = (content_top - fragment_top).clamp(0.0, total_content_height);
-    let block_end = (content_top - fragment_bounds.y()).clamp(block_start, total_content_height);
-    (block_start, block_end)
+    let block_start = (content_top.points() - fragment_top).clamp(0.0, total_content_height);
+    let block_end =
+        (content_top.points() - fragment_bounds.y()).clamp(block_start, total_content_height);
+    (
+        GridFragmentBlockOffset::new(block_start),
+        GridFragmentBlockOffset::new(block_end),
+    )
 }
 
 #[derive(Debug, Clone)]
 pub(in crate::layout) struct GridLayout {
-    pub(in crate::layout) height: f32,
+    pub(in crate::layout) height: PhysicalContentHeight,
     pub(in crate::layout) first_baseline: Option<f32>,
     pub(in crate::layout) last_baseline: Option<f32>,
     pub(in crate::layout) items: Vec<GridItemLayout>,
@@ -1368,6 +1425,17 @@ pub(in crate::layout) struct GridLayout {
 pub(in crate::layout::grid) enum GridLayoutPurpose {
     FinalLayout,
     IntrinsicProbe,
+}
+
+/// Taffy leaves used by one Grid sizing pass.
+///
+/// A contribution proxy models normal-flow content inside an inherited
+/// subgrid axis. It participates in track sizing but never maps to a returned
+/// grid item or a paint/replay record.
+#[derive(Debug, Clone)]
+enum GridTaffyLeaf {
+    Item(GridItemEstimate),
+    Contribution(GridItemEstimate),
 }
 
 #[derive(Debug, Clone)]
@@ -1423,6 +1491,11 @@ impl GridItemLayout {
         self.rect.origin.y
     }
 
+    /// Return Taffy's physical border-box geometry for this placed item.
+    ///
+    /// This is deliberately not the container's `PhysicalContentWidth`:
+    /// converting it to a child content-box width needs the child's logical
+    /// percentage basis, particularly in vertical writing modes.
     pub(in crate::layout::grid) fn width(&self) -> f32 {
         self.rect.size.width
     }
@@ -1465,10 +1538,9 @@ impl GridItemLayout {
 
     pub(in crate::layout::grid) fn page_top_rect(
         &self,
-        page_left: f32,
-        content_top: f32,
+        container_origin: PageTopPoint,
     ) -> PageTopRect {
-        grid_rect_to_page_top_rect(self.rect, page_left, content_top)
+        grid_rect_to_page_top_rect(self.rect, container_origin)
     }
 
     pub(in crate::layout::grid) fn with_block_slice(
@@ -1516,33 +1588,72 @@ impl<'a> LayoutBuilder<'a> {
     /// other layout modes:
     /// <https://www.w3.org/TR/css-grid-1/#algo-overview> and
     /// <https://www.w3.org/TR/css-sizing-3/#intrinsic>.
+    ///
+    /// `width` is the grid container's physical CSS content-box width.
     pub(in crate::layout::grid) fn compute_grid_layout(
         &mut self,
         style: &ComputedStyle,
         children: &[GridChild<'_>],
         stylesheets: &[Stylesheet],
-        width: f32,
-        height: Option<f32>,
+        width: PhysicalContentWidth,
+        height: Option<PhysicalContentHeight>,
         purpose: GridLayoutPurpose,
     ) -> Option<GridLayout> {
-        let intrinsic_layout = self.compute_grid_layout_pass(
+        // A direct subgrid replay installs this one-shot context immediately
+        // before entering its formatting context. Consume it here rather than
+        // leaving it visible to unrelated nested grids.
+        let subgrid_context = self.take_resolved_subgrid_context();
+        let preliminary_layout = self.compute_grid_layout_pass(
             style,
             children,
             stylesheets,
+            subgrid_context.as_ref(),
+            &[],
             GridLayoutPassConfig {
                 width,
                 root_height: height,
-                item_height_basis: grid_percentage_basis_from_points(
-                    height,
+                item_height_basis: grid_percentage_basis(
+                    height.map(PhysicalContentHeight::content_box_length),
                     GridAvailableSizeSource::ContainerBlockSize,
                 ),
-                row_gap_basis: grid_percentage_basis_from_points(
-                    height,
+                row_gap_basis: grid_percentage_basis(
+                    height.map(PhysicalContentHeight::content_box_length),
                     GridAvailableSizeSource::ContainerBlockSize,
                 ),
                 reported_height: None,
             },
         )?;
+        let contributions = if purpose == GridLayoutPurpose::FinalLayout
+            && subgrid_context.is_none()
+        {
+            self.collect_subgrid_contributions(style, children, stylesheets, &preliminary_layout)
+        } else {
+            Vec::new()
+        };
+        let intrinsic_layout = if contributions.is_empty() {
+            preliminary_layout
+        } else {
+            self.compute_grid_layout_pass(
+                style,
+                children,
+                stylesheets,
+                subgrid_context.as_ref(),
+                &contributions,
+                GridLayoutPassConfig {
+                    width,
+                    root_height: height,
+                    item_height_basis: grid_percentage_basis(
+                        height.map(PhysicalContentHeight::content_box_length),
+                        GridAvailableSizeSource::ContainerBlockSize,
+                    ),
+                    row_gap_basis: grid_percentage_basis(
+                        height.map(PhysicalContentHeight::content_box_length),
+                        GridAvailableSizeSource::ContainerBlockSize,
+                    ),
+                    reported_height: None,
+                },
+            )?
+        };
         // An auto-height grid can still provide a definite physical block
         // size to its items when its physical row tracks are explicitly fixed.
         // Run the item-placement phase again with that used grid height so
@@ -1559,15 +1670,17 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 children,
                 stylesheets,
+                subgrid_context.as_ref(),
+                &contributions,
                 GridLayoutPassConfig {
                     width,
                     root_height: Some(intrinsic_layout.height),
-                    item_height_basis: grid_percentage_basis_from_points(
-                        Some(intrinsic_layout.height),
+                    item_height_basis: grid_percentage_basis(
+                        Some(intrinsic_layout.height.content_box_length()),
                         GridAvailableSizeSource::ContainerBlockSize,
                     ),
-                    row_gap_basis: grid_percentage_basis_from_points(
-                        Some(intrinsic_layout.height),
+                    row_gap_basis: grid_percentage_basis(
+                        Some(intrinsic_layout.height.content_box_length()),
                         GridAvailableSizeSource::ContainerBlockSize,
                     ),
                     reported_height: Some(intrinsic_layout.height),
@@ -1585,12 +1698,14 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 children,
                 stylesheets,
+                subgrid_context.as_ref(),
+                &contributions,
                 GridLayoutPassConfig {
                     width,
                     root_height: Some(intrinsic_layout.height),
                     item_height_basis: PercentageBasis::indefinite(),
-                    row_gap_basis: grid_percentage_basis_from_points(
-                        Some(intrinsic_layout.height),
+                    row_gap_basis: grid_percentage_basis(
+                        Some(intrinsic_layout.height.content_box_length()),
                         GridAvailableSizeSource::ContainerBlockSize,
                     ),
                     reported_height: Some(intrinsic_layout.height),
@@ -1604,9 +1719,37 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 width,
                 intrinsic_layout,
+                subgrid_context.as_ref(),
             ));
         }
         Some(intrinsic_layout)
+    }
+
+    /// Run the existing subgrid contribution probe with a placed item's
+    /// physical border-box width.
+    ///
+    /// This is intentionally a narrow legacy boundary. Taffy's placed-item
+    /// width is not a CSS content-box width, but converting it correctly needs
+    /// the child's logical percentage basis (which may be the physical height
+    /// in vertical writing modes). Keep the historical probe arithmetic here
+    /// until that conversion has a dedicated representation.
+    pub(in crate::layout::grid) fn compute_grid_layout_for_subgrid_contribution_probe(
+        &mut self,
+        style: &ComputedStyle,
+        children: &[GridChild<'_>],
+        stylesheets: &[Stylesheet],
+        placed_item_border_box_width: f32,
+        height: Option<f32>,
+        purpose: GridLayoutPurpose,
+    ) -> Option<GridLayout> {
+        self.compute_grid_layout(
+            style,
+            children,
+            stylesheets,
+            PhysicalContentWidth::new(content_box_pt(placed_item_border_box_width)),
+            height.map(|height| PhysicalContentHeight::new(content_box_pt(height))),
+            purpose,
+        )
     }
 
     /// Compute one Taffy grid layout pass.
@@ -1623,10 +1766,14 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         children: &[GridChild<'_>],
         stylesheets: &[Stylesheet],
+        subgrid_context: Option<&ResolvedSubgridContext>,
+        contributions: &[SubgridContribution],
         config: GridLayoutPassConfig,
     ) -> Option<GridLayout> {
-        let width = config.width;
+        let content_width = config.width;
+        let width = content_width.points();
         let root_height = config.root_height;
+        let root_height_points = root_height.map(PhysicalContentHeight::points);
         let contained_subgrid_columns = (style.contain.layout || style.contain.paint)
             && matches!(style.grid_template_columns, css::GridTrackList::None);
         let contained_subgrid_rows = (style.contain.layout || style.contain.paint)
@@ -1647,8 +1794,8 @@ impl<'a> LayoutBuilder<'a> {
         let item_width_basis = if contained_subgrid_columns {
             GridPercentageBasis::indefinite()
         } else {
-            grid_percentage_basis_from_points(
-                Some(width),
+            grid_percentage_basis(
+                Some(content_width.content_box_length()),
                 GridAvailableSizeSource::ContainerInlineSize,
             )
         };
@@ -1660,13 +1807,24 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-grid-2/#track-sizing>.
         let swaps_physical_grid_axes =
             WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes();
-        let mut tree: taffy_layout::TaffyTree<GridItemEstimate> = taffy_layout::TaffyTree::new();
+        let physical_column_subgrid = subgrid_context
+            .and_then(|context| context.physical_axis(GridAxis::Column, swaps_physical_grid_axes));
+        let physical_row_subgrid = subgrid_context
+            .and_then(|context| context.physical_axis(GridAxis::Row, swaps_physical_grid_axes));
+        let resolved_item_placements = subgrid_context
+            .map(|context| context.resolve_item_placements(children, style.grid_auto_flow));
+        let mut tree: taffy_layout::TaffyTree<GridTaffyLeaf> = taffy_layout::TaffyTree::new();
         tree.disable_rounding();
-        let row_adjustment = taffy_startward_implicit_row_adjustment(style, children, root_height);
-        let column_adjustment = taffy_startward_implicit_column_adjustment(style, children, width);
+        let row_adjustment =
+            taffy_startward_implicit_row_adjustment(style, children, root_height_points);
+        let column_adjustment =
+            taffy_startward_implicit_column_adjustment(style, children, content_width);
         let mut nodes = Vec::with_capacity(children.len());
         let mut estimates = Vec::with_capacity(children.len());
-        for child in children {
+        for (index, child) in children.iter().enumerate() {
+            let resolved_placement = resolved_item_placements
+                .as_ref()
+                .map(|placements| placements[index]);
             let estimate = self.estimate_grid_item_size(
                 child,
                 stylesheets,
@@ -1674,19 +1832,26 @@ impl<'a> LayoutBuilder<'a> {
                 item_width_basis,
                 item_height_basis,
             );
+            // A subgrid has no independent intrinsic contribution in an
+            // inherited axis. Its explicitly placed descendants are inserted
+            // below as projected proxy leaves after preliminary placement.
+            // Retain the original estimate for replay/baseline bookkeeping;
+            // only the Taffy sizing leaf is made empty in that logical axis.
+            // <https://drafts.csswg.org/css-grid-2/#subgrid-track-sizing>
+            let sizing_estimate = grid_item_parent_sizing_estimate(estimate, &child.style);
             // Grid's intrinsic contributions are logical, while Taffy's
             // layout tree is physical. Keep the logical estimate for Grid's
             // own track and baseline calculations, and project only the
             // automatic measurement inputs supplied to Taffy.
             // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
-            let physical_estimate = estimate.physical_measurements();
+            let physical_estimate = sizing_estimate.physical_measurements();
             estimates.push(estimate);
             let node = tree
                 .new_leaf_with_context(
                     taffy_layout::Style {
                         display: taffy_layout::Display::Block,
                         box_sizing: taffy_box_sizing(child.style.box_sizing),
-                        direction: taffy_direction(child.style.direction),
+                        direction: taffy_direction(child.style.used_direction()),
                         size: taffy_layout::Size {
                             width: taffy_grid_item_dimension(
                                 child.style.box_values.width.clone(),
@@ -1753,37 +1918,129 @@ impl<'a> LayoutBuilder<'a> {
                             taffy_effective_grid_justify_self(&child.style, style)
                         },
                         grid_row: if swaps_physical_grid_axes {
-                            taffy_grid_line_with_startward_adjustment(
-                                &child.style.grid_column_start,
-                                &child.style.grid_column_end,
-                                &column_adjustment,
-                            )
+                            resolved_placement
+                                .and_then(|placement| placement.columns)
+                                .map(ResolvedSubgridPlacement::taffy_line)
+                                .unwrap_or_else(|| {
+                                    physical_row_subgrid.map_or_else(
+                                        || {
+                                            taffy_grid_line_with_startward_adjustment(
+                                                &child.style.grid_column_start,
+                                                &child.style.grid_column_end,
+                                                &column_adjustment,
+                                            )
+                                        },
+                                        |axis| {
+                                            axis.clamped_taffy_line(
+                                                &child.style.grid_column_start,
+                                                &child.style.grid_column_end,
+                                            )
+                                        },
+                                    )
+                                })
                         } else {
-                            taffy_grid_line_with_startward_adjustment(
-                                &child.style.grid_row_start,
-                                &child.style.grid_row_end,
-                                &row_adjustment,
-                            )
+                            resolved_placement
+                                .and_then(|placement| placement.rows)
+                                .map(ResolvedSubgridPlacement::taffy_line)
+                                .unwrap_or_else(|| {
+                                    physical_row_subgrid.map_or_else(
+                                        || {
+                                            taffy_grid_line_with_startward_adjustment(
+                                                &child.style.grid_row_start,
+                                                &child.style.grid_row_end,
+                                                &row_adjustment,
+                                            )
+                                        },
+                                        |axis| {
+                                            axis.clamped_taffy_line(
+                                                &child.style.grid_row_start,
+                                                &child.style.grid_row_end,
+                                            )
+                                        },
+                                    )
+                                })
                         },
                         grid_column: if swaps_physical_grid_axes {
-                            taffy_grid_line_with_startward_adjustment(
-                                &child.style.grid_row_start,
-                                &child.style.grid_row_end,
-                                &row_adjustment,
-                            )
+                            resolved_placement
+                                .and_then(|placement| placement.rows)
+                                .map(ResolvedSubgridPlacement::taffy_line)
+                                .unwrap_or_else(|| {
+                                    physical_column_subgrid.map_or_else(
+                                        || {
+                                            taffy_grid_line_with_startward_adjustment(
+                                                &child.style.grid_row_start,
+                                                &child.style.grid_row_end,
+                                                &row_adjustment,
+                                            )
+                                        },
+                                        |axis| {
+                                            axis.clamped_taffy_line(
+                                                &child.style.grid_row_start,
+                                                &child.style.grid_row_end,
+                                            )
+                                        },
+                                    )
+                                })
                         } else {
-                            taffy_grid_line_with_startward_adjustment(
-                                &child.style.grid_column_start,
-                                &child.style.grid_column_end,
-                                &column_adjustment,
-                            )
+                            resolved_placement
+                                .and_then(|placement| placement.columns)
+                                .map(ResolvedSubgridPlacement::taffy_line)
+                                .unwrap_or_else(|| {
+                                    physical_column_subgrid.map_or_else(
+                                        || {
+                                            taffy_grid_line_with_startward_adjustment(
+                                                &child.style.grid_column_start,
+                                                &child.style.grid_column_end,
+                                                &column_adjustment,
+                                            )
+                                        },
+                                        |axis| {
+                                            axis.clamped_taffy_line(
+                                                &child.style.grid_column_start,
+                                                &child.style.grid_column_end,
+                                            )
+                                        },
+                                    )
+                                })
                         },
                         ..Default::default()
                     },
-                    estimate,
+                    GridTaffyLeaf::Item(sizing_estimate),
                 )
                 .ok()?;
             nodes.push(node);
+        }
+        let mut contribution_nodes = Vec::with_capacity(contributions.len());
+        for contribution in contributions {
+            // The collector has already selected the inherited logical axes
+            // and applied their outer box/gutter edge adjustments. Project it
+            // once here, at the same logical-to-physical boundary as real
+            // grid items; proxy leaves must never need ad-hoc axis zeroing.
+            let estimate = contribution.adjusted_estimate().physical_measurements();
+            let node = tree
+                .new_leaf_with_context(
+                    taffy_layout::Style {
+                        display: taffy_layout::Display::Block,
+                        grid_row: taffy_layout::Line {
+                            start: taffy_layout::line(
+                                i16::try_from(contribution.area.row_start).ok()?,
+                            ),
+                            end: taffy_layout::line(i16::try_from(contribution.area.row_end).ok()?),
+                        },
+                        grid_column: taffy_layout::Line {
+                            start: taffy_layout::line(
+                                i16::try_from(contribution.area.column_start).ok()?,
+                            ),
+                            end: taffy_layout::line(
+                                i16::try_from(contribution.area.column_end).ok()?,
+                            ),
+                        },
+                        ..Default::default()
+                    },
+                    GridTaffyLeaf::Contribution(estimate),
+                )
+                .ok()?;
+            contribution_nodes.push(node);
         }
         // Taffy's empty grid currently omits otherwise-valid explicit track
         // geometry. CSS Grid still sizes an empty grid from its explicit
@@ -1795,6 +2052,7 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-grid-1/#explicit-grids>
         // <https://www.w3.org/TR/css-contain-1/#containment-size>
         let mut layout_nodes = nodes.clone();
+        layout_nodes.extend(contribution_nodes);
         if layout_nodes.is_empty()
             && !grid_track_list_has_auto_fit(&style.grid_template_columns)
             && !grid_track_list_has_auto_fit(&style.grid_template_rows)
@@ -1817,7 +2075,7 @@ impl<'a> LayoutBuilder<'a> {
                         },
                         ..Default::default()
                     },
-                    GridItemEstimate::fixed(0.0, 0.0),
+                    GridTaffyLeaf::Contribution(GridItemEstimate::fixed(0.0, 0.0)),
                 )
                 .ok()?;
             layout_nodes.push(placeholder);
@@ -1827,10 +2085,10 @@ impl<'a> LayoutBuilder<'a> {
                 taffy_layout::Style {
                     display: taffy_layout::Display::Grid,
                     box_sizing: taffy_layout::BoxSizing::BorderBox,
-                    direction: taffy_direction(style.direction),
+                    direction: taffy_direction(style.used_direction()),
                     size: taffy_layout::Size {
                         width: taffy_layout::Dimension::length(width),
-                        height: root_height
+                        height: root_height_points
                             .map(taffy_layout::Dimension::length)
                             .unwrap_or_else(taffy_layout::Dimension::auto),
                     },
@@ -1842,47 +2100,77 @@ impl<'a> LayoutBuilder<'a> {
                         width: taffy_dimension(style.box_values.max_width.clone()),
                         height: taffy_dimension(style.box_values.max_height.clone()),
                     },
-                    grid_template_columns: if swaps_physical_grid_axes {
-                        taffy_grid_template_rows_with_startward_adjustment(style, &row_adjustment)
-                    } else {
-                        taffy_grid_template_columns_with_startward_adjustment(
-                            style,
-                            &column_adjustment,
-                        )
-                    },
-                    grid_template_rows: if swaps_physical_grid_axes {
-                        taffy_grid_template_columns_with_startward_adjustment(
-                            style,
-                            &column_adjustment,
-                        )
-                    } else {
-                        taffy_grid_template_rows_with_startward_adjustment(style, &row_adjustment)
-                    },
+                    grid_template_columns: physical_column_subgrid
+                        .map(ResolvedSubgridAxis::taffy_tracks)
+                        .unwrap_or_else(|| {
+                            if swaps_physical_grid_axes {
+                                taffy_grid_template_rows_with_startward_adjustment(
+                                    style,
+                                    &row_adjustment,
+                                )
+                            } else {
+                                taffy_grid_template_columns_with_startward_adjustment(
+                                    style,
+                                    &column_adjustment,
+                                )
+                            }
+                        }),
+                    grid_template_rows: physical_row_subgrid
+                        .map(ResolvedSubgridAxis::taffy_tracks)
+                        .unwrap_or_else(|| {
+                            if swaps_physical_grid_axes {
+                                taffy_grid_template_columns_with_startward_adjustment(
+                                    style,
+                                    &column_adjustment,
+                                )
+                            } else {
+                                taffy_grid_template_rows_with_startward_adjustment(
+                                    style,
+                                    &row_adjustment,
+                                )
+                            }
+                        }),
                     grid_template_areas: taffy_grid_template_areas_with_startward_adjustment(
                         &style.grid_template_areas,
                         &row_adjustment,
                         &column_adjustment,
                     ),
-                    grid_template_column_names:
-                        taffy_grid_template_column_names_with_startward_adjustment(
-                            style,
-                            &column_adjustment,
-                        ),
-                    grid_template_row_names:
-                        taffy_grid_template_row_names_with_startward_adjustment(
-                            style,
-                            &row_adjustment,
-                        ),
-                    grid_auto_columns: if swaps_physical_grid_axes {
-                        taffy_grid_auto_tracks(&style.grid_auto_rows)
-                    } else {
-                        taffy_grid_auto_tracks(&style.grid_auto_columns)
-                    },
-                    grid_auto_rows: if swaps_physical_grid_axes {
-                        taffy_grid_auto_tracks(&style.grid_auto_columns)
-                    } else {
-                        taffy_grid_auto_tracks(&style.grid_auto_rows)
-                    },
+                    grid_template_column_names: physical_column_subgrid
+                        .map(|axis| axis.line_names().to_vec())
+                        .unwrap_or_else(|| {
+                            taffy_grid_template_column_names_with_startward_adjustment(
+                                style,
+                                &column_adjustment,
+                            )
+                        }),
+                    grid_template_row_names: physical_row_subgrid
+                        .map(|axis| axis.line_names().to_vec())
+                        .unwrap_or_else(|| {
+                            taffy_grid_template_row_names_with_startward_adjustment(
+                                style,
+                                &row_adjustment,
+                            )
+                        }),
+                    grid_auto_columns: physical_column_subgrid.map_or_else(
+                        || {
+                            if swaps_physical_grid_axes {
+                                taffy_grid_auto_tracks(&style.grid_auto_rows)
+                            } else {
+                                taffy_grid_auto_tracks(&style.grid_auto_columns)
+                            }
+                        },
+                        |_| Vec::new(),
+                    ),
+                    grid_auto_rows: physical_row_subgrid.map_or_else(
+                        || {
+                            if swaps_physical_grid_axes {
+                                taffy_grid_auto_tracks(&style.grid_auto_columns)
+                            } else {
+                                taffy_grid_auto_tracks(&style.grid_auto_rows)
+                            }
+                        },
+                        |_| Vec::new(),
+                    ),
                     grid_auto_flow: taffy_grid_auto_flow(style.grid_auto_flow),
                     justify_content: Some(if swaps_physical_grid_axes {
                         taffy_grid_align_content(style.align_content)
@@ -1905,21 +2193,31 @@ impl<'a> LayoutBuilder<'a> {
                         taffy_grid_align_items(style.align_items)
                     }),
                     gap: taffy_layout::Size {
-                        width: taffy_grid_gap(
-                            if swaps_physical_grid_axes {
-                                style.row_gap.clone()
-                            } else {
-                                style.column_gap.clone()
+                        width: physical_column_subgrid.map_or_else(
+                            || {
+                                taffy_grid_gap(
+                                    if swaps_physical_grid_axes {
+                                        style.row_gap.clone()
+                                    } else {
+                                        style.column_gap.clone()
+                                    },
+                                    item_width_basis,
+                                )
                             },
-                            item_width_basis,
+                            |axis| taffy_layout::LengthPercentage::length(axis.taffy_gap()),
                         ),
-                        height: taffy_grid_gap(
-                            if swaps_physical_grid_axes {
-                                style.column_gap.clone()
-                            } else {
-                                style.row_gap.clone()
+                        height: physical_row_subgrid.map_or_else(
+                            || {
+                                taffy_grid_gap(
+                                    if swaps_physical_grid_axes {
+                                        style.column_gap.clone()
+                                    } else {
+                                        style.row_gap.clone()
+                                    },
+                                    row_gap_basis,
+                                )
                             },
-                            row_gap_basis,
+                            |axis| taffy_layout::LengthPercentage::length(axis.taffy_gap()),
                         ),
                     },
                     ..Default::default()
@@ -1931,12 +2229,17 @@ impl<'a> LayoutBuilder<'a> {
             root,
             taffy_layout::Size {
                 width: taffy_layout::AvailableSpace::Definite(width),
-                height: root_height
+                height: root_height_points
                     .map(taffy_layout::AvailableSpace::Definite)
                     .unwrap_or(taffy_layout::AvailableSpace::MaxContent),
             },
             |known_dimensions, available_space, _node_id, node_context, _style| {
-                measure_grid_item(known_dimensions, available_space, node_context)
+                let estimate = node_context.map(|context| match context {
+                    GridTaffyLeaf::Item(estimate) | GridTaffyLeaf::Contribution(estimate) => {
+                        estimate
+                    }
+                });
+                measure_grid_item(known_dimensions, available_space, estimate)
             },
         )
         .ok()?;
@@ -2021,20 +2324,29 @@ impl<'a> LayoutBuilder<'a> {
             }
             taffy::tree::DetailedLayoutInfo::None => GapDecorationGridGutters::default(),
         };
-        let mut items = Vec::with_capacity(nodes.len());
-        for (index, node) in nodes.into_iter().enumerate() {
-            let layout = tree.layout(node).ok()?;
-            items.push(GridItemLayout::new(
-                GridRect::new(
-                    GridPoint::new(layout.location.x, layout.location.y),
-                    GridSize::new(layout.size.width.max(0.0), layout.size.height.max(0.0)),
-                ),
-                grid_item_areas.get(index).cloned(),
-            ));
-        }
+        // Proxy nodes are appended after real child nodes and intentionally
+        // have no corresponding `GridItemLayout`: they influence only Taffy's
+        // track sizing, never replay, baselines, gap decoration, or fragment
+        // planning.
+        debug_assert!(grid_item_areas.len() >= nodes.len());
+        let mut items = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(index, node)| {
+                let layout = tree.layout(node).ok()?;
+                Some(GridItemLayout::new(
+                    GridRect::new(
+                        GridPoint::new(layout.location.x, layout.location.y),
+                        GridSize::new(layout.size.width.max(0.0), layout.size.height.max(0.0)),
+                    ),
+                    grid_item_areas.get(index).cloned(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        debug_assert_eq!(items.len(), children.len());
         apply_startward_auto_fit_track_corrections(
             style,
-            width,
+            content_width,
             root_layout.size.height,
             &track_corrections,
             &mut items,
@@ -2042,7 +2354,7 @@ impl<'a> LayoutBuilder<'a> {
         apply_grid_self_alignment_corrections(
             style,
             children,
-            width,
+            content_width,
             root_layout.size.height,
             &column_line_offsets,
             &row_line_offsets,
@@ -2051,7 +2363,7 @@ impl<'a> LayoutBuilder<'a> {
         apply_grid_aspect_ratio_item_size_corrections(
             style,
             children,
-            width,
+            content_width,
             root_layout.size.height,
             &column_line_offsets,
             &row_line_offsets,
@@ -2061,7 +2373,7 @@ impl<'a> LayoutBuilder<'a> {
             apply_grid_deferred_percentage_item_size_corrections(
                 style,
                 children,
-                width,
+                content_width,
                 root_layout.size.height,
                 &column_line_offsets,
                 &row_line_offsets,
@@ -2078,7 +2390,9 @@ impl<'a> LayoutBuilder<'a> {
         let last_baseline =
             grid_container_baseline(style, children, &estimates, &items, GridBaselineSet::Last);
         Some(GridLayout {
-            height: config.reported_height.unwrap_or(root_layout.size.height),
+            height: config.reported_height.unwrap_or_else(|| {
+                PhysicalContentHeight::new(content_box_pt(root_layout.size.height))
+            }),
             first_baseline,
             last_baseline,
             items,
@@ -2087,6 +2401,30 @@ impl<'a> LayoutBuilder<'a> {
             row_line_offsets,
         })
     }
+}
+
+/// The direct grid item representing a subgrid is empty in an inherited axis;
+/// projected descendant proxy leaves supply that axis's track-sizing
+/// contribution. `GridItemEstimate` is logical, so this remains independent
+/// of the container's physical writing-mode adapter.
+fn grid_item_parent_sizing_estimate(
+    mut estimate: GridItemEstimate,
+    style: &ComputedStyle,
+) -> GridItemEstimate {
+    if matches!(
+        style.grid_template_columns,
+        css::GridTrackList::Subgrid { .. }
+    ) {
+        estimate.metrics.width = content_box_pt(0.0);
+        estimate.metrics.min_width = content_box_pt(0.0);
+        estimate.metrics.content_width = content_box_pt(0.0);
+    }
+    if matches!(style.grid_template_rows, css::GridTrackList::Subgrid { .. }) {
+        estimate.metrics.height = content_box_pt(0.0);
+        estimate.metrics.min_height = content_box_pt(0.0);
+        estimate.metrics.content_height = content_box_pt(0.0);
+    }
+    estimate
 }
 
 /// Whether an auto-sized grid's physical rows have fully fixed explicit sizes.
@@ -2144,13 +2482,18 @@ fn grid_track_size_is_fixed(size: &css::GridTrackSize) -> bool {
     !min.contains_percentage() && min == max
 }
 
-fn grid_gap_resolves_differently_with_basis(gap: css::ComputedGap, container_size: f32) -> bool {
+fn grid_gap_resolves_differently_with_basis(
+    gap: css::ComputedGap,
+    container_size: PhysicalContentHeight,
+) -> bool {
     let css::ComputedGap::LengthPercentage(value) = gap else {
         return false;
     };
     let intrinsic = value.length_max_zero().points();
     let used = value
-        .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(container_size)))
+        .used_length_with_percentage_basis(PercentageBasis::definite(
+            container_size.content_box_length(),
+        ))
         .map(layout_points)
         .unwrap_or(value.length_points())
         .max(0.0);
@@ -2158,11 +2501,11 @@ fn grid_gap_resolves_differently_with_basis(gap: css::ComputedGap, container_siz
 }
 
 struct GridLayoutPassConfig {
-    width: f32,
-    root_height: Option<f32>,
+    width: PhysicalContentWidth,
+    root_height: Option<PhysicalContentHeight>,
     item_height_basis: GridPercentageBasis,
     row_gap_basis: GridPercentageBasis,
-    reported_height: Option<f32>,
+    reported_height: Option<PhysicalContentHeight>,
 }
 
 #[derive(Default)]
@@ -2243,7 +2586,7 @@ fn grid_track_has_item(axis: GridAxis, track_index: usize, item_areas: &[GridIte
 
 fn apply_startward_auto_fit_track_corrections(
     style: &ComputedStyle,
-    container_width: f32,
+    container_width: PhysicalContentWidth,
     container_height: f32,
     corrections: &GridTrackLayoutCorrections,
     items: &mut [GridItemLayout],
@@ -2256,7 +2599,7 @@ fn apply_startward_auto_fit_track_corrections(
             apply_track_layout_correction_axis(
                 correction,
                 style.justify_content,
-                container_width,
+                container_width.points(),
                 usize::from(area.column_start).saturating_sub(1),
                 usize::from(area.column_end).saturating_sub(1),
                 item,
@@ -2356,7 +2699,7 @@ struct GridBaselineAlignmentContext<'a, 'box_tree> {
 fn apply_grid_self_alignment_corrections(
     container_style: &ComputedStyle,
     children: &[GridChild<'_>],
-    container_width: f32,
+    container_width: PhysicalContentWidth,
     container_height: f32,
     column_line_offsets: &[f32],
     row_line_offsets: &[f32],
@@ -2403,7 +2746,7 @@ fn horizontal_self_alignment_offset(
     justify_self: JustifySelf,
     child_style: &ComputedStyle,
     justify_content: css::JustifyContent,
-    container_width: f32,
+    container_width: PhysicalContentWidth,
     area: GridItemArea,
     column_line_offsets: &[f32],
     item_width: f32,
@@ -2424,7 +2767,7 @@ fn horizontal_self_alignment_offset(
         SelfAlignmentAxisContext {
             axis: PhysicalAxis::Horizontal,
             content_alignment: justify_content,
-            container_size: container_width,
+            container_size: container_width.points(),
             line_offsets: column_line_offsets,
             start_line: usize::from(area.column_start).saturating_sub(1),
             end_line: usize::from(area.column_end).saturating_sub(1),
@@ -2478,7 +2821,7 @@ fn vertical_self_alignment_offset(
 fn apply_grid_aspect_ratio_item_size_corrections(
     container_style: &ComputedStyle,
     children: &[GridChild<'_>],
-    container_width: f32,
+    container_width: PhysicalContentWidth,
     container_height: f32,
     column_line_offsets: &[f32],
     row_line_offsets: &[f32],
@@ -2520,7 +2863,7 @@ fn apply_grid_aspect_ratio_item_size_corrections(
         };
         let Some(area_x) = content_aligned_grid_line_offset(
             horizontal_content_alignment,
-            container_width,
+            container_width.points(),
             column_line_offsets,
             usize::from(area.column_start).saturating_sub(1),
         ) else {
@@ -2528,7 +2871,7 @@ fn apply_grid_aspect_ratio_item_size_corrections(
         };
         let Some(area_right) = content_aligned_grid_line_offset(
             horizontal_content_alignment,
-            container_width,
+            container_width.points(),
             column_line_offsets,
             usize::from(area.column_end).saturating_sub(1),
         ) else {
@@ -2554,7 +2897,7 @@ fn apply_grid_aspect_ratio_item_size_corrections(
         let area_height = (area_bottom - area_y).max(0.0);
         let metrics = used_box_metrics(
             child_style,
-            PercentageBasis::definite(layout_pt(container_width)),
+            PercentageBasis::definite(layout_pt(container_width.points())),
         );
         let horizontal_non_content = metrics.horizontal_non_content_length();
         let vertical_non_content = metrics.vertical_non_content_length();
@@ -2633,17 +2976,15 @@ fn apply_grid_aspect_ratio_item_size_corrections(
 
 /// Resolve a contained subgrid item's cyclic percentage after track sizing.
 ///
-/// Layout and paint containment turn each subgridded axis into `none`.  A
-/// percentage item on the resulting implicit track is therefore automatic
-/// while that track is sized, but it still resolves against the final grid
-/// area during the item-layout phase.  Taffy performs those phases together,
-/// so apply this small, post-track portion of Grid's item sizing here.
+/// Layout and paint containment turn each subgridded axis into `none`. A
+/// percentage item on the resulting implicit track is automatic while sizing,
+/// but resolves against its final grid area for item layout.
 /// <https://drafts.csswg.org/css-grid-2/#subgrid-listing>
 /// <https://www.w3.org/TR/css-grid-1/#grid-item-sizing>
 fn apply_grid_deferred_percentage_item_size_corrections(
     container_style: &ComputedStyle,
     children: &[GridChild<'_>],
-    container_width: f32,
+    container_width: PhysicalContentWidth,
     container_height: f32,
     column_line_offsets: &[f32],
     row_line_offsets: &[f32],
@@ -2661,7 +3002,7 @@ fn apply_grid_deferred_percentage_item_size_corrections(
         let child_style = &child.style;
         let Some(area_x) = content_aligned_grid_line_offset(
             container_style.justify_content,
-            container_width,
+            container_width.points(),
             column_line_offsets,
             usize::from(area.column_start).saturating_sub(1),
         ) else {
@@ -2669,7 +3010,7 @@ fn apply_grid_deferred_percentage_item_size_corrections(
         };
         let Some(area_right) = content_aligned_grid_line_offset(
             container_style.justify_content,
-            container_width,
+            container_width.points(),
             column_line_offsets,
             usize::from(area.column_end).saturating_sub(1),
         ) else {
@@ -2695,7 +3036,7 @@ fn apply_grid_deferred_percentage_item_size_corrections(
         let area_height = (area_bottom - area_y).max(0.0);
         let metrics = used_box_metrics(
             child_style,
-            PercentageBasis::definite(layout_pt(container_width)),
+            PercentageBasis::definite(layout_pt(container_width.points())),
         );
         let horizontal_non_content = metrics.horizontal_non_content_length();
         let vertical_non_content = metrics.vertical_non_content_length();
@@ -2803,7 +3144,8 @@ pub(super) fn grid_subject_self_start_side(
     if block_start.axis() == axis {
         Some(block_start)
     } else {
-        let inline_start = inline_start_side(child_style.writing_mode, child_style.direction);
+        let inline_start =
+            inline_start_side(child_style.writing_mode, child_style.used_direction());
         (inline_start.axis() == axis).then_some(inline_start)
     }
 }
@@ -2816,7 +3158,7 @@ pub(super) fn grid_subject_self_end_side(
     if block_end.axis() == axis {
         Some(block_end)
     } else {
-        let inline_end = inline_end_side(child_style.writing_mode, child_style.direction);
+        let inline_end = inline_end_side(child_style.writing_mode, child_style.used_direction());
         (inline_end.axis() == axis).then_some(inline_end)
     }
 }
@@ -3213,5 +3555,35 @@ pub(in crate::layout) fn definite_grid_gap_size(
         css::ComputedGap::LengthPercentage(value) => value
             .used_length_with_percentage_basis(PercentageBasis::definite(container_size))
             .unwrap_or_else(|| layout_pt(value.length_points())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_physical_height_drives_percentage_gap_relayout() {
+        let gap =
+            css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_percent(0.5));
+        let height = PhysicalContentHeight::new(content_box_pt(80.0));
+
+        assert!(grid_gap_resolves_differently_with_basis(gap, height));
+    }
+
+    #[test]
+    fn grid_layout_retains_a_physical_content_height() {
+        let layout = GridLayout {
+            height: PhysicalContentHeight::new(content_box_pt(60.0)),
+            first_baseline: None,
+            last_baseline: None,
+            items: Vec::new(),
+            gap_gutters: GapDecorationGridGutters::default(),
+            column_line_offsets: Vec::new(),
+            row_line_offsets: Vec::new(),
+        };
+
+        let _: PhysicalContentHeight = layout.height;
+        assert_eq!(layout.height.points(), 60.0);
     }
 }

@@ -10,6 +10,10 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
     let (direction, writing_mode) =
         logical_mapping_context(style, declarations, inheritance_source);
     let declarations = declarations_after_css_wide_rollbacks(declarations, direction, writing_mode);
+    let declarations = declarations
+        .into_iter()
+        .filter_map(canonical_cascaded_declaration)
+        .collect::<Vec<_>>();
     apply_cascaded_custom_property_declarations(style, &declarations);
     apply_cascaded_font_size_declarations_with_parent_ch_advance(
         style,
@@ -18,6 +22,12 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
         parent_ch_advance,
     );
     apply_cascaded_color_declarations(style, &declarations, inheritance_source);
+    let declarations = declarations_after_variable_substitution_and_shorthand_expansion(
+        &declarations,
+        &style.custom_properties,
+        direction,
+        writing_mode,
+    );
 
     for (index, declaration) in declarations.iter().enumerate() {
         let name = declaration.name.as_ref();
@@ -44,9 +54,8 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
         }
         match name {
             "color" => {
-                if let Some(color) = parse_color(value) {
-                    style.color = color;
-                }
+                // The shared color prepass has already selected and resolved
+                // the winning `color` declaration for this marker style.
             }
             "-webkit-text-fill-color" => {
                 if value.eq_ignore_ascii_case("currentcolor") {
@@ -87,6 +96,11 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
             "font-feature-settings" => {
                 if let Some(font_feature_settings) = parse_font_feature_settings(value) {
                     style.font_feature_settings = font_feature_settings;
+                }
+            }
+            "font-variation-settings" => {
+                if let Some(font_variation_settings) = parse_font_variation_settings(value) {
+                    style.font_variation_settings = font_variation_settings;
                 }
             }
             "font-size-adjust" => {
@@ -225,6 +239,11 @@ pub(crate) fn apply_cascaded_marker_declarations_with_inheritance_source_and_par
                 "auto" => style.text_wrap_style = TextWrapStyle::Auto,
                 "balance" => style.text_wrap_style = TextWrapStyle::Balance,
                 "stable" => style.text_wrap_style = TextWrapStyle::Stable,
+                _ => {}
+            },
+            "wrap-inside" => match value.trim().to_ascii_lowercase().as_str() {
+                "auto" => style.wrap_inside = WrapInside::Auto,
+                "avoid" => style.wrap_inside = WrapInside::Avoid,
                 _ => {}
             },
             "line-clamp" | "-webkit-line-clamp" => {

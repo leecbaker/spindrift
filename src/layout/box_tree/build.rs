@@ -1,29 +1,93 @@
 use super::*;
 
-#[cfg(test)]
 pub(crate) fn build_page_box<'a>(
     root: &'a Node,
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
 ) -> MutablePageBox<'a> {
-    build_page_box_inner(root, stylesheets, parent_style, None, None)
+    build_page_box_inner(root, stylesheets, parent_style, None)
 }
 
-/// Builds the document formatting tree with the used principal-flow axes.
-///
-/// CSS Writing Modes substitutes an eligible HTML body's writing mode and
-/// direction for the root element's used values. Supplying that substitution
-/// while constructing the root box makes inherited root pseudo-elements and
-/// descendants observe the same principal flow as the initial containing
-/// block.
-/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
-pub(crate) fn build_page_box_with_principal_flow<'a>(
-    root: &'a Node,
-    stylesheets: &[Stylesheet],
-    parent_style: &ComputedStyle,
+/// Install the principal-flow used axes on the root formatting box after the
+/// cascade has built its descendants and generated pseudo boxes. This is a
+/// layout-only value: child and pseudo computed styles keep the cascade they
+/// received from the actual root element.
+pub(crate) fn apply_principal_flow_to_root_layout_box(
+    page_box: &mut MutablePageBox<'_>,
     principal_flow: DocumentPrincipalFlow,
-) -> MutablePageBox<'a> {
-    build_page_box_inner(root, stylesheets, parent_style, None, Some(principal_flow))
+) {
+    fn apply_to_html_descendants(
+        boxes: &mut [MutableFormattingBox<'_>],
+        principal_flow: DocumentPrincipalFlow,
+    ) {
+        for box_ in boxes {
+            if let Some(core) = box_.element_core_mut() {
+                if core.element.document_syntax == dom::DocumentSyntax::Html
+                    && core.element.tag.eq_ignore_ascii_case("html")
+                    && matches!(&core.source, BoxSource::Principal)
+                {
+                    core.style.writing_mode = principal_flow.writing_mode;
+                    core.style.direction = principal_flow.direction;
+                    // Inline root generated content participates in the
+                    // initial principal inline flow. A block-level pseudo
+                    // establishes its own formatting context. These are
+                    // layout-only used values; the cascaded pseudo styles
+                    // remain unchanged in the DOM.
+                    for pseudo in [
+                        core.style.before_style.as_deref_mut(),
+                        core.style.after_style.as_deref_mut(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter(|pseudo| !pseudo.display.is_block_level())
+                    {
+                        pseudo.writing_mode = principal_flow.writing_mode;
+                        pseudo.direction = principal_flow.direction;
+                    }
+                }
+                let is_root_principal_pseudo = core.element.document_syntax
+                    == dom::DocumentSyntax::Html
+                    && core.element.tag.eq_ignore_ascii_case("html")
+                    && !core.style.display.is_block_level()
+                    && matches!(
+                        &core.source,
+                        BoxSource::GeneratedPseudo(pseudo)
+                            if matches!(
+                                pseudo.kind,
+                                GeneratedPseudoKind::Before | GeneratedPseudoKind::After
+                            )
+                    );
+                if is_root_principal_pseudo {
+                    core.style.writing_mode = principal_flow.writing_mode;
+                    core.style.direction = principal_flow.direction;
+                }
+                apply_to_html_descendants(&mut core.children, principal_flow);
+            } else if let MutableFormattingBox::AnonymousBlock(anonymous) = box_ {
+                let wraps_root_principal_pseudo = anonymous.children.iter().any(|child| {
+                    child.element_core().is_some_and(|core| {
+                        core.element.document_syntax == dom::DocumentSyntax::Html
+                            && core.element.tag.eq_ignore_ascii_case("html")
+                            && !core.style.display.is_block_level()
+                            && matches!(
+                                &core.source,
+                                BoxSource::GeneratedPseudo(pseudo)
+                                    if matches!(
+                                        pseudo.kind,
+                                        GeneratedPseudoKind::Before | GeneratedPseudoKind::After
+                                    )
+                            )
+                    })
+                });
+                if wraps_root_principal_pseudo {
+                    anonymous.style.writing_mode = principal_flow.writing_mode;
+                    anonymous.style.direction = principal_flow.direction;
+                }
+                apply_to_html_descendants(&mut anonymous.children, principal_flow);
+            }
+        }
+    }
+
+    apply_to_html_descendants(&mut page_box.children, principal_flow);
 }
 
 #[cfg(test)]
@@ -33,7 +97,7 @@ pub(crate) fn build_page_box_with_font_metrics<'a>(
     parent_style: &ComputedStyle,
     font_system: &mut FontSystem,
 ) -> MutablePageBox<'a> {
-    build_page_box_inner(root, stylesheets, parent_style, Some(font_system), None)
+    build_page_box_inner(root, stylesheets, parent_style, Some(font_system))
 }
 
 fn build_page_box_inner<'a>(
@@ -41,7 +105,6 @@ fn build_page_box_inner<'a>(
     stylesheets: &[Stylesheet],
     parent_style: &ComputedStyle,
     font_system: Option<&mut FontSystem>,
-    principal_flow: Option<DocumentPrincipalFlow>,
 ) -> MutablePageBox<'a> {
     let built = match &root.kind {
         NodeKind::Element(element) => build_child_boxes_inner(
@@ -52,7 +115,6 @@ fn build_page_box_inner<'a>(
             true,
             false,
             font_system,
-            principal_flow,
         ),
         NodeKind::Text(text) => {
             if text.is_empty() {
@@ -63,14 +125,18 @@ fn build_page_box_inner<'a>(
                         text: text.clone(),
                         style: inherited_text_style(parent_style),
                     })],
+                    footnotes: Vec::new(),
                     counter_events: Vec::new(),
+                    suppressed_named_string_events: Vec::new(),
                 }
             }
         }
     };
     MutablePageBox {
         children: built.boxes,
+        footnotes: built.footnotes,
         counter_events: built.counter_events,
+        suppressed_named_string_events: built.suppressed_named_string_events,
     }
 }
 
@@ -92,20 +158,51 @@ fn inherited_text_style(parent_style: &ComputedStyle) -> Box<ComputedStyle> {
 /// font-metric pass does not inherit again from the physical parent:
 /// <https://www.w3.org/TR/css-display-3/#valdef-display-contents>.
 fn flattened_contents_text_style(parent_style: &ComputedStyle) -> Box<ComputedStyle> {
-    let mut style = parent_style.clone();
-    style.deferred_font_size = css::DeferredFontSize::Absolute(style.font_size);
+    let mut style = flattened_contents_inheritance_style(parent_style);
+    // A `display: contents` element has no principal box and therefore cannot
+    // originate typographic pseudo-elements. Its flattened text still
+    // inherits ordinary values from the element, while a box-generating
+    // ancestor can apply its own `::first-line`/`::first-letter` styling at
+    // layout time.
+    // <https://drafts.csswg.org/css-display-3/#valdef-display-contents>
+    // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
+    style.first_line_style = None;
+    style.first_letter_style = None;
     Box::new(style)
+}
+
+/// Freeze inherited font metrics before flattening a `display: contents`
+/// subtree into its box parent.
+///
+/// The flattened descendants still inherit through the contents element, but
+/// later font-metric resolution runs against their physical box parent.  An
+/// unresolved relative inherited font size would therefore be resolved a
+/// second time against that physical parent instead of the suppressed element.
+/// <https://drafts.csswg.org/css-display-3/#valdef-display-contents>
+fn flattened_contents_inheritance_style(parent_style: &ComputedStyle) -> ComputedStyle {
+    let mut style = parent_style.clone();
+    // Cascading has already resolved this element's parent-relative
+    // `font-size` into `font_size`; only the deferred representation remains
+    // for the later physical-tree font-metric pass. Do not resolve it again
+    // here: a `3em` contents element would otherwise become 9em when this
+    // flattened inheritance style is materialized.
+    style.deferred_font_size = css::DeferredFontSize::Absolute(style.font_size);
+    style
 }
 
 #[derive(Default)]
 struct BuiltChildren<'a> {
     boxes: Vec<MutableFormattingBox<'a>>,
+    footnotes: Vec<MutableFootnoteBox<'a>>,
     counter_events: Vec<CounterEventNode<'a>>,
+    suppressed_named_string_events: Vec<SuppressedNamedStringEvent>,
 }
 
 struct BuiltElement<'a> {
     box_: MutableFormattingBox<'a>,
+    footnotes: Vec<MutableFootnoteBox<'a>>,
     counter_event: CounterEventNode<'a>,
+    suppressed_named_string_events: Vec<SuppressedNamedStringEvent>,
 }
 
 pub(crate) fn build_child_boxes_with_font_metrics<'a>(
@@ -123,7 +220,6 @@ pub(crate) fn build_child_boxes_with_font_metrics<'a>(
         true,
         false,
         Some(font_system),
-        None,
     )
     .boxes
 }
@@ -137,12 +233,14 @@ fn build_child_boxes_inner<'a>(
     normalize_for_parent: bool,
     text_parent_is_flattened_contents: bool,
     mut font_system: Option<&mut FontSystem>,
-    principal_flow: Option<DocumentPrincipalFlow>,
 ) -> BuiltChildren<'a> {
     let sibling_tags = element_sibling_signature_list(element);
     let mut element_index = 0usize;
     let mut raw = Vec::new();
+    let mut footnotes = Vec::new();
     let mut counter_events = Vec::new();
+    let mut suppressed_named_string_events = Vec::new();
+    let mut pending_suppressed_named_string_events = Vec::new();
     push_generated_pseudo_box(
         &mut raw,
         &mut counter_events,
@@ -212,50 +310,202 @@ fn build_child_boxes_inner<'a>(
                         ancestors,
                     ),
                 };
-                let style = if ancestors.is_empty() {
+                let mut style = if ancestors.is_empty() {
                     root_display_fixed_style(style)
                 } else {
                     style
                 };
-                let style = if ancestors.is_empty()
-                    && child_element.document_syntax == dom::DocumentSyntax::Html
-                    && child_element.tag.eq_ignore_ascii_case("html")
-                    && let Some(principal_flow) = principal_flow
+                // This child is physically reparented past a `display:
+                // contents` ancestor. An inherited font size must retain the
+                // already-computed value from that suppressed ancestor rather
+                // than resolving once more against its physical box parent.
+                // Explicit relative font sizes remain deferred: their parent
+                // is the flattened ancestor and still supplies the correct
+                // percentage/em basis.
+                // <https://drafts.csswg.org/css-display-3/#valdef-display-contents>
+                if text_parent_is_flattened_contents
+                    && matches!(style.deferred_font_size, css::DeferredFontSize::Inherit)
                 {
-                    principal_flow_root_style(style, principal_flow)
-                } else {
-                    style
-                };
+                    style.deferred_font_size = css::DeferredFontSize::Absolute(style.font_size);
+                }
+                if text_parent_is_flattened_contents {
+                    // Generated boxes are physically emitted beside the
+                    // suppressed `display: contents` element as well. Their
+                    // cascaded `font_size` already includes the flattened
+                    // ancestor; freeze the deferred form so the metric pass
+                    // cannot apply that ancestor's relative size a second
+                    // time against the physical parent.
+                    for pseudo in [
+                        style.marker_style.as_deref_mut(),
+                        style.before_style.as_deref_mut(),
+                        style.after_style.as_deref_mut(),
+                        style.first_line_style.as_deref_mut(),
+                        style.first_letter_style.as_deref_mut(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        pseudo.deferred_font_size =
+                            css::DeferredFontSize::Absolute(pseudo.font_size);
+                    }
+                }
+                if display_contents_computes_to_none_for_css_layout_svg_root(
+                    child_element,
+                    element,
+                    &style,
+                ) {
+                    style.display = Display::NONE;
+                }
+                // A flex or grid container blockifies each tree-abiding child
+                // before CSS Tables can run its anonymous-wrapper fixup. In
+                // particular, direct table-internal children become independent
+                // block-level flex/grid items rather than being collected into
+                // a synthetic table fragment.
+                // <https://drafts.csswg.org/css-display-4/#transformations>
+                // <https://drafts.csswg.org/css-flexbox-1/#flex-items>
+                // <https://drafts.csswg.org/css-tables-3/#fixup-algorithm>
+                if parent_style.display.is_flex() || parent_style.display.is_grid() {
+                    style.display = style.display.blockified();
+                }
+                // A table-internal display type without a table formatting
+                // parent is represented by anonymous table structure for
+                // table layout, but it has no containment-capable principal
+                // box of its own. Use its ordinary block-flow proxy at this
+                // element boundary so positioned descendants receive the
+                // same hypothetical normal-flow position as the anonymous
+                // wrapper. The authored containment value remains available
+                // to cascade, while its inapplicable property effects are
+                // removed from the proxy's used layout style.
+                // <https://drafts.csswg.org/css-tables-3/#fixup>
+                // <https://drafts.csswg.org/css-contain-1/#containment-principal>
+                if !parent_style.display.is_table()
+                    && matches!(
+                        style.display.inner,
+                        DisplayInner::TableHeaderGroup
+                            | DisplayInner::TableRowGroup
+                            | DisplayInner::TableFooterGroup
+                            | DisplayInner::TableRow
+                    )
+                {
+                    style.display = Display::BLOCK;
+                    style.contain.size = false;
+                    style.contain.layout = false;
+                    style.contain.paint = false;
+                }
                 if style.display.is_contents() {
                     // CSS Display 3 `display: contents` suppresses the
                     // element's principal box but keeps its children in the box
                     // tree, inheriting from the contents element and matching
                     // selectors with that element in their ancestor chain.
                     // https://www.w3.org/TR/css-display-3/#valdef-display-contents
+                    let flattened_style = flattened_contents_inheritance_style(&style);
                     let mut child_ancestors = ancestors.to_vec();
                     child_ancestors.push(signature);
                     let built = build_child_boxes_inner(
                         child_element,
                         stylesheets,
-                        &style,
+                        &flattened_style,
                         &child_ancestors,
                         false,
                         true,
                         font_system.as_deref_mut(),
-                        None,
                     );
                     raw.extend(built.boxes);
+                    footnotes.extend(built.footnotes);
                     counter_events.extend(built.counter_events);
-                } else if let Some(built) = build_element_box(
-                    child_element,
-                    signature,
-                    style,
-                    stylesheets,
-                    ancestors,
-                    font_system.as_deref_mut(),
-                ) {
-                    raw.push(built.box_);
+                    suppressed_named_string_events.extend(built.suppressed_named_string_events);
+                } else if style.display.is_none() {
+                    pending_suppressed_named_string_events.extend(
+                        suppressed_named_string_events_for_subtree(
+                            child_element,
+                            style,
+                            stylesheets,
+                            ancestors,
+                        ),
+                    );
+                    counter_events.push(suppressed_counter_event_for_subtree(
+                        child_element,
+                        ancestors,
+                    ));
+                } else {
+                    let is_footnote = style.float == Float::Footnote;
+                    let footnote_display = style.footnote_display;
+                    let footnote_policy = style.footnote_policy;
+                    let footnote_call_style = style.footnote_call_style.clone();
+                    let footnote_marker_style = style.footnote_marker_style.clone();
+                    let Some(mut built) = build_element_box(
+                        child_element,
+                        signature,
+                        style,
+                        stylesheets,
+                        ancestors,
+                        font_system.as_deref_mut(),
+                    ) else {
+                        continue;
+                    };
+                    suppressed_named_string_events.extend(
+                        pending_suppressed_named_string_events
+                            .drain(..)
+                            .map(|mut event| {
+                                event.target = SuppressedNamedStringEventTarget::BeforeElement(
+                                    child_element.id,
+                                );
+                                event
+                            }),
+                    );
+                    if is_footnote {
+                        let mut call_boxes = Vec::new();
+                        let mut call_counter_events = Vec::new();
+                        push_generated_pseudo_box(
+                            &mut call_boxes,
+                            &mut call_counter_events,
+                            child_element,
+                            parent_style,
+                            footnote_call_style.as_deref(),
+                            GeneratedPseudoKind::FootnoteCall,
+                        );
+                        // GCPM increments the `footnote` counter at the
+                        // footnote's source position. Its call is then a
+                        // child event, so both the call and detached body see
+                        // the same stable post-increment counter snapshot.
+                        // https://www.w3.org/TR/css-gcpm-3/#footnote-counter
+                        built.counter_event.counter_style.counter_increments.push(
+                            css::CounterChange {
+                                name: "footnote".to_string(),
+                                value: css::CounterValue::new(1),
+                            },
+                        );
+                        built
+                            .counter_event
+                            .children
+                            .splice(0..0, call_counter_events);
+                        if let Some(marker_style) = footnote_marker_style.as_deref()
+                            && marker_style.content.is_generated()
+                        {
+                            built.counter_event.children.insert(
+                                1,
+                                CounterEventNode {
+                                    element: child_element,
+                                    source: CounterEventSource::FootnoteMarker,
+                                    counter_style: CounterEventStyle::from_computed(marker_style),
+                                    children: Vec::new(),
+                                },
+                            );
+                        }
+                        built.box_.style_mut().float = Float::None;
+                        raw.extend(call_boxes);
+                        footnotes.push(MutableFootnoteBox {
+                            element: child_element,
+                            body: built.box_,
+                            display: footnote_display,
+                            policy: footnote_policy,
+                        });
+                    } else {
+                        raw.push(built.box_);
+                    }
+                    footnotes.extend(built.footnotes);
                     counter_events.push(built.counter_event);
+                    suppressed_named_string_events.extend(built.suppressed_named_string_events);
                 }
             }
         }
@@ -268,6 +518,12 @@ fn build_child_boxes_inner<'a>(
         parent_style.after_style.as_deref(),
         GeneratedPseudoKind::After,
     );
+    suppressed_named_string_events.extend(pending_suppressed_named_string_events.drain(..).map(
+        |mut event| {
+            event.target = SuppressedNamedStringEventTarget::AfterElement(element.id);
+            event
+        },
+    ));
     let boxes = if normalize_for_parent {
         normalize_block_container_children(raw, parent_style)
     } else {
@@ -275,24 +531,96 @@ fn build_child_boxes_inner<'a>(
     };
     BuiltChildren {
         boxes,
+        footnotes,
         counter_events,
+        suppressed_named_string_events,
     }
 }
 
-/// Applies the principal-flow used values to the HTML root's formatting style.
-///
-/// This intentionally happens after cascading: the root retains its computed
-/// declarations for selector matching, while its principal box, generated
-/// pseudo-elements, and inherited descendants use the CSS Writing Modes
-/// body-propagated axes.
-/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
-fn principal_flow_root_style(
-    mut style: ComputedStyle,
-    principal_flow: DocumentPrincipalFlow,
-) -> ComputedStyle {
-    style.writing_mode = principal_flow.writing_mode;
-    style.direction = principal_flow.direction;
-    style
+/// Inline SVG roots whose parent is outside SVG participate in CSS box layout.
+/// CSS Display therefore makes `display: contents` compute to `none` for the
+/// root itself, rather than flattening SVG scene children into HTML layout.
+/// <https://drafts.csswg.org/css-display-3/#unbox-svg>
+fn display_contents_computes_to_none_for_css_layout_svg_root(
+    element: &Element,
+    parent: &Element,
+    style: &ComputedStyle,
+) -> bool {
+    style.display.is_contents()
+        && element.namespace_url == "http://www.w3.org/2000/svg"
+        && element.tag == "svg"
+        && parent.namespace_url != "http://www.w3.org/2000/svg"
+}
+
+fn suppressed_named_string_events_for_subtree(
+    element: &Element,
+    style: ComputedStyle,
+    stylesheets: &[Stylesheet],
+    ancestors: &[ElementSignature],
+) -> Vec<SuppressedNamedStringEvent> {
+    let mut events = Vec::new();
+    if !style.string_sets.is_empty() {
+        events.push(SuppressedNamedStringEvent {
+            element: element.clone(),
+            style: style.clone(),
+            // The surrounding child builder replaces this temporary target
+            // with the following source boundary.
+            target: SuppressedNamedStringEventTarget::AfterElement(element.id),
+        });
+    }
+    let mut child_ancestors = ancestors.to_vec();
+    child_ancestors.push(ElementSignature::new(
+        element.tag.clone(),
+        element.attrs.clone(),
+    ));
+    for child in &element.children {
+        let NodeKind::Element(child) = &child.kind else {
+            continue;
+        };
+        let signature = ElementSignature::new(child.tag.clone(), child.attrs.clone());
+        let child_style = style_for_layout_element(
+            child,
+            signature,
+            stylesheets,
+            Some(&style),
+            &child_ancestors,
+        );
+        events.extend(suppressed_named_string_events_for_subtree(
+            child,
+            child_style,
+            stylesheets,
+            &child_ancestors,
+        ));
+    }
+    events
+}
+
+fn suppressed_counter_event_for_subtree<'a>(
+    element: &'a Element,
+    ancestors: &[ElementSignature],
+) -> CounterEventNode<'a> {
+    let mut child_ancestors = ancestors.to_vec();
+    child_ancestors.push(ElementSignature::new(
+        element.tag.clone(),
+        element.attrs.clone(),
+    ));
+    let children = element
+        .children
+        .iter()
+        .filter_map(|child| match &child.kind {
+            NodeKind::Element(child) => Some(suppressed_counter_event_for_subtree(
+                child,
+                &child_ancestors,
+            )),
+            NodeKind::Text(_) => None,
+        })
+        .collect();
+    CounterEventNode {
+        element,
+        source: CounterEventSource::Principal,
+        counter_style: CounterEventStyle::suppressed_display_none(),
+        children,
+    }
 }
 
 fn build_element_box<'a>(
@@ -304,9 +632,6 @@ fn build_element_box<'a>(
     font_system: Option<&mut FontSystem>,
 ) -> Option<BuiltElement<'a>> {
     let mut style = Box::new(style);
-    if style.display.is_none() {
-        return None;
-    }
     if matches!(style.position, Position::Absolute | Position::Fixed) {
         style.abspos_static_source_was_inline_level = style.display.is_inline_level();
         style.abspos_static_source_was_atomic_inline = style.display.is_atomic_inline();
@@ -327,11 +652,14 @@ fn build_element_box<'a>(
             true,
             false,
             font_system,
-            None,
         )
     };
-    let children = built_children.boxes;
-    let mut counter_children = built_children.counter_events;
+    let BuiltChildren {
+        boxes: children,
+        footnotes,
+        counter_events: mut counter_children,
+        suppressed_named_string_events,
+    } = built_children;
     let marker = marker_box(&style);
     if let Some(marker) = &marker {
         counter_children.insert(
@@ -339,13 +667,16 @@ fn build_element_box<'a>(
             CounterEventNode {
                 element,
                 source: CounterEventSource::Marker,
-                style: marker.style.as_ref().clone(),
+                counter_style: CounterEventStyle::from_computed(&marker.style),
                 children: Vec::new(),
             },
         );
     }
     let source = BoxSource::Principal;
-    let counter_style = style.as_ref().clone();
+    // Counter planning observes the computed style before layout-only display
+    // fixups (such as replaced-element blockification), but it needs only
+    // counter declarations and scope flags rather than another full style.
+    let counter_style = CounterEventStyle::from_computed(&style);
 
     if content_replacement || is_replaced_element(element) {
         style.display = if style.display.is_block_level() {
@@ -357,109 +688,127 @@ fn build_element_box<'a>(
         };
         let box_ = if style.display.is_inline_or_run_in_level() {
             Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
-                element,
-                signature,
-                source,
+                core: ElementBoxCoreWith {
+                    element,
+                    signature,
+                    source,
+                    style,
+                    children,
+                },
                 marker,
-                style,
-                children,
                 table_fragment: None,
             }))
         } else {
             Some(MutableFormattingBox::Replaced(MutableReplacedBox {
-                element,
-                signature,
-                source,
+                core: ElementBoxCoreWith {
+                    element,
+                    signature,
+                    source,
+                    style,
+                    children,
+                },
                 marker,
-                style,
-                children,
             }))
         }?;
         return Some(BuiltElement {
             box_,
+            footnotes,
             counter_event: CounterEventNode {
                 element,
                 source: CounterEventSource::Principal,
-                style: counter_style,
+                counter_style,
                 children: counter_children,
             },
+            suppressed_named_string_events,
         });
     }
 
     let box_ = if style.display.is_table() && style.display.is_inline_or_run_in_level() {
         let fragment = build_table_fragment(element, &signature, &children);
         MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
-            element,
-            signature,
-            source,
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
-            children,
             table_fragment: Some(fragment),
         })
-    } else if style.display.is_table()
-        || (style.display.is_block_level() && is_html_table_element(element))
-    {
+    } else if style.display.is_table() {
         let fragment = build_table_fragment(element, &signature, &children);
         MutableFormattingBox::Table(MutableTableBox {
-            element,
-            signature,
-            source,
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
-            children,
             fragment,
         })
     } else if style.display.is_flex() && style.display.is_block_level() {
         MutableFormattingBox::Flex(MutableFlexBox {
-            element,
-            signature,
-            source,
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
-            children,
         })
     } else if style.display.is_atomic_inline()
         || (style.display.is_run_in() && !style.display.is_flow())
     {
         MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
-            element,
-            signature,
-            source,
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
-            children,
             table_fragment: None,
         })
     } else if style.display.is_block_level() {
         MutableFormattingBox::Block(MutableBlockBox {
-            element,
-            signature,
-            source,
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
             run_in_children: Vec::new(),
-            children,
         })
     } else {
         MutableFormattingBox::Inline(MutableInlineBox {
-            element,
-            signature,
-            source,
+            core: ElementBoxCoreWith {
+                element,
+                signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
             fragment_edges: InlineBoxFragmentEdges::ALL,
-            children,
         })
     };
     Some(BuiltElement {
         box_,
+        footnotes,
         counter_event: CounterEventNode {
             element,
             source: CounterEventSource::Principal,
-            style: counter_style,
+            counter_style,
             children: counter_children,
         },
+        suppressed_named_string_events,
     })
 }
 
@@ -487,6 +836,17 @@ fn push_generated_pseudo_box<'a>(
         style.abspos_static_source_was_atomic_inline = style.display.is_atomic_inline();
         style.display = style.display.blockified();
     }
+    // Tree-abiding generated boxes are direct flex/grid children just like
+    // principal element boxes. CSS Display blockifies them before CSS Tables
+    // applies anonymous-wrapper fixup; delaying this until flex/grid
+    // itemization lets `display: table-row`/`table-cell` manufacture an empty
+    // table fragment and loses its generated content.
+    // <https://drafts.csswg.org/css-display-3/#transformations>
+    // <https://drafts.csswg.org/css-flexbox-1/#flex-items>
+    // <https://drafts.csswg.org/css-tables-3/#fixup-algorithm>
+    if originating_style.display.is_flex() || originating_style.display.is_grid() {
+        style.display = style.display.blockified();
+    }
     if let Some(box_) = build_generated_pseudo_box(
         originating_element,
         originating_signature,
@@ -497,11 +857,8 @@ fn push_generated_pseudo_box<'a>(
         output.push(box_);
         counter_events.push(CounterEventNode {
             element: originating_element,
-            source: match kind {
-                GeneratedPseudoKind::Before => CounterEventSource::Before,
-                GeneratedPseudoKind::After => CounterEventSource::After,
-            },
-            style: pseudo_style.clone(),
+            source: kind.counter_event_source(),
+            counter_style: CounterEventStyle::from_computed(pseudo_style),
             children: Vec::new(),
         });
     }
@@ -529,67 +886,77 @@ fn build_generated_pseudo_box<'a>(
     if style.display.is_table() && style.display.is_inline_or_run_in_level() {
         let fragment = build_table_fragment(originating_element, &originating_signature, &children);
         Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
-            element: originating_element,
-            signature: originating_signature,
-            source,
+            core: ElementBoxCoreWith {
+                element: originating_element,
+                signature: originating_signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
-            children,
             table_fragment: Some(fragment),
         }))
-    } else if style.display.is_table()
-        || (style.display.is_block_level() && is_html_table_element(originating_element))
-    {
+    } else if style.display.is_table() {
         let fragment = build_table_fragment(originating_element, &originating_signature, &children);
         Some(MutableFormattingBox::Table(MutableTableBox {
-            element: originating_element,
-            signature: originating_signature,
-            source,
+            core: ElementBoxCoreWith {
+                element: originating_element,
+                signature: originating_signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
-            children,
             fragment,
         }))
     } else if style.display.is_flex() && style.display.is_block_level() {
         Some(MutableFormattingBox::Flex(MutableFlexBox {
-            element: originating_element,
-            signature: originating_signature,
-            source,
+            core: ElementBoxCoreWith {
+                element: originating_element,
+                signature: originating_signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
-            children,
         }))
     } else if style.display.is_atomic_inline()
         || (style.display.is_run_in() && !style.display.is_flow())
     {
         Some(MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
-            element: originating_element,
-            signature: originating_signature,
-            source,
+            core: ElementBoxCoreWith {
+                element: originating_element,
+                signature: originating_signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
-            children,
             table_fragment: None,
         }))
     } else if style.display.is_block_level() {
         Some(MutableFormattingBox::Block(MutableBlockBox {
-            element: originating_element,
-            signature: originating_signature,
-            source,
+            core: ElementBoxCoreWith {
+                element: originating_element,
+                signature: originating_signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
             run_in_children: Vec::new(),
-            children,
         }))
     } else {
         Some(MutableFormattingBox::Inline(MutableInlineBox {
-            element: originating_element,
-            signature: originating_signature,
-            source,
+            core: ElementBoxCoreWith {
+                element: originating_element,
+                signature: originating_signature,
+                source,
+                style,
+                children,
+            },
             marker,
-            style,
             fragment_edges: InlineBoxFragmentEdges::ALL,
-            children,
         }))
     }
 }
@@ -932,7 +1299,12 @@ fn anonymous_table_fragment_cell_style_and_children<'a>(
     children: &mut Vec<MutableFormattingBox<'a>>,
 ) -> (ComputedStyle, Vec<MutableFormattingBox<'a>>) {
     let parent_style = anonymous_table_fragment_cell_parent_style(children);
-    let normalized = normalize_orphan_table_internal_boxes(std::mem::take(children), &parent_style);
+    // The generated cell is a block container. Normalize its children only
+    // after synthesizing that cell, so CSS Tables fixup sees the correct
+    // parent and CSS 2.2 can split in-flow blocks out of inline descendants.
+    // <https://drafts.csswg.org/css-tables/#fixup-algorithm>
+    // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+    let normalized = normalize_block_container_children(std::mem::take(children), &parent_style);
     (parent_style, normalized)
 }
 
@@ -954,17 +1326,7 @@ fn anonymous_table_fragment_cell_parent_style(
 }
 
 fn table_fragment_child_style(child: &MutableFormattingBox<'_>) -> ComputedStyle {
-    match child {
-        MutableFormattingBox::Block(box_) => box_.style.as_ref().clone(),
-        MutableFormattingBox::Inline(box_) => box_.style.as_ref().clone(),
-        MutableFormattingBox::InlineSplitBlockContext(box_) => box_.style.as_ref().clone(),
-        MutableFormattingBox::AnonymousBlock(box_) => box_.style.as_ref().clone(),
-        MutableFormattingBox::AtomicInline(box_) => box_.style.as_ref().clone(),
-        MutableFormattingBox::Text(box_) => box_.style.as_ref().clone(),
-        MutableFormattingBox::Table(box_) => box_.style.as_ref().clone(),
-        MutableFormattingBox::Flex(box_) => box_.style.as_ref().clone(),
-        MutableFormattingBox::Replaced(box_) => box_.style.as_ref().clone(),
-    }
+    child.style().clone()
 }
 
 fn flush_anonymous_table_fragment_row<'a>(
@@ -1069,28 +1431,28 @@ fn table_fragment_group_signature<'a>(
     group.as_ref().map(|group| &group.signature)
 }
 
-fn is_table_caption_box(element: &Element, style: &ComputedStyle) -> bool {
-    is_html_table_caption_element(element) || style.display.is_table_caption()
+fn is_table_caption_box(_element: &Element, style: &ComputedStyle) -> bool {
+    style.display.is_table_caption()
 }
 
-fn is_table_column_group_box(element: &Element, style: &ComputedStyle) -> bool {
-    is_html_table_column_group_element(element) || style.display.is_table_column_group()
+fn is_table_column_group_box(_element: &Element, style: &ComputedStyle) -> bool {
+    style.display.is_table_column_group()
 }
 
-fn is_table_column_box(element: &Element, style: &ComputedStyle) -> bool {
-    is_html_table_column_element(element) || style.display.is_table_column()
+fn is_table_column_box(_element: &Element, style: &ComputedStyle) -> bool {
+    style.display.is_table_column()
 }
 
-fn is_table_row_group_box(element: &Element, style: &ComputedStyle) -> bool {
-    is_html_table_row_group_element(element) || style.display.is_table_row_group()
+fn is_table_row_group_box(_element: &Element, style: &ComputedStyle) -> bool {
+    style.display.is_table_row_group()
 }
 
-fn is_table_row_box(element: &Element, style: &ComputedStyle) -> bool {
-    is_html_table_row_element(element) || style.display.is_table_row()
+fn is_table_row_box(_element: &Element, style: &ComputedStyle) -> bool {
+    style.display.is_table_row()
 }
 
-fn is_table_cell_box(element: &Element, style: &ComputedStyle) -> bool {
-    is_html_table_cell_element(element) || style.display.is_table_cell()
+fn is_table_cell_box(_element: &Element, style: &ComputedStyle) -> bool {
+    style.display.is_table_cell()
 }
 
 pub(crate) fn marker_box(style: &ComputedStyle) -> Option<MutableMarkerBox> {

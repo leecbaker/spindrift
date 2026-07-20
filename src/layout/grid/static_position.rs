@@ -9,10 +9,10 @@ pub(super) struct PositionedGridStaticContext<'a> {
     pub(super) container_style: &'a ComputedStyle,
     pub(super) stylesheets: &'a [Stylesheet],
     pub(super) inner_x: f32,
-    pub(super) inner_width: f32,
+    pub(super) inner_width: PhysicalContentWidth,
     pub(super) content_top: f32,
-    pub(super) definite_content_height: Option<f32>,
-    pub(super) content_height: f32,
+    pub(super) definite_content_height: Option<PhysicalContentHeight>,
+    pub(super) content_height: PhysicalContentHeight,
     pub(super) column_line_offsets: &'a [f32],
     pub(super) row_line_offsets: &'a [f32],
     pub(super) establishes_positioning_containing_block: bool,
@@ -29,9 +29,9 @@ pub(super) struct PositionedGridStaticContext<'a> {
 pub(in crate::layout) struct GridPositioningScope {
     container_style: ComputedStyle,
     inner_x: f32,
-    inner_width: f32,
+    inner_width: PhysicalContentWidth,
     content_top: f32,
-    content_height: f32,
+    content_height: PhysicalContentHeight,
     column_line_offsets: Vec<f32>,
     row_line_offsets: Vec<f32>,
     containing_block: ContainingBlock,
@@ -84,9 +84,9 @@ impl GridPositioningScope {
                 &self.column_line_offsets,
                 self.container_style.column_gap.clone(),
                 self.container_style.justify_content,
-                self.inner_width,
+                self.inner_width.points(),
             );
-            let row_size = self.content_height;
+            let row_size = self.content_height.points();
             let y = grid_static_line_offset(
                 &self.container_style.grid_template_rows,
                 &self.container_style.grid_auto_rows,
@@ -103,7 +103,7 @@ impl GridPositioningScope {
                 &self.column_line_offsets,
                 self.container_style.column_gap.clone(),
                 self.container_style.justify_content,
-                self.inner_width,
+                self.inner_width.points(),
             );
             let right = match (x, right) {
                 // An abspos item with matching explicit start and end lines
@@ -124,10 +124,10 @@ impl GridPositioningScope {
                     &self.column_line_offsets,
                     &self.container_style.grid_template_columns,
                     self.container_style.justify_content,
-                    self.inner_width,
+                    self.inner_width.points(),
                 )
             })
-            .unwrap_or(self.inner_width);
+            .unwrap_or(self.inner_width.points());
             let bottom = grid_static_line_offset(
                 &self.container_style.grid_template_rows,
                 &self.container_style.grid_auto_rows,
@@ -171,7 +171,10 @@ impl GridPositioningScope {
             let (x, right) = if flow.physical_axis(LogicalAxis::Inline) == PhysicalAxis::Horizontal
                 && flow.physical_side(LogicalSide::InlineStart) == PhysicalSide::Right
             {
-                (self.inner_width - right, self.inner_width - x)
+                (
+                    self.inner_width.points() - right,
+                    self.inner_width.points() - x,
+                )
             } else {
                 (x, right)
             };
@@ -259,9 +262,9 @@ fn grid_static_following_line_offset(start: f32, line_offsets: &[f32]) -> Option
 
 pub(super) struct GridPositioningGeometry<'a> {
     pub(super) inner_x: f32,
-    pub(super) inner_width: f32,
+    pub(super) inner_width: PhysicalContentWidth,
     pub(super) content_top: f32,
-    pub(super) content_height: f32,
+    pub(super) content_height: PhysicalContentHeight,
     pub(super) column_line_offsets: &'a [f32],
     pub(super) row_line_offsets: &'a [f32],
 }
@@ -296,7 +299,7 @@ impl<'a> LayoutBuilder<'a> {
             .unwrap_or(GridItemLayout::new(
                 GridRect::new(
                     GridPoint::new(0.0, 0.0),
-                    GridSize::new(context.inner_width, child.style.line_height),
+                    GridSize::new(context.inner_width.points(), child.style.line_height),
                 ),
                 None,
             ));
@@ -307,7 +310,7 @@ impl<'a> LayoutBuilder<'a> {
             context.column_line_offsets,
             context.container_style.column_gap.clone(),
             context.container_style.justify_content,
-            context.inner_width,
+            context.inner_width.points(),
         );
         let column_end = grid_static_line_offset(
             &context.container_style.grid_template_columns,
@@ -316,7 +319,7 @@ impl<'a> LayoutBuilder<'a> {
             context.column_line_offsets,
             context.container_style.column_gap.clone(),
             context.container_style.justify_content,
-            context.inner_width,
+            context.inner_width.points(),
         );
         let column_end = match (column_start, column_end) {
             (Some(start), Some(end)) if (start - end).abs() <= 0.01 => {
@@ -329,7 +332,7 @@ impl<'a> LayoutBuilder<'a> {
                     context.column_line_offsets,
                     &context.container_style.grid_template_columns,
                     context.container_style.justify_content,
-                    context.inner_width,
+                    context.inner_width.points(),
                 )
             }),
         };
@@ -348,7 +351,7 @@ impl<'a> LayoutBuilder<'a> {
             // rectangle spans the grid container's content box. It is not
             // auto-placed after the in-flow grid items.
             // <https://www.w3.org/TR/css-grid-1/#abspos-items>
-            hypothetical.set_axis_geometry(GridAxis::Column, 0.0, context.inner_width);
+            hypothetical.set_axis_geometry(GridAxis::Column, 0.0, context.inner_width.points());
         }
         if WritingModeAxes::new(
             context.container_style.writing_mode,
@@ -366,16 +369,19 @@ impl<'a> LayoutBuilder<'a> {
             && column_end.is_some()
         {
             let logical_start = column_start.unwrap_or(0.0);
-            let logical_end = column_end.unwrap_or(context.inner_width).max(logical_start);
+            let logical_end = column_end
+                .unwrap_or(context.inner_width.points())
+                .max(logical_start);
             hypothetical.set_axis_geometry(
                 GridAxis::Column,
-                context.inner_width - logical_end,
+                context.inner_width.points() - logical_end,
                 logical_end - logical_start,
             );
         }
         let row_container_size = context
             .definite_content_height
-            .unwrap_or(context.content_height);
+            .unwrap_or(context.content_height)
+            .points();
         let row_start = grid_static_line_offset(
             &context.container_style.grid_template_rows,
             &context.container_style.grid_auto_rows,
@@ -424,7 +430,7 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         if !context.establishes_positioning_containing_block {
-            hypothetical.set_axis_geometry(GridAxis::Column, 0.0, context.inner_width);
+            hypothetical.set_axis_geometry(GridAxis::Column, 0.0, context.inner_width.points());
             hypothetical.set_axis_geometry(GridAxis::Row, 0.0, row_container_size);
         }
 
@@ -447,7 +453,7 @@ impl<'a> LayoutBuilder<'a> {
                 context.column_line_offsets,
                 context.container_style.row_gap.clone(),
                 context.container_style.align_content,
-                context.inner_width,
+                context.inner_width.points(),
             )
             .unwrap_or(0.0);
             let x_end = grid_static_line_offset(
@@ -457,15 +463,15 @@ impl<'a> LayoutBuilder<'a> {
                 context.column_line_offsets,
                 context.container_style.row_gap.clone(),
                 context.container_style.align_content,
-                context.inner_width,
+                context.inner_width.points(),
             )
-            .unwrap_or(context.inner_width)
+            .unwrap_or(context.inner_width.points())
             .max(x_start);
             let x = if matches!(
                 context.container_style.writing_mode,
                 WritingMode::VerticalRl | WritingMode::SidewaysRl
             ) {
-                context.inner_width - x_end
+                context.inner_width.points() - x_end
             } else {
                 x_start
             };
@@ -503,7 +509,7 @@ impl<'a> LayoutBuilder<'a> {
             &mut hypothetical,
             &child.style,
             context.container_style,
-            PercentageBasis::definite(layout_pt(context.inner_width)),
+            PercentageBasis::definite(layout_pt(context.inner_width.points())),
         );
 
         let static_left = context.inner_x + hypothetical.x();
@@ -515,7 +521,7 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-position-3/#static-position>
         let static_width = grid_abspos_alignment_axis_metrics(
             &child.style,
-            PercentageBasis::definite(layout_pt(context.inner_width)),
+            PercentageBasis::definite(layout_pt(context.inner_width.points())),
             GridAbsposAlignmentAxis::Horizontal,
         )
         .border_size
@@ -561,8 +567,10 @@ fn apply_grid_abspos_self_alignment(
     container_style: &ComputedStyle,
     inline_percentage_basis: PercentageBasis<LayoutLength>,
 ) {
-    let container_axes =
-        WritingModeAxes::new(container_style.writing_mode, container_style.direction);
+    let container_axes = WritingModeAxes::new(
+        container_style.writing_mode,
+        container_style.used_direction(),
+    );
     let horizontal = grid_abspos_alignment_axis_metrics(
         child_style,
         inline_percentage_basis,
@@ -822,8 +830,9 @@ pub(in crate::layout) fn grid_abspos_late_horizontal_static_position(
     grid: GridAbsposStaticAlignment,
     style: &ComputedStyle,
     containing_block: ContainingBlock,
-    border_box_width: f32,
+    border_box_width: BorderBoxLength,
 ) -> StaticHorizontalPosition {
+    let border_box_width = border_box_width.points();
     let axes = WritingModeAxes::new(grid.writing_mode, grid.direction);
     let (self_alignment, container_alignment) = if axes.swaps_physical_axes() {
         (style.align_self, grid.align_items)

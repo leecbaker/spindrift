@@ -40,6 +40,137 @@ fn rects_have_gap_y(a: &quire::RenderedRect, b: &quire::RenderedRect, expected: 
     (gap - expected).abs() < 0.5
 }
 
+#[tokio::test]
+async fn normal_flow_reference_boxes_keep_definite_sizes_and_siblings() {
+    let document = Html::from_string(
+        "<!doctype html><style>\
+         @page { size: 500px 200px; margin: 0 } body { margin: 0 }\
+         #parent { width: 400px; height: 80px; background: blue }\
+         .item { display: inline-block; width: 40px; height: 60px; background: yellow }\
+         </style><div id=\"parent\"><span class=\"item\"></span><span class=\"item\"></span></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let blue = page
+        .rects()
+        .iter()
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
+        .expect("normal-flow parent should paint its background");
+    assert!(
+        (blue.width() - 300.0).abs() < 0.01 && (blue.height() - 60.0).abs() < 0.01,
+        "definite normal-flow parent dimensions must survive child layout: {blue:?}"
+    );
+    let items = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        items.len(),
+        2,
+        "both inline-block siblings must paint: {items:?}"
+    );
+    assert!(
+        items
+            .iter()
+            .all(|rect| (rect.width() - 30.0).abs() < 0.01 && (rect.height() - 45.0).abs() < 0.01),
+        "inline-block dimensions must survive normal-flow replay: {items:?}"
+    );
+    assert!(
+        (items[1].x() - (items[0].x() + items[0].width())).abs() < 0.01,
+        "inline-block siblings must retain their shared line placement: {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn normal_flow_column_reference_matches_flex_margin_geometry() {
+    const COMMON: &str = "<!doctype html><style>\
+        div { background: blue; margin: 1em 0; border: 1px solid black; }\
+        span { background: white; margin: 1em; width: 8em; }\
+        </style><div><span>filler</span><span>filler</span><span>filler</span><span>filler</span></div>";
+    let mut options = RenderOptions::default();
+    options.set_margin_points(0.0);
+    let flex = Html::from_string(format!(
+        "{COMMON}<style>div {{ display: flex; flex-direction: column; }} span {{ display: inline-block; }}</style>"
+    ))
+    .render(&options)
+    .await
+    .unwrap();
+    let reference = Html::from_string(format!(
+        "{COMMON}<style>span {{ display: block; }} span ~ span {{ margin: 2em 1em 1em; }}</style>"
+    ))
+    .render(&options)
+    .await
+    .unwrap();
+
+    let colored_rects = |document: &quire::Document| {
+        document.pages[0]
+            .rects()
+            .iter()
+            .filter(|rect| {
+                matches!(
+                    rect.fill,
+                    Some(color) if color == CssColor::new(0, 0, 255)
+                        || color == CssColor::new(255, 255, 255)
+                )
+            })
+            .map(|rect| (rect.x(), rect.y(), rect.width(), rect.height(), rect.fill))
+            .collect::<Vec<_>>()
+    };
+    let reference_rects = colored_rects(&reference);
+    let flex_rects = colored_rects(&flex);
+    assert_eq!(
+        reference_rects.len(),
+        flex_rects.len(),
+        "ordinary block flow must preserve the same number of colored boxes as the flex reference"
+    );
+    for (reference, flex) in reference_rects.iter().zip(&flex_rects) {
+        assert_eq!(
+            reference.4, flex.4,
+            "corresponding boxes must keep their paint color"
+        );
+        for (reference, flex) in [reference.0, reference.1, reference.2, reference.3]
+            .into_iter()
+            .zip([flex.0, flex.1, flex.2, flex.3])
+        {
+            assert!(
+                (reference - flex).abs() <= 0.01,
+                "ordinary block flow must preserve the same flex margin geometry: reference={reference_rects:?}, flex={flex_rects:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn generated_flex_container_replays_its_anonymous_content_item() {
+    let mut options = RenderOptions::default();
+    options.set_margin_points(0.0);
+    let document = Html::from_string(
+        "<!doctype html><style>\
+         div { background: #3366cc; border: 1px solid black }\
+         div::after { content: 'xxx'; background: yellow; margin: 1em; width: 200px; height: 2em; display: flex }\
+         </style><div></div>",
+    )
+    .render(&options)
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    assert!(
+        page.lines().iter().any(|line| line.text == "xxx"),
+        "a generated flex container must create and paint its anonymous content item"
+    );
+    assert!(
+        page.rects()
+            .iter()
+            .any(|rect| rect.fill == Some(CssColor::new(255, 255, 0))),
+        "the generated flex container's principal background must survive replay"
+    );
+}
+
 async fn single_x_line_x(target_style: &str) -> f32 {
     let document = Html::from_string(format!(
         "<!DOCTYPE html><style>\
@@ -72,8 +203,8 @@ async fn assert_vertical_rl_inline_flex_column_wrap_gap(html: &str) {
         .await
         .unwrap();
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
-    let gray = Color::new(128, 128, 128);
+    let green = CssColor::new(0, 128, 0);
+    let gray = CssColor::new(128, 128, 128);
     let container = page
         .rects()
         .iter()
@@ -185,7 +316,7 @@ async fn stretched_vertical_flex_item_defines_descendant_percentage_padding_basi
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "expected green flex item background: {:?}",
@@ -216,7 +347,7 @@ async fn stretched_replaced_descendant_transfers_size_from_stretched_flex_item()
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "expected green inline-flex background: {:?}",
@@ -254,7 +385,7 @@ async fn assert_column_flex_post_flexing_percentage_height_descendant_square(doc
     let green_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
     assert!(
         !green_rects.is_empty(),
@@ -318,7 +449,7 @@ async fn block_flex_item_contains_first_child_margin() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "expected flex item background: {:?}",
@@ -348,7 +479,7 @@ async fn block_flex_item_contains_internal_float_height() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "expected flex item background: {:?}",
@@ -378,7 +509,7 @@ async fn inline_flex_item_contains_first_child_margin() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "expected inline-flex item background: {:?}",
@@ -407,7 +538,7 @@ async fn flex_blockified_inline_item_paints_source_background_once() {
     let painted = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(10, 20, 30)))
+        .filter(|rect| rect.fill == Some(CssColor::new(10, 20, 30)))
         .collect::<Vec<_>>();
     assert_eq!(
         painted.len(),
@@ -436,7 +567,7 @@ async fn column_flex_stretched_aspect_ratio_item_keeps_content_auto_minimum() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "expected green flex item background: {:?}",
@@ -467,7 +598,7 @@ async fn empty_column_flex_stretched_aspect_ratio_item_keeps_transferred_basis()
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "expected green flex item background: {:?}",
@@ -499,7 +630,7 @@ async fn stretch_min_cross_size_preserves_non_negative_content_box() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
+    let green = CssColor::new(0, 128, 0);
     for (x, y) in [(37.5, 37.5), (112.5, 37.5), (37.5, 112.5), (112.5, 112.5)] {
         assert_eq!(
             final_rect_fill_at(page, x, y),
@@ -526,8 +657,8 @@ async fn abspos_auto_position_honors_flex_alignment_on_both_axes() {
     .unwrap();
 
     let page = &document.pages[0];
-    let yellow = Color::new(255, 255, 0);
-    let green = Color::new(0, 128, 0);
+    let yellow = CssColor::new(255, 255, 0);
+    let green = CssColor::new(0, 128, 0);
     let parent = page
         .rects()
         .iter()
@@ -572,14 +703,14 @@ async fn abspos_auto_position_covers_vertical_writing_flex_content_box() {
         let red = page
             .rects()
             .iter()
-            .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+            .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
             .unwrap_or_else(|| {
                 panic!(
                     "expected flex background for {writing_mode}: {:?}",
                     page.rects()
                 )
             });
-        let green = Color::new(0, 128, 0);
+        let green = CssColor::new(0, 128, 0);
         let px = 0.75;
         let content_left = red.x() + 20.0 * px;
         let content_bottom = red.y() + 15.0 * px;
@@ -641,7 +772,7 @@ div::after {
     let yellow = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .collect::<Vec<_>>();
     assert_eq!(
         yellow.len(),
@@ -713,7 +844,7 @@ async fn flex_order_painting_uses_order_modified_document_order_with_negative_ma
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap_or_else(|| panic!("expected red flex item background: {:?}", page.rects()));
     assert_eq!(
         final_rect_fill_at(
@@ -721,7 +852,7 @@ async fn flex_order_painting_uses_order_modified_document_order_with_negative_ma
             red.x() + red.width() / 2.0,
             red.y() + red.height() / 2.0
         ),
-        Some(Color::new(0, 128, 0)),
+        Some(CssColor::new(0, 128, 0)),
         "order-modified flex painting should cover the lower-order red item with the negative-margin green item: {:?}",
         page.rects()
     );
@@ -745,7 +876,7 @@ async fn definite_width_block_flex_container_overflows_without_shrinking_items()
     let container = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("definite-width flex container background should paint");
     assert!(
         (container.width() - 480.0).abs() < 0.01,
@@ -753,10 +884,10 @@ async fn definite_width_block_flex_container_overflows_without_shrinking_items()
     );
 
     for color in [
-        Color::new(255, 255, 0),
-        Color::new(255, 192, 203),
-        Color::new(173, 216, 230),
-        Color::new(128, 128, 128),
+        CssColor::new(255, 255, 0),
+        CssColor::new(255, 192, 203),
+        CssColor::new(173, 216, 230),
+        CssColor::new(128, 128, 128),
     ] {
         let item = page
             .rects()
@@ -795,7 +926,7 @@ async fn auto_height_row_flex_container_applies_min_max_height_constraints() {
     let mut flexboxes = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(144, 238, 144)))
+        .filter(|rect| rect.fill == Some(CssColor::new(144, 238, 144)))
         .collect::<Vec<_>>();
     assert_eq!(
         flexboxes.len(),
@@ -843,7 +974,7 @@ async fn fixed_width_block_flex_container_resolves_auto_margins() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("centered flex container background should paint");
     assert!(
         (green.x() - 100.0).abs() < 0.01 && (green.width() - 100.0).abs() < 0.01,
@@ -943,8 +1074,8 @@ async fn align_content_stretch_overflow_falls_back_to_wrap_reverse_flex_start() 
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
-    let red = Color::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
     let green_rect = page
         .rects()
         .iter()
@@ -985,8 +1116,8 @@ async fn flex_shrink_to_fit_item_remeasures_against_column_line_cross_size() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
-    let red = Color::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
     for (x, y) in [(10.0, 50.0), (140.0, 50.0), (10.0, 150.0), (140.0, 150.0)] {
         let x = x * 0.75;
         let y = y * 0.75;
@@ -1022,7 +1153,7 @@ async fn column_wrap_flex_min_content_width_uses_item_cross_contribution() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("min-content flex container background should paint");
     assert!(
         (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
@@ -1034,7 +1165,7 @@ async fn column_wrap_flex_min_content_width_uses_item_cross_contribution() {
             green.x() + green.width() / 2.0,
             green.y() + green.height() / 2.0
         ),
-        Some(Color::new(0, 128, 0)),
+        Some(CssColor::new(0, 128, 0)),
         "green flex container should fully cover the red reference square: {:?}",
         page.rects()
     );
@@ -1055,7 +1186,7 @@ async fn column_wrap_inline_flex_min_content_width_uses_item_cross_contribution(
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("inline-flex background should paint");
     assert!(
         (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
@@ -1078,7 +1209,7 @@ async fn column_wrap_flex_min_content_width_does_not_sum_wrapped_columns() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("min-content column flex background should paint");
     assert!(
         (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
@@ -1140,7 +1271,7 @@ async fn floated_column_wrap_flex_shrink_to_fit_width_matches_wpt() {
     .unwrap();
 
     let page = &document.pages[0];
-    let grey = Color::new(170, 170, 170);
+    let grey = CssColor::new(170, 170, 170);
     let grey_rects = page
         .rects()
         .iter()
@@ -1189,7 +1320,7 @@ async fn wrapped_row_flex_min_content_width_uses_largest_item_contribution() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("min-content wrapped flex background should paint");
     assert!(
         (green.width() - 40.0).abs() < 0.01,
@@ -1219,7 +1350,7 @@ async fn floated_row_flex_min_content_caps_non_growing_item_by_flex_base() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("floated flex container background should paint");
     assert!(
         (green.width() - 75.0).abs() < 0.01 && (green.height() - 75.0).abs() < 0.01,
@@ -1231,7 +1362,7 @@ async fn floated_row_flex_min_content_caps_non_growing_item_by_flex_base() {
             green.x() + green.width() / 2.0,
             green.y() + green.height() / 2.0
         ),
-        Some(Color::new(0, 128, 0)),
+        Some(CssColor::new(0, 128, 0)),
         "green flex container should fully cover the red reference square: {:?}",
         page.rects()
     );
@@ -1252,7 +1383,7 @@ async fn nowrap_row_flex_min_content_width_keeps_all_items_on_one_line() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("min-content nowrap flex background should paint");
     assert!(
         (green.width() - 75.0).abs() < 0.01,
@@ -1275,7 +1406,7 @@ async fn flex_intrinsic_width_percentage_gap_contributes_only_length_component()
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("max-content flex background should paint");
     assert!(
         (green.width() - 50.0).abs() < 0.01,
@@ -1299,12 +1430,12 @@ async fn flex_definite_width_percentage_gap_resolves_against_content_box() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first flex item should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second flex item should paint");
     assert!(
         rects_have_gap_x(red, blue, 60.0),
@@ -1328,7 +1459,7 @@ async fn flex_max_content_width_uses_growing_item_max_content_contributions() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("max-content flex background should paint");
     assert!(
         (green.width() - 100.0).abs() < 0.01,
@@ -1354,14 +1485,14 @@ async fn visibility_collapse_keeps_cross_strut_without_painting_item() {
     assert!(
         page.rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+            .all(|rect| rect.fill != Some(CssColor::new(255, 0, 0))),
         "collapsed flex item should not paint: {:?}",
         page.rects()
     );
     let container = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK) && rect.width() >= 89.0)
+        .find(|rect| rect.fill == Some(CssColor::BLACK) && rect.width() >= 89.0)
         .expect("flex container background should paint");
     assert!(
         container.height() >= 35.9,
@@ -1387,14 +1518,14 @@ async fn visibility_collapse_preserves_column_cross_size_strut() {
     assert!(
         page.rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+            .all(|rect| rect.fill != Some(CssColor::new(255, 0, 0))),
         "collapsed column flex item should not paint: {:?}",
         page.rects()
     );
     let container = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK))
+        .find(|rect| rect.fill == Some(CssColor::BLACK))
         .expect("inline-flex container background should paint");
     assert!(
         container.width() >= 49.9,
@@ -1403,12 +1534,12 @@ async fn visibility_collapse_preserves_column_cross_size_strut() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("first flex item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second flex item should paint");
     assert!(
         rects_have_gap_y(green, blue, 0.0),
@@ -1434,14 +1565,14 @@ async fn visibility_collapse_vertical_row_preserves_cross_size_strut() {
     assert!(
         page.rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+            .all(|rect| rect.fill != Some(CssColor::new(255, 0, 0))),
         "collapsed vertical-writing flex item should not paint: {:?}",
         page.rects()
     );
     let container = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK))
+        .find(|rect| rect.fill == Some(CssColor::BLACK))
         .expect("vertical-writing inline-flex container background should paint");
     assert!(
         container.width() >= 49.9,
@@ -1450,12 +1581,12 @@ async fn visibility_collapse_vertical_row_preserves_cross_size_strut() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("first vertical flex item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second vertical flex item should paint");
     assert!(
         rects_have_gap_y(green, blue, 0.0),
@@ -1487,7 +1618,7 @@ async fn visibility_collapse_replaced_item_keeps_cross_strut_without_painting_im
     let container = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK) && rect.width() >= 119.0)
+        .find(|rect| rect.fill == Some(CssColor::BLACK) && rect.width() >= 119.0)
         .expect("flex container background should paint");
     assert!(
         container.height() >= 49.9,
@@ -1496,12 +1627,12 @@ async fn visibility_collapse_replaced_item_keeps_cross_strut_without_painting_im
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("first flex item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second flex item should paint");
     assert!(
         (blue.x() - (green.x() + green.width())).abs() < 0.1,
@@ -1533,7 +1664,7 @@ async fn visibility_collapse_column_replaced_item_keeps_cross_strut_without_pain
     let container = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK))
+        .find(|rect| rect.fill == Some(CssColor::BLACK))
         .expect("inline-flex container background should paint");
     assert!(
         container.width() >= 49.9,
@@ -1542,12 +1673,12 @@ async fn visibility_collapse_column_replaced_item_keeps_cross_strut_without_pain
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("first flex item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second flex item should paint");
     assert!(
         rects_have_gap_y(green, blue, 0.0),
@@ -1575,19 +1706,19 @@ async fn visibility_collapse_strut_reflows_wrapped_lines() {
     assert!(
         page.rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+            .all(|rect| rect.fill != Some(CssColor::new(255, 0, 0))),
         "collapsed flex item should not paint: {:?}",
         page.rects()
     );
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("first flex line item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second flex line item should paint");
     assert!(
         green.y() - blue.y() >= 65.0,
@@ -1615,24 +1746,24 @@ async fn visibility_collapse_strut_reflows_wrap_reverse_lines() {
     assert!(
         page.rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+            .all(|rect| rect.fill != Some(CssColor::new(255, 0, 0))),
         "collapsed flex item should not paint: {:?}",
         page.rects()
     );
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("first flex line item should paint");
     let yellow = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("strut-expanded flex line item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("last flex line item should paint");
     let first_gap = if green.y() <= yellow.y() {
         yellow.y() - (green.y() + green.height())
@@ -1715,7 +1846,7 @@ async fn wrapped_row_align_items_baseline_preserves_line_cross_slots() {
 
     let page = &document.pages[0];
     let px = 0.75;
-    let green = Some(Color::new(0, 128, 0));
+    let green = Some(CssColor::new(0, 128, 0));
     let flexbox = page
         .rects()
         .iter()
@@ -1813,12 +1944,12 @@ async fn baseline_aligned_column_items_share_vertical_text_baseline() {
     let wide = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("wide column-axis baseline participant should paint");
     let narrow = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("narrow column-axis baseline participant should paint");
     let wide_baseline = wide.x() + wide.width() - 15.0;
     let narrow_baseline = narrow.x() + narrow.width() - 5.0;
@@ -1846,12 +1977,12 @@ async fn last_baseline_aligned_column_items_share_vertical_text_baseline() {
     let wide = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("wide last-baseline participant should paint");
     let narrow = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("narrow last-baseline participant should paint");
     let wide_baseline = wide.x() + wide.width() - 45.0;
     let narrow_baseline = narrow.x() + narrow.width() - 15.0;
@@ -2953,12 +3084,12 @@ async fn column_flex_align_content_last_baseline_uses_safe_end_fallback() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("flex container background should paint");
     let first_green = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .min_by(|left, right| left.x().total_cmp(&right.x()))
         .expect("flex item backgrounds should paint");
 
@@ -2983,7 +3114,7 @@ async fn abspos_flex_child_static_position_uses_flex_alignment() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("absolutely positioned flex child should paint");
     assert!(
         (red.x() - 50.0).abs() < 0.5,
@@ -3008,12 +3139,12 @@ async fn inline_source_abspos_flex_child_uses_flex_static_rect_for_auto_horizont
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("block-source absolutely positioned flex child should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("inline-source absolutely positioned flex child should paint");
     assert!(
         (green.x() - red.x()).abs() < 0.01,
@@ -3065,17 +3196,17 @@ async fn display_contents_children_participate_as_flex_items() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("first display: contents child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second display: contents child should paint");
     let yellow = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("following flex item should paint");
     assert!(
         (green.x() - 10.0).abs() < 0.5
@@ -3232,7 +3363,7 @@ fn assert_no_blue_at_text_position(page: &quire::Page, line: &quire::RenderedLin
 
 fn blue_rect_covers_text_position(page: &quire::Page, line: &quire::RenderedLine, x: f32) -> bool {
     page.rects().iter().any(|rect| {
-        rect.fill == Some(Color::new(0, 0, 255))
+        rect.fill == Some(CssColor::new(0, 0, 255))
             && x >= rect.x() - 0.5
             && x <= rect.x() + rect.width() + 0.5
             && line.y() >= rect.y() - 0.5
@@ -3273,7 +3404,7 @@ async fn display_contents_text_runs_form_anonymous_flex_items_without_contents_b
     let blue_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .collect::<Vec<_>>();
     assert_eq!(
         blue_rects.len(),
@@ -3303,7 +3434,7 @@ async fn column_flex_fragments_by_item_progression() {
         assert!(
             page.rects()
                 .iter()
-                .any(|rect| rect.fill == Some(Color::new(0, 128, 0))
+                .any(|rect| rect.fill == Some(CssColor::new(0, 128, 0))
                     && (rect.height() - 40.0).abs() < 0.01),
             "page {page_index} should contain one flex item: {:?}",
             page.rects()
@@ -3332,7 +3463,7 @@ async fn wrapped_row_flex_fragments_by_line() {
         assert!(
             page.rects()
                 .iter()
-                .any(|rect| rect.fill == Some(Color::new(0, 0, 255))
+                .any(|rect| rect.fill == Some(CssColor::new(0, 0, 255))
                     && (rect.height() - 40.0).abs() < 0.01),
             "page {page_index} should contain one row flex line: {:?}",
             page.rects()
@@ -3361,7 +3492,7 @@ async fn fragmented_row_flex_clones_container_background() {
         assert!(
             page.rects()
                 .iter()
-                .any(|rect| rect.fill == Some(Color::BLACK)
+                .any(|rect| rect.fill == Some(CssColor::BLACK)
                     && (rect.width() - 60.0).abs() < 0.01
                     && rect.height() >= 39.9),
             "page {page_index} should contain a cloned flex container background: {:?}",
@@ -3391,14 +3522,14 @@ async fn flex_item_break_before_is_consumed_at_container_layer() {
         document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(255, 0, 0))),
+            .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0))),
         "first item should stay on page 1"
     );
     assert!(
         document.pages[1]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(255, 0, 0))),
+            .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0))),
         "second item should render on page 2"
     );
 }
@@ -3425,14 +3556,14 @@ async fn final_flex_item_break_after_propagates_after_container() {
         document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 128, 0))),
+            .any(|rect| rect.fill == Some(CssColor::new(0, 128, 0))),
         "flex item should render before the break"
     );
     assert!(
         document.pages[1]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 0, 255))),
+            .any(|rect| rect.fill == Some(CssColor::new(0, 0, 255))),
         "following block should render after the propagated break"
     );
 }
@@ -3457,12 +3588,12 @@ async fn oversized_column_flex_item_splits_across_pages() {
     let first = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first item slice should paint");
     let second = document.pages[1]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("second item slice should paint");
     assert!(
         (first.height() - 60.0).abs() < 0.5 && (second.height() - 40.0).abs() < 0.5,
@@ -3490,12 +3621,12 @@ async fn oversized_wrapped_row_flex_line_splits_across_pages() {
     let first = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("first line slice should paint");
     let second = document.pages[1]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second line slice should paint");
     assert!(
         (first.height() - 60.0).abs() < 0.5 && (second.height() - 40.0).abs() < 0.5,
@@ -3526,7 +3657,7 @@ async fn split_flex_item_continuation_replays_later_child_content() {
         document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 128, 0))
+            .any(|rect| rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.height() - 60.0).abs() < 0.5),
         "first page should paint the first child content: {:?}",
         document.pages[0].rects()
@@ -3535,7 +3666,7 @@ async fn split_flex_item_continuation_replays_later_child_content() {
         document.pages[1]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 0, 255))
+            .any(|rect| rect.fill == Some(CssColor::new(0, 0, 255))
                 && (rect.height() - 40.0).abs() < 0.5),
         "second page should paint the later child content: {:?}",
         document.pages[1].rects()
@@ -3544,7 +3675,7 @@ async fn split_flex_item_continuation_replays_later_child_content() {
         !document.pages[1]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 128, 0))),
+            .any(|rect| rect.fill == Some(CssColor::new(0, 128, 0))),
         "second page must not replay the start of the flex item: {:?}",
         document.pages[1].rects()
     );

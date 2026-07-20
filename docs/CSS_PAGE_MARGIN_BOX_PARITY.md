@@ -59,6 +59,15 @@ footers.
   generated-pseudo target cross-references, URL image items, and Level 3
   linear/radial gradient image items, so supported non-text inline items can
   replay through `string()` in margin boxes.
+- Page-associated `counter(page)`, `counter(pages)`, and `counters()` values
+  captured by `string-set` remain typed until pagination completes. They then
+  resolve against the source assignment's finalized page context, so a later
+  page that reads `string()` retains the source page number while `pages`
+  reflects the completed document.
+- `display: none` elements with `string-set` emit non-painting, source-ordered
+  assignment events. They do not create layout, counters, breaks, or paint,
+  but still update running headers at the location where their content box
+  would otherwise have been created.
 - `string(..., start)` and `element(..., start)` use final assignment placement:
   named strings update from the source box's first emitted fragment, and running
   elements use a zero-size source marker because the source box is removed from
@@ -99,10 +108,9 @@ footers.
   margin boxes. Supported color, URL/image, linear-gradient, and
   radial-gradient paints are clipped to rounded `background-clip` areas for all
   three box classes.
-- Viewport-dependent `@page` rules are resolved at page-context layout time,
-  preserving the immutable initial page box needed for `vw`/`vh` descriptors.
-  Page-margin box styles resolve their viewport-relative lengths against that
-  same initial page box, before fixed-dimension used-value resolution, so empty
+- Viewport-dependent `@page` rules are resolved at page-context layout time.
+  Page-margin box styles resolve their viewport-relative lengths against the
+  active page fragmentainer before fixed-dimension used-value resolution, so empty
   generated boxes retain their specified background and margin geometry.
   Propagated canvas backgrounds paint the page padding box, including its
   padding band but leaving the page border visible, while page backgrounds use
@@ -157,6 +165,10 @@ footers.
   cascade, page counters, target references, named strings, generated text,
   vertical-writing fixed-box placement, background images, outlines,
   visibility, stacking order, and negative `z-index` replay.
+- Local smoke coverage verifies page/page-count named-string counters across
+  pagination plus direct, nested, and inline `display:none` named-string
+  sources. The 20 manual `css/css-gcpm/` documents are rendered directly by
+  Quire because they do not provide WPT reference links.
 - PDF tests verify that negative `z-index` page-margin opacity emits a
   transparency group, preventing regressions where below-document replay drops
   paint effects.

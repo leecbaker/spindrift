@@ -36,10 +36,6 @@ pub(crate) struct ParsedCssUrl {
 /// URL-token helper and must be parsed as a function value:
 /// <https://drafts.csswg.org/css-backgrounds-3/#the-background> and
 /// <https://drafts.csswg.org/css-values-5/#request-url-modifiers>.
-pub(crate) fn parse_first_css_url(value: &str) -> Option<String> {
-    parse_first_css_url_with_modifiers(value).map(|url| url.src)
-}
-
 pub(crate) fn parse_first_css_url_with_modifiers(value: &str) -> Option<ParsedCssUrl> {
     let mut remaining = trim_css_value(value);
     while let Some(offset) = find_ascii_url_function(remaining) {

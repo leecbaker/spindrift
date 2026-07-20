@@ -68,27 +68,43 @@ impl<'a> LayoutBuilder<'a> {
         row: &TableRow<'_>,
         cell_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        cell_borders: css::Edges,
-        border_box: TableCellBorderBox,
-        placement: TableGridPlacement,
-        content_offset: f32,
-        content_x_offset: f32,
-        child_fragments: &[TableCellChildFragmentPlan],
+        content_geometry: TableCellContentGeometry,
+        content_plan: &TableCellContentPlan,
     ) {
         let Some(children) = cell.children.as_deref() else {
             return;
         };
+        let child_fragments = &content_plan.child_fragments;
         if child_fragments.is_empty() {
             return;
         }
+        if let Some(fragment_range) = content_plan.fragment_range {
+            debug_assert!(fragment_range.source_child_start < fragment_range.source_child_end);
+            debug_assert!(
+                fragment_range.source_block_bottom <= fragment_range.source_block_top + 0.01
+            );
+            debug_assert!(
+                fragment_range.painted_block_bottom <= fragment_range.painted_block_top + 0.01
+            );
+            debug_assert_eq!(
+                fragment_range.continues_from_previous,
+                child_fragments
+                    .iter()
+                    .any(|fragment| fragment.metadata.continues_from_previous_page)
+            );
+            debug_assert_eq!(
+                fragment_range.continues_to_next,
+                child_fragments
+                    .iter()
+                    .any(|fragment| fragment.metadata.continues_to_next_page)
+            );
+            debug_assert!(child_fragments.iter().all(|fragment| {
+                (fragment_range.source_child_start..fragment_range.source_child_end)
+                    .contains(&fragment.source_child_index)
+            }));
+        }
 
-        let content_box = border_box.content_box(
-            placement,
-            cell_style.padding,
-            cell_borders,
-            content_offset,
-            content_x_offset,
-        );
+        let content_box = content_geometry.content_box();
         let content_scope = self.enter_table_cell_content_scope(
             cell_style,
             content_box,
@@ -111,7 +127,7 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
         child_plan: &TableCellChildFragmentPlan,
     ) {
-        let child_top = child_plan.child_top;
+        let child_top = child_plan.painted_child_top;
         let child_height = child_plan.child_height;
         let slice_top = child_plan.slice_top;
         let slice_bottom = child_plan.slice_bottom;
@@ -135,9 +151,9 @@ impl<'a> LayoutBuilder<'a> {
                     return;
                 };
                 self.paint_table_cell_element_child_slice(
-                    box_.element,
-                    &box_.style,
-                    &box_.children,
+                    box_.core.element,
+                    &box_.core.style,
+                    &box_.core.children,
                     stylesheets,
                     child_top,
                     child_height,
@@ -163,8 +179,8 @@ impl<'a> LayoutBuilder<'a> {
                     return;
                 };
                 self.paint_table_cell_anonymous_child_slice(
-                    &box_.style,
-                    &box_.children,
+                    &box_.core.style,
+                    &box_.core.children,
                     child_top,
                     slice_top,
                     slice_bottom,
@@ -193,18 +209,18 @@ impl<'a> LayoutBuilder<'a> {
                 let box_tree::FormattingBox::AtomicInline(box_) = child_box else {
                     return;
                 };
-                if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Svg) {
+                if replaced_element_kind(box_.core.element) == Some(ReplacedElementKind::Svg) {
                     self.paint_table_cell_replaced_child_slice(
-                        box_.element,
-                        &box_.style,
+                        box_.core.element,
+                        &box_.core.style,
                         child_top,
                         child_height,
                     );
                 } else {
                     self.paint_table_cell_element_child_slice(
-                        box_.element,
-                        &box_.style,
-                        &box_.children,
+                        box_.core.element,
+                        &box_.core.style,
+                        &box_.core.children,
                         stylesheets,
                         child_top,
                         child_height,
@@ -218,8 +234,8 @@ impl<'a> LayoutBuilder<'a> {
                     return;
                 };
                 self.paint_table_cell_replaced_child_slice(
-                    box_.element,
-                    &box_.style,
+                    box_.core.element,
+                    &box_.core.style,
                     child_top,
                     child_height,
                 );
@@ -286,9 +302,9 @@ impl<'a> LayoutBuilder<'a> {
         let translated = nested
             .fragment
             .clone()
-            .translated(PaintTranslation::new(x, child_plan.child_top));
-        let bounds =
-            PageTopRect::new(x, child_plan.child_top, nested.width, nested.height).paint_clip();
+            .translated(PaintTranslation::new(x, child_plan.painted_child_top));
+        let bounds = PageTopRect::new(x, child_plan.painted_child_top, nested.width, nested.height)
+            .paint_clip();
         let slice_clip = PaintClip::from_paint_rect(PaintRect::new(
             PaintPoint::new(x, child_plan.slice_bottom),
             PaintSize::new(nested.width, slice_height),
@@ -468,6 +484,8 @@ impl<'a> LayoutBuilder<'a> {
             child_top,
             slice_top,
             slice_bottom,
+            slice_top,
+            slice_bottom,
         ) {
             let child = &children[child_plan.source_child_index];
             if matches!(
@@ -495,7 +513,11 @@ impl<'a> LayoutBuilder<'a> {
         table_metrics: TableMetrics,
         column_plan: &TableColumnPlan,
         fragment: &TableBodyPaintFragment,
-    ) -> (Vec<PaintPrimitive>, Vec<PaintPrimitive>) {
+    ) -> (
+        Vec<PaintPrimitive>,
+        Vec<PaintPrimitive>,
+        Vec<RelativeTablePartStructuralPaint>,
+    ) {
         let top = fragment.plan.fragment_top;
         let bottom = fragment.bottom();
         let height = (top - bottom).max(0.0);
@@ -504,8 +526,9 @@ impl<'a> LayoutBuilder<'a> {
             table_vertical_edge_spacing(&[fragment_has_occupied_row], table_metrics);
         let mut backgrounds = Vec::new();
         let mut outlines = Vec::new();
+        let mut relative_part_paints = Vec::new();
         if height <= 0.0 && vertical_edge_spacing <= 0.0 {
-            return (backgrounds, outlines);
+            return (backgrounds, outlines, relative_part_paints);
         }
 
         if let Some(fill) = table_style.background_color {
@@ -541,18 +564,48 @@ impl<'a> LayoutBuilder<'a> {
         let fragment_rows = fragment.rows();
         let fragment_row_tops = fragment.row_tops();
         let fragment_row_heights = fragment.row_heights();
+        let fragment_row_offsets = fragment.row_offsets();
+        let fragment_original_row_heights = fragment.original_row_heights();
         let grid_placement = fragment.grid_placement;
-        for (start_column, end_column, column_group) in
-            table_column_group_spans(columns, column_plan.column_count())
+        let grid_row_bounds = fragment.grid_row_bounds.as_deref();
+        let mut column_group_spans = table_column_group_spans(columns, column_plan.column_count());
+        if let Some(placement) = grid_placement
+            && table_style.writing_mode.has_vertical_lines()
         {
+            // Column and column-group backgrounds are disjoint within their
+            // respective CSS table painting layers.  Their source order can
+            // run in the opposite physical direction in a vertical or
+            // sideways root, though.  Use the committed page projection to
+            // paint them in a stable visual order, so a later background
+            // cannot soften the shared antialiased edge of an earlier one.
+            // <https://www.w3.org/TR/css-tables-3/#drawing-backgrounds>
+            // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+            column_group_spans.sort_by(
+                |(first_start, first_end, _), (second_start, second_end, _)| {
+                    compare_table_column_page_paint_order(
+                        placement,
+                        column_plan,
+                        *first_start,
+                        *first_end,
+                        *second_start,
+                        *second_end,
+                    )
+                },
+            );
+        }
+        let mut synthetic_group_backgrounds = Vec::new();
+        for (start_column, end_column, column_group) in column_group_spans {
             let column_group_style =
                 self.style_for_table_column_group(&column_group, table_style, stylesheets);
-            if let Some(placement) = grid_placement
-                && column_group_style.writing_mode.has_vertical_lines()
+            let mut layer_primitives = Vec::new();
+            if let (Some(placement), Some(row_bounds)) = (grid_placement, grid_row_bounds)
+                && table_style.writing_mode.has_vertical_lines()
             {
-                backgrounds.extend(table_column_grid_background_primitives(
+                layer_primitives.extend(table_column_grid_background_primitives(
                     placement,
                     column_plan,
+                    &fragment_rows,
+                    row_bounds,
                     start_column,
                     end_column,
                     &column_group_style,
@@ -561,7 +614,7 @@ impl<'a> LayoutBuilder<'a> {
                     self.resource_cache,
                 ));
             } else {
-                backgrounds.extend(table_column_fragment_background_primitives(
+                layer_primitives.extend(table_column_fragment_background_primitives(
                     table_x,
                     top,
                     height,
@@ -574,7 +627,7 @@ impl<'a> LayoutBuilder<'a> {
                     &fragment_row_tops,
                     &fragment_row_heights,
                 ));
-                backgrounds.extend(table_column_fragment_background_image_primitives(
+                layer_primitives.extend(table_column_fragment_background_image_primitives(
                     table_x,
                     top,
                     height,
@@ -591,8 +644,19 @@ impl<'a> LayoutBuilder<'a> {
                     self.resource_cache,
                 ));
             }
+            if table_column_group_has_explicit_columns(
+                columns,
+                start_column,
+                end_column,
+                column_plan.column_count(),
+            ) {
+                backgrounds.extend(layer_primitives);
+            } else {
+                synthetic_group_backgrounds.push((start_column, layer_primitives));
+            }
         }
         let mut column_index = 0;
+        let mut column_spans = Vec::new();
         for column in columns {
             if column_index >= column_plan.column_count() {
                 break;
@@ -615,13 +679,40 @@ impl<'a> LayoutBuilder<'a> {
                 column_index += span;
                 continue;
             }
+            column_spans.push((column_index, span, column));
+            column_index += span;
+        }
+        if let Some(placement) = grid_placement
+            && table_style.writing_mode.has_vertical_lines()
+        {
+            // See the matching column-group ordering above. These spans are
+            // disjoint at the column paint layer, so this changes only the
+            // rasterization order of shared fractional edges.
+            column_spans.sort_by(
+                |(first_start, first_span, _), (second_start, second_span, _)| {
+                    compare_table_column_page_paint_order(
+                        placement,
+                        column_plan,
+                        *first_start,
+                        first_start.saturating_add(*first_span),
+                        *second_start,
+                        second_start.saturating_add(*second_span),
+                    )
+                },
+            );
+        }
+        let mut physical_column_backgrounds = Vec::new();
+        for (column_index, span, column) in column_spans {
             let column_style = self.style_for_table_column(column, table_style, stylesheets);
-            if let Some(placement) = grid_placement
-                && column_style.writing_mode.has_vertical_lines()
+            let mut layer_primitives = Vec::new();
+            if let (Some(placement), Some(row_bounds)) = (grid_placement, grid_row_bounds)
+                && table_style.writing_mode.has_vertical_lines()
             {
-                backgrounds.extend(table_column_grid_background_primitives(
+                layer_primitives.extend(table_column_grid_background_primitives(
                     placement,
                     column_plan,
+                    &fragment_rows,
+                    row_bounds,
                     column_index,
                     column_index + span,
                     &column_style,
@@ -630,7 +721,7 @@ impl<'a> LayoutBuilder<'a> {
                     self.resource_cache,
                 ));
             } else {
-                backgrounds.extend(table_column_fragment_background_primitives(
+                layer_primitives.extend(table_column_fragment_background_primitives(
                     table_x,
                     top,
                     height,
@@ -643,7 +734,7 @@ impl<'a> LayoutBuilder<'a> {
                     &fragment_row_tops,
                     &fragment_row_heights,
                 ));
-                backgrounds.extend(table_column_fragment_background_image_primitives(
+                layer_primitives.extend(table_column_fragment_background_image_primitives(
                     table_x,
                     top,
                     height,
@@ -660,19 +751,59 @@ impl<'a> LayoutBuilder<'a> {
                     self.resource_cache,
                 ));
             }
-            column_index += span;
+            physical_column_backgrounds.push((column_index, layer_primitives));
+        }
+        physical_column_backgrounds.extend(synthetic_group_backgrounds);
+        physical_column_backgrounds.sort_by_key(|(start_column, _)| *start_column);
+        if table_columns_paint_in_reverse_page_order(table_style) {
+            physical_column_backgrounds.reverse();
+        }
+        for (_, layer_primitives) in physical_column_backgrounds {
+            backgrounds.extend(layer_primitives);
         }
 
-        let occupied_inline_bounds = column_plan
-            .occupied_inline_bounds()
-            .unwrap_or_else(|| TableInlineBounds::new(0.0, used_table_width));
-        let occupied_x = table_x + occupied_inline_bounds.start;
-        let occupied_width = occupied_inline_bounds.size;
+        let occupied_inline_bounds = column_plan.occupied_inline_bounds().unwrap_or_else(|| {
+            TableInlineBounds::new(
+                TableGridLength::new(0.0),
+                TableGridLength::new(used_table_width),
+            )
+        });
+        let occupied_x = occupied_inline_bounds.page_x(table_x);
+        let occupied_width = occupied_inline_bounds.page_width();
+        // Relative offsets of table rows and row groups resolve against the
+        // table grid's physical containing block. The grid remains in normal
+        // table coordinates; only the generated structural paint below is
+        // translated.
+        // <https://drafts.csswg.org/css-position-3/#relative-positioning>
+        let table_grid_containing_block = ContainingBlock::from_page_top_rect(PageTopRect::new(
+            table_x,
+            top,
+            used_table_width,
+            height,
+        ));
 
         for (start_row, end_row, row_group) in table_row_group_spans(rows) {
             let row_group_style =
                 self.style_for_table_row_group(&row_group, table_style, stylesheets);
-            if let Some(fill) = row_group_style.background_color {
+            let background_start = backgrounds.len();
+            let outline_start = outlines.len();
+            if let (Some(placement), Some(row_bounds)) = (grid_placement, grid_row_bounds) {
+                backgrounds.extend(table_row_group_grid_background_primitives(
+                    placement,
+                    row_bounds,
+                    column_plan,
+                    grid,
+                    &fragment_rows,
+                    &fragment_row_heights,
+                    &fragment_row_offsets,
+                    start_row,
+                    end_row,
+                    &row_group_style,
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                ));
+            } else if let Some(fill) = row_group_style.background_color {
                 let mut segment_start = None;
                 let mut previous_local = None;
                 for (local_row, original_row) in fragment_rows.iter().cloned().enumerate() {
@@ -686,8 +817,7 @@ impl<'a> LayoutBuilder<'a> {
                     {
                         push_table_fragment_row_span_background(
                             &mut backgrounds,
-                            occupied_x,
-                            occupied_width,
+                            PageInlineSpan::new(occupied_x, occupied_width),
                             &fragment_row_tops,
                             &fragment_row_heights,
                             start,
@@ -699,8 +829,7 @@ impl<'a> LayoutBuilder<'a> {
                 if let (Some(start), Some(end)) = (segment_start, previous_local) {
                     push_table_fragment_row_span_background(
                         &mut backgrounds,
-                        occupied_x,
-                        occupied_width,
+                        PageInlineSpan::new(occupied_x, occupied_width),
                         &fragment_row_tops,
                         &fragment_row_heights,
                         start,
@@ -722,35 +851,113 @@ impl<'a> LayoutBuilder<'a> {
                     &row_group_style,
                 );
             }
+            let offset = relative_position_offset(&row_group_style, table_grid_containing_block);
+            let translation = PaintTranslation::new(offset.x(), offset.y());
+            for primitive in &mut backgrounds[background_start..] {
+                *primitive = primitive.clone().translated(translation);
+            }
+            for primitive in &mut outlines[outline_start..] {
+                *primitive = primitive.clone().translated(translation);
+            }
+            if matches!(
+                row_group_style.position,
+                Position::Relative | Position::Sticky
+            ) {
+                let mut primitives = backgrounds.split_off(background_start);
+                primitives.extend(outlines.split_off(outline_start));
+                relative_part_paints.push(RelativeTablePartStructuralPaint {
+                    style: row_group_style.as_computed().clone(),
+                    bounds: PageTopRect::new(occupied_x, top, occupied_width, height).paint_clip(),
+                    primitives,
+                });
+            }
         }
 
         for (local_row, original_row) in fragment_rows.iter().cloned().enumerate() {
             let row_style = self.style_for_table_row(&rows[original_row], table_style, stylesheets);
             if let Some(bounds) = table_fragment_row_span_bounds(
-                occupied_x,
-                occupied_width,
+                PageInlineSpan::new(occupied_x, occupied_width),
                 &fragment_row_tops,
                 &fragment_row_heights,
                 local_row,
                 local_row + 1,
             ) {
-                backgrounds.extend(table_row_fragment_background_primitives(
-                    table_x,
-                    bounds.paint_rect(),
-                    column_plan,
-                    grid,
-                    &fragment_rows,
-                    &fragment_row_tops,
-                    &fragment_row_heights,
-                    original_row,
-                    &row_style,
-                    self.base_url,
-                    self.root_url,
-                    self.resource_cache,
-                ));
+                let mut row_backgrounds = if let (Some(placement), Some(row_bounds)) =
+                    (grid_placement, grid_row_bounds)
+                {
+                    table_row_grid_background_primitives(
+                        placement,
+                        row_bounds,
+                        column_plan,
+                        grid,
+                        &fragment_rows,
+                        &fragment_row_heights,
+                        &fragment_row_offsets,
+                        original_row,
+                        &row_style,
+                        self.base_url,
+                        self.root_url,
+                        self.resource_cache,
+                    )
+                } else {
+                    table_row_fragment_background_primitives(
+                        table_x,
+                        bounds.paint_rect(),
+                        column_plan,
+                        grid,
+                        &fragment_rows,
+                        &fragment_row_tops,
+                        &fragment_row_heights,
+                        &fragment_row_offsets,
+                        &fragment_original_row_heights,
+                        original_row,
+                        &row_style,
+                        self.base_url,
+                        self.root_url,
+                        self.resource_cache,
+                    )
+                };
+                let row_offset = relative_position_offset(&row_style, table_grid_containing_block);
+                let row_group_offset = rows[original_row]
+                    .row_groups
+                    .last()
+                    .map(|group| self.style_for_table_row_group(group, table_style, stylesheets))
+                    .map(|style| relative_position_offset(&style, table_grid_containing_block))
+                    .unwrap_or_else(RelativeOffset::zero);
+                let translation = PaintTranslation::new(
+                    row_offset.x() + row_group_offset.x(),
+                    row_offset.y() + row_group_offset.y(),
+                );
+                for primitive in &mut row_backgrounds {
+                    *primitive = primitive.clone().translated(translation);
+                }
+                let relative_style =
+                    matches!(row_style.position, Position::Relative | Position::Sticky)
+                        .then(|| row_style.as_computed().clone())
+                        .or_else(|| {
+                            rows[original_row]
+                                .row_groups
+                                .last()
+                                .map(|group| {
+                                    self.style_for_table_row_group(group, table_style, stylesheets)
+                                })
+                                .filter(|style| {
+                                    matches!(style.position, Position::Relative | Position::Sticky)
+                                })
+                                .map(|style| style.as_computed().clone())
+                        });
+                if let Some(relative_style) = relative_style {
+                    relative_part_paints.push(RelativeTablePartStructuralPaint {
+                        style: relative_style.clone(),
+                        bounds: PaintClip::from_paint_rect(bounds.paint_rect()),
+                        primitives: row_backgrounds,
+                    });
+                } else {
+                    backgrounds.extend(row_backgrounds);
+                }
             }
         }
-        (backgrounds, outlines)
+        (backgrounds, outlines, relative_part_paints)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -814,8 +1021,7 @@ impl<'a> LayoutBuilder<'a> {
         row_group_style: &ComputedStyle,
     ) {
         let Some(bounds) = table_fragment_row_span_bounds(
-            table_x,
-            used_table_width,
+            PageInlineSpan::new(table_x, used_table_width),
             row_tops,
             row_heights,
             start,
@@ -846,19 +1052,28 @@ impl<'a> LayoutBuilder<'a> {
         fragment: &TableBodyPaintFragment,
     ) -> Vec<PaintPrimitive> {
         let rows = fragment.rows();
-        let row_tops = fragment.row_tops();
         let row_heights = fragment.row_heights();
         let row_offsets = fragment.row_offsets();
         let original_row_heights = fragment.original_row_heights();
-        let placement = TableGridPlacement::new(PageTopPoint::new(table_x, 0.0));
+        let horizontal_page_top = fragment.row_tops().into_iter().fold(0.0_f32, f32::max);
+        // Horizontal table fragments retain page-local row coordinates even
+        // when a retained logical placement was not needed by another table
+        // paint phase. Preserve that established projection instead of
+        // suppressing all collapsed-border paint; vertical roots still require
+        // the retained grid placement inside `paint_fragment_rows`.
+        let placement = fragment
+            .grid_placement
+            .unwrap_or_else(|| TableGridPlacement::new(PageTopPoint::new(table_x, 0.0)));
         let (rects, paths) = geometry.grid.paint_fragment_rows(
             placement,
+            TableGridPlacement::new(PageTopPoint::new(table_x, horizontal_page_top)),
             column_plan,
             &rows,
-            &row_tops,
+            &fragment.row_tops(),
             &row_heights,
             &row_offsets,
             &original_row_heights,
+            fragment.grid_row_bounds.as_deref(),
         );
         rects
             .into_iter()
@@ -907,29 +1122,37 @@ impl<'a> LayoutBuilder<'a> {
                 // physical-height metric cannot size that track.
                 // <https://drafts.csswg.org/css-tables-3/#row-layout>
                 // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
-                let cell_block_contribution =
-                    if context.table_style.writing_mode.has_vertical_lines() {
-                        table_cell_content_max_width(
-                            self,
-                            cell,
-                            &prepared.style,
-                            context.stylesheets,
-                            Some(prepared.borders),
-                        )
-                    } else {
-                        prepared.metrics.border_box_height
-                    };
+                let cell_block_contribution = table_cell_root_block_track_contribution(
+                    self,
+                    cell,
+                    &prepared.style,
+                    context.table_style,
+                    context.stylesheets,
+                    Some(prepared.borders),
+                    prepared.metrics.border_box_height,
+                );
                 row_height = row_height.max(cell_block_contribution);
             }
-            if table_cell_participates_in_physical_y_row_baseline(
-                &prepared.style,
-                row_style,
-                placement,
-            ) && let Some(baseline) = self.table_cell_physical_y_row_baseline_candidate(
-                cell,
-                &prepared,
-                context.stylesheets,
-            ) {
+            // This baseline accumulator stores a physical-Y extent.  It can
+            // enlarge a row only when the table root's block tracks also run
+            // on physical Y; for vertical roots, those tracks run across the
+            // page and a cell baseline is an alignment detail rather than a
+            // row-width constraint.
+            // <https://drafts.csswg.org/css-tables-3/#row-layout>
+            // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+            if !TableCellAxisAdapter::for_table(context.table_style)
+                .root_track_uses_physical_width(TableRootTrackAxis::Block)
+                && table_cell_participates_in_physical_y_row_baseline(
+                    &prepared.style,
+                    row_style,
+                    placement,
+                )
+                && let Some(baseline) = self.table_cell_physical_y_row_baseline_candidate(
+                    cell,
+                    &prepared,
+                    context.stylesheets,
+                )
+            {
                 has_baseline_cells = true;
                 max_baseline = max_baseline.max(baseline);
                 max_after_baseline = max_after_baseline
@@ -965,9 +1188,15 @@ impl<'a> LayoutBuilder<'a> {
         let mut spanning_cells = Vec::new();
         for (row_index, row) in context.rows.iter().enumerate() {
             let row_style = self.style_for_table_row(row, context.table_style, context.stylesheets);
+            let source_height = if row_style.running_element_name.is_some() {
+                0.0
+            } else {
+                self.measure_table_row_height(context, row_index, &row_style)
+            };
             if table_row_is_collapsed(&row_style) || row_style.running_element_name.is_some() {
                 plan_rows.push(TableRowHeightPlan {
                     base: 0.0,
+                    source_height,
                     reference: 0.0,
                     final_height: 0.0,
                     auto: false,
@@ -986,6 +1215,7 @@ impl<'a> LayoutBuilder<'a> {
             ) {
                 plan_rows.push(TableRowHeightPlan {
                     base: 0.0,
+                    source_height: 0.0,
                     reference: 0.0,
                     final_height: 0.0,
                     auto: false,
@@ -993,9 +1223,10 @@ impl<'a> LayoutBuilder<'a> {
                 });
                 continue;
             }
-            let base = self.measure_table_row_height(context, row_index, &row_style);
+            let base = source_height;
             plan_rows.push(TableRowHeightPlan {
                 base,
+                source_height,
                 reference: base,
                 final_height: base,
                 auto: table_root_block_size(&row_style).is_auto(),
@@ -1019,18 +1250,15 @@ impl<'a> LayoutBuilder<'a> {
                     ) else {
                         continue;
                     };
-                    let required_block_size =
-                        if context.table_style.writing_mode.has_vertical_lines() {
-                            table_cell_content_max_width(
-                                self,
-                                cell,
-                                &prepared.style,
-                                context.stylesheets,
-                                Some(prepared.borders),
-                            )
-                        } else {
-                            prepared.metrics.border_box_height
-                        };
+                    let required_block_size = table_cell_root_block_track_contribution(
+                        self,
+                        cell,
+                        &prepared.style,
+                        context.table_style,
+                        context.stylesheets,
+                        Some(prepared.borders),
+                        prepared.metrics.border_box_height,
+                    );
                     spanning_cells.push((row_index, placement.rowspan, required_block_size));
                 }
             }
@@ -1076,4 +1304,47 @@ impl<'a> LayoutBuilder<'a> {
             target_content_height,
         }
     }
+}
+
+/// Compare two column-layer spans in the stable order of their committed page
+/// geometry.
+///
+/// The table grid owns source logical order, while the PDF surface owns the
+/// final physical edge coverage.  Painting from physical top-to-bottom and
+/// then left-to-right makes equivalent writing-mode projections share the
+/// same antialiased edge ownership:
+/// <https://drafts.csswg.org/css-tables-3/#drawing-backgrounds>
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+fn compare_table_column_page_paint_order(
+    placement: TableGridPlacement,
+    column_plan: &TableColumnPlan,
+    first_start: usize,
+    first_end: usize,
+    second_start: usize,
+    second_end: usize,
+) -> std::cmp::Ordering {
+    let first = table_column_page_paint_rect(placement, column_plan, first_start, first_end);
+    let second = table_column_page_paint_rect(placement, column_plan, second_start, second_end);
+    second
+        .top_y()
+        .total_cmp(&first.top_y())
+        .then_with(|| first.x().total_cmp(&second.x()))
+}
+
+fn table_column_page_paint_rect(
+    placement: TableGridPlacement,
+    column_plan: &TableColumnPlan,
+    start_column: usize,
+    end_column: usize,
+) -> PageTopRect {
+    let inline_bounds = column_plan.inline_bounds_for_span(
+        start_column,
+        end_column
+            .min(column_plan.column_count())
+            .saturating_sub(start_column),
+    );
+    placement.page_top_rect_for(TableGridRect::new(
+        TableGridPoint::from_lengths(inline_bounds.start, TableGridLength::new(0.0)),
+        TableGridSize::from_lengths(inline_bounds.size, placement.logical_block_grid_extent()),
+    ))
 }

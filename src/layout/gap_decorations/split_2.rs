@@ -25,7 +25,7 @@ pub(in crate::layout) fn segment_start_endpoint(
     gap: GapBand,
     cursor: f32,
     crossing_gap: GapBand,
-    crossing_rule_width: f32,
+    crossing_rule_width: GapRuleWidth,
     crossing_rule_can_paint: bool,
 ) -> GapRuleEndpoint {
     if cursor <= GAP_RULE_EPSILON {
@@ -36,7 +36,6 @@ pub(in crate::layout) fn segment_start_endpoint(
             gap,
             cursor,
             crossing_gap,
-            crossing_gap.size(),
             crossing_rule_width,
             crossing_rule_can_paint,
         )
@@ -48,8 +47,7 @@ pub(in crate::layout) fn segment_junction_endpoint(
     gap: GapBand,
     position: f32,
     crossing_gap: GapBand,
-    crossing_gap_width: f32,
-    crossing_rule_width: f32,
+    crossing_rule_width: GapRuleWidth,
     crossing_rule_can_paint: bool,
 ) -> GapRuleEndpoint {
     let crossing_segment_absent = context.container_kind == GapContainerKind::Grid
@@ -59,18 +57,18 @@ pub(in crate::layout) fn segment_junction_endpoint(
     if crossing_segment_absent {
         GapRuleEndpoint::cap(position)
     } else {
-        GapRuleEndpoint::junction(position, crossing_gap_width, crossing_rule_width)
+        GapRuleEndpoint::junction(position, crossing_gap, crossing_rule_width)
     }
 }
 
 pub(in crate::layout) fn crossing_rule_can_paint(
-    width: f32,
+    width: GapRuleWidth,
     style: Option<BorderStyle>,
-    color: Option<Color>,
+    color: Option<CssColor>,
 ) -> bool {
-    width > GAP_RULE_EPSILON
+    width.can_paint()
         && !style.unwrap_or(BorderStyle::None).suppresses_used_width()
-        && color.unwrap_or(Color::TRANSPARENT).is_visible()
+        && color.unwrap_or(CssColor::TRANSPARENT).is_visible()
 }
 
 pub(in crate::layout) fn grid_crossing_segment_present_at_junction(
@@ -147,7 +145,7 @@ pub(in crate::layout) fn nearest_crossing_gap(
 pub(in crate::layout) fn crossing_width_for_gap(
     context: AxisRuleContext<'_>,
     gap: GapBand,
-) -> Option<f32> {
+) -> Option<GapRuleWidth> {
     context
         .crossing_gaps
         .iter()
@@ -162,7 +160,7 @@ pub(in crate::layout) fn crossing_width_for_gap(
                 .widths
                 .value_for_index(index, crossing_gap_count)
                 .map(|width| {
-                    used_gap_rule_length(width, PercentageBasis::definite(layout_pt(gap.size())))
+                    used_gap_rule_width(width, PercentageBasis::definite(layout_pt(gap.size())))
                 })
         })
 }
@@ -186,12 +184,9 @@ pub(in crate::layout) fn crossing_can_paint_for_gap(
                     .widths
                     .value_for_index(index, crossing_gap_count)
                     .map(|width| {
-                        used_gap_rule_length(
-                            width,
-                            PercentageBasis::definite(layout_pt(gap.size())),
-                        )
+                        used_gap_rule_width(width, PercentageBasis::definite(layout_pt(gap.size())))
                     })
-                    .unwrap_or(0.0),
+                    .unwrap_or(GapRuleWidth::ZERO),
                 context
                     .crossing_rule
                     .styles
@@ -211,25 +206,25 @@ pub(in crate::layout) fn offset_gap_rule_segment(
     let start_inset = used_gap_rule_endpoint_inset(
         match segment.start.kind {
             GapRuleEndpointKind::Cap => rule.inset_cap_start.clone(),
-            GapRuleEndpointKind::Junction => rule.inset_junction_start.clone(),
+            GapRuleEndpointKind::Junction(_) => rule.inset_junction_start.clone(),
         },
         segment.start,
     );
     let end_inset = used_gap_rule_endpoint_inset(
         match segment.end.kind {
             GapRuleEndpointKind::Cap => rule.inset_cap_end.clone(),
-            GapRuleEndpointKind::Junction => rule.inset_junction_end.clone(),
+            GapRuleEndpointKind::Junction(_) => rule.inset_junction_end.clone(),
         },
         segment.end,
     );
     GapDecorationSegment {
         start: GapRuleEndpoint {
             position: segment.start.position + start_inset,
-            ..segment.start
+            kind: segment.start.kind,
         },
         end: GapRuleEndpoint {
             position: segment.end.position - end_inset,
-            ..segment.end
+            kind: segment.end.kind,
         },
     }
 }
@@ -239,14 +234,24 @@ pub(in crate::layout) fn used_gap_rule_endpoint_inset(
     endpoint: GapRuleEndpoint,
 ) -> f32 {
     match value {
-        css::GapRuleInsetValue::LengthPercentage(value) => value
-            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
-                endpoint.crossing_gap_width,
-            )))
-            .map(layout_points)
-            .unwrap_or_else(|| value.length_points()),
-        css::GapRuleInsetValue::OverlapJoin if endpoint.kind == GapRuleEndpointKind::Junction => {
-            -(endpoint.crossing_gap_width + endpoint.crossing_rule_width) * 0.5
+        css::GapRuleInsetValue::LengthPercentage(value) => match endpoint.kind {
+            GapRuleEndpointKind::Cap => value.length_points(),
+            GapRuleEndpointKind::Junction(junction) => value
+                .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(
+                    junction.crossing_gap.size(),
+                )))
+                .map(layout_points)
+                .unwrap_or_else(|| value.length_points()),
+        },
+        css::GapRuleInsetValue::OverlapJoin
+            if matches!(endpoint.kind, GapRuleEndpointKind::Junction(_)) =>
+        {
+            match endpoint.kind {
+                GapRuleEndpointKind::Junction(junction) => junction
+                    .crossing_rule_width
+                    .overlap_join_inset(junction.crossing_gap),
+                GapRuleEndpointKind::Cap => unreachable!("junction match retains junction data"),
+            }
         }
         css::GapRuleInsetValue::OverlapJoin => 0.0,
     }
@@ -273,7 +278,7 @@ pub(in crate::layout) fn solid_gap_rule_centerlines(
                     rect.y() + rect.height(),
                     rect.x() + rect.width() / 2.0,
                     rect.y(),
-                    rect.width(),
+                    PaintStrokeWidth::new(rect.width()),
                     color,
                     None,
                 ))
@@ -283,7 +288,7 @@ pub(in crate::layout) fn solid_gap_rule_centerlines(
                     rect.y() + rect.height() / 2.0,
                     rect.x() + rect.width(),
                     rect.y() + rect.height() / 2.0,
-                    rect.height(),
+                    PaintStrokeWidth::new(rect.height()),
                     color,
                     None,
                 ))
@@ -474,15 +479,15 @@ pub(in crate::layout) fn gap_rule_segment_primitives(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     segment: GapDecorationSegment,
-    width: f32,
+    width: GapRuleWidth,
     style: BorderStyle,
-    color: Color,
+    color: CssColor,
 ) -> Vec<PaintPrimitive> {
-    if width <= GAP_RULE_EPSILON || style.suppresses_used_width() || !color.is_visible() {
+    if !width.can_paint() || style.suppresses_used_width() || !color.is_visible() {
         return Vec::new();
     }
     match style {
-        BorderStyle::Double if width >= 3.0 => {
+        BorderStyle::Double if width.double_bands().is_some() => {
             double_gap_rule_primitives(context, gap, segment, width, color)
         }
         BorderStyle::Groove | BorderStyle::Ridge => {
@@ -516,21 +521,25 @@ fn patterned_gap_rule_primitives(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     segment: GapDecorationSegment,
-    width: f32,
+    width: GapRuleWidth,
     style: BorderStyle,
-    color: Color,
+    color: CssColor,
 ) -> Vec<PaintPrimitive> {
     let (axis_start, axis_length, cross_start, horizontal) = match context.kind {
         GapRuleAxisKind::Column => (
             context.container.page_rect.top_y() - segment.end.position,
             segment.end.position - segment.start.position,
-            context.container.page_rect.x() + gap.center() - width / 2.0,
+            width
+                .centered_span(context.container.page_rect.x() + gap.center())
+                .start,
             false,
         ),
         GapRuleAxisKind::Row => (
             context.container.page_rect.x() + segment.start.position,
             segment.end.position - segment.start.position,
-            context.container.page_rect.top_y() - gap.center() - width / 2.0,
+            width
+                .centered_span(context.container.page_rect.top_y() - gap.center())
+                .start,
             true,
         ),
     };
@@ -541,7 +550,7 @@ fn patterned_gap_rule_primitives(
             axis_start,
             axis_length,
             cross_start,
-            width,
+            width.into_paint_stroke_width(),
             horizontal,
             color,
         );
@@ -553,9 +562,9 @@ fn patterned_gap_rule_primitives(
             axis_start,
             axis_length,
             cross_start,
-            width,
+            width.into_paint_stroke_width(),
             horizontal,
-            width,
+            width.into_paint_stroke_width(),
             color,
         );
         rects.into_iter().map(PaintPrimitive::Rect).collect()
@@ -566,16 +575,22 @@ pub(in crate::layout) fn double_gap_rule_primitives(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     segment: GapDecorationSegment,
-    width: f32,
-    color: Color,
+    width: GapRuleWidth,
+    color: CssColor,
 ) -> Vec<PaintPrimitive> {
     // A gap rule has a centerline, unlike a particular side of a border box.
     // Reusing `paint_border_side` here puts the second `double` stripe on the
     // outside of its selected box side, which can move it out of the gap.
     // Keep both stripes symmetric around the rule centerline instead.
     // <https://drafts.csswg.org/css-gaps-1/#gap-rule-painting>
-    let stripe = (width / 3.0).max(1.0);
-    let offset = (width - stripe) / 2.0;
+    let stripe = GapRuleWidth::new(
+        width
+            .double_bands()
+            .expect("double gap-rule paint requires a double-band width")
+            .stripe
+            .get(),
+    );
+    let offset = width.center_offset() - stripe.center_offset();
     vec![
         solid_gap_rule_primitive_with_cross_offset(context, gap, segment, stripe, color, -offset),
         solid_gap_rule_primitive_with_cross_offset(context, gap, segment, stripe, color, offset),
@@ -586,22 +601,29 @@ pub(in crate::layout) fn groove_ridge_gap_rule_primitives(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     segment: GapDecorationSegment,
-    width: f32,
+    width: GapRuleWidth,
     style: BorderStyle,
-    color: Color,
+    color: CssColor,
 ) -> Vec<PaintPrimitive> {
     let (first, second) =
         groove_ridge_border_colors(style, gap_rule_border_edge(context.kind, true), color);
-    let half = width / 2.0;
+    let half = width.half();
     vec![
-        solid_gap_rule_primitive_with_cross_offset(context, gap, segment, half, first, -half / 2.0),
         solid_gap_rule_primitive_with_cross_offset(
             context,
             gap,
             segment,
-            width - half,
+            half,
+            first,
+            -half.center_offset(),
+        ),
+        solid_gap_rule_primitive_with_cross_offset(
+            context,
+            gap,
+            segment,
+            width.remainder_after(half),
             second,
-            (width - half) / 2.0,
+            width.remainder_after(half).center_offset(),
         ),
     ]
 }
@@ -610,8 +632,8 @@ pub(in crate::layout) fn solid_gap_rule_primitive(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     segment: GapDecorationSegment,
-    width: f32,
-    color: Color,
+    width: GapRuleWidth,
+    color: CssColor,
     dash: Option<(f32, f32)>,
 ) -> PaintPrimitive {
     solid_gap_rule_primitive_with_cross_offset_and_dash(
@@ -623,8 +645,8 @@ pub(in crate::layout) fn solid_gap_rule_primitive_with_cross_offset(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     segment: GapDecorationSegment,
-    width: f32,
-    color: Color,
+    width: GapRuleWidth,
+    color: CssColor,
     cross_offset: f32,
 ) -> PaintPrimitive {
     solid_gap_rule_primitive_with_cross_offset_and_dash(
@@ -642,8 +664,8 @@ pub(in crate::layout) fn solid_gap_rule_primitive_with_cross_offset_and_dash(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     segment: GapDecorationSegment,
-    width: f32,
-    color: Color,
+    width: GapRuleWidth,
+    color: CssColor,
     cross_offset: f32,
     dash: Option<(f32, f32)>,
 ) -> PaintPrimitive {
@@ -656,28 +678,30 @@ pub(in crate::layout) fn solid_gap_rule_primitive_with_cross_offset_and_dash(
     if dash.is_none() {
         return match context.kind {
             GapRuleAxisKind::Column => {
-                let x = context.container.page_rect.x() + gap.center() + cross_offset - width / 2.0;
+                let span = width
+                    .centered_span(context.container.page_rect.x() + gap.center() + cross_offset);
                 PaintPrimitive::Rect(RenderedRect::new(
-                    x,
+                    span.start,
                     context.container.page_rect.top_y() - segment.end.position,
-                    width,
+                    span.size(),
                     (segment.end.position - segment.start.position).max(0.0),
                     Some(color),
                     None,
-                    0.0,
+                    PaintStrokeWidth::ZERO,
                 ))
             }
             GapRuleAxisKind::Row => {
-                let y =
-                    context.container.page_rect.top_y() - gap.center() - cross_offset - width / 2.0;
+                let span = width.centered_span(
+                    context.container.page_rect.top_y() - gap.center() - cross_offset,
+                );
                 PaintPrimitive::Rect(RenderedRect::new(
                     context.container.page_rect.x() + segment.start.position,
-                    y,
+                    span.start,
                     (segment.end.position - segment.start.position).max(0.0),
-                    width,
+                    span.size(),
                     Some(color),
                     None,
-                    0.0,
+                    PaintStrokeWidth::ZERO,
                 ))
             }
         };
@@ -690,7 +714,7 @@ pub(in crate::layout) fn solid_gap_rule_primitive_with_cross_offset_and_dash(
                 context.container.page_rect.top_y() - segment.start.position,
                 x,
                 context.container.page_rect.top_y() - segment.end.position,
-                width,
+                width.into_paint_stroke_width(),
                 color,
                 dash,
             ))
@@ -702,7 +726,7 @@ pub(in crate::layout) fn solid_gap_rule_primitive_with_cross_offset_and_dash(
                 y,
                 context.container.page_rect.x() + segment.end.position,
                 y,
-                width,
+                width.into_paint_stroke_width(),
                 color,
                 dash,
             ))
@@ -731,16 +755,53 @@ impl AxisRuleContext<'_> {
     }
 }
 
-pub(in crate::layout) fn used_gap_rule_length<T, Source>(
+pub(in crate::layout) fn used_gap_rule_width<T, Source>(
     value: css::ComputedLengthPercentage,
     percentage_basis: PercentageBasis<T, Source>,
-) -> f32
+) -> GapRuleWidth
 where
     T: SemanticLengthExt,
 {
-    value
-        .used_length_with_percentage_basis(percentage_basis)
-        .map(layout_points)
-        .unwrap_or(value.length_points())
-        .max(0.0)
+    GapRuleWidth::new(
+        value
+            .used_length_with_percentage_basis(percentage_basis)
+            .map(layout_points)
+            .unwrap_or(value.length_points()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn junction_insets_retain_crossing_gap_geometry() {
+        let crossing_gap = GapBand {
+            start: 10.0,
+            end: 30.0,
+            grid_line: None,
+            segment_range: None,
+            rule_index: None,
+        };
+        let junction = GapRuleEndpoint::junction(20.0, crossing_gap, GapRuleWidth::new(4.0));
+        let percentage = css::GapRuleInsetValue::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(0.5),
+        );
+
+        assert_eq!(
+            used_gap_rule_endpoint_inset(percentage.clone(), junction),
+            10.0
+        );
+        assert_eq!(
+            used_gap_rule_endpoint_inset(css::GapRuleInsetValue::OverlapJoin, junction),
+            -12.0
+        );
+
+        let cap = GapRuleEndpoint::cap(20.0);
+        assert_eq!(used_gap_rule_endpoint_inset(percentage, cap), 0.0);
+        assert_eq!(
+            used_gap_rule_endpoint_inset(css::GapRuleInsetValue::OverlapJoin, cap),
+            0.0
+        );
+    }
 }

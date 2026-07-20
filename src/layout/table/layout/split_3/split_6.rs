@@ -1,4 +1,17 @@
 use super::*;
+use crate::layout::block::percentage_height_is_auto_for_margin_collapse;
+
+/// The first physical-Y table-row baseline together with the selected cell
+/// font's paint-coordinate adjustment.
+///
+/// Table sizing consumes `offset`, while an atomic `inline-table` must also
+/// translate that CSS-layout coordinate into its captured paint fragment's
+/// coordinate system.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::table) struct TableRowBaseline {
+    pub(in crate::layout::table) offset: f32,
+    pub(in crate::layout::table) rendered_font_adjustment: f32,
+}
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout::table) fn resolve_table_target_content_height(
@@ -25,12 +38,32 @@ impl<'a> LayoutBuilder<'a> {
                     + border_widths.bottom
             });
         if let Some(wrapper_border_box_block_size) = wrapper_border_box_block_size {
-            return Some(content_box_pt(
+            let assigned_grid_content_size = content_box_pt(
                 (wrapper_border_box_block_size.points()
                     - vertical_non_content.points()
                     - wrapper_non_grid_block_size.points())
                 .max(0.0),
-            ));
+            );
+            // Grid and flex alignment assign a used wrapper border-box span,
+            // but that span still participates in the table wrapper's own
+            // min/max constraints.  In particular, a stretched auto-height
+            // table must not bypass `max-height`; conversely, an authored
+            // max-height alone must not manufacture a target for intrinsic
+            // rows when no parent supplies a definite wrapper size.
+            // <https://drafts.csswg.org/css-tables/#computing-the-table-height>
+            return Some(
+                used_table_target_content_height(
+                    table_style,
+                    self.definite_block_size_stack
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(PercentageBasis::indefinite),
+                    vertical_non_content,
+                )
+                .map_or(assigned_grid_content_size, |constraint_target| {
+                    assigned_grid_content_size.min(constraint_target)
+                }),
+            );
         }
         used_table_target_content_height(
             table_style,
@@ -82,29 +115,21 @@ impl<'a> LayoutBuilder<'a> {
                 ) else {
                     continue;
                 };
-                let required_height = if context.table_style.writing_mode.has_vertical_lines() {
-                    // The table root's block track is physical width in a
-                    // vertical writing mode. Reusing the physical-height
-                    // cell metric here would grow the row during the
-                    // reference pass after its logical block size was
-                    // correctly established in the base pass.
-                    // <https://drafts.csswg.org/css-tables-3/#row-layout>
-                    // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
-                    table_cell_content_max_width(
-                        self,
-                        cell,
-                        &prepared.style,
-                        context.stylesheets,
-                        Some(prepared.borders),
-                    )
-                } else {
-                    self.table_cell_border_box_height_with_basis(
-                        &prepared.row_sizing_style,
-                        prepared.metrics.content_height,
-                        target_content_height_basis,
-                        prepared.borders,
-                    )
-                };
+                let physical_height = self.table_cell_border_box_height_with_basis(
+                    &prepared.row_sizing_style,
+                    prepared.metrics.content_height,
+                    target_content_height_basis,
+                    prepared.borders,
+                );
+                let required_height = table_cell_root_block_track_contribution(
+                    self,
+                    cell,
+                    &prepared.style,
+                    context.table_style,
+                    context.stylesheets,
+                    Some(prepared.borders),
+                    physical_height,
+                );
                 distribute_table_span_constraint(
                     plan_rows,
                     row_index,
@@ -235,7 +260,9 @@ impl<'a> LayoutBuilder<'a> {
 
         let mut saw_visible_column_cell = false;
         for placement in placements {
-            let cell_width = column_plan.width_for_span(placement.column, placement.colspan);
+            let cell_inline =
+                column_plan.inline_bounds_for_span(placement.column, placement.colspan);
+            let cell_width = cell_inline.page_width();
             if cell_width <= 0.0 {
                 continue;
             }
@@ -245,7 +272,9 @@ impl<'a> LayoutBuilder<'a> {
             apply_table_cell_used_padding(
                 &mut cell_style,
                 table_cellpadding,
-                PercentageBasis::definite(layout_pt(cell_width)),
+                PercentageBasis::definite(LogicalInlineContentSize::new(content_box_pt(
+                    cell_width,
+                ))),
             );
             let cell_is_empty = table_cell_inline_text(cell).is_empty()
                 && self.table_cell_non_text_content_height(
@@ -269,9 +298,10 @@ impl<'a> LayoutBuilder<'a> {
         captions: &[TableCaption<'_>],
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        table_width: f32,
+        table_width: PhysicalContentWidth,
         side: CaptionSide,
     ) -> f32 {
+        let table_width = table_width.points();
         captions
             .iter()
             .filter_map(|caption| {
@@ -339,7 +369,7 @@ impl<'a> LayoutBuilder<'a> {
         column_plan: &TableColumnPlan,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
-    ) -> Option<f32> {
+    ) -> Option<TableRowBaseline> {
         // CSS 2.2 table height layout aligns cells with `vertical-align:
         // baseline` by an actual in-flow cell baseline, falling back to the
         // bottom content edge when the cell has non-text content but no
@@ -370,8 +400,73 @@ impl<'a> LayoutBuilder<'a> {
                     return None;
                 }
                 self.table_cell_physical_y_row_baseline_candidate(cell, &prepared, stylesheets)
+                    .map(|offset| TableRowBaseline {
+                        offset,
+                        rendered_font_adjustment: self
+                            .font_system
+                            .rendered_first_line_baseline_offset(&prepared.style)
+                            .points(),
+                    })
             })
-            .reduce(f32::max)
+            .max_by(|left, right| left.offset.total_cmp(&right.offset))
+    }
+
+    /// Return the physical-Y content baseline exposed by a table row to an
+    /// enclosing `inline-table`.
+    ///
+    /// This intentionally does not require a cell to have `vertical-align:
+    /// baseline`: row-cell alignment controls table height layout, whereas CSS
+    /// 2.2 defines an inline-table's exported baseline as the first row's
+    /// content baseline.
+    /// <https://www.w3.org/TR/CSS22/tables.html#table-display>
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layout::table) fn table_row_inline_baseline_offset(
+        &mut self,
+        row_index: usize,
+        row: &TableRow<'_>,
+        placements: &[TableCellPlacement],
+        row_style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        table_cellpadding: Option<f32>,
+        column_plan: &TableColumnPlan,
+        table_metrics: TableMetrics,
+        collapsed_geometry: Option<&CollapsedTableGeometry>,
+    ) -> Option<TableRowBaseline> {
+        placements
+            .iter()
+            .filter_map(|placement| {
+                let cell = &row.cells[placement.cell];
+                let prepared = self.prepare_table_cell(
+                    cell,
+                    row,
+                    row_style,
+                    placement,
+                    row_index,
+                    0.0,
+                    stylesheets,
+                    table_cellpadding,
+                    column_plan,
+                    table_metrics.clone(),
+                    collapsed_geometry,
+                )?;
+                (table_cell_baseline_offset_axis(&prepared.style) == PhysicalAxis::Vertical)
+                    .then(|| {
+                        let offset = self.table_cell_physical_y_row_baseline_candidate(
+                            cell,
+                            &prepared,
+                            stylesheets,
+                        );
+                        offset.map(|offset| TableRowBaseline {
+                            offset,
+                            rendered_font_adjustment: self
+                                .font_system
+                                .rendered_first_line_baseline_offset(&prepared.style)
+                                .points(),
+                        })
+                    })
+                    .flatten()
+            })
+            .max_by(|left, right| left.offset.total_cmp(&right.offset))
     }
 
     pub(in crate::layout::table) fn table_cell_row_baseline_offset_for_alignment(
@@ -422,7 +517,7 @@ impl<'a> LayoutBuilder<'a> {
             context.table_metrics.clone(),
             target_row_index,
         );
-        Some((origin_top - target_top).max(0.0) + target_baseline)
+        Some((origin_top - target_top).max(0.0) + target_baseline.offset)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -532,19 +627,17 @@ impl<'a> LayoutBuilder<'a> {
         let mut style = self.style_for_table_cell(cell, row, row_style, stylesheets);
         let area = TableGridArea::from_placement(row_index, placement);
         let inline_bounds = column_plan.inline_bounds_for_area(area);
-        let width = inline_bounds.size.max(0.0);
+        let width = inline_bounds.page_width().max(0.0);
         // A table cell's percentage padding resolves against the final table
         // grid inline size, including only the border spacing between tracks.
         // It must not use the cell span width, which itself includes the
         // padding being resolved.
         // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
-        let table_grid_inline_size = column_plan
-            .width_for_span(0, column_plan.column_count())
-            .max(0.0);
+        let table_grid_inline_size = column_plan.total_width();
         apply_table_cell_used_padding(
             &mut style,
             table_cellpadding,
-            PercentageBasis::definite(layout_pt(table_grid_inline_size)),
+            PercentageBasis::definite(table_grid_inline_size),
         );
         let borders = table_cell_border_insets(
             &style,
@@ -586,55 +679,80 @@ impl<'a> LayoutBuilder<'a> {
         cell_width: f32,
         border_insets: css::Edges,
     ) -> TableCellLayoutMetrics {
-        let available_width = (cell_width
-            - cell_style.padding.left
-            - cell_style.padding.right
-            - border_insets.left
-            - border_insets.right)
-            .max(0.0);
-        let text_height = self.table_cell_text_content_height(cell, cell_style, available_width);
-        let explicit_height_basis =
-            table_cell_explicit_content_height_basis(cell_style, border_insets);
-        let non_text_height = if explicit_height_basis.is_definite() {
-            cell.children
-                .as_deref()
-                .map(|children| {
-                    table_cell_replaced_content_height(cell).points().max(
-                        self.table_cell_children_final_relayout_height(
-                            children,
-                            stylesheets,
-                            available_width,
-                            explicit_height_basis,
-                        ),
-                    )
-                })
-                .unwrap_or_else(|| table_cell_non_text_content_height(cell).points())
-        } else {
-            self.table_cell_non_text_content_height(cell, stylesheets, available_width)
-        };
-        let content_height = text_height.max(non_text_height);
-        let border_box_height = table_cell_border_box_height_with_insets(
-            row_sizing_style,
-            content_height,
-            border_insets,
-        );
-        let baseline_offset = self
-            .table_cell_alignment_baseline_offset(
-                cell,
-                cell_style,
-                stylesheets,
-                available_width,
-                border_insets,
-            )
-            .unwrap_or_else(|| {
-                self.table_cell_content_bottom_baseline(cell_style, content_height, border_insets)
+        self.with_positioned_layout_suppressed(|layout| {
+            let available_width = (cell_width
+                - cell_style.padding.left
+                - cell_style.padding.right
+                - border_insets.left
+                - border_insets.right)
+                .max(0.0);
+            let text_height =
+                layout.table_cell_text_content_height(cell, cell_style, available_width);
+            // Anonymous table cells still form an inline formatting context. A
+            // separately measured non-text atomic inline only captures the
+            // tallest individual atom; the prepared sequence is what preserves
+            // intervening whitespace and therefore a wrapped second line.
+            // <https://www.w3.org/TR/CSS22/tables.html#anonymous-boxes>
+            // <https://www.w3.org/TR/css-inline-3/#line-layout>
+            let inline_sequence_height = cell.children.as_deref().and_then(|children| {
+                layout.table_cell_inline_sequence_height(
+                    cell_style,
+                    children,
+                    stylesheets,
+                    available_width,
+                    PercentageBasis::indefinite(),
+                )
             });
+            let explicit_height_basis =
+                table_cell_explicit_content_height_basis(cell_style, border_insets);
+            let non_text_height = if explicit_height_basis.is_definite() {
+                cell.children
+                    .as_deref()
+                    .map(|children| {
+                        table_cell_replaced_content_height(cell).points().max(
+                            layout.table_cell_children_final_relayout_height(
+                                children,
+                                stylesheets,
+                                available_width,
+                                explicit_height_basis,
+                            ),
+                        )
+                    })
+                    .unwrap_or_else(|| table_cell_non_text_content_height(cell).points())
+            } else {
+                layout.table_cell_non_text_content_height(cell, stylesheets, available_width)
+            };
+            let content_height = text_height
+                .max(non_text_height)
+                .max(inline_sequence_height.unwrap_or(0.0));
+            debug_assert!(content_height >= 0.0);
+            let border_box_height = table_cell_border_box_height_with_insets(
+                row_sizing_style,
+                content_height,
+                border_insets,
+            );
+            let baseline_offset = layout
+                .table_cell_alignment_baseline_offset(
+                    cell,
+                    cell_style,
+                    stylesheets,
+                    available_width,
+                    border_insets,
+                )
+                .unwrap_or_else(|| {
+                    layout.table_cell_content_bottom_baseline(
+                        cell_style,
+                        content_height,
+                        border_insets,
+                    )
+                });
 
-        TableCellLayoutMetrics {
-            content_height,
-            border_box_height,
-            baseline_offset,
-        }
+            TableCellLayoutMetrics {
+                content_height,
+                border_box_height,
+                baseline_offset,
+            }
+        })
     }
 
     /// Remeasure table-cell content after row height distribution.
@@ -661,57 +779,77 @@ impl<'a> LayoutBuilder<'a> {
             return first_pass;
         }
 
-        let available_width = (cell_width
-            - cell_style.padding.left
-            - cell_style.padding.right
-            - border_insets.left
-            - border_insets.right)
-            .max(0.0);
-        let text_height = self.table_cell_text_content_height(cell, cell_style, available_width);
-        let non_text_height = cell
-            .children
-            .as_deref()
-            .map(|children| {
-                table_cell_replaced_content_height(cell).points().max(
-                    self.table_cell_children_final_relayout_height(
-                        children,
+        self.with_positioned_layout_suppressed(|layout| {
+            let available_width = (cell_width
+                - cell_style.padding.left
+                - cell_style.padding.right
+                - border_insets.left
+                - border_insets.right)
+                .max(0.0);
+            let text_height =
+                layout.table_cell_text_content_height(cell, cell_style, available_width);
+            let inline_sequence_height = cell.children.as_deref().and_then(|children| {
+                layout.table_cell_inline_sequence_height(
+                    cell_style,
+                    children,
+                    stylesheets,
+                    available_width,
+                    percentage_height_basis,
+                )
+            });
+            let non_text_height = cell
+                .children
+                .as_deref()
+                .map(|children| {
+                    table_cell_replaced_content_height(cell).points().max(
+                        layout.table_cell_children_final_relayout_height(
+                            children,
+                            stylesheets,
+                            available_width,
+                            percentage_height_basis,
+                        ),
+                    )
+                })
+                .unwrap_or_else(|| table_cell_non_text_content_height(cell).points());
+            let content_height = text_height
+                .max(non_text_height)
+                .max(inline_sequence_height.unwrap_or(0.0));
+            let baseline_offset = if text_height > 0.0 && text_height >= non_text_height {
+                layout
+                    .table_cell_alignment_baseline_offset(
+                        cell,
+                        cell_style,
                         stylesheets,
                         available_width,
-                        percentage_height_basis,
-                    ),
-                )
-            })
-            .unwrap_or_else(|| table_cell_non_text_content_height(cell).points());
-        let content_height = text_height.max(non_text_height);
-        let baseline_offset = if text_height > 0.0 && text_height >= non_text_height {
-            self.table_cell_alignment_baseline_offset(
-                cell,
-                cell_style,
-                stylesheets,
-                available_width,
-                border_insets,
-            )
-            .unwrap_or_else(|| {
-                self.table_cell_content_bottom_baseline(cell_style, content_height, border_insets)
-            })
-        } else {
-            self.table_cell_content_bottom_baseline(cell_style, content_height, border_insets)
-        };
+                        border_insets,
+                    )
+                    .unwrap_or_else(|| {
+                        layout.table_cell_content_bottom_baseline(
+                            cell_style,
+                            content_height,
+                            border_insets,
+                        )
+                    })
+            } else {
+                layout.table_cell_content_bottom_baseline(cell_style, content_height, border_insets)
+            };
 
-        TableCellLayoutMetrics {
-            content_height,
-            border_box_height: first_pass.border_box_height,
-            baseline_offset,
-        }
+            TableCellLayoutMetrics {
+                content_height,
+                border_box_height: first_pass.border_box_height,
+                baseline_offset,
+            }
+        })
     }
 
     /// Resolve table-cell row-track constraints in the table row flow.
     ///
-    /// A cell can establish a distinct writing mode for its contents. When
-    /// that flow is orthogonal to the row, its physical `height` is not a
-    /// physical row-track constraint: the table's column inline size supplies
-    /// that orthogonal used size instead. The row-sizing surrogate preserves
-    /// the original cell style for content layout, alignment, and paint.
+    /// A cell can establish a distinct writing mode for its contents. A
+    /// physical-height `ch` term is resolved by table row sizing in the table
+    /// track context, whereas an already definite logical `inline-size`
+    /// remains a real physical row constraint. Keep the cell's original style
+    /// for content layout, alignment, and paint, while using this row-flow
+    /// surrogate solely for row measurement.
     /// <https://drafts.csswg.org/css-tables-3/#row-layout>
     /// <https://drafts.csswg.org/css-writing-modes-4/#writing-mode>
     pub(in crate::layout::table) fn table_cell_row_sizing_style(
@@ -722,9 +860,9 @@ impl<'a> LayoutBuilder<'a> {
     ) -> ComputedStyle {
         let mut style = cell_style.clone();
         if cell_style.writing_mode != row_style.writing_mode {
-            if !cell_style.box_values.height.is_auto() {
+            if cell_style.physical_height_has_font_metric {
                 set_style_used_height(&mut style, column_inline_size.max(0.0));
-            } else {
+            } else if cell_style.box_values.height.is_auto() {
                 set_style_auto_height(&mut style);
                 style.box_values.min_height = css::ComputedLengthPercentageOrAuto::Auto;
                 style.box_values.max_height = css::ComputedLengthPercentageOrAuto::Auto;
@@ -834,6 +972,27 @@ impl<'a> LayoutBuilder<'a> {
                     continue;
                 }
             }
+            if let box_tree::FormattingBox::Inline(box_) = child {
+                if matches!(
+                    box_.core.style.position,
+                    Position::Absolute | Position::Fixed
+                ) {
+                    continue;
+                }
+                // Inline content before a block child occupies its own line in
+                // the table-cell normal-flow sequence. It therefore adds to
+                // the row minimum instead of competing with that block's
+                // height through a `max` calculation.
+                // <https://www.w3.org/TR/CSS22/tables.html#height-layout>
+                inline_line_height = inline_line_height.max(
+                    self.table_cell_children_text_content_height(
+                        &box_.core.children,
+                        available_width,
+                    )
+                    .max(box_.core.style.line_height),
+                );
+                continue;
+            }
             if let Some(inline_height) =
                 self.table_cell_measured_inline_outer_height(child, stylesheets, available_width)
             {
@@ -844,9 +1003,11 @@ impl<'a> LayoutBuilder<'a> {
                 block_flow.push_atomic_height(inline_line_height);
                 inline_line_height = 0.0;
             }
-            if let Some(collapsed_margin) =
-                table_cell_self_collapsing_block_margin(child, self.document_canvas_overflow)
-            {
+            if let Some(collapsed_margin) = table_cell_self_collapsing_block_margin(
+                child,
+                PercentageBasis::indefinite(),
+                self.document_canvas_overflow,
+            ) {
                 block_flow.push_collapsed_margin(collapsed_margin);
                 continue;
             }
@@ -899,24 +1060,27 @@ impl<'a> LayoutBuilder<'a> {
             table_cell_formatting_child_has_parent_percentage_block_size(child);
         match child {
             box_tree::FormattingBox::Table(box_) => {
-                if matches!(box_.style.position, Position::Absolute | Position::Fixed) {
+                if matches!(
+                    box_.core.style.position,
+                    Position::Absolute | Position::Fixed
+                ) {
                     return 0.0;
                 }
                 if !has_parent_percentage {
                     return self.estimate_table_height(
-                        box_.element,
-                        &box_.style,
+                        box_.core.element,
+                        &box_.core.style,
                         stylesheets,
                         available_width,
                         &box_.fragment,
                     );
                 }
                 let style = self.table_cell_content_sizing_style(
-                    &box_.style,
+                    &box_.core.style,
                     TableCellContentSizingPolicy::RowMinimum,
                 );
                 self.estimate_table_height(
-                    box_.element,
+                    box_.core.element,
                     &style,
                     stylesheets,
                     available_width,
@@ -924,33 +1088,53 @@ impl<'a> LayoutBuilder<'a> {
                 )
             }
             box_tree::FormattingBox::Block(box_) => {
-                if is_document_canvas_element(box_.element) {
+                if is_document_canvas_element(box_.core.element) {
                     return self.table_cell_measured_element_child_height(
-                        box_.element,
-                        &box_.style,
-                        &box_.children,
+                        box_.core.element,
+                        &box_.core.style,
+                        &box_.core.children,
                         stylesheets,
                         available_width,
                         child,
                     );
                 }
                 self.table_cell_row_minimum_element_outer_height(
-                    box_.element,
-                    &box_.style,
-                    &box_.children,
+                    box_.core.element,
+                    &box_.core.style,
+                    &box_.core.children,
                     stylesheets,
                     available_width,
                     child,
                 )
             }
             box_tree::FormattingBox::Flex(box_) => self.table_cell_measured_element_child_height(
-                box_.element,
-                &box_.style,
-                &box_.children,
+                box_.core.element,
+                &box_.core.style,
+                &box_.core.children,
                 stylesheets,
                 available_width,
                 child,
             ),
+            // An anonymous block is one contiguous inline run generated by
+            // CSS 2.2's block-in-inline transformation. Measure its prepared
+            // line sequence directly: recursively taking the maximum child
+            // line height loses cross-inline vertical alignment (for example
+            // a `vertical-align: top` ordinal beside a smaller inline), and
+            // can make the following block overlap the next table row.
+            // <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>
+            // <https://drafts.csswg.org/css-tables-3/#row-layout>
+            box_tree::FormattingBox::AnonymousBlock(box_)
+                if !has_non_inline_formatting_box(&box_.children) =>
+            {
+                self.table_cell_inline_sequence_height(
+                    &box_.style,
+                    &box_.children,
+                    stylesheets,
+                    available_width,
+                    PercentageBasis::indefinite(),
+                )
+                .unwrap_or(0.0)
+            }
             box_tree::FormattingBox::AnonymousBlock(box_) => self
                 .table_cell_children_non_text_content_height(
                     &box_.children,
@@ -959,7 +1143,7 @@ impl<'a> LayoutBuilder<'a> {
                 ),
             box_tree::FormattingBox::InlineSplitBlockContext(box_) => self
                 .table_cell_children_non_text_content_height(
-                    &box_.children,
+                    &box_.core.children,
                     stylesheets,
                     available_width,
                 ),
@@ -1063,7 +1247,7 @@ impl<'a> LayoutBuilder<'a> {
                 self.estimate_image_height(element, &style, available_width)
             }
             Some(ReplacedElementKind::Svg) => estimate_svg_height(element, &style, available_width),
-            None if style.display.is_table() || is_html_table_element(element) => self
+            None if style.display.is_table() => self
                 .estimate_element_height(
                     element,
                     &style,
@@ -1100,7 +1284,23 @@ impl<'a> LayoutBuilder<'a> {
             PercentageBasis::definite(layout_pt(available_outer_width.max(0.0))),
         );
         let style = &used_style;
-        if is_self_collapsing_block_box(element, style, children, self.document_canvas_overflow) {
+        // An unresolved percentage height computes to `auto` for this
+        // self-collapsing predicate, even though the computed percentage is
+        // retained for the later table-cell relayout.
+        // <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>
+        let mut margin_collapse_style = None;
+        if percentage_height_is_auto_for_margin_collapse(style, PercentageBasis::indefinite()) {
+            let mut style_for_margin_collapse = style.clone();
+            style_for_margin_collapse.box_values.height = css::ComputedLengthPercentageOrAuto::Auto;
+            margin_collapse_style = Some(style_for_margin_collapse);
+        }
+        let margin_collapse_style = margin_collapse_style.as_ref().unwrap_or(style);
+        if is_self_collapsing_block_box(
+            element,
+            margin_collapse_style,
+            children,
+            self.document_canvas_overflow,
+        ) {
             let descendant_start_margin = collapsible_first_child_start_margin_from_boxes(
                 children,
                 element,
@@ -1193,7 +1393,7 @@ impl<'a> LayoutBuilder<'a> {
                     Some((&box_.style, &box_.children))
                 }
                 box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-                    Some((&box_.style, &box_.children))
+                    Some((&box_.core.style, &box_.core.children))
                 }
                 _ => None,
             } {
@@ -1241,6 +1441,7 @@ impl<'a> LayoutBuilder<'a> {
             {
                 if let Some(collapsed_margin) = table_cell_self_collapsing_block_margin(
                     child_box,
+                    PercentageBasis::indefinite(),
                     self.document_canvas_overflow,
                 ) {
                     block_flow.push_collapsed_margin(collapsed_margin);
@@ -1313,6 +1514,22 @@ impl<'a> LayoutBuilder<'a> {
                 ));
                 continue;
             }
+            if let box_tree::FormattingBox::Inline(box_) = child {
+                if matches!(
+                    box_.core.style.position,
+                    Position::Absolute | Position::Fixed
+                ) {
+                    continue;
+                }
+                inline_line_height = inline_line_height.max(
+                    self.table_cell_children_text_content_height(
+                        &box_.core.children,
+                        available_width,
+                    )
+                    .max(box_.core.style.line_height),
+                );
+                continue;
+            }
             if let Some(inline_height) = self.table_cell_measured_inline_outer_height_with_basis(
                 child,
                 stylesheets,
@@ -1326,9 +1543,11 @@ impl<'a> LayoutBuilder<'a> {
                 block_flow.push_atomic_height(inline_line_height);
                 inline_line_height = 0.0;
             }
-            if let Some(collapsed_margin) =
-                table_cell_self_collapsing_block_margin(child, self.document_canvas_overflow)
-            {
+            if let Some(collapsed_margin) = table_cell_self_collapsing_block_margin(
+                child,
+                percentage_height_basis,
+                self.document_canvas_overflow,
+            ) {
                 block_flow.push_collapsed_margin(collapsed_margin);
                 continue;
             }
@@ -1357,12 +1576,15 @@ impl<'a> LayoutBuilder<'a> {
     ) -> f32 {
         match child {
             box_tree::FormattingBox::Table(box_) => {
-                if matches!(box_.style.position, Position::Absolute | Position::Fixed) {
+                if matches!(
+                    box_.core.style.position,
+                    Position::Absolute | Position::Fixed
+                ) {
                     return 0.0;
                 }
                 self.estimate_table_height(
-                    box_.element,
-                    &box_.style,
+                    box_.core.element,
+                    &box_.core.style,
                     stylesheets,
                     available_width,
                     &box_.fragment,
@@ -1370,22 +1592,34 @@ impl<'a> LayoutBuilder<'a> {
             }
             box_tree::FormattingBox::Block(box_) => self
                 .table_cell_final_relayout_element_outer_height(
-                    box_.element,
-                    &box_.style,
-                    &box_.children,
+                    box_.core.element,
+                    &box_.core.style,
+                    &box_.core.children,
                     stylesheets,
                     available_width,
                     percentage_height_basis,
                 ),
             box_tree::FormattingBox::Flex(box_) => self
                 .table_cell_final_relayout_element_outer_height(
-                    box_.element,
+                    box_.core.element,
+                    &box_.core.style,
+                    &box_.core.children,
+                    stylesheets,
+                    available_width,
+                    percentage_height_basis,
+                ),
+            box_tree::FormattingBox::AnonymousBlock(box_)
+                if !has_non_inline_formatting_box(&box_.children) =>
+            {
+                self.table_cell_inline_sequence_height(
                     &box_.style,
                     &box_.children,
                     stylesheets,
                     available_width,
                     percentage_height_basis,
-                ),
+                )
+                .unwrap_or(0.0)
+            }
             box_tree::FormattingBox::AnonymousBlock(box_) => self
                 .table_cell_children_final_relayout_height(
                     &box_.children,
@@ -1395,7 +1629,7 @@ impl<'a> LayoutBuilder<'a> {
                 ),
             box_tree::FormattingBox::InlineSplitBlockContext(box_) => self
                 .table_cell_children_final_relayout_height(
-                    &box_.children,
+                    &box_.core.children,
                     stylesheets,
                     available_width,
                     PercentageBasis::indefinite(),
@@ -1432,7 +1666,23 @@ impl<'a> LayoutBuilder<'a> {
             PercentageBasis::definite(layout_pt(available_outer_width.max(0.0))),
         );
         let style = &used_style;
-        if is_self_collapsing_block_box(element, style, children, self.document_canvas_overflow) {
+        // An unresolved percentage height computes to `auto` for this
+        // self-collapsing predicate, even though the computed percentage is
+        // retained for the later table-cell relayout.
+        // <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>
+        let mut margin_collapse_style = None;
+        if percentage_height_is_auto_for_margin_collapse(style, parent_percentage_height_basis) {
+            let mut style_for_margin_collapse = style.clone();
+            style_for_margin_collapse.box_values.height = css::ComputedLengthPercentageOrAuto::Auto;
+            margin_collapse_style = Some(style_for_margin_collapse);
+        }
+        let margin_collapse_style = margin_collapse_style.as_ref().unwrap_or(style);
+        if is_self_collapsing_block_box(
+            element,
+            margin_collapse_style,
+            children,
+            self.document_canvas_overflow,
+        ) {
             let descendant_start_margin = collapsible_first_child_start_margin_from_boxes(
                 children,
                 element,
@@ -1489,6 +1739,7 @@ impl<'a> LayoutBuilder<'a> {
         .map(SemanticLengthExt::points);
 
         let mut block_flow = TableCellBlockFlowHeight::default();
+        let mut inline_line_height = 0.0_f32;
         if !has_non_inline_formatting_box(children)
             && (has_direct_inline_content_box(children)
                 || has_atomic_inline_formatting_box(children))
@@ -1518,12 +1769,47 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         for child_box in children {
+            if has_non_inline_formatting_box(children) {
+                match child_box {
+                    box_tree::FormattingBox::Text(box_) => {
+                        inline_line_height =
+                            inline_line_height.max(self.estimate_text_physical_height(
+                                &box_.text,
+                                &box_.style,
+                                content_width,
+                                0.0,
+                                0.0,
+                            ));
+                        continue;
+                    }
+                    box_tree::FormattingBox::Inline(box_)
+                        if !matches!(
+                            box_.core.style.position,
+                            Position::Absolute | Position::Fixed
+                        ) =>
+                    {
+                        inline_line_height = inline_line_height.max(
+                            self.table_cell_children_text_content_height(
+                                &box_.core.children,
+                                content_width,
+                            )
+                            .max(box_.core.style.line_height),
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if inline_line_height > 0.0 {
+                block_flow.push_atomic_height(inline_line_height);
+                inline_line_height = 0.0;
+            }
             if let Some((box_style, box_children)) = match child_box {
                 box_tree::FormattingBox::AnonymousBlock(box_) => {
                     Some((&box_.style, &box_.children))
                 }
                 box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-                    Some((&box_.style, &box_.children))
+                    Some((&box_.core.style, &box_.core.children))
                 }
                 _ => None,
             } {
@@ -1576,8 +1862,13 @@ impl<'a> LayoutBuilder<'a> {
                 || is_document_canvas_element(child_element)
                 || is_replaced_element(child_element)
             {
+                let child_percentage_height_basis = block_size_percentage_basis_from_points(
+                    specified_content_height,
+                    BlockSizeBasisSource::TableCell,
+                );
                 if let Some(collapsed_margin) = table_cell_self_collapsing_block_margin(
                     child_box,
+                    child_percentage_height_basis,
                     self.document_canvas_overflow,
                 ) {
                     block_flow.push_collapsed_margin(collapsed_margin);
@@ -1588,14 +1879,14 @@ impl<'a> LayoutBuilder<'a> {
                         child_children,
                         stylesheets,
                         content_width,
-                        block_size_percentage_basis_from_points(
-                            specified_content_height,
-                            BlockSizeBasisSource::TableCell,
-                        ),
+                        child_percentage_height_basis,
                     );
                     block_flow.push_child_height(child_box, child_height);
                 }
             }
+        }
+        if inline_line_height > 0.0 {
+            block_flow.push_atomic_height(inline_line_height);
         }
         let mut content_height = block_flow.finish();
 
@@ -1745,10 +2036,18 @@ fn table_cell_sibling_collapsible_margins(
 
 fn table_cell_self_collapsing_block_margin(
     child: &box_tree::FormattingBox<'_>,
+    percentage_height_basis: BlockSizePercentageBasis,
     overflow_context: DocumentCanvasOverflowContext,
 ) -> Option<f32> {
     let (element, _, style, children) = child.element_parts()?;
-    if !is_self_collapsing_block_box(element, style, children, overflow_context) {
+    let mut margin_collapse_style = None;
+    if percentage_height_is_auto_for_margin_collapse(style, percentage_height_basis) {
+        let mut style_for_margin_collapse = style.clone();
+        style_for_margin_collapse.box_values.height = css::ComputedLengthPercentageOrAuto::Auto;
+        margin_collapse_style = Some(style_for_margin_collapse);
+    }
+    let margin_collapse_style = margin_collapse_style.as_ref().unwrap_or(style);
+    if !is_self_collapsing_block_box(element, margin_collapse_style, children, overflow_context) {
         return None;
     }
     let descendant_start_margin =

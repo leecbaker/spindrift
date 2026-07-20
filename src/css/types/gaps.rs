@@ -217,7 +217,7 @@ impl GapRuleInsetValue {
 pub(crate) struct GapRuleAxis {
     pub(crate) widths: GapRuleList<ComputedLengthPercentage>,
     pub(crate) styles: GapRuleList<BorderStyle>,
-    pub(crate) colors: GapRuleList<Color>,
+    pub(crate) colors: GapRuleList<CssColor>,
     pub(crate) rule_break: GapRuleBreak,
     pub(crate) visibility_items: GapRuleVisibilityItems,
     pub(crate) inset_cap_start: GapRuleInsetValue,
@@ -231,7 +231,7 @@ impl GapRuleAxis {
         Self {
             widths: GapRuleList::single(ComputedLengthPercentage::from_points(3.0 * CSS_PX_TO_PT)),
             styles: GapRuleList::single(BorderStyle::None),
-            colors: GapRuleList::single(Color::BLACK),
+            colors: GapRuleList::single(CssColor::BLACK),
             rule_break: GapRuleBreak::Normal,
             visibility_items: GapRuleVisibilityItems::Normal,
             inset_cap_start: GapRuleInsetValue::ZERO,

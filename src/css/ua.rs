@@ -39,6 +39,7 @@ pub(crate) fn html_document_important_user_agent_stylesheet() -> Stylesheet {
         .clone()
 }
 
+#[cfg(test)]
 pub(crate) fn html5_presentational_hints_stylesheet() -> Stylesheet {
     static STYLESHEET: OnceLock<Stylesheet> = OnceLock::new();
     STYLESHEET
@@ -58,6 +59,25 @@ pub(crate) fn html5_presentational_hints_stylesheet() -> Stylesheet {
             stylesheet
         })
         .clone()
+}
+
+/// Build the HTML presentational-hints stylesheet in one document's URL
+/// context. Dynamic hints are injected after selector matching, so retaining
+/// this context on the stylesheet lets a legacy `background` attribute resolve
+/// relative URLs as an ordinary author declaration would.
+pub(crate) fn html5_presentational_hints_stylesheet_with_urls(
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+) -> Stylesheet {
+    let mut stylesheet = parse_stylesheet(
+        &Css::from_string(HTML5_PH_CSS)
+            .with_base_url(base_url.cloned())
+            .with_root_url(root_url.cloned())
+            .with_author_origin()
+            .with_specificity_override(0),
+    );
+    stylesheet.html_presentational_hints = true;
+    stylesheet
 }
 
 #[cfg(test)]

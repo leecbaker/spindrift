@@ -2,9 +2,9 @@ use super::selector::{QuireSelectorImpl, QuireSelectorParser};
 use super::types::{
     ContainerRule, CounterStyleRange, CounterStyleRangeInterval, CounterStyleRule,
     CounterStyleSystem, Css, CssFontFace, Declarations, Direction, Display, FontFaceSource,
-    FontStyle, FontWeight, FontWidth, KeyframeStep, KeyframesRule, MediaEnvironment, PagePseudo,
-    PageRule, PageSelector, PageSpecificity, ScopeRule, StyleRule, Stylesheet, StylesheetOrigin,
-    UnicodeRange,
+    FontPaletteValues, FontStyle, FontWeight, FontWidth, KeyframeStep, KeyframesRule,
+    MediaEnvironment, PagePseudo, PageRule, PageSelector, PageSpecificity, ScopeRule, StyleRule,
+    Stylesheet, StylesheetOrigin, UnicodeRange,
 };
 use super::values::{
     parse_color, parse_css_string_token, parse_display, parse_font_family_names, parse_font_style,
@@ -50,6 +50,7 @@ pub(crate) fn parse_stylesheet_with_media_environment(
         current_layer: css.import_layer_name().map(ToOwned::to_owned),
         current_scopes: Vec::new(),
         media_environment: *media_environment,
+        namespace_prelude_open: true,
     };
     let mut parsed_rules = Vec::new();
     let mut parsed_container_rules = Vec::new();
@@ -58,9 +59,15 @@ pub(crate) fn parse_stylesheet_with_media_environment(
     let mut parsed_after_marker_rules = Vec::new();
     let mut parsed_before_rules = Vec::new();
     let mut parsed_after_rules = Vec::new();
+    let mut parsed_footnote_call_rules = Vec::new();
+    let mut parsed_footnote_marker_rules = Vec::new();
     let mut parsed_first_line_rules = Vec::new();
     let mut parsed_first_letter_rules = Vec::new();
     let mut parsed_keyframes = Vec::new();
+    let mut parsed_font_faces = Vec::new();
+    let mut parsed_counter_styles = Vec::new();
+    let mut parsed_font_feature_values = Vec::new();
+    let mut parsed_font_palette_values = Vec::new();
 
     for item in StyleSheetParser::new(&mut parser, &mut rule_parser).flatten() {
         flatten_rule(
@@ -72,9 +79,15 @@ pub(crate) fn parse_stylesheet_with_media_environment(
             &mut parsed_after_marker_rules,
             &mut parsed_before_rules,
             &mut parsed_after_rules,
+            &mut parsed_footnote_call_rules,
+            &mut parsed_footnote_marker_rules,
             &mut parsed_first_line_rules,
             &mut parsed_first_letter_rules,
             &mut parsed_keyframes,
+            &mut parsed_font_faces,
+            &mut parsed_counter_styles,
+            &mut parsed_font_feature_values,
+            &mut parsed_font_palette_values,
         );
     }
 
@@ -126,6 +139,22 @@ pub(crate) fn parse_stylesheet_with_media_environment(
             rule
         })
         .collect();
+    let footnote_call_rules = parsed_footnote_call_rules
+        .into_iter()
+        .enumerate()
+        .map(|(order, mut rule)| {
+            rule.order = order;
+            rule
+        })
+        .collect();
+    let footnote_marker_rules = parsed_footnote_marker_rules
+        .into_iter()
+        .enumerate()
+        .map(|(order, mut rule)| {
+            rule.order = order;
+            rule
+        })
+        .collect();
     let first_line_rules = parsed_first_line_rules
         .into_iter()
         .enumerate()
@@ -161,9 +190,14 @@ pub(crate) fn parse_stylesheet_with_media_environment(
             declarations
         });
     let first_page_declarations = cascade_page_declarations(&page_rules, 1);
+    let font_feature_values =
+        parse_font_feature_values_rules(parsed_font_feature_values, &layer_names);
 
     Stylesheet {
         origin: css.origin(),
+        base_url: css.base_url().cloned(),
+        root_url: css.root_url().cloned(),
+        forced_colors: media_environment.forced_colors,
         html_presentational_hints: false,
         specificity_override: css.specificity_override(),
         layer_names,
@@ -176,15 +210,23 @@ pub(crate) fn parse_stylesheet_with_media_environment(
         after_marker_rules,
         before_rules,
         after_rules,
+        footnote_call_rules,
+        footnote_marker_rules,
         first_line_rules,
         first_letter_rules,
         page_rules,
         page_declarations,
         first_page_declarations,
-        font_faces: parse_font_faces(css),
-        font_feature_values: parse_font_feature_values(css),
-        font_palette_values: parse_font_palette_values(css),
-        counter_styles: parse_counter_styles(css),
+        font_faces: parsed_font_faces,
+        font_feature_values,
+        font_palette_values: {
+            let mut values = FontPaletteValues::default();
+            for (name, definition) in parsed_font_palette_values {
+                values.insert(name, definition);
+            }
+            values
+        },
+        counter_styles: parsed_counter_styles,
     }
 }
 
@@ -289,3 +331,15 @@ pub(crate) use rule_parser::{
     custom_property_value_is_valid, is_custom_property_name, media_rule_applies,
     media_rule_applies_in_environment, supports_condition_applies,
 };
+
+/// Parses a declaration at specified-value time and returns the canonical
+/// property/value operation the cascade should apply.
+pub(in crate::css) fn declaration_operation(name: &str, value: &str) -> Option<(String, String)> {
+    match rule_parser::parse_canonical_declaration(name, value) {
+        rule_parser::DeclarationParseResult::Valid(operation) => {
+            Some((operation.name, operation.value))
+        }
+        rule_parser::DeclarationParseResult::UnsupportedProperty
+        | rule_parser::DeclarationParseResult::InvalidValue => None,
+    }
+}

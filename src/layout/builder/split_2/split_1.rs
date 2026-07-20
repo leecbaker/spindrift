@@ -44,6 +44,8 @@ impl<'a> LayoutBuilder<'a> {
             page_value_scope_stack: Vec::new(),
             page_named_strings: Vec::new(),
             page_running_elements: Vec::new(),
+            suppressed_named_strings_before: HashMap::new(),
+            suppressed_named_strings_after: HashMap::new(),
             page_anchors: HashMap::new(),
             page_anchor_text: HashMap::new(),
             document_canvas_background: None,
@@ -59,14 +61,30 @@ impl<'a> LayoutBuilder<'a> {
             initial_viewport_context: page_context,
             page_descriptor_viewport_size: page_context.size,
             fragmentainer_override: None,
+            footnote_bodies: HashMap::new(),
+            footnote_measurements: Vec::new(),
+            footnote_reservations: HashMap::new(),
+            footnote_layout_mode: FootnoteLayoutMode::Measure,
+            footnote_measurement_depth: 0,
+            rendered_footnotes: std::collections::HashSet::new(),
+            pending_page_footnotes: Vec::new(),
             fragmentation_suppression_depth: 0,
             multicol_spanner_fragmentation_depth: 0,
             multicol_spanner_speculation_depth: 0,
             multicol_balance_probe_depth: 0,
+            speculative_auto_float_margin_box_heights: HashMap::new(),
+            active_auto_float_measurements: Vec::new(),
+            active_auto_float_measurement_fallbacks: Vec::new(),
             forced_break_containment_scopes: Vec::new(),
             cursor_y: page_context.top(),
             content_left: page_context.left(),
             content_right: page_context.right(),
+            table_cell_content_coordinate_contexts: Vec::new(),
+            principal_inline_end_inset: 0.0,
+            principal_body_block_end_inset: layout_pt(0.0),
+            root_principal_flow_context: RootPrincipalFlowContext::default(),
+            root_pseudo_block_projection: None,
+            inline_split_float_exclusion_query_offset: RelativeOffset::zero(),
             content_logical_inline_size_stack: Vec::new(),
             multicol_column_containing_blocks: Vec::new(),
             intrinsic_inline_percentage_basis_stack: Vec::new(),
@@ -78,14 +96,22 @@ impl<'a> LayoutBuilder<'a> {
             block_static_position_y_offset: None,
             absolute_static_position: None,
             grid_positioning_scopes: Vec::new(),
+            pending_subgrid_contexts: Vec::new(),
             escaped_atom_positioning_depth: 0,
             escaped_atom_containing_block: None,
             containing_block_direction: Direction::Ltr,
             containing_block_writing_mode: WritingMode::HorizontalTb,
             initial_containing_block_writing_mode: WritingMode::HorizontalTb,
+            principal_flow: DocumentPrincipalFlow {
+                writing_mode: WritingMode::HorizontalTb,
+                direction: Direction::Ltr,
+                source: PrincipalFlowSource::Root,
+                propagates_axes: false,
+            },
             fragment_top_offsets: Vec::new(),
             child_available_space_stack: Vec::new(),
             normal_flow_relative_containing_blocks: Vec::new(),
+            block_static_position_contexts: Vec::new(),
             definite_block_size_stack: Vec::new(),
             replayed_flex_item_percentage_height_bases: Vec::new(),
             table_wrapper_block_size_overrides: Vec::new(),
@@ -116,18 +142,23 @@ impl<'a> LayoutBuilder<'a> {
             bookmarks: Vec::new(),
             positioned_layers: Vec::new(),
             fixed_layers: Vec::new(),
+            deferred_multicol_positioned_children: Vec::new(),
+            multicol_positioned_replay_capture_depth: 0,
             pending_positioned_page_span_target: None,
             next_paint_source_order: 1,
             overflow_clips: Vec::new(),
             active_scroll_snap_scopes: Vec::new(),
             next_float_id: 1,
             float_contexts: vec![FloatContext { shapes: Vec::new() }],
+            float_fragment_parent_inline_spans: Vec::new(),
             adjoining_float_origin_y: None,
             pending_paint_fragments: Vec::new(),
             pending_page_side_effects: Vec::new(),
             applied_clearance_count: 0,
+            float_paint_capture_depth: 0,
             preserve_scoped_paint_public_order: false,
             defer_next_block_decoration_promotion: false,
+            suppress_next_principal_box_decoration: false,
         };
         builder.rebuild_empty_current_page_context();
         builder.initial_viewport_context = builder.current_page_context;
@@ -136,10 +167,30 @@ impl<'a> LayoutBuilder<'a> {
 
     pub(in crate::layout) fn layout_page_box(
         &mut self,
-        page_box: &box_tree::PageBox<'_>,
+        page_box: &box_tree::PageBox<'a>,
         stylesheets: &[Stylesheet],
     ) {
         self.prepare_counter_plan(&page_box.counter_events);
+        self.install_footnotes(page_box);
+        if self.footnote_layout_mode == FootnoteLayoutMode::Render {
+            self.rendered_footnotes.clear();
+        }
+        self.suppressed_named_strings_before.clear();
+        self.suppressed_named_strings_after.clear();
+        for event in &page_box.suppressed_named_string_events {
+            let target = event.target;
+            let destination = match target {
+                box_tree::SuppressedNamedStringEventTarget::BeforeElement(element) => &mut self
+                    .suppressed_named_strings_before
+                    .entry(element)
+                    .or_default(),
+                box_tree::SuppressedNamedStringEventTarget::AfterElement(element) => &mut self
+                    .suppressed_named_strings_after
+                    .entry(element)
+                    .or_default(),
+            };
+            destination.push(event.clone());
+        }
         self.page_counter_initial_values = page_box
             .counter_events
             .iter()
@@ -182,24 +233,23 @@ impl<'a> LayoutBuilder<'a> {
                 // and then fragmenting across several named pages.
                 // <https://www.w3.org/TR/css-page-3/#using-named-pages>
                 // <https://www.w3.org/TR/CSS2/visudet.html#root-height>
-                let (root_page_start, root_page_start_specified) =
-                    formatting_box_page_value_sources(child).0;
-                if root_page_start_specified {
-                    self.enter_page_name_scope_for_value(root_page_start.as_deref());
+                let root_page_start =
+                    resolved_formatting_box_page_boundary_values(child, None).start;
+                if let Some(root_page_start) = root_page_start {
+                    self.enter_page_name_scope_for_value(Some(&root_page_start));
                 }
                 // Select root/body background propagation before descendant
                 // layout. When the root paints the canvas, the body remains
                 // an ordinary box; discovering the root only after children
                 // would otherwise suppress the body's own background.
                 // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
-                if self.iframe_viewport.is_none()
-                    && let Some((_, _, style, _)) = child.element_parts()
+                if let Some((_, _, style, _)) = child.element_parts()
                     && style.visibility == Visibility::Visible
-                    && (style.background_color.is_some_and(Color::is_visible)
+                    && (style.background_color.is_some_and(CssColor::is_visible)
                         || style
                             .background_layers
                             .iter()
-                            .any(|layer| layer.image.is_some()))
+                            .any(|layer| layer.image.is_image()))
                 {
                     self.document_canvas_background = Some(DocumentCanvasBackground {
                         style: canvas_background_style(style),
@@ -213,7 +263,66 @@ impl<'a> LayoutBuilder<'a> {
                         BlockSizeBasisSource::InitialContainingBlock,
                     ));
             }
-            self.layout_formatting_box(child, stylesheets);
+            // The page box is the root formatting context rather than a CSS
+            // block container, so its children do not pass through the usual
+            // block-child traversal that dispatches floats. A floated
+            // document root still participates in the initial containing
+            // block's float formatting context.
+            // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+            if is_document_root
+                && let Some((element, _, style, children)) = child.element_parts()
+                && matches!(style.position, Position::Absolute | Position::Fixed)
+            {
+                let root_layout_style = self.principal_flow.root_layout_style(style);
+                // The page-box root bypasses ordinary block-child traversal,
+                // but its own positioning scheme is still resolved against
+                // the initial containing block.  Dispatch it through the
+                // normal positioned principal-box path so definite insets,
+                // borders, and fixed-layer ownership are preserved.
+                // <https://drafts.csswg.org/css-position-3/#absolute-positioning>
+                // and <https://drafts.csswg.org/css-position-3/#fixed-positioning>
+                self.layout_positioned_block(
+                    element,
+                    &root_layout_style,
+                    stylesheets,
+                    Some(children),
+                    None,
+                );
+                // Ordinary root flow flushes any positioned descendants at
+                // its block-layout boundary.  A positioned root has no such
+                // in-flow boundary, so commit its principal layer here.
+                self.flush_positioned_layers();
+            } else if is_document_root
+                && let Some((element, signature, style, children)) = child.element_parts()
+                && style.float != Float::None
+            {
+                let root_layout_style = self.principal_flow.root_layout_style(style);
+                let mut float_run = self.float_run_state();
+                self.layout_floating_child(
+                    element,
+                    signature.clone(),
+                    &root_layout_style,
+                    Some(children),
+                    None,
+                    stylesheets,
+                    &mut float_run,
+                );
+            } else if is_document_root
+                && let Some((element, signature, style, children)) = child.element_parts()
+            {
+                let root_layout_style = self.principal_flow.root_layout_style(style);
+                self.layout_element_box(
+                    element,
+                    &root_layout_style,
+                    stylesheets,
+                    signature.clone(),
+                    &box_tree::BoxSource::Principal,
+                    &[],
+                    children,
+                );
+            } else {
+                self.layout_formatting_box(child, stylesheets);
+            }
             if is_document_root {
                 self.definite_block_size_stack.pop();
             }
@@ -272,12 +381,13 @@ impl<'a> LayoutBuilder<'a> {
         root_font_metrics: &mut Option<css::RootFontMetricLengthBasis>,
     ) -> (f32, LayoutLength) {
         let box_edges_require_ch_advance = style.box_values.requires_ch_advance();
-        style.resolve_deferred_font_size_with_viewport(
+        style.resolve_deferred_font_size_with_viewport_and_root_metrics(
             css::FontRelativeLengthBasis::new(layout_pt(parent_font_size), parent_ch_advance),
             LayoutSize::new(
                 self.current_page_context.area_width(),
                 self.current_page_context.area_height(),
             ),
+            *root_font_metrics,
         );
         style
             .line_height_value
@@ -447,18 +557,8 @@ impl<'a> LayoutBuilder<'a> {
         formatting_box: &box_tree::MutableFormattingBox<'_>,
         parent_font_size: f32,
     ) -> bool {
-        let style = match formatting_box {
-            box_tree::MutableFormattingBox::Block(box_) => &box_.style,
-            box_tree::MutableFormattingBox::Inline(box_) => &box_.style,
-            box_tree::MutableFormattingBox::InlineSplitBlockContext(box_) => &box_.style,
-            box_tree::MutableFormattingBox::AnonymousBlock(box_) => &box_.style,
-            box_tree::MutableFormattingBox::AtomicInline(box_) => &box_.style,
-            box_tree::MutableFormattingBox::Text(box_) => &box_.style,
-            box_tree::MutableFormattingBox::Table(box_) => &box_.style,
-            box_tree::MutableFormattingBox::Flex(box_) => &box_.style,
-            box_tree::MutableFormattingBox::Replaced(box_) => &box_.style,
-        };
-        style
+        formatting_box
+            .style()
             .deferred_font_size
             .requires_parent_ch_advance(parent_font_size)
     }
@@ -505,15 +605,16 @@ impl<'a> LayoutBuilder<'a> {
         match formatting_box {
             box_tree::MutableFormattingBox::Block(box_) => {
                 let (font_size, _ch_advance) = self.resolve_deferred_font_metrics_in_style(
-                    &mut box_.style,
+                    &mut box_.core.style,
                     parent_font_size,
                     parent_ch_advance,
                     root_font_metrics,
                 );
                 let child_requires_parent_ch = self
                     .children_require_parent_ch_advance(&box_.run_in_children, font_size)
-                    || self.children_require_parent_ch_advance(&box_.children, font_size);
-                let ch_advance = self.ch_advance_for_style(&box_.style, child_requires_parent_ch);
+                    || self.children_require_parent_ch_advance(&box_.core.children, font_size);
+                let ch_advance =
+                    self.ch_advance_for_style(&box_.core.style, child_requires_parent_ch);
                 for child in &mut box_.run_in_children {
                     self.resolve_deferred_font_metrics_in_box(
                         child,
@@ -522,7 +623,7 @@ impl<'a> LayoutBuilder<'a> {
                         root_font_metrics,
                     );
                 }
-                for child in &mut box_.children {
+                for child in &mut box_.core.children {
                     self.resolve_deferred_font_metrics_in_box(
                         child,
                         font_size,
@@ -532,24 +633,25 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
             box_tree::MutableFormattingBox::Inline(box_) => {
-                recurse(self, &mut box_.children, &mut box_.style)
+                recurse(self, &mut box_.core.children, &mut box_.core.style)
             }
             box_tree::MutableFormattingBox::InlineSplitBlockContext(box_) => {
-                recurse(self, &mut box_.children, &mut box_.style)
+                recurse(self, &mut box_.core.children, &mut box_.core.style)
             }
             box_tree::MutableFormattingBox::AnonymousBlock(box_) => {
                 recurse(self, &mut box_.children, &mut box_.style)
             }
             box_tree::MutableFormattingBox::AtomicInline(box_) => {
                 let (font_size, _ch_advance) = self.resolve_deferred_font_metrics_in_style(
-                    &mut box_.style,
+                    &mut box_.core.style,
                     parent_font_size,
                     parent_ch_advance,
                     root_font_metrics,
                 );
                 let child_requires_parent_ch =
-                    self.children_require_parent_ch_advance(&box_.children, font_size);
-                let ch_advance = self.ch_advance_for_style(&box_.style, child_requires_parent_ch);
+                    self.children_require_parent_ch_advance(&box_.core.children, font_size);
+                let ch_advance =
+                    self.ch_advance_for_style(&box_.core.style, child_requires_parent_ch);
                 if let Some(fragment) = &mut box_.table_fragment {
                     self.resolve_deferred_font_metrics_in_table_fragment(
                         fragment,
@@ -558,7 +660,7 @@ impl<'a> LayoutBuilder<'a> {
                         root_font_metrics,
                     );
                 }
-                for child in &mut box_.children {
+                for child in &mut box_.core.children {
                     self.resolve_deferred_font_metrics_in_box(
                         child,
                         font_size,
@@ -577,21 +679,22 @@ impl<'a> LayoutBuilder<'a> {
             }
             box_tree::MutableFormattingBox::Table(box_) => {
                 let (font_size, _ch_advance) = self.resolve_deferred_font_metrics_in_style(
-                    &mut box_.style,
+                    &mut box_.core.style,
                     parent_font_size,
                     parent_ch_advance,
                     root_font_metrics,
                 );
                 let child_requires_parent_ch =
-                    self.children_require_parent_ch_advance(&box_.children, font_size);
-                let ch_advance = self.ch_advance_for_style(&box_.style, child_requires_parent_ch);
+                    self.children_require_parent_ch_advance(&box_.core.children, font_size);
+                let ch_advance =
+                    self.ch_advance_for_style(&box_.core.style, child_requires_parent_ch);
                 self.resolve_deferred_font_metrics_in_table_fragment(
                     &mut box_.fragment,
                     font_size,
                     ch_advance,
                     root_font_metrics,
                 );
-                for child in &mut box_.children {
+                for child in &mut box_.core.children {
                     self.resolve_deferred_font_metrics_in_box(
                         child,
                         font_size,
@@ -601,10 +704,10 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
             box_tree::MutableFormattingBox::Flex(box_) => {
-                recurse(self, &mut box_.children, &mut box_.style)
+                recurse(self, &mut box_.core.children, &mut box_.core.style)
             }
             box_tree::MutableFormattingBox::Replaced(box_) => {
-                recurse(self, &mut box_.children, &mut box_.style)
+                recurse(self, &mut box_.core.children, &mut box_.core.style)
             }
         }
     }
@@ -751,6 +854,12 @@ impl<'a> LayoutBuilder<'a> {
     ) -> ComputedStyle {
         let mut style = style.clone();
         self.resolve_style_current_viewport_lengths(&mut style);
+        // A frozen box tree can retain an `em`/`rem` expression until it is
+        // replayed for intrinsic sizing or an isolated formatting context.
+        // These units are computed from the element's resolved font sizes,
+        // independently of any containing-block percentage basis.
+        // <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+        style.finalize_computed_font_relative_lengths();
         self.resolve_style_font_metric_lengths(&mut style);
         style.apply_effective_zoom();
         // Viewport and font-relative units can turn an authored box edge into
@@ -767,10 +876,11 @@ impl<'a> LayoutBuilder<'a> {
         &self,
         style: &mut ComputedStyle,
     ) {
-        // In paged media the page area is the viewport used to resolve
-        // viewport-relative lengths. Resolve at layout time so a box that is
-        // pre-broken into a differently sized destination page observes that
-        // destination page's viewport rather than the previous fragment.
+        // Every page fragmentainer establishes its own paged-media viewport.
+        // Resolve viewport-relative used values only after a prebreak has
+        // selected the destination page context; otherwise a box moved from a
+        // `:first` sheet can retain that sheet's `vw`/`vh` size on the next
+        // page.
         // <https://www.w3.org/TR/css-page-3/#page-model>
         // <https://www.w3.org/TR/css-values-4/#viewport-relative-lengths>
         Self::resolve_style_viewport_lengths(
@@ -788,23 +898,23 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         match formatting_box {
             box_tree::MutableFormattingBox::Block(box_) => {
-                self.resolve_style_font_metric_lengths(&mut box_.style);
+                self.resolve_style_font_metric_lengths(&mut box_.core.style);
                 for child in &mut box_.run_in_children {
                     self.resolve_font_metric_lengths_in_box(child);
                 }
-                for child in &mut box_.children {
+                for child in &mut box_.core.children {
                     self.resolve_font_metric_lengths_in_box(child);
                 }
             }
             box_tree::MutableFormattingBox::Inline(box_) => {
-                self.resolve_style_font_metric_lengths(&mut box_.style);
-                for child in &mut box_.children {
+                self.resolve_style_font_metric_lengths(&mut box_.core.style);
+                for child in &mut box_.core.children {
                     self.resolve_font_metric_lengths_in_box(child);
                 }
             }
             box_tree::MutableFormattingBox::InlineSplitBlockContext(box_) => {
-                self.resolve_style_font_metric_lengths(&mut box_.style);
-                for child in &mut box_.children {
+                self.resolve_style_font_metric_lengths(&mut box_.core.style);
+                for child in &mut box_.core.children {
                     self.resolve_font_metric_lengths_in_box(child);
                 }
             }
@@ -815,11 +925,11 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
             box_tree::MutableFormattingBox::AtomicInline(box_) => {
-                self.resolve_style_font_metric_lengths(&mut box_.style);
+                self.resolve_style_font_metric_lengths(&mut box_.core.style);
                 if let Some(fragment) = &mut box_.table_fragment {
                     self.resolve_font_metric_lengths_in_table_fragment(fragment);
                 }
-                for child in &mut box_.children {
+                for child in &mut box_.core.children {
                     self.resolve_font_metric_lengths_in_box(child);
                 }
             }
@@ -827,21 +937,21 @@ impl<'a> LayoutBuilder<'a> {
                 self.resolve_style_font_metric_lengths(&mut box_.style);
             }
             box_tree::MutableFormattingBox::Table(box_) => {
-                self.resolve_style_font_metric_lengths(&mut box_.style);
+                self.resolve_style_font_metric_lengths(&mut box_.core.style);
                 self.resolve_font_metric_lengths_in_table_fragment(&mut box_.fragment);
-                for child in &mut box_.children {
+                for child in &mut box_.core.children {
                     self.resolve_font_metric_lengths_in_box(child);
                 }
             }
             box_tree::MutableFormattingBox::Flex(box_) => {
-                self.resolve_style_font_metric_lengths(&mut box_.style);
-                for child in &mut box_.children {
+                self.resolve_style_font_metric_lengths(&mut box_.core.style);
+                for child in &mut box_.core.children {
                     self.resolve_font_metric_lengths_in_box(child);
                 }
             }
             box_tree::MutableFormattingBox::Replaced(box_) => {
-                self.resolve_style_font_metric_lengths(&mut box_.style);
-                for child in &mut box_.children {
+                self.resolve_style_font_metric_lengths(&mut box_.core.style);
+                for child in &mut box_.core.children {
                     self.resolve_font_metric_lengths_in_box(child);
                 }
             }
@@ -1167,23 +1277,37 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
     ) {
         match formatting_box {
-            box_tree::FormattingBox::Block(box_) => self.layout_element_box(
-                box_.element,
-                &box_.style,
-                stylesheets,
-                box_.signature.clone(),
-                &box_.source,
-                &box_.run_in_children,
-                &box_.children,
-            ),
+            box_tree::FormattingBox::Block(box_) => {
+                // The document box can recur through an anonymous root-flow
+                // wrapper before it reaches its own descendants. Keep the
+                // stored style computed, but apply the principal-flow axes at
+                // every formatting entry for that one principal box.
+                let layout_style = box_
+                    .core
+                    .element
+                    .tag
+                    .eq_ignore_ascii_case("html")
+                    .then_some(())
+                    .filter(|_| matches!(&box_.core.source, box_tree::BoxSource::Principal))
+                    .map(|_| self.principal_flow.root_layout_style(&box_.core.style));
+                self.layout_element_box(
+                    box_.core.element,
+                    layout_style.as_ref().unwrap_or(&box_.core.style),
+                    stylesheets,
+                    box_.core.signature.clone(),
+                    &box_.core.source,
+                    &box_.run_in_children,
+                    &box_.core.children,
+                );
+            }
             box_tree::FormattingBox::Inline(box_) => self.layout_element_box(
-                box_.element,
-                &box_.style,
+                box_.core.element,
+                &box_.core.style,
                 stylesheets,
-                box_.signature.clone(),
-                &box_.source,
+                box_.core.signature.clone(),
+                &box_.core.source,
                 &[],
-                &box_.children,
+                &box_.core.children,
             ),
             box_tree::FormattingBox::AnonymousBlock(box_) => {
                 self.layout_anonymous_block(&box_.style, &box_.children, stylesheets, None);
@@ -1192,42 +1316,42 @@ impl<'a> LayoutBuilder<'a> {
                 self.layout_inline_split_block_context(box_, stylesheets)
             }
             box_tree::FormattingBox::AtomicInline(box_) => self.layout_element_box(
-                box_.element,
-                &box_.style,
+                box_.core.element,
+                &box_.core.style,
                 stylesheets,
-                box_.signature.clone(),
-                &box_.source,
+                box_.core.signature.clone(),
+                &box_.core.source,
                 &[],
-                &box_.children,
+                &box_.core.children,
             ),
             box_tree::FormattingBox::Table(box_) => {
                 self.layout_table_box(
-                    box_.element,
-                    &box_.style,
+                    box_.core.element,
+                    &box_.core.style,
                     stylesheets,
-                    box_.signature.clone(),
-                    &box_.source,
-                    &box_.children,
+                    box_.core.signature.clone(),
+                    &box_.core.source,
+                    &box_.core.children,
                     &box_.fragment,
                 );
             }
             box_tree::FormattingBox::Flex(box_) => self.layout_element_box(
-                box_.element,
-                &box_.style,
+                box_.core.element,
+                &box_.core.style,
                 stylesheets,
-                box_.signature.clone(),
-                &box_.source,
+                box_.core.signature.clone(),
+                &box_.core.source,
                 &[],
-                &box_.children,
+                &box_.core.children,
             ),
             box_tree::FormattingBox::Replaced(box_) => self.layout_element_box(
-                box_.element,
-                &box_.style,
+                box_.core.element,
+                &box_.core.style,
                 stylesheets,
-                box_.signature.clone(),
-                &box_.source,
+                box_.core.signature.clone(),
+                &box_.core.source,
                 &[],
-                &box_.children,
+                &box_.core.children,
             ),
             box_tree::FormattingBox::Text(box_) => {
                 let text = normalized_text_for_style(&box_.text, &box_.style);
@@ -1252,6 +1376,7 @@ impl<'a> LayoutBuilder<'a> {
         self.push_ancestor_signature(signature);
         match source {
             box_tree::BoxSource::Principal => {
+                self.capture_suppressed_named_strings_before(element.id);
                 self.layout_element_with_child_boxes_and_run_ins(
                     element,
                     style,
@@ -1259,17 +1384,13 @@ impl<'a> LayoutBuilder<'a> {
                     run_in_children,
                     Some(children),
                 );
+                self.capture_suppressed_named_strings_after(element.id);
             }
             box_tree::BoxSource::GeneratedPseudo(pseudo) => {
                 self.layout_generated_pseudo_box(
                     element,
                     style,
-                    match pseudo.kind {
-                        box_tree::GeneratedPseudoKind::Before => {
-                            box_tree::CounterEventSource::Before
-                        }
-                        box_tree::GeneratedPseudoKind::After => box_tree::CounterEventSource::After,
-                    },
+                    pseudo.kind.counter_event_source(),
                     stylesheets,
                     run_in_children,
                     Some(children),
@@ -1303,6 +1424,7 @@ impl<'a> LayoutBuilder<'a> {
         self.push_ancestor_signature(signature);
         match source {
             box_tree::BoxSource::Principal => {
+                self.capture_suppressed_named_strings_before(element.id);
                 self.layout_element_with_child_boxes_run_ins_and_table_fragment(
                     element,
                     style,
@@ -1311,17 +1433,13 @@ impl<'a> LayoutBuilder<'a> {
                     Some(children),
                     Some(fragment),
                 );
+                self.capture_suppressed_named_strings_after(element.id);
             }
             box_tree::BoxSource::GeneratedPseudo(pseudo) => {
                 self.layout_generated_pseudo_box(
                     element,
                     style,
-                    match pseudo.kind {
-                        box_tree::GeneratedPseudoKind::Before => {
-                            box_tree::CounterEventSource::Before
-                        }
-                        box_tree::GeneratedPseudoKind::After => box_tree::CounterEventSource::After,
-                    },
+                    pseudo.kind.counter_event_source(),
                     stylesheets,
                     &[],
                     Some(children),
@@ -1345,6 +1463,17 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let counter_scope = self.begin_pseudo_counter_scope(element, source, style);
         self.element_side_effect_suppression_depth += 1;
+        let previous_root_pseudo_block_projection = self.root_pseudo_block_projection;
+        if element.tag.eq_ignore_ascii_case("html")
+            && style.writing_mode == WritingMode::VerticalLr
+            && self.principal_flow.writing_mode == WritingMode::HorizontalTb
+        {
+            self.root_pseudo_block_projection = Some(RootPseudoBlockProjection {
+                element: element.id,
+                block_start: PhysicalSide::Left,
+                block_end_inset: self.principal_body_block_end_inset,
+            });
+        }
         self.layout_element_inner(
             element,
             style,
@@ -1353,6 +1482,7 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             table_fragment,
         );
+        self.root_pseudo_block_projection = previous_root_pseudo_block_projection;
         self.element_side_effect_suppression_depth -= 1;
         self.end_counter_scope(counter_scope);
     }
@@ -1379,30 +1509,6 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             &[],
             child_boxes,
-        );
-    }
-
-    /// Lay out a replayed flex/grid item while its outer item context owns the
-    /// principal box's paint effects. Descendant effect contexts are unchanged.
-    /// CSS Grid and Flexbox paint items as stacking units after resolving their
-    /// independent formatting contexts:
-    /// <https://www.w3.org/TR/css-grid-1/#z-order> and
-    /// <https://www.w3.org/TR/css-flexbox-1/#painting>.
-    pub(in crate::layout) fn layout_element_with_child_boxes_without_principal_effect_context(
-        &mut self,
-        element: &Element,
-        style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
-        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
-    ) {
-        self.layout_element_with_child_boxes_run_ins_and_table_fragment_with_principal_effect_context(
-            element,
-            style,
-            stylesheets,
-            &[],
-            child_boxes,
-            None,
-            false,
         );
     }
 
@@ -1463,7 +1569,7 @@ impl<'a> LayoutBuilder<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn layout_element_with_child_boxes_run_ins_and_table_fragment_with_principal_effect_context(
+    pub(in crate::layout) fn layout_element_with_child_boxes_run_ins_and_table_fragment_with_principal_effect_context(
         &mut self,
         element: &Element,
         style: &ComputedStyle,
@@ -1473,9 +1579,19 @@ impl<'a> LayoutBuilder<'a> {
         table_fragment: Option<&box_tree::TableFragment<'_>>,
         capture_principal_effect_context: bool,
     ) {
+        // Most formatting contexts dispatch principal children directly to
+        // this common boundary instead of through `layout_element_box`.
+        // Consume any non-painting GCPM source event at that same source-order
+        // point before a following child's break/page selection is applied.
+        self.capture_suppressed_named_strings_before(element.id);
         self.push_page_value_scope(style);
-        let page_name_scope = self.enter_page_name_scope(style, child_boxes);
-        let fragmentainer_kind = FragmentainerKind::Page;
+        let page_name_scope = self.enter_page_name_scope(element, style, child_boxes);
+        // The common element-dispatch boundary is also used while a
+        // multicolumn container lays out its temporary column fragmentainers.
+        // Break selection must therefore use the active fragmentation context
+        // rather than assuming the outer paged-media page:
+        // <https://www.w3.org/TR/css-break-3/#break-types>.
+        let fragmentainer_kind = self.active_fragmentainer_kind();
         if self.should_prebreak_avoid_inside(
             element,
             style,
@@ -1483,7 +1599,21 @@ impl<'a> LayoutBuilder<'a> {
             child_boxes,
             fragmentainer_kind,
         ) {
+            // Prebreaking before an avoid-kept subtree is a real box
+            // fragmentation boundary. Preserve the same destination-local
+            // containing-block geometry as the later speculative retry path;
+            // raw `push_page` offsets otherwise retain the prior fragment's
+            // root/body canvas translation for tables and other nested BFCs.
+            // <https://www.w3.org/TR/css-break-3/#box-splitting>
+            let continuation = (fragmentainer_kind == FragmentainerKind::Page)
+                .then(|| self.block_page_break_continuation_context());
+            let source_page_count = self.pages.len();
             self.push_page_if_nonempty();
+            if self.pages.len() != source_page_count
+                && let Some(continuation) = continuation
+            {
+                self.replay_fragment_continuation_on_page(&continuation, self.current_page_context);
+            }
         }
         let mut layout_style;
         let box_break_context = FragmentBreakContext::for_standalone_box(style);
@@ -1533,6 +1663,7 @@ impl<'a> LayoutBuilder<'a> {
                 if let Some(counter_scope) = counter_scope {
                     self.end_counter_scope(counter_scope);
                 }
+                self.capture_suppressed_named_strings_after(element.id);
                 self.pop_page_value_scope();
                 self.exit_page_name_scope(page_name_scope);
                 return;
@@ -1558,6 +1689,7 @@ impl<'a> LayoutBuilder<'a> {
                 if let Some(counter_scope) = counter_scope {
                     self.end_counter_scope(counter_scope);
                 }
+                self.capture_suppressed_named_strings_after(element.id);
                 self.pop_page_value_scope();
                 self.exit_page_name_scope(page_name_scope);
                 return;
@@ -1583,6 +1715,7 @@ impl<'a> LayoutBuilder<'a> {
             if let Some(counter_scope) = counter_scope {
                 self.end_counter_scope(counter_scope);
             }
+            self.capture_suppressed_named_strings_after(element.id);
             self.pop_page_value_scope();
             self.exit_page_name_scope(page_name_scope);
             return;
@@ -1599,12 +1732,14 @@ impl<'a> LayoutBuilder<'a> {
         if let Some(counter_scope) = counter_scope {
             self.end_counter_scope(counter_scope);
         }
+        self.capture_suppressed_named_strings_after(element.id);
         self.pop_page_value_scope();
         self.exit_page_name_scope(page_name_scope);
     }
 
     pub(in crate::layout) fn enter_page_name_scope(
         &mut self,
+        element: &Element,
         style: &ComputedStyle,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> Option<PageNameScope> {
@@ -1618,23 +1753,32 @@ impl<'a> LayoutBuilder<'a> {
         {
             return None;
         }
-        let page_value_sources =
-            page_value_sources_from_style_and_children(style, child_boxes.unwrap_or_default());
-        if !style.page_name_specified
-            && page_value_sources.0.0.is_none()
-            && page_value_sources.1.0.is_none()
-        {
+        let page_value_sources = page_value_sources_from_element_style_and_children(
+            element,
+            style,
+            child_boxes.unwrap_or_default(),
+        );
+        let start_page_name = match &page_value_sources.start {
+            PageBoundaryValue::Named(name) => Some(name.as_str()),
+            PageBoundaryValue::Inapplicable
+            | PageBoundaryValue::Inherited
+            | PageBoundaryValue::Auto => None,
+        };
+        let end_page_name = match page_value_sources.end {
+            PageBoundaryValue::Named(name) => Some(name),
+            PageBoundaryValue::Inapplicable
+            | PageBoundaryValue::Inherited
+            | PageBoundaryValue::Auto => None,
+        };
+        if !style.page_name_specified && start_page_name.is_none() && end_page_name.is_none() {
             return None;
         }
-        self.enter_page_name_scope_for_value(page_value_sources.0.0.as_deref());
-        Some(self.page_name_scope_checkpoint(page_value_sources.1.0))
-    }
-
-    pub(in crate::layout) fn page_name_scope_checkpoint(
-        &self,
-        end_page_name: Option<String>,
-    ) -> PageNameScope {
-        PageNameScope { end_page_name }
+        // Element scopes establish lexical `page` used-value resolution, but
+        // do not themselves materialize a page. The parent formatting
+        // context owns the class-A boundary and compares this box's
+        // propagated start value with its preceding sibling's end value.
+        // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+        Some(PageNameScope::Element)
     }
 
     /// Switches named page groups at a class A sibling page-break boundary.
@@ -1648,18 +1792,59 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         page_name: Option<&str>,
     ) {
-        if self.page_name_scope_suppression > 0 {
+        if self.page_name_scope_suppression > 0 || self.fragmentation_suppression_depth > 0 {
             return;
         }
-        if self.enter_page_name_scope_for_value(page_name).is_some() {
-            // A class-A boundary itself establishes the destination page
-            // group, even when the selected normal-flow box has no used
-            // geometry (for example, an empty block containing only
-            // `display:none` content). A subsequent distinct sibling must
-            // therefore materialize this otherwise empty page group.
-            // <https://www.w3.org/TR/css-page-3/#using-named-pages>
-            self.current_page_has_named_page_flow_content = true;
+        // A class-A page boundary belongs to the active principal
+        // fragmentation flow. An orthogonal nested block progresses along a
+        // different physical axis and cannot materialize a page transition by
+        // itself; its parent fragmentainer owns any eventual page break.
+        // <https://www.w3.org/TR/css-break-3/#possible-breaks>
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+        if self.containing_block_writing_mode != self.principal_flow.writing_mode {
+            return;
         }
+        // A class-A boundary belongs to the participating boxes in that
+        // principal fragmentation flow, rather than to a physical-Y cursor.
+        // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+        if self.principal_flow.writing_mode != WritingMode::HorizontalTb {
+            // The root start value chooses the first page type but does not
+            // itself cross a fragmentainer boundary.  Moving the vertical
+            // block cursor here made the first named child disappear before
+            // it could contribute any content.
+            // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+            if !self.current_page_has_named_page_flow_content {
+                self.enter_page_name_scope_for_value(page_name);
+                return;
+            }
+            // The page fragmentainer remains physically top-to-bottom even
+            // when the principal block axis is horizontal. Selecting a named
+            // page therefore updates the active fragment's type without
+            // manufacturing an unrelated horizontal page strip; subsequent
+            // vertical-flow placement remains owned by that fragmentainer.
+            // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+            // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+            // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+            let Some(page_name) = page_name else {
+                return;
+            };
+            self.current_page_name = Some(page_name.to_string());
+            return;
+        }
+        // The structural page value on the preceding side may differ from
+        // the succeeding one even when both surrounding lexical scopes
+        // resolve to the same materialized page name.  For example, a first
+        // child can end the parent's `a` group with `b`; the following
+        // inherited child must start a *new* `a` page.  Comparing only the
+        // destination with `current_page_name` loses that return boundary.
+        // <https://drafts.csswg.org/css-page-3/#using-named-pages>
+        if self.current_page_name.as_deref() == page_name
+            && self.current_page_has_named_page_flow_content
+        {
+            self.push_page_for_page_name(page_name);
+            return;
+        }
+        self.enter_page_name_scope_for_value(page_name);
     }
 
     /// Enters a page-name scope for inline-level content.
@@ -1678,6 +1863,8 @@ impl<'a> LayoutBuilder<'a> {
         }
         let previous = self.current_page_name.clone();
         self.enter_page_name_scope_for_value(page_name);
-        Some(self.page_name_scope_checkpoint(previous))
+        Some(PageNameScope::Inline {
+            previous_page_name: previous,
+        })
     }
 }

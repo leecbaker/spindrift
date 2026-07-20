@@ -351,7 +351,7 @@ pub(in crate::layout) fn collapsible_start_margin_for_box(
 ) -> f32 {
     if can_collapse_block_start_margin(
         style,
-        used_border_widths(style),
+        UsedEdges::from_css_edges(used_border_widths(style)),
         has_direct_inline_content_box(child_boxes),
         overflow_context.used_overflow(element, style),
     ) && let Some(descendant_margin) = collapsible_first_child_start_margin_from_boxes(
@@ -419,19 +419,22 @@ pub(in crate::layout) fn formatting_box_can_only_create_phantom_line_boxes(
                     && text.text.chars().all(is_css_collapsible_whitespace))
         }
         box_tree::FormattingBox::Inline(box_) => {
-            inline_box_has_no_nonzero_inline_axis_component(&box_.style)
-                && !box_.style.content.is_generated()
+            inline_box_has_no_nonzero_inline_axis_component(&box_.core.style)
+                && !box_.core.style.content.is_generated()
                 && !box_
+                    .core
                     .style
                     .before_style
                     .as_deref()
                     .is_some_and(|style| style.content.is_generated())
                 && !box_
+                    .core
                     .style
                     .after_style
                     .as_deref()
                     .is_some_and(|style| style.content.is_generated())
                 && box_
+                    .core
                     .children
                     .iter()
                     .all(formatting_box_can_only_create_phantom_line_boxes)
@@ -441,6 +444,7 @@ pub(in crate::layout) fn formatting_box_can_only_create_phantom_line_boxes(
             .iter()
             .all(formatting_box_can_only_create_phantom_line_boxes),
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
+            .core
             .children
             .iter()
             .all(formatting_box_can_only_create_phantom_line_boxes),
@@ -478,8 +482,8 @@ pub(in crate::layout) fn generated_content_has_non_phantom_inline_content(
 fn inline_box_has_no_nonzero_inline_axis_component(style: &ComputedStyle) -> bool {
     let borders = used_border_widths(style);
     [
-        inline_start_side(style.writing_mode, style.direction),
-        inline_end_side(style.writing_mode, style.direction),
+        inline_start_side(style.writing_mode, style.used_direction()),
+        inline_end_side(style.writing_mode, style.used_direction()),
     ]
     .into_iter()
     .all(|side| {
@@ -507,9 +511,11 @@ pub(in crate::layout) fn has_atomic_inline_formatting_box(
             has_atomic_inline_formatting_box(&box_.children)
         }
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-            has_atomic_inline_formatting_box(&box_.children)
+            has_atomic_inline_formatting_box(&box_.core.children)
         }
-        box_tree::FormattingBox::Inline(box_) => has_atomic_inline_formatting_box(&box_.children),
+        box_tree::FormattingBox::Inline(box_) => {
+            has_atomic_inline_formatting_box(&box_.core.children)
+        }
         box_tree::FormattingBox::Block(_)
         | box_tree::FormattingBox::Text(_)
         | box_tree::FormattingBox::Table(_)
@@ -614,7 +620,7 @@ pub(in crate::layout) fn collapsible_start_margin_dom_with_resolver(
 ) -> f32 {
     if can_collapse_block_start_margin(
         style,
-        used_border_widths(style),
+        UsedEdges::from_css_edges(used_border_widths(style)),
         has_direct_inline_content_dom_with_resolver(
             element,
             style,
@@ -893,7 +899,7 @@ mod tests {
         ComputedStyle {
             font_size: 12.0,
             line_height: 14.4,
-            color: Color::BLACK,
+            color: CssColor::BLACK,
             ..ComputedStyle::initial()
         }
     }
@@ -983,7 +989,10 @@ mod tests {
 
                 assert_eq!(
                     formatting_box_page_value_sources(body),
-                    ((None, false), (None, false))
+                    PageBoundaryValues {
+                        start: PageBoundaryValue::Inherited,
+                        end: PageBoundaryValue::Inherited,
+                    }
                 );
             })
             .expect("deep page-value regression thread should start")

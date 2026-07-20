@@ -9,10 +9,16 @@ pub(in crate::layout) struct BlockFlowChildrenPhaseInput<'a, 'boxes> {
     pub(in crate::layout) can_collapse_start_margin: bool,
     pub(in crate::layout) can_collapse_end_margin: bool,
     pub(in crate::layout) applied_start_margin: LayoutLength,
+    /// Whether a cleared parent's applied start margin already includes its
+    /// first adjoining in-flow descendant's start-margin contribution.
+    pub(in crate::layout) clearance_consumed_adjoining_start_margin: bool,
     pub(in crate::layout) starts_at_page_top: bool,
     pub(in crate::layout) laid_out_column_children: bool,
     pub(in crate::layout) use_box_inline_items: bool,
     pub(in crate::layout) use_ordered_mixed_flow: bool,
+    /// Whether a preceding direct inline run establishes the source side of
+    /// the first class-A child boundary.
+    pub(in crate::layout) has_preceding_inline_flow_content: bool,
     pub(in crate::layout) definite_content_height: Option<f32>,
     pub(in crate::layout) descendant_percentage_height_basis: Option<BlockSizePercentageBasis>,
 }

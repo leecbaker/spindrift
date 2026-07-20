@@ -25,17 +25,26 @@ impl<'a> LayoutBuilder<'a> {
             children: nodes.to_vec(),
             is_target: false,
         };
+        let has_direct_line_break = element_has_direct_line_break(&element);
         let text = inline_text_for_style(&element, style);
-        if text.is_empty() {
+        if text.is_empty() && !has_direct_line_break {
             return false;
         }
-        if has_styled_inline_descendant_with_font_metrics(
-            &element,
-            style,
-            stylesheets,
-            &self.ancestors,
-            &mut self.font_system,
-        ) {
+        // An inline fragment can contain a semantic `<br>` with no text or
+        // font-style difference. It still needs the item collector, which
+        // carries the element's `clear` value into the forced-break record;
+        // the text-only path would reduce it to a newline and lose clearance.
+        // <https://html.spec.whatwg.org/multipage/text-level-semantics.html#the-br-element>
+        // <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+        if has_direct_line_break
+            || has_styled_inline_descendant_with_font_metrics(
+                &element,
+                style,
+                stylesheets,
+                &self.ancestors,
+                &mut self.font_system,
+            )
+        {
             self.layout_inline_items_block(&element, style, stylesheets, (0.0, 0.0), None, None);
         } else {
             self.layout_text_block(&text, style, 0.0, 0.0, None);

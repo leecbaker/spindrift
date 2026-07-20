@@ -1,8 +1,8 @@
 use super::*;
 
 fn assert_no_red_or_hotpink_rects(document: &quire::Document) {
-    let red = Color::new(255, 0, 0);
-    let hotpink = Color::new(255, 105, 180);
+    let red = CssColor::new(255, 0, 0);
+    let hotpink = CssColor::new(255, 105, 180);
     let painted = document
         .pages
         .iter()
@@ -32,7 +32,7 @@ async fn layout_containment_captures_nested_fixed_descendant() {
     .await
     .unwrap();
 
-    let green = filled_rect(&document.pages[0], Color::new(0, 255, 0));
+    let green = filled_rect(&document.pages[0], CssColor::new(0, 255, 0));
     assert!((green.x() - 30.0).abs() < 0.01, "{green:?}");
     assert!((green.width() - 60.0).abs() < 0.01, "{green:?}");
 }
@@ -94,9 +94,9 @@ async fn percentage_block_width_uses_destination_page_size_after_prebreak() {
     .await
     .unwrap();
 
-    let yellow = filled_rect(&document.pages[0], Color::new(255, 255, 0));
-    let cyan = filled_rect(&document.pages[1], Color::new(0, 255, 255));
-    let pink = filled_rect(&document.pages[2], Color::new(255, 192, 203));
+    let yellow = filled_rect(&document.pages[0], CssColor::new(255, 255, 0));
+    let cyan = filled_rect(&document.pages[1], CssColor::new(0, 255, 255));
+    let pink = filled_rect(&document.pages[2], CssColor::new(255, 192, 203));
 
     assert_eq!(document.pages.len(), 3);
     assert_eq!(document.pages[0].width(), 375.0);
@@ -126,7 +126,7 @@ async fn percentage_flex_width_uses_destination_page_size_after_prebreak() {
     .await
     .unwrap();
 
-    let cyan = filled_rect(&document.pages[1], Color::new(0, 255, 255));
+    let cyan = filled_rect(&document.pages[1], CssColor::new(0, 255, 255));
 
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[1].width(), 240.0);
@@ -149,7 +149,7 @@ async fn percentage_hr_width_uses_destination_page_size_after_prebreak() {
     .await
     .unwrap();
 
-    let cyan = filled_rect(&document.pages[1], Color::new(0, 255, 255));
+    let cyan = filled_rect(&document.pages[1], CssColor::new(0, 255, 255));
 
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[1].width(), 240.0);
@@ -171,7 +171,7 @@ async fn viewport_width_units_use_destination_page_size_after_prebreak() {
     .await
     .unwrap();
 
-    let cyan = filled_rect(&document.pages[1], Color::new(0, 255, 255));
+    let cyan = filled_rect(&document.pages[1], CssColor::new(0, 255, 255));
 
     assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[1].width(), 240.0);
@@ -225,7 +225,7 @@ async fn fixed_generated_before_and_after_boxes_paint_at_page_bottom_right() {
     let mut blue_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .collect::<Vec<_>>();
     blue_rects.sort_by(|left, right| left.x().total_cmp(&right.x()));
 
@@ -251,7 +251,7 @@ async fn absolute_positioned_table_bottom_anchors_border_box_to_page_area() {
     let table_background = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(238, 238, 238)))
+        .filter(|rect| rect.fill == Some(CssColor::new(238, 238, 238)))
         .max_by(|left, right| left.width().total_cmp(&right.width()))
         .unwrap();
 
@@ -346,6 +346,51 @@ async fn absolute_position_auto_offsets_use_static_position_after_flow() {
 }
 
 #[tokio::test]
+async fn block_level_abspos_is_not_dispatched_by_raw_inline_collection() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>\
+         @page { size: 400px 300px; margin: 0 }\
+         body, p, div { margin: 0; font: 20px/20px monospace }\
+         .probe { position: absolute; width: 100px; height: 100px; background: rgb(0, 128, 0); color: red; z-index: -1 }\
+         </style>\
+         <p>Test <strong>paragraph</strong></p>\
+         <div class=\"probe\">X XXX<br>XX</div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page = &document.pages[0];
+    let green_rects = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        green_rects.len(),
+        1,
+        "green positioned probes: {green_rects:?}"
+    );
+
+    let green = green_rects[0];
+    // The static position is the start of the block formatting box following
+    // the 20px preceding paragraph, expressed in the rendered PDF coordinate
+    // system. A raw-inline dispatch would instead place a second probe at the
+    // parent's initial cursor.
+    assert!((green.y() - 133.10303).abs() < 0.01, "{green:?}");
+    assert_eq!(
+        page.lines()
+            .iter()
+            .filter(|line| line.text == "X XXX" || line.text == "XX")
+            .count(),
+        2,
+        "positioned probe text should be emitted once: {:?}",
+        page.lines(),
+    );
+}
+
+#[tokio::test]
 async fn absolute_block_level_abspos_static_position_after_inline_content() {
     let document = Html::from_string(
         "<!DOCTYPE html>\
@@ -382,7 +427,6 @@ async fn absolute_block_level_abspos_static_position_after_inline_content() {
     let inline_after_rtl = line("inline after rtl");
     let abs_after_rtl = line("abs after rtl");
     let line_right = |line: &quire::RenderedLine| line.x() + rendered_line_advance(line);
-
     assert!((abs_before_ltr.y() - inline_before_ltr.y()).abs() < 0.01);
     assert!(
         (abs_before_ltr.x() - inline_before_ltr.x()).abs() < 0.01,
@@ -565,12 +609,12 @@ async fn auto_positioned_abspos_after_text_before_float() {
         let red_index = page
             .rects()
             .iter()
-            .position(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+            .position(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
             .expect("red float rectangle should be painted");
         let green_index = page
             .rects()
             .iter()
-            .position(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+            .position(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
             .unwrap_or_else(|| {
                 panic!(
                     "green abspos rectangle should be painted: {:?}",
@@ -588,8 +632,8 @@ async fn auto_positioned_abspos_after_text_before_float() {
             "{case}: green abspos should cover the later float: red={red:?} green={green:?}",
         );
         assert!(
-            first_rect_paint_operation_index(page, Color::new(0, 128, 0))
-                > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+            first_rect_paint_operation_index(page, CssColor::new(0, 128, 0))
+                > first_rect_paint_operation_index(page, CssColor::new(255, 0, 0)),
             "{case}: green abspos should paint after red: operations={:?} rects={:?}",
             page.paint_operations(),
             page.rects(),
@@ -670,19 +714,19 @@ async fn inline_block_abspos_static_position_uses_margin_box_top() {
     .unwrap();
 
     let page = &document.pages[0];
-    let rect = |color: Color| {
+    let rect = |color: CssColor| {
         page.rects()
             .iter()
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("missing {color:?} rect: {:?}", page.rects()))
     };
-    let parent = rect(Color::new(0, 0, 255));
+    let parent = rect(CssColor::new(0, 0, 255));
     let parent_content_top = parent.y() + parent.height() - 0.75;
 
     for color in [
-        Color::new(255, 255, 0),
-        Color::new(255, 192, 203),
-        Color::new(173, 216, 230),
+        CssColor::new(255, 255, 0),
+        CssColor::new(255, 192, 203),
+        CssColor::new(173, 216, 230),
     ] {
         let child = rect(color);
         let child_top = child.y() + child.height();
@@ -788,7 +832,7 @@ async fn block_abspos_static_position_after_inline_uses_trimmed_text_box_line_he
         document.pages[0]
             .rects()
             .iter()
-            .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+            .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
             .unwrap_or_else(|| panic!("missing abspos rect: {:?}", document.pages[0].rects()))
             .y()
     };
@@ -900,8 +944,8 @@ async fn fixed_static_position_inside_static_position_absolute() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
-    let red = Color::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
 
     let emitted_rects = emitted_rects_with_fills(page, &[green, red]);
     assert_eq!(
@@ -984,7 +1028,7 @@ async fn absolute_auto_width_fills_between_left_and_right() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 30.0).abs() < 0.01);
@@ -1002,7 +1046,7 @@ async fn absolute_auto_width_between_insets_subtracts_non_auto_margins() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 35.0).abs() < 0.01);
@@ -1020,7 +1064,7 @@ async fn absolute_auto_width_between_insets_subtracts_padding_and_borders() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 30.0).abs() < 0.01);
@@ -1038,7 +1082,7 @@ async fn absolute_right_offset_anchors_margin_box_edge() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 115.0).abs() < 0.01);
@@ -1056,7 +1100,7 @@ async fn absolute_overconstrained_horizontal_axis_uses_containing_direction() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 120.0).abs() < 0.01);
@@ -1071,7 +1115,7 @@ async fn absolute_horizontal_auto_margins_center_definite_width_between_insets()
     .render(&RenderOptions::default()).await
     .unwrap();
 
-    let blue = filled_rect(&document.pages[0], Color::new(34, 146, 212));
+    let blue = filled_rect(&document.pages[0], CssColor::new(34, 146, 212));
 
     assert!((blue.x() - 40.0).abs() < 0.01);
     assert!((blue.width() - 100.0).abs() < 0.01);
@@ -1088,7 +1132,7 @@ async fn absolute_right_anchored_width_applies_min_width_before_positioning() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 140.0).abs() < 0.01);
@@ -1106,7 +1150,7 @@ async fn absolute_auto_height_fills_between_top_and_bottom() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.y() - 40.0).abs() < 0.01);
@@ -1121,7 +1165,7 @@ async fn absolute_vertical_auto_margins_center_definite_height_between_insets() 
     .render(&RenderOptions::default()).await
     .unwrap();
 
-    let blue = filled_rect(&document.pages[0], Color::new(34, 146, 212));
+    let blue = filled_rect(&document.pages[0], CssColor::new(34, 146, 212));
 
     assert!((blue.y() - 60.0).abs() < 0.01);
     assert!((blue.height() - 40.0).abs() < 0.01);
@@ -1138,7 +1182,7 @@ async fn absolute_auto_height_between_insets_subtracts_non_auto_margins() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.y() - 47.0).abs() < 0.01);
@@ -1156,7 +1200,7 @@ async fn absolute_auto_height_between_insets_subtracts_padding_and_borders() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.y() - 40.0).abs() < 0.01);
@@ -1244,11 +1288,11 @@ async fn absolute_table_auto_margins_center_like_block_between_insets() {
     .unwrap();
 
     let page = &document.pages[0];
-    let red = filled_rect(page, Color::new(255, 0, 0));
+    let red = filled_rect(page, CssColor::new(255, 0, 0));
     let green = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .max_by(|left, right| {
             (left.width() * left.height()).total_cmp(&(right.width() * right.height()))
         })
@@ -1263,8 +1307,8 @@ async fn absolute_table_auto_margins_center_like_block_between_insets() {
     assert!((green.width() - red.width()).abs() < 0.01);
     assert!((green.height() - red.height()).abs() < 0.01);
     assert!(
-        first_rect_paint_operation_index(page, Color::new(0, 128, 0))
-            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+        first_rect_paint_operation_index(page, CssColor::new(0, 128, 0))
+            > first_rect_paint_operation_index(page, CssColor::new(255, 0, 0)),
         "green table should paint after and cover the red block: {:?}",
         page.paint_operations()
     );
@@ -1293,7 +1337,7 @@ async fn absolute_auto_width_table_uses_fragment_intrinsic_width() {
     let table_background = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(238, 238, 238)))
+        .filter(|rect| rect.fill == Some(CssColor::new(238, 238, 238)))
         .max_by(|left, right| left.width().total_cmp(&right.width()))
         .unwrap();
 
@@ -1320,7 +1364,7 @@ async fn absolute_collapsed_table_bottom_uses_fragment_border_insets() {
     let table_background = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 170, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 170, 0)))
         .max_by(|left, right| left.width().total_cmp(&right.width()))
         .unwrap();
 
@@ -1389,7 +1433,7 @@ async fn positions_absolute_children_against_relative_containing_blocks() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 35.0).abs() < 0.01);
@@ -1407,7 +1451,7 @@ async fn transformed_block_establishes_containing_block_for_absolute_child() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 35.0).abs() < 0.01);
@@ -1425,7 +1469,7 @@ async fn positioned_containing_block_uses_relative_parent_padding_box() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 12.0).abs() < 0.01);
@@ -1443,7 +1487,7 @@ async fn positioned_table_cell_establishes_padding_box_containing_block() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 12.0).abs() < 0.01);
@@ -1461,7 +1505,7 @@ async fn positioned_table_wrapper_establishes_containing_block_for_cell_descenda
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 30.0).abs() < 0.01);
@@ -1479,7 +1523,7 @@ async fn positioned_inline_block_fragment_captures_absolute_descendants() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(34, 146, 212)))
+        .find(|rect| rect.fill == Some(CssColor::new(34, 146, 212)))
         .unwrap();
 
     assert!((blue.x() - 11.0).abs() < 0.01);
@@ -1507,7 +1551,7 @@ async fn abspos_float_inside_positioned_inline_uses_inline_containing_block() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "green abspos rectangle should be painted: {:?}",
@@ -1546,7 +1590,7 @@ async fn abspos_float_inside_transformed_inline_uses_inline_containing_block() {
     .await
     .unwrap();
 
-    let green = filled_rect(&document.pages[0], Color::new(0, 128, 0));
+    let green = filled_rect(&document.pages[0], CssColor::new(0, 128, 0));
     assert!((green.x() - 0.0).abs() < 0.01, "{green:?}");
     assert!((green.y() - 120.0).abs() < 0.01, "{green:?}");
     assert!((green.width() - 75.0).abs() < 0.01, "{green:?}");
@@ -1572,7 +1616,7 @@ async fn abspos_float_inside_nested_positioned_inline_uses_nearest_source() {
     .await
     .unwrap();
 
-    let green = filled_rect(&document.pages[0], Color::new(0, 128, 0));
+    let green = filled_rect(&document.pages[0], CssColor::new(0, 128, 0));
     assert!((green.x() - 37.5).abs() < 0.01, "{green:?}");
     assert!((green.y() - 120.0).abs() < 0.01, "{green:?}");
     assert!((green.width() - 75.0).abs() < 0.01, "{green:?}");
@@ -1597,7 +1641,7 @@ async fn abspos_float_inside_positioned_inline_after_text_uses_inline_start() {
     .await
     .unwrap();
 
-    let green = filled_rect(&document.pages[0], Color::new(0, 128, 0));
+    let green = filled_rect(&document.pages[0], CssColor::new(0, 128, 0));
     assert!((green.x() - 0.0).abs() < 0.01, "{green:?}");
     assert!((green.y() - 120.0).abs() < 0.01, "{green:?}");
     assert!((green.width() - 75.0).abs() < 0.01, "{green:?}");
@@ -1788,7 +1832,7 @@ async fn block_in_inline_only_child_self_collapsing_margins_collapse_through_par
     assert_eq!(wrapped.pages[0].rects(), direct.pages[0].rects());
     assert_eq!(wrapped.pages[0].rects(), reference.pages[0].rects());
 
-    let green = Color::new(0, 128, 0);
+    let green = CssColor::new(0, 128, 0);
     let green_rects = wrapped.pages[0]
         .rects()
         .iter()
@@ -1836,7 +1880,7 @@ body { margin: 0 }
     .await
     .unwrap();
 
-    let green = Color::new(0, 128, 0);
+    let green = CssColor::new(0, 128, 0);
     let page = &document.pages[0];
     let green_rects = page
         .rects()
@@ -1906,7 +1950,7 @@ body { margin: 0 }
         let page = &document.pages[0];
         assert_eq!(
             final_rect_fill_at(page, 18.75, 75.0),
-            Some(Color::new(0, 128, 0)),
+            Some(CssColor::new(0, 128, 0)),
             "{inline_edge} should prevent phantom collapse: {:?}",
             page.rects()
         );
@@ -2072,7 +2116,7 @@ async fn min_height_smaller_than_content_allows_last_child_bottom_margin_to_coll
     let mut green_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
     green_rects.sort_by(|a, b| b.y().total_cmp(&a.y()));
 
@@ -2111,7 +2155,7 @@ async fn min_height_that_grows_parent_keeps_last_child_bottom_margin_inside() {
     let mut green_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
     green_rects.sort_by(|a, b| b.y().total_cmp(&a.y()));
 
@@ -2151,7 +2195,7 @@ async fn min_height_blocks_large_last_child_bottom_margin_from_growing_parent() 
     let mut green_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
     green_rects.sort_by(|a, b| b.y().total_cmp(&a.y()));
 
@@ -2199,7 +2243,10 @@ async fn margin_trim_block_start_trims_collapsed_block_inside_inline_margin() {
 
     let page = &document.pages[0];
     for (x, y) in [(3.75, 3.75), (37.5, 37.5), (71.25, 71.25)] {
-        assert_eq!(final_rect_fill_at(page, x, y), Some(Color::new(0, 128, 0)));
+        assert_eq!(
+            final_rect_fill_at(page, x, y),
+            Some(CssColor::new(0, 128, 0))
+        );
     }
 }
 
@@ -2212,7 +2259,7 @@ async fn paints_body_background_on_page() {
     let background = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("the propagated body background should paint the document canvas");
     assert!(background.width() > 0.0 && background.height() > 0.0);
 }
@@ -2266,7 +2313,7 @@ async fn absolute_principal_decoration_materializes_continuation_pages() {
         assert!(
             page.rects()
                 .iter()
-                .any(|rect| rect.fill == Some(Color::new(255, 0, 0))),
+                .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0))),
             "expected absolute background on every continuation page: {page:?}"
         );
     }
@@ -2291,7 +2338,7 @@ async fn positioned_descendant_paint_materializes_its_destination_page() {
         document.pages[2]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 255, 0)))
+            .any(|rect| rect.fill == Some(CssColor::new(0, 255, 0)))
     );
 }
 
@@ -2387,14 +2434,16 @@ async fn following_flow_after_nested_absolute_overflow_stays_in_source_flow() {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    assert_eq!(document.pages.len(), 4, "{page_lines:?}");
+    // Transparent absolute margin boxes do not create otherwise blank
+    // fragmentainers. Only their paint and positioned descendants materialize
+    // document pages, so the two positioned text fragments occupy two pages.
+    assert_eq!(document.pages.len(), 2, "{page_lines:?}");
     assert!(page_has_line(&document.pages[0], "Before"));
     assert!(page_has_line(&document.pages[0], "After"));
     assert!(
         document
             .pages
             .iter()
-            .skip(1)
             .any(|page| page_has_line(page, "Absolute second page")),
         "{page_lines:?}"
     );
@@ -2402,7 +2451,6 @@ async fn following_flow_after_nested_absolute_overflow_stays_in_source_flow() {
         document
             .pages
             .iter()
-            .skip(1)
             .any(|page| page_has_line(page, "Absolute third page")),
         "{page_lines:?}"
     );
@@ -2513,7 +2561,33 @@ async fn named_page_change_and_break_before_page_create_one_break() {
 }
 
 #[tokio::test]
-async fn explicit_page_auto_exits_ancestor_named_page_group() {
+async fn named_page_without_matching_page_rule_preserves_text_metrics_across_the_break() {
+    let document = Html::from_string(
+        "<div style=\"page:foo\">\
+           <div style=\"float:left\">First page</div>\
+           <div style=\"clear:both\">Also first page</div>\
+           <div style=\"page:bar\">Second page</div>\
+         </div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    // CSS Paged Media changes only the selected page context.  An unmatched
+    // named page must not re-cascade the continuing document box or alter its
+    // computed font metrics.  This is the structural path exercised by WPT
+    // css/css-page/page-name-000-print.html.
+    // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+    assert_eq!(document.pages.len(), 2);
+    let first = &document.pages[0].lines()[0];
+    let second = &document.pages[1].lines()[0];
+    assert_eq!(second.text, "Second page");
+    assert_eq!(first.font_size, second.font_size);
+    assert_eq!(first.font_id, second.font_id);
+}
+
+#[tokio::test]
+async fn explicit_page_auto_uses_ancestor_named_page_group() {
     let document = Html::from_string(
         "<style>\
          @page { size: 100pt 100pt; margin: 10pt }\
@@ -2531,13 +2605,75 @@ async fn explicit_page_auto_exits_ancestor_named_page_group() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages.len(), 3);
+    assert_eq!(document.pages.len(), 2);
+    assert_eq!(document.pages[0].lines()[0].text, "A");
+    assert_eq!(document.pages[0].lines()[1].text, "B");
+    assert_eq!(document.pages[1].lines()[0].text, "C");
+    assert_eq!(document.pages[0].lines()[0].x(), 30.0);
+    assert_eq!(document.pages[0].lines()[1].x(), 30.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
+}
+
+#[tokio::test]
+async fn propagated_page_auto_resolves_in_its_nearest_formatting_tree_scope() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 100pt 100pt; margin: 10pt }\
+         @page a { margin-left: 30pt }\
+         @page b { margin-left: 50pt }\
+         body, div, section { margin: 0; font-size: 10pt; line-height: 10pt }\
+         </style>\
+         <body style=\"page:a\">\
+           <div>A</div>\
+           <div style=\"page:b\"><section><div style=\"page:auto\">B</div></section></div>\
+         </body>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    // The nested `auto` is propagated through its wrappers, but it resolves
+    // to `b`, its nearest non-auto formatting-tree ancestor, before the body
+    // compares the class-A boundary. It must not inherit the output cursor's
+    // preceding `a` page type.
+    // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+    assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[0].lines()[0].text, "A");
     assert_eq!(document.pages[1].lines()[0].text, "B");
-    assert_eq!(document.pages[2].lines()[0].text, "C");
     assert_eq!(document.pages[0].lines()[0].x(), 30.0);
-    assert_eq!(document.pages[1].lines()[0].x(), 10.0);
-    assert_eq!(document.pages[2].lines()[0].x(), 50.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
+}
+
+#[tokio::test]
+async fn vertical_root_named_page_start_preserves_initial_text_metrics() {
+    let named = Html::from_string(
+        "<html style=\"writing-mode: vertical-rl\"><body><div style=\"page:a\">a</div><div style=\"page:b\">b</div></body></html>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let reference = Html::from_string(
+        "<html style=\"writing-mode: vertical-rl\"><body><div style=\"margin-block-end:999in\">a</div><div>b</div></body></html>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let named_line = &named.pages[0].lines()[0];
+    let reference_line = &reference.pages[0].lines()[0];
+    assert_eq!(named_line.text, "a");
+    assert_eq!(reference_line.text, "a");
+    assert_eq!(named_line.font_id, reference_line.font_id);
+    assert_eq!(named_line.font_size, reference_line.font_size);
+    assert!(
+        (named_line.x() - reference_line.x()).abs() < 0.01
+            && (named_line.y() - reference_line.y()).abs() < 0.01,
+        "named=({}, {}), reference=({}, {})",
+        named_line.x(),
+        named_line.y(),
+        reference_line.x(),
+        reference_line.y(),
+    );
 }
 
 #[tokio::test]
@@ -2752,12 +2888,12 @@ async fn fixed_auto_width_shrink_to_fit_uses_nested_column_flex_intrinsics() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     let green_rows = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
 
     assert_eq!(green_rows.len(), 2);
@@ -3006,12 +3142,12 @@ async fn absolute_block_inside_inline_uses_split_inline_static_position() {
     let red_index = page
         .rects()
         .iter()
-        .position(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .position(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("red abspos rectangle should be painted");
     let green_index = page
         .rects()
         .iter()
-        .position(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .position(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "green abspos rectangle should be painted: {:?}",
@@ -3029,8 +3165,8 @@ async fn absolute_block_inside_inline_uses_split_inline_static_position() {
         "green abspos should cover red at the wrapper static position: red={red:?} green={green:?}",
     );
     assert!(
-        first_rect_paint_operation_index(page, Color::new(0, 128, 0))
-            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+        first_rect_paint_operation_index(page, CssColor::new(0, 128, 0))
+            > first_rect_paint_operation_index(page, CssColor::new(255, 0, 0)),
         "green abspos should paint after red: operations={:?} rects={:?}",
         page.paint_operations(),
         page.rects(),
@@ -3342,7 +3478,7 @@ async fn flex_container_own_page_name_creates_boundary_around_container() {
 }
 
 #[tokio::test]
-async fn nested_block_page_names_inside_flex_item_create_internal_breaks_only() {
+async fn nested_block_page_names_inside_unsplit_flex_item_do_not_fragment_pages() {
     let document = Html::from_string(
         "<style>\
          @page { size: 120pt 160pt; margin: 10pt }\
@@ -3360,26 +3496,16 @@ async fn nested_block_page_names_inside_flex_item_create_internal_breaks_only() 
     .await
     .unwrap();
 
-    assert_eq!(
-        document.pages.len(),
-        2,
-        "{:?}",
-        document
-            .pages
-            .iter()
-            .map(|page| {
-                page.lines()
-                    .iter()
-                    .map(|line| (line.text.as_str(), line.x(), line.y()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    );
+    // Flexbox owns pagination for an unsplit item. Its independently laid-out
+    // contents cannot materialize a page transition before the container has
+    // selected an item-fragment boundary.
+    // <https://www.w3.org/TR/css-flexbox-1/#pagination>
+    assert_eq!(document.pages.len(), 1);
     assert_eq!(document.pages[0].lines()[0].text, "A");
     assert_eq!(document.pages[0].lines()[1].text, "B");
-    assert_eq!(document.pages[1].lines()[0].text, "C");
-    assert_eq!(document.pages[1].lines()[1].text, "D");
-    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
+    assert_eq!(document.pages[0].lines()[2].text, "C");
+    assert_eq!(document.pages[0].lines()[3].text, "D");
+    assert_eq!(document.pages[0].lines()[1].x(), 10.0);
 }
 
 #[tokio::test]
@@ -3702,7 +3828,7 @@ async fn repeated_table_footer_copy_uses_destination_page_context() {
 }
 
 #[tokio::test]
-async fn table_row_explicit_page_auto_exits_table_named_page_group() {
+async fn table_row_explicit_page_auto_uses_table_named_page_group() {
     let document = Html::from_string(
         "<style>\
          @page { size: 120pt 100pt; margin: 10pt }\
@@ -3735,11 +3861,11 @@ async fn table_row_explicit_page_auto_exits_table_named_page_group() {
     assert_eq!(document.pages[0].lines()[0].text, "First");
     assert_eq!(document.pages[1].lines()[0].text, "Second");
     assert_eq!(document.pages[0].lines()[0].x(), 30.0);
-    assert_eq!(document.pages[1].lines()[0].x(), 10.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 30.0);
 }
 
 #[tokio::test]
-async fn empty_page_named_block_with_display_none_child_still_creates_page_group() {
+async fn empty_page_named_block_with_display_none_child_coalesces_with_next_group() {
     let document = Html::from_string(
         "<style>\
          @page { size: 100pt 100pt; margin: 10pt }\
@@ -3756,13 +3882,11 @@ async fn empty_page_named_block_with_display_none_child_still_creates_page_group
     .await
     .unwrap();
 
-    assert_eq!(document.pages.len(), 3);
+    assert_eq!(document.pages.len(), 2);
     assert_eq!(document.pages[0].lines()[0].text, "A");
-    assert!(document.pages[1].lines().is_empty());
-    assert_eq!(document.pages[1].width(), 140.0);
-    assert_eq!(document.pages[2].lines()[0].text, "B");
+    assert_eq!(document.pages[1].lines()[0].text, "B");
     assert_eq!(document.pages[0].lines()[0].x(), 30.0);
-    assert_eq!(document.pages[2].lines()[0].x(), 50.0);
+    assert_eq!(document.pages[1].lines()[0].x(), 50.0);
 }
 
 #[tokio::test]
@@ -3857,7 +3981,7 @@ async fn paints_parent_block_after_child_forced_page_break() {
     let pdf = document
         .write_pdf_bytes(&crate::PdfOptions::default())
         .unwrap();
-    assert!(pdf_searchable_text(&pdf).starts_with("%PDF-1.7"));
+    assert!(pdf_searchable_text(&pdf).starts_with("%PDF-1.4"));
 }
 
 #[tokio::test]
@@ -3902,7 +4026,7 @@ async fn break_after_avoid_moves_sibling_run_when_it_fits_next_page() {
         document.pages[0]
             .rects()
             .iter()
-            .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+            .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
             .count(),
         1
     );
@@ -3910,13 +4034,13 @@ async fn break_after_avoid_moves_sibling_run_when_it_fits_next_page() {
         document.pages[0]
             .rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(0, 0, 255)))
+            .all(|rect| rect.fill != Some(CssColor::new(0, 0, 255)))
     );
     assert_eq!(
         document.pages[1]
             .rects()
             .iter()
-            .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+            .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
             .count(),
         1
     );
@@ -3924,7 +4048,7 @@ async fn break_after_avoid_moves_sibling_run_when_it_fits_next_page() {
         document.pages[1]
             .rects()
             .iter()
-            .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+            .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
             .count(),
         1
     );
@@ -3948,13 +4072,13 @@ async fn break_before_avoid_moves_previous_sibling_when_run_fits_next_page() {
         document.pages[0]
             .rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(0, 0, 255)))
+            .all(|rect| rect.fill != Some(CssColor::new(0, 0, 255)))
     );
     assert_eq!(
         document.pages[1]
             .rects()
             .iter()
-            .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+            .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
             .count(),
         1
     );
@@ -4111,6 +4235,109 @@ async fn floated_break_inside_avoid_block_moves_to_next_page_when_it_fits() {
     assert!(
         (page_two_lines[0].y() - page_two_lines[1].y()).abs() > 0.01,
         "floated avoid lines should occupy distinct vertical positions: {page_two_lines:?}",
+    );
+}
+
+#[tokio::test]
+async fn cleared_avoid_float_moves_to_fresh_page_when_clearance_overflows() {
+    // CSS 2.2 clear placement happens before fragmentation. Once the second
+    // float has been moved below the first left float, its own unbreakable
+    // margin box no longer fits in the current page fragment and must start a
+    // new page rather than being clipped into the first page.
+    // https://www.w3.org/TR/CSS22/visuren.html#flow-control
+    // https://www.w3.org/TR/css-break-3/#break-within
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 5in 3in; margin: .5in }\
+         html, body { margin: 0; padding: 0; height: 100% }\
+         .test { height: 60%; float: left; clear: left; background: blue; page-break-inside: avoid }\
+         </style><br style=\"clear:both\"><div class=\"test\">1</div><div class=\"test\">2</div>X",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_text = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(document.pages.len(), 2, "{page_text:?}");
+    assert_eq!(page_text[0], vec!["1", "X"]);
+    assert_eq!(page_text[1], vec!["2"]);
+}
+
+#[tokio::test]
+async fn cleared_nested_avoid_float_defers_without_advancing_parent_flow() {
+    // The nested clear-containing block still owns ordinary in-flow text.
+    // Moving only its floated child must therefore defer that float's paint
+    // to the next fragmentainer rather than moving `X`/`Y` with it.
+    // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+    // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    let document = Html::from_string(
+        "<!DOCTYPE html><style>\
+         @page { size: 5in 3in; margin: .5in }\
+         html, body { margin: 0; padding: 0; height: 100% }\
+         .test { height: 60%; float: left; clear: left; background: blue; page-break-inside: avoid }\
+         </style><br style=\"clear:both\"><div class=\"test\">1</div>\
+         <div style=\"height:60%;clear:both\"><div class=\"test\" style=\"height:100%\">2</div>X<br>Y</div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_text = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(document.pages.len(), 2, "{page_text:?}");
+    assert_eq!(page_text[0], vec!["1", "X", "Y"]);
+    assert_eq!(page_text[1], vec!["2"]);
+}
+
+#[tokio::test]
+async fn deferred_float_replays_body_and_clipped_containing_block_geometry() {
+    // The deferred float must resolve its percentage width against the same
+    // overflow-clipped containing block on its destination page. Root/body
+    // margins are deliberately nonzero so retaining only the old page cursor
+    // would shift the second float horizontally.
+    // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    // <https://www.w3.org/TR/CSS22/visuren.html#flow-control>
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 120pt; margin: 20pt }\
+         html { margin: 0 } body { margin: 10pt; font-size: 10pt; line-height: 10pt }\
+         .clip { overflow: hidden; width: 80pt }\
+         .test { box-sizing: border-box; width: 50%; height: 50pt; float: left; clear: left; background: blue; page-break-inside: avoid }</style>\
+         <div class=\"clip\"><div class=\"test\">1</div><div class=\"test\">2</div></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 2);
+    let float_rect = document.pages[1]
+        .rects()
+        .iter()
+        .find(|rect| {
+            rect.fill == Some(CssColor::new(0, 0, 255))
+                && (rect.width() - 40.0).abs() < 0.01
+                && rect.height() > 0.0
+        })
+        .expect("destination page should retain the float's clipped percentage width");
+    assert!(
+        (float_rect.x() - 30.0).abs() < 0.01,
+        "destination float must retain page + body x-offset: {float_rect:?}"
     );
 }
 
@@ -4285,7 +4512,7 @@ async fn positioned_positive_z_index_paints_after_normal_flow() {
 
     assert_eq!(
         painted_red_blue_rect_fills(&document.pages[0]),
-        vec![Color::new(255, 0, 0), Color::new(0, 0, 255)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 0, 255)]
     );
 }
 
@@ -4299,7 +4526,7 @@ async fn positioned_negative_z_index_paints_before_normal_flow() {
 
     assert_eq!(
         painted_red_blue_rect_fills(&document.pages[0]),
-        vec![Color::new(0, 0, 255), Color::new(255, 0, 0)]
+        vec![CssColor::new(0, 0, 255), CssColor::new(255, 0, 0)]
     );
 }
 
@@ -4314,9 +4541,9 @@ async fn absolute_z_index_auto_does_not_trap_positive_positioned_descendant() {
     assert_eq!(
         painted_rect_fills(
             &document.pages[0],
-            &[Color::new(255, 0, 0), Color::new(0, 255, 0)]
+            &[CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
         ),
-        vec![Color::new(255, 0, 0), Color::new(0, 255, 0)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
     );
 }
 
@@ -4332,15 +4559,15 @@ async fn positioned_descendant_z_index_stays_inside_parent_stacking_context() {
         painted_rect_fills(
             &document.pages[0],
             &[
-                Color::new(0, 0, 255),
-                Color::new(0, 255, 0),
-                Color::new(255, 0, 0),
+                CssColor::new(0, 0, 255),
+                CssColor::new(0, 255, 0),
+                CssColor::new(255, 0, 0),
             ],
         ),
         vec![
-            Color::new(0, 0, 255),
-            Color::new(0, 255, 0),
-            Color::new(255, 0, 0),
+            CssColor::new(0, 0, 255),
+            CssColor::new(0, 255, 0),
+            CssColor::new(255, 0, 0),
         ]
     );
 }
@@ -4357,15 +4584,15 @@ async fn positioned_negative_descendant_stays_inside_parent_stacking_context() {
         painted_rect_fills(
             &document.pages[0],
             &[
-                Color::new(255, 0, 0),
-                Color::new(0, 0, 255),
-                Color::new(0, 255, 0),
+                CssColor::new(255, 0, 0),
+                CssColor::new(0, 0, 255),
+                CssColor::new(0, 255, 0),
             ],
         ),
         vec![
-            Color::new(255, 0, 0),
-            Color::new(0, 0, 255),
-            Color::new(0, 255, 0),
+            CssColor::new(255, 0, 0),
+            CssColor::new(0, 0, 255),
+            CssColor::new(0, 255, 0),
         ]
     );
 }
@@ -4381,9 +4608,9 @@ async fn transparent_positioned_parent_keeps_positioned_child_stacking_context()
     assert_eq!(
         painted_rect_fills(
             &document.pages[0],
-            &[Color::new(255, 0, 0), Color::new(0, 255, 0)]
+            &[CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
         ),
-        vec![Color::new(255, 0, 0), Color::new(0, 255, 0)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
     );
 }
 
@@ -4427,7 +4654,7 @@ async fn fixed_position_transaction_leaves_no_temporary_paint_primitives() {
     .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default()).await
     .unwrap();
 
-    assert!(pdf_searchable_text(&pdf).starts_with("%PDF-1.7"));
+    assert!(pdf_searchable_text(&pdf).starts_with("%PDF-1.4"));
 }
 
 #[tokio::test]
@@ -4441,7 +4668,7 @@ async fn absolute_position_transaction_replays_inserted_backgrounds() {
     document.validate_paint_operations().unwrap();
     assert_eq!(
         painted_red_blue_rect_fills(&document.pages[0]),
-        vec![Color::new(255, 0, 0), Color::new(0, 0, 255)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 0, 255)]
     );
     assert!(
         document
@@ -4460,11 +4687,11 @@ async fn fixed_position_z_index_applies_on_each_page() {
 
     assert_eq!(
         painted_red_blue_rect_fills(&document.pages[0]),
-        vec![Color::new(255, 0, 0), Color::new(0, 0, 255)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 0, 255)]
     );
     assert_eq!(
         painted_red_blue_rect_fills(&document.pages[1]),
-        vec![Color::new(255, 0, 0), Color::new(0, 0, 255)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 0, 255)]
     );
 }
 
@@ -4480,15 +4707,15 @@ async fn multiple_negative_positioned_siblings_sort_by_z_index() {
         painted_rect_fills(
             &document.pages[0],
             &[
-                Color::new(0, 0, 255),
-                Color::new(0, 255, 0),
-                Color::new(255, 0, 0),
+                CssColor::new(0, 0, 255),
+                CssColor::new(0, 255, 0),
+                CssColor::new(255, 0, 0),
             ],
         ),
         vec![
-            Color::new(0, 0, 255),
-            Color::new(0, 255, 0),
-            Color::new(255, 0, 0),
+            CssColor::new(0, 0, 255),
+            CssColor::new(0, 255, 0),
+            CssColor::new(255, 0, 0),
         ]
     );
 }
@@ -4503,7 +4730,7 @@ async fn z_index_auto_and_zero_share_source_order_level() {
 
     assert_eq!(
         painted_red_blue_rect_fills(&document.pages[0]),
-        vec![Color::new(255, 0, 0), Color::new(0, 0, 255)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 0, 255)]
     );
 }
 
@@ -4522,8 +4749,8 @@ async fn positioned_inline_z_index_offsets_split_block_segment() {
     .unwrap();
 
     let page = &document.pages[0];
-    let red = filled_rect(page, Color::new(255, 0, 0));
-    let green = filled_rect(page, Color::new(0, 128, 0));
+    let red = filled_rect(page, CssColor::new(255, 0, 0));
+    let green = filled_rect(page, CssColor::new(0, 128, 0));
     assert!(
         (green.x() - red.x()).abs() < 0.01
             && (green.y() - red.y()).abs() < 0.01
@@ -4532,8 +4759,8 @@ async fn positioned_inline_z_index_offsets_split_block_segment() {
         "split block should move with positioned inline: red={red:?} green={green:?}",
     );
     assert!(
-        first_rect_paint_operation_index(page, Color::new(0, 128, 0))
-            > first_rect_paint_operation_index(page, Color::new(255, 0, 0)),
+        first_rect_paint_operation_index(page, CssColor::new(0, 128, 0))
+            > first_rect_paint_operation_index(page, CssColor::new(255, 0, 0)),
         "positioned inline z-index should paint split block above red: operations={:?}",
         page.operations()
     );
@@ -4547,7 +4774,7 @@ async fn positioned_context_preserves_internal_inline_above_negative_child() {
     .render(&RenderOptions::default()).await
     .unwrap();
 
-    let red_index = first_rect_paint_operation_index(&document.pages[0], Color::new(255, 0, 0));
+    let red_index = first_rect_paint_operation_index(&document.pages[0], CssColor::new(255, 0, 0));
     let text_index = document.pages[0]
         .operations()
         .iter()
@@ -4573,7 +4800,7 @@ async fn flex_item_z_index_paints_above_later_item() {
 
     assert_eq!(
         painted_red_blue_rect_fills(&document.pages[0]),
-        vec![Color::new(255, 0, 0), Color::new(0, 0, 255)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 0, 255)]
     );
 }
 
@@ -4589,15 +4816,15 @@ async fn fixed_z_index_auto_traps_positive_positioned_descendant() {
         painted_rect_fills(
             &document.pages[0],
             &[
-                Color::new(0, 0, 255),
-                Color::new(0, 255, 0),
-                Color::new(255, 0, 0),
+                CssColor::new(0, 0, 255),
+                CssColor::new(0, 255, 0),
+                CssColor::new(255, 0, 0),
             ],
         ),
         vec![
-            Color::new(0, 0, 255),
-            Color::new(0, 255, 0),
-            Color::new(255, 0, 0),
+            CssColor::new(0, 0, 255),
+            CssColor::new(0, 255, 0),
+            CssColor::new(255, 0, 0),
         ]
     );
 }
@@ -4614,15 +4841,15 @@ async fn sticky_z_index_auto_traps_positive_positioned_descendant() {
         painted_rect_fills(
             &document.pages[0],
             &[
-                Color::new(0, 0, 255),
-                Color::new(0, 255, 0),
-                Color::new(255, 0, 0),
+                CssColor::new(0, 0, 255),
+                CssColor::new(0, 255, 0),
+                CssColor::new(255, 0, 0),
             ],
         ),
         vec![
-            Color::new(0, 0, 255),
-            Color::new(0, 255, 0),
-            Color::new(255, 0, 0),
+            CssColor::new(0, 0, 255),
+            CssColor::new(0, 255, 0),
+            CssColor::new(255, 0, 0),
         ]
     );
 }
@@ -4638,9 +4865,9 @@ async fn relative_z_index_auto_does_not_trap_positive_positioned_descendant() {
     assert_eq!(
         painted_rect_fills(
             &document.pages[0],
-            &[Color::new(255, 0, 0), Color::new(0, 255, 0)]
+            &[CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
         ),
-        vec![Color::new(255, 0, 0), Color::new(0, 255, 0)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
     );
 }
 
@@ -4655,9 +4882,9 @@ async fn float_fake_context_does_not_trap_positioned_descendant() {
     assert_eq!(
         painted_rect_fills(
             &document.pages[0],
-            &[Color::new(255, 0, 0), Color::new(0, 255, 0)]
+            &[CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
         ),
-        vec![Color::new(255, 0, 0), Color::new(0, 255, 0)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
     );
 }
 
@@ -4672,9 +4899,9 @@ async fn inline_block_fake_context_does_not_trap_positioned_descendant() {
     assert_eq!(
         painted_rect_fills(
             &document.pages[0],
-            &[Color::new(255, 0, 0), Color::new(0, 255, 0)]
+            &[CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
         ),
-        vec![Color::new(255, 0, 0), Color::new(0, 255, 0)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
     );
 }
 
@@ -4689,9 +4916,9 @@ async fn table_fake_context_does_not_trap_positioned_descendant() {
     assert_eq!(
         painted_rect_fills(
             &document.pages[0],
-            &[Color::new(255, 0, 0), Color::new(0, 255, 0)]
+            &[CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
         ),
-        vec![Color::new(255, 0, 0), Color::new(0, 255, 0)]
+        vec![CssColor::new(255, 0, 0), CssColor::new(0, 255, 0)]
     );
 }
 
@@ -4703,7 +4930,6 @@ async fn effect_triggers_trap_positive_positioned_descendants() {
         "filter: blur(0)",
         "mix-blend-mode: multiply",
         "isolation: isolate",
-        "contain: layout",
         "contain: paint",
         "content-visibility: auto",
         "clip-path: inset(0)",
@@ -4713,13 +4939,30 @@ async fn effect_triggers_trap_positive_positioned_descendants() {
         assert_eq!(
             stacking_trigger_paint_order(parent_declaration).await,
             vec![
-                Color::new(0, 0, 255),
-                Color::new(0, 255, 0),
-                Color::new(255, 0, 0),
+                CssColor::new(0, 0, 255),
+                CssColor::new(0, 255, 0),
+                CssColor::new(255, 0, 0),
             ],
             "{parent_declaration} should isolate positioned descendants"
         );
     }
+}
+
+#[tokio::test]
+async fn layout_containment_does_not_trap_positive_positioned_descendants() {
+    // Layout containment establishes an independent formatting context and a
+    // containing block, but unlike paint containment it does not establish a
+    // stacking context. The positive-z-index child therefore remains above
+    // the later z-index:1 sibling.
+    // <https://www.w3.org/TR/css-contain-1/#containment-layout>
+    assert_eq!(
+        stacking_trigger_paint_order("contain: layout").await,
+        vec![
+            CssColor::new(0, 0, 255),
+            CssColor::new(255, 0, 0),
+            CssColor::new(0, 255, 0),
+        ],
+    );
 }
 
 #[tokio::test]
@@ -4786,13 +5029,13 @@ async fn positioned_collapsed_table_paints_cell_text_above_late_border_rects() {
     assert!(!covering_rect_after_text);
 }
 
-fn painted_red_blue_rect_fills(page: &quire::Page) -> Vec<Color> {
-    let red = Color::new(255, 0, 0);
-    let blue = Color::new(0, 0, 255);
+fn painted_red_blue_rect_fills(page: &quire::Page) -> Vec<CssColor> {
+    let red = CssColor::new(255, 0, 0);
+    let blue = CssColor::new(0, 0, 255);
     painted_rect_fills(page, &[red, blue])
 }
 
-async fn stacking_trigger_paint_order(parent_declaration: &str) -> Vec<Color> {
+async fn stacking_trigger_paint_order(parent_declaration: &str) -> Vec<CssColor> {
     let document = Html::from_string(format!(
         "<style>@page {{ size: 120pt 120pt; margin: 10pt }} body, div {{ margin: 0 }} .parent {{ {parent_declaration}; width: 30pt; height: 30pt; background: #0000ff }} .child {{ position: absolute; z-index: 999; left: 0; top: 0; width: 30pt; height: 30pt; background: #00ff00 }} .sibling {{ position: absolute; z-index: 1; left: 0; top: 0; width: 30pt; height: 30pt; background: #ff0000 }}</style><div class=\"parent\"><div class=\"child\"></div></div><div class=\"sibling\"></div>"
     ))
@@ -4803,14 +5046,14 @@ async fn stacking_trigger_paint_order(parent_declaration: &str) -> Vec<Color> {
     painted_rect_fills(
         &document.pages[0],
         &[
-            Color::new(0, 0, 255),
-            Color::new(0, 255, 0),
-            Color::new(255, 0, 0),
+            CssColor::new(0, 0, 255),
+            CssColor::new(0, 255, 0),
+            CssColor::new(255, 0, 0),
         ],
     )
 }
 
-fn filled_rect(page: &quire::Page, color: Color) -> &quire::RenderedRect {
+fn filled_rect(page: &quire::Page, color: CssColor) -> &quire::RenderedRect {
     page.rects()
         .iter()
         .find(|rect| rect.fill == Some(color))
@@ -4819,7 +5062,7 @@ fn filled_rect(page: &quire::Page, color: Color) -> &quire::RenderedRect {
 
 fn emitted_rects_with_fills<'a>(
     page: &'a quire::Page,
-    colors: &[Color],
+    colors: &[CssColor],
 ) -> Vec<(usize, &'a quire::RenderedRect)> {
     page.paint_operations()
         .iter()
@@ -4845,11 +5088,11 @@ fn same_rect(left: &quire::RenderedRect, right: &quire::RenderedRect) -> bool {
 
 #[derive(Debug)]
 struct PdfEmittedRect {
-    fill: Color,
+    fill: CssColor,
     rect: (f32, f32, f32, f32),
 }
 
-fn pdf_emitted_rects_with_fills(pdf: &[u8], colors: &[Color]) -> Vec<PdfEmittedRect> {
+fn pdf_emitted_rects_with_fills(pdf: &[u8], colors: &[CssColor]) -> Vec<PdfEmittedRect> {
     let mut current_fill = None;
     let mut rects = Vec::new();
     let rendered = pdf_searchable_text(pdf);
@@ -4873,12 +5116,12 @@ fn pdf_emitted_rects_with_fills(pdf: &[u8], colors: &[Color]) -> Vec<PdfEmittedR
     rects
 }
 
-fn parse_pdf_fill_rgb(line: &str) -> Option<Color> {
+fn parse_pdf_fill_rgb(line: &str) -> Option<CssColor> {
     let mut parts = line.split_whitespace();
     let red = parts.next()?.parse::<f32>().ok()?;
     let green = parts.next()?.parse::<f32>().ok()?;
     let blue = parts.next()?.parse::<f32>().ok()?;
-    (matches!(parts.next()?, "rg" | "scn") && parts.next().is_none()).then_some(Color::new(
+    (matches!(parts.next()?, "rg" | "scn") && parts.next().is_none()).then_some(CssColor::new(
         pdf_color_component(red),
         pdf_color_component(green),
         pdf_color_component(blue),
@@ -4905,7 +5148,7 @@ fn same_pdf_rect(left: (f32, f32, f32, f32), right: (f32, f32, f32, f32)) -> boo
         && (left.3 - right.3).abs() < 0.01
 }
 
-fn assert_final_rect_fill(page: &quire::Page, rect: &quire::RenderedRect, expected: Color) {
+fn assert_final_rect_fill(page: &quire::Page, rect: &quire::RenderedRect, expected: CssColor) {
     for x_fraction in [0.125, 0.5, 0.875] {
         for y_fraction in [0.125, 0.5, 0.875] {
             let x = rect.x() + rect.width() * x_fraction;
@@ -4919,7 +5162,7 @@ fn assert_final_rect_fill(page: &quire::Page, rect: &quire::RenderedRect, expect
     }
 }
 
-fn painted_rect_fills(page: &quire::Page, colors: &[Color]) -> Vec<Color> {
+fn painted_rect_fills(page: &quire::Page, colors: &[CssColor]) -> Vec<CssColor> {
     page.operations()
         .iter()
         .filter_map(|operation| match operation {
@@ -4933,7 +5176,7 @@ fn painted_rect_fills(page: &quire::Page, colors: &[Color]) -> Vec<Color> {
 }
 
 fn painted_blue_rect_count(page: &quire::Page) -> usize {
-    let blue = Color::new(0, 0, 255);
+    let blue = CssColor::new(0, 0, 255);
     page.operations()
         .iter()
         .filter(|operation| match operation {

@@ -7,6 +7,7 @@ pub(in crate::layout) fn paint_transform_for_box(
     if !style.has_transform() {
         return None;
     }
+    let border_box = transform_border_box_from_used_style(style, border_box);
     let reference_box = html_transform_reference_box(style, border_box);
     if transform_list_contains_3d(&style.transform) {
         let origin = style
@@ -61,6 +62,7 @@ pub(in crate::layout) fn transform_3d_suppresses_paint(
     if !transform_list_contains_3d(&style.transform) {
         return false;
     }
+    let border_box = transform_border_box_from_used_style(style, border_box);
     let reference_box = html_transform_reference_box(style, border_box);
     let origin = style
         .transform_origin
@@ -282,6 +284,50 @@ fn html_transform_reference_box(style: &ComputedStyle, border_box: PaintRect) ->
     )
 }
 
+/// Recover a box's definite declared border-box extent when paint capture only
+/// retained descendant ink bounds.
+///
+/// Effects are often scoped after a block's decorations have been promoted or
+/// suppressed (notably for root/body canvas handling). The capture bounds can
+/// then shrink to a child even though CSS percentages in `transform` resolve
+/// against the transformed element's own used border box. A definite declared
+/// size is already a used layout value at this boundary, so it may safely
+/// widen the retained paint bound without using descendant geometry as a
+/// percentage basis.
+/// <https://drafts.csswg.org/css-transforms-1/#transform-rendering>
+fn transform_border_box_from_used_style(style: &ComputedStyle, captured: PaintRect) -> PaintRect {
+    let borders = used_border_widths(style);
+    let horizontal_non_content =
+        borders.left + style.padding.left + style.padding.right + borders.right;
+    let vertical_non_content =
+        borders.bottom + style.padding.bottom + style.padding.top + borders.top;
+    let declared_border_extent = |declared: Option<f32>, non_content: f32, captured_extent: f32| {
+        declared
+            .map(|declared| match style.box_sizing {
+                css::BoxSizing::ContentBox => declared + non_content,
+                css::BoxSizing::BorderBox => declared,
+            })
+            .filter(|extent| extent.is_finite())
+            .map(|extent| extent.max(captured_extent))
+            .unwrap_or(captured_extent)
+    };
+    PaintRect::new(
+        captured.origin,
+        PaintSize::new(
+            declared_border_extent(
+                style.box_values.width.length_if_no_percent(),
+                horizontal_non_content,
+                captured.size.width,
+            ),
+            declared_border_extent(
+                style.box_values.height.length_if_no_percent(),
+                vertical_non_content,
+                captured.size.height,
+            ),
+        ),
+    )
+}
+
 /// Return used padding for a transform reference box when a block's declared
 /// content width lets us reconstruct its percentage basis from its final
 /// border box.
@@ -426,12 +472,7 @@ pub(in crate::layout) fn transform_function_matrix(
 ) -> euclid::Transform2D<f32, PaintSpace, PaintSpace> {
     match function {
         css::TransformFunction::Matrix(matrix) => {
-            // Layout has already projected CSS geometry into Quire's
-            // page-local paint space.  That space is PDF user space, so CSS
-            // matrix components cross this boundary unchanged.
-            let matrix: euclid::Transform2D<f32, PaintSpace, PaintSpace> =
-                matrix.into_space(euclid::Scale::new(css::CSS_PX_TO_PT));
-            matrix
+            matrix.into_y_up_space(euclid::Scale::new(css::CSS_PX_TO_PT))
         }
         css::TransformFunction::Translate(translation) => euclid::Transform2D::translation(
             used_length_percentage(
@@ -452,11 +493,14 @@ pub(in crate::layout) fn transform_function_matrix(
             .points(),
         ),
         css::TransformFunction::Scale(scale) => euclid::Transform2D::scale(scale.x, scale.y),
-        css::TransformFunction::Rotate(angle) => euclid::Transform2D::rotation(angle),
+        // CSS positive angles are clockwise in its y-down coordinate system.
+        // Page paint uses y-up PDF coordinates, so the projected angle is
+        // counter-clockwise.
+        css::TransformFunction::Rotate(angle) => euclid::Transform2D::rotation(-angle),
         css::TransformFunction::Skew(angles) => euclid::Transform2D::new(
             1.0,
-            angles.y.radians.tan(),
-            angles.x.radians.tan(),
+            -angles.y.radians.tan(),
+            -angles.x.radians.tan(),
             1.0,
             0.0,
             0.0,
@@ -503,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn css_matrix_translation_is_projected_from_css_pixels_into_paint_points() {
+    fn css_matrix_is_projected_from_css_y_down_to_paint_y_up() {
         let matrix = css::CssAffineMatrix::new(1.0, 0.0, 0.0, 1.0, 10.0, 20.0);
         let transform = transform_function_matrix(
             css::TransformFunction::Matrix(matrix),
@@ -511,7 +555,29 @@ mod tests {
         );
 
         assert_eq!(transform.m31, 10.0 * css::CSS_PX_TO_PT);
-        assert_eq!(transform.m32, 20.0 * css::CSS_PX_TO_PT);
+        assert_eq!(transform.m32, -20.0 * css::CSS_PX_TO_PT);
+    }
+
+    #[test]
+    fn css_rotation_and_skew_are_projected_from_y_down_to_y_up() {
+        let rotation = transform_function_matrix(
+            css::TransformFunction::Rotate(euclid::Angle::degrees(90.0)),
+            PaintSize::new(100.0, 100.0),
+        );
+        assert!(rotation.m11.abs() < 1e-6);
+        assert_eq!(rotation.m12, -1.0);
+        assert_eq!(rotation.m21, 1.0);
+        assert!(rotation.m22.abs() < 1e-6);
+
+        let skew = transform_function_matrix(
+            css::TransformFunction::Skew(css::CssSkewAngles {
+                x: euclid::Angle::degrees(45.0),
+                y: euclid::Angle::degrees(45.0),
+            }),
+            PaintSize::new(100.0, 100.0),
+        );
+        assert_eq!(skew.m12, -1.0);
+        assert_eq!(skew.m21, -1.0);
     }
 
     #[test]
@@ -533,6 +599,28 @@ mod tests {
 
         assert_eq!(transform.e(), 40.0);
         assert_eq!(transform.f(), -20.0);
+    }
+
+    #[test]
+    fn definite_box_size_wins_over_descendant_ink_for_transform_percentages() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(300.0),
+        );
+        style.box_values.height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(300.0),
+        );
+        style
+            .transform
+            .push(css::TransformFunction::Translate(CssTransformTranslation {
+                x: ComputedLengthPercentage::from_percent(0.1),
+                y: ComputedLengthPercentage::from_percent(0.1),
+            }));
+
+        let transform = paint_transform_for_box(&style, paint_space_rect(10.0, 20.0, 75.0, 75.0))
+            .expect("translate establishes a transform");
+        assert_eq!(transform.e(), 30.0);
+        assert_eq!(transform.f(), -30.0);
     }
 
     #[test]

@@ -201,6 +201,67 @@ pub(super) struct PageBlockSpan {
     height: f32,
 }
 
+/// An absolute vertical coordinate in the CSS page box's top-edge layout
+/// convention.
+///
+/// Unlike a block extent, this is a position: moving toward block-end
+/// subtracts a layout length because page-top coordinates decrease downward.
+/// Float clearance and continuation handling use it so a float bottom cannot
+/// be accidentally supplied where an occupied height is required:
+/// <https://www.w3.org/TR/CSS22/visuren.html#flow-control>.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(in crate::layout) struct PageTopBlockPosition(f32);
+
+impl PageTopBlockPosition {
+    pub(in crate::layout) const fn new(top_y: f32) -> Self {
+        Self(top_y)
+    }
+
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0
+    }
+
+    pub(in crate::layout) fn toward_block_end(self, distance: LayoutLength) -> Self {
+        Self(self.0 - distance.points())
+    }
+
+    /// Return the page position moved toward physical block-start by `distance`.
+    pub(in crate::layout) fn toward_block_start(self, distance: LayoutLength) -> Self {
+        Self(self.0 + distance.points())
+    }
+
+    /// Return the non-negative block-axis extent from this page position to a
+    /// later block-end edge in page-top coordinates.
+    pub(in crate::layout) fn block_extent_to(self, block_end: Self) -> LayoutLength {
+        layout_pt((self.0 - block_end.0).max(0.0))
+    }
+
+    /// Return the position closest to page block-end.
+    pub(in crate::layout) fn min(self, other: Self) -> Self {
+        if self.0 <= other.0 { self } else { other }
+    }
+}
+
+/// An absolute horizontal coordinate in the CSS page box.
+///
+/// Horizontal writing uses page `x` for inline placement, while vertical
+/// writing uses the same physical axis for block progression. Keeping it a
+/// position rather than a bare scalar prevents a vertical exclusion retry
+/// from confusing a page coordinate with a line-width displacement.
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub(in crate::layout) struct PageInlinePosition(f32);
+
+impl PageInlinePosition {
+    pub(in crate::layout) const fn new(x: f32) -> Self {
+        Self(x)
+    }
+
+    pub(in crate::layout) fn points(self) -> f32 {
+        self.0
+    }
+}
+
 impl PageBlockSpan {
     pub(super) fn new(top_y: f32, height: f32) -> Self {
         Self {
@@ -240,6 +301,10 @@ impl PageTopPoint {
         Self { x, top_y }
     }
 
+    pub(super) fn from_inline_x_and_block_position(x: f32, top: PageTopBlockPosition) -> Self {
+        Self::new(x, top.points())
+    }
+
     pub(super) fn x(self) -> f32 {
         self.x
     }
@@ -255,13 +320,6 @@ impl PageTopPoint {
 pub(in crate::layout) enum PageTopSpace {}
 
 type PageTopEuclidRect = euclid::Rect<f32, PageTopSpace>;
-/// A physical page-local size used with the top-edge layout convention.
-///
-/// This is intentionally separate from [`PaintSize`]: a page-top box's
-/// vertical coordinate grows downward during layout, while paint geometry is
-/// bottom-left-origin.
-pub(in crate::layout) type PageTopSize = euclid::Size2D<f32, PageTopSpace>;
-
 /// A page-space rectangle described by its physical top edge.
 ///
 /// CSS layout code commonly knows a box's physical top edge and block size
@@ -325,7 +383,7 @@ impl PageTopRect {
         OverflowClip::from_paint_rect(self.paint_rect())
     }
 
-    pub(super) fn rendered_rect(self, fill: Option<Color>) -> RenderedRect {
+    pub(super) fn rendered_rect(self, fill: Option<CssColor>) -> RenderedRect {
         RenderedRect::from_paint_rect(self.paint_rect(), fill)
     }
 }
@@ -400,12 +458,11 @@ pub(super) fn paint_space_point(x: f32, y: f32) -> PaintPoint {
 /// <https://www.w3.org/TR/css-page-3/#page-model>.
 pub(super) fn grid_rect_to_page_top_rect(
     rect: GridRect,
-    page_left: f32,
-    content_top: f32,
+    container_origin: PageTopPoint,
 ) -> PageTopRect {
     PageTopRect::new(
-        page_left + rect.origin.x,
-        content_top - rect.origin.y,
+        container_origin.x() + rect.origin.x,
+        container_origin.top_y() - rect.origin.y,
         rect.size.width.max(0.0),
         rect.size.height.max(0.0),
     )
@@ -455,6 +512,12 @@ impl LogicalInlineContentSize {
         self.0.points()
     }
 
+    /// Keep the larger of two contributions measured on the same logical
+    /// inline content-box axis.
+    pub(in crate::layout) fn max(self, other: Self) -> Self {
+        if self.0 >= other.0 { self } else { other }
+    }
+
     pub(in crate::layout) fn content_box_length(self) -> ContentBoxLength {
         self.0
     }
@@ -500,6 +563,14 @@ impl PhysicalContentWidth {
         self.0.points()
     }
 
+    pub(in crate::layout) fn non_negative(self) -> Self {
+        Self::new(self.0.max(content_box_pt(0.0)))
+    }
+
+    pub(in crate::layout) fn max(self, other: Self) -> Self {
+        if self.0 >= other.0 { self } else { other }
+    }
+
     pub(in crate::layout) fn content_box_length(self) -> ContentBoxLength {
         self.0
     }
@@ -516,6 +587,18 @@ impl PhysicalContentHeight {
 
     pub(in crate::layout) fn points(self) -> f32 {
         self.0.points()
+    }
+
+    /// Clamp a physical content-box extent at the zero-size boundary.
+    ///
+    /// Heights that model available layout space cannot be negative, even
+    /// when their source constraint is over-constrained.
+    pub(in crate::layout) fn non_negative(self) -> Self {
+        Self::new(self.0.max(content_box_pt(0.0)))
+    }
+
+    pub(in crate::layout) fn max(self, other: Self) -> Self {
+        if self.0 >= other.0 { self } else { other }
     }
 
     pub(in crate::layout) fn content_box_length(self) -> ContentBoxLength {
@@ -903,8 +986,23 @@ mod tests {
         let rect = GridRect::new(GridPoint::new(15.0, 40.0), GridSize::new(60.0, 25.0));
 
         assert_eq!(
-            grid_rect_to_page_top_rect(rect, 100.0, 300.0),
+            grid_rect_to_page_top_rect(
+                rect,
+                PageTopPoint::from_inline_x_and_block_position(
+                    100.0,
+                    PageTopBlockPosition::new(300.0),
+                ),
+            ),
             PageTopRect::new(115.0, 260.0, 60.0, 25.0)
         );
+    }
+
+    #[test]
+    fn page_top_block_position_keeps_block_end_motion_explicit() {
+        let top = PageTopBlockPosition::new(300.0);
+        let bottom = top.toward_block_end(layout_pt(25.0));
+
+        assert_eq!(bottom, PageTopBlockPosition::new(275.0));
+        assert_eq!(top.block_extent_to(bottom), layout_pt(25.0));
     }
 }

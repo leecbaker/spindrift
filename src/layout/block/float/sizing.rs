@@ -1,10 +1,31 @@
 use super::super::super::*;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::layout) struct AutoFloatMeasurementKey {
+    element: ElementId,
+    content_width_bits: u32,
+    border_box_width_bits: u32,
+    margin_box_width_bits: u32,
+    style_fingerprint: u64,
+    percentage_basis_fingerprint: u64,
+    counter_fingerprint: u64,
+    quote_depth: usize,
+    page_index: usize,
+}
+
+fn debug_fingerprint(value: &impl std::fmt::Debug) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    format!("{value:?}").hash(&mut hasher);
+    hasher.finish()
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct ResolvedFloatInlineSize {
     pub(in crate::layout) content_width: ContentBoxLength,
     pub(in crate::layout) border_box_width: BorderBoxLength,
-    pub(in crate::layout) margin_box_width: f32,
+    pub(in crate::layout) margin_box_width: MarginBoxLength,
 }
 
 /// Freeze a float's temporary replay style to the used inline size.
@@ -36,6 +57,44 @@ pub(in crate::layout) fn freeze_float_replay_width(
     style.box_values.max_width = css::ComputedLengthPercentageOrAuto::Auto;
 }
 
+/// Freeze a floated box's definite used block size before isolated replay.
+///
+/// A float establishes an independent formatting context, but its percentage
+/// block size is resolved against the original containing block, not against
+/// the float's own replayed content box.  Replaying an unresolved percentage
+/// therefore applies it a second time (for example, `height: 60%` becoming
+/// 36% of the page).  Keep the used size at this boundary, alongside the
+/// already-frozen used inline size:
+/// <https://www.w3.org/TR/CSS22/visudet.html#the-height-property> and
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+pub(in crate::layout) fn freeze_float_replay_height(
+    style: &mut ComputedStyle,
+    containing_block_height: BlockSizePercentageBasis,
+) -> Option<ContentBoxLength> {
+    let vertical_non_content = non_content_pt(
+        style.padding.top
+            + style.padding.bottom
+            + used_border_widths(style).top
+            + used_border_widths(style).bottom,
+    );
+    let content_height = used_content_box_size_with_basis(
+        style.box_values.height.clone(),
+        style.box_sizing,
+        containing_block_height,
+        vertical_non_content,
+    )?;
+    let replay_height = match style.box_sizing {
+        BoxSizing::ContentBox => content_height.points(),
+        BoxSizing::BorderBox => {
+            content_box_to_border_box_length(content_height, vertical_non_content).points()
+        }
+    };
+    style.box_values.height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+        css::ComputedLengthPercentage::from_points(replay_height.max(0.0)),
+    );
+    Some(content_height)
+}
+
 /// Prepare the principal box style used by both float measurement and final
 /// float replay.
 ///
@@ -60,7 +119,7 @@ impl<'a> LayoutBuilder<'a> {
         containing_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
-    ) -> f32 {
+    ) -> MarginBoxLength {
         self.resolved_float_inline_size(
             element,
             style,
@@ -170,8 +229,9 @@ impl<'a> LayoutBuilder<'a> {
             PercentageBasis::definite(content_box_pt(available_outer_width)),
             horizontal_extras,
         );
-        let intrinsic_widths = ((specified_content_width.is_none()
-            && needs_intrinsic_width_contribution(style.box_values.width.clone()))
+        let intrinsic_widths = ((style.display.is_table()
+            || specified_content_width.is_none()
+                && needs_intrinsic_width_contribution(style.box_values.width.clone()))
             || needs_intrinsic_width_contribution(style.box_values.min_width.clone())
             || needs_intrinsic_width_contribution(style.box_values.max_width.clone()))
         .then(|| {
@@ -234,6 +294,18 @@ impl<'a> LayoutBuilder<'a> {
             }
         });
         let content_width = if let Some((preferred_min, preferred)) = intrinsic_widths {
+            // CSS table width is a preferred used size rather than permission
+            // to make the table grid narrower than its intrinsic minimum. A
+            // floated table must expose that minimum before float placement:
+            // otherwise its wrapper can fit beside an earlier float while the
+            // grid itself overflows through that float's exclusion band.
+            // <https://www.w3.org/TR/CSS22/tables.html#auto-table-layout>
+            // <https://www.w3.org/TR/CSS22/visudet.html#float-width>
+            let content_width = if style.display.is_table() {
+                content_box_pt(content_width.points().max(preferred_min))
+            } else {
+                content_width
+            };
             constrain_width_with_intrinsic(
                 style,
                 content_width,
@@ -281,7 +353,7 @@ impl<'a> LayoutBuilder<'a> {
         inline_size: ResolvedFloatInlineSize,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
-    ) -> f32 {
+    ) -> MarginBoxLength {
         let built_child_boxes;
         let child_boxes = if child_boxes.is_some() || is_replaced_element(element) {
             child_boxes
@@ -303,15 +375,16 @@ impl<'a> LayoutBuilder<'a> {
                     child_boxes,
                 );
             }
-            return self
-                .estimate_element_height(
+            return margin_box_pt(
+                self.estimate_element_height(
                     element,
                     style,
                     stylesheets,
-                    inline_size.margin_box_width,
+                    inline_size.margin_box_width.points(),
                     child_boxes,
                 )
-                .unwrap_or(0.0);
+                .unwrap_or(0.0),
+            );
         }
 
         self.measure_auto_float_margin_box_height(
@@ -343,7 +416,53 @@ impl<'a> LayoutBuilder<'a> {
         inline_size: ResolvedFloatInlineSize,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
-    ) -> f32 {
+    ) -> MarginBoxLength {
+        // Isolated measurement lays out this same DOM element again. Complex
+        // formatting contexts (notably a float below nested balanced columns)
+        // can ask for the outer float's height while that replay is still in
+        // progress. Layout snapshots intentionally roll back the replay, so a
+        // snapshot-owned flag would lose the active cycle marker. Keep the
+        // marker on the builder instead and use the ordinary finite estimator
+        // for the recursive edge.
+        //
+        // CSS 2.2 requires an auto-height float to use its BFC's used height;
+        // the fallback does not change the final replay path. It only provides
+        // a terminating provisional size while that same BFC is being solved.
+        // <https://www.w3.org/TR/CSS22/visudet.html#root-height>
+        let element_key = element.id;
+        let cache_key = AutoFloatMeasurementKey {
+            element: element.id,
+            content_width_bits: inline_size.content_width.points().to_bits(),
+            border_box_width_bits: inline_size.border_box_width.points().to_bits(),
+            margin_box_width_bits: inline_size.margin_box_width.points().to_bits(),
+            style_fingerprint: debug_fingerprint(placed_style),
+            percentage_basis_fingerprint: debug_fingerprint(&self.definite_block_size_stack.last()),
+            counter_fingerprint: debug_fingerprint(&self.counter_set),
+            quote_depth: self.quote_depth,
+            page_index: self.pages.len(),
+        };
+        if let Some(height) = self
+            .speculative_auto_float_margin_box_heights
+            .get(&cache_key)
+        {
+            return *height;
+        }
+
+        if !self.active_auto_float_measurements.is_empty() {
+            let height = self.nested_auto_float_margin_box_height(
+                element,
+                placed_style,
+                stylesheets,
+                inline_size,
+                child_boxes,
+            );
+            if self.speculative_auto_float_margin_box_heights.len() < 256 {
+                self.speculative_auto_float_margin_box_heights
+                    .insert(cache_key, height);
+            }
+            return height;
+        }
+        self.active_auto_float_measurements.push(element_key);
         let snapshot = self.snapshot();
         let probe_top = 10_000.0;
         let replay_style = float_replay_style(placed_style);
@@ -355,8 +474,20 @@ impl<'a> LayoutBuilder<'a> {
         self.content_left = placed_style.margin.left;
         self.content_right = self.content_left + inline_size.border_box_width.points().max(1.0);
         self.cursor_y = probe_top - placed_style.margin.top;
-        self.containing_block_direction = placed_style.direction;
-        self.containing_block_writing_mode = placed_style.writing_mode;
+        // The floated element is itself an orthogonal child of this
+        // formatting context. Keep the parent flow here: block layout records
+        // it before installing `placed_style` for descendants, and uses that
+        // relationship to resolve the float's auto logical inline size.
+        // Replacing it with the float's own flow makes a vertical float look
+        // parallel to itself and leaves its physical height at zero.
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+        if !crate::layout::block::writing_modes_are_orthogonal(
+            self.containing_block_writing_mode,
+            placed_style.writing_mode,
+        ) {
+            self.containing_block_direction = placed_style.used_direction();
+            self.containing_block_writing_mode = placed_style.writing_mode;
+        }
         self.fragmentation_suppression_depth += 1;
         self.push_page_name_scope_suppression();
         self.push_float_context();
@@ -370,8 +501,87 @@ impl<'a> LayoutBuilder<'a> {
         );
         let border_box_height = (probe_top - placed_style.margin.top - self.cursor_y).max(0.0);
         self.restore(snapshot);
+        let popped = self.active_auto_float_measurements.pop();
+        debug_assert_eq!(popped, Some(element_key));
 
-        placed_style.margin.top + border_box_height + placed_style.margin.bottom
+        let height =
+            margin_box_pt(placed_style.margin.top + border_box_height + placed_style.margin.bottom);
+        // The cache is bounded because a pathological document can otherwise
+        // manufacture a distinct generated-content state for every replay.
+        // Entries are only an optimization; omitting a new one leaves layout
+        // semantics unchanged.
+        if self.speculative_auto_float_margin_box_heights.len() < 256 {
+            self.speculative_auto_float_margin_box_heights
+                .insert(cache_key, height);
+        }
+        height
+    }
+
+    /// Return a finite provisional height for a float nested inside an
+    /// in-progress isolated auto-height measurement.
+    ///
+    /// An exact isolated replay is needed at the top of the measurement tree,
+    /// where inline and generated-content interactions determine the BFC's
+    /// used height. Launching the same replay recursively for each floated
+    /// descendant, however, makes nested float trees exponential. The final
+    /// layout still replays each descendant exactly for placement and paint;
+    /// this provisional edge only supplies the ancestor's finite BFC extent.
+    fn nested_auto_float_margin_box_height(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        inline_size: ResolvedFloatInlineSize,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+    ) -> MarginBoxLength {
+        let element_key = element.id;
+        let bare_height = self.minimum_auto_float_margin_box_height(style);
+        if self
+            .active_auto_float_measurement_fallbacks
+            .contains(&element_key)
+        {
+            return bare_height;
+        }
+
+        self.active_auto_float_measurement_fallbacks
+            .push(element_key);
+        let estimated_height = self
+            .estimate_element_height(
+                element,
+                style,
+                stylesheets,
+                inline_size.margin_box_width.points(),
+                child_boxes,
+            )
+            .map(margin_box_pt)
+            .unwrap_or(bare_height);
+        let popped = self.active_auto_float_measurement_fallbacks.pop();
+        debug_assert_eq!(popped, Some(element_key));
+        estimated_height.max(bare_height)
+    }
+
+    /// The innermost leg of a recursive float measurement has no safe
+    /// descendant traversal left. Preserve the float's authored minimum block
+    /// size and box metrics, while treating its unresolved auto content as
+    /// empty as CSS 2.2 does for an empty float.
+    fn minimum_auto_float_margin_box_height(&self, style: &ComputedStyle) -> MarginBoxLength {
+        let borders = used_border_widths(style);
+        let vertical_non_content =
+            non_content_pt(style.padding.top + style.padding.bottom + borders.top + borders.bottom);
+        let content_height = constrain_content_height(
+            style,
+            content_box_pt(0.0),
+            self.definite_block_size_stack
+                .last()
+                .cloned()
+                .unwrap_or_else(PercentageBasis::indefinite),
+        );
+        margin_box_pt(
+            style.margin.top
+                + vertical_non_content.points()
+                + content_height.points()
+                + style.margin.bottom,
+        )
     }
 }
 
@@ -385,10 +595,12 @@ fn resolved_float_inline_size_from_content_box(
     ResolvedFloatInlineSize {
         content_width,
         border_box_width,
-        margin_box_width: style.margin.left
-            + border_box_width.points()
-            + visual_horizontal_extras
-            + style.margin.right,
+        margin_box_width: margin_box_pt(
+            style.margin.left
+                + border_box_width.points()
+                + visual_horizontal_extras
+                + style.margin.right,
+        ),
     }
 }
 
@@ -425,7 +637,7 @@ mod tests {
 
         assert_eq!(inline_size.content_width.points(), 150.0);
         assert_eq!(inline_size.border_box_width.points(), 170.0);
-        assert_eq!(inline_size.margin_box_width, 182.0);
+        assert_eq!(inline_size.margin_box_width, margin_box_pt(182.0));
     }
 
     #[test]
@@ -447,7 +659,7 @@ mod tests {
 
         assert_eq!(inline_size.content_width.points(), 0.0);
         assert_eq!(inline_size.border_box_width.points(), 150.0);
-        assert_eq!(inline_size.margin_box_width, 150.0);
+        assert_eq!(inline_size.margin_box_width, margin_box_pt(150.0));
     }
 
     #[test]
@@ -471,7 +683,7 @@ mod tests {
         let inline_size = ResolvedFloatInlineSize {
             content_width: content_box_pt(80.0),
             border_box_width: border_box_pt(120.0),
-            margin_box_width: 120.0,
+            margin_box_width: margin_box_pt(120.0),
         };
         let mut content_box_style = ComputedStyle::initial();
         content_box_style.box_sizing = BoxSizing::ContentBox;

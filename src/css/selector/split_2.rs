@@ -44,6 +44,8 @@ impl NonTSPseudoClass for QuirePseudoClass {
 pub(crate) enum QuirePseudoElement {
     Before,
     After,
+    FootnoteCall,
+    FootnoteMarker,
     Marker,
     FirstLine,
     FirstLetter,
@@ -57,6 +59,8 @@ impl ToCss for QuirePseudoElement {
         dest.write_str(match self {
             QuirePseudoElement::Before => "::before",
             QuirePseudoElement::After => "::after",
+            QuirePseudoElement::FootnoteCall => "::footnote-call",
+            QuirePseudoElement::FootnoteMarker => "::footnote-marker",
             QuirePseudoElement::Marker => "::marker",
             QuirePseudoElement::FirstLine => "::first-line",
             QuirePseudoElement::FirstLetter => "::first-letter",

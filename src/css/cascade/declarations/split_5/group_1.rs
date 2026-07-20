@@ -621,6 +621,7 @@ pub(in crate::css) fn apply_cascaded_declaration_group_1(
         "border-style" => {
             if let Some(styles) = parse_border_styles(value) {
                 style.border_styles = styles;
+                materialize_visible_border_widths(style);
             }
         }
         "outline-width" => {

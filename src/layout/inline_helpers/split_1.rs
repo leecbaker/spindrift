@@ -126,7 +126,14 @@ where
         .rev()
         .find_map(|item| match item.as_ref() {
             InlineLineItem::Fragment(fragment) if !fragment.text().is_empty() => {
-                Some(line_end_letter_spacing_width(fragment.text(), fragment.style()).points())
+                // Graph-backed fragments have already moved terminal shaper
+                // tracking into explicit visual-boundary advances.  Keep the
+                // legacy fallback for isolated test and compatibility items.
+                Some(if fragment.tracking_scope().is_none() {
+                    line_end_letter_spacing_width(fragment.text(), fragment.style()).points()
+                } else {
+                    0.0
+                })
             }
             InlineLineItem::Atom(_) => Some(0.0),
             _ => None,
@@ -229,6 +236,17 @@ pub(in crate::layout) fn inline_atom_logical_inline_size(
     atom: &InlineAtom,
     containing_style: &ComputedStyle,
 ) -> f32 {
+    if let InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)) = atom.content() {
+        // Box-edge atoms retain a physical line-height so they can contribute
+        // to the line box and paint their decoration. Their `advance`,
+        // however, is already in the containing line's logical inline
+        // coordinate. Projecting the physical atom height again in vertical
+        // writing modes would turn a zero-width lexical scope marker into a
+        // one-line advance.
+        // <https://www.w3.org/TR/css-inline-3/#inline-boxes> and
+        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+        return edge.advance;
+    }
     match containing_style.writing_mode {
         WritingMode::HorizontalTb => atom.size.width,
         WritingMode::VerticalRl
@@ -264,7 +282,10 @@ pub(in crate::layout) fn inline_atom_logical_inline_start_margin(
 ) -> f32 {
     inline_atom_margin_for_side(
         atom,
-        inline_start_side(containing_style.writing_mode, containing_style.direction),
+        inline_start_side(
+            containing_style.writing_mode,
+            containing_style.used_direction(),
+        ),
     )
 }
 
@@ -274,7 +295,10 @@ pub(in crate::layout) fn inline_atom_logical_inline_end_margin(
 ) -> f32 {
     inline_atom_margin_for_side(
         atom,
-        inline_end_side(containing_style.writing_mode, containing_style.direction),
+        inline_end_side(
+            containing_style.writing_mode,
+            containing_style.used_direction(),
+        ),
     )
 }
 
@@ -365,6 +389,11 @@ pub(in crate::layout) fn can_paint_inline_fragments_together(
         && (left.style().font_size - right.style().font_size).abs() < 0.01
         && left.style().vertical_align == right.style().vertical_align
         && left.style().color == right.style().color
+        // Palette selection is paint state. Adjacent palette-only inline
+        // boxes may share shaping context, but must not collapse into one
+        // rendered text run because a COLR glyph reads the palette at paint.
+        // <https://drafts.csswg.org/css-fonts-4/#font-palette-prop>
+        && left.style().font_palette == right.style().font_palette
         && left.style().visibility == right.style().visibility
         && left.style().text_decoration == right.style().text_decoration
 }
@@ -374,6 +403,8 @@ pub(in crate::layout) fn inline_text_sources_are_paint_compatible(
     right: InlineTextSource,
 ) -> bool {
     match (left, right) {
+        (InlineTextSource::BidiControl, InlineTextSource::BidiControl) => true,
+        (InlineTextSource::BidiControl, _) | (_, InlineTextSource::BidiControl) => false,
         (InlineTextSource::Marker, InlineTextSource::Marker) => true,
         (InlineTextSource::Marker, _) | (_, InlineTextSource::Marker) => false,
         (InlineTextSource::RunIn, InlineTextSource::RunIn) => true,
@@ -465,6 +496,8 @@ pub(in crate::layout) fn styles_have_equivalent_text_shaping_inputs(
         && left.font_width == right.font_width
         && left.font_synthesis == right.font_synthesis
         && left.font_feature_settings == right.font_feature_settings
+        && left.text_spacing_trim == right.text_spacing_trim
+        && left.font_variation_settings == right.font_variation_settings
         && left.font_kerning == right.font_kerning
         && left.font_variant_ligatures == right.font_variant_ligatures
         && left.font_variant_position == right.font_variant_position
@@ -473,6 +506,10 @@ pub(in crate::layout) fn styles_have_equivalent_text_shaping_inputs(
         && left.font_variant_alternates == right.font_variant_alternates
         && left.font_variant_east_asian == right.font_variant_east_asian
         && left.font_variant_emoji == right.font_variant_emoji
+        // This predicate also authorizes reusing one source-shaped paint
+        // artifact, so a paint-only palette boundary must remain explicit.
+        // <https://drafts.csswg.org/css-fonts-4/#font-palette-prop>
+        && left.font_palette == right.font_palette
         && left.word_break == right.word_break
         && left.overflow_wrap == right.overflow_wrap
         && left.text_wrap_mode == right.text_wrap_mode

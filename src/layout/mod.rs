@@ -1,34 +1,34 @@
 use crate::css::{
-    self, AdditiveCounterStyle, AlignContent, AlignItems, AlignSelf, AlignmentBaseline,
-    AlignmentSafety, BackgroundImage, BaselineMetric, BaselineShift, BookmarkLabelPart,
-    BorderStyle, BoxSizing, CaptionSide, Clear, ClipPath, Color, ComputedStyle, Content,
-    ContentAlignmentKeyword, ContentVisibility, CounterReset, CounterResetKind, CounterStyleRange,
-    CounterStyleRule, CounterStyleSystem, CounterValue, CssBookmarkState, Declarations, Direction,
-    Display, DisplayInner, DominantBaseline, ElementAttributeSignature, ElementSiblingSignature,
-    ElementSiblingSignatureList, ElementSignature, EmptyCells, FilterValue, FlexDirection,
-    FlexWrap, Float, GeneratedAltTextPart, GeneratedContentPart, GeneratedQuote, Isolation,
-    JustifyContent, JustifyItems, JustifySelf, LinearGradientDirection, ListStylePosition,
-    ListStyleType, LogicalAxis, LogicalSide, MarkerContent, MarkerContentPart, MarkerSide,
-    MaskValue, MixBlendMode, NamedStringPart, NumericCounterStyle, PageBreak, PageRule,
-    PageSpecificity, PhysicalAxis, PhysicalSide, Position, Quotes, SelfAlignmentKeyword,
-    Stylesheet, StylesheetOrigin, TableCellVerticalAlign, TableLayout, TextAlign, TextAlignLast,
-    TextAutospace, TextDecorationSkipInk, TextDecorationSkipSpaces, TextDecorationStyle,
-    TextDecorationThickness, TextJustify, TextTransformCase, TextUnderlineOffset,
-    TextUnderlinePosition, UnicodeBidi, VerticalAlign, Visibility, WhiteSpace, WritingMode,
-    WritingModeAxes, block_end_side, block_start_side, inline_end_side, inline_start_side,
+    self, AlignContent, AlignItems, AlignSelf, AlignmentBaseline, AlignmentSafety, BackgroundImage,
+    BaselineMetric, BaselineShift, BookmarkLabelPart, BorderStyle, BoxSizing, CaptionSide, Clear,
+    ClipPath, ComputedStyle, Content, ContentAlignmentKeyword, ContentVisibility, CounterReset,
+    CounterResetKind, CounterStyleRange, CounterStyleRule, CounterStyleSystem, CounterValue,
+    CssBookmarkState, CssColor, Declarations, Direction, Display, DisplayInner, DominantBaseline,
+    ElementAttributeSignature, ElementSiblingSignature, ElementSiblingSignatureList,
+    ElementSignature, EmptyCells, FilterValue, FlexDirection, FlexWrap, Float,
+    GeneratedAltTextPart, GeneratedContentPart, GeneratedQuote, Isolation, JustifyContent,
+    JustifyItems, JustifySelf, LinearGradientDirection, ListStylePosition, ListStyleType,
+    LogicalAxis, LogicalSide, MarkerContent, MarkerContentPart, MarkerSide, MaskValue,
+    MixBlendMode, NamedStringPart, PageBreak, PageRule, PageSpecificity, PhysicalAxis,
+    PhysicalSide, Position, Quotes, SelfAlignmentKeyword, Stylesheet, StylesheetOrigin,
+    TableCellVerticalAlign, TableLayout, TextAlign, TextAlignLast, TextAutospace,
+    TextDecorationSkipInk, TextDecorationSkipSpaces, TextDecorationStyle, TextDecorationThickness,
+    TextJustify, TextSpacingTrim, TextTransformCase, TextUnderlineOffset, TextUnderlinePosition,
+    UnicodeBidi, VerticalAlign, Visibility, WhiteSpace, WritingMode, WritingModeAxes,
+    block_end_side, block_start_side, inline_end_side, inline_start_side,
 };
 use crate::document::{
     Bookmark, BookmarkState, Document, DocumentMetadata, Page, PaintBand, PaintBlendMode,
-    PaintCheckpoint, PaintClip, PaintClipPathEffect, PaintDisplacement, PaintEffects,
-    PaintFilterEffect, PaintFragment, PaintMaskEffect, PaintPoint, PaintPrimitive, PaintRect,
-    PaintSize, PaintSpace, PaintStackingContext, PaintTransform, PaintTranslation,
-    RenderedCornerRadius, RenderedGlyph, RenderedGradient, RenderedGradientKind,
-    RenderedGradientPattern, RenderedGradientStop, RenderedImage, RenderedImagePattern,
-    RenderedImageSourceRect, RenderedLine, RenderedLineSource, RenderedLink, RenderedPath,
-    RenderedPathClip, RenderedPathClipPath, RenderedPathCommand, RenderedPathFillRule,
-    RenderedPathLineCap, RenderedPathStrokeStyle, RenderedRect, RenderedRoundedRect,
-    RenderedRoundedRectRadii, RenderedStroke, RenderedSvgPattern, RenderedTextMatrix,
-    RenderedTextRun, StackLevel, TextRunPoint, paint_rect_path_commands,
+    PaintCheckpoint, PaintClip, PaintClipPathEffect, PaintClipUnion, PaintDisplacement,
+    PaintEffects, PaintFilterEffect, PaintFragment, PaintMaskEffect, PaintPoint, PaintPrimitive,
+    PaintRect, PaintSize, PaintSpace, PaintStackingContext, PaintStrokeWidth, PaintTransform,
+    PaintTranslation, RenderedClipPathPolygon, RenderedCornerRadius, RenderedGlyph,
+    RenderedGradient, RenderedGradientKind, RenderedGradientPattern, RenderedGradientStop,
+    RenderedImage, RenderedImagePattern, RenderedImageSourceRect, RenderedLine, RenderedLineSource,
+    RenderedLink, RenderedPath, RenderedPathClip, RenderedPathClipPath, RenderedPathCommand,
+    RenderedPathFillRule, RenderedPathLineCap, RenderedPathStrokeStyle, RenderedRect,
+    RenderedRoundedRect, RenderedRoundedRectRadii, RenderedStroke, RenderedSvgPattern,
+    RenderedTextMatrix, RenderedTextRun, StackLevel, TextRunPoint, paint_rect_path_commands,
 };
 use crate::dom::{self, Element, ElementId, Node, NodeKind};
 use crate::resource::ResourceCache;
@@ -49,10 +49,11 @@ use crate::text::{
 use crate::timing::DebugTimer;
 use crate::units::{
     BorderBoxLength, BorderBoxSize, ContentBoxLength, ContentBoxSize, LayoutLength,
-    NonContentLength, PercentageBasis, RasterPixelSize, SemanticLengthExt, border_box_pt,
-    border_box_to_content_box_length, content_box_pt, content_box_size_pt,
-    content_box_to_border_box_length, content_box_to_border_box_size, layout_points, layout_pt,
-    non_content_pt, raster_natural_layout_size,
+    MarginBoxLength, MarginBoxSize, NonContentLength, PercentageBasis, RasterPixelSize,
+    SemanticLengthExt, border_box_pt, border_box_to_content_box_length, content_box_pt,
+    content_box_size_pt, content_box_to_border_box_length, content_box_to_border_box_size,
+    layout_points, layout_pt, margin_box_pt, margin_box_size_pt, non_content_pt,
+    raster_natural_layout_size,
 };
 use std::collections::HashMap;
 use taffy::prelude as taffy_layout;
@@ -68,9 +69,10 @@ mod assets;
 mod block;
 #[allow(unused_imports)]
 pub(in crate::layout) use self::block::{
-    FloatAvoidingBfcMeasurement, FloatAvoidingBfcPlacement, FloatBand, FloatClearanceResolution,
-    FloatContext, FloatId, FloatPaintFragment, FloatPlacement, FloatRunState, FloatShape,
-    LogicalFloatBand, UsedFloatSide,
+    AutoFloatMeasurementKey, FloatAvoidingBfcMeasurement, FloatAvoidingBfcPlacement, FloatBand,
+    FloatBandPlacement, FloatBandQuery, FloatClearanceResolution, FloatContext, FloatId,
+    FloatPaintFragment, FloatPlacement, FloatRunState, FloatShape, LogicalFloatBand, UsedFloatSide,
+    float_avoiding_auto_border_box_width, vertical_physical_inline_span,
 };
 mod box_tree;
 mod builder;
@@ -78,6 +80,7 @@ mod counters;
 mod element_semantics;
 mod flex;
 mod flow_helpers;
+mod footnotes;
 mod fragmentation;
 mod gap_decorations;
 mod geometry;
@@ -96,6 +99,7 @@ mod list;
 mod page_generated;
 mod page_margin;
 mod paint_helpers;
+pub(crate) use paint_helpers::shaped_rect_path_commands;
 mod paint_ops;
 mod positioned_child;
 mod quotes;
@@ -111,10 +115,12 @@ pub(crate) fn rasterize_generated_image(
 ) -> Option<crate::image_store::RasterImage> {
     let decoded = match image {
         crate::image_store::GeneratedRasterImage::Linear { gradient, size, .. } => {
-            assets::rasterize_linear_gradient(gradient, *size)
+            // Generated recipes are resolved at their element paint boundary,
+            // so a symbolic currentcolor cannot remain here.
+            assets::rasterize_linear_gradient(gradient, *size, crate::css::CssColor::TRANSPARENT)
         }
         crate::image_store::GeneratedRasterImage::Radial { gradient, size, .. } => {
-            assets::rasterize_radial_gradient(gradient, *size)
+            assets::rasterize_radial_gradient(gradient, *size, crate::css::CssColor::TRANSPARENT)
         }
     }?;
     Some(crate::image_store::RasterImage {

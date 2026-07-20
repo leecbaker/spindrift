@@ -1,5 +1,29 @@
 use super::*;
 
+use crate::layout::asset_helpers::{
+    CssImageNaturalDimensions, ResolvedObjectViewBox, resolved_object_view_box,
+    resolved_object_view_box_for_svg,
+};
+
+/// The border-image resolution result that controls whether ordinary border
+/// styles remain visible. A successfully resolved image replaces the normal
+/// border even when its slice geometry produces no paint primitives.
+/// <https://www.w3.org/TR/css-backgrounds-3/#border-image-source>
+pub(in crate::layout) enum BorderPaint {
+    UseNormalBorder,
+    ReplaceNormalBorder { primitives: Vec<PaintPrimitive> },
+}
+
+/// The descendant-content clip carried by an atomic replaced element.
+///
+/// An empty contour is distinct from the absence of `border-shape`: it
+/// suppresses content entirely, rather than falling back to the rectangular
+/// content box.
+#[derive(Debug, Clone)]
+enum ReplacedBorderShapeContentClip {
+    Path(RenderedPathClip),
+    Empty,
+}
 /// A positioned box's source style and its normalized layout style.
 ///
 /// Positioned layout must retain the source style for cascade-owned decisions
@@ -164,9 +188,12 @@ impl<'a> LayoutBuilder<'a> {
                 content_x,
                 content_y + canvas.content_size.height - page.height(),
             ));
+            fragment.promote_page_background_to_in_flow_block();
             fragment.promote_background_border_to_in_flow_block();
-            fragment = fragment
-                .with_contents_effect_scoped_to_rect(PaintClip::from_paint_rect(content_rect));
+            fragment = fragment.with_contents_effect_scoped_to_rect_if_needed(
+                page,
+                PaintClip::from_paint_rect(content_rect),
+            );
             self.current_page
                 .append_paint_fragment_owned(fragment, PaintTranslation::identity());
         }
@@ -206,7 +233,7 @@ impl<'a> LayoutBuilder<'a> {
         ) else {
             return;
         };
-        let border_widths = box_metrics.border;
+        let border_widths = box_metrics.border.to_css_edges();
         let content_width = image.content_size.width;
         let content_height = image.content_size.height;
         let border_box_width = image.border_box_size.width;
@@ -217,11 +244,24 @@ impl<'a> LayoutBuilder<'a> {
         let border_x = border_origin.x;
         let border_y = border_origin.y;
         let paint_checkpoint = self.current_page.paint_checkpoint();
+        let decoration_rect =
+            paint_space_rect(border_x, border_y, border_box_width, border_box_height);
+        let border_shape_content_clip =
+            single_border_shape_content_clip(decoration_rect, style, border_widths);
         if style.visibility == Visibility::Visible {
             if style.background_color.is_some() || used_border_width(style) > layout_pt(0.0) {
-                let (rects, rounded_rects, paths, strokes) = block_paint_ops(
-                    paint_space_rect(border_x, border_y, border_box_width, border_box_height),
+                // Replaced content occupies the content layer: its box
+                // background belongs below it, while inset shadows and the
+                // border must paint above it. A monolithic decoration pass
+                // reverses that order and lets the image erase its border.
+                let (rects, rounded_rects, paths, strokes) = block_paint_ops_with_phases(
+                    decoration_rect,
                     style,
+                    border_widths,
+                    true,
+                    true,
+                    false,
+                    false,
                 );
                 for rect in rects {
                     self.push_rect_in_band(PaintBand::InFlowBlock, rect);
@@ -241,18 +281,27 @@ impl<'a> LayoutBuilder<'a> {
             // painter treats a zero destination as an omitted viewport, so
             // do not let it fall back to its natural dimensions here.
             // <https://www.w3.org/TR/css-contain-1/#containment-size>
-            if content_width > 0.0 && content_height > 0.0 {
+            if content_width > 0.0
+                && content_height > 0.0
+                && !matches!(
+                    border_shape_content_clip,
+                    Some(ReplacedBorderShapeContentClip::Empty)
+                )
+            {
                 if let Some(asset) = image.svg {
-                    self.push_svg_group_in_band(
-                        PaintBand::InFlowBlock,
-                        svg_replaced_group(
-                            &asset,
-                            paint_space_rect(image_x, image_y, content_width, content_height),
-                            style.object_fit,
-                            style.object_position.clone(),
-                            style.object_view_box.clone(),
-                        ),
+                    let mut group = svg_replaced_group(
+                        &asset,
+                        paint_space_rect(image_x, image_y, content_width, content_height),
+                        style.object_fit,
+                        style.object_position.clone(),
+                        style.object_view_box.clone(),
                     );
+                    if let Some(ReplacedBorderShapeContentClip::Path(clip)) =
+                        border_shape_content_clip
+                    {
+                        group = group.with_clip(clip);
+                    }
+                    self.push_svg_group_in_band(PaintBand::InFlowBlock, group);
                 } else {
                     let mut rendered = RenderedImage::from_paint_rect(
                         paint_space_rect(image_x, image_y, content_width, content_height),
@@ -260,13 +309,18 @@ impl<'a> LayoutBuilder<'a> {
                         image.decoded.pixel_width,
                         image.decoded.pixel_height,
                         None,
-                        style.image_rendering != css::ImageRendering::Pixelated,
-                        image.decoded.rgb,
+                        raster_image_interpolation(style),
+                        image.decoded.rgb.shared(),
                         image.decoded.alpha,
                         element.attrs.get("alt").cloned().map(Rc::from),
                     )
                     .with_raster_color_space(image.decoded.color_space.clone())
                     .with_image_id(image.decoded.image_id);
+                    if let Some(ReplacedBorderShapeContentClip::Path(clip)) =
+                        border_shape_content_clip
+                    {
+                        rendered = rendered.with_clip(clip);
+                    }
                     if apply_object_fit(
                         &mut rendered,
                         style.object_fit,
@@ -276,6 +330,27 @@ impl<'a> LayoutBuilder<'a> {
                         self.push_image(rendered);
                     }
                 }
+            }
+            if style.background_color.is_some() || used_border_width(style) > layout_pt(0.0) {
+                let (rects, rounded_rects, paths, strokes) = block_paint_ops_with_phases(
+                    decoration_rect,
+                    style,
+                    border_widths,
+                    false,
+                    false,
+                    true,
+                    true,
+                );
+                for rect in rects {
+                    self.push_rect_in_band(PaintBand::InFlowBlock, rect);
+                }
+                for rounded_rect in rounded_rects {
+                    self.push_rounded_rect_in_band(PaintBand::InFlowBlock, rounded_rect);
+                }
+                for path in paths {
+                    self.push_path_in_band(PaintBand::InFlowBlock, path);
+                }
+                self.extend_strokes_in_band(PaintBand::InFlowBlock, strokes);
             }
         }
         self.scope_current_page_replaced_paint_since(
@@ -311,17 +386,21 @@ impl<'a> LayoutBuilder<'a> {
             PercentageBasis::definite(layout_pt(available_width)),
         );
         let style = &used_style;
-        let image = used_generated_image_value(
-            image,
-            style,
-            available_width,
-            self.base_url,
-            self.root_url,
-            self.resource_cache,
-        )
-        .unwrap_or_else(|| used_invalid_replacement_image(style, available_width));
+        let image = image
+            .as_image()
+            .and_then(|image| {
+                used_generated_image_value(
+                    image,
+                    style,
+                    available_width,
+                    self.base_url,
+                    self.root_url,
+                    self.resource_cache,
+                )
+            })
+            .unwrap_or_else(|| used_invalid_replacement_image(style, available_width));
         let alt_text = self.generated_alt_text(element, style);
-        let border_widths = box_metrics.border;
+        let border_widths = box_metrics.border.to_css_edges();
         let content_width = image.content_size.width;
         let content_height = image.content_size.height;
         let border_box_width = image.border_box_size.width;
@@ -369,8 +448,8 @@ impl<'a> LayoutBuilder<'a> {
                         image.decoded.pixel_width,
                         image.decoded.pixel_height,
                         None,
-                        style.image_rendering != css::ImageRendering::Pixelated,
-                        image.decoded.rgb,
+                        raster_image_interpolation(style),
+                        image.decoded.rgb.shared(),
                         image.decoded.alpha,
                         alt_text.map(Rc::from),
                     )
@@ -423,7 +502,7 @@ impl<'a> LayoutBuilder<'a> {
         ) else {
             return;
         };
-        let border_widths = box_metrics.border;
+        let border_widths = box_metrics.border.to_css_edges();
         let content_width = geometry.content_size.width;
         let content_height = geometry.content_size.height;
         let border_box_width = geometry.border_box_size.width;
@@ -433,13 +512,15 @@ impl<'a> LayoutBuilder<'a> {
         let border_x = border_origin.x;
         let border_y = border_origin.y;
         let paint_checkpoint = self.current_page.paint_checkpoint();
+        let border_paint_rect =
+            paint_space_rect(border_x, border_y, border_box_width, border_box_height);
+        let border_shape_content_clip = style_clips_overflow(style)
+            .then(|| single_border_shape_content_clip(border_paint_rect, style, border_widths))
+            .flatten();
         if style.visibility == Visibility::Visible
             && (style.background_color.is_some() || used_border_width(style) > layout_pt(0.0))
         {
-            let (rects, rounded_rects, paths, strokes) = block_paint_ops(
-                paint_space_rect(border_x, border_y, border_box_width, border_box_height),
-                style,
-            );
+            let (rects, rounded_rects, paths, strokes) = block_paint_ops(border_paint_rect, style);
             for rect in rects {
                 self.push_rect_in_band(PaintBand::InFlowBlock, rect);
             }
@@ -451,7 +532,14 @@ impl<'a> LayoutBuilder<'a> {
             }
             self.extend_strokes_in_band(PaintBand::InFlowBlock, strokes);
         }
-        if style.visibility == Visibility::Visible && content_width > 0.0 && content_height > 0.0 {
+        if style.visibility == Visibility::Visible
+            && content_width > 0.0
+            && content_height > 0.0
+            && !matches!(
+                border_shape_content_clip,
+                Some(ReplacedBorderShapeContentClip::Empty)
+            )
+        {
             let content_x = border_x + border_widths.left + style.padding.left;
             let content_y = border_y + border_widths.bottom + style.padding.bottom;
             // An inline SVG with omitted root dimensions is parsed with a
@@ -460,26 +548,21 @@ impl<'a> LayoutBuilder<'a> {
             // as `<rect width="100%">`; otherwise a 1 by 1 viewBox leaks
             // into paint even when Flexbox has assigned a 100px item.
             // <https://www.w3.org/TR/SVG2/coords.html#ViewportSpace>
-            let viewport_asset = asset.with_replaced_viewport(content_width, content_height);
-            self.push_svg_group_in_band(
-                PaintBand::InFlowBlock,
-                viewport_asset.paint_group(paint_space_rect(
-                    content_x,
-                    content_y,
-                    content_width,
-                    content_height,
-                )),
+            let viewport_asset =
+                asset.with_replaced_viewport(content_box_size_pt(content_width, content_height));
+            let mut group = viewport_asset.paint_inline_group(
+                paint_space_rect(content_x, content_y, content_width, content_height),
+                style_clips_overflow(style),
             );
+            if let Some(ReplacedBorderShapeContentClip::Path(clip)) = border_shape_content_clip {
+                group = group.with_clip(clip);
+            }
+            self.push_svg_group_in_band(PaintBand::InFlowBlock, group);
         }
         self.scope_current_page_replaced_paint_since(
             &paint_checkpoint,
             PaintBand::InFlowBlock,
-            PaintClip::from_paint_rect(paint_space_rect(
-                border_x,
-                border_y,
-                border_box_width,
-                border_box_height,
-            )),
+            PaintClip::from_paint_rect(border_paint_rect),
             style,
         );
         self.cursor_y -= border_box_height + style.margin.bottom;
@@ -494,16 +577,16 @@ impl<'a> LayoutBuilder<'a> {
         let margin_box_width = style.margin.left + border_box_width + style.margin.right;
         let margin_box_height = style.margin.top + border_box_height + style.margin.bottom;
         self.cursor_y -= style.margin.top;
-        self.prebreak_bfc_margin_box_if_needed(margin_box_height, style.margin.top);
-        let (margin_box_left, avoided_top, _) = self.place_float_avoiding_margin_box(
-            self.cursor_y,
-            PageTopSize::new(margin_box_width, margin_box_height),
+        self.prebreak_bfc_margin_box_if_needed(margin_box_pt(margin_box_height), style.margin.top);
+        let placement = self.place_float_avoiding_margin_box(
+            PageTopBlockPosition::new(self.cursor_y),
+            margin_box_size_pt(margin_box_width, margin_box_height),
             style.clear,
             style.writing_mode,
             style.direction,
             self.containing_block_direction,
         );
-        self.cursor_y = avoided_top;
+        self.cursor_y = placement.origin.top_y();
         // Replaced elements participate in normal flow just like ordinary
         // block boxes. Record a used positive block fragment before its
         // painting is emitted so named-page boundaries and fragmentation do
@@ -513,7 +596,7 @@ impl<'a> LayoutBuilder<'a> {
             self.mark_current_page_flow_content();
         }
         PaintPoint::new(
-            margin_box_left + style.margin.left,
+            placement.origin.x() + style.margin.left,
             self.cursor_y - border_box_height,
         )
     }
@@ -552,6 +635,12 @@ impl<'a> LayoutBuilder<'a> {
             PaintBackgroundArea::from_paint_rect(border_rect),
             PaintBackgroundArea::from_paint_rect(border_rect),
             Some(fixed_positioning_area),
+            // A fixed-position containing-block stack records ancestors that
+            // localize viewport-fixed painting. A fixed background in that
+            // subtree must likewise use element-local positioning; the box's
+            // own transform is included before its containing-block scope is
+            // necessarily pushed.
+            style.has_transform() || !self.fixed_containing_blocks.is_empty(),
             style,
             self.base_url,
             self.root_url,
@@ -566,13 +655,13 @@ impl<'a> LayoutBuilder<'a> {
     /// supports URL sources, numeric/percentage slices, width/outset
     /// resolution, optional center `fill`, and `stretch` sizing:
     /// <https://www.w3.org/TR/css-backgrounds-3/#border-images>.
-    pub(in crate::layout) fn border_image_slices(
+    pub(in crate::layout) fn border_image_paint(
         &self,
         border_rect: PaintRect,
         style: &ComputedStyle,
-    ) -> Vec<PaintPrimitive> {
-        let Some(src) = style.border_image.source.as_ref() else {
-            return Vec::new();
+    ) -> BorderPaint {
+        let Some(src) = style.border_image.source.as_image() else {
+            return BorderPaint::UseNormalBorder;
         };
         let resolved = match src.selected_image() {
             BackgroundImage::Url {
@@ -590,7 +679,7 @@ impl<'a> LayoutBuilder<'a> {
                     .as_ref()
                     .or(style.border_image.source_root_url.as_ref()),
                 self.resource_cache,
-                true,
+                style.image_orientation == css::ImageOrientation::FromImage,
                 request_modifiers,
             ),
             image => rasterize_generated_css_image(
@@ -612,7 +701,7 @@ impl<'a> LayoutBuilder<'a> {
         };
         let asset = match resolved {
             Some(asset) => asset,
-            None => return Vec::new(),
+            None => return BorderPaint::UseNormalBorder,
         };
         let (source_width, source_height) = match &asset {
             ResolvedImageAsset::Raster(decoded) => (decoded.pixel_width, decoded.pixel_height),
@@ -637,8 +726,8 @@ impl<'a> LayoutBuilder<'a> {
             used_border_image_widths(
                 style,
                 borders,
-                border_rect.size.width,
-                border_rect.size.height,
+                border_box_pt(border_rect.size.width),
+                border_box_pt(border_rect.size.height),
                 slices,
             ),
             area_width,
@@ -729,7 +818,7 @@ impl<'a> LayoutBuilder<'a> {
                             source,
                             repeat_x,
                             repeat_y,
-                            background_raster_interpolation(style),
+                            raster_image_interpolation(style),
                         );
                         primitives.extend(images.into_iter().map(PaintPrimitive::Image));
                     }
@@ -746,7 +835,7 @@ impl<'a> LayoutBuilder<'a> {
                 }
             }
         }
-        primitives
+        BorderPaint::ReplaceNormalBorder { primitives }
     }
 
     pub(in crate::layout) fn layout_positioned_block(
@@ -1009,9 +1098,33 @@ impl<'a> LayoutBuilder<'a> {
                 _ => {}
             }
         }
-        let positioned_available_outer_width =
-            (containing_block.width() - used_style.margin.left - used_style.margin.right)
-                .max(used_style.font_size);
+        // Direct flex children install a static-position rectangle before the
+        // generic absolute-positioning algorithm. Preserve its centered-axis
+        // available size for automatic sizing; the ordinary containing block
+        // still resolves the final inset equation.
+        // <https://www.w3.org/TR/css-flexbox-1/#abspos-items>
+        // <https://drafts.csswg.org/css-align-3/#abspos-sizing>
+        let absolute_static_position = self
+            .absolute_static_position
+            .or_else(|| grid_positioning_context.map(|context| context.static_position));
+        let horizontal_insets_are_auto_for_available =
+            used_inset_left(&used_style, containing_block).is_none()
+                && used_inset_right(&used_style, containing_block).is_none();
+        let flex_available_outer_width = (horizontal_insets_are_auto_for_available
+            && horizontal_size_was_auto)
+            .then(|| {
+                absolute_static_position
+                    .and_then(AbsoluteStaticPosition::flex_alignment)
+                    .and_then(|alignment| {
+                        alignment.available_horizontal_outer_size(containing_block)
+                    })
+            })
+            .flatten();
+        let positioned_available_outer_width = (flex_available_outer_width
+            .unwrap_or(containing_block.width())
+            - used_style.margin.left
+            - used_style.margin.right)
+            .max(used_style.font_size);
         let replaced_content_size = if is_replaced_element(element) {
             used_image(
                 element,
@@ -1057,23 +1170,25 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 containing_block_fragment_origin_page_index
             };
-        // Direct grid children install their already-resolved static rectangle
-        // explicitly. For positioned descendants, a live grid scope supplies
-        // the same rectangle only while that grid still provides the actual
-        // containing block.
-        // <https://www.w3.org/TR/css-grid-1/#abspos>
-        let absolute_static_position = self
-            .absolute_static_position
-            .or_else(|| grid_positioning_context.map(|context| context.static_position));
         // A hypothetical normal-flow position can lie outside the containing
         // block, for example through a negative margin on an intervening block
         // ancestor. CSS Positioned Layout uses that position directly when
         // resolving two automatic inline insets; it must not be clamped back
         // into the containing block.
         // <https://www.w3.org/TR/css-position-3/#static-position-rectangle>
+        // An auto-inset positioned box rooted in the initial containing block
+        // still takes its static-position rectangle from the hypothetical
+        // in-flow box. `previous_left` and `previous_right` are the active
+        // normal-flow content edges, so they already include any propagated
+        // root/body canvas inset. Adding the canvas inset again would shift a
+        // body descendant by its margin twice.
+        // <https://www.w3.org/TR/css-position-3/#static-position-rectangle>
+        // <https://www.w3.org/TR/css-backgrounds-3/#special-backgrounds>
+        let static_source_left = previous_left;
+        let static_source_right = previous_right;
         let source_static_position = AbsoluteStaticPosition::from_page_rect_with_horizontal_outside(
-            previous_left,
-            previous_right,
+            static_source_left,
+            static_source_right,
             previous_cursor_y,
             true,
         );
@@ -1082,6 +1197,10 @@ impl<'a> LayoutBuilder<'a> {
         let inline_static_position = self.inline_static_position;
         let inline_static_uses_margin_box_top = inline_auto_static_y
             && inline_static_position.is_some_and(|position| position.use_margin_box_top);
+        // A margin-box static rectangle already fixes the positioned
+        // fragment's block-start. Translating its first line again from a
+        // baseline would shift atomic inline sources twice. Baseline-mode
+        // placeholders instead use the prepared line baseline below.
         let inline_static_baseline_position = (inline_auto_static_y
             && !inline_static_uses_margin_box_top)
             .then_some(inline_static_position)
@@ -1170,6 +1289,18 @@ impl<'a> LayoutBuilder<'a> {
         }
         if horizontal_insets_are_auto
             && horizontal_size_was_auto
+            && let Some(flex_alignment) =
+                absolute_static_position.and_then(AbsoluteStaticPosition::flex_alignment)
+            && let Some(position) = flex_alignment.centered_horizontal_static_position(
+                containing_block,
+                auto_or_intrinsic_width + horizontal_non_content,
+                style.margin.left,
+                style.margin.right,
+            )
+        {
+            static_horizontal_position = position;
+        } else if horizontal_insets_are_auto
+            && horizontal_size_was_auto
             && let Some(grid_alignment) =
                 absolute_static_position.and_then(AbsoluteStaticPosition::grid_alignment)
         {
@@ -1177,9 +1308,13 @@ impl<'a> LayoutBuilder<'a> {
                 grid_alignment,
                 style,
                 containing_block,
-                auto_or_intrinsic_width + horizontal_non_content,
+                border_box_pt(auto_or_intrinsic_width + horizontal_non_content),
             );
         }
+        let containing_horizontal_direction = physical_horizontal_axis_direction(
+            self.containing_block_writing_mode,
+            self.containing_block_direction,
+        );
         let mut positioned_x = resolve_absolute_horizontal_with_non_content(
             style,
             containing_block,
@@ -1199,7 +1334,7 @@ impl<'a> LayoutBuilder<'a> {
                     .is_some())
             .then_some(auto_or_intrinsic_width),
             static_horizontal_position,
-            self.containing_block_direction,
+            containing_horizontal_direction,
             horizontal_non_content,
         );
         // An absolutely positioned table is laid out against the containing
@@ -1218,10 +1353,6 @@ impl<'a> LayoutBuilder<'a> {
         // the measured fragment span:
         // <https://www.w3.org/TR/css-page-3/#using-named-pages>
         self.push_page_name_scope_suppression();
-        let positioned_is_orthogonal = positioned_box_is_orthogonal_to_containing_block(
-            self.containing_block_writing_mode,
-            style.writing_mode,
-        );
         let auto_height = if vertical_size_was_auto && let Some((_, height)) = replaced_content_size
         {
             height
@@ -1232,25 +1363,55 @@ impl<'a> LayoutBuilder<'a> {
             estimate_style.box_values.margin =
                 css::CssEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
             set_style_used_width(&mut estimate_style, positioned_content_width);
+            // `positioned_content_width` is already a used content-box
+            // size.  The measurement surrogate must not interpret it through
+            // the authored `box-sizing` and subtract padding/borders again.
+            // <https://www.w3.org/TR/css-sizing-3/#box-sizing>
+            estimate_style.box_sizing = BoxSizing::ContentBox;
             set_style_auto_height(&mut estimate_style);
             clear_position_insets(&mut estimate_style);
-            self.measure_auto_positioned_block_height(
+            // Absolute-positioned automatic sizes use fit-content sizing on
+            // their automatic axes. A vertical box's physical height is its
+            // logical inline axis, so treating this as a normal-flow `auto`
+            // height would stretch it through its vertical containing block
+            // during the measurement pass.
+            // <https://www.w3.org/TR/css-position-3/#abspos-layout>
+            // <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+            if estimate_style.writing_mode.has_vertical_lines() {
+                estimate_style.box_values.height =
+                    css::ComputedLengthPercentageOrAuto::FitContent(None);
+            }
+            let measured_height = self.measure_auto_positioned_block_height(
                 element,
                 &estimate_style,
                 stylesheets,
-                positioned_content_width,
+                PositionedAutoBlockMeasurementSpace {
+                    content_width: PhysicalContentWidth::new(content_box_pt(
+                        positioned_content_width,
+                    )),
+                    available_physical_height: PhysicalContentHeight::new(content_box_pt(
+                        containing_block.height(),
+                    )),
+                },
                 child_boxes,
                 table_fragment,
-            )
+            );
             // Size-contained positioned boxes use the measured size of their
             // empty principal formatting context. A font-sized floor would
             // incorrectly reintroduce descendant/font intrinsic size.
+            // In vertical writing, physical height is the logical inline
+            // axis. Its automatic size is the measured inline contribution;
+            // a logical block-axis line-height floor belongs to physical
+            // width and would make a one-glyph abspos box too tall.
+            // <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
             // <https://www.w3.org/TR/css-contain-1/#containment-size>
-            .max(if style.contain.size {
+            if style.contain.size {
                 0.0
+            } else if style.writing_mode.has_vertical_lines() {
+                measured_height
             } else {
-                style.line_height
-            })
+                measured_height.max(style.line_height)
+            }
         };
         self.pop_page_name_scope_suppression();
         if vertical_insets_are_auto
@@ -1324,7 +1485,7 @@ impl<'a> LayoutBuilder<'a> {
                     auto_or_intrinsic_width,
                     None,
                     static_horizontal_position,
-                    self.containing_block_direction,
+                    containing_horizontal_direction,
                     horizontal_non_content,
                 );
                 positioned_content_width = positioned_x.size;
@@ -1357,14 +1518,6 @@ impl<'a> LayoutBuilder<'a> {
             positioned_y.margin_start
         };
         self.cursor_y = containing_block.top_y() - positioned_y.start - positioned_margin_top;
-        if !inline_auto_static_y
-            && vertical_insets_are_auto
-            && !(left_inset.is_some() && right_inset.is_some())
-            && absolute_static_position.is_none()
-            && positioned_is_orthogonal
-        {
-            self.cursor_y += positioned_content_height;
-        }
         // Enter the destination fragmentainer's local coordinate space before
         // laying out the positioned subtree. Keeping a continuous coordinate
         // below the source page and translating captured paint afterward loses
@@ -1419,6 +1572,12 @@ impl<'a> LayoutBuilder<'a> {
             css::CssEdges::all(css::ComputedLengthPercentageOrAuto::ZERO);
         set_style_used_width(&mut flow_style, positioned_content_width);
         set_style_used_height(&mut flow_style, positioned_content_height);
+        // Positioned-axis resolution supplies content-box sizes.  The static
+        // flow surrogate replays those used values, so it must retain their
+        // content-box space instead of reapplying an authored border-box
+        // conversion.
+        // <https://www.w3.org/TR/css-sizing-3/#box-sizing>
+        flow_style.box_sizing = BoxSizing::ContentBox;
         clear_position_insets(&mut flow_style);
         let border_widths = used_border_widths(&flow_style);
         let positioned_containing_block_top = self.cursor_y - border_widths.top;
@@ -1491,8 +1650,8 @@ impl<'a> LayoutBuilder<'a> {
         };
         let has_principal_decoration = style.visibility == Visibility::Visible
             && (style.background_color.is_some()
-                || style.background_image.is_some()
-                || style.border_image.source.is_some()
+                || style.background_image.is_image()
+                || style.border_image.source.is_image()
                 || used_border_width(style) > layout_pt(0.0)
                 || (style.outline_width > 0.0 && !style.outline_style.suppresses_used_width()));
         let principal_decoration_target_page_index = has_principal_decoration
@@ -1697,6 +1856,17 @@ impl<'a> LayoutBuilder<'a> {
                     positioned_fragment.with_monolithic_fragmentation_scope(bounds);
             }
             let mut policy = StackingContextPolicy::for_positioned(element, style, bounds);
+            if self
+                .document_canvas_overflow
+                .is_viewport_overflow_source(element)
+            {
+                // Propagated root/body overflow is applied to the viewport;
+                // its source box has used `overflow: visible` and must not
+                // retain a local clipping effect when positioned.
+                // <https://drafts.csswg.org/css-overflow-3/#overflow-propagation>
+                policy.effects.overflow_clip = None;
+                policy.effects.rounded_overflow_clip = None;
+            }
             if uses_initial_page_containing_block && style.position != Position::Fixed {
                 // Paged media clips document-content painting to the page area.
                 // Fixed descendants instead replay over the final page
@@ -2016,26 +2186,36 @@ impl<'a> LayoutBuilder<'a> {
                     existing.max(target_page_index)
                 }),
         );
+        // A positioned descendant is measured while its source inline run is
+        // still selecting normal-flow fragment breaks. It may need a later
+        // fragmentainer for its paint, but must not advance that source flow
+        // or make its widow/orphan decision from the provisional destination.
+        // The enclosing formatter materializes this retained span once it
+        // has committed the in-flow break sequence.
+        // <https://www.w3.org/TR/css-position-3/#absolute-positioning>
+        // <https://www.w3.org/TR/css-break-3/#widows-orphans>
     }
 
     pub(in crate::layout) fn materialize_pending_positioned_page_span(&mut self) {
-        let target_page_index = self
-            .pending_positioned_page_span_target
-            .take()
-            .into_iter()
-            .chain(self.positioned_layers.iter().map(|layer| layer.page_index))
-            .max();
-        let Some(target_page_index) = target_page_index else {
-            return;
-        };
-        while self.pages.len() < target_page_index {
-            if !self.current_page_has_content() {
+        if self.out_of_flow_prebreak_suppression_depth == 0 {
+            let target_page_index = self
+                .pending_positioned_page_span_target
+                .take()
+                .into_iter()
+                .chain(self.positioned_layers.iter().map(|layer| layer.page_index))
+                .max();
+            let Some(target_page_index) = target_page_index else {
+                return;
+            };
+            while self.pages.len() < target_page_index {
+                if !self.current_page_has_content() {
+                    self.mark_current_page_flow_content();
+                }
+                self.push_page_without_flushing_positioned_layers();
+            }
+            if self.pages.len() == target_page_index {
                 self.mark_current_page_flow_content();
             }
-            self.push_page_without_flushing_positioned_layers();
-        }
-        if self.pages.len() == target_page_index {
-            self.mark_current_page_flow_content();
         }
     }
 
@@ -2174,92 +2354,6 @@ impl<'a> LayoutBuilder<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ObjectViewBoxSourceSpace {}
-
-type NormalizedObjectSourcePoint = euclid::Point2D<f32, ObjectViewBoxSourceSpace>;
-type NormalizedObjectSourceSize = euclid::Size2D<f32, ObjectViewBoxSourceSpace>;
-type NormalizedObjectSourceRect = euclid::Rect<f32, ObjectViewBoxSourceSpace>;
-
-fn resolved_object_view_box(
-    view_box: css::ObjectViewBox,
-    natural_size: LayoutSize,
-) -> Option<NormalizedObjectSourceRect> {
-    if natural_size.width <= 0.0 || natural_size.height <= 0.0 {
-        return None;
-    }
-    let resolve_x = |value| {
-        used_length_percentage(
-            value,
-            PercentageBasis::definite(layout_pt(natural_size.width)),
-        )
-        .points()
-            / natural_size.width
-    };
-    let resolve_y = |value| {
-        used_length_percentage(
-            value,
-            PercentageBasis::definite(layout_pt(natural_size.height)),
-        )
-        .points()
-            / natural_size.height
-    };
-    let rect = match view_box {
-        css::ObjectViewBox::None => NormalizedObjectSourceRect::new(
-            NormalizedObjectSourcePoint::new(0.0, 0.0),
-            NormalizedObjectSourceSize::new(1.0, 1.0),
-        ),
-        css::ObjectViewBox::Inset {
-            top,
-            right,
-            bottom,
-            left,
-            ..
-        } => {
-            let left = resolve_x(left);
-            let right = resolve_x(right);
-            let top = resolve_y(top);
-            let bottom = resolve_y(bottom);
-            NormalizedObjectSourceRect::new(
-                NormalizedObjectSourcePoint::new(left, top),
-                NormalizedObjectSourceSize::new(1.0 - left - right, 1.0 - top - bottom),
-            )
-        }
-        css::ObjectViewBox::Xywh {
-            x,
-            y,
-            width,
-            height,
-            ..
-        } => NormalizedObjectSourceRect::new(
-            NormalizedObjectSourcePoint::new(resolve_x(x), resolve_y(y)),
-            NormalizedObjectSourceSize::new(resolve_x(width), resolve_y(height)),
-        ),
-        css::ObjectViewBox::Rect {
-            top,
-            right,
-            bottom,
-            left,
-        } => {
-            let left = resolve_x(left);
-            let right = resolve_x(right);
-            let top = resolve_y(top);
-            let bottom = resolve_y(bottom);
-            NormalizedObjectSourceRect::new(
-                NormalizedObjectSourcePoint::new(left, top),
-                NormalizedObjectSourceSize::new(right - left, bottom - top),
-            )
-        }
-    };
-    (rect.origin.x.is_finite()
-        && rect.origin.y.is_finite()
-        && rect.size.width.is_finite()
-        && rect.size.height.is_finite()
-        && rect.size.width > 0.0
-        && rect.size.height > 0.0)
-        .then_some(rect)
-}
-
 fn rectangular_object_view_box_clip(rect: PaintRect) -> RenderedPathClip {
     RenderedPathClip::new(
         vec![
@@ -2275,21 +2369,26 @@ fn rectangular_object_view_box_clip(rect: PaintRect) -> RenderedPathClip {
 }
 
 fn object_view_box_clip(
-    view_box: css::ObjectViewBox,
+    view_box: &ResolvedObjectViewBox,
     natural_size: LayoutSize,
-    source: NormalizedObjectSourceRect,
     geometry: ConcreteObjectGeometry,
-) -> RenderedPathClip {
-    let radii = match view_box {
-        css::ObjectViewBox::Inset { radii, .. } | css::ObjectViewBox::Xywh { radii, .. } => radii,
-        css::ObjectViewBox::None | css::ObjectViewBox::Rect { .. } => None,
-    };
-    let Some(radii) = radii.filter(|radii| !radii.clone().is_zero()) else {
-        return rectangular_object_view_box_clip(geometry.visible);
+) -> Option<RenderedPathClip> {
+    // Every concrete object is clipped to the visible portion of its content
+    // box. This is independent of `object-view-box`: an ineffective view box
+    // leaves source selection alone, but must not remove the object-fit clip.
+    // Keeping this as an image-local clip also gives the raster resource the
+    // same edge coverage as an equivalent clipped background image.
+    if !view_box.applies() {
+        return Some(rectangular_object_view_box_clip(geometry.visible));
+    }
+    let source = view_box.source_rect();
+    let Some(radii) = view_box.radii().filter(|radii| !(*radii).clone().is_zero()) else {
+        return Some(rectangular_object_view_box_clip(geometry.visible));
     };
     let source_width = natural_size.width * source.size.width;
     let source_height = natural_size.height * source.size.height;
-    let source_radii = used_rounded_rect_radii(radii, LayoutSize::new(source_width, source_height));
+    let source_radii =
+        used_rounded_rect_radii(radii.clone(), LayoutSize::new(source_width, source_height));
     let scale_x = geometry.concrete.size.width / source_width;
     let scale_y = geometry.concrete.size.height / source_height;
     let scale_corner = |corner: RenderedCornerRadius| {
@@ -2315,7 +2414,7 @@ fn object_view_box_clip(
         rectangular.commands,
         rectangular.fill_rule,
     ));
-    clip
+    Some(clip)
 }
 
 /// Resolve the concrete object size and position for a raster replaced element.
@@ -2325,7 +2424,7 @@ fn object_view_box_clip(
 /// keeps `object-fit` and `background-size` on one source-to-destination
 /// mapping model, including the PDF image resource's pixel coordinate system.
 /// <https://www.w3.org/TR/css-images-3/#the-object-fit>
-fn apply_object_fit(
+pub(in crate::layout) fn apply_object_fit(
     image: &mut RenderedImage,
     object_fit: ObjectFit,
     object_position: css::BackgroundPosition,
@@ -2343,13 +2442,12 @@ fn apply_object_fit(
         source_width as f32 * css::CSS_PX_TO_PT,
         source_height as f32 * css::CSS_PX_TO_PT,
     );
-    let Some(source) = resolved_object_view_box(object_view_box.clone(), natural_size) else {
-        return false;
-    };
+    let view_box = resolved_object_view_box(object_view_box, Some(natural_size));
+    let source = view_box.source_rect();
     let Some(geometry) = concrete_object_geometry(
         image.paint_rect(),
-        natural_size.width * source.size.width,
-        natural_size.height * source.size.height,
+        CssImageNaturalDimensions::from_layout_size(natural_size)
+            .scaled(source.size.width, source.size.height),
         object_fit,
         object_position,
     ) else {
@@ -2363,12 +2461,23 @@ fn apply_object_fit(
         full_width,
         full_height,
     ));
-    *image = image.clone().with_clip(object_view_box_clip(
-        object_view_box,
-        natural_size,
-        source,
-        geometry,
-    ));
+    if let Some(clip) = object_view_box_clip(&view_box, natural_size, geometry) {
+        // `object-view-box` crops the source image, but it must not discard
+        // an enclosing CSS clip such as `border-shape`. PDF applies multiple
+        // clipping paths as their intersection in one graphics state.
+        // <https://drafts.csswg.org/css-images-4/#object-view-box>
+        let clip = if let Some(existing) = image.clip().cloned() {
+            let mut combined = existing;
+            combined
+                .additional_clips
+                .push(RenderedPathClipPath::new(clip.commands, clip.fill_rule));
+            combined.additional_clips.extend(clip.additional_clips);
+            combined
+        } else {
+            clip
+        };
+        *image = image.clone().with_clip(clip);
+    }
     true
 }
 
@@ -2387,50 +2496,52 @@ struct ConcreteObjectGeometry {
 
 fn concrete_object_geometry(
     destination: crate::document::PaintRect,
-    natural_width: f32,
-    natural_height: f32,
+    natural_dimensions: CssImageNaturalDimensions,
     object_fit: ObjectFit,
     object_position: css::BackgroundPosition,
 ) -> Option<ConcreteObjectGeometry> {
-    if natural_width <= 0.0
-        || natural_height <= 0.0
-        || destination.size.width <= 0.0
-        || destination.size.height <= 0.0
+    if destination.size.width <= 0.0 || destination.size.height <= 0.0 {
+        return None;
+    }
+    let none_size = || natural_dimensions.default_size(destination.size);
+    let contain_size = || natural_dimensions.contain_size(destination.size);
+    let concrete_size = match object_fit {
+        ObjectFit::Fill => destination.size,
+        ObjectFit::Contain => contain_size(),
+        ObjectFit::Cover => natural_dimensions.cover_size(destination.size),
+        ObjectFit::None => none_size(),
+        ObjectFit::ScaleDown => {
+            let none = none_size();
+            let contain = contain_size();
+            if none.width <= contain.width && none.height <= contain.height {
+                none
+            } else {
+                contain
+            }
+        }
+    };
+    if concrete_size.width <= 0.0
+        || concrete_size.height <= 0.0
+        || !concrete_size.width.is_finite()
+        || !concrete_size.height.is_finite()
     {
         return None;
     }
-    let contain_scale =
-        (destination.size.width / natural_width).min(destination.size.height / natural_height);
-    let cover_scale =
-        (destination.size.width / natural_width).max(destination.size.height / natural_height);
-    let (concrete_width, concrete_height) = match object_fit {
-        ObjectFit::Fill => (destination.size.width, destination.size.height),
-        ObjectFit::Contain => (
-            natural_width * contain_scale,
-            natural_height * contain_scale,
-        ),
-        ObjectFit::Cover => (natural_width * cover_scale, natural_height * cover_scale),
-        ObjectFit::None => (natural_width, natural_height),
-        ObjectFit::ScaleDown => {
-            let scale = contain_scale.min(1.0);
-            (natural_width * scale, natural_height * scale)
-        }
-    };
     let offset_x = used_background_position_axis(
         object_position.x,
-        destination.size.width - concrete_width,
+        destination.size.width - concrete_size.width,
         false,
     );
     let offset_y = used_background_position_axis(
         object_position.y,
-        destination.size.height - concrete_height,
+        destination.size.height - concrete_size.height,
         true,
     );
     let concrete = paint_space_rect(
         destination.origin.x + offset_x,
         destination.origin.y + offset_y,
-        concrete_width,
-        concrete_height,
+        concrete_size.width,
+        concrete_size.height,
     );
     let visible = concrete.intersection(&destination)?;
     Some(ConcreteObjectGeometry { concrete, visible })
@@ -2441,7 +2552,7 @@ fn concrete_object_geometry(
 /// SVG source coordinates start at the top, while paint rectangles start at
 /// the bottom. The source Y conversion therefore inverts the visible
 /// intersection within the concrete object.
-fn svg_replaced_group(
+pub(in crate::layout) fn svg_replaced_group(
     asset: &SharedSvgAsset,
     destination: PaintRect,
     object_fit: ObjectFit,
@@ -2449,25 +2560,27 @@ fn svg_replaced_group(
     object_view_box: css::ObjectViewBox,
 ) -> crate::svg::SvgPaintGroup {
     let natural_size = asset.replaced_intrinsic_size();
-    let Some(view_box) = resolved_object_view_box(object_view_box.clone(), natural_size) else {
-        return crate::svg::SvgPaintGroup::empty();
-    };
-    let Some(geometry) = concrete_object_geometry(
-        destination,
-        natural_size.width * view_box.size.width,
-        natural_size.height * view_box.size.height,
-        object_fit,
-        object_position,
-    ) else {
+    let view_box = resolved_object_view_box_for_svg(object_view_box, asset);
+    let source_view_box = view_box.source_rect();
+    let intrinsic = asset.intrinsic_dimensions();
+    let natural_dimensions = CssImageNaturalDimensions::from_layout_axes(
+        intrinsic.width,
+        intrinsic.height,
+        intrinsic.aspect_ratio,
+    )
+    .scaled(source_view_box.size.width, source_view_box.size.height);
+    let Some(geometry) =
+        concrete_object_geometry(destination, natural_dimensions, object_fit, object_position)
+    else {
         return crate::svg::SvgPaintGroup::empty();
     };
     // The SVG root still has its complete source viewport.  The view box only
     // changes CSS Images' effective natural size, so scale that full viewport
     // to the concrete object before selecting the requested source rectangle.
-    let viewport_asset = asset.with_replaced_viewport(
-        geometry.concrete.size.width / view_box.size.width,
-        geometry.concrete.size.height / view_box.size.height,
-    );
+    let viewport_asset = asset.with_replaced_viewport(content_box_size_pt(
+        geometry.concrete.size.width / source_view_box.size.width,
+        geometry.concrete.size.height / source_view_box.size.height,
+    ));
     let source_size = viewport_asset.source_viewport_size();
     let left =
         (geometry.visible.min_x() - geometry.concrete.min_x()) / geometry.concrete.size.width;
@@ -2477,22 +2590,41 @@ fn svg_replaced_group(
     let visible_height = geometry.visible.size.height / geometry.concrete.size.height;
     let source = SvgSourceRect::new(
         SvgSourcePoint::new(
-            source_size.width * (view_box.origin.x + view_box.size.width * left),
+            source_size.width * (source_view_box.origin.x + source_view_box.size.width * left),
             source_size.height
-                * (view_box.origin.y + view_box.size.height * (1.0 - bottom - visible_height)),
+                * (source_view_box.origin.y
+                    + source_view_box.size.height * (1.0 - bottom - visible_height)),
         ),
         SvgSourceSize::new(
-            source_size.width * view_box.size.width * visible_width,
-            source_size.height * view_box.size.height * visible_height,
+            source_size.width * source_view_box.size.width * visible_width,
+            source_size.height * source_view_box.size.height * visible_height,
         ),
     );
     let group = viewport_asset.paint_group_for_source_rect(geometry.visible, source);
-    group.with_clip(object_view_box_clip(
-        object_view_box,
-        natural_size,
-        view_box,
-        geometry,
-    ))
+    if let Some(clip) = object_view_box_clip(&view_box, natural_size, geometry) {
+        group.with_clip(clip)
+    } else {
+        group
+    }
+}
+
+/// Build the clipped content contour for a replaced box with one
+/// `border-shape` and clipping overflow.
+///
+/// Replaced content is emitted as an atomic image/SVG primitive, outside the
+/// normal-flow fragment capture that supplies ordinary overflow effects.  It
+/// therefore carries the shape clip directly while the principal decoration
+/// remains outside the clip.
+fn single_border_shape_content_clip(
+    border_rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+) -> Option<ReplacedBorderShapeContentClip> {
+    let overflow_clip = single_border_shape_overflow_path_clip(border_rect, style, border_insets)?;
+    let BorderShapeOverflowClip::Path(clip) = overflow_clip else {
+        return Some(ReplacedBorderShapeContentClip::Empty);
+    };
+    Some(ReplacedBorderShapeContentClip::Path(clip))
 }
 
 /// Emit tiled vector paths for one CSS border-image slice.
@@ -2569,8 +2701,7 @@ mod tests {
         let destination: PaintRect = paint_space_rect(10.0, 20.0, 100.0, 100.0);
         let geometry = concrete_object_geometry(
             destination,
-            200.0,
-            100.0,
+            CssImageNaturalDimensions::from_layout_size(LayoutSize::new(200.0, 100.0)),
             ObjectFit::Cover,
             css::BackgroundPosition::INITIAL,
         )
@@ -2594,8 +2725,12 @@ mod tests {
             radii: None,
         };
 
-        let resolved = resolved_object_view_box(view_box, natural)
-            .expect("positive object-view-box source geometry");
+        let resolved = resolved_object_view_box(view_box, Some(natural));
+        assert!(
+            resolved.applies(),
+            "positive object-view-box source geometry"
+        );
+        let resolved = resolved.source_rect();
 
         assert_eq!(resolved.origin.x, 0.1);
         assert_eq!(resolved.origin.y, 0.1);
@@ -2604,7 +2739,7 @@ mod tests {
     }
 
     #[test]
-    fn object_view_box_rejects_empty_source_geometry() {
+    fn object_view_box_ignores_empty_source_geometry() {
         let view_box = css::ObjectViewBox::Inset {
             top: ComputedLengthPercentage::from_points(50.0),
             right: ComputedLengthPercentage::ZERO,
@@ -2613,7 +2748,31 @@ mod tests {
             radii: None,
         };
 
-        assert!(resolved_object_view_box(view_box, LayoutSize::new(100.0, 100.0)).is_none());
+        let resolved = resolved_object_view_box(view_box, Some(LayoutSize::new(100.0, 100.0)));
+        assert!(!resolved.applies());
+        assert_eq!(resolved.source_rect().size.width, 1.0);
+        assert_eq!(resolved.source_rect().size.height, 1.0);
+    }
+
+    #[test]
+    fn ineffective_object_view_box_keeps_the_concrete_object_clip() {
+        let destination = paint_space_rect(10.0, 20.0, 80.0, 40.0);
+        let geometry = concrete_object_geometry(
+            destination,
+            CssImageNaturalDimensions::from_layout_size(LayoutSize::new(100.0, 100.0)),
+            ObjectFit::Cover,
+            css::BackgroundPosition::INITIAL,
+        )
+        .expect("positive replaced geometry should be paintable");
+        let no_effect = ResolvedObjectViewBox::NoEffect;
+
+        let clip = object_view_box_clip(&no_effect, LayoutSize::new(100.0, 100.0), geometry)
+            .expect("the concrete object must remain clipped");
+
+        assert_eq!(
+            clip.commands,
+            rectangular_object_view_box_clip(destination).commands
+        );
     }
 
     #[test]
@@ -2660,6 +2819,46 @@ mod tests {
     }
 
     #[test]
+    fn raster_object_fit_intersects_an_existing_css_content_clip() {
+        let destination = paint_space_rect(0.0, 0.0, 100.0, 100.0);
+        let border_shape_clip =
+            rectangular_object_view_box_clip(paint_space_rect(10.0, 10.0, 80.0, 80.0));
+        let mut image = RenderedImage::from_paint_rect(
+            destination,
+            false,
+            200,
+            100,
+            None,
+            true,
+            vec![0; 200 * 100 * 3].into(),
+            None,
+            None,
+        )
+        .with_clip(border_shape_clip.clone());
+        let view_box = css::ObjectViewBox::Xywh {
+            x: ComputedLengthPercentage::from_points(37.5),
+            y: ComputedLengthPercentage::from_points(18.75),
+            width: ComputedLengthPercentage::from_points(75.0),
+            height: ComputedLengthPercentage::from_points(37.5),
+            radii: None,
+        };
+
+        assert!(apply_object_fit(
+            &mut image,
+            ObjectFit::Fill,
+            css::BackgroundPosition::INITIAL,
+            view_box,
+        ));
+        let clip = image.clip().expect("both clips remain attached");
+        assert_eq!(clip.commands, border_shape_clip.commands);
+        assert_eq!(clip.additional_clips.len(), 1);
+        assert_eq!(
+            clip.additional_clips[0].commands,
+            rectangular_object_view_box_clip(destination).commands
+        );
+    }
+
+    #[test]
     fn rounded_object_view_box_uses_a_destination_corner_clip() {
         let view_box = crate::css::parse_object_view_box(
             "xywh(10pt 10pt 80pt 80pt round 12pt)",
@@ -2667,23 +2866,89 @@ mod tests {
         )
         .expect("valid rounded basic shape");
         let natural = LayoutSize::new(100.0, 100.0);
-        let source = resolved_object_view_box(view_box.clone(), natural).unwrap();
+        let source = resolved_object_view_box(view_box, Some(natural));
         let geometry = concrete_object_geometry(
             paint_space_rect(10.0, 20.0, 80.0, 80.0),
-            80.0,
-            80.0,
+            CssImageNaturalDimensions::from_layout_size(LayoutSize::new(80.0, 80.0)),
             ObjectFit::Fill,
             css::BackgroundPosition::INITIAL,
         )
         .unwrap();
 
-        let clip = object_view_box_clip(view_box, natural, source, geometry);
+        let clip = object_view_box_clip(&source, natural, geometry)
+            .expect("applied object-view-box creates a clip");
 
         assert!(
             clip.commands.len() > 5,
             "rounded clip contains curve commands"
         );
         assert_eq!(clip.additional_clips.len(), 1);
+    }
+
+    #[test]
+    fn ratio_only_object_fit_none_uses_the_content_box_as_its_default_size() {
+        let destination = paint_space_rect(10.0, 20.0, 100.0, 100.0);
+        let natural = CssImageNaturalDimensions::from_layout_axes(None, None, Some(2.0));
+
+        let geometry = concrete_object_geometry(
+            destination,
+            natural,
+            ObjectFit::None,
+            css::BackgroundPosition::INITIAL,
+        )
+        .expect("ratio-only image has a concrete object size");
+
+        assert_eq!(geometry.concrete, paint_space_rect(10.0, 70.0, 100.0, 50.0));
+        assert_eq!(geometry.visible, geometry.concrete);
+    }
+
+    #[test]
+    fn ratio_only_object_fit_scale_down_uses_the_same_default_sizing_result() {
+        let destination = paint_space_rect(10.0, 20.0, 100.0, 100.0);
+        let natural = CssImageNaturalDimensions::from_layout_axes(None, None, Some(2.0));
+
+        let geometry = concrete_object_geometry(
+            destination,
+            natural,
+            ObjectFit::ScaleDown,
+            css::BackgroundPosition::INITIAL,
+        )
+        .expect("ratio-only image has a concrete object size");
+
+        assert_eq!(geometry.concrete, paint_space_rect(10.0, 70.0, 100.0, 50.0));
+    }
+
+    #[test]
+    fn explicit_natural_dimensions_keep_none_size_and_position() {
+        let geometry = concrete_object_geometry(
+            paint_space_rect(10.0, 20.0, 100.0, 100.0),
+            CssImageNaturalDimensions::from_layout_size(LayoutSize::new(16.0, 8.0)),
+            ObjectFit::None,
+            css::BackgroundPosition::INITIAL,
+        )
+        .expect("explicit image dimensions are paintable");
+
+        assert_eq!(geometry.concrete, paint_space_rect(10.0, 112.0, 16.0, 8.0));
+    }
+
+    #[test]
+    fn object_view_box_scales_present_axes_and_ratio_before_none_sizing() {
+        let natural = CssImageNaturalDimensions::from_layout_axes(
+            Some(crate::units::layout_pt(80.0)),
+            None,
+            Some(2.0),
+        )
+        .scaled(0.5, 0.25);
+
+        let geometry = concrete_object_geometry(
+            paint_space_rect(0.0, 0.0, 100.0, 100.0),
+            natural,
+            ObjectFit::None,
+            css::BackgroundPosition::INITIAL,
+        )
+        .expect("scaled object-view-box dimensions are paintable");
+
+        assert_eq!(geometry.concrete, paint_space_rect(0.0, 90.0, 40.0, 10.0));
     }
 
     #[test]

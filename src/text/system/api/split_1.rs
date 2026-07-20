@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::FontVariationSettings;
 use crate::units::{LayoutLength, SemanticLengthExt, layout_pt};
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -11,7 +12,12 @@ pub(in crate::text) struct FontSizeAdjustmentRange {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::text) struct RenderedRunTabContext<'a> {
+    /// The computed style of the preserved tab itself. Its `tab-size` value
+    /// selects the tab period.
     pub(in crate::text) style: &'a ComputedStyle,
+    /// The nearest block container's computed style. Numeric `tab-size`
+    /// values use this style's U+0020 advance, including text spacing.
+    pub(in crate::text) metric_style: &'a ComputedStyle,
 }
 
 impl FontSystem {
@@ -25,7 +31,7 @@ impl FontSystem {
     /// normal closure return, including its early returns.
     pub(in crate::text) fn with_reusable_parley_layout<T>(
         &mut self,
-        shape: impl FnOnce(&mut Self, &mut ParleyLayout<[u8; 4]>) -> T,
+        shape: impl FnOnce(&mut Self, &mut ParleyLayout<FontPalette>) -> T,
     ) -> T {
         let mut layout = std::mem::take(&mut self.parley_layout_scratch);
         let result = shape(self, &mut layout);
@@ -43,17 +49,26 @@ impl FontSystem {
     }
 
     pub(in crate::text) fn font_feature_context_for_style(
-        &self,
+        &mut self,
         style: &ComputedStyle,
     ) -> Option<FontFeatureContext> {
-        let family = font_feature_family(&style.font_family);
-        let face_defaults = family
-            .as_ref()
-            .and_then(|family| {
-                self.font_feature_defaults_by_family
-                    .get(&family.trim().to_ascii_lowercase())
-            })
-            .cloned();
+        // `font-feature-settings` defaults in an @font-face rule belong to
+        // the selected face, rather than its family. Resolve the authored
+        // face directly: a descriptor applies while shaping the face's own
+        // supported characters, even when the face cannot render U+0020 and
+        // is therefore unsuitable for a metric-only probe.
+        // <https://www.w3.org/TR/css-fonts-4/#font-face-font-feature-settings>
+        let selected_face = self
+            .resolve_font_family(
+                &style.font_family,
+                style.font_weight,
+                style.font_style,
+                style.font_width,
+            )
+            .and_then(|font_id| self.document_fonts.selected_face_features(font_id));
+        let (family, face_defaults) = selected_face
+            .map(|(family, defaults)| (Some(family), Some(defaults)))
+            .unwrap_or_else(|| (font_feature_family(&style.font_family), None));
         if face_defaults.is_none() && self.font_feature_values.values.is_empty() {
             return None;
         }
@@ -62,6 +77,101 @@ impl FontSystem {
             face_defaults,
             font_feature_values: self.font_feature_values.clone(),
         })
+    }
+
+    /// Merge selected-face descriptor coordinates into the style's explicit
+    /// variation map. The element property remains later in the map and thus
+    /// wins duplicate tags, while descriptor coordinates override registered
+    /// CSS-axis defaults during shaping.
+    pub(in crate::text) fn style_with_selected_face_variations(
+        &mut self,
+        style: &ComputedStyle,
+    ) -> ComputedStyle {
+        // Descriptor defaults belong to the authored face selected from the
+        // CSS family, not to the font used for U+0020 line metrics. A
+        // selected face may not contain U+0020 while still rendering its
+        // supported glyphs with these variation coordinates.
+        // <https://www.w3.org/TR/css-fonts-4/#font-feature-variation-resolution>
+        let Some(font_id) = self.resolve_font_family(
+            &style.font_family,
+            style.font_weight,
+            style.font_style,
+            style.font_width,
+        ) else {
+            return style.clone();
+        };
+        let Some(descriptor) = self.document_fonts.selected_face_variations(font_id) else {
+            return style.clone();
+        };
+        if descriptor.0.is_empty() {
+            return style.clone();
+        }
+        let mut resolved = style.clone();
+        let mut variations = descriptor.0;
+        for setting in &style.font_variation_settings.0 {
+            if let Some(existing) = variations
+                .iter_mut()
+                .find(|existing| existing.tag == setting.tag)
+            {
+                *existing = *setting;
+            } else {
+                variations.push(*setting);
+            }
+        }
+        variations.sort_by_key(|setting| setting.tag);
+        resolved.font_variation_settings = FontVariationSettings(variations);
+        resolved
+    }
+
+    /// Prepare the style passed to the shaping backend after CSS face
+    /// selection. A fixed selected face cannot receive faux bold or italic
+    /// when the corresponding `font-synthesis` gate is disabled. Keeping the
+    /// gate at this boundary preserves the backend's complete glyph stream
+    /// (including GPOS kerning), instead of replacing it with a simplified
+    /// post-shaping fallback.
+    /// <https://www.w3.org/TR/css-fonts-4/#font-synthesis-intro>
+    pub(in crate::text) fn shaping_style_for_selected_face(
+        &mut self,
+        style: &ComputedStyle,
+    ) -> ComputedStyle {
+        let mut shaping_style = self.style_with_selected_face_variations(style);
+        let Some(font_id) = self.resolve_metric_font_for_style(style) else {
+            return shaping_style;
+        };
+        let selected_attributes = self.document_fonts.selected_face_fixed_attributes(font_id);
+        let is_registered_css_family = named_font_families(&style.font_family)
+            .iter()
+            .any(|family| self.document_fonts.has_registered_css_family(family));
+        let intrinsic_attributes = is_registered_css_family
+            .then(|| {
+                self.document_fonts.get(font_id).and_then(|font| {
+                    let face = ttf_parser::Face::parse(&font.data, font.face_index).ok()?;
+                    Some((
+                        FontWeight::from_number(face.weight().to_number() as f32)?,
+                        if face.is_italic() {
+                            FontStyle::Italic
+                        } else {
+                            FontStyle::Normal
+                        },
+                    ))
+                })
+            })
+            .flatten();
+        let (weight, face_style) = match (selected_attributes, intrinsic_attributes) {
+            (Some((weight, style)), _) => (weight, style),
+            (None, Some((weight, style))) => (Some(weight), style),
+            (None, None) => return shaping_style,
+        };
+        if !style.font_synthesis.weight
+            && let Some(weight) = weight
+            && weight != style.font_weight
+        {
+            shaping_style.font_weight = weight;
+        }
+        if !style.font_synthesis.style && face_style != style.font_style {
+            shaping_style.font_style = face_style;
+        }
+        shaping_style
     }
 
     pub(crate) fn resolve_style(&mut self, style: &ComputedStyle) -> Option<usize> {
@@ -81,39 +191,6 @@ impl FontSystem {
         )
     }
 
-    pub(in crate::text) fn font_size_adjust_target_ratio(
-        &mut self,
-        style: &ComputedStyle,
-    ) -> Option<(FontSizeAdjustMetric, f32)> {
-        let FontSizeAdjust::Value { metric, value } = style.font_size_adjust else {
-            return None;
-        };
-        let ratio = match value {
-            FontSizeAdjustValue::Number(value) => value,
-            FontSizeAdjustValue::FromFont => {
-                let font_id = self.resolve_metric_font_for_style(style)?;
-                let font = self.document_fonts.get(font_id)?;
-                font_size_adjust_metric_ratio(font, metric)?
-            }
-        };
-        ratio.is_finite().then_some((metric, ratio))
-    }
-
-    pub(in crate::text) fn adjusted_font_size_for_font(
-        &mut self,
-        style: &ComputedStyle,
-        font_id: usize,
-    ) -> Option<f32> {
-        let (metric, target_ratio) = self.font_size_adjust_target_ratio(style)?;
-        let font = self.document_fonts.get(font_id)?;
-        let selected_ratio = font_size_adjust_metric_ratio(font, metric)?;
-        if selected_ratio <= 0.0 {
-            return None;
-        }
-        let adjusted = style.font_size * target_ratio / selected_ratio;
-        adjusted.is_finite().then_some(adjusted)
-    }
-
     /// Resolve the face's used shaping size. An element-level
     /// `font-size-adjust` takes precedence over the `@font-face size-adjust`
     /// descriptor; otherwise the descriptor scales this face alone.
@@ -124,35 +201,42 @@ impl FontSystem {
         style: &ComputedStyle,
         font_id: usize,
     ) -> Option<f32> {
-        if !matches!(style.font_size_adjust, FontSizeAdjust::None) {
-            return self.adjusted_font_size_for_font(style, font_id);
-        }
-        let factor = self.document_fonts.font_size_adjust(font_id)?;
-        let adjusted = style.font_size * factor;
-        adjusted.is_finite().then_some(adjusted)
+        self.font_size_adjusted_size_for_font_id(style, font_id)
     }
 
     pub(in crate::text) fn font_size_adjusted_size_for_font_id(
-        &self,
+        &mut self,
         style: &ComputedStyle,
         font_id: usize,
     ) -> Option<f32> {
-        let FontSizeAdjust::Value { metric, value } = style.font_size_adjust else {
-            return None;
-        };
-        let target_ratio = match value {
-            FontSizeAdjustValue::Number(value) => value,
-            FontSizeAdjustValue::FromFont => {
+        let adjusted = match style.font_size_adjust {
+            FontSizeAdjust::None => {
+                let factor = self.document_fonts.font_size_adjust(font_id)?;
+                style.font_size * factor
+            }
+            FontSizeAdjust::Value { metric, value } => {
+                let target_ratio = match value {
+                    FontSizeAdjustValue::Number(value) => value,
+                    FontSizeAdjustValue::FromFont => {
+                        // `from-font` resolves the requested aspect value
+                        // from the element's first available face, not from
+                        // each fallback run. The selected run's own metric
+                        // is the denominator below, so fallback glyphs keep
+                        // the primary face's intended apparent size.
+                        // <https://www.w3.org/TR/css-fonts-5/#font-size-adjust-prop>
+                        let primary_font_id = self.resolve_metric_font_for_style(style)?;
+                        let font = self.document_fonts.get(primary_font_id)?;
+                        font_size_adjust_metric_ratio(font, metric)?
+                    }
+                };
                 let font = self.document_fonts.get(font_id)?;
-                font_size_adjust_metric_ratio(font, metric)?
+                let selected_ratio = font_size_adjust_metric_ratio(font, metric)?;
+                if selected_ratio <= 0.0 {
+                    return None;
+                }
+                style.font_size * target_ratio / selected_ratio
             }
         };
-        let font = self.document_fonts.get(font_id)?;
-        let selected_ratio = font_size_adjust_metric_ratio(font, metric)?;
-        if selected_ratio <= 0.0 {
-            return None;
-        }
-        let adjusted = style.font_size * target_ratio / selected_ratio;
         adjusted.is_finite().then_some(adjusted)
     }
 
@@ -197,13 +281,12 @@ impl FontSystem {
         let shaped_text = bidi_text.as_str();
         self.with_reusable_parley_layout(|this, layout| {
             let feature_context = this.font_feature_context_for_style(style);
-            let font_family_source = this.resolved_parley_font_family_source(style);
-            let mut builder = this.parley_layout_context.ranged_builder(
-                &mut this.parley_font_context,
-                shaped_text,
-                1.0,
-                false,
-            );
+            let font_family_source = this
+                .emoji_presentation_family_source(emoji_text.as_ref(), style)
+                .unwrap_or_else(|| this.resolved_parley_font_family_source(style));
+            let mut builder: parley::RangedBuilder<'_, FontPalette> = this
+                .parley_layout_context
+                .ranged_builder(&mut this.parley_font_context, shaped_text, 1.0, false);
             push_parley_default_style(&mut builder, style, &font_family_source);
             push_parley_text_spacing_default_with_context(
                 &mut builder,
@@ -329,17 +412,17 @@ impl FontSystem {
 
     /// Finds the first CSS font-stack face that is eligible to render one
     /// character, including `unicode-range` restrictions.
-    pub(in crate::text) fn font_for_character(
+    pub(in crate::text) fn character_font_match(
         &mut self,
         style: &ComputedStyle,
         character: char,
-    ) -> Option<usize> {
+    ) -> Option<CharacterFontMatch> {
         let families = match &style.font_family {
             FontFamily::List(families) => families.as_slice(),
             family => std::slice::from_ref(family),
         };
         for family in families {
-            let font_id = match family {
+            let matched = match family {
                 FontFamily::Names(names) => names.iter().find_map(|name| {
                     self.resolve_single_family(
                         name,
@@ -347,7 +430,9 @@ impl FontSystem {
                         style.font_style,
                         style.font_width,
                     )
-                    .filter(|font_id| self.document_fonts.font_has_character(*font_id, character))
+                    .and_then(|font_id| {
+                        self.document_fonts.character_font_match(font_id, character)
+                    })
                 }),
                 _ => self
                     .resolve_font_family(
@@ -356,10 +441,12 @@ impl FontSystem {
                         style.font_style,
                         style.font_width,
                     )
-                    .filter(|font_id| self.document_fonts.font_has_character(*font_id, character)),
+                    .and_then(|font_id| {
+                        self.document_fonts.character_font_match(font_id, character)
+                    }),
             };
-            if font_id.is_some() {
-                return font_id;
+            if matched.is_some() {
+                return matched;
             }
         }
         self.resolve_system_fallback_for_character(
@@ -368,6 +455,18 @@ impl FontSystem {
             style.font_style,
             style.font_width,
         )
+        .and_then(|font_id| self.document_fonts.character_font_match(font_id, character))
+    }
+
+    /// Finds the first CSS font-stack face that is eligible to render one
+    /// character, including `unicode-range` restrictions.
+    pub(in crate::text) fn font_for_character(
+        &mut self,
+        style: &ComputedStyle,
+        character: char,
+    ) -> Option<usize> {
+        self.character_font_match(style, character)
+            .map(|matched| matched.font_id)
     }
 
     pub(in crate::text) fn vertical_upright_ch_advance(
@@ -427,7 +526,11 @@ impl FontSystem {
         let Some(font) = font_id.and_then(|id| self.document_fonts.get(id)) else {
             return layout_pt(style.line_height);
         };
-        let font_height = (font.ascender as f32 - font.descender as f32).max(0.0) * style.font_size
+        let font_height = (font.layout_metrics.ascender as f32
+            - font.layout_metrics.descender as f32
+            + font.layout_metrics.line_gap as f32)
+            .max(0.0)
+            * style.font_size
             / font.units_per_em.max(1) as f32;
         layout_pt(font_height.max(style.font_size))
     }
@@ -460,7 +563,13 @@ impl FontSystem {
             return ResolvedInlineTextMetrics { content, line };
         };
 
-        for run in shaped.runs.iter().filter(|run| run.font_id.is_some()) {
+        // A preserved tab is a CSS layout advance, not a shaped font glyph.
+        // It must neither select a fallback font nor expand the normal
+        // line-height box.
+        // <https://drafts.csswg.org/css-text-3/#tab-size-property>
+        for run in shaped.runs.iter().filter(|run| {
+            run.font_id.is_some() && run.text.chars().any(|character| character != '\t')
+        }) {
             let Some(run_content) = self.content_extents_for_font(run.font_id, run.font_size)
             else {
                 continue;
@@ -478,18 +587,21 @@ impl FontSystem {
         // encloses every eligible face rather than only the first face in the
         // family list.
         // <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>
-        for character in shaped.text.chars() {
+        for character in shaped.text.chars().filter(|character| *character != '\t') {
             let Some(font_id) = self.font_for_character(style, character) else {
                 continue;
             };
-            let Some(run_content) = self.content_extents_for_font(Some(font_id), style.font_size)
+            let used_font_size = self
+                .font_size_adjusted_size_for_font_id(style, font_id)
+                .unwrap_or(style.font_size);
+            let Some(run_content) = self.content_extents_for_font(Some(font_id), used_font_size)
             else {
                 continue;
             };
             content = content.union(run_content);
             line = line.union(self.normal_line_extents_for_font(
                 Some(font_id),
-                style.font_size,
+                used_font_size,
                 run_content,
             ));
         }
@@ -498,7 +610,7 @@ impl FontSystem {
     }
 
     fn content_extents_for_style_font(
-        &self,
+        &mut self,
         font_id: Option<usize>,
         style: &ComputedStyle,
     ) -> Option<FontRunVerticalExtents> {
@@ -515,21 +627,35 @@ impl FontSystem {
     ) -> Option<FontRunVerticalExtents> {
         let font = font_id.and_then(|id| self.document_fonts.get(id))?;
         let units_per_em = font.units_per_em.max(1) as f32;
-        let ascent = font.ascender as f32 * font_size / units_per_em;
+        if !font_size.is_finite() || font_size < 0.0 {
+            return None;
+        }
+
+        // The CSS inline content area is the font's em box, even when an
+        // OpenType face's ascender and descender span more or less than one
+        // em. Font metrics locate the alphabetic baseline *inside* that box;
+        // they instead determine `line-height: normal` separately below.
+        // <https://www.w3.org/TR/CSS22/visudet.html#line-height>
+        // <https://drafts.csswg.org/css-inline-3/#inline-height>
+        let above_baseline = font.layout_metrics.ascender as f32 * font_size / units_per_em;
+        let below_baseline = font_size - above_baseline;
         Some(FontRunVerticalExtents::from_points(
-            ascent,
-            font_size - ascent,
+            above_baseline,
+            below_baseline,
         ))
     }
 
     fn line_extents_for_style_font(
-        &self,
+        &mut self,
         font_id: Option<usize>,
         style: &ComputedStyle,
         content: FontRunVerticalExtents,
     ) -> FontRunVerticalExtents {
         if style.line_height_is_normal {
-            self.normal_line_extents_for_font(font_id, style.font_size, content)
+            let used_font_size = font_id
+                .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
+                .unwrap_or(style.font_size);
+            self.normal_line_extents_for_font(font_id, used_font_size, content)
         } else {
             self.explicit_line_extents_for_content(style.line_height, content)
         }
@@ -544,7 +670,10 @@ impl FontSystem {
         let line_height = font_id
             .and_then(|id| self.document_fonts.get(id))
             .map(|font| {
-                (font.ascender as f32 - font.descender as f32).max(0.0) * font_size
+                (font.layout_metrics.ascender as f32 - font.layout_metrics.descender as f32
+                    + font.layout_metrics.line_gap as f32)
+                    .max(0.0)
+                    * font_size
                     / font.units_per_em.max(1) as f32
             })
             .unwrap_or(font_size)
@@ -590,7 +719,7 @@ impl FontSystem {
             underline_thickness: fallback.underline_thickness,
             strikeout_position: fallback.strikeout_position,
             strikeout_thickness: fallback.strikeout_thickness,
-            descender_depth: (-font.descender as f32 * scale).max(0.0),
+            descender_depth: (-font.program_metrics.descender as f32 * scale).max(0.0),
         };
 
         if let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) {
@@ -635,7 +764,9 @@ impl FontSystem {
             let scale = run.font_size / font.units_per_em.max(1) as f32;
             let mut pen_x = 0.0;
             for glyph in glyphs {
-                if let Some(bbox) = face.glyph_bounding_box(ttf_parser::GlyphId(glyph.id)) {
+                if let Some(glyph_id) = glyph.painted_id()
+                    && let Some(bbox) = face.glyph_bounding_box(ttf_parser::GlyphId(glyph_id))
+                {
                     let origin_x = pen_x + glyph.x_offset;
                     let origin_y = glyph.y_offset;
                     let corners = [
@@ -719,15 +850,15 @@ impl FontSystem {
             return self.shape_styled_text_runs_with_parley(&[StyledTextSpan { text, style }]);
         }
         self.with_reusable_parley_layout(|this, layout| {
+            let parley_style = this.shaping_style_for_selected_face(style);
             let feature_context = this.font_feature_context_for_style(style);
-            let font_family_source = this.resolved_parley_font_family_source(style);
-            let mut builder = this.parley_layout_context.ranged_builder(
-                &mut this.parley_font_context,
-                shaping_text,
-                1.0,
-                false,
-            );
-            push_parley_default_style(&mut builder, style, &font_family_source);
+            let font_family_source = this
+                .emoji_presentation_family_source(text, style)
+                .unwrap_or_else(|| this.resolved_parley_font_family_source(style));
+            let mut builder: parley::RangedBuilder<'_, FontPalette> = this
+                .parley_layout_context
+                .ranged_builder(&mut this.parley_font_context, shaping_text, 1.0, false);
+            push_parley_default_style(&mut builder, &parley_style, &font_family_source);
             push_parley_text_spacing_default_with_context(
                 &mut builder,
                 shaping_text,
@@ -742,13 +873,10 @@ impl FontSystem {
             let adjustment_ranges =
                 this.font_size_adjustment_ranges_for_line(&line, shaping_text, style);
             if !adjustment_ranges.is_empty() {
-                let mut builder = this.parley_layout_context.ranged_builder(
-                    &mut this.parley_font_context,
-                    shaping_text,
-                    1.0,
-                    false,
-                );
-                push_parley_default_style(&mut builder, style, &font_family_source);
+                let mut builder: parley::RangedBuilder<'_, FontPalette> = this
+                    .parley_layout_context
+                    .ranged_builder(&mut this.parley_font_context, shaping_text, 1.0, false);
+                push_parley_default_style(&mut builder, &parley_style, &font_family_source);
                 push_parley_text_spacing_default_with_context(
                     &mut builder,
                     shaping_text,
@@ -906,6 +1034,7 @@ impl FontSystem {
                 dropped_default_ignorable_runs.push(DroppedDefaultIgnorableRun {
                     x_offset,
                     advance: run.advance(),
+                    text: run_text.clone().into_owned().into(),
                 });
                 continue;
             }
@@ -936,17 +1065,22 @@ impl FontSystem {
                     dropped_default_ignorable_runs.push(DroppedDefaultIgnorableRun {
                         x_offset,
                         advance: dropped_advance,
+                        text: Rc::from(""),
                     });
                 }
                 rehomed_control_fallback_runs.push(rendered_runs.len());
                 rendered_runs.push(rehomed_run);
-                tab_contexts.push(RenderedRunTabContext { style });
+                tab_contexts.push(RenderedRunTabContext {
+                    style,
+                    metric_style: style,
+                });
                 continue;
             }
-            if self
-                .document_fonts
-                .support_kind_for_run(font_id, run_text.as_ref())
-                == FontSupportKind::ColorOrEmojiOnlyFallback
+            if !run_text.contains('\t')
+                && self
+                    .document_fonts
+                    .support_kind_for_run(font_id, run_text.as_ref())
+                    == FontSupportKind::ColorOrEmojiOnlyFallback
                 && !self
                     .document_fonts
                     .run_has_color_glyph(font_id, run_text.as_ref())
@@ -974,38 +1108,15 @@ impl FontSystem {
                     glyphs,
                     glyph_source_ranges,
                 });
-                tab_contexts.push(RenderedRunTabContext { style });
+                tab_contexts.push(RenderedRunTabContext {
+                    style,
+                    metric_style: style,
+                });
                 continue;
             }
             let Some(font) = self.document_fonts.get(font_id) else {
                 continue;
             };
-            if ((!style.font_synthesis.weight && style.font_weight.0 >= FontWeight::BOLD.0)
-                || (!style.font_synthesis.style && style.font_style != FontStyle::Normal))
-                && let Some(glyphs) = shape_text_with_document_font(
-                    font,
-                    run_text.as_ref(),
-                    run.font_size(),
-                    style.used_letter_spacing().points(),
-                    style.used_word_spacing().points(),
-                )
-                && !glyphs.is_empty()
-            {
-                let glyph_source_ranges = vec![None; glyphs.len()];
-                rendered_runs.push(ShapedGlyphRun {
-                    text: run_text.into_owned().into(),
-                    x_offset,
-                    y_offset: 0.0,
-                    text_matrix: crate::RenderedTextMatrix::IDENTITY,
-                    font_size: run.font_size(),
-                    font_id: Some(font_id),
-                    font_palette: style.font_palette.clone(),
-                    glyphs,
-                    glyph_source_ranges,
-                });
-                tab_contexts.push(RenderedRunTabContext { style });
-                continue;
-            }
             let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
                 continue;
             };
@@ -1013,6 +1124,7 @@ impl FontSystem {
             let scale = run.font_size() / units_per_em;
             let mut glyphs = Vec::new();
             let mut glyph_source_ranges = Vec::new();
+            let mut emitted_source_ranges = Vec::<Range<usize>>::new();
             for cluster in run.visual_clusters() {
                 let cluster_range = cluster.text_range();
                 let cluster_text = text.get(cluster_range.clone()).unwrap_or_default();
@@ -1034,7 +1146,8 @@ impl FontSystem {
                     continue;
                 }
                 if emitted_cluster_text.as_ref() == "\t" {
-                    glyphs.push(synthesized_tab_glyph(&face, scale));
+                    let provisional_advance = cluster.glyphs().map(|glyph| glyph.advance).sum();
+                    glyphs.push(synthesized_tab_glyph(provisional_advance));
                     glyph_source_ranges.push(Some(cluster_range));
                     continue;
                 }
@@ -1044,9 +1157,14 @@ impl FontSystem {
                         continue;
                     };
                     let unicode = if first_cluster_glyph {
-                        if default_ignorable_only {
+                        if default_ignorable_only
+                            || emitted_source_ranges
+                                .iter()
+                                .any(|range| range == &cluster_range)
+                        {
                             String::new()
                         } else {
+                            emitted_source_ranges.push(cluster_range.clone());
                             emitted_cluster_text.as_ref().to_owned()
                         }
                     } else {
@@ -1061,16 +1179,29 @@ impl FontSystem {
                         first_cluster_glyph = false;
                         continue;
                     }
-                    let emitted_glyph_id = unicode
-                        .chars()
-                        .next()
-                        .filter(|_| unicode.chars().count() == 1)
-                        .and_then(|character| css_space_separator_blank_glyph(&face, character))
-                        .map(|glyph| glyph.0)
-                        .unwrap_or(glyph_id);
+                    let emitted_glyph_id =
+                        if matches!(style.text_layout_policy(), TextLayoutPolicy::Vertical(_)) {
+                            // The shaper has already selected any OpenType
+                            // vertical alternate. Replacing a Unicode space
+                            // separator with the horizontal U+0020 glyph here
+                            // would discard that selection, including the `vert`
+                            // form required for transformed vertical units.
+                            // <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>
+                            glyph_id
+                        } else {
+                            unicode
+                                .chars()
+                                .next()
+                                .filter(|_| unicode.chars().count() == 1)
+                                .and_then(|character| {
+                                    css_space_separator_blank_glyph(&face, character)
+                                })
+                                .map(|glyph| glyph.0)
+                                .unwrap_or(glyph_id)
+                        };
                     first_cluster_glyph = false;
                     glyphs.push(RenderedGlyph {
-                        id: emitted_glyph_id,
+                        kind: RenderedGlyphKind::Paint(emitted_glyph_id),
                         x_advance: glyph.advance,
                         nominal_x_advance: face
                             .glyph_hor_advance(ttf_parser::GlyphId(emitted_glyph_id))
@@ -1105,12 +1236,16 @@ impl FontSystem {
                 glyphs,
                 glyph_source_ranges,
             });
-            tab_contexts.push(RenderedRunTabContext { style });
+            tab_contexts.push(RenderedRunTabContext {
+                style,
+                metric_style: style,
+            });
         }
         for run in &mut rendered_runs {
             run.x_offset =
                 corrected_visual_run_x_offset(run.x_offset, &dropped_default_ignorable_runs);
         }
+        stitch_dropped_join_control_runs(&mut rendered_runs, &dropped_default_ignorable_runs);
         for index in rehomed_control_fallback_runs.into_iter().rev() {
             if stitch_rehomed_control_fallback_run(&mut rendered_runs, index) {
                 tab_contexts.remove(index + 1);
@@ -1135,10 +1270,7 @@ impl FontSystem {
         text: &str,
         style: &ComputedStyle,
     ) -> Option<Vec<UnicodeRangeResolvedSpan>> {
-        let FontFamily::Names(names) = &style.font_family else {
-            return None;
-        };
-        let names = names.clone();
+        let names = named_font_families(&style.font_family);
         if names.is_empty()
             || !names.iter().any(|name| {
                 self.resolve_single_family(
@@ -1153,16 +1285,16 @@ impl FontSystem {
             return None;
         }
 
-        let mut selections = Vec::<(Range<usize>, Option<String>)>::new();
-        let mut previous_family = None::<String>;
+        let mut selections = Vec::<(Range<usize>, Option<FontFamily>)>::new();
+        let mut previous_family = None::<FontFamily>;
         for (start, character) in text.char_indices() {
             let end = start + character.len_utf8();
             let family = if character_is_join_control(character) {
                 previous_family
                     .clone()
-                    .or_else(|| self.next_unicode_range_family_for_text(text, end, style, &names))
+                    .or_else(|| self.next_unicode_range_family_for_text(text, end, style))
             } else {
-                self.unicode_range_family_for_character(character, style, &names)
+                self.unicode_range_family_for_character(character, style)
             };
             if let Some(family) = &family {
                 previous_family = Some(family.clone());
@@ -1177,7 +1309,7 @@ impl FontSystem {
         for (range, family) in selections {
             let mut span_style = style.clone();
             if let Some(family) = family {
-                span_style.font_family = FontFamily::Names(vec![family]);
+                span_style.font_family = family;
             }
             if let Some(previous) = spans.last_mut()
                 && previous.style == span_style
@@ -1203,11 +1335,10 @@ impl FontSystem {
         text: &str,
         start: usize,
         style: &ComputedStyle,
-        names: &[String],
-    ) -> Option<String> {
+    ) -> Option<FontFamily> {
         text.get(start..)?.chars().find_map(|character| {
             (!character_is_join_control(character))
-                .then(|| self.unicode_range_family_for_character(character, style, names))
+                .then(|| self.unicode_range_family_for_character(character, style))
                 .flatten()
         })
     }
@@ -1216,19 +1347,35 @@ impl FontSystem {
         &mut self,
         character: char,
         style: &ComputedStyle,
-        names: &[String],
-    ) -> Option<String> {
-        for name in names {
-            let Some(font_id) = self.resolve_single_family(
-                name,
-                style.font_weight,
-                style.font_style,
-                style.font_width,
-            ) else {
-                continue;
-            };
-            if self.document_fonts.font_has_character(font_id, character) {
-                return Some(name.clone());
+    ) -> Option<FontFamily> {
+        let families = match &style.font_family {
+            FontFamily::List(families) => families.as_slice(),
+            family => std::slice::from_ref(family),
+        };
+        for family in families {
+            match family {
+                FontFamily::Names(names) => {
+                    for name in names {
+                        let Some(font_id) = self.resolve_single_family(
+                            name,
+                            style.font_weight,
+                            style.font_style,
+                            style.font_width,
+                        ) else {
+                            continue;
+                        };
+                        if self.document_fonts.font_has_character(font_id, character) {
+                            return Some(FontFamily::Names(vec![name.clone()]));
+                        }
+                    }
+                }
+                generic => {
+                    // A generic family is resolved by the platform after all
+                    // explicitly range-limited named faces have declined the
+                    // character. Keep it as the backend family source rather
+                    // than retaining a rejected preceding face in the stack.
+                    return Some(generic.clone());
+                }
             }
         }
         None
@@ -1270,6 +1417,24 @@ impl FontSystem {
         Some(shaped)
     }
 
+    /// Shape an inline layout artifact without backend-owned tracking.
+    ///
+    /// CSS Text resolves nonzero `letter-spacing` at final visual
+    /// typographic-unit boundaries. Graph layout therefore retains an
+    /// untracked glyph stream and represents every used advance explicitly as
+    /// `InlineFragment::leading_tracking`, after line selection and bidi
+    /// reordering: <https://www.w3.org/TR/css-text-3/#letter-spacing-property>.
+    pub(crate) fn shape_untracked_inline_line(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+        line_height: f32,
+    ) -> Option<ShapedInlineLine> {
+        let mut untracked_style = style.clone();
+        untracked_style.letter_spacing = crate::css::ComputedLengthPercentage::ZERO;
+        self.shape_unwrapped_line(text, &untracked_style, line_height)
+    }
+
     /// Shape text whose UAX #9 visual order has already been resolved.
     ///
     /// Mixed inline layout first resolves one complete line, including the
@@ -1300,19 +1465,19 @@ impl FontSystem {
         // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
         // <https://www.unicode.org/reports/tr9/#reordering-resolved-levels>.
         if text.chars().any(character_has_joining_behavior) {
-            return self.shape_unwrapped_line(text, style, line_height);
+            let logical_paint_style = Self::visual_bidi_paint_style(style, style.used_direction());
+            return self.shape_unwrapped_line(text, &logical_paint_style, line_height);
         }
+        let visual_paint_style = Self::visual_bidi_paint_style(style, style.used_direction());
         let mut guarded_text = String::with_capacity(text.len() + 2 * '\u{202d}'.len_utf8());
         guarded_text.push('\u{202d}');
         guarded_text.push_str(text);
         guarded_text.push('\u{202c}');
-        self.shape_unwrapped_line(&guarded_text, style, line_height)
+        self.shape_unwrapped_line(&guarded_text, &visual_paint_style, line_height)
             .map(|mut shaped| {
                 shaped.text = Rc::from(text);
                 strip_bidi_format_controls_from_shaped_runs(&mut shaped.runs);
-                if resolved_direction == ResolvedBidiDirection::Rtl {
-                    self.apply_resolved_bidi_glyph_mirroring(&mut shaped.runs);
-                }
+                self.apply_resolved_bidi_glyph_mirroring(&mut shaped, resolved_direction);
                 shaped
             })
     }
@@ -1347,14 +1512,17 @@ impl FontSystem {
         width: f32,
         line_height: f32,
         tab_origin: f32,
+        tab_metric_style: &ComputedStyle,
     ) -> Option<ShapedInlineLine> {
         if spans.is_empty() {
             return None;
         }
         let first_style = spans.first().map(|span| span.style)?;
-        let mut runs = position_shaped_runs(
-            self.shape_styled_text_runs_with_parley_at_tab_origin(spans, tab_origin),
-        );
+        let mut runs = position_shaped_runs(self.shape_styled_text_runs_with_parley_at_tab_origin(
+            spans,
+            tab_origin,
+            tab_metric_style,
+        ));
         self.apply_vertical_upright_advances(&mut runs, first_style);
         let baseline_adjustment = self
             .shaped_runs_baseline_adjustment(&runs, first_style, line_height)
@@ -1377,6 +1545,7 @@ impl FontSystem {
     /// reordering pass, while RTL slices receive L4 glyph mirroring after
     /// shaping because the caller already supplied the final visual order:
     /// <https://www.w3.org/TR/css-writing-modes-4/#bidi-algo>.
+    #[allow(clippy::too_many_arguments)] // The explicit shaping context preserves call-site units.
     pub(crate) fn shape_visually_ordered_inline_fragments(
         &mut self,
         spans: &[StyledTextSpan<'_>],
@@ -1384,28 +1553,59 @@ impl FontSystem {
         width: f32,
         line_height: f32,
         tab_origin: f32,
+        tab_metric_style: &ComputedStyle,
         resolved_direction: ResolvedBidiDirection,
     ) -> Option<ShapedInlineLine> {
-        let first_style = spans.first()?.style;
+        spans.first()?;
         if spans
             .iter()
             .flat_map(|span| span.text.chars())
             .any(character_has_joining_behavior)
         {
+            let logical_paint_styles = spans
+                .iter()
+                .map(|span| Self::visual_bidi_paint_style(span.style, span.style.used_direction()))
+                .collect::<Vec<_>>();
+            let logical_paint_spans = spans
+                .iter()
+                .zip(&logical_paint_styles)
+                .map(|(span, style)| StyledTextSpan {
+                    text: span.text,
+                    style,
+                })
+                .collect::<Vec<_>>();
+            let logical_tab_metric_style =
+                Self::visual_bidi_paint_style(tab_metric_style, tab_metric_style.used_direction());
             return self.shape_styled_inline_fragments(
-                spans,
+                &logical_paint_spans,
                 text_summary,
                 width,
                 line_height,
                 tab_origin,
+                &logical_tab_metric_style,
             );
         }
+        let visual_paint_styles = spans
+            .iter()
+            .map(|span| Self::visual_bidi_paint_style(span.style, span.style.used_direction()))
+            .collect::<Vec<_>>();
+        let visual_paint_spans = spans
+            .iter()
+            .zip(&visual_paint_styles)
+            .map(|(span, style)| StyledTextSpan {
+                text: span.text,
+                style,
+            })
+            .collect::<Vec<_>>();
+        let visual_tab_metric_style =
+            Self::visual_bidi_paint_style(tab_metric_style, tab_metric_style.used_direction());
+        let first_style = visual_paint_spans.first()?.style;
         let mut guarded_spans = Vec::with_capacity(spans.len() + 2);
         guarded_spans.push(StyledTextSpan {
             text: "\u{202d}",
             style: first_style,
         });
-        guarded_spans.extend_from_slice(spans);
+        guarded_spans.extend_from_slice(&visual_paint_spans);
         guarded_spans.push(StyledTextSpan {
             text: "\u{202c}",
             style: first_style,
@@ -1416,18 +1616,46 @@ impl FontSystem {
             width,
             line_height,
             tab_origin,
+            &visual_tab_metric_style,
         )?;
         strip_bidi_format_controls_from_shaped_runs(&mut shaped.runs);
-        if resolved_direction == ResolvedBidiDirection::Rtl {
-            self.apply_resolved_bidi_glyph_mirroring(&mut shaped.runs);
-        }
+        self.apply_resolved_bidi_glyph_mirroring(&mut shaped, resolved_direction);
         Some(shaped)
     }
 
-    /// Apply UAX #9 L4 to a visually ordered RTL slice without changing its
-    /// Unicode source text or running UAX #9 a second time.
-    fn apply_resolved_bidi_glyph_mirroring(&self, runs: &mut [ShapedInlineRun]) {
-        for run in runs {
+    /// Return the style used to shape text after the containing line has
+    /// already resolved CSS bidi scopes through UAX #9.
+    ///
+    /// The selected visual fragment must retain font and OpenType inputs, but
+    /// it must not inject `unicode-bidi` controls a second time. Non-joining
+    /// visual slices are guarded with LRO by their caller; joining text keeps
+    /// its logical CSS shaping direction while remaining unscoped:
+    /// <https://drafts.csswg.org/css-writing-modes-4/#bidi-algo> and
+    /// <https://www.unicode.org/reports/tr9/#L4>.
+    fn visual_bidi_paint_style(style: &ComputedStyle, direction: Direction) -> ComputedStyle {
+        let mut visual_style = style.clone();
+        visual_style.unicode_bidi = UnicodeBidi::Normal;
+        visual_style.direction = direction;
+        visual_style
+    }
+
+    /// Apply UAX #9 L4 to an already visually ordered RTL line without
+    /// changing its Unicode source text or running UAX #9 a second time.
+    ///
+    /// Call this exactly once when logical shaping crosses into a selected
+    /// visual slice. Cached source slices are shaped before the UBA chooses
+    /// their final level, so they require the same presentation correction as
+    /// freshly shaped visual slices:
+    /// <https://www.unicode.org/reports/tr9/#L4>.
+    pub(crate) fn apply_resolved_bidi_glyph_mirroring(
+        &self,
+        shaped: &mut ShapedInlineLine,
+        resolved_direction: ResolvedBidiDirection,
+    ) {
+        if resolved_direction != ResolvedBidiDirection::Rtl {
+            return;
+        }
+        for run in &mut shaped.runs {
             let Some(font_id) = run.font_id else {
                 continue;
             };
@@ -1439,6 +1667,9 @@ impl FontSystem {
             };
             let scale = run.font_size / font.units_per_em.max(1) as f32;
             for glyph in &mut run.glyphs {
+                if glyph.rendered.is_advance_only() {
+                    continue;
+                }
                 let mut characters = glyph.rendered.unicode.chars();
                 let Some(character) = characters.next() else {
                     continue;
@@ -1458,11 +1689,19 @@ impl FontSystem {
                     .glyph_hor_advance(mirrored_id)
                     .map(|advance| advance as f32 * scale)
                     .unwrap_or(old_nominal);
-                glyph.rendered.id = mirrored_id.0;
+                glyph.rendered.kind = RenderedGlyphKind::Paint(mirrored_id.0);
                 glyph.rendered.nominal_x_advance = mirrored_nominal;
                 glyph.rendered.x_advance = mirrored_nominal + extra_advance;
             }
         }
+    }
+}
+
+fn named_font_families(family: &FontFamily) -> Vec<String> {
+    match family {
+        FontFamily::Names(names) => names.clone(),
+        FontFamily::List(families) => families.iter().flat_map(named_font_families).collect(),
+        _ => Vec::new(),
     }
 }
 

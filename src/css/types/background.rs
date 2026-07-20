@@ -231,7 +231,55 @@ pub(crate) enum BackgroundAttachment {
     Local,
 }
 
-/// Computed single-layer CSS background image.
+/// A computed CSS image-property value.
+///
+/// CSS image-consuming properties distinguish the `none` keyword from a
+/// syntactically valid image that has become invalid (for example, an
+/// `image-set()` whose candidates were all removed by MIME negotiation).
+/// Keeping the distinction in computed style prevents property parsers and
+/// paint consumers from accidentally treating an invalid image as an invalid
+/// declaration or as the `none` keyword.
+/// <https://drafts.csswg.org/css-images-4/#invalid-image>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ComputedImage {
+    /// The CSS `none` keyword or the property's initial value.
+    None,
+    /// A valid CSS image value that represents an invalid image.
+    Invalid,
+    /// A syntactically valid image value. Its external resource can still
+    /// fail to load later at paint time.
+    Image(Box<BackgroundImage>),
+}
+
+impl ComputedImage {
+    pub(crate) fn image(image: BackgroundImage) -> Self {
+        Self::Image(Box::new(image))
+    }
+
+    pub(crate) const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub(crate) const fn is_image(&self) -> bool {
+        matches!(self, Self::Image(_))
+    }
+
+    pub(crate) const fn as_image(&self) -> Option<&BackgroundImage> {
+        match self {
+            Self::Image(image) => Some(image),
+            Self::None | Self::Invalid => None,
+        }
+    }
+
+    pub(crate) fn as_image_mut(&mut self) -> Option<&mut BackgroundImage> {
+        match self {
+            Self::Image(image) => Some(image),
+            Self::None | Self::Invalid => None,
+        }
+    }
+}
+
+/// Computed single concrete CSS image.
 ///
 /// CSS Images defines gradients as generated images. The renderer supports URL
 /// images and CSS Images Level 3 linear and radial gradients:
@@ -255,7 +303,7 @@ pub(crate) enum BackgroundImage {
     LinearGradient(LinearGradient),
     RadialGradient(RadialGradient),
     ConicGradient(ConicGradient),
-    Color(ColorImageColor),
+    CssColor(ColorImageColor),
 }
 
 /// The color argument to CSS Images Level 4's `image()` function.
@@ -265,14 +313,14 @@ pub(crate) enum BackgroundImage {
 /// <https://drafts.csswg.org/css-color-4/#currentcolor-color>
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum ColorImageColor {
-    Color(Color),
+    CssColor(CssColor),
     CurrentColor,
 }
 
 impl ColorImageColor {
-    pub(crate) fn resolve(self, current_color: Color) -> Color {
+    pub(crate) fn resolve(self, current_color: CssColor) -> CssColor {
         match self {
-            Self::Color(color) => color,
+            Self::CssColor(color) => color,
             Self::CurrentColor => current_color,
         }
     }
@@ -302,7 +350,7 @@ impl BackgroundImage {
             Self::LinearGradient(gradient) => gradient.resolve_font_metric_lengths(ch_advance),
             Self::RadialGradient(gradient) => gradient.resolve_font_metric_lengths(ch_advance),
             Self::ConicGradient(gradient) => gradient.resolve_font_metric_lengths(ch_advance),
-            Self::Color(_) => {}
+            Self::CssColor(_) => {}
             Self::Url { .. } => {}
         }
     }
@@ -313,7 +361,7 @@ impl BackgroundImage {
             Self::LinearGradient(gradient) => gradient.resolve_em_relative_lengths(font_size),
             Self::RadialGradient(gradient) => gradient.resolve_em_relative_lengths(font_size),
             Self::ConicGradient(gradient) => gradient.resolve_em_relative_lengths(font_size),
-            Self::Color(_) | Self::Url { .. } => {}
+            Self::CssColor(_) | Self::Url { .. } => {}
         }
     }
 
@@ -331,7 +379,7 @@ impl BackgroundImage {
             Self::ConicGradient(gradient) => {
                 gradient.resolve_root_font_relative_lengths(root_font_size)
             }
-            Self::Color(_) | Self::Url { .. } => {}
+            Self::CssColor(_) | Self::Url { .. } => {}
         }
     }
 
@@ -341,7 +389,7 @@ impl BackgroundImage {
             Self::LinearGradient(gradient) => gradient.requires_ch_advance(),
             Self::RadialGradient(gradient) => gradient.requires_ch_advance(),
             Self::ConicGradient(gradient) => gradient.requires_ch_advance(),
-            Self::Color(_) => false,
+            Self::CssColor(_) => false,
             Self::Url { .. } => false,
         }
     }
@@ -355,7 +403,7 @@ impl BackgroundImage {
 /// <https://www.w3.org/TR/css-backgrounds-3/#layering>.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BackgroundLayer {
-    pub image: Option<BackgroundImage>,
+    pub image: ComputedImage,
     pub position: BackgroundPosition,
     pub size: BackgroundSize,
     pub repeat: BackgroundRepeat,
@@ -367,7 +415,7 @@ pub(crate) struct BackgroundLayer {
 impl BackgroundLayer {
     pub(crate) const fn initial() -> Self {
         Self {
-            image: None,
+            image: ComputedImage::None,
             position: BackgroundPosition::INITIAL,
             size: BackgroundSize::AUTO,
             repeat: BackgroundRepeat::Repeat,
@@ -378,7 +426,7 @@ impl BackgroundLayer {
     }
 
     pub(crate) fn resolve_font_metric_lengths(&mut self, ch_advance: LayoutLength) {
-        if let Some(image) = &mut self.image {
+        if let Some(image) = self.image.as_image_mut() {
             image.resolve_font_metric_lengths(ch_advance);
         }
         self.size.resolve_font_metric_lengths(ch_advance);
@@ -386,7 +434,7 @@ impl BackgroundLayer {
     }
 
     pub(crate) fn resolve_em_relative_lengths(&mut self, font_size: LayoutLength) {
-        if let Some(image) = &mut self.image {
+        if let Some(image) = self.image.as_image_mut() {
             image.resolve_em_relative_lengths(font_size);
         }
         self.size.resolve_em_relative_lengths(font_size);
@@ -394,7 +442,7 @@ impl BackgroundLayer {
     }
 
     pub(crate) fn resolve_root_font_relative_lengths(&mut self, root_font_size: f32) {
-        if let Some(image) = &mut self.image {
+        if let Some(image) = self.image.as_image_mut() {
             image.resolve_root_font_relative_lengths(root_font_size);
         }
         self.size.resolve_root_font_relative_lengths(root_font_size);
@@ -404,7 +452,7 @@ impl BackgroundLayer {
 
     pub(crate) fn requires_ch_advance(&self) -> bool {
         self.image
-            .as_ref()
+            .as_image()
             .is_some_and(BackgroundImage::requires_ch_advance)
             || self.size.requires_ch_advance()
             || self.position.requires_ch_advance()
@@ -426,9 +474,28 @@ impl BackgroundLayer {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LinearGradient {
     pub direction: LinearGradientDirection,
+    /// The CSS CssColor 4 coordinate system used between color stops.
+    ///
+    /// CSS Images 4 defaults this to Oklab when the function omits an
+    /// explicit `in <color-space>` prelude.
+    /// <https://drafts.csswg.org/css-images-4/#coloring-gradient-line>
+    pub interpolation: GradientInterpolationMethod,
     pub repeating: bool,
     pub stops: Vec<GradientColorStop>,
     pub hints: Vec<GradientColorHint>,
+}
+
+impl LinearGradient {
+    /// Resolves the element-dependent `currentcolor` token at the gradient's
+    /// used-value boundary. CSS CssColor defines `currentcolor` in terms of the
+    /// consuming element, rather than the element that supplied the image.
+    pub(crate) fn resolve_current_color(&self, current_color: CssColor) -> Self {
+        let mut resolved = self.clone();
+        for stop in &mut resolved.stops {
+            stop.color = stop.color.resolve_current_color(current_color);
+        }
+        resolved
+    }
 }
 
 /// Computed `radial-gradient()` or `repeating-radial-gradient()` image.
@@ -441,9 +508,20 @@ pub(crate) struct RadialGradient {
     pub shape: RadialGradientShape,
     pub size: RadialGradientSize,
     pub position: BackgroundPosition,
+    pub interpolation: GradientInterpolationMethod,
     pub repeating: bool,
     pub stops: Vec<GradientColorStop>,
     pub hints: Vec<GradientColorHint>,
+}
+
+impl RadialGradient {
+    pub(crate) fn resolve_current_color(&self, current_color: CssColor) -> Self {
+        let mut resolved = self.clone();
+        for stop in &mut resolved.stops {
+            stop.color = stop.color.resolve_current_color(current_color);
+        }
+        resolved
+    }
 }
 
 /// Computed `conic-gradient()` or `repeating-conic-gradient()` image.
@@ -455,14 +533,220 @@ pub(crate) struct RadialGradient {
 pub(crate) struct ConicGradient {
     pub start_angle: f32,
     pub position: BackgroundPosition,
+    pub interpolation: GradientInterpolationMethod,
     pub repeating: bool,
     pub stops: Vec<ConicGradientStop>,
 }
 
+impl ConicGradient {
+    pub(crate) fn resolve_current_color(&self, current_color: CssColor) -> Self {
+        let mut resolved = self.clone();
+        for stop in &mut resolved.stops {
+            stop.color = stop.color.resolve_current_color(current_color);
+        }
+        resolved
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ConicGradientStop {
-    pub color: Color,
+    pub color: GradientColor,
     pub position: Option<f32>,
+}
+
+/// A gradient stop keeps `currentcolor` symbolic until the consuming element's
+/// used style is known. Unlike an ordinary solid paint, a gradient can be
+/// reused by generated content and border images, so resolving it during CSS
+/// token parsing would bind it to the wrong element.
+/// <https://drafts.csswg.org/css-color-4/#currentcolor-color>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum GradientColor {
+    CssColor(CssColor),
+    /// A specified color whose `none` components remain missing until CSS
+    /// CssColor interpolation has copied analogous components from the other
+    /// endpoint. The concrete color is still kept for ordinary paint paths.
+    ColorWithMissing {
+        color: CssColor,
+        missing: GradientMissingComponents,
+        source: GradientMissingComponentSpace,
+    },
+    CurrentColor,
+}
+
+/// Bitset for the first three color components and alpha, in source order.
+/// CSS CssColor's missing-component fixup happens after conversion into the
+/// interpolation space, immediately before premultiplied interpolation.
+/// <https://drafts.csswg.org/css-color-4/#interpolation-missing>
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct GradientMissingComponents(u8);
+
+/// The specified coordinate family that carried `none`. CSS CssColor only
+/// propagates missing components into analogous coordinates; an RGB channel
+/// is not, for example, an Oklab lightness coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum GradientMissingComponentSpace {
+    Rgb,
+    Xyz,
+    Lab,
+    Oklab,
+    Hsl,
+    Hwb,
+    Lch,
+    Oklch,
+}
+
+impl GradientMissingComponents {
+    pub(crate) const fn new(bits: u8) -> Self {
+        Self(bits & 0b1111)
+    }
+
+    pub(crate) const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub(crate) const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl GradientColor {
+    pub(crate) const fn resolve(self, current_color: CssColor) -> CssColor {
+        match self {
+            Self::CssColor(color) | Self::ColorWithMissing { color, .. } => color,
+            Self::CurrentColor => current_color,
+        }
+    }
+
+    pub(crate) const fn is_current_color(self) -> bool {
+        matches!(self, Self::CurrentColor)
+    }
+
+    pub(crate) const fn as_color(self) -> Option<CssColor> {
+        match self {
+            Self::CssColor(color) | Self::ColorWithMissing { color, .. } => Some(color),
+            Self::CurrentColor => None,
+        }
+    }
+
+    pub(crate) const fn missing_components_for(
+        self,
+        interpolation: GradientInterpolationMethod,
+    ) -> GradientMissingComponents {
+        let Self::ColorWithMissing {
+            missing, source, ..
+        } = self
+        else {
+            return GradientMissingComponents::new(0);
+        };
+        let analogous = match source {
+            GradientMissingComponentSpace::Rgb => matches!(
+                interpolation.space,
+                GradientInterpolationSpace::Srgb
+                    | GradientInterpolationSpace::SrgbLinear
+                    | GradientInterpolationSpace::DisplayP3
+                    | GradientInterpolationSpace::DisplayP3Linear
+                    | GradientInterpolationSpace::A98Rgb
+                    | GradientInterpolationSpace::ProphotoRgb
+                    | GradientInterpolationSpace::Rec2020
+            ),
+            GradientMissingComponentSpace::Xyz => matches!(
+                interpolation.space,
+                GradientInterpolationSpace::XyzD50 | GradientInterpolationSpace::XyzD65
+            ),
+            GradientMissingComponentSpace::Lab => {
+                matches!(interpolation.space, GradientInterpolationSpace::Lab)
+            }
+            GradientMissingComponentSpace::Oklab => {
+                matches!(interpolation.space, GradientInterpolationSpace::Oklab)
+            }
+            GradientMissingComponentSpace::Hsl => {
+                matches!(interpolation.space, GradientInterpolationSpace::Hsl)
+            }
+            GradientMissingComponentSpace::Hwb => {
+                matches!(interpolation.space, GradientInterpolationSpace::Hwb)
+            }
+            GradientMissingComponentSpace::Lch => {
+                matches!(interpolation.space, GradientInterpolationSpace::Lch)
+            }
+            GradientMissingComponentSpace::Oklch => {
+                matches!(interpolation.space, GradientInterpolationSpace::Oklch)
+            }
+        };
+        if analogous {
+            missing
+        } else {
+            GradientMissingComponents::new(0)
+        }
+    }
+
+    pub(crate) const fn resolve_current_color(self, current_color: CssColor) -> Self {
+        match self {
+            Self::CurrentColor => Self::CssColor(current_color),
+            color => color,
+        }
+    }
+}
+
+/// CSS Images 4's gradient-specific color interpolation method.
+///
+/// This intentionally lives with gradients rather than `CssColorSpace`: the
+/// latter denotes retained PDF component spaces, while these values describe
+/// both the CSS conversion coordinates and, for polar spaces, a hue path.
+/// <https://drafts.csswg.org/css-color-4/#interpolation>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct GradientInterpolationMethod {
+    pub space: GradientInterpolationSpace,
+    pub hue: HueInterpolationMethod,
+}
+
+impl GradientInterpolationMethod {
+    pub(crate) const OKLAB: Self = Self {
+        space: GradientInterpolationSpace::Oklab,
+        hue: HueInterpolationMethod::Shorter,
+    };
+
+    pub(crate) const fn is_polar(self) -> bool {
+        self.space.is_polar()
+    }
+}
+
+impl Default for GradientInterpolationMethod {
+    fn default() -> Self {
+        Self::OKLAB
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum GradientInterpolationSpace {
+    Srgb,
+    SrgbLinear,
+    DisplayP3,
+    DisplayP3Linear,
+    A98Rgb,
+    ProphotoRgb,
+    Rec2020,
+    XyzD50,
+    XyzD65,
+    Lab,
+    Oklab,
+    Hsl,
+    Hwb,
+    Lch,
+    Oklch,
+}
+
+impl GradientInterpolationSpace {
+    pub(crate) const fn is_polar(self) -> bool {
+        matches!(self, Self::Hsl | Self::Hwb | Self::Lch | Self::Oklch)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum HueInterpolationMethod {
+    Shorter,
+    Longer,
+    Increasing,
+    Decreasing,
 }
 
 impl ConicGradient {
@@ -681,7 +965,7 @@ pub(crate) enum GradientVerticalDirection {
 /// <https://www.w3.org/TR/css-images-3/#color-stop-syntax>.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GradientColorStop {
-    pub color: Color,
+    pub color: GradientColor,
     pub position: Option<ComputedLengthPercentage>,
 }
 
@@ -779,7 +1063,7 @@ impl ResolveViewportLengths for BackgroundImage {
             Self::LinearGradient(gradient) => gradient.resolve_viewport_lengths(basis),
             Self::RadialGradient(gradient) => gradient.resolve_viewport_lengths(basis),
             Self::ConicGradient(gradient) => gradient.resolve_viewport_lengths(basis),
-            Self::Color(_) => {}
+            Self::CssColor(_) => {}
             Self::Url { .. } => {}
         }
     }
@@ -787,7 +1071,7 @@ impl ResolveViewportLengths for BackgroundImage {
 
 impl ResolveViewportLengths for BackgroundLayer {
     fn resolve_viewport_lengths(&mut self, basis: ViewportLengthBasis) {
-        if let Some(image) = &mut self.image {
+        if let Some(image) = self.image.as_image_mut() {
             image.resolve_viewport_lengths(basis);
         }
         self.size.resolve_viewport_lengths(basis);

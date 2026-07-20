@@ -1,3 +1,5 @@
+use base64::Engine;
+use image::ImageEncoder;
 use std::rc::Rc;
 use std::sync::{
     Arc,
@@ -8,9 +10,11 @@ use super::{
     PdfFontValidationProfile, embedded_font_candidate_key, embedded_font_plans_with_profile,
     embedded_font_plans_with_profile_and_mode, quantized_pdf_font_size, same_embedded_font_program,
 };
-use crate::document::{DocumentFontData, FontProgramKind, PaintBand};
+use crate::document::{
+    CssFontVerticalMetrics, DocumentFontData, FontProgramKind, OpenTypeVerticalMetrics, PaintBand,
+};
 use crate::{
-    Color, Document, DocumentFont, DocumentMetadata, Error, FontEmbeddingMode, Html, Page,
+    CssColor, Document, DocumentFont, DocumentMetadata, Error, FontEmbeddingMode, Html, Page,
     PdfCompression, PdfOptions, PdfProfile, RenderOptions, RenderedGlyph, RenderedLine,
     RenderedTextRun,
 };
@@ -35,6 +39,27 @@ fn assert_alpha_ext_gstate(rendered: &str) {
     assert!(rendered.contains("/CA 0.5"));
 }
 
+fn rgb_jpeg_data_uri(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    icc_profile: Option<Vec<u8>>,
+) -> (String, Vec<u8>) {
+    let mut bytes = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95);
+    if let Some(profile) = icc_profile {
+        encoder.set_icc_profile(profile).unwrap();
+    }
+    encoder
+        .write_image(pixels, width, height, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    let uri = format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    );
+    (uri, bytes)
+}
+
 #[test]
 fn pdf_profiles_round_trip_and_select_their_writer_metadata() {
     let profiles = [
@@ -46,7 +71,7 @@ fn pdf_profiles_round_trip_and_select_their_writer_metadata() {
         ("pdf/a-3u", PdfProfile::PdfA3U, (1, 7), Some((3, "U"))),
     ];
 
-    assert_eq!(PdfProfile::default(), PdfProfile::PdfA2B);
+    assert_eq!(PdfProfile::default(), PdfProfile::Pdf);
     for (name, expected, pdf_version, pdfa_identification) in profiles {
         let profile = name.parse::<PdfProfile>().unwrap();
 
@@ -81,11 +106,14 @@ fn assert_transparency_group(rendered: &str) {
 }
 
 fn assert_translate_transform(rendered: &str) {
-    assert!(rendered.contains("1 0 0 1 5 7 cm"));
+    // CSS positive block-direction translation moves down the page. Paint and
+    // PDF coordinates are bottom-left-origin, so the corresponding PDF CTM
+    // has a negative `f` translation.
+    assert!(rendered.contains("1 0 0 1 5 -7 cm"));
 }
 
 fn translate_transform_count(rendered: &str) -> usize {
-    rendered.matches("1 0 0 1 5 7 cm").count()
+    rendered.matches("1 0 0 1 5 -7 cm").count()
 }
 
 fn clip_scope_count(rendered: &str) -> usize {
@@ -309,7 +337,15 @@ fn assert_unique_form_resource_names(pdf: &[u8]) {
 }
 
 fn green_rect(x: f32, y: f32, width: f32, height: f32) -> crate::RenderedRect {
-    crate::RenderedRect::new(x, y, width, height, Some(Color::new(0, 255, 0)), None, 0.0)
+    crate::RenderedRect::new(
+        x,
+        y,
+        width,
+        height,
+        Some(CssColor::new(0, 255, 0)),
+        None,
+        crate::PaintStrokeWidth::ZERO,
+    )
 }
 
 #[test]
@@ -328,9 +364,9 @@ fn rounded_rects_participate_in_paint_order_and_pdf_serialization() {
                 bottom_right: crate::RenderedCornerRadius::new(4.0, 4.0),
                 bottom_left: crate::RenderedCornerRadius::new(4.0, 4.0),
             },
-            Some(Color::BLACK),
+            Some(CssColor::BLACK),
             None,
-            0.0,
+            crate::PaintStrokeWidth::ZERO,
         ),
     );
     let document = Document {
@@ -365,6 +401,21 @@ fn paint_tree_coalesces_adjacent_same_fill_rectangles() {
 }
 
 #[test]
+fn paint_tree_coalesces_reverse_order_adjacent_same_fill_rectangles() {
+    let mut page = Page::new(100.0, 100.0);
+    // CSS paint order can visit the right-hand BFC root before an adjoining
+    // float to its left. The PDF path must still contain one rectangle so its
+    // shared edge is covered once during rasterization.
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(10.0, 0.0, 10.0, 10.0));
+    page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 0.0, 10.0, 10.0));
+
+    let rendered = rendered_pdf_for_page(page);
+
+    assert_eq!(filled_rect_count(&rendered), 1);
+    assert!(rendered.contains("0 0 20 10 re\nf"));
+}
+
+#[test]
 fn paint_tree_batches_disjoint_same_fill_rectangles_into_one_path() {
     let mut page = Page::new(100.0, 100.0);
     page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 0.0, 10.0, 10.0));
@@ -377,17 +428,26 @@ fn paint_tree_batches_disjoint_same_fill_rectangles_into_one_path() {
 }
 
 #[test]
-fn paint_tree_drops_opaque_underpaint_covered_by_later_rectangles() {
+fn paint_tree_preserves_opaque_underpaint_covered_by_later_rectangles() {
     let mut page = Page::new(100.0, 100.0);
     page.push_rect_in_band(
         PaintBand::InFlowBlock,
-        crate::RenderedRect::new(0.0, 0.0, 10.0, 10.0, Some(Color::new(255, 0, 0)), None, 0.0),
+        crate::RenderedRect::new(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            Some(CssColor::new(255, 0, 0)),
+            None,
+            crate::PaintStrokeWidth::ZERO,
+        ),
     );
     page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 0.0, 10.0, 10.0));
 
     let rendered = rendered_pdf_for_page(page);
 
-    assert_eq!(filled_rect_count(&rendered), 1);
+    assert_eq!(filled_rect_count(&rendered), 2);
+    assert!(rendered.contains("/CSsRGB cs\n1 0 0 scn\n0 0 10 10 re\nf"));
     assert!(rendered.contains("/CSsRGB cs\n0 1 0 scn\n0 0 10 10 re\nf"));
 }
 
@@ -401,7 +461,7 @@ fn paint_tree_rect_coalescing_flushes_before_lines() {
         20.0,
         10.0,
         None,
-        Color::BLACK,
+        CssColor::BLACK,
         Vec::new(),
     ));
     page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 10.0, 10.0, 10.0));
@@ -424,10 +484,10 @@ fn paint_tree_rect_coalescing_flushes_before_vector_paths() {
                 crate::RenderedPathCommand::line_to(crate::PaintPoint::new(20.0, 25.0)),
                 crate::RenderedPathCommand::Close,
             ],
-            Some(Color::BLACK),
+            Some(CssColor::BLACK),
             crate::RenderedPathFillRule::NonZero,
             None,
-            0.0,
+            crate::PaintStrokeWidth::ZERO,
             None,
         ),
     );
@@ -450,9 +510,9 @@ fn paint_tree_rect_coalescing_flushes_before_rounded_rectangles() {
             10.0,
             10.0,
             crate::RenderedRoundedRectRadii::ZERO,
-            Some(Color::BLACK),
+            Some(CssColor::BLACK),
             None,
-            0.0,
+            crate::PaintStrokeWidth::ZERO,
         ),
     );
     page.push_rect_in_band(PaintBand::InFlowBlock, green_rect(0.0, 10.0, 10.0, 10.0));
@@ -516,7 +576,7 @@ async fn emits_pdf_header_and_text() {
         .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
         .await
         .unwrap();
-    assert!(pdf.starts_with(b"%PDF-1.7"));
+    assert!(pdf.starts_with(b"%PDF-1.4"));
     let rendered = pdf_searchable_text(&pdf);
     assert!(rendered.contains("/Subtype /Type0"));
     assert!(rendered.contains("/FontFile2"));
@@ -529,7 +589,7 @@ async fn generated_pdf_streams_use_flate_decode() {
     let pdf = Html::from_string(
         "<style>@page { size: 300pt 200pt; margin: 0 } body { margin: 0 }\
          .raster { width: 40pt; height: 30pt; background-image: conic-gradient(red, blue) }\
-         .tile { width: 240pt; height: 120pt; background-image: linear-gradient(90deg, red, blue);\
+         .tile { width: 240pt; height: 120pt; background-image: linear-gradient(90deg in srgb, red, blue);\
                   background-size: 40pt 30pt; background-repeat: space round }</style>\
          <p>Hello</p><div class=\"raster\"></div><div class=\"tile\"></div>\
          <svg width=\"20pt\" height=\"20pt\" xmlns=\"http://www.w3.org/2000/svg\">\
@@ -556,6 +616,85 @@ async fn generated_pdf_streams_use_flate_decode() {
 }
 
 #[tokio::test]
+async fn eligible_jpeg_sources_are_embedded_once_with_dctdecode() {
+    let (image, original_bytes) = rgb_jpeg_data_uri(
+        &[
+            240, 32, 16, 16, 192, 64, //
+            32, 64, 240, 224, 224, 32,
+        ],
+        2,
+        2,
+        None,
+    );
+    let pdf = Html::from_string(format!(
+        "<style>@page {{ size: 100pt 100pt; margin: 0 }} body {{ margin: 0 }}\
+         .tile {{ width: 40pt; height: 40pt; background: url({image}) repeat }}</style>\
+         <div class=\"tile\"></div><div class=\"tile\"></div>",
+    ))
+    .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
+    .await
+    .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    assert_eq!(rendered.matches("/Subtype /Image").count(), 1, "{rendered}");
+    assert!(rendered.contains("/Width 2"), "{rendered}");
+    assert!(rendered.contains("/Height 2"), "{rendered}");
+    assert!(rendered.contains("/Filter /DCTDecode"), "{rendered}");
+    assert!(find_bytes(&pdf, &original_bytes).is_some());
+}
+
+#[tokio::test]
+async fn pdfa_converts_tagged_jpegs_instead_of_passing_them_through() {
+    let display_p3 = crate::color::icc_profile_bytes(crate::css::CssColorSpace::DisplayP3).unwrap();
+    let (image, original_bytes) = rgb_jpeg_data_uri(&[240, 32, 16], 1, 1, Some(display_p3));
+    let pdf = Html::from_string(format!(
+        "<style>@page {{ size: 100pt 100pt; margin: 0 }} body, img {{ margin: 0 }}\
+         img {{ display: block; width: 20pt; height: 20pt }}</style><img src=\"{image}\">",
+    ))
+    .write_pdf_bytes(
+        &RenderOptions::default(),
+        &crate::PdfOptions {
+            profile: PdfProfile::PdfA2B,
+            ..crate::PdfOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    assert!(rendered.contains("/Filter /FlateDecode"), "{rendered}");
+    assert!(!rendered.contains("/Filter /DCTDecode"), "{rendered}");
+    assert!(find_bytes(&pdf, &original_bytes).is_none());
+}
+
+#[tokio::test]
+async fn ordinary_pdf_preserves_tagged_jpegs_with_dctdecode() {
+    let display_p3 = crate::color::icc_profile_bytes(crate::css::CssColorSpace::DisplayP3).unwrap();
+    let (image, original_bytes) = rgb_jpeg_data_uri(&[240, 32, 16], 1, 1, Some(display_p3));
+    let pdf = Html::from_string(format!(
+        "<style>@page {{ size: 100pt 100pt; margin: 0 }} body, img {{ margin: 0 }}\
+         img {{ display: block; width: 20pt; height: 20pt }}</style><img src=\"{image}\">",
+    ))
+    .write_pdf_bytes(
+        &RenderOptions::default(),
+        &crate::PdfOptions {
+            profile: PdfProfile::Pdf,
+            ..crate::PdfOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    // The image owns its embedded Display-P3 profile. The page may also
+    // define calibrated CSS color-space resources, but the JPEG's direct
+    // DCT representation must remain ICC-based independently of their names.
+    assert!(rendered.contains("/ColorSpace [/ICCBased"), "{rendered}");
+    assert!(rendered.contains("/Filter /DCTDecode"), "{rendered}");
+    assert!(find_bytes(&pdf, &original_bytes).is_some());
+}
+
+#[tokio::test]
 async fn uncompressed_pdf_streams_omit_flate_decode() {
     let pdf_options = PdfOptions {
         compression: PdfCompression::Uncompressed,
@@ -564,7 +703,7 @@ async fn uncompressed_pdf_streams_omit_flate_decode() {
     let pdf = Html::from_string(
         "<style>@page { size: 300pt 200pt; margin: 0 } body { margin: 0 }\
          .raster { width: 40pt; height: 30pt; background-image: conic-gradient(red, blue) }\
-         .tile { width: 240pt; height: 120pt; background-image: linear-gradient(90deg, red, blue);\
+         .tile { width: 240pt; height: 120pt; background-image: linear-gradient(90deg in srgb, red, blue);\
                   background-size: 40pt 30pt; background-repeat: space round }</style>\
          <p>Hello</p><div class=\"raster\"></div><div class=\"tile\"></div>\
          <svg width=\"20pt\" height=\"20pt\" xmlns=\"http://www.w3.org/2000/svg\">\
@@ -613,9 +752,7 @@ fn pdf_metadata_stream_mirrors_document_info_dictionary() {
     assert!(rendered.contains("/Creator (Quire Test Suite)"));
     assert!(rendered.contains("/Producer (quire-test producer)"));
     assert!(xmp.contains("<pdf:Producer>quire-test producer</pdf:Producer>"));
-    assert!(xmp.contains(r#"xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/""#));
-    assert!(xmp.contains(r#"pdfaid:part="2""#));
-    assert!(xmp.contains(r#"pdfaid:conformance="B""#));
+    assert!(!xmp.contains("pdfaid"));
     assert!(xmp.contains("<xmp:CreatorTool>Quire Test Suite</xmp:CreatorTool>"));
     assert!(xmp.contains("<dc:creator><rdf:Seq><rdf:li>Ada Lovelace</rdf:li>"));
     assert!(xmp.contains("<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Spec Title</rdf:li>"));
@@ -1421,9 +1558,9 @@ async fn body_canvas_constant_gradients_with_explicit_tiles_emit_solid_paths() {
 async fn opaque_css_background_gradients_emit_native_shadings_at_tile_geometry() {
     let pdf = Html::from_string(
         "<style>@page { size: 300pt 200pt; margin: 0 } body { margin: 0 }\
-         .linear { width: 200pt; height: 60pt; background-image: linear-gradient(90deg, red, blue);\
+         .linear { width: 200pt; height: 60pt; background-image: linear-gradient(90deg in srgb, red, blue);\
          background-size: 100pt 40pt; background-position: 30pt 10pt; background-repeat: no-repeat }\
-         .radial { width: 200pt; height: 100pt; background-image: radial-gradient(ellipse, red, blue);\
+         .radial { width: 200pt; height: 100pt; background-image: radial-gradient(ellipse in srgb, red, blue);\
          background-size: 100pt 50pt; background-position: 40pt 20pt; background-repeat: no-repeat }</style>\
          <div class=linear></div><div class=radial></div>",
     )
@@ -1442,7 +1579,7 @@ async fn opaque_css_background_gradients_emit_native_shadings_at_tile_geometry()
 async fn page_box_css_background_gradient_uses_native_pdf_shading() {
     let pdf = Html::from_string(
         "<style>@page { size: 200pt 100pt; margin: 0;\
-         background-image: linear-gradient(90deg, red, blue);\
+         background-image: linear-gradient(90deg in srgb, red, blue);\
          background-size: 100pt 40pt; background-position: 20pt 10pt; background-repeat: no-repeat }\
          body { margin: 0 }</style><p></p>",
     )
@@ -1461,7 +1598,7 @@ async fn page_margin_box_css_background_gradient_uses_native_pdf_shading() {
     let pdf = Html::from_string(
         "<style>@page { size: 200pt 100pt; margin: 20pt;\
          @top-left { content: \"margin\"; width: 80pt; height: 20pt;\
-         background-image: radial-gradient(ellipse, red, blue);\
+         background-image: radial-gradient(ellipse in srgb, red, blue);\
          background-size: 40pt 20pt; background-repeat: no-repeat } }\
          body { margin: 0 }</style><p>body</p>",
     )
@@ -1479,7 +1616,7 @@ async fn page_margin_box_css_background_gradient_uses_native_pdf_shading() {
 async fn repeated_opaque_css_gradient_uses_a_shared_pdf_tiling_shading() {
     let pdf = Html::from_string(
         "<style>@page { size: 300pt 200pt; margin: 0 } body { margin: 0 }\
-         div { width: 240pt; height: 120pt; background-image: linear-gradient(90deg, red, blue);\
+         div { width: 240pt; height: 120pt; background-image: linear-gradient(90deg in srgb, red, blue);\
          background-size: 40pt 30pt; background-repeat: space round }</style><div></div>",
     )
     .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
@@ -1499,7 +1636,7 @@ async fn repeating_css_linear_gradient_uses_vector_shading_without_image_tiles()
         "<style>@page { size: 300pt 200pt; margin: 0 } body { margin: 0 }\
          div { width: 240pt; height: 120pt; padding: 20pt;\
          background-origin: content-box;\
-         background-image: repeating-linear-gradient(to bottom right, white 0pt, black 15pt, white 30pt); }\
+         background-image: repeating-linear-gradient(to bottom right in srgb, white 0pt, black 15pt, white 30pt); }\
          </style><div></div>",
     )
     .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
@@ -1521,7 +1658,7 @@ async fn repeating_css_gradient_cycle_boundary_discontinuity_remains_vector() {
     let pdf = Html::from_string(
         "<style>@page { size: 300pt 200pt; margin: 0 } body { margin: 0 }\
          div { width: 200pt; height: 100pt;\
-         background-image: repeating-linear-gradient(90deg, red 0pt, blue 10pt, green 20pt); }\
+         background-image: repeating-linear-gradient(90deg in srgb, red 0pt, blue 10pt, green 20pt); }\
          </style><div></div>",
     )
     .write_pdf_bytes(&RenderOptions::default(), &options)
@@ -1538,7 +1675,7 @@ async fn repeating_css_radial_gradient_uses_vector_shading_without_image_tiles()
     let pdf = Html::from_string(
         "<style>@page { size: 300pt 200pt; margin: 0 } body { margin: 0 }\
          div { width: 180pt; height: 120pt;\
-         background-image: repeating-radial-gradient(ellipse at 30% 40%, red 0pt, blue 12pt, red 24pt); }\
+         background-image: repeating-radial-gradient(ellipse at 30% 40% in srgb, red 0pt, blue 12pt, red 24pt); }\
          </style><div></div>",
     )
     .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
@@ -1560,9 +1697,9 @@ async fn long_repeating_css_gradient_domains_use_one_periodic_function_per_color
     let pdf = Html::from_string(
         "<style>@page { size: 2400pt 800pt; margin: 0 } body { margin: 0 }\
          .linear { width: 2200pt; height: 180pt;\
-         background-image: repeating-linear-gradient(90deg, red 0pt, blue 10pt, red 20pt); }\
+         background-image: repeating-linear-gradient(90deg in srgb, red 0pt, blue 10pt, red 20pt); }\
          .radial { width: 1200pt; height: 500pt;\
-         background-image: repeating-radial-gradient(ellipse, red 0pt, blue 10pt, red 20pt); }\
+         background-image: repeating-radial-gradient(ellipse in srgb, red 0pt, blue 10pt, red 20pt); }\
          </style><div class=linear></div><div class=radial></div>",
     )
     .write_pdf_bytes(&RenderOptions::default(), &options)
@@ -1587,7 +1724,7 @@ async fn repeating_css_gradient_hints_hard_stops_and_alpha_remain_vector() {
         let pdf = Html::from_string(
             "<style>@page { size: 300pt 200pt; margin: 0 } body { margin: 0 }\
              div { width: 200pt; height: 100pt;\
-             background-image: repeating-linear-gradient(90deg, rgb(255 0 0 / .2) 0pt, 3pt, blue 12pt, green 12pt, rgb(255 0 0 / .2) 24pt); }\
+             background-image: repeating-linear-gradient(90deg in srgb, rgb(255 0 0 / .2) 0pt, 3pt, blue 12pt, green 12pt, rgb(255 0 0 / .2) 24pt); }\
              </style><div></div>",
         )
         .write_pdf_bytes(&RenderOptions::default(), &options)
@@ -1615,7 +1752,7 @@ async fn zero_period_repeating_css_gradient_uses_its_vector_average_color() {
     let pdf = Html::from_string(
         "<style>@page { size: 300pt 200pt; margin: 0 } body { margin: 0 }\
          div { width: 200pt; height: 100pt;\
-         background-image: repeating-linear-gradient(90deg, red 0pt, transparent 0pt, blue 0pt); }\
+         background-image: repeating-linear-gradient(90deg in srgb, red 0pt, transparent 0pt, blue 0pt); }\
          </style><div></div>",
     )
     .write_pdf_bytes(&RenderOptions::default(), &crate::PdfOptions::default())
@@ -1637,7 +1774,7 @@ async fn physically_unresolvable_repeating_css_gradient_uses_a_bounded_vector_av
     let pdf = Html::from_string(
         "<style>@page { size: 300pt 200pt; margin: 0 } body { margin: 0 }\
          div { width: 240pt; height: 100pt;\
-         background-image: repeating-linear-gradient(90deg, red 0pt, blue .01pt); }\
+         background-image: repeating-linear-gradient(90deg in srgb, red 0pt, blue .01pt); }\
          </style><div></div>",
     )
     .write_pdf_bytes(&RenderOptions::default(), &options)
@@ -1659,7 +1796,7 @@ async fn physically_unresolvable_repeating_radial_gradient_uses_a_bounded_vector
     let pdf = Html::from_string(
         "<style>@page { size: 300pt 200pt; margin: 0 } body { margin: 0 }\
          div { width: 180pt; height: 120pt;\
-         background-image: repeating-radial-gradient(red 0pt, blue .01pt); }\
+         background-image: repeating-radial-gradient(in srgb, red 0pt, blue .01pt); }\
          </style><div></div>",
     )
     .write_pdf_bytes(&RenderOptions::default(), &options)
@@ -1709,6 +1846,7 @@ async fn svg_gradient_stop_alpha_emits_a_vector_soft_mask() {
     assert!(rendered.contains("/S /Luminosity"));
     assert!(rendered.contains("/DeviceGray"));
     assert!(rendered.contains("/GSsvgAlpha1 gs"));
+    assert!(rendered.contains("/BBox [0 0 100 100]"));
 }
 
 #[tokio::test]
@@ -1876,7 +2014,7 @@ fn pdf_font_embedding_prunes_unused_fonts_and_merges_byte_identical_font_plans()
         40.0,
         12.0,
         Some(0),
-        Color::BLACK,
+        CssColor::BLACK,
         vec![
             RenderedTextRun {
                 text: Rc::from("A"),
@@ -1959,14 +2097,11 @@ fn pdf_font_embedding_uses_only_visible_text_glyphs() {
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
     let font = test_document_font(0, blob);
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(glyph_a, "A", Color::BLACK));
+    page.push_line(test_rendered_line(glyph_a, "A", CssColor::BLACK));
     page.push_line(test_rendered_line(
         glyph_b,
         "B",
-        Color {
-            a: 0.0,
-            ..Color::BLACK
-        },
+        CssColor::BLACK.with_alpha(0.0),
     ));
     let document = Document {
         pages: vec![page],
@@ -1995,7 +2130,7 @@ fn pdf_font_embedding_subsets_ttf_with_compact_cids() {
     let blob = FontiqueBlob::new(Arc::new(font_bytes.clone()));
     let font = test_document_font(0, blob);
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(glyph_a, "A", Color::BLACK));
+    page.push_line(test_rendered_line(glyph_a, "A", CssColor::BLACK));
     let document = Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
@@ -2034,7 +2169,7 @@ fn pdf_full_font_embedding_uses_original_ttf_identity_cids_and_full_cmap() {
     let blob = FontiqueBlob::new(Arc::new(font_bytes.clone()));
     let font = test_document_font(0, blob);
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(glyph_a, "A", Color::BLACK));
+    page.push_line(test_rendered_line(glyph_a, "A", CssColor::BLACK));
     let document = Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
@@ -2088,7 +2223,7 @@ fn pdf_font_embedding_subsets_cff_with_compact_cids() {
     let mut font = test_document_font(0, blob);
     font.post_script_name = "BarlowCondensed-Regular".to_string();
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(glyph_a, "A", Color::BLACK));
+    page.push_line(test_rendered_line(glyph_a, "A", CssColor::BLACK));
     let document = Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
@@ -2141,7 +2276,7 @@ fn pdfa_cff_subset_fallback_embeds_the_full_cff_program() {
         40.0,
         12.0,
         Some(0),
-        Color::BLACK,
+        CssColor::BLACK,
         vec![RenderedTextRun {
             text: Rc::from("A"),
             actual_text: None,
@@ -2197,7 +2332,7 @@ fn pdf_full_font_embedding_uses_original_cff_program_and_identity_cids() {
     let mut font = test_document_font(0, blob);
     font.post_script_name = "BarlowCondensed-Regular".to_string();
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(glyph_a, "A", Color::BLACK));
+    page.push_line(test_rendered_line(glyph_a, "A", CssColor::BLACK));
     let document = Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
@@ -2239,7 +2374,7 @@ fn pdf_subset_font_names_use_six_uppercase_prefix() {
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
     let font = test_document_font(0, blob);
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(glyph_a, "A", Color::BLACK));
+    page.push_line(test_rendered_line(glyph_a, "A", CssColor::BLACK));
     let document = Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
@@ -2274,7 +2409,7 @@ fn pdf_font_embedding_errors_when_a_standalone_font_has_an_invalid_face_index() 
     let mut font = test_document_font(0, blob);
     font.face_index = 1;
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(glyph_a, "A", Color::BLACK));
+    page.push_line(test_rendered_line(glyph_a, "A", CssColor::BLACK));
     let document = Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
@@ -2302,7 +2437,7 @@ fn pdf_cid_font_writes_default_width_and_real_font_bbox() {
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
     let font = test_document_font(0, blob);
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(glyph_a, "A", Color::BLACK));
+    page.push_line(test_rendered_line(glyph_a, "A", CssColor::BLACK));
     let document = Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
@@ -2341,7 +2476,7 @@ fn pdf_font_plan_pdfa_includes_cid_set_bits_for_used_cids() {
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
     let font = test_document_font(0, blob);
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(glyph_a, "A", Color::BLACK));
+    page.push_line(test_rendered_line(glyph_a, "A", CssColor::BLACK));
     let document = Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
@@ -2391,7 +2526,10 @@ fn pdfa_font_embedding_uses_full_font_when_subsetting_is_forbidden_and_errors_wi
 
     let rejected_document = document_with_single_glyph_font(no_outline, glyph_a);
     assert!(matches!(
-        rejected_document.write_pdf_bytes(&crate::PdfOptions::default()),
+        rejected_document.write_pdf_bytes(&PdfOptions {
+            profile: PdfProfile::PdfA2B,
+            ..PdfOptions::default()
+        }),
         Err(Error::FontEmbedding { .. })
     ));
 }
@@ -2404,7 +2542,7 @@ fn pdfa_font_embedding_errors_for_painted_glyphs_without_unicode_mapping() {
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
     let font = test_document_font(0, blob);
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(glyph_a, "", Color::BLACK));
+    page.push_line(test_rendered_line(glyph_a, "", CssColor::BLACK));
     let document = Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
@@ -2413,7 +2551,10 @@ fn pdfa_font_embedding_errors_for_painted_glyphs_without_unicode_mapping() {
         image_store: Box::default(),
     };
     assert!(matches!(
-        document.write_pdf_bytes(&crate::PdfOptions::default()),
+        document.write_pdf_bytes(&PdfOptions {
+            profile: PdfProfile::PdfA2B,
+            ..PdfOptions::default()
+        }),
         Err(Error::FontEmbedding { .. })
     ));
 }
@@ -2431,7 +2572,7 @@ fn pdfa_font_embedding_accepts_empty_glyph_summary_covered_by_actual_text() {
         40.0,
         12.0,
         Some(0),
-        Color::BLACK,
+        CssColor::BLACK,
         vec![RenderedTextRun {
             text: Rc::from("A"),
             actual_text: Some(Rc::from("A")),
@@ -2472,7 +2613,7 @@ fn pdf_font_embedding_keeps_shaped_ligature_glyphs_or_falls_back() {
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
     let font = test_document_font(0, blob);
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(ligature.0, "ffi", Color::BLACK));
+    page.push_line(test_rendered_line(ligature.0, "ffi", CssColor::BLACK));
     let document = Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
@@ -2514,7 +2655,7 @@ fn pdf_text_runs_emit_positioned_show_for_advance_adjustments() {
         40.0,
         12.0,
         Some(0),
-        Color::BLACK,
+        CssColor::BLACK,
         vec![RenderedTextRun {
             text: Rc::from("AV"),
             actual_text: None,
@@ -2549,6 +2690,186 @@ fn pdf_text_runs_emit_positioned_show_for_advance_adjustments() {
 }
 
 #[test]
+fn pdf_text_runs_apply_per_glyph_origins_without_changing_advances() {
+    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
+    let glyph_a = face.glyph_index('A').unwrap().0;
+    let glyph_b = face.glyph_index('B').unwrap().0;
+    let glyph_c = face.glyph_index('C').unwrap().0;
+    let blob = FontiqueBlob::new(Arc::new(font_bytes));
+    let font = test_document_font(0, blob);
+    let mut offset_b = test_rendered_glyph_with_advances(glyph_b, "B", 6.0, 12.0);
+    offset_b.x_offset = -2.0;
+    offset_b.y_offset = 3.0;
+    let mut page = Page::new(120.0, 80.0);
+    page.push_line(RenderedLine::new(
+        "ABC".to_string(),
+        10.0,
+        40.0,
+        12.0,
+        Some(0),
+        CssColor::BLACK,
+        vec![RenderedTextRun {
+            text: Rc::from("ABC"),
+            actual_text: None,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            text_matrix: crate::RenderedTextMatrix::IDENTITY,
+            font_size: 12.0,
+            font_id: Some(0),
+            glyphs: Some(
+                vec![
+                    test_rendered_glyph_with_advances(glyph_a, "A", 6.0, 6.0),
+                    offset_b,
+                    test_rendered_glyph_with_advances(glyph_c, "C", 6.0, 6.0),
+                ]
+                .into(),
+            ),
+        }],
+    ));
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: vec![font],
+        bookmarks: Vec::new(),
+        image_store: Box::default(),
+    };
+
+    let pdf = document
+        .write_pdf_bytes(&PdfOptions {
+            compression: PdfCompression::Uncompressed,
+            ..PdfOptions::default()
+        })
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    assert!(rendered.contains("1 0 0 1 14 43 Tm"), "{rendered}");
+    assert!(
+        rendered.contains("1 0 0 1 22 40 Tm"),
+        "the following glyph must use the 12pt accumulated used advance, not B's 12pt nominal advance: {rendered}"
+    );
+}
+
+#[test]
+fn pdf_text_runs_transform_per_glyph_origins_with_the_run_matrix() {
+    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
+    let glyph_a = face.glyph_index('A').unwrap().0;
+    let glyph_b = face.glyph_index('B').unwrap().0;
+    let blob = FontiqueBlob::new(Arc::new(font_bytes));
+    let font = test_document_font(0, blob);
+    let mut offset_b = test_rendered_glyph_with_advances(glyph_b, "B", 6.0, 6.0);
+    offset_b.x_offset = -2.0;
+    offset_b.y_offset = 3.0;
+    let mut page = Page::new(120.0, 80.0);
+    page.push_line(RenderedLine::new(
+        "AB".to_string(),
+        10.0,
+        40.0,
+        12.0,
+        Some(0),
+        CssColor::BLACK,
+        vec![RenderedTextRun {
+            text: Rc::from("AB"),
+            actual_text: None,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            text_matrix: crate::RenderedTextMatrix::ROTATE_CW,
+            font_size: 12.0,
+            font_id: Some(0),
+            glyphs: Some(
+                vec![
+                    test_rendered_glyph_with_advances(glyph_a, "A", 6.0, 6.0),
+                    offset_b,
+                ]
+                .into(),
+            ),
+        }],
+    ));
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: vec![font],
+        bookmarks: Vec::new(),
+        image_store: Box::default(),
+    };
+
+    let pdf = document
+        .write_pdf_bytes(&PdfOptions {
+            compression: PdfCompression::Uncompressed,
+            ..PdfOptions::default()
+        })
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+
+    assert!(rendered.contains("0 -1 1 0 13 36 Tm"), "{rendered}");
+}
+
+#[test]
+fn pdf_advance_only_tab_is_not_subset_or_painted_and_preserves_actual_text() {
+    let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
+    let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
+    let glyph_a = face.glyph_index('A').unwrap().0;
+    let font = test_document_font(0, FontiqueBlob::new(Arc::new(font_bytes)));
+    let mut page = Page::new(120.0, 80.0);
+    page.push_line(RenderedLine::new(
+        "\tA".to_string(),
+        10.0,
+        40.0,
+        12.0,
+        Some(0),
+        CssColor::BLACK,
+        vec![RenderedTextRun {
+            text: Rc::from("\tA"),
+            actual_text: Some(Rc::from("\tA")),
+            x_offset: 0.0,
+            y_offset: 0.0,
+            text_matrix: crate::RenderedTextMatrix::IDENTITY,
+            font_size: 12.0,
+            font_id: Some(0),
+            glyphs: Some(
+                vec![
+                    RenderedGlyph {
+                        kind: crate::document::RenderedGlyphKind::AdvanceOnly,
+                        x_advance: 24.0,
+                        nominal_x_advance: 0.0,
+                        x_offset: 0.0,
+                        y_offset: 0.0,
+                        unicode: "\t".to_string(),
+                    },
+                    test_rendered_glyph(glyph_a, "A"),
+                ]
+                .into(),
+            ),
+        }],
+    ));
+    let document = Document {
+        pages: vec![page],
+        metadata: DocumentMetadata::default(),
+        fonts: vec![font],
+        bookmarks: Vec::new(),
+        image_store: Box::default(),
+    };
+
+    let plans = embedded_font_plans_with_profile(&document, 1, PdfFontValidationProfile::Default);
+    assert_eq!(plans.fonts[0].source_gid_to_cid.len(), 1);
+    assert!(plans.fonts[0].source_gid_to_cid.contains_key(&glyph_a));
+
+    let pdf = document
+        .write_pdf_bytes(&PdfOptions {
+            compression: PdfCompression::Uncompressed,
+            ..PdfOptions::default()
+        })
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+    let cid_a = plans.fonts[0].source_gid_to_cid[&glyph_a];
+    assert!(rendered.contains(" TJ"), "{rendered}");
+    assert!(rendered.contains(&format!("<{cid_a:04X}>")), "{rendered}");
+    assert!(rendered.contains("/ActualText"), "{rendered}");
+    assert!(rendered.contains("<FEFF00090041>"), "{rendered}");
+}
+
+#[test]
 fn pdf_text_runs_emit_selected_text_matrix_and_offsets() {
     let font_bytes = std::fs::read("weasyprint-samples/invoice/SourceSans3-Regular.ttf").unwrap();
     let face = ttf_parser::Face::parse(&font_bytes, 0).unwrap();
@@ -2562,7 +2883,7 @@ fn pdf_text_runs_emit_selected_text_matrix_and_offsets() {
         40.0,
         12.0,
         Some(0),
-        Color::BLACK,
+        CssColor::BLACK,
         vec![RenderedTextRun {
             text: Rc::from("A"),
             actual_text: None,
@@ -2605,7 +2926,7 @@ fn pdf_identity_text_runs_reuse_text_state_with_relative_positioning() {
         40.0,
         12.0,
         Some(0),
-        Color::BLACK,
+        CssColor::BLACK,
         vec![
             RenderedTextRun {
                 text: Rc::from("A"),
@@ -2658,8 +2979,16 @@ fn test_document_font(id: usize, blob: FontiqueBlob<u8>) -> DocumentFont {
         data: DocumentFontData::from_blob(blob),
         face_index: 0,
         units_per_em: 1000,
-        ascender: 984,
-        descender: -273,
+        program_metrics: OpenTypeVerticalMetrics {
+            ascender: 984,
+            descender: -273,
+            line_gap: 0,
+        },
+        layout_metrics: CssFontVerticalMetrics {
+            ascender: 984,
+            descender: -273,
+            line_gap: 0,
+        },
         cap_height: 660,
         italic_angle: 0,
         bbox: [-438, -293, 1142, 1034],
@@ -2670,7 +2999,7 @@ fn document_with_single_glyph_font(font_bytes: Vec<u8>, glyph_id: u16) -> Docume
     let blob = FontiqueBlob::new(Arc::new(font_bytes));
     let font = test_document_font(0, blob);
     let mut page = Page::new(120.0, 80.0);
-    page.push_line(test_rendered_line(glyph_id, "A", Color::BLACK));
+    page.push_line(test_rendered_line(glyph_id, "A", CssColor::BLACK));
     Document {
         pages: vec![page],
         metadata: DocumentMetadata::default(),
@@ -2703,7 +3032,7 @@ fn test_rendered_glyph(id: u16, unicode: &str) -> RenderedGlyph {
     test_rendered_glyph_with_advances(id, unicode, 7.0, 7.0)
 }
 
-fn test_rendered_line(glyph_id: u16, unicode: &str, color: Color) -> RenderedLine {
+fn test_rendered_line(glyph_id: u16, unicode: &str, color: CssColor) -> RenderedLine {
     RenderedLine::new(
         unicode.to_string(),
         10.0,
@@ -2787,7 +3116,7 @@ fn test_rendered_glyph_with_advances(
     nominal_x_advance: f32,
 ) -> RenderedGlyph {
     RenderedGlyph {
-        id,
+        kind: crate::document::RenderedGlyphKind::Paint(id),
         x_advance,
         nominal_x_advance,
         x_offset: 0.0,

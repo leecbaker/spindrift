@@ -108,6 +108,7 @@ fn parse_page_at_rule<'a>(
                 context.root_url,
             ),
             margin_boxes: parse_page_rule_margin_boxes(body, context.base_url, context.root_url),
+            footnote_area: parse_page_rule_footnote_area(body, context.base_url, context.root_url),
             order: state.order,
             layer_order: current_layer
                 .and_then(|name| context.layer_order.get(name))
@@ -166,7 +167,9 @@ pub(super) fn parse_page_rule_margin_boxes(
         let mut body_rest = page_body;
         while let Some(box_start) = find_margin_at_rule(body_rest, &at_name) {
             let box_rest = &body_rest[box_start + at_name.len()..];
-            let Some(box_open_offset) = box_rest.find('{') else {
+            let Some(box_open_offset) =
+                crate::css::component_values::find_next_top_level_open_brace(box_rest, 0)
+            else {
                 break;
             };
             let box_open = box_start + at_name.len() + box_open_offset;
@@ -185,6 +188,40 @@ pub(super) fn parse_page_rule_margin_boxes(
         }
     }
     boxes
+}
+
+/// Parses GCPM's `@footnote` page-area rule without conflating it with one of
+/// CSS Paged Media's sixteen page-margin boxes:
+/// <https://www.w3.org/TR/css-gcpm-3/#footnote-area>.
+pub(super) fn parse_page_rule_footnote_area(
+    page_body: &str,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+) -> Option<Declarations> {
+    let at_name = "@footnote";
+    let mut body_rest = page_body;
+    let mut declarations = Declarations::new();
+    let mut found = false;
+    while let Some(area_start) = find_margin_at_rule(body_rest, at_name) {
+        let area_rest = &body_rest[area_start + at_name.len()..];
+        let Some(area_open_offset) =
+            crate::css::component_values::find_next_top_level_open_brace(area_rest, 0)
+        else {
+            break;
+        };
+        let area_open = area_start + at_name.len() + area_open_offset;
+        let Some(area_close) = find_matching_brace(body_rest, area_open) else {
+            break;
+        };
+        declarations.extend(parse_declarations_with_urls(
+            &body_rest[area_open + 1..area_close],
+            base_url,
+            root_url,
+        ));
+        found = true;
+        body_rest = &body_rest[area_close + 1..];
+    }
+    found.then_some(declarations)
 }
 
 /// Finds an exact page-margin at-rule name.
@@ -499,7 +536,9 @@ pub(super) fn strip_nested_page_rules(body: &str) -> String {
     while let Some(at_start) = body[position..].find('@') {
         let at_start = position + at_start;
         output.push_str(&body[position..at_start]);
-        let Some(open_offset) = body[at_start..].find('{') else {
+        let Some(open_offset) =
+            crate::css::component_values::find_next_top_level_open_brace(&body[at_start..], 0)
+        else {
             position = at_start + 1;
             continue;
         };

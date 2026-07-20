@@ -13,28 +13,26 @@ pub(in crate::layout::table) struct TableWrapperPaintBox {
     /// The root table flow used to project the logical grid before adding the
     /// wrapper's physical padding and border edges.
     pub(in crate::layout::table) axes: TableAxes,
-    pub(in crate::layout::table) content_width: f32,
-    pub(in crate::layout::table) content_height: f32,
+    pub(in crate::layout::table) grid_size: TableGridLogicalSize,
     pub(in crate::layout::table) table_width: UsedTableWidth,
     pub(in crate::layout::table) table_metrics: TableMetrics,
 }
 
 impl TableWrapperPaintBox {
-    pub(in crate::layout::table) fn grid_content_box(self) -> PageTopRect {
+    pub(in crate::layout::table) fn grid_placement(self) -> TableGridPlacement {
         let grid_origin = PageTopPoint::new(
             self.table_x,
             self.top - self.table_width.border_widths.top - self.table_width.padding.top,
         );
-        TableGridPlacement::with_axes(
-            grid_origin,
-            self.axes,
-            self.content_width,
-            self.content_height,
-        )
-        .page_top_rect_for(TableGridRect::new(
-            TableGridPoint::new(0.0, 0.0),
-            TableGridSize::new(self.content_width, self.content_height),
-        ))
+        TableGridPlacement::with_axes(grid_origin, self.axes, self.grid_size)
+    }
+
+    pub(in crate::layout::table) fn grid_content_box(self) -> PageTopRect {
+        self.grid_placement().full_page_top_rect()
+    }
+
+    pub(in crate::layout::table) fn physical_grid_width(self) -> PhysicalContentWidth {
+        self.grid_size.physical_width(self.axes)
     }
 
     pub(in crate::layout::table) fn border_box(self) -> PageTopRect {
@@ -219,11 +217,76 @@ impl TableRowPiecePlan {
 pub(in crate::layout::table) struct TableCellFragmentPlan {
     pub(in crate::layout::table) border_box: TableCellBorderBox,
     pub(in crate::layout::table) placement: TableGridPlacement,
-    pub(in crate::layout::table) content_offset: f32,
-    pub(in crate::layout::table) content_x_offset: f32,
-    pub(in crate::layout::table) content_clip: Option<OverflowClip>,
+    /// The final content rectangle, including alignment in the cell's own
+    /// block axis.  Root-table grid geometry is deliberately not reused as a
+    /// substitute for this cell-local containing block.
+    pub(in crate::layout::table) content_geometry: TableCellContentGeometry,
+    pub(in crate::layout::table) content_clip: Option<TableCellClipRegion>,
     pub(in crate::layout::table) area: TableGridArea,
     pub(in crate::layout::table) content: TableCellContentPlan,
+}
+
+/// Visible table-cell areas retained across collapsed row/column tracks.
+///
+/// This stays in table-grid layout until the final retained-paint boundary,
+/// where its rectangles become one PDF union clip path.
+#[derive(Debug, Clone, Default)]
+pub(in crate::layout::table) struct TableCellClipRegion {
+    regions: Vec<OverflowClip>,
+}
+
+impl TableCellClipRegion {
+    pub(in crate::layout::table) fn from_clip(clip: OverflowClip) -> Self {
+        Self {
+            regions: vec![clip],
+        }
+    }
+
+    pub(in crate::layout::table) fn from_clips(regions: Vec<OverflowClip>) -> Option<Self> {
+        (!regions.is_empty()).then_some(Self { regions })
+    }
+
+    pub(in crate::layout::table) fn intersect(&self, other: &Self) -> Option<Self> {
+        Self::from_clips(
+            self.regions
+                .iter()
+                .flat_map(|left| {
+                    other
+                        .regions
+                        .iter()
+                        .filter_map(move |right| left.intersect(*right))
+                })
+                .collect(),
+        )
+    }
+
+    pub(in crate::layout::table) fn bounding_clip(&self) -> Option<OverflowClip> {
+        let first = *self.regions.first()?;
+        let mut min_x = first.paint_rect().min_x();
+        let mut min_y = first.paint_rect().min_y();
+        let mut max_x = first.paint_rect().max_x();
+        let mut max_y = first.paint_rect().max_y();
+        for clip in &self.regions[1..] {
+            let rect = clip.paint_rect();
+            min_x = min_x.min(rect.min_x());
+            min_y = min_y.min(rect.min_y());
+            max_x = max_x.max(rect.max_x());
+            max_y = max_y.max(rect.max_y());
+        }
+        Some(OverflowClip::from_paint_rect(paint_space_rect(
+            min_x,
+            min_y,
+            max_x - min_x,
+            max_y - min_y,
+        )))
+    }
+
+    pub(in crate::layout::table) fn paint_clips(&self) -> Vec<PaintClip> {
+        self.regions
+            .iter()
+            .map(|clip| PaintClip::from_paint_rect(clip.paint_rect()))
+            .collect()
+    }
 }
 
 impl TableCellFragmentPlan {
@@ -243,18 +306,8 @@ impl TableCellFragmentPlan {
         self.border_box.page_top_rect(self.placement).height()
     }
 
-    pub(in crate::layout::table) fn content_box(
-        &self,
-        cell_style: &ComputedStyle,
-        cell_borders: css::Edges,
-    ) -> TableCellContentBox {
-        self.border_box.content_box(
-            self.placement,
-            cell_style.padding,
-            cell_borders,
-            self.content_offset,
-            self.content_x_offset,
-        )
+    pub(in crate::layout::table) fn content_box(&self) -> TableCellContentBox {
+        self.content_geometry.content_box()
     }
 }
 
@@ -269,7 +322,53 @@ impl TableCellFragmentPlan {
 pub(in crate::layout::table) struct TableCellContentPlan {
     pub(in crate::layout::table) inline_sequence: Option<inline_layout::InlineLineSequence>,
     pub(in crate::layout::table) child_fragments: Vec<TableCellChildFragmentPlan>,
+    /// The source and painted block spans represented by this cell piece.
+    ///
+    /// A row fragment is not merely a height clipped from the original row:
+    /// its cell contents retain their source-child range and continuation
+    /// state so subsequent fragmentainers can resume at a legal child
+    /// boundary.  CSS Fragmentation breaks table-cell block contents at the
+    /// same class-C opportunities as an ordinary block container:
+    /// <https://www.w3.org/TR/css-break-3/#break-within>.
+    pub(in crate::layout::table) fragment_range: Option<TableCellFragmentRange>,
     pub(in crate::layout::table) children_painted_by_inline_sequence: bool,
+}
+
+impl TableCellContentPlan {
+    /// Return the final inline fragment span on the cell's logical block axis.
+    ///
+    /// CSS Tables aligns a cell's actual content fragment, after its inline
+    /// constraint has formed lines, rather than an unconstrained intrinsic
+    /// probe.  Orthogonal cells map this span to physical width; keeping the
+    /// projection on the planned line sequence prevents a root-table track
+    /// metric from leaking back into cell alignment.
+    /// <https://drafts.csswg.org/css-tables-3/#table-cell-content-layout-second-pass>
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+    pub(in crate::layout::table) fn logical_block_subject_size(
+        &self,
+        cell_style: &ComputedStyle,
+    ) -> f32 {
+        let Some(sequence) = &self.inline_sequence else {
+            return 0.0;
+        };
+        match cell_style.writing_mode {
+            WritingMode::HorizontalTb => sequence.total_height(),
+            WritingMode::VerticalRl
+            | WritingMode::VerticalLr
+            | WritingMode::SidewaysRl
+            | WritingMode::SidewaysLr => {
+                // The vertical line stack reserves a full `line-height` for
+                // its final line, but its last typographic unit occupies only
+                // the font-size block extent. Align the actual inline-text
+                // subject rather than treating that trailing leading as
+                // content. For one upright line this is its glyph's em box;
+                // for several lines the inter-line distances remain intact.
+                // <https://www.w3.org/TR/css-inline-3/#line-height-property>
+                (sequence.total_height() - (cell_style.line_height - cell_style.font_size).max(0.0))
+                    .max(0.0)
+            }
+        }
+    }
 }
 
 impl TableCellContentPlan {
@@ -277,16 +376,42 @@ impl TableCellContentPlan {
         Self {
             inline_sequence: None,
             child_fragments: Vec::new(),
+            fragment_range: None,
             children_painted_by_inline_sequence: false,
         }
     }
+}
+
+/// Child-aware source range represented by one table-cell fragment.
+///
+/// The coordinates remain in the source cell's block coordinate system while
+/// `painted_*` records the portion selected for the destination fragmentainer.
+/// Keeping both spans explicit prevents continuation paint from inferring its
+/// state solely from a row-height slice.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::table) struct TableCellFragmentRange {
+    pub(in crate::layout::table) source_child_start: usize,
+    pub(in crate::layout::table) source_child_end: usize,
+    pub(in crate::layout::table) source_block_top: f32,
+    pub(in crate::layout::table) source_block_bottom: f32,
+    pub(in crate::layout::table) painted_block_top: f32,
+    pub(in crate::layout::table) painted_block_bottom: f32,
+    pub(in crate::layout::table) continues_from_previous: bool,
+    pub(in crate::layout::table) continues_to_next: bool,
 }
 
 /// One planned in-flow table-cell child slice for a split row piece.
 #[derive(Debug, Clone)]
 pub(in crate::layout::table) struct TableCellChildFragmentPlan {
     pub(in crate::layout::table) source_child_index: usize,
-    pub(in crate::layout::table) child_top: f32,
+    /// Block-start edge in the source cell's coordinate system. This is used
+    /// only to decide which source child interval intersects a row piece.
+    pub(in crate::layout::table) source_child_top: f32,
+    /// Block-start edge in the destination fragmentainer's coordinate system.
+    ///
+    /// A continuation piece restarts at the new row's block-start edge, so it
+    /// cannot paint using `source_child_top` directly.
+    pub(in crate::layout::table) painted_child_top: f32,
     pub(in crate::layout::table) child_height: f32,
     pub(in crate::layout::table) slice_top: f32,
     pub(in crate::layout::table) slice_bottom: f32,
@@ -409,6 +534,9 @@ pub(in crate::layout::table) struct TableRowOverflowBreakInput {
     pub(in crate::layout::table) row_required_height: f32,
     pub(in crate::layout::table) current_fragmentainer: TableFragmentainer,
     pub(in crate::layout::table) row_kept_by_avoid_group: bool,
+    /// An oversized row with an authored row-level avoid still prefers its
+    /// first child fragment to begin at the next class-A boundary.
+    pub(in crate::layout::table) prefer_fresh_fragment: bool,
     pub(in crate::layout::table) can_break: bool,
     pub(in crate::layout::table) chrome_context: TableFragmentChromeContext,
 }
@@ -636,7 +764,7 @@ impl TableForcedBreakDecision {
     pub(in crate::layout::table) fn choose(input: TableForcedBreakInput) -> Self {
         let incoming_repeat_policy = input
             .chrome_context
-            .repeat_policy(input.row_required_height);
+            .repeat_policy(layout_pt(input.row_required_height));
         Self {
             boundary: TableFragmentBoundaryDecision::new(
                 input.outgoing_repeat_policy,
@@ -687,7 +815,7 @@ impl TableNamedPageBreakDecision {
 
         let incoming_repeat_policy = input
             .chrome_context
-            .repeat_policy(input.row_required_height);
+            .repeat_policy(layout_pt(input.row_required_height));
         Some(Self {
             boundary: TableFragmentBoundaryDecision::new(
                 input.outgoing_repeat_policy,
@@ -873,16 +1001,18 @@ impl Default for TableAvoidBreakCandidateState {
 impl TableAvoidRunBreakDecision {
     pub(in crate::layout::table) fn choose(input: TableAvoidRunBreakInput) -> Option<Self> {
         let avoid_run_height = input.candidate.height() + input.row_height;
-        let incoming_repeat_policy = input.chrome_context.repeat_policy(avoid_run_height);
+        let incoming_repeat_policy = input
+            .chrome_context
+            .repeat_policy(layout_pt(avoid_run_height));
         let next_fragmentainer = input
             .chrome_context
             .fresh_fragmentainer(incoming_repeat_policy);
         FragmentPrebreakDecision::choose(FragmentPrebreakInput {
             can_advance: input.can_advance,
             current_fragmentainer: input.current_fragmentainer.as_fragmentainer(),
-            required_block_size: input.row_height,
+            required_block_size: layout_pt(input.row_height),
             empty_fragmentainer: next_fragmentainer.body_capacity_fragmentainer(),
-            empty_fit_block_size: avoid_run_height,
+            empty_fit_block_size: layout_pt(avoid_run_height),
         })
         .should_break
         .then_some(Self {
@@ -895,20 +1025,29 @@ impl TableAvoidRunBreakDecision {
 
 impl TableRowOverflowBreakDecision {
     pub(in crate::layout::table) fn choose(input: TableRowOverflowBreakInput) -> Option<Self> {
-        let row_requires_split =
-            input.row_height > input.current_fragmentainer.fragmentainer_block_size() + 0.01;
+        let row_requires_split = input.row_height
+            > input
+                .current_fragmentainer
+                .fragmentainer_block_size()
+                .points()
+                + 0.01;
+        // `row_required_height` includes any non-row table edge that must be
+        // emitted immediately after this row. The row itself remains the
+        // paint/slicing unit, but the fragmentation fit check must reserve the
+        // complete trailing contribution.
         let row_overflows_page = if row_requires_split {
-            !input.row_kept_by_avoid_group
-                && input.current_fragmentainer.available_block_size() <= 0.01
+            input.prefer_fresh_fragment
+                || !input.row_kept_by_avoid_group
+                    && input.current_fragmentainer.available_block_size().points() <= 0.01
         } else {
-            input.row_height > input.current_fragmentainer.available_block_size()
+            input.row_required_height > input.current_fragmentainer.available_block_size().points()
         };
         let row_overflows_reserved_footer = if row_requires_split {
             !input.row_kept_by_avoid_group
-                && input.current_fragmentainer.available_body_size() <= 0.01
+                && input.current_fragmentainer.available_body_size().points() <= 0.01
         } else {
-            input.row_height + input.current_fragmentainer.reserved_footer_height
-                > input.current_fragmentainer.available_block_size()
+            input.row_required_height + input.current_fragmentainer.reserved_footer_height.points()
+                > input.current_fragmentainer.available_block_size().points()
         };
         let should_advance = FragmentAdvanceDecision::choose(FragmentAdvanceInput {
             break_is_applicable: true,
@@ -925,7 +1064,7 @@ impl TableRowOverflowBreakDecision {
             row_height: input.row_height,
             incoming_repeat_policy: input
                 .chrome_context
-                .repeat_policy(input.row_required_height),
+                .repeat_policy(layout_pt(input.row_required_height)),
         })
     }
 }
@@ -935,10 +1074,11 @@ impl TableOversizedRowSliceDecision {
         let available_body_size = input
             .current_fragmentainer
             .available_body_size()
-            .min(input.current_fragmentainer.body_capacity);
+            .points()
+            .min(input.current_fragmentainer.body_capacity.points());
         let incoming_repeat_policy = input
             .chrome_context
-            .repeat_policy(input.row_required_height);
+            .repeat_policy(layout_pt(input.row_required_height));
         if available_body_size > 0.01 && input.remaining_height > available_body_size + 0.01 {
             return Self {
                 kind: TableOversizedRowSliceDecisionKind::PaintSlice,
@@ -981,6 +1121,22 @@ impl TableOversizedRowSliceDecision {
     pub(in crate::layout::table) fn continues_after_slice(self) -> bool {
         self.remaining_height - self.piece_height > 0.01
     }
+
+    /// Restrict a height-based candidate to a legal shared table-cell child
+    /// boundary.  A zero-sized result means that the source row must advance
+    /// before its next piece; callers only use that result when another
+    /// fragmentainer is available.
+    pub(in crate::layout::table) fn at_child_boundary(mut self, piece_height: f32) -> Self {
+        debug_assert!(piece_height >= 0.0);
+        if !self.paints_slice() {
+            return self;
+        }
+        self.piece_height = piece_height.min(self.piece_height).max(0.0);
+        if self.piece_height <= 0.01 {
+            self.kind = TableOversizedRowSliceDecisionKind::AdvanceBeforeSlice;
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1022,30 +1178,33 @@ impl TableFragmentRepeatPolicy {
         if self.repeat_footer { rows } else { &[] }
     }
 
-    pub(in crate::layout::table) fn reserved_footer_height(&self, footer_height: f32) -> f32 {
+    pub(in crate::layout::table) fn reserved_footer_height(
+        &self,
+        footer_height: LayoutLength,
+    ) -> LayoutLength {
         if self.repeat_footer {
             footer_height
         } else {
-            0.0
+            layout_pt(0.0)
         }
     }
 
     pub(in crate::layout::table) fn body_capacity(
         &self,
-        fragmentainer_block_size: f32,
-        header_height: f32,
-        footer_height: f32,
-    ) -> f32 {
+        fragmentainer_block_size: LayoutLength,
+        header_height: LayoutLength,
+        footer_height: LayoutLength,
+    ) -> LayoutLength {
         let repeated_height = if self.repeat_header {
             header_height
         } else {
-            0.0
+            layout_pt(0.0)
         } + if self.repeat_footer {
             footer_height
         } else {
-            0.0
+            layout_pt(0.0)
         };
-        (fragmentainer_block_size - repeated_height).max(0.0)
+        layout_pt((fragmentainer_block_size.points() - repeated_height.points()).max(0.0))
     }
 }
 
@@ -1060,9 +1219,9 @@ impl TableFragmentRepeatPolicy {
 /// <https://www.w3.org/TR/CSS22/tables.html#value-def-table-header-group>.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout::table) struct TableFragmentChromeContext {
-    pub(in crate::layout::table) fragmentainer_block_size: f32,
-    pub(in crate::layout::table) header_height: f32,
-    pub(in crate::layout::table) footer_height: f32,
+    pub(in crate::layout::table) fragmentainer_block_size: LayoutLength,
+    pub(in crate::layout::table) header_height: LayoutLength,
+    pub(in crate::layout::table) footer_height: LayoutLength,
     pub(in crate::layout::table) allow_header: bool,
     pub(in crate::layout::table) allow_footer: bool,
 }
@@ -1070,7 +1229,7 @@ pub(in crate::layout::table) struct TableFragmentChromeContext {
 impl TableFragmentChromeContext {
     pub(in crate::layout::table) fn repeat_policy(
         self,
-        required_body_height: f32,
+        required_body_height: LayoutLength,
     ) -> TableFragmentRepeatPolicy {
         table_fragment_repeat_policy(
             required_body_height,
@@ -1116,23 +1275,23 @@ impl TableFragmentChromeContext {
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout::table) struct TableFragmentainer {
     base: Fragmentainer,
-    pub(in crate::layout::table) reserved_footer_height: f32,
-    pub(in crate::layout::table) body_capacity: f32,
+    pub(in crate::layout::table) reserved_footer_height: LayoutLength,
+    pub(in crate::layout::table) body_capacity: LayoutLength,
 }
 
 impl TableFragmentainer {
     fn with_base(
         base: Fragmentainer,
-        fragmentainer_block_size: f32,
+        fragmentainer_block_size: LayoutLength,
         repeat_policy: TableFragmentRepeatPolicy,
-        header_height: f32,
-        footer_height: f32,
+        header_height: LayoutLength,
+        footer_height: LayoutLength,
         reserve_footer: bool,
     ) -> Self {
         let reserved_footer_height = if reserve_footer {
             repeat_policy.reserved_footer_height(footer_height)
         } else {
-            0.0
+            layout_pt(0.0)
         };
         Self {
             base,
@@ -1145,17 +1304,17 @@ impl TableFragmentainer {
         }
     }
 
-    pub(in crate::layout::table) fn current_from_cursor_bounds(
-        fragmentainer_block_size: f32,
-        content_block_start: f32,
-        fragmentainer_block_end: f32,
+    pub(in crate::layout::table) fn current_from_page_cursor_bounds(
+        fragmentainer_block_size: LayoutLength,
+        content_block_start: PageTopBlockPosition,
+        fragmentainer_block_end: PageTopBlockPosition,
         repeat_policy: TableFragmentRepeatPolicy,
-        header_height: f32,
-        footer_height: f32,
+        header_height: LayoutLength,
+        footer_height: LayoutLength,
         reserve_footer: bool,
     ) -> Self {
         Self::with_base(
-            Fragmentainer::from_cursor_bounds(
+            Fragmentainer::from_page_cursor_bounds(
                 fragmentainer_block_size,
                 content_block_start,
                 fragmentainer_block_end,
@@ -1169,34 +1328,38 @@ impl TableFragmentainer {
     }
 
     pub(in crate::layout::table) fn fresh(
-        fragmentainer_block_size: f32,
+        fragmentainer_block_size: LayoutLength,
         repeat_policy: TableFragmentRepeatPolicy,
-        header_height: f32,
-        footer_height: f32,
+        header_height: LayoutLength,
+        footer_height: LayoutLength,
     ) -> Self {
         let body_capacity =
             repeat_policy.body_capacity(fragmentainer_block_size, header_height, footer_height);
         Self {
             base: Fragmentainer::new(fragmentainer_block_size, body_capacity),
-            reserved_footer_height: 0.0,
+            reserved_footer_height: layout_pt(0.0),
             body_capacity,
         }
     }
 
-    pub(in crate::layout::table) fn fragmentainer_block_size(&self) -> f32 {
+    pub(in crate::layout::table) fn fragmentainer_block_size(&self) -> LayoutLength {
         self.base.fragmentainer_block_size()
     }
 
-    pub(in crate::layout::table) fn available_block_size(&self) -> f32 {
+    pub(in crate::layout::table) fn available_block_size(&self) -> LayoutLength {
         self.base.available_block_size()
     }
 
-    pub(in crate::layout::table) fn required_block_size_overflows(&self, block_size: f32) -> bool {
+    pub(in crate::layout::table) fn required_block_size_overflows(
+        &self,
+        block_size: LayoutLength,
+    ) -> bool {
         self.base.required_block_size_overflows(block_size)
     }
 
-    pub(in crate::layout::table) fn available_body_size(&self) -> f32 {
-        (self.available_block_size() - self.reserved_footer_height).max(0.0)
+    pub(in crate::layout::table) fn available_body_size(&self) -> LayoutLength {
+        self.base
+            .available_block_size_after_reservation(self.reserved_footer_height)
     }
 
     pub(in crate::layout::table) fn as_fragmentainer(&self) -> Fragmentainer {
@@ -1258,19 +1421,21 @@ impl TableRowGroupAvoidDecision {
 
         if !input
             .current_fragmentainer
-            .required_block_size_overflows(input.group_height)
+            .required_block_size_overflows(layout_pt(input.group_height))
         {
             return None;
         }
 
-        let repeat_policy = input.chrome_context.repeat_policy(input.group_height);
+        let repeat_policy = input
+            .chrome_context
+            .repeat_policy(layout_pt(input.group_height));
         let repeat_fragmentainer = input.chrome_context.fresh_fragmentainer(repeat_policy);
         if FragmentPrebreakDecision::choose(FragmentPrebreakInput {
             can_advance: input.can_advance,
             current_fragmentainer: input.current_fragmentainer.as_fragmentainer(),
-            required_block_size: input.group_height,
+            required_block_size: layout_pt(input.group_height),
             empty_fragmentainer: repeat_fragmentainer.body_capacity_fragmentainer(),
-            empty_fit_block_size: input.group_height,
+            empty_fit_block_size: layout_pt(input.group_height),
         })
         .should_break
         {
@@ -1291,7 +1456,8 @@ impl TableRowGroupAvoidDecision {
             .without_repeats()
             .fresh_fragmentainer(no_repeat_policy);
         (input.group_height
-            <= no_repeat_fragmentainer.body_capacity + TABLE_AVOID_UNFRAGMENTED_OVERFLOW_TOLERANCE)
+            <= no_repeat_fragmentainer.body_capacity.points()
+                + TABLE_AVOID_UNFRAGMENTED_OVERFLOW_TOLERANCE)
             .then_some(Self {
                 group: input.group,
                 group_height: input.group_height,
@@ -1336,10 +1502,10 @@ impl TableAvoidRowGroupKeepState {
 /// <https://www.w3.org/TR/CSS22/tables.html#value-def-table-footer-group>
 /// <https://www.w3.org/TR/css-break-3/#break-within>
 pub(in crate::layout::table) fn table_fragment_repeat_policy(
-    required_body_height: f32,
-    fragmentainer_block_size: f32,
-    header_height: f32,
-    footer_height: f32,
+    required_body_height: LayoutLength,
+    fragmentainer_block_size: LayoutLength,
+    header_height: LayoutLength,
+    footer_height: LayoutLength,
     allow_header: bool,
     allow_footer: bool,
 ) -> TableFragmentRepeatPolicy {
@@ -1362,11 +1528,13 @@ pub(in crate::layout::table) fn table_fragment_repeat_policy(
         },
     ];
 
-    let required_body_height = required_body_height.max(0.0);
+    let required_body_height = layout_pt(required_body_height.points().max(0.0));
     for policy in candidates {
         let body_capacity =
             policy.body_capacity(fragmentainer_block_size, header_height, footer_height);
-        if body_capacity > 0.01 && required_body_height <= body_capacity + 0.01 {
+        if body_capacity.points() > 0.01
+            && required_body_height.points() <= body_capacity.points() + 0.01
+        {
             return policy;
         }
     }
@@ -1374,7 +1542,10 @@ pub(in crate::layout::table) fn table_fragment_repeat_policy(
     candidates
         .into_iter()
         .find(|policy| {
-            policy.body_capacity(fragmentainer_block_size, header_height, footer_height) > 0.01
+            policy
+                .body_capacity(fragmentainer_block_size, header_height, footer_height)
+                .points()
+                > 0.01
         })
         .unwrap_or(TableFragmentRepeatPolicy {
             repeat_header: false,
@@ -1400,6 +1571,24 @@ pub(in crate::layout::table) struct TableBodyPaintFragment {
     /// the first committed row's logical block offset here lets all structural
     /// paint phases project through the same table-root axes as cell layout.
     pub(in crate::layout::table) grid_placement: Option<TableGridPlacement>,
+    /// Source row tracks, retained independently of fragment-local paint
+    /// placement so structural backgrounds can use their unfragmented CSS
+    /// Tables positioning rectangles.
+    pub(in crate::layout::table) grid_row_bounds: Option<Vec<TableRowBounds>>,
+}
+
+/// Structural table paint owned by a relatively positioned row or row group.
+///
+/// Table layout creates row and row-group backgrounds after row content has
+/// been measured. Retaining those primitives with their originating style
+/// lets finalization place them in the positioned auto stack rather than
+/// flattening them into the table's in-flow background band.
+/// <https://drafts.csswg.org/css-position-3/#relative-positioning>
+#[derive(Debug, Clone)]
+pub(in crate::layout::table) struct RelativeTablePartStructuralPaint {
+    pub(in crate::layout::table) style: ComputedStyle,
+    pub(in crate::layout::table) bounds: PaintClip,
+    pub(in crate::layout::table) primitives: Vec<PaintPrimitive>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1421,13 +1610,29 @@ pub(in crate::layout::table) struct PreparedTableCell {
 
 impl PreparedTableCell {
     pub(in crate::layout::table) fn width(&self) -> f32 {
-        self.inline_bounds.size
+        self.inline_bounds.page_width()
     }
+}
+
+/// The final coordinate context established by one table-cell content scope.
+///
+/// Inline atomic fragments can outlive the immediate cell-layout call. They
+/// therefore must retain the cell's page origin and logical flow rather than
+/// infer a sideways projection from a nesting counter during replay:
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box> and
+/// <https://drafts.csswg.org/css-tables-3/#table-cell-content-layout-second-pass>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct TableCellContentCoordinateContext {
+    pub(in crate::layout) origin: PageTopPoint,
+    pub(in crate::layout) writing_mode: WritingMode,
+    pub(in crate::layout) direction: Direction,
 }
 
 pub(in crate::layout::table) struct TableCellContentScope {
     pub(in crate::layout::table) content_left: f32,
     pub(in crate::layout::table) content_right: f32,
+    pub(in crate::layout::table) table_cell_content_coordinate_contexts:
+        Vec<TableCellContentCoordinateContext>,
     pub(in crate::layout::table) cursor_y: f32,
     pub(in crate::layout::table) ancestors: Vec<ElementSignature>,
     pub(in crate::layout::table) containing_block_direction: Direction,
@@ -1499,6 +1704,10 @@ pub(in crate::layout::table) struct TableHeightPlan {
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout::table) struct TableRowHeightPlan {
     pub(in crate::layout::table) base: f32,
+    /// The row's pre-`visibility: collapse` intrinsic block contribution.
+    /// Spanning-cell descendants are laid out against these source tracks
+    /// before the collapsed tracks are removed from visible painting.
+    pub(in crate::layout::table) source_height: f32,
     pub(in crate::layout::table) reference: f32,
     pub(in crate::layout::table) final_height: f32,
     pub(in crate::layout::table) auto: bool,
@@ -1621,6 +1830,7 @@ impl TableBodyPaintFragment {
                 start_decision,
             ),
             grid_placement: None,
+            grid_row_bounds: None,
         }
     }
 
@@ -1634,7 +1844,27 @@ impl TableBodyPaintFragment {
         planned_row_heights: &[f32],
         planned_row_occupancy: &[bool],
         table_metrics: TableMetrics,
+        _fragmentainer_block_size: f32,
     ) -> TableGridPlacement {
+        if self.grid_row_bounds.is_none() {
+            self.grid_row_bounds = Some(
+                planned_row_heights
+                    .iter()
+                    .enumerate()
+                    .map(|(row_index, row_height)| {
+                        TableRowBounds::new(
+                            table_row_block_start(
+                                planned_row_heights,
+                                planned_row_occupancy,
+                                row_index,
+                                table_metrics.clone(),
+                            ),
+                            *row_height,
+                        )
+                    })
+                    .collect(),
+            );
+        }
         *self.grid_placement.get_or_insert_with(|| {
             let logical_block_start = table_row_block_start(
                 planned_row_heights,
@@ -1642,14 +1872,44 @@ impl TableBodyPaintFragment {
                 decision.row_index,
                 table_metrics.clone(),
             );
+            let table_block_extent = table_grid_height(
+                planned_row_heights,
+                planned_row_occupancy,
+                table_metrics.clone(),
+            );
+            // `table_x` is the physical left edge of the complete table grid.
+            // The root writing mode is applied by `TableGridPlacement` below;
+            // shifting this origin for vertical fragmentainers would apply the
+            // block-direction projection a second time and move an
+            // unfragmented vertical-rl table to the fragmentainer's far edge.
+            // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+            let projected_table_x = if table_style.writing_mode.has_vertical_lines() {
+                // `table_x` is the wrapper content-box's physical left edge.
+                // The row grid starts after its logical block-start edge
+                // spacing, which is physical X for a vertical table.
+                table_x + table_vertical_edge_spacing(planned_row_occupancy, table_metrics.clone())
+            } else {
+                table_x
+            };
+            let projected_table_top = decision.row_top
+                + decision.row_offset
+                + logical_block_start
+                + if table_style.writing_mode.has_vertical_lines() {
+                    // Column-plan offsets retain the inline-start separated
+                    // border spacing. The fragment row top is already at the
+                    // first cell's inline edge, so recover the wrapper grid's
+                    // physical top before projecting those offsets.
+                    table_metrics.spacing.horizontal.length_points()
+                } else {
+                    0.0
+                };
             TableGridPlacement::with_axes(
-                PageTopPoint::new(
-                    table_x,
-                    decision.row_top + decision.row_offset + logical_block_start,
-                ),
+                PageTopPoint::new(projected_table_x, projected_table_top),
                 TableAxes::for_style(table_style),
-                column_plan.total_width(),
-                table_grid_height(planned_row_heights, planned_row_occupancy, table_metrics),
+                TableGridLogicalSize::new(
+                    column_plan.total_width(),
+                    LogicalBlockContentSize::new(content_box_pt(table_block_extent)),
+                ),
             )
         })
     }
@@ -1859,11 +2119,13 @@ pub(in crate::layout::table) fn table_horizontal_non_content_width(
 
 pub(in crate::layout::table) fn table_content_width_clamped_to_min_content(
     style: &ComputedStyle,
-    content_width: f32,
-    min_content: f32,
-) -> f32 {
+    content_width: LogicalInlineContentSize,
+    min_content: LogicalInlineContentSize,
+) -> LogicalInlineContentSize {
     if style.table_layout == TableLayout::Auto {
-        content_width.max(min_content)
+        LogicalInlineContentSize::new(content_box_pt(
+            content_width.points().max(min_content.points()),
+        ))
     } else {
         content_width
     }
@@ -1939,6 +2201,8 @@ pub(in crate::layout::table) fn table_column_background_primitives(
 pub(in crate::layout::table) fn table_column_grid_background_primitives(
     placement: TableGridPlacement,
     column_plan: &TableColumnPlan,
+    fragment_rows: &[usize],
+    row_bounds: &[TableRowBounds],
     start_column: usize,
     end_column: usize,
     style: &ComputedStyle,
@@ -1949,27 +2213,124 @@ pub(in crate::layout::table) fn table_column_grid_background_primitives(
     if start_column >= end_column || start_column >= column_plan.column_count() {
         return Vec::new();
     }
+    // `TableColumnPlan` has already resolved `direction` for its inline
+    // bounds. `TableGridPlacement` deliberately projects table-grid slots
+    // with LTR inline progression to avoid applying that reversal twice.
     let inline_bounds = column_plan.inline_bounds_for_span(
         start_column,
         end_column.min(column_plan.column_count()) - start_column,
     );
-    let grid_rect = TableGridRect::new(
-        TableGridPoint::new(inline_bounds.start, 0.0),
-        TableGridSize::new(inline_bounds.size, placement.logical_block_extent()),
+    let positioning_rect = TableGridRect::new(
+        TableGridPoint::from_lengths(inline_bounds.start, TableGridLength::new(0.0)),
+        TableGridSize::from_lengths(inline_bounds.size, placement.logical_block_grid_extent()),
     );
-    let paint_rect = placement.overflow_clip_for(grid_rect).paint_rect();
-    let mut primitives =
-        table_column_background_primitives_with_clip(paint_rect, style, paint_rect);
-    let area = PaintBackgroundArea::from_paint_rect(paint_rect);
-    primitives.extend(background_image_primitives_for_style_with_paint_areas(
-        area,
-        area,
-        style,
-        base_url,
-        root_url,
-        resource_cache,
-    ));
+    let logical_paint_view =
+        placement.logical_paint_view_with_inline_edge(column_plan.horizontal_spacing);
+    let logical_positioning_area = PaintBackgroundArea::from_paint_rect(
+        logical_paint_view
+            .overflow_clip_for(positioning_rect)
+            .paint_rect(),
+    );
+    let logical_paint_transform =
+        placement.logical_paint_to_page_transform(column_plan.horizontal_spacing);
+    let image_style = table_column_image_style_for_placement(style, placement);
+    let mut primitives = Vec::new();
+    for row_index in fragment_rows {
+        let Some(row) = row_bounds.get(*row_index).copied() else {
+            continue;
+        };
+        if row.size <= 0.0 {
+            continue;
+        }
+        let clip = placement
+            .overflow_clip_for(TableGridRect::new(
+                TableGridPoint::from_lengths(
+                    inline_bounds.start,
+                    // `row.start` is a source logical block offset.  The
+                    // final `TableGridPlacement` projection below owns the
+                    // vertical-rl reversal; pre-reversing it here would flip
+                    // column background clips a second time.
+                    TableGridLength::new(row.start),
+                ),
+                TableGridSize::from_lengths(inline_bounds.size, TableGridLength::new(row.size)),
+            ))
+            .paint_rect();
+        primitives.extend(table_column_background_primitives_with_clip(
+            clip, style, clip,
+        ));
+        let logical_clip = logical_paint_view
+            .overflow_clip_for(TableGridRect::new(
+                TableGridPoint::from_lengths(inline_bounds.start, TableGridLength::new(row.start)),
+                TableGridSize::from_lengths(inline_bounds.size, TableGridLength::new(row.size)),
+            ))
+            .paint_rect();
+        primitives.extend(
+            background_image_primitives_for_style_with_paint_areas(
+                logical_positioning_area,
+                PaintBackgroundArea::from_paint_rect(logical_clip),
+                &image_style,
+                base_url,
+                root_url,
+                resource_cache,
+            )
+            .into_iter()
+            .map(|primitive| {
+                transform_table_column_image_primitive(primitive, logical_paint_transform)
+            }),
+        );
+    }
     primitives
+}
+
+/// Apply the root table's logical-to-page transform to a structural image
+/// primitive.  Linear gradients with coincident hard stops are emitted as
+/// vector paths, and carry their local transform directly into PDF painting.
+/// Other image forms remain in the ordinary physical painter until their
+/// retained pattern representation supports an equivalent transform scope.
+fn transform_table_column_image_primitive(
+    primitive: PaintPrimitive,
+    transform: PaintTransform,
+) -> PaintPrimitive {
+    match primitive {
+        PaintPrimitive::Path(mut path) => {
+            path.transform = transform.multiply(path.transform);
+            PaintPrimitive::Path(path)
+        }
+        primitive => primitive,
+    }
+}
+
+/// Project structural column gradients into the physical orientation of the
+/// table grid.  The generic painter receives the already-projected physical
+/// box, so vertical-rl needs the corresponding quarter-turn of a logical
+/// gradient direction.
+fn table_column_image_style_for_placement(
+    style: &ComputedStyle,
+    placement: TableGridPlacement,
+) -> ComputedStyle {
+    let angle_delta = match placement.writing_mode() {
+        WritingMode::VerticalRl | WritingMode::SidewaysRl => -90.0,
+        WritingMode::VerticalLr | WritingMode::SidewaysLr => 90.0,
+        WritingMode::HorizontalTb => 0.0,
+    };
+    if angle_delta == 0.0 {
+        return style.clone();
+    }
+    let mut projected = style.clone();
+    for layer in &mut projected.background_layers {
+        if let Some(css::BackgroundImage::LinearGradient(gradient)) = layer.image.as_image_mut()
+            && let LinearGradientDirection::Angle(angle) = &mut gradient.direction
+        {
+            *angle = (*angle + angle_delta).rem_euclid(360.0);
+        }
+    }
+    if let Some(css::BackgroundImage::LinearGradient(gradient)) =
+        projected.background_image.as_image_mut()
+        && let LinearGradientDirection::Angle(angle) = &mut gradient.direction
+    {
+        *angle = (*angle + angle_delta).rem_euclid(360.0);
+    }
+    projected
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2212,9 +2573,9 @@ fn table_column_fragment_cell_clips(
             let cell_inline =
                 column_plan.inline_bounds_for_span(placement.column, placement.colspan);
             let cell_rect = paint_space_rect(
-                table_x + cell_inline.start,
+                cell_inline.page_x(table_x),
                 cell_bottom,
-                cell_inline.size,
+                cell_inline.page_width(),
                 (cell_top - cell_bottom).max(0.0),
             );
             if cell_rect.size.width > 0.0 && cell_rect.size.height > 0.0 {
@@ -2240,21 +2601,14 @@ pub(in crate::layout::table) fn table_row_fragment_background_primitives(
     fragment_rows: &[usize],
     row_tops: &[f32],
     row_heights: &[f32],
+    row_offsets: &[f32],
+    original_row_heights: &[f32],
     row_index: usize,
     style: &ComputedStyle,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
 ) -> Vec<PaintPrimitive> {
-    if matches!(
-        style.writing_mode,
-        WritingMode::VerticalRl
-            | WritingMode::VerticalLr
-            | WritingMode::SidewaysRl
-            | WritingMode::SidewaysLr
-    ) {
-        return Vec::new();
-    }
     let clips = table_row_fragment_cell_clips(
         table_x,
         column_plan,
@@ -2264,6 +2618,27 @@ pub(in crate::layout::table) fn table_row_fragment_background_primitives(
         row_heights,
         row_index,
     );
+    // `box-decoration-break` defaults to `slice`, so a row background is
+    // positioned against the unfragmented source row even though each table
+    // fragment exposes it only through the cells visible in that fragment.
+    // In particular, a repeating image must not restart at a column/page
+    // boundary.  The row plan retains the amount already consumed from the
+    // source row and its original height precisely for this projection:
+    // <https://www.w3.org/TR/css-break-3/#break-decoration>.
+    let positioning_rect = fragment_rows
+        .iter()
+        .position(|source_row| *source_row == row_index)
+        .and_then(|local_row| {
+            let top = *row_tops.get(local_row)? + *row_offsets.get(local_row)?;
+            let height = *original_row_heights.get(local_row)?;
+            (height > 0.0).then_some(paint_space_rect(
+                positioning_rect.origin.x,
+                top - height,
+                positioning_rect.size.width,
+                height,
+            ))
+        })
+        .unwrap_or(positioning_rect);
     let positioning_area = PaintBackgroundArea::from_paint_rect(positioning_rect);
     let mut primitives = Vec::new();
     if let Some(fill) = style.background_color
@@ -2273,6 +2648,238 @@ pub(in crate::layout::table) fn table_row_fragment_background_primitives(
             clips
                 .iter()
                 .cloned()
+                .map(|clip| PaintPrimitive::Rect(RenderedRect::from_paint_rect(clip, Some(fill)))),
+        );
+    }
+    primitives.extend(clips.into_iter().flat_map(|clip| {
+        background_image_primitives_for_style_with_paint_areas(
+            positioning_area,
+            PaintBackgroundArea::from_paint_rect(clip),
+            style,
+            base_url,
+            root_url,
+            resource_cache,
+        )
+    }));
+    primitives
+}
+
+/// Paint one row background from source table-grid geometry.
+///
+/// Unlike fragment-local `row_top` values, `row_bounds` identifies the whole
+/// source row.  The positioning rectangle therefore remains continuous under
+/// the default `box-decoration-break: slice`, while the generated primitives
+/// are visible only through originating cell pieces in this fragment.
+/// <https://drafts.csswg.org/css-tables-3/#drawing-cell-backgrounds> and
+/// <https://www.w3.org/TR/css-break-3/#break-decoration>.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::layout::table) fn table_row_grid_background_primitives(
+    placement: TableGridPlacement,
+    row_bounds: &[TableRowBounds],
+    column_plan: &TableColumnPlan,
+    table_grid: &TableGrid,
+    fragment_rows: &[usize],
+    row_heights: &[f32],
+    row_offsets: &[f32],
+    row_index: usize,
+    style: &ComputedStyle,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+    resource_cache: &ResourceCache,
+) -> Vec<PaintPrimitive> {
+    let Some(source_row) = row_bounds.get(row_index).copied() else {
+        return Vec::new();
+    };
+    let positioning_rect = placement
+        .page_top_rect_for(TableGridRect::new(
+            TableGridPoint::from_lengths(
+                TableGridLength::new(0.0),
+                TableGridLength::new(source_row.start),
+            ),
+            TableGridSize::from_lengths(
+                placement.logical_inline_grid_extent(),
+                TableGridLength::new(source_row.size),
+            ),
+        ))
+        .paint_rect();
+    let clips = table_originating_cell_grid_clips(
+        placement,
+        row_bounds,
+        column_plan,
+        table_grid,
+        fragment_rows,
+        row_heights,
+        row_offsets,
+        row_index,
+        row_index,
+        row_index.saturating_add(1),
+    );
+    table_structural_background_primitives(
+        positioning_rect,
+        clips,
+        style,
+        base_url,
+        root_url,
+        resource_cache,
+    )
+}
+
+/// Paint one row-group background from source table-grid geometry.
+///
+/// Row groups and rows deliberately share originating-cell clipping so cells
+/// spanning later source rows expose the correct structural background in a
+/// fragmented table.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::layout::table) fn table_row_group_grid_background_primitives(
+    placement: TableGridPlacement,
+    row_bounds: &[TableRowBounds],
+    column_plan: &TableColumnPlan,
+    table_grid: &TableGrid,
+    fragment_rows: &[usize],
+    row_heights: &[f32],
+    row_offsets: &[f32],
+    start_row: usize,
+    end_row: usize,
+    style: &ComputedStyle,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+    resource_cache: &ResourceCache,
+) -> Vec<PaintPrimitive> {
+    let Some(start) = row_bounds.get(start_row).copied() else {
+        return Vec::new();
+    };
+    let Some(end) = end_row
+        .checked_sub(1)
+        .and_then(|index| row_bounds.get(index))
+        .copied()
+    else {
+        return Vec::new();
+    };
+    let positioning_rect = placement
+        .page_top_rect_for(TableGridRect::new(
+            TableGridPoint::from_lengths(
+                TableGridLength::new(0.0),
+                TableGridLength::new(start.start),
+            ),
+            TableGridSize::from_lengths(
+                placement.logical_inline_grid_extent(),
+                TableGridLength::new((end.start + end.size - start.start).max(0.0)),
+            ),
+        ))
+        .paint_rect();
+    let clips = (start_row..end_row)
+        .flat_map(|originating_row| {
+            table_originating_cell_grid_clips(
+                placement,
+                row_bounds,
+                column_plan,
+                table_grid,
+                fragment_rows,
+                row_heights,
+                row_offsets,
+                originating_row,
+                start_row,
+                end_row,
+            )
+        })
+        .collect();
+    table_structural_background_primitives(
+        positioning_rect,
+        clips,
+        style,
+        base_url,
+        root_url,
+        resource_cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn table_originating_cell_grid_clips(
+    placement: TableGridPlacement,
+    row_bounds: &[TableRowBounds],
+    column_plan: &TableColumnPlan,
+    table_grid: &TableGrid,
+    fragment_rows: &[usize],
+    row_heights: &[f32],
+    row_offsets: &[f32],
+    originating_row: usize,
+    structural_start_row: usize,
+    structural_end_row: usize,
+) -> Vec<PaintRect> {
+    let Some(placements) = table_grid.rows.get(originating_row) else {
+        return Vec::new();
+    };
+    let mut clips = Vec::new();
+    for cell in placements {
+        let cell_start_row = originating_row;
+        let cell_end_row = originating_row
+            .saturating_add(cell.rowspan.max(1))
+            .min(row_bounds.len());
+        let Some(cell_start) = row_bounds.get(cell_start_row).copied() else {
+            continue;
+        };
+        let Some(cell_end) = cell_end_row
+            .checked_sub(1)
+            .and_then(|index| row_bounds.get(index))
+            .copied()
+        else {
+            continue;
+        };
+        let cell_block_start = cell_start.start;
+        let cell_block_end = cell_end.start + cell_end.size;
+        let inline = column_plan.inline_bounds_for_span(cell.column, cell.colspan);
+        for (local_row, source_row) in fragment_rows.iter().copied().enumerate() {
+            if source_row < structural_start_row
+                || source_row >= structural_end_row
+                || source_row < cell_start_row
+                || source_row >= cell_end_row
+            {
+                continue;
+            }
+            let (Some(source_bounds), Some(visible_size), Some(visible_offset)) = (
+                row_bounds.get(source_row),
+                row_heights.get(local_row),
+                row_offsets.get(local_row),
+            ) else {
+                continue;
+            };
+            let visible_start = source_bounds.start + visible_offset.max(0.0);
+            let visible_end = visible_start + visible_size.max(0.0);
+            let start = visible_start.max(cell_block_start);
+            let end = visible_end.min(cell_block_end);
+            if end <= start {
+                continue;
+            }
+            clips.push(
+                placement
+                    .page_top_rect_for(TableGridRect::new(
+                        TableGridPoint::from_lengths(inline.start, TableGridLength::new(start)),
+                        TableGridSize::from_lengths(inline.size, TableGridLength::new(end - start)),
+                    ))
+                    .paint_rect(),
+            );
+        }
+    }
+    clips
+}
+
+fn table_structural_background_primitives(
+    positioning_rect: PaintRect,
+    clips: Vec<PaintRect>,
+    style: &ComputedStyle,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+    resource_cache: &ResourceCache,
+) -> Vec<PaintPrimitive> {
+    let positioning_area = PaintBackgroundArea::from_paint_rect(positioning_rect);
+    let mut primitives = Vec::new();
+    if let Some(fill) = style.background_color
+        && fill.is_visible()
+    {
+        primitives.extend(
+            clips
+                .iter()
+                .copied()
                 .map(|clip| PaintPrimitive::Rect(RenderedRect::from_paint_rect(clip, Some(fill)))),
         );
     }
@@ -2329,9 +2936,9 @@ fn table_row_fragment_cell_clips(
         };
         let cell_inline = column_plan.inline_bounds_for_span(placement.column, placement.colspan);
         clips.push(paint_space_rect(
-            table_x + cell_inline.start,
+            cell_inline.page_x(table_x),
             cell_bottom,
-            cell_inline.size,
+            cell_inline.page_width(),
             (cell_top - cell_bottom).max(0.0),
         ));
     }
@@ -2371,14 +2978,16 @@ fn table_column_background_rect(
         grid_height
     };
     let rect = TableGridRect::new(
-        TableGridPoint::new(inline_bounds.start, 0.0),
-        TableGridSize::new(inline_bounds.size, block_size),
+        TableGridPoint::from_lengths(inline_bounds.start, TableGridLength::new(0.0)),
+        TableGridSize::from_lengths(inline_bounds.size, TableGridLength::new(block_size)),
     );
     let placement = TableGridPlacement::with_axes(
         PageTopPoint::new(table_x, grid_top),
         column_plan.axes,
-        column_plan.total_width(),
-        block_size,
+        TableGridLogicalSize::new(
+            column_plan.total_width(),
+            LogicalBlockContentSize::new(content_box_pt(block_size)),
+        ),
     );
     let paint_rect = placement.overflow_clip_for(rect).paint_rect();
     Some((paint_rect, inline_bounds))
@@ -2431,16 +3040,15 @@ pub(in crate::layout::table) fn visible_column_span(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::layout::table) fn push_table_fragment_row_span_background(
     primitives: &mut Vec<PaintPrimitive>,
-    table_x: f32,
-    used_table_width: f32,
+    inline_span: PageInlineSpan,
     row_tops: &[f32],
     row_heights: &[f32],
     start: usize,
     end: usize,
-    fill: Color,
+    fill: CssColor,
 ) {
     if let Some(bounds) =
-        table_fragment_row_span_bounds(table_x, used_table_width, row_tops, row_heights, start, end)
+        table_fragment_row_span_bounds(inline_span, row_tops, row_heights, start, end)
     {
         primitives.push(PaintPrimitive::Rect(RenderedRect::from_paint_rect(
             bounds.paint_rect(),
@@ -2450,8 +3058,7 @@ pub(in crate::layout::table) fn push_table_fragment_row_span_background(
 }
 
 pub(in crate::layout::table) fn table_fragment_row_span_bounds(
-    table_x: f32,
-    used_table_width: f32,
+    inline_span: PageInlineSpan,
     row_tops: &[f32],
     row_heights: &[f32],
     start: usize,
@@ -2464,7 +3071,9 @@ pub(in crate::layout::table) fn table_fragment_row_span_bounds(
     let last = end - 1;
     let bottom = row_tops[last] - row_heights[last];
     let height = (top - bottom).max(0.0);
-    (height > 0.0).then_some(PageTopRect::new(table_x, top, used_table_width, height).paint_clip())
+    (height > 0.0).then_some(
+        PageTopRect::new(inline_span.left_x(), top, inline_span.width(), height).paint_clip(),
+    )
 }
 
 pub(in crate::layout::table) fn table_wrapper_collision_height(
@@ -2514,7 +3123,7 @@ pub(in crate::layout::table) fn table_wrapper_collision_height_for_border_box(
 pub(in crate::layout::table) fn table_wrapper_positioning_containing_block(
     table_x: f32,
     table_wrapper_top: f32,
-    content_width: f32,
+    content_width: PhysicalContentWidth,
     content_height: f32,
     table_width: UsedTableWidth,
     top_caption_height: f32,
@@ -2523,7 +3132,7 @@ pub(in crate::layout::table) fn table_wrapper_positioning_containing_block(
     PageTopRect::new(
         table_x - table_width.padding.left,
         table_wrapper_top,
-        content_width + table_width.padding.left + table_width.padding.right,
+        content_width.points() + table_width.padding.left + table_width.padding.right,
         top_caption_height
             + table_width.border_widths.top
             + table_width.padding.top
@@ -2571,6 +3180,65 @@ pub(in crate::layout::table) enum TableHeightTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn current_fragmentainer(
+        block_size: f32,
+        content_start: f32,
+        block_end: f32,
+        repeat_policy: TableFragmentRepeatPolicy,
+        header_height: f32,
+        footer_height: f32,
+        reserve_footer: bool,
+    ) -> TableFragmentainer {
+        TableFragmentainer::current_from_page_cursor_bounds(
+            layout_pt(block_size),
+            PageTopBlockPosition::new(content_start),
+            PageTopBlockPosition::new(block_end),
+            repeat_policy,
+            layout_pt(header_height),
+            layout_pt(footer_height),
+            reserve_footer,
+        )
+    }
+
+    #[test]
+    fn row_span_background_bounds_preserve_the_explicit_physical_inline_span() {
+        let bounds = table_fragment_row_span_bounds(
+            PageInlineSpan::new(30.0, 90.0),
+            &[200.0, 160.0],
+            &[40.0, 40.0],
+            0,
+            2,
+        )
+        .expect("two visible rows have a paint bound");
+
+        assert_eq!(
+            bounds,
+            PageTopRect::new(30.0, 200.0, 90.0, 80.0).paint_clip()
+        );
+    }
+
+    #[test]
+    fn table_cell_clip_region_keeps_disjoint_visible_rowspan_areas() {
+        let region = TableCellClipRegion::from_clips(vec![
+            OverflowClip::from_paint_rect(paint_space_rect(0.0, 0.0, 10.0, 4.0)),
+            OverflowClip::from_paint_rect(paint_space_rect(0.0, 6.0, 10.0, 4.0)),
+        ])
+        .expect("visible areas");
+        let viewport = TableCellClipRegion::from_clip(OverflowClip::from_paint_rect(
+            paint_space_rect(2.0, 0.0, 4.0, 10.0),
+        ));
+
+        let intersection = region.intersect(&viewport).expect("shared area");
+        let clips = intersection.paint_clips();
+        assert_eq!(clips.len(), 2);
+        assert_eq!(
+            intersection.bounding_clip(),
+            Some(OverflowClip::from_paint_rect(paint_space_rect(
+                2.0, 0.0, 4.0, 10.0
+            )))
+        );
+    }
 
     #[test]
     fn table_avoid_candidate_does_not_arm_current_row_for_break_before_avoid() {
@@ -2620,27 +3288,33 @@ mod tests {
             repeat_footer: true,
         };
 
-        assert_eq!(policy.body_capacity(100.0, 15.0, 10.0), 75.0);
-        assert_eq!(policy.body_capacity(20.0, 15.0, 10.0), 0.0);
+        assert_eq!(
+            policy.body_capacity(layout_pt(100.0), layout_pt(15.0), layout_pt(10.0)),
+            layout_pt(75.0)
+        );
+        assert_eq!(
+            policy.body_capacity(layout_pt(20.0), layout_pt(15.0), layout_pt(10.0)),
+            layout_pt(0.0)
+        );
     }
 
     #[test]
     fn table_chrome_context_uses_fragmentainer_block_size_for_repeat_policy() {
         let context = TableFragmentChromeContext {
-            fragmentainer_block_size: 90.0,
-            header_height: 20.0,
-            footer_height: 15.0,
+            fragmentainer_block_size: layout_pt(90.0),
+            header_height: layout_pt(20.0),
+            footer_height: layout_pt(15.0),
             allow_header: true,
             allow_footer: true,
         };
 
-        let policy = context.repeat_policy(70.0);
+        let policy = context.repeat_policy(layout_pt(70.0));
         assert!(policy.repeat_header);
         assert!(!policy.repeat_footer);
 
         let fragmentainer = context.fresh_fragmentainer(policy);
-        assert_eq!(fragmentainer.fragmentainer_block_size(), 90.0);
-        assert_eq!(fragmentainer.body_capacity, 70.0);
+        assert_eq!(fragmentainer.fragmentainer_block_size(), layout_pt(90.0));
+        assert_eq!(fragmentainer.body_capacity, layout_pt(70.0));
     }
 
     #[test]
@@ -2654,9 +3328,9 @@ mod tests {
             page_break: PageBreak::Column,
             row_required_height: 40.0,
             chrome_context: TableFragmentChromeContext {
-                fragmentainer_block_size: 100.0,
-                header_height: 10.0,
-                footer_height: 5.0,
+                fragmentainer_block_size: layout_pt(100.0),
+                header_height: layout_pt(10.0),
+                footer_height: layout_pt(5.0),
                 allow_header: true,
                 allow_footer: true,
             },
@@ -2678,9 +3352,9 @@ mod tests {
             },
             row_required_height: 70.0,
             chrome_context: TableFragmentChromeContext {
-                fragmentainer_block_size: 90.0,
-                header_height: 20.0,
-                footer_height: 15.0,
+                fragmentainer_block_size: layout_pt(90.0),
+                header_height: layout_pt(20.0),
+                footer_height: layout_pt(15.0),
                 allow_header: true,
                 allow_footer: true,
             },
@@ -2762,7 +3436,7 @@ mod tests {
 
     #[test]
     fn row_group_avoid_stays_when_group_fits_current_fragmentainer() {
-        let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
+        let current_fragmentainer = current_fragmentainer(
             100.0,
             80.0,
             0.0,
@@ -2775,18 +3449,24 @@ mod tests {
             true,
         );
 
-        assert_eq!(current_fragmentainer.fragmentainer_block_size(), 100.0);
-        assert_eq!(current_fragmentainer.available_block_size(), 80.0);
-        assert_eq!(current_fragmentainer.available_body_size(), 70.0);
+        assert_eq!(
+            current_fragmentainer.fragmentainer_block_size(),
+            layout_pt(100.0)
+        );
+        assert_eq!(
+            current_fragmentainer.available_block_size(),
+            layout_pt(80.0)
+        );
+        assert_eq!(current_fragmentainer.available_body_size(), layout_pt(70.0));
         assert!(
             TableRowGroupAvoidDecision::choose(TableRowGroupAvoidDecisionInput {
                 group: TableAvoidRowGroup::new(0, 2),
                 group_height: 60.0,
                 current_fragmentainer,
                 chrome_context: TableFragmentChromeContext {
-                    fragmentainer_block_size: 100.0,
-                    header_height: 10.0,
-                    footer_height: 10.0,
+                    fragmentainer_block_size: layout_pt(100.0),
+                    header_height: layout_pt(10.0),
+                    footer_height: layout_pt(10.0),
                     allow_header: true,
                     allow_footer: true,
                 },
@@ -2798,7 +3478,7 @@ mod tests {
 
     #[test]
     fn row_group_avoid_moves_to_next_fragment_with_repeated_chrome() {
-        let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
+        let current_fragmentainer = current_fragmentainer(
             100.0,
             40.0,
             0.0,
@@ -2815,9 +3495,9 @@ mod tests {
             group_height: 80.0,
             current_fragmentainer,
             chrome_context: TableFragmentChromeContext {
-                fragmentainer_block_size: 100.0,
-                header_height: 10.0,
-                footer_height: 10.0,
+                fragmentainer_block_size: layout_pt(100.0),
+                header_height: layout_pt(10.0),
+                footer_height: layout_pt(10.0),
                 allow_header: true,
                 allow_footer: true,
             },
@@ -2832,7 +3512,7 @@ mod tests {
 
     #[test]
     fn row_group_avoid_can_suppress_chrome_for_bounded_overflow() {
-        let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
+        let current_fragmentainer = current_fragmentainer(
             100.0,
             40.0,
             0.0,
@@ -2849,9 +3529,9 @@ mod tests {
             group_height: 101.0,
             current_fragmentainer,
             chrome_context: TableFragmentChromeContext {
-                fragmentainer_block_size: 100.0,
-                header_height: 20.0,
-                footer_height: 20.0,
+                fragmentainer_block_size: layout_pt(100.0),
+                header_height: layout_pt(20.0),
+                footer_height: layout_pt(20.0),
                 allow_header: true,
                 allow_footer: true,
             },
@@ -2866,7 +3546,7 @@ mod tests {
 
     #[test]
     fn row_group_avoid_stays_when_fragmentainer_cannot_advance() {
-        let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
+        let current_fragmentainer = current_fragmentainer(
             100.0,
             40.0,
             0.0,
@@ -2885,9 +3565,9 @@ mod tests {
                 group_height: 80.0,
                 current_fragmentainer,
                 chrome_context: TableFragmentChromeContext {
-                    fragmentainer_block_size: 100.0,
-                    header_height: 10.0,
-                    footer_height: 10.0,
+                    fragmentainer_block_size: layout_pt(100.0),
+                    header_height: layout_pt(10.0),
+                    footer_height: layout_pt(10.0),
                     allow_header: true,
                     allow_footer: true,
                 },
@@ -2899,7 +3579,7 @@ mod tests {
 
     #[test]
     fn oversized_row_slice_advances_when_empty_body_can_advance() {
-        let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
+        let current_fragmentainer = current_fragmentainer(
             100.0,
             0.0,
             0.0,
@@ -2916,9 +3596,9 @@ mod tests {
             row_required_height: 0.01,
             current_fragmentainer,
             chrome_context: TableFragmentChromeContext {
-                fragmentainer_block_size: 100.0,
-                header_height: 0.0,
-                footer_height: 0.0,
+                fragmentainer_block_size: layout_pt(100.0),
+                header_height: layout_pt(0.0),
+                footer_height: layout_pt(0.0),
                 allow_header: false,
                 allow_footer: false,
             },
@@ -2934,7 +3614,7 @@ mod tests {
 
     #[test]
     fn oversized_row_slice_uses_body_capacity_at_fragment_start() {
-        let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
+        let current_fragmentainer = current_fragmentainer(
             50.0,
             120.0,
             0.0,
@@ -2951,9 +3631,9 @@ mod tests {
             row_required_height: 120.0,
             current_fragmentainer,
             chrome_context: TableFragmentChromeContext {
-                fragmentainer_block_size: 50.0,
-                header_height: 0.0,
-                footer_height: 0.0,
+                fragmentainer_block_size: layout_pt(50.0),
+                header_height: layout_pt(0.0),
+                footer_height: layout_pt(0.0),
                 allow_header: false,
                 allow_footer: false,
             },
@@ -2970,7 +3650,7 @@ mod tests {
 
     #[test]
     fn oversized_row_slice_paints_when_empty_body_cannot_advance() {
-        let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
+        let current_fragmentainer = current_fragmentainer(
             100.0,
             0.0,
             0.0,
@@ -2987,9 +3667,9 @@ mod tests {
             row_required_height: 0.01,
             current_fragmentainer,
             chrome_context: TableFragmentChromeContext {
-                fragmentainer_block_size: 100.0,
-                header_height: 0.0,
-                footer_height: 0.0,
+                fragmentainer_block_size: layout_pt(100.0),
+                header_height: layout_pt(0.0),
+                footer_height: layout_pt(0.0),
                 allow_header: false,
                 allow_footer: false,
             },

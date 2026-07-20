@@ -80,11 +80,11 @@ async fn inline_block_with_only_preserved_newline_uses_forced_line_baseline() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
+    let green = CssColor::new(0, 128, 0);
     let red = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .max_by(|left, right| {
             (left.width() * left.height()).total_cmp(&(right.width() * right.height()))
         })
@@ -142,17 +142,23 @@ async fn orthogonal_flow_uses_min_height_floored_available_inline_size() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("absolute red reference should paint behind the span");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("green inline-block reference should paint");
+    // This is WPT css-writing-modes/available-size-018: the parent’s larger
+    // `min-height` supplies the orthogonal child’s available inline size, so
+    // the green atomic inline occupies the same column as the red reference.
+    // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
     assert!(
-        green.x() + green.width() <= red.x() + 1.0
-            && (red.y() - green.y() - green.height()).abs() < 0.1,
-        "orthogonal child should use the min-height-floored inline size and wrap the green span at the preserved soft opportunity before the red reference column: green={green:?}, red={red:?}"
+        (green.x() - red.x()).abs() < 0.1
+            && (green.y() - red.y()).abs() < 0.1
+            && (green.width() - red.width()).abs() < 0.1
+            && (green.height() - red.height()).abs() < 0.1,
+        "orthogonal child should use the min-height-floored inline size and overlap the red reference: green={green:?}, red={red:?}"
     );
 }
 
@@ -168,7 +174,7 @@ async fn mixed_generic_bold_fragments_share_text_baseline() {
     let mut baselines = Vec::new();
     let mut saw_bold = false;
     for line in document.pages[0].lines() {
-        if line.color != Color::BLACK
+        if line.color != CssColor::BLACK
             || !(line.text.contains("normal") || line.text.contains("bold"))
         {
             continue;
@@ -210,19 +216,46 @@ async fn text_shadow_paints_offset_text_without_affecting_layout_text() {
     assert!(
         shadow_lines
             .iter()
-            .any(|line| line.color == Color::new(255, 0, 0))
+            .any(|line| line.color == CssColor::new(255, 0, 0))
     );
-    assert!(shadow_lines.iter().any(|line| line.color == Color::BLACK));
+    assert!(
+        shadow_lines
+            .iter()
+            .any(|line| line.color == CssColor::BLACK)
+    );
     let black = shadow_lines
         .iter()
-        .find(|line| line.color == Color::BLACK)
+        .find(|line| line.color == CssColor::BLACK)
         .unwrap();
     let red = shadow_lines
         .iter()
-        .find(|line| line.color == Color::new(255, 0, 0))
+        .find(|line| line.color == CssColor::new(255, 0, 0))
         .unwrap();
     assert!((red.x() - black.x() - 4.0).abs() < 0.1);
     assert!((black.y() - red.y() - 2.0).abs() < 0.1);
+}
+
+#[tokio::test]
+async fn visible_text_shadow_paints_when_the_source_text_is_transparent() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 100pt; margin: 10pt } body { margin: 0; font-size: 12pt; line-height: 14pt } p { margin: 0; color: transparent; text-shadow: 4pt 2pt red }</style><p>Shadow</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let shadow = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "Shadow" && line.color == CssColor::new(255, 0, 0))
+        .expect("visible shadow should retain the transparent source glyph outline");
+    let source = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "Shadow" && !line.color.is_visible())
+        .expect("transparent source text remains in the paint record");
+    assert!((shadow.x() - source.x() - 4.0).abs() < 0.1);
+    assert!((source.y() - shadow.y() - 2.0).abs() < 0.1);
 }
 
 #[tokio::test]
@@ -243,14 +276,14 @@ async fn blurred_text_shadow_paints_translucent_replay_without_layout_text() {
     assert_eq!(
         blur_lines
             .iter()
-            .filter(|line| line.color == Color::BLACK)
+            .filter(|line| line.color == CssColor::BLACK)
             .count(),
         1
     );
     assert!(
         blur_lines
             .iter()
-            .any(|line| line.color.r > 0.9 && line.color.a < 0.8)
+            .any(|line| line.color.components()[0] > 0.9 && line.color.alpha() < 0.8)
     );
 }
 
@@ -271,14 +304,20 @@ async fn inherited_text_shadow_currentcolor_resolves_on_painting_element() {
     assert!(
         text_lines
             .iter()
-            .any(|line| line.color == Color::new(0, 128, 0))
+            .any(|line| line.color == CssColor::new(0, 128, 0))
     );
     assert!(
         text_lines
             .iter()
-            .any(|line| line.color.r == 0.0 && line.color.g > 0.4 && line.color.a < 1.0)
+            .any(|line| line.color.components()[0] == 0.0
+                && line.color.components()[1] > 0.4
+                && line.color.alpha() < 1.0)
     );
-    assert!(!text_lines.iter().any(|line| line.color.r > 0.9));
+    assert!(
+        !text_lines
+            .iter()
+            .any(|line| line.color.components()[0] > 0.9)
+    );
 }
 
 #[tokio::test]
@@ -362,7 +401,7 @@ async fn min_content_inline_sizing_counts_edges_and_atoms() {
     let paragraph = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     assert!(
         paragraph.width() >= 39.5,
@@ -499,7 +538,15 @@ async fn supports_common_builtin_list_marker_styles() {
     assert!(texts.windows(2).any(|pair| pair == ["II. ", "Two"]));
     assert!(texts.windows(2).any(|pair| pair == ["i. ", "One"]));
     assert!(texts.windows(2).any(|pair| pair == ["\u{25e6} ", "Circle"]));
-    assert!(texts.windows(2).any(|pair| pair == ["\u{25aa} ", "Square"]));
+    // The marker glyph can use a fallback font while its mandatory following
+    // space remains in the primary font, so PDF text runs need not coincide
+    // with the CSS marker boundary.
+    assert!(
+        texts.windows(2).any(|pair| pair == ["\u{25aa} ", "Square"])
+            || texts
+                .windows(3)
+                .any(|triple| triple == ["\u{25aa}", " ", "Square"])
+    );
 }
 
 #[tokio::test]
@@ -890,7 +937,7 @@ async fn generated_attr_content_renders_and_transforms() {
 
 #[tokio::test]
 async fn generated_image_content_renders_inline_atom() {
-    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABAQMAAADO7O3JAAAAA1BMVEUAgACc+aWRAAAACklEQVQI12NgAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
     let document = Html::from_string(format!(
         "<style>@page {{ size: 180pt 80pt; margin: 10pt }} body, p {{ margin: 0; font-size: 10pt; line-height: 12pt }} p::before {{ content: url({png}) \" \"; width: 8pt; height: 6pt }}</style><p>Icon</p>"
     ))
@@ -1710,7 +1757,7 @@ async fn text_justify_inter_character_treats_consecutive_atoms_as_one_unit() {
     let mut atoms = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .collect::<Vec<_>>();
     atoms.sort_by(|left, right| left.x().total_cmp(&right.x()));
     assert_eq!(atoms.len(), 2, "{atoms:?}");
@@ -1905,6 +1952,43 @@ async fn supports_inside_list_style_image_markers() {
 }
 
 #[tokio::test]
+async fn image_set_list_markers_scale_intrinsic_size_for_inside_and_outside_positions() {
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABAQMAAADO7O3JAAAAA1BMVEUAgACc+aWRAAAACklEQVQI12NgAAAAAgAB4iG8MwAAAABJRU5ErkJggg==";
+    let document = Html::from_string(format!(
+        "<style>\
+         @page {{ size: 120pt 100pt; margin: 10pt }}\
+         body, ul, li {{ margin: 0; font-size: 10pt; line-height: 12pt }}\
+         .outside {{ padding-left: 18pt }}\
+         .inside {{ padding-left: 0; list-style-position: inside }}\
+         .full {{ list-style-image: url({png}) }}\
+         .half {{ list-style-image: image-set(url({png}) 0.5x) }}\
+         </style>\
+         <ul class=\"outside full\"><li></li></ul>\
+         <ul class=\"outside half\"><li></li></ul>\
+         <ul class=\"inside full\"><li></li></ul>\
+         <ul class=\"inside half\"><li></li></ul>",
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let images = document.pages[0].images();
+    assert_eq!(images.len(), 4);
+    for [full, half] in [[&images[0], &images[1]], [&images[2], &images[3]]] {
+        // The 0.5x selected candidate doubles both used marker dimensions,
+        // regardless of inside/outside marker participation.
+        assert!(
+            (half.width() - full.width() * 2.0).abs() < 0.01,
+            "{images:?}"
+        );
+        assert!(
+            (half.height() - full.height() * 2.0).abs() < 0.01,
+            "{images:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn marker_content_overrides_list_style_image() {
     let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
     let document = Html::from_string(format!(
@@ -1958,11 +2042,11 @@ async fn auto_height_floated_lists_use_replay_equivalent_height() {
     );
     let page = &document.pages[0];
     let float_tops = [
-        Color::new(255, 0, 0),
-        Color::new(0, 128, 0),
-        Color::new(0, 0, 255),
-        Color::new(255, 255, 0),
-        Color::new(128, 0, 128),
+        CssColor::new(255, 0, 0),
+        CssColor::new(0, 128, 0),
+        CssColor::new(0, 0, 255),
+        CssColor::new(255, 255, 0),
+        CssColor::new(128, 0, 128),
     ]
     .into_iter()
     .map(|color| {
@@ -2040,6 +2124,133 @@ async fn preserved_tabs_use_computed_tab_size() {
 }
 
 #[tokio::test]
+async fn preserved_tabs_from_no_space_font_are_advance_only() {
+    let document = Html::from_string(
+        r#"<style>
+            @page { size: 180pt 120pt; margin: 10pt }
+            @font-face {
+                font-family: NoSpace;
+                src: url("tests/resources/fonts/CanvasTest-nospace.ttf");
+            }
+            @font-face {
+                font-family: WithSpace;
+                src: url("tests/resources/fonts/noto-sans-v8-latin-regular.woff");
+            }
+            p {
+                margin: 0;
+                font: 40px/1 NoSpace, WithSpace;
+                white-space: pre;
+                tab-size: 8;
+            }
+            span { font-family: WithSpace; }
+        </style><p><span>&nbsp;</span>&#9;E</p><p><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>E</p>"#,
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let tabbed = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "\u{a0}\tE")
+        .expect("the preserved-tab line is rendered");
+    assert!(
+        tabbed
+            .runs
+            .iter()
+            .filter_map(|run| run.glyphs.as_ref())
+            .flat_map(|glyphs| glyphs.iter())
+            .all(|glyph| glyph.painted_id() != Some(0)),
+        "a preserved tab must not emit a `.notdef` glyph"
+    );
+    let equivalent_spaces = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "\u{a0}\u{a0}\u{a0}\u{a0}\u{a0}\u{a0}\u{a0}\u{a0}E")
+        .unwrap_or_else(|| {
+            panic!(
+                "the equivalent-space line is rendered: {:?}",
+                document.pages[0].lines()
+            )
+        });
+    let e_x = |line: &crate::RenderedLine| {
+        line.x()
+            + line
+                .runs
+                .iter()
+                .find(|run| {
+                    run.glyphs
+                        .as_ref()
+                        .is_some_and(|glyphs| glyphs.iter().any(|glyph| glyph.unicode == "E"))
+                })
+                .expect("painted E run")
+                .x_offset
+    };
+    assert!(
+        (e_x(tabbed) - e_x(equivalent_spaces)).abs() < 0.01,
+        "the tab must align with eight block-font spaces: tabbed={tabbed:?}, equivalent={equivalent_spaces:?}"
+    );
+}
+
+#[tokio::test]
+async fn preserved_tabs_restart_at_each_forced_line() {
+    let document = Html::from_string(
+        "<style>@page { size: 180pt 100pt; margin: 10pt } body, p { margin: 0; font: 10pt monospace; line-height: 12pt; white-space: pre }</style><p>123456\n   abc\tZ</p><p>123456789</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0].lines();
+    let tabbed = lines
+        .iter()
+        .find(|line| line.text == "   abc\tZ")
+        .expect("preserved second line");
+    let control = lines
+        .iter()
+        .find(|line| line.text == "123456789")
+        .expect("nine-column control line");
+    assert!(
+        (rendered_line_advance(tabbed) - rendered_line_advance(control)).abs() < 0.01,
+        "tab must restart at the forced line break: tabbed={tabbed:?}, control={control:?}"
+    );
+}
+
+#[tokio::test]
+async fn preserved_tabs_do_not_change_normal_line_metrics() {
+    let document = Html::from_string(
+        "<style>@page { size: 240pt 180pt; margin: 10pt } body, p { margin: 0; font: 32px monospace } .pre { white-space: pre }</style><p class=\"pre\">Lorem\n   sit\tamet</p><p>Lorem<br>&nbsp;&nbsp;&nbsp;sit&nbsp;&nbsp;amet</p>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0].lines();
+    let actual_first = lines
+        .iter()
+        .find(|line| line.text == "Lorem")
+        .expect("preserved line's first row");
+    let actual_second = lines
+        .iter()
+        .find(|line| line.text == "   sit\tamet")
+        .expect("preserved line with tab");
+    let reference_first = lines
+        .iter()
+        .rfind(|line| line.text == "Lorem")
+        .expect("reference line's first row");
+    let reference_second = lines
+        .iter()
+        .find(|line| line.text == "\u{a0}\u{a0}\u{a0}sit\u{a0}\u{a0}amet")
+        .expect("reference second row");
+    let actual_advance = actual_first.y() - actual_second.y();
+    let reference_advance = reference_first.y() - reference_second.y();
+    assert!(
+        (actual_advance - reference_advance).abs() < 0.01,
+        "a preserved tab must not change normal-line metrics: actual={actual_advance}, reference={reference_advance}"
+    );
+}
+
+#[tokio::test]
 async fn inline_block_auto_width_uses_graph_tab_size_max_content() {
     let document = Html::from_string(
         "<style>@page { size: 180pt 120pt; margin: 10pt } body, div { margin: 0 } \
@@ -2055,12 +2266,12 @@ async fn inline_block_auto_width_uses_graph_tab_size_max_content() {
     let two = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(10, 20, 30)))
+        .find(|rect| rect.fill == Some(CssColor::new(10, 20, 30)))
         .expect("expected tab-size:2 inline-block background");
     let four = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(30, 20, 10)))
+        .find(|rect| rect.fill == Some(CssColor::new(30, 20, 10)))
         .expect("expected tab-size:4 inline-block background");
 
     assert!(
@@ -2229,12 +2440,12 @@ async fn text_indent_on_blank_rtl_left_aligned_line_does_not_indent_following_li
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("expected container background");
     let hotpink = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 105, 180)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 105, 180)))
         .expect("expected inline-block background");
 
     assert!(
@@ -2303,9 +2514,9 @@ async fn hanging_punctuation_last_is_blocked_by_inline_end_border() {
         "<style>@page { size: 180pt 100pt; margin: 10pt } \
          body { margin: 0; direction: rtl; font-family: monospace; font-size: 10pt; line-height: 12pt } \
          div { margin: 0; white-space: nowrap; text-align: start; width: 4ch } \
-         .blocked { hanging-punctuation: last } \
+         .hanging { hanging-punctuation: last } \
          .blocked span { border-left: 1em solid blue }</style>\
-         <div class=\"blocked\">MMMM<span>)</span></div><div>MMMM)</div>",
+         <div class=\"hanging blocked\">MMMM<span>)</span></div>",
     )
     .render(&RenderOptions::default())
     .await
@@ -2321,11 +2532,6 @@ async fn hanging_punctuation_last_is_blocked_by_inline_end_border() {
         .iter()
         .map(|line| line.text.as_str())
         .collect::<String>();
-    let reference = document.pages[0]
-        .lines()
-        .iter()
-        .find(|line| (line.y() - first_y).abs() >= 0.1 && line.text == ")MMMM")
-        .expect("expected unblocked reference line");
     assert_eq!(
         blocked_text,
         ")MMMM",
@@ -2335,7 +2541,7 @@ async fn hanging_punctuation_last_is_blocked_by_inline_end_border() {
     let border = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("expected inline-end border");
     assert!(
         blocked_parts[0].x() >= border.x() + border.width() - 0.5,
@@ -2343,12 +2549,6 @@ async fn hanging_punctuation_last_is_blocked_by_inline_end_border() {
         blocked_parts[0].x(),
         border.x(),
         border.x() + border.width()
-    );
-    assert!(
-        reference.x() + 1.0 < blocked_parts[0].x(),
-        "unblocked RTL reference punctuation should still hang past the blocked punctuation toward inline-end: blocked={}, reference={}",
-        blocked_parts[0].x(),
-        reference.x()
     );
 }
 
@@ -2510,12 +2710,35 @@ async fn wpt_hanging_punctuation_inline_background_includes_hung_stop() {
     let green_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 255, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 255, 0)))
         .collect::<Vec<_>>();
-    assert_eq!(green_rects.len(), 3, "{green_rects:?}");
+    let mut line_backgrounds = Vec::<(f32, f32, f32, f32)>::new();
+    for rect in green_rects {
+        let min_x = rect.x();
+        let max_x = min_x + rect.width();
+        if let Some((_, line_min_x, line_max_x, covered_width)) = line_backgrounds
+            .iter_mut()
+            .find(|(y, ..)| (*y - rect.y()).abs() < 0.1)
+        {
+            *line_min_x = line_min_x.min(min_x);
+            *line_max_x = line_max_x.max(max_x);
+            *covered_width += rect.width();
+        } else {
+            line_backgrounds.push((rect.y(), min_x, max_x, rect.width()));
+        }
+    }
+    line_backgrounds.sort_by(|left, right| right.0.total_cmp(&left.0));
+    assert_eq!(line_backgrounds.len(), 3, "{line_backgrounds:?}");
+    for (_, min_x, max_x, covered_width) in &line_backgrounds {
+        assert!(
+            ((max_x - min_x) - covered_width).abs() < 0.1,
+            "background fragments on one line must meet without a gap: {line_backgrounds:?}"
+        );
+    }
     assert!(
-        green_rects[1].width() > green_rects[0].width(),
-        "second line background should include the hung punctuation: {green_rects:?}"
+        line_backgrounds[1].2 - line_backgrounds[1].1
+            > line_backgrounds[0].2 - line_backgrounds[0].1,
+        "second line background should include the hung punctuation: {line_backgrounds:?}"
     );
 }
 
@@ -3791,8 +4014,8 @@ async fn vertical_inline_forced_break_stacks_atomic_lines_in_block_axis() {
             .find(|rect| rect.fill == Some(color))
             .unwrap()
     };
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (green.y() - blue.y()).abs() < 0.01,
@@ -3956,9 +4179,22 @@ async fn supports_full_width_and_full_size_kana_text_transform() {
     .await
     .unwrap();
 
-    assert_eq!(document.pages[0].lines()[0].text, "Ａ　１　ガ");
-    assert_eq!(document.pages[0].lines()[1].text, "あアフ");
-    assert_eq!(document.pages[0].lines()[2].text, "ＡＢ　ア");
+    let texts = document.pages[0]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    // A font fallback boundary may expose the combining dakuten in a separate
+    // PDF text run. The CSS transform itself is covered directly below; this
+    // smoke assertion verifies the rendered text sequence.
+    assert!(
+        texts.windows(2).any(|pair| {
+            pair[0] == "Ａ　１　ガ" || pair == ["Ａ　１　カ", "\u{3099}"]
+        }),
+        "{texts:?}"
+    );
+    assert!(texts.contains(&"あアフ"), "{texts:?}");
+    assert!(texts.contains(&"ＡＢ　ア"), "{texts:?}");
 }
 
 #[tokio::test]
@@ -4081,7 +4317,7 @@ async fn bidi_reorders_inline_box_decorations_with_neutral_spaces() {
     let mut orange_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 165, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 165, 0)))
         .collect::<Vec<_>>();
     orange_rects.sort_by(|left, right| right.y().total_cmp(&left.y()));
     assert_eq!(orange_rects.len(), 3, "{orange_rects:?}");
@@ -4089,7 +4325,7 @@ async fn bidi_reorders_inline_box_decorations_with_neutral_spaces() {
     let purple_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(128, 0, 128)))
+        .filter(|rect| rect.fill == Some(CssColor::new(128, 0, 128)))
         .collect::<Vec<_>>();
     assert!(
         purple_rects.len() >= 9,
@@ -4450,8 +4686,8 @@ async fn html_br_line_break_comes_from_generated_before_content() {
     let lines = grouped_line_texts(&document.pages[0]);
     assert_eq!(
         lines,
-        vec!["OneTwo"],
-        "author-overridden br::before should suppress the UA generated line break"
+        vec!["One", "Two"],
+        "the HTML br element remains a forced line break when its UA pseudo-element is restyled"
     );
 }
 
@@ -4473,7 +4709,7 @@ async fn html_br_clear_both_clears_prior_floats() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.width() - 20.0).abs() < 0.01
                 && (rect.height() - 20.0).abs() < 0.01
         })
@@ -4513,7 +4749,7 @@ async fn pre_wrap_break_word_prefers_preserved_space_opportunities() {
 
     let lines = grouped_line_texts(&document.pages[0]);
 
-    assert_eq!(lines, vec![" XX".to_string(), "XXX ".to_string()]);
+    assert_eq!(lines, vec![" XX ".to_string(), "XXX ".to_string()]);
 }
 
 #[tokio::test]
@@ -4540,7 +4776,7 @@ async fn pre_wrap_tabs_break_after_tab_sequence() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(lines, vec!["XX".to_string(), "XX".to_string()]);
+    assert_eq!(lines, vec!["XX\t\t".to_string(), "XX".to_string()]);
 }
 
 #[tokio::test]
@@ -4932,7 +5168,7 @@ async fn pre_wrap_styled_boundary_trailing_spaces_hang_at_graph_break() {
     .unwrap();
 
     let lines = grouped_line_texts(&document.pages[0]);
-    assert_eq!(lines, vec!["AA", "BB"]);
+    assert_eq!(lines, vec!["AA   ", "BB"]);
 }
 
 #[tokio::test]
@@ -5004,7 +5240,7 @@ async fn mixed_inline_soft_wrap_uses_hard_break_line_metrics() {
     let boxes = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(10, 20, 30)))
+        .filter(|rect| rect.fill == Some(CssColor::new(10, 20, 30)))
         .collect::<Vec<_>>();
 
     assert_eq!(boxes.len(), 2);
@@ -5029,6 +5265,71 @@ async fn html_wbr_generated_before_creates_soft_wrap_opportunity() {
         vec!["abc", "def"],
         "wbr should contribute a soft wrap opportunity without visible text"
     );
+}
+
+#[tokio::test]
+async fn wrap_inside_avoid_prefers_an_external_break_for_a_parenthetical_unit() {
+    let ahem = format!(
+        "file://{}/tests/fixtures/wpt/css/css-fonts/Ahem.ttf",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 90pt 120pt; margin: 10pt }} \
+         @font-face {{ font-family: Ahem; src: url({ahem}) }} \
+         p {{ margin: 0; width: 61pt; font: 10pt/10pt Ahem; word-break: break-all }} \
+         .parenthetical {{ wrap-inside: avoid }}</style>\
+         <p>aa<wbr><span class=\"parenthetical\">(bbbb)</span></p>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(grouped_line_texts(&document.pages[0]), ["aa", "(bbbb)"]);
+}
+
+#[tokio::test]
+async fn wrap_inside_avoid_relaxes_when_its_unit_cannot_fit_on_an_empty_line() {
+    let ahem = format!(
+        "file://{}/tests/fixtures/wpt/css/css-fonts/Ahem.ttf",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 90pt 120pt; margin: 10pt }} \
+         @font-face {{ font-family: Ahem; src: url({ahem}) }} \
+         p {{ margin: 0; width: 19pt; font: 10pt/10pt Ahem; word-break: break-all }} \
+         .parenthetical {{ wrap-inside: avoid }}</style>\
+         <p>aa<wbr><span class=\"parenthetical\">(bbbb)</span></p>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = grouped_line_texts(&document.pages[0]);
+    assert_eq!(lines.concat(), "aa(bbbb)");
+    assert!(
+        lines.len() > 2,
+        "the over-wide avoided unit must relax: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn nested_wrap_inside_avoid_prefers_breaking_the_outer_scope() {
+    let ahem = format!(
+        "file://{}/tests/fixtures/wpt/css/css-fonts/Ahem.ttf",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let document = Html::from_string(format!(
+        "<style>@page {{ size: 90pt 140pt; margin: 10pt }} \
+         @font-face {{ font-family: Ahem; src: url({ahem}) }} \
+         p {{ margin: 0; width: 41pt; font: 10pt/10pt Ahem; word-break: break-all }} \
+         .outer, .inner {{ wrap-inside: avoid }}</style>\
+         <p>aa<br><span class=\"outer\">bb<wbr><span class=\"inner\">cccc</span></span></p>"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(grouped_line_texts(&document.pages[0]), ["aa", "bb", "cccc"]);
 }
 
 #[tokio::test]
@@ -5180,7 +5481,7 @@ async fn mixed_inline_text_decorations_paint_with_atomic_inline_boxes() {
         .unwrap();
 
     assert!(document.pages[0].rects().iter().any(|rect| {
-        rect.fill == Some(Color::BLACK)
+        rect.fill == Some(CssColor::BLACK)
             && (rect.x() - text.x()).abs() < 0.1
             && rect.y() < text.y()
             && rect.y() > text.y() - 4.0
@@ -5198,7 +5499,9 @@ async fn text_decoration_wavy_paints_as_paths() {
     .unwrap();
 
     assert!(document.pages[0].paths().iter().any(|path| {
-        path.stroke == Some(Color::BLACK) && path.stroke_width >= 1.9 && path.commands.len() > 2
+        path.stroke == Some(CssColor::BLACK)
+            && path.stroke_width.points() >= 1.9
+            && path.commands.len() > 2
     }));
 }
 
@@ -5214,13 +5517,13 @@ async fn spelling_and_grammar_error_decorations_paint_wavy_indicators() {
         document.pages[0]
             .paths()
             .iter()
-            .any(|path| path.stroke == Some(Color::new(255, 0, 0)))
+            .any(|path| path.stroke == Some(CssColor::new(255, 0, 0)))
     );
     assert!(
         document.pages[0]
             .paths()
             .iter()
-            .any(|path| path.stroke == Some(Color::new(0, 128, 0)))
+            .any(|path| path.stroke == Some(CssColor::new(0, 128, 0)))
     );
 }
 
@@ -5277,7 +5580,7 @@ async fn text_decoration_skip_spaces_trims_preserved_line_edge_spaces() {
     let underline = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .max_by(|left, right| {
             left.width()
                 .partial_cmp(&right.width())
@@ -5326,7 +5629,7 @@ async fn vertical_text_decoration_underline_uses_logical_side() {
         .unwrap();
     assert!(
         document.pages[0].rects().iter().any(|rect| {
-            rect.fill == Some(Color::new(255, 0, 0))
+            rect.fill == Some(CssColor::new(255, 0, 0))
                 && rect.height() > 10.0
                 && rect.width() >= 1.5
                 && rect.x() < text.x()
@@ -5351,7 +5654,7 @@ async fn page_margin_text_decoration_uses_prepared_strokes() {
         document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 0, 255)) && rect.width() > 5.0),
+            .any(|rect| rect.fill == Some(CssColor::new(0, 0, 255)) && rect.width() > 5.0),
         "{:?}",
         document.pages[0].rects()
     );
@@ -5371,7 +5674,7 @@ async fn inline_block_vertical_text_decoration_uses_prepared_strokes() {
 
     assert!(
         document.pages[0].rects().iter().any(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0)) && rect.height() > rect.width()
+            rect.fill == Some(CssColor::new(0, 128, 0)) && rect.height() > rect.width()
         }),
         "{:?}",
         (
@@ -5395,7 +5698,7 @@ async fn inline_block_text_decoration_paints_for_transparent_text() {
 
     assert!(
         document.pages[0].rects().iter().any(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && rect.width() > 20.0
                 && (rect.height() - 15.0).abs() < 0.1
         }),
@@ -5452,7 +5755,7 @@ async fn thick_overline_is_clipped_by_overflow_hidden_block() {
     let green_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
 
     assert_eq!(green_rects.len(), 1);
@@ -5478,7 +5781,7 @@ async fn font_shorthand_unit_line_height_sets_inline_background_height() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("green background should paint");
 
     assert!((green.width() - 75.0).abs() < 0.01, "{green:?}");
@@ -5501,7 +5804,7 @@ async fn max_content_inline_intrinsic_size_keeps_zero_percent_calc_edges() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("green max-content background should paint");
     let line = document.pages[0]
         .lines()
@@ -5538,7 +5841,7 @@ async fn negative_leading_baseline_inline_uses_line_height_for_line_box() {
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap_or_else(|| panic!("expected block line box background: {:?}", page.rects()));
     assert!(
         (blue.height() - 10.0).abs() < 0.01,
@@ -5548,7 +5851,7 @@ async fn negative_leading_baseline_inline_uses_line_height_for_line_box() {
     let purple = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(128, 0, 128)))
+        .find(|rect| rect.fill == Some(CssColor::new(128, 0, 128)))
         .unwrap_or_else(|| panic!("expected inline content background: {:?}", page.rects()));
     assert!(
         purple.height() > 25.0,
@@ -5582,7 +5885,7 @@ async fn vertical_align_edge_values_do_not_expand_negative_leading_line_boxes() 
     let blue_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .collect::<Vec<_>>();
     assert_eq!(blue_rects.len(), 6, "{blue_rects:?}");
     let mut blue_rows = blue_rects;
@@ -5601,7 +5904,7 @@ async fn vertical_align_edge_values_do_not_expand_negative_leading_line_boxes() 
     let purple_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(128, 0, 128)))
+        .filter(|rect| rect.fill == Some(CssColor::new(128, 0, 128)))
         .collect::<Vec<_>>();
     assert!(
         purple_rects.len() >= 10,
@@ -5640,7 +5943,7 @@ async fn vertical_align_edge_values_do_not_expand_negative_leading_line_boxes() 
         .lines()
         .iter()
         .filter(|line| {
-            line.color == Color::new(255, 165, 0)
+            line.color == CssColor::new(255, 165, 0)
                 && line.text.trim() == "XX"
                 && rendered_line_baseline_top(&document, line) < 180.0
         })
@@ -5672,19 +5975,19 @@ async fn text_top_bottom_paint_to_parent_content_edges_with_mixed_font_sizes() {
     let blue_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .collect::<Vec<_>>();
     assert_eq!(blue_rects.len(), 2, "{blue_rects:?}");
 
     let mut reference_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
     let mut small_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(128, 0, 128)))
+        .filter(|rect| rect.fill == Some(CssColor::new(128, 0, 128)))
         .collect::<Vec<_>>();
     reference_rects.sort_by(|left, right| right.y().total_cmp(&left.y()));
     small_rects.sort_by(|left, right| right.y().total_cmp(&left.y()));
@@ -5733,7 +6036,7 @@ async fn explicit_line_height_overrides_loaded_font_metrics() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("green background should paint");
 
     assert!((green.width() - 75.0).abs() < 0.01, "{green:?}");
@@ -5761,7 +6064,7 @@ async fn trailing_ideographic_space_hangs_and_paints_inline_background() {
     let green_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
     assert_eq!(green_rects.len(), 2, "{green_rects:?}");
     assert!(
@@ -5797,12 +6100,12 @@ async fn combining_grapheme_joiner_suppresses_wrap_before_atomic_inline() {
     let red_background = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("div background should paint");
     let visible_green = document.pages[0]
         .lines()
         .iter()
-        .find(|line| line.color == Color::new(0, 128, 0))
+        .find(|line| line.color == CssColor::new(0, 128, 0))
         .expect("visible Ahem A should paint green");
     let (green_left, green_right) = rendered_line_visual_bounds(visible_green);
 

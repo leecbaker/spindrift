@@ -5,42 +5,106 @@ pub(in crate::layout) fn writing_modes_are_orthogonal(a: WritingMode, b: Writing
         != WritingModeAxes::new(b, Direction::Ltr).swaps_physical_axes()
 }
 
-pub(in crate::layout) fn child_available_space_for_block(
+/// Build the child available space exported by a formatting-context root.
+///
+/// A physical-height fallback used to fit an orthogonal descendant is not a
+/// CSS percentage basis. The nearest scroll container terminates the ancestor
+/// lookup: it either contributes its constrained used height or causes the
+/// initial containing block to be used. This policy applies at every
+/// formatting-context boundary, not only ordinary block flow.
+/// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+pub(in crate::layout) fn child_available_space_for_formatting_context(
     style: &ComputedStyle,
-    content_width: f32,
-    definite_content_height: Option<f32>,
+    content_width: PhysicalContentWidth,
+    definite_content_height: Option<PhysicalContentHeight>,
     inherited_orthogonal_available_height: OrthogonalAvailableHeight,
-    initial_fallback_height: f32,
+    initial_fallback_height: PhysicalContentHeight,
 ) -> ChildAvailableSpace {
     let local_orthogonal_constraint = orthogonal_fallback_physical_content_height(
         style,
-        PercentageBasis::definite(layout_pt(content_width)),
+        PercentageBasis::definite(content_width.content_box_length()),
     );
+    let direct_orthogonal_constraint = direct_orthogonal_available_height(
+        style,
+        PercentageBasis::definite(content_width.content_box_length()),
+    );
+    let is_scroll_container = style_clips_overflow(style);
     let mut space = ChildAvailableSpace::new(
         style.writing_mode,
-        PhysicalContentWidth::new(content_box_pt(content_width)),
-        definite_content_height.map(|height| PhysicalContentHeight::new(content_box_pt(height))),
-        PhysicalContentHeight::new(content_box_pt(
-            local_orthogonal_constraint
-                .unwrap_or_else(|| inherited_orthogonal_available_height.value.points()),
-        )),
+        content_width,
+        definite_content_height,
+        inherited_orthogonal_available_height.value(),
+    )
+    // Preserve the tagged nearest-scroll-container policy through a
+    // non-scrolling formatting context. Reconstructing from only the numeric
+    // fallback would silently turn it into an ICB policy, allowing a nested
+    // scroll container to discard the actual nearest scroller.
+    .with_orthogonal_available_height(inherited_orthogonal_available_height)
+    // A non-scrolling constrained block is an available-size source only for
+    // its direct orthogonal child. Keeping it separate from the inherited
+    // nearest-scroll-container policy prevents it from leaking through an
+    // intermediate same-writing-mode formatting context.
+    .with_direct_orthogonal_available_height(
+        (!is_scroll_container)
+            .then_some(direct_orthogonal_constraint)
+            .flatten()
+            // An immediate non-scrolling constraint can select an orthogonal
+            // child's line-fitting measure, but it cannot enlarge that measure
+            // beyond the initial containing block. The ICB remains the fallback
+            // ceiling when the direct `height`/`min-height`/`max-height` is
+            // taller; it is not a percentage-height basis.
+            // <https://www.w3.org/TR/css-writing-modes-3/#orthogonal-auto>
+            .and_then(|height| height.capped_by_initial_containing_block(initial_fallback_height)),
     );
-    if style_clips_overflow(style) {
-        let initial = initial_fallback_height.max(0.0);
-        space = space.with_orthogonal_available_height(OrthogonalAvailableHeight {
-            value: PhysicalContentHeight::new(content_box_pt(
-                local_orthogonal_constraint
-                    .unwrap_or(initial)
-                    .min(initial)
-                    .max(0.0),
-            )),
-            source: local_orthogonal_constraint.map_or(
-                OrthogonalAvailableSizeSource::InitialContainingBlock,
-                |_| OrthogonalAvailableSizeSource::NearestScrollContainer,
-            ),
-        });
+    if is_scroll_container {
+        let initial = initial_fallback_height.points().max(0.0);
+        // A minimum alone only constrains the scroll container's eventual
+        // auto used height; it does not provide the definite/max constraint
+        // used to choose an orthogonal child's line-fitting measure. A
+        // definite `height` does, and a `max-height` selects the same measure
+        // floored by `min-height` through `local_orthogonal_constraint`.
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+        let has_max_height = used_max_height(
+            style,
+            PercentageBasis::definite(content_width.content_box_length()),
+        )
+        .is_some();
+        let constrained_height = definite_content_height
+            .or(has_max_height
+                .then_some(local_orthogonal_constraint)
+                .flatten())
+            .map(PhysicalContentHeight::points);
+        // A scroll container without a usable height/max-height/min-height
+        // constraint is still the nearest scroller and stops an outer
+        // scroll-container's fallback from leaking through.
+        let fallback = constrained_height.map_or_else(
+            || OrthogonalAvailableHeight::initial_containing_block(initial_fallback_height),
+            |height| {
+                OrthogonalAvailableHeight::nearest_scroll_container(PhysicalContentHeight::new(
+                    content_box_pt(height.min(initial).max(0.0)),
+                ))
+            },
+        );
+        space = space.with_orthogonal_available_height(fallback);
     }
     space
+}
+
+/// Backwards-compatible name for normal block-flow callers.
+pub(in crate::layout) fn child_available_space_for_block(
+    style: &ComputedStyle,
+    content_width: PhysicalContentWidth,
+    definite_content_height: Option<PhysicalContentHeight>,
+    inherited_orthogonal_available_height: OrthogonalAvailableHeight,
+    initial_fallback_height: PhysicalContentHeight,
+) -> ChildAvailableSpace {
+    child_available_space_for_formatting_context(
+        style,
+        content_width,
+        definite_content_height,
+        inherited_orthogonal_available_height,
+        initial_fallback_height,
+    )
 }
 
 /// Fallback physical height for orthogonal descendants of an auto-height block.
@@ -52,15 +116,40 @@ pub(in crate::layout) fn child_available_space_for_block(
 /// <https://www.w3.org/TR/css-writing-modes-3/#orthogonal-auto>.
 pub(in crate::layout) fn orthogonal_fallback_physical_content_height(
     style: &ComputedStyle,
-    percentage_basis: PercentageBasis<LayoutLength>,
-) -> Option<f32> {
+    percentage_basis: PercentageBasis<ContentBoxLength>,
+) -> Option<PhysicalContentHeight> {
     let min_height = used_min_height(style, percentage_basis).map(SemanticLengthExt::points);
     let max_height = used_max_height(style, percentage_basis).map(SemanticLengthExt::points);
-    match (min_height, max_height) {
-        (Some(min_height), Some(max_height)) => Some(max_height.max(min_height)),
-        (Some(min_height), None) => Some(min_height),
-        (None, Some(max_height)) => Some(max_height),
-        (None, None) => None,
+    let height = match (min_height, max_height) {
+        (Some(min_height), Some(max_height)) => max_height.max(min_height),
+        (Some(min_height), None) => min_height,
+        (None, Some(max_height)) => max_height,
+        (None, None) => return None,
+    };
+    Some(PhysicalContentHeight::new(content_box_pt(height)))
+}
+
+/// Preserve whether a non-scrolling direct constraint comes from a larger
+/// minimum floor rather than an ordinary maximum constraint. The two select
+/// the same final line measure, but only the former also fixes the wrapped
+/// physical-width contribution of an auto-sized vertical child.
+/// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-auto>
+fn direct_orthogonal_available_height(
+    style: &ComputedStyle,
+    percentage_basis: PercentageBasis<ContentBoxLength>,
+) -> Option<DirectOrthogonalAvailableHeight> {
+    if let Some(height) = style.box_values.height.length_if_no_percent() {
+        return Some(DirectOrthogonalAvailableHeight::Definite(
+            PhysicalContentHeight::new(content_box_pt(height.max(0.0))),
+        ));
+    }
+    let min_height = used_min_height(style, percentage_basis).map(SemanticLengthExt::points);
+    let max_height = used_max_height(style, percentage_basis).map(SemanticLengthExt::points);
+    let height = orthogonal_fallback_physical_content_height(style, percentage_basis)?;
+    if min_height.is_some_and(|minimum| max_height.is_none_or(|maximum| minimum > maximum)) {
+        Some(DirectOrthogonalAvailableHeight::MinimumFloor(height))
+    } else {
+        Some(DirectOrthogonalAvailableHeight::Maximum(height))
     }
 }
 
@@ -81,8 +170,7 @@ pub(in crate::layout) fn vertical_block_align_content_needs_fragment_bounds(
 
 pub(in crate::layout) fn vertical_block_align_content_x_offset(
     style: &ComputedStyle,
-    content_left: f32,
-    content_width: f32,
+    content_inline_span: PageInlineSpan,
     subject_bounds: Option<PaintClip>,
 ) -> f32 {
     if !vertical_block_align_content_needs_fragment_bounds(style) {
@@ -92,18 +180,17 @@ pub(in crate::layout) fn vertical_block_align_content_x_offset(
         return 0.0;
     };
     let subject_width = subject_bounds.width().max(0.0);
-    let free_space = content_width.max(0.0) - subject_width;
+    let content_width = content_inline_span.width().max(0.0);
+    let free_space = content_width - subject_width;
     let toward_block_end = content_alignment_offset_toward_end(
         style.align_content,
         free_space,
         block_align_content_defaults_to_safe_overflow(style),
     );
     match block_start_side(style.writing_mode) {
-        PhysicalSide::Left => content_left + toward_block_end - subject_bounds.x(),
+        PhysicalSide::Left => content_inline_span.left_x() + toward_block_end - subject_bounds.x(),
         PhysicalSide::Right => {
-            content_left + content_width.max(0.0)
-                - toward_block_end
-                - (subject_bounds.x() + subject_width)
+            content_inline_span.right_x() - toward_block_end - (subject_bounds.x() + subject_width)
         }
         PhysicalSide::Top | PhysicalSide::Bottom => 0.0,
     }
@@ -133,26 +220,26 @@ pub(in crate::layout) fn plain_inline_content_needs_inline_items(
 ///
 /// CSS 2.2 lets an in-flow last child's bottom margin adjoin its parent's bottom
 /// margin when the parent has auto height and no separating border/padding/line
-/// boxes. A used `min-height` only blocks that collapse when it increases the
-/// parent's used content height, so block layout compares constraints against
-/// the content height with the candidate child margin removed. If the collapse
-/// is blocked, the child margin still must not inflate the parent's
-/// min-height-constrained used height:
+/// boxes. A used min/max height only permits that collapse when it leaves the
+/// parent's used content height unchanged. Block layout therefore compares the
+/// constrained height against the content height with the candidate child
+/// margin removed. If the collapse is blocked, the child margin still must not
+/// inflate the parent's constrained used height:
 /// <https://www.w3.org/TR/CSS22/box.html#collapsing-margins> and
 /// <https://www.w3.org/TR/CSS22/visudet.html#min-max-heights>.
 pub(in crate::layout) fn block_end_margin_collapse_survives_height_constraints(
     style: &ComputedStyle,
-    content_width: f32,
-    vertical_extras: f32,
-    content_height_without_child_margin: f32,
+    content_width: PhysicalContentWidth,
+    vertical_non_content: NonContentLength,
+    content_height_without_child_margin: PhysicalContentHeight,
 ) -> bool {
     let requested_content_height = used_content_box_height_or_auto(
         style,
-        layout_pt(content_height_without_child_margin),
-        non_content_pt(vertical_extras),
+        layout_pt(content_height_without_child_margin.points()),
+        vertical_non_content,
     )
     .map(SemanticLengthExt::points)
-    .unwrap_or(content_height_without_child_margin);
+    .unwrap_or_else(|| content_height_without_child_margin.points());
     let height_depends_on_intrinsic_content =
         needs_intrinsic_height_contribution(style.box_values.height.clone())
             || needs_intrinsic_height_contribution(style.box_values.min_height.clone())
@@ -161,21 +248,21 @@ pub(in crate::layout) fn block_end_margin_collapse_survives_height_constraints(
         constrain_height_with_intrinsic(
             style,
             content_box_pt(requested_content_height),
-            content_box_pt(content_height_without_child_margin),
-            content_box_pt(content_height_without_child_margin),
-            PercentageBasis::definite(content_box_pt(content_width)),
-            non_content_pt(vertical_extras),
+            content_height_without_child_margin.content_box_length(),
+            content_height_without_child_margin.content_box_length(),
+            PercentageBasis::definite(content_width.content_box_length()),
+            vertical_non_content,
         )
         .points()
     } else {
         constrain_content_height(
             style,
             content_box_pt(requested_content_height),
-            PercentageBasis::definite(layout_pt(content_width)),
+            PercentageBasis::definite(content_width.content_box_length()),
         )
         .points()
     };
-    constrained_height <= content_height_without_child_margin + 0.01
+    (constrained_height - content_height_without_child_margin.points()).abs() <= 0.01
 }
 
 /// Horizontal and size inputs for one normal-flow block box.
@@ -190,22 +277,21 @@ pub(in crate::layout) fn block_end_margin_collapse_survives_height_constraints(
 pub(in crate::layout) struct BlockLayoutGeometry {
     pub(in crate::layout) style: ComputedStyle,
     pub(in crate::layout) relative_offset: RelativeOffset,
-    pub(in crate::layout) border_widths: css::Edges,
-    pub(in crate::layout) vertical_extras: f32,
+    pub(in crate::layout) border_edges: UsedEdges,
+    pub(in crate::layout) vertical_non_content: NonContentLength,
     pub(in crate::layout) containing_block_content_height: BlockSizePercentageBasis,
     /// Definite physical content height exported for descendant percentage
     /// resolution. This remains physical even for a vertical block, whose
     /// logical inline size is the same axis.
     pub(in crate::layout) definite_content_height: Option<PhysicalContentHeight>,
     pub(in crate::layout) content_logical_inline_size: LogicalInlineContentSize,
-    pub(in crate::layout) outer_inline: BlockInlineBounds,
-    pub(in crate::layout) content_inline: BlockInlineBounds,
+    pub(in crate::layout) outer_inline: BlockBorderBoxInlineBounds,
+    pub(in crate::layout) content_inline: BlockContentBoxInlineBounds,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct BlockLayoutInlineConstraint {
-    pub(in crate::layout) containing_left: f32,
-    pub(in crate::layout) containing_right: f32,
+    pub(in crate::layout) containing_inline_span: PageInlineSpan,
     /// Containing-block logical inline size used by margin and padding
     /// percentages.
     /// The containing block's logical inline percentage basis. This belongs
@@ -227,20 +313,12 @@ pub(in crate::layout) struct BlockLayoutInlineConstraint {
 }
 
 impl BlockLayoutGeometry {
-    pub(in crate::layout) fn outer_inline(&self) -> BlockInlineBounds {
+    pub(in crate::layout) fn outer_inline(&self) -> BlockBorderBoxInlineBounds {
         self.outer_inline
     }
 
-    pub(in crate::layout) fn content_inline(&self) -> BlockInlineBounds {
+    pub(in crate::layout) fn content_inline(&self) -> BlockContentBoxInlineBounds {
         self.content_inline
-    }
-
-    pub(in crate::layout) fn outer_width(&self) -> f32 {
-        self.outer_inline.size()
-    }
-
-    pub(in crate::layout) fn content_width(&self) -> f32 {
-        self.content_inline.size()
     }
 
     pub(in crate::layout) fn content_logical_inline_size(&self) -> LogicalInlineContentSize {
@@ -256,11 +334,13 @@ impl BlockLayoutGeometry {
     /// <https://www.w3.org/TR/CSS22/box.html#box-dimensions>.
     pub(in crate::layout) fn border_box_top_rect(
         &self,
-        outer_x: f32,
         block_top: f32,
         block_height: f32,
     ) -> BlockBorderBox {
-        BlockBorderBox::new(outer_x, block_top, self.outer_width(), block_height)
+        BlockBorderBox::from_rect(BlockRect::new(
+            BlockPoint::new(self.outer_inline.span().left_x(), block_top),
+            BlockSize::new(self.outer_inline.width().points(), block_height.max(0.0)),
+        ))
     }
 
     /// Return the block padding box as a top-edge page rectangle.
@@ -270,14 +350,15 @@ impl BlockLayoutGeometry {
     /// <https://www.w3.org/TR/css-position-3/#def-cb>.
     pub(in crate::layout) fn padding_box_top_rect(
         &self,
-        outer_x: f32,
         block_top: f32,
         content_height: f32,
     ) -> PageTopRect {
         PageTopRect::new(
-            outer_x + self.border_widths.left,
-            block_top - self.border_widths.top,
-            self.content_width() + self.style.padding.left + self.style.padding.right,
+            self.outer_inline.span().left_x() + self.border_edges.left.points(),
+            block_top - self.border_edges.top.points(),
+            self.content_inline.width().points()
+                + self.style.padding.left
+                + self.style.padding.right,
             content_height + self.style.padding.top + self.style.padding.bottom,
         )
     }
@@ -291,23 +372,40 @@ impl BlockLayoutGeometry {
 /// instead of carrying unqualified `x` and `width` scalars through layout:
 /// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth>.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct BlockInlineBounds {
-    pub(in crate::layout) span: PageInlineSpan,
+pub(in crate::layout) struct BlockBorderBoxInlineBounds {
+    span: PageInlineSpan,
 }
 
-impl BlockInlineBounds {
-    pub(in crate::layout) fn new(start: f32, size: f32) -> Self {
-        Self {
-            span: PageInlineSpan::new(start, size),
-        }
+impl BlockBorderBoxInlineBounds {
+    pub(in crate::layout) fn new(span: PageInlineSpan) -> Self {
+        Self { span }
     }
 
-    pub(in crate::layout) fn start(self) -> f32 {
-        self.span.left_x()
+    pub(in crate::layout) fn span(self) -> PageInlineSpan {
+        self.span
     }
 
-    pub(in crate::layout) fn size(self) -> f32 {
-        self.span.width()
+    pub(in crate::layout) fn width(self) -> BorderBoxLength {
+        border_box_pt(self.span.width())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct BlockContentBoxInlineBounds {
+    span: PageInlineSpan,
+}
+
+impl BlockContentBoxInlineBounds {
+    pub(in crate::layout) fn new(span: PageInlineSpan) -> Self {
+        Self { span }
+    }
+
+    pub(in crate::layout) fn span(self) -> PageInlineSpan {
+        self.span
+    }
+
+    pub(in crate::layout) fn width(self) -> ContentBoxLength {
+        content_box_pt(self.span.width())
     }
 }
 
@@ -325,13 +423,8 @@ pub(in crate::layout) struct BlockBorderBox {
 }
 
 impl BlockBorderBox {
-    pub(in crate::layout) fn new(x: f32, top_y: f32, width: f32, height: f32) -> Self {
-        Self {
-            rect: BlockRect::new(
-                BlockPoint::new(x, top_y),
-                BlockSize::new(width.max(0.0), height.max(0.0)),
-            ),
-        }
+    pub(in crate::layout) fn from_rect(rect: BlockRect) -> Self {
+        Self { rect }
     }
 
     pub(in crate::layout) fn x(self) -> f32 {

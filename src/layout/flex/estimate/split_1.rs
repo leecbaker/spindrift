@@ -1,17 +1,88 @@
 use super::*;
+use crate::layout::assets::PositionedAutoBlockMeasurementSpace;
 use crate::layout::flex::compute::estimated_outer_cross_size;
+use crate::layout::flex::compute::{
+    flex_baseline_set, flex_item_baseline_axis_is_parallel_to_main_axis,
+};
+use crate::units::{IntoLayoutLength, layout_to_content_box_length};
+
+fn flex_estimated_border_box_width(
+    style: &ComputedStyle,
+    content_width: ContentBoxLength,
+) -> BorderBoxLength {
+    content_box_to_border_box_length(
+        content_width,
+        non_content_pt(style.padding.left + style.padding.right + horizontal_border_width(style)),
+    )
+}
 
 /// The physical containing space available to an intrinsic block-size walk
 /// below a flex item.
 ///
-/// Width remains a physical constraint for inline measurement, while the
-/// block-size percentage basis independently controls whether descendant
+/// The logical inline constraint remains distinct from the block-size
+/// percentage basis, which independently controls whether descendant
 /// `height` percentages resolve:
 /// <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout::flex) struct FlexMinContentBlockContainingSpace {
-    pub(in crate::layout::flex) width: PhysicalContentWidth,
+    pub(in crate::layout::flex) inline_size: LogicalInlineContentSize,
     pub(in crate::layout::flex) height_percentage_basis: BlockSizePercentageBasis,
+}
+
+/// Signed inline-axis extras added to a flex item's intrinsic content
+/// contribution. Margins may be negative, so this is deliberately not a
+/// `MarginBoxLength`.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::flex) struct FlexIntrinsicInlineOuterExtras(LayoutLength);
+
+impl FlexIntrinsicInlineOuterExtras {
+    pub(in crate::layout::flex) fn new(value: LayoutLength) -> Self {
+        Self(value)
+    }
+
+    /// Add this signed outer contribution to an intrinsic content-box
+    /// contribution. The result remains an intrinsic logical-inline
+    /// contribution, rather than becoming a margin-box size: negative
+    /// margins are deliberately preserved until the contribution merge.
+    pub(in crate::layout::flex) fn add_to(
+        self,
+        contribution: LogicalInlineContentSize,
+    ) -> LogicalInlineContentSize {
+        LogicalInlineContentSize::new(layout_to_content_box_length(
+            contribution.content_box_length().into_layout_length() + self.0,
+        ))
+    }
+}
+
+/// A signed, margin-inclusive child contribution accumulated into a flex
+/// item's logical block-size estimate.
+#[derive(Debug, Clone, Copy)]
+struct FlexBlockStackContribution(LayoutLength);
+
+impl FlexBlockStackContribution {
+    fn zero() -> Self {
+        Self(layout_pt(0.0))
+    }
+
+    fn from_content_size(value: LogicalBlockContentSize) -> Self {
+        Self(value.content_box_length().into_layout_length())
+    }
+
+    fn from_outer_extent(value: LayoutLength) -> Self {
+        Self(value)
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self(self.0 + other.0)
+    }
+
+    fn max(self, other: Self) -> Self {
+        if self.0 >= other.0 { self } else { other }
+    }
+
+    fn as_content_size(self) -> LogicalBlockContentSize {
+        LogicalBlockContentSize::new(layout_to_content_box_length(self.0))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -24,6 +95,118 @@ struct FlexItemPhysicalIntrinsicSizes {
     min_content_height: PhysicalContentHeight,
 }
 
+/// Intrinsic sizes before CSS Writing Modes projects a flex item onto the
+/// physical axes consumed by Flexbox.
+#[derive(Debug, Clone, Copy)]
+struct FlexItemLogicalIntrinsicSizes {
+    preferred_inline: LogicalInlineContentSize,
+    min_inline: LogicalInlineContentSize,
+    block: LogicalBlockContentSize,
+}
+
+/// The physical intrinsic content-box sizes of a flex container before the
+/// scalar `IntrinsicItemMetrics` adapter. Keeping this record typed prevents
+/// a main/cross projection from being reassembled as interchangeable width
+/// and height floats while line metrics and authored CSS sizes are applied.
+#[derive(Debug, Clone, Copy)]
+struct FlexIntrinsicContainerPhysicalSizes {
+    min_width: PhysicalContentWidth,
+    width: PhysicalContentWidth,
+    min_height: PhysicalContentHeight,
+    height: PhysicalContentHeight,
+}
+
+impl FlexIntrinsicContainerPhysicalSizes {
+    fn from_axis_contributions(
+        physical_direction: FlexDirection,
+        min_main: FlexMainSize,
+        max_main: FlexMainSize,
+        min_cross: FlexCrossSize,
+        max_cross: FlexCrossSize,
+    ) -> Self {
+        if physical_direction.is_column_axis() {
+            Self {
+                min_width: PhysicalContentWidth::new(flex_cross_content_box_length(min_cross)),
+                width: PhysicalContentWidth::new(flex_cross_content_box_length(max_cross)),
+                min_height: PhysicalContentHeight::new(flex_main_content_box_length(min_main)),
+                height: PhysicalContentHeight::new(flex_main_content_box_length(max_main)),
+            }
+        } else {
+            Self {
+                min_width: PhysicalContentWidth::new(flex_main_content_box_length(min_main)),
+                width: PhysicalContentWidth::new(flex_main_content_box_length(max_main)),
+                min_height: PhysicalContentHeight::new(flex_cross_content_box_length(min_cross)),
+                height: PhysicalContentHeight::new(flex_cross_content_box_length(max_cross)),
+            }
+        }
+    }
+
+    fn include_multiline_cross_size(
+        &mut self,
+        physical_direction: FlexDirection,
+        cross_size: FlexCrossSize,
+    ) {
+        if physical_direction.is_row_axis() {
+            let cross_size = PhysicalContentHeight::new(flex_cross_content_box_length(cross_size));
+            self.height = self.height.max(cross_size);
+            self.min_height = self.min_height.max(cross_size);
+        } else {
+            let cross_size = PhysicalContentWidth::new(flex_cross_content_box_length(cross_size));
+            self.width = self.width.max(cross_size);
+            self.min_width = self.min_width.max(cross_size);
+        }
+    }
+
+    fn resolved_width(
+        self,
+        style: &ComputedStyle,
+        available: FlexAvailableSpace,
+    ) -> PhysicalContentWidth {
+        used_length_percentage_or_auto_with_basis(
+            style.box_values.width.clone(),
+            available.width_basis,
+        )
+        .map(layout_to_content_box_length)
+        .map(PhysicalContentWidth::new)
+        .unwrap_or(self.width)
+    }
+
+    fn resolved_height(
+        self,
+        style: &ComputedStyle,
+        available: FlexAvailableSpace,
+    ) -> PhysicalContentHeight {
+        let percentage_basis = available
+            .height
+            .map(PhysicalContentHeight::content_box_length)
+            .unwrap_or_else(|| available.width.content_box_length())
+            .into_layout_length();
+        used_length_percentage_or_auto(
+            style.box_values.height.clone(),
+            PercentageBasis::definite(percentage_basis),
+        )
+        .map(layout_to_content_box_length)
+        .map(PhysicalContentHeight::new)
+        .or(available.height)
+        .unwrap_or(self.height)
+    }
+
+    fn intrinsic_metrics(
+        self,
+        width: PhysicalContentWidth,
+        height: PhysicalContentHeight,
+    ) -> FlexPhysicalIntrinsicMetrics {
+        FlexPhysicalIntrinsicMetrics {
+            width,
+            height,
+            min_width: self.min_width,
+            min_height: self.min_height,
+            content_width: self.width,
+            content_height: self.height,
+        }
+    }
+}
+
 /// Apply a flex item's block-axis constraints without inventing a percentage
 /// basis from its physical inline size.
 ///
@@ -34,19 +217,19 @@ struct FlexItemPhysicalIntrinsicSizes {
 /// <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>.
 pub(in crate::layout::flex) fn constrain_flex_item_estimated_height<Source>(
     style: &ComputedStyle,
-    value: f32,
-    min_content: f32,
-    max_content: f32,
+    value: ContentBoxLength,
+    min_content: ContentBoxLength,
+    max_content: ContentBoxLength,
     percentage_basis: PercentageBasis<ContentBoxLength, Source>,
-    vertical_non_content: f32,
+    vertical_non_content: NonContentLength,
 ) -> ContentBoxLength {
     constrain_height_with_intrinsic(
         style,
-        content_box_pt(value),
-        content_box_pt(min_content),
-        content_box_pt(max_content),
+        value,
+        min_content,
+        max_content,
         percentage_basis,
-        non_content_pt(vertical_non_content),
+        vertical_non_content,
     )
 }
 
@@ -59,33 +242,27 @@ pub(in crate::layout::flex) fn constrain_flex_item_estimated_height<Source>(
 /// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>.
 fn flex_item_physical_intrinsic_sizes(
     writing_mode: WritingMode,
-    logical_inline_size: f32,
-    logical_min_inline_size: f32,
-    logical_block_size: f32,
+    logical: FlexItemLogicalIntrinsicSizes,
 ) -> FlexItemPhysicalIntrinsicSizes {
     if !WritingModeAxes::new(writing_mode, Direction::Ltr).swaps_physical_axes() {
         FlexItemPhysicalIntrinsicSizes {
-            preferred_width: PhysicalContentWidth::new(content_box_pt(logical_inline_size)),
-            preferred_min_width: PhysicalContentWidth::new(content_box_pt(logical_min_inline_size)),
-            intrinsic_content_height: PhysicalContentHeight::new(content_box_pt(
-                logical_block_size,
-            )),
-            min_content_height: PhysicalContentHeight::new(content_box_pt(
-                logical_block_size.max(0.0),
-            )),
+            preferred_width: PhysicalContentWidth::new(
+                logical.preferred_inline.content_box_length(),
+            ),
+            preferred_min_width: PhysicalContentWidth::new(logical.min_inline.content_box_length()),
+            intrinsic_content_height: PhysicalContentHeight::new(
+                logical.block.content_box_length(),
+            ),
+            min_content_height: PhysicalContentHeight::new(logical.block.content_box_length()),
         }
     } else {
         FlexItemPhysicalIntrinsicSizes {
-            preferred_width: PhysicalContentWidth::new(content_box_pt(logical_block_size)),
-            preferred_min_width: PhysicalContentWidth::new(content_box_pt(
-                logical_block_size.max(0.0),
-            )),
-            intrinsic_content_height: PhysicalContentHeight::new(content_box_pt(
-                logical_inline_size,
-            )),
-            min_content_height: PhysicalContentHeight::new(content_box_pt(
-                logical_min_inline_size.max(0.0),
-            )),
+            preferred_width: PhysicalContentWidth::new(logical.block.content_box_length()),
+            preferred_min_width: PhysicalContentWidth::new(logical.block.content_box_length()),
+            intrinsic_content_height: PhysicalContentHeight::new(
+                logical.preferred_inline.content_box_length(),
+            ),
+            min_content_height: PhysicalContentHeight::new(logical.min_inline.content_box_length()),
         }
     }
 }
@@ -103,12 +280,13 @@ fn flex_basis_uses_content_inline_size(
     style: &ComputedStyle,
     physical_direction: FlexDirection,
 ) -> bool {
-    let logical_inline_is_main = match WritingModeAxes::new(style.writing_mode, style.direction)
-        .physical_axis(LogicalAxis::Inline)
-    {
-        PhysicalAxis::Horizontal => physical_direction.is_row_axis(),
-        PhysicalAxis::Vertical => physical_direction.is_column_axis(),
-    };
+    let logical_inline_is_main =
+        match WritingModeAxes::new(style.writing_mode, style.used_direction())
+            .physical_axis(LogicalAxis::Inline)
+        {
+            PhysicalAxis::Horizontal => physical_direction.is_row_axis(),
+            PhysicalAxis::Vertical => physical_direction.is_column_axis(),
+        };
     if !logical_inline_is_main {
         return false;
     }
@@ -144,8 +322,7 @@ impl<'a> LayoutBuilder<'a> {
         available: FlexItemAvailableSpace,
         physical_direction: FlexDirection,
     ) -> FlexItemEstimate {
-        let percentage_height_basis =
-            flex_item_estimate_percentage_height_basis(&child.style, available);
+        let percentage_height_basis = flex_item_estimate_percentage_height_basis(available);
         let mut estimate =
             self.with_flex_item_percentage_height_basis(percentage_height_basis, |layout| {
                 layout.estimate_flex_item_size_with_percentage_basis(
@@ -161,8 +338,7 @@ impl<'a> LayoutBuilder<'a> {
             // border box instead.
             // <https://www.w3.org/TR/css-contain-1/#containment-layout>
             estimate.metrics.clear_block_baselines();
-            estimate.first_horizontal_baseline = None;
-            estimate.last_horizontal_baseline = None;
+            estimate.baselines = FlexItemBaselineEstimate::default();
         }
         estimate
     }
@@ -179,10 +355,11 @@ impl<'a> LayoutBuilder<'a> {
         // normalized multicol style for its tracks and balancing geometry.
         let multicol_style = self.multicol_used_style(&child.style);
         let style = &multicol_style;
-        let containing_width = available.width.points();
+        let containing_width = available.width.content_box_length();
         let containing_width_basis = available.width_basis;
         let containing_height_basis = available.height_basis;
-        let containing_inline_size = available.inline_size(style).points();
+        let containing_inline_size = available.inline_size(style);
+        let containing_inline_size_points = containing_inline_size.points();
         let containing_inline_basis = available.inline_basis(style);
         let preferred_inline_basis = if containing_inline_basis.is_definite() {
             containing_inline_basis
@@ -190,24 +367,36 @@ impl<'a> LayoutBuilder<'a> {
             containing_width_basis
         };
         let vertical_non_content =
-            style.padding.top + style.padding.bottom + vertical_border_width(style);
+            non_content_pt(style.padding.top + style.padding.bottom + vertical_border_width(style));
         if let Some(children) = child.anonymous_content() {
             let measurement = self.intrinsic_inline_measurement_for_boxes(
                 children,
                 style,
                 stylesheets,
-                containing_inline_size.max(1.0),
+                containing_inline_size_points.max(1.0),
             );
             let contribution = measurement.contribution;
-            let logical_inline_size = contribution.max_content.max(style.font_size * 0.25);
-            let logical_min_inline_size = contribution.min_content.max(style.font_size * 0.25);
+            let logical_inline_size = contribution
+                .max_content
+                .points()
+                .max(style.font_size * 0.25);
+            let logical_min_inline_size = contribution
+                .min_content
+                .points()
+                .max(style.font_size * 0.25);
             let used_line_height = self.font_system.used_line_height(style).points();
             let logical_block_size = measurement.height().max(used_line_height);
             let physical_intrinsic = flex_item_physical_intrinsic_sizes(
                 style.writing_mode,
-                logical_inline_size,
-                logical_min_inline_size,
-                logical_block_size,
+                FlexItemLogicalIntrinsicSizes {
+                    preferred_inline: LogicalInlineContentSize::new(content_box_pt(
+                        logical_inline_size,
+                    )),
+                    min_inline: LogicalInlineContentSize::new(content_box_pt(
+                        logical_min_inline_size,
+                    )),
+                    block: LogicalBlockContentSize::new(content_box_pt(logical_block_size)),
+                },
             );
             let content_width = used_length_percentage_or_auto_with_basis(
                 style.box_values.width.clone(),
@@ -218,40 +407,47 @@ impl<'a> LayoutBuilder<'a> {
             let content_height = used_content_box_height_or_auto_with_basis(
                 style,
                 containing_height_basis,
-                non_content_pt(vertical_non_content),
+                vertical_non_content,
             )
-            .map(SemanticLengthExt::points)
-            .unwrap_or(physical_intrinsic.intrinsic_content_height.points());
+            .unwrap_or(
+                physical_intrinsic
+                    .intrinsic_content_height
+                    .content_box_length(),
+            );
             let width = constrain_content_width(
                 style,
                 content_box_pt(content_width),
-                PercentageBasis::definite(layout_pt(containing_width)),
+                PercentageBasis::definite(containing_width),
             )
             .points();
             let height = constrain_flex_item_estimated_height(
                 style,
                 content_height,
-                physical_intrinsic.min_content_height.points(),
-                physical_intrinsic.intrinsic_content_height.points(),
+                physical_intrinsic.min_content_height.content_box_length(),
+                physical_intrinsic
+                    .intrinsic_content_height
+                    .content_box_length(),
                 containing_height_basis,
                 vertical_non_content,
             );
             let min_width = constrain_content_width(
                 style,
                 physical_intrinsic.preferred_min_width.content_box_length(),
-                PercentageBasis::definite(layout_pt(containing_width)),
+                PercentageBasis::definite(containing_width),
             )
             .points();
             let min_height = constrain_flex_item_estimated_height(
                 style,
-                physical_intrinsic.min_content_height.points(),
-                physical_intrinsic.min_content_height.points(),
-                physical_intrinsic.intrinsic_content_height.points(),
+                physical_intrinsic.min_content_height.content_box_length(),
+                physical_intrinsic.min_content_height.content_box_length(),
+                physical_intrinsic
+                    .intrinsic_content_height
+                    .content_box_length(),
                 containing_height_basis,
                 vertical_non_content,
             );
             let fallback_line_baseline_offset =
-                self.inline_box_text_line_layout_baseline_offset(style);
+                layout_pt(self.inline_box_text_line_layout_baseline_offset(style));
             let first_line_baseline_offset = first_sequence_line_baseline_offset(
                 &measurement.sequence,
                 fallback_line_baseline_offset,
@@ -262,13 +458,13 @@ impl<'a> LayoutBuilder<'a> {
             );
             let preceding_line_height = preceding_line_height_before_last(&measurement.sequence);
             let baseline_edge = used_border_widths(style).top + style.padding.top;
-            let first_baseline = baseline_edge + first_line_baseline_offset;
+            let first_baseline = baseline_edge + first_line_baseline_offset.points();
             let last_baseline = baseline_edge
                 + measurement
                     .sequence
-                    .last_line_baseline_offset(fallback_line_baseline_offset);
-            return FlexItemEstimate {
-                metrics: IntrinsicItemMetrics {
+                    .last_line_baseline_offset(fallback_line_baseline_offset.points());
+            return FlexItemEstimate::new(
+                IntrinsicItemMetrics {
                     width: content_box_pt(width),
                     height,
                     min_width: content_box_pt(min_width),
@@ -281,22 +477,33 @@ impl<'a> LayoutBuilder<'a> {
                     first_baseline: Some(first_baseline),
                     last_baseline: Some(last_baseline),
                 },
-                first_horizontal_baseline: first_horizontal_text_baseline_offset(
-                    style,
-                    width,
-                    first_line_baseline_offset,
-                ),
-                last_horizontal_baseline: last_horizontal_text_baseline_offset(
-                    style,
-                    width,
-                    preceding_line_height,
-                    last_line_baseline_offset,
-                ),
-            };
+                FlexItemBaselineEstimate {
+                    vertical: FlexItemBaselinePair {
+                        first: Some(FlexVerticalBaselineOffset::new(first_baseline)),
+                        last: Some(FlexVerticalBaselineOffset::new(last_baseline)),
+                    },
+                    horizontal: FlexItemBaselinePair {
+                        first: first_horizontal_text_baseline_offset(
+                            style,
+                            flex_estimated_border_box_width(style, content_box_pt(width)),
+                            first_line_baseline_offset,
+                        ),
+                        last: last_horizontal_text_baseline_offset(
+                            style,
+                            flex_estimated_border_box_width(style, content_box_pt(width)),
+                            preceding_line_height,
+                            last_line_baseline_offset,
+                        ),
+                    },
+                },
+            );
         }
 
         let Some((element, signature, child_boxes)) = child.element_parts() else {
-            return FlexItemEstimate::fixed(0.0, 0.0);
+            return FlexItemEstimate::fixed(
+                PhysicalContentWidth::new(content_box_pt(0.0)),
+                PhysicalContentHeight::new(content_box_pt(0.0)),
+            );
         };
         if style.contain.size && replaced_element_kind(element).is_none() {
             // Size-contained flex items participate in flex layout with their
@@ -310,7 +517,7 @@ impl<'a> LayoutBuilder<'a> {
                 .map(|width| {
                     used_length_percentage(
                         width,
-                        PercentageBasis::definite(layout_pt(containing_width.max(0.0))),
+                        PercentageBasis::definite(containing_width.into_layout_length()),
                     )
                     .points()
                 })
@@ -322,7 +529,7 @@ impl<'a> LayoutBuilder<'a> {
                 .map(|height| {
                     used_length_percentage(
                         height,
-                        PercentageBasis::definite(layout_pt(containing_width.max(0.0))),
+                        PercentageBasis::definite(containing_width.into_layout_length()),
                     )
                     .points()
                 })
@@ -336,7 +543,7 @@ impl<'a> LayoutBuilder<'a> {
             let mut content_height = used_content_box_height_or_auto_with_basis(
                 style,
                 containing_height_basis,
-                non_content_pt(vertical_non_content),
+                vertical_non_content,
             )
             .map(SemanticLengthExt::points)
             .unwrap_or(fallback_height);
@@ -353,14 +560,14 @@ impl<'a> LayoutBuilder<'a> {
             let width = constrain_content_width(
                 style,
                 content_box_pt(content_width),
-                PercentageBasis::definite(layout_pt(containing_width)),
+                PercentageBasis::definite(containing_width),
             )
             .points();
             let height = constrain_flex_item_estimated_height(
                 style,
-                content_height,
-                0.0,
-                0.0,
+                content_box_pt(content_height),
+                content_box_pt(0.0),
+                content_box_pt(0.0),
                 containing_height_basis,
                 vertical_non_content,
             );
@@ -370,36 +577,48 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 child_boxes,
                 stylesheets,
-                containing_width,
+                available.width,
             );
-            return FlexItemEstimate {
-                metrics: IntrinsicItemMetrics {
+            return FlexItemEstimate::new(
+                IntrinsicItemMetrics {
                     width: content_box_pt(width),
                     height,
                     min_width: constrain_content_width(
                         style,
                         content_box_pt(fallback_width),
-                        PercentageBasis::definite(layout_pt(containing_width)),
+                        PercentageBasis::definite(containing_width),
                     ),
                     min_height: constrain_flex_item_estimated_height(
                         style,
-                        fallback_height,
-                        fallback_height,
-                        fallback_height,
+                        content_box_pt(fallback_height),
+                        content_box_pt(fallback_height),
+                        content_box_pt(fallback_height),
                         containing_height_basis,
                         vertical_non_content,
                     ),
                     content_width: content_box_pt(fallback_width),
                     content_height: content_box_pt(fallback_height),
                     preferred_aspect_ratio: style.aspect_ratio.preferred_ratio(false, None),
-                    first_baseline: descendant_baselines.first_baseline,
-                    last_baseline: descendant_baselines.last_baseline,
+                    first_baseline: descendant_baselines
+                        .vertical
+                        .first
+                        .map(FlexVerticalBaselineOffset::points),
+                    last_baseline: descendant_baselines
+                        .vertical
+                        .last
+                        .map(FlexVerticalBaselineOffset::points),
                 },
-                first_horizontal_baseline: descendant_baselines.first_horizontal_baseline,
-                last_horizontal_baseline: descendant_baselines.last_horizontal_baseline,
-            };
+                descendant_baselines,
+            );
         }
         if style.display.is_flex() {
+            let main_size_resolved_by_flex = matches!(
+                available.width_basis,
+                PercentageBasis::Definite {
+                    source: FlexAvailableSizeSource::PostFlexingMainSize,
+                    ..
+                }
+            ) && physical_direction.is_row_axis();
             let intrinsic_size = self.with_ancestor_signature(signature.clone(), |layout| {
                 let built_child_boxes;
                 let child_boxes = if let Some(child_boxes) = child_boxes {
@@ -414,31 +633,59 @@ impl<'a> LayoutBuilder<'a> {
                 };
                 let children = flex_children_from_boxes(element, signature, style, child_boxes);
                 (!children.is_empty()).then(|| {
-                    let intrinsic_height = used_content_box_height_or_auto_with_basis(
+                    let explicit_intrinsic_height = used_content_box_height_or_auto_with_basis(
                         style,
                         containing_height_basis,
-                        non_content_pt(vertical_non_content),
+                        vertical_non_content,
                     );
+                    // An auto-height flex item stretched by a parent line
+                    // has a definite used cross size for its descendants.
+                    // A nested flex container must retain that marked basis
+                    // while estimating its own items; otherwise percentage
+                    // block constraints inside it are treated as cyclic even
+                    // after the parent has finalized the line cross size.
+                    // <https://www.w3.org/TR/css-flexbox-1/#definite-sizes>
+                    let intrinsic_height = explicit_intrinsic_height.or_else(|| {
+                        available
+                            .stretched_height
+                            .map(PhysicalContentHeight::content_box_length)
+                    });
+                    let intrinsic_height_basis = if explicit_intrinsic_height.is_some() {
+                        flex_available_percentage_basis(
+                            intrinsic_height,
+                            FlexAvailableSizeSource::IntrinsicContainerSize,
+                        )
+                    } else if available.stretched_height.is_some() {
+                        available.height_basis
+                    } else {
+                        flex_available_percentage_basis(
+                            intrinsic_height,
+                            FlexAvailableSizeSource::IntrinsicContainerSize,
+                        )
+                    };
                     layout.estimate_intrinsic_flex_container_size(
                         &children,
                         style,
                         stylesheets,
                         FlexAvailableSpace {
-                            width: PhysicalContentWidth::new(content_box_pt(containing_width)),
-                            width_basis: flex_available_percentage_basis_from_points(
-                                used_length_percentage_or_auto_with_basis(
-                                    style.box_values.width.clone(),
-                                    containing_width_basis,
+                            width: PhysicalContentWidth::new(containing_width),
+                            width_basis: if main_size_resolved_by_flex {
+                                PercentageBasis::definite_from(
+                                    containing_width,
+                                    FlexAvailableSizeSource::PostFlexingMainSize,
                                 )
-                                .map(|width| width.points())
-                                .map(|_| containing_width),
-                                FlexAvailableSizeSource::IntrinsicContainerSize,
-                            ),
+                            } else {
+                                flex_available_percentage_basis(
+                                    used_length_percentage_or_auto_with_basis(
+                                        style.box_values.width.clone(),
+                                        containing_width_basis,
+                                    )
+                                    .map(|_| containing_width),
+                                    FlexAvailableSizeSource::IntrinsicContainerSize,
+                                )
+                            },
                             height: intrinsic_height.map(PhysicalContentHeight::new),
-                            height_basis: flex_available_percentage_basis_from_points(
-                                intrinsic_height.map(SemanticLengthExt::points),
-                                FlexAvailableSizeSource::IntrinsicContainerSize,
-                            ),
+                            height_basis: intrinsic_height_basis,
                         },
                     )
                 })
@@ -449,38 +696,44 @@ impl<'a> LayoutBuilder<'a> {
                     containing_width_basis,
                 )
                 .map(|width| width.points())
-                .unwrap_or_else(|| intrinsic_size.width.points())
+                .unwrap_or_else(|| {
+                    if main_size_resolved_by_flex {
+                        containing_width.points()
+                    } else {
+                        intrinsic_size.width.points()
+                    }
+                })
                 .max(style.font_size);
                 let used_line_height = self.font_system.used_line_height(style).points();
                 let content_height = used_content_box_height_or_auto_with_basis(
                     style,
                     containing_height_basis,
-                    non_content_pt(vertical_non_content),
+                    vertical_non_content,
                 )
                 .map(SemanticLengthExt::points)
                 .unwrap_or_else(|| intrinsic_size.height.points())
                 .max(used_line_height);
-                return FlexItemEstimate {
-                    metrics: IntrinsicItemMetrics {
+                return FlexItemEstimate::new(
+                    IntrinsicItemMetrics {
                         width: constrain_content_width(
                             style,
                             content_box_pt(content_width),
-                            PercentageBasis::definite(layout_pt(containing_width)),
+                            PercentageBasis::definite(containing_width),
                         ),
                         height: constrain_content_height(
                             style,
                             content_box_pt(content_height),
-                            PercentageBasis::definite(layout_pt(containing_width)),
+                            PercentageBasis::definite(containing_width),
                         ),
                         min_width: constrain_content_width(
                             style,
                             intrinsic_size.min_width,
-                            PercentageBasis::definite(layout_pt(containing_width)),
+                            PercentageBasis::definite(containing_width),
                         ),
                         min_height: constrain_content_height(
                             style,
                             intrinsic_size.min_height,
-                            PercentageBasis::definite(layout_pt(containing_width)),
+                            PercentageBasis::definite(containing_width),
                         ),
                         content_width: intrinsic_size.content_width,
                         content_height: intrinsic_size.content_height,
@@ -488,9 +741,8 @@ impl<'a> LayoutBuilder<'a> {
                         first_baseline: intrinsic_size.first_baseline,
                         last_baseline: intrinsic_size.last_baseline,
                     },
-                    first_horizontal_baseline: intrinsic_size.first_horizontal_baseline,
-                    last_horizontal_baseline: intrinsic_size.last_horizontal_baseline,
-                };
+                    intrinsic_size.baselines,
+                );
             }
         }
 
@@ -501,16 +753,16 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     stylesheets,
                     child_boxes,
-                    containing_width,
-                    crate::layout::grid::grid_percentage_basis_from_points(
-                        containing_width_basis.points(),
+                    containing_width.points(),
+                    crate::layout::grid::grid_percentage_basis(
+                        containing_width_basis.value(),
                         crate::layout::grid::GridAvailableSizeSource::ContainerInlineSize,
                     ),
-                    crate::layout::grid::grid_percentage_basis_from_points(
-                        containing_height_basis.points(),
+                    crate::layout::grid::grid_percentage_basis(
+                        containing_height_basis.value(),
                         crate::layout::grid::GridAvailableSizeSource::ContainerBlockSize,
                     ),
-                    vertical_non_content,
+                    vertical_non_content.points(),
                 )
             });
             if let Some(grid_intrinsic) = grid_intrinsic {
@@ -521,33 +773,33 @@ impl<'a> LayoutBuilder<'a> {
                 let width = constrain_content_width(
                     style,
                     grid_intrinsic.content_width,
-                    PercentageBasis::definite(layout_pt(containing_width)),
+                    PercentageBasis::definite(containing_width),
                 )
                 .points();
                 let height = constrain_flex_item_estimated_height(
                     style,
-                    content_height.points(),
-                    intrinsic_height.points(),
-                    intrinsic_height.points(),
+                    content_height,
+                    intrinsic_height,
+                    intrinsic_height,
                     containing_height_basis,
                     vertical_non_content,
                 );
                 let min_width = constrain_content_width(
                     style,
                     grid_intrinsic.min_width,
-                    PercentageBasis::definite(layout_pt(containing_width)),
+                    PercentageBasis::definite(containing_width),
                 )
                 .points();
                 let min_height = constrain_flex_item_estimated_height(
                     style,
-                    intrinsic_height.points(),
-                    intrinsic_height.points(),
-                    intrinsic_height.points(),
+                    intrinsic_height,
+                    intrinsic_height,
+                    intrinsic_height,
                     containing_height_basis,
                     vertical_non_content,
                 );
-                return FlexItemEstimate {
-                    metrics: IntrinsicItemMetrics {
+                return FlexItemEstimate::new(
+                    IntrinsicItemMetrics {
                         width: content_box_pt(width),
                         height,
                         min_width: content_box_pt(min_width),
@@ -558,9 +810,8 @@ impl<'a> LayoutBuilder<'a> {
                         first_baseline: grid_intrinsic.first_baseline,
                         last_baseline: grid_intrinsic.last_baseline,
                     },
-                    first_horizontal_baseline: None,
-                    last_horizontal_baseline: None,
-                };
+                    FlexItemBaselineEstimate::default(),
+                );
             }
         }
 
@@ -591,7 +842,7 @@ impl<'a> LayoutBuilder<'a> {
         };
         if let Some(intrinsic) = replaced_intrinsic
             && let Some(size) =
-                estimate_replaced_flex_item(intrinsic, style, containing_width, available)
+                estimate_replaced_flex_item(intrinsic, style, available.width, available)
         {
             return size;
         }
@@ -615,44 +866,44 @@ impl<'a> LayoutBuilder<'a> {
             let content_height = used_content_box_height_or_auto_with_basis(
                 style,
                 containing_height_basis,
-                non_content_pt(vertical_non_content),
+                vertical_non_content,
             )
-            .map(SemanticLengthExt::points)
-            .unwrap_or(row_height);
+            .unwrap_or_else(|| content_box_pt(row_height));
             let width = constrain_content_width(
                 style,
                 content_box_pt(content_width),
-                PercentageBasis::definite(layout_pt(containing_width)),
+                PercentageBasis::definite(containing_width),
             )
             .points();
             let height = constrain_flex_item_estimated_height(
                 style,
                 content_height,
-                row_height,
-                row_height,
+                content_box_pt(row_height),
+                content_box_pt(row_height),
                 containing_height_basis,
                 vertical_non_content,
             );
             let min_width = constrain_content_width(
                 style,
                 content_box_pt(row_width),
-                PercentageBasis::definite(layout_pt(containing_width)),
+                PercentageBasis::definite(containing_width),
             )
             .points();
             let min_height = constrain_flex_item_estimated_height(
                 style,
-                row_height,
-                row_height,
-                row_height,
+                content_box_pt(row_height),
+                content_box_pt(row_height),
+                content_box_pt(row_height),
                 containing_height_basis,
                 vertical_non_content,
             );
-            let line_baseline_offset = self.inline_box_text_line_layout_baseline_offset(style);
+            let line_baseline_offset =
+                layout_pt(self.inline_box_text_line_layout_baseline_offset(style));
             let first_baseline = used_border_widths(style).top
                 + style.padding.top
                 + self.inline_box_text_line_layout_baseline_offset(style);
-            return FlexItemEstimate {
-                metrics: IntrinsicItemMetrics {
+            return FlexItemEstimate::new(
+                IntrinsicItemMetrics {
                     width: content_box_pt(width),
                     height,
                     min_width: content_box_pt(min_width),
@@ -663,24 +914,32 @@ impl<'a> LayoutBuilder<'a> {
                     first_baseline: Some(first_baseline),
                     last_baseline: Some(first_baseline),
                 },
-                first_horizontal_baseline: first_horizontal_text_baseline_offset(
-                    style,
-                    width,
-                    line_baseline_offset,
-                ),
-                last_horizontal_baseline: last_horizontal_text_baseline_offset(
-                    style,
-                    width,
-                    0.0,
-                    line_baseline_offset,
-                ),
-            };
+                FlexItemBaselineEstimate {
+                    vertical: FlexItemBaselinePair {
+                        first: Some(FlexVerticalBaselineOffset::new(first_baseline)),
+                        last: Some(FlexVerticalBaselineOffset::new(first_baseline)),
+                    },
+                    horizontal: FlexItemBaselinePair {
+                        first: first_horizontal_text_baseline_offset(
+                            style,
+                            flex_estimated_border_box_width(style, content_box_pt(width)),
+                            line_baseline_offset,
+                        ),
+                        last: last_horizontal_text_baseline_offset(
+                            style,
+                            flex_estimated_border_box_width(style, content_box_pt(width)),
+                            layout_pt(0.0),
+                            line_baseline_offset,
+                        ),
+                    },
+                },
+            );
         }
 
         let definition_list_column_height =
             self.estimate_definition_list_column_height(child, stylesheets, containing_inline_size);
         let inline_content_width =
-            (containing_inline_size - style.padding.left - style.padding.right).max(1.0);
+            (containing_inline_size_points - style.padding.left - style.padding.right).max(1.0);
         let inline_percentage_basis = if style.box_values.width.is_auto() {
             PercentageBasis::indefinite()
         } else {
@@ -691,7 +950,11 @@ impl<'a> LayoutBuilder<'a> {
         };
         let mut inline_measurement =
             self.with_intrinsic_inline_percentage_basis(inline_percentage_basis, |layout| {
-                layout.estimate_child_inline_measurement(child, stylesheets, inline_content_width)
+                layout.estimate_child_inline_measurement(
+                    child,
+                    stylesheets,
+                    LogicalInlineContentSize::new(content_box_pt(inline_content_width)),
+                )
             });
         let child_intrinsic = self.estimate_child_intrinsic_widths(
             child,
@@ -699,9 +962,22 @@ impl<'a> LayoutBuilder<'a> {
             containing_inline_size,
             inline_measurement.contribution,
         );
+        let remeasuring_post_flexed_main_size =
+            matches!(
+                if physical_direction.is_row_axis() {
+                    available.width_basis
+                } else {
+                    available.height_basis
+                },
+                PercentageBasis::Definite {
+                    source: FlexAvailableSizeSource::PostFlexingMainSize,
+                    ..
+                }
+            ) && flex_basis_uses_content_inline_size(style, physical_direction);
         let content_basis_inline_width =
             flex_basis_uses_content_inline_size(style, physical_direction)
-                && child_intrinsic.max_content > inline_content_width + 0.01;
+                && !remeasuring_post_flexed_main_size
+                && child_intrinsic.max_content.points() > inline_content_width + 0.01;
         if content_basis_inline_width {
             inline_measurement =
                 self.with_intrinsic_inline_percentage_basis(inline_percentage_basis, |layout| {
@@ -721,35 +997,62 @@ impl<'a> LayoutBuilder<'a> {
             child,
             stylesheets,
             hypothetical_cross_measure_width,
-            inline_measurement.height(),
+            LogicalBlockContentSize::new(content_box_pt(inline_measurement.height())),
         );
 
         let logical_inline_size = child_intrinsic.max_content;
         let logical_min_inline_size = child_intrinsic.min_content;
-        let used_line_height = style.line_height;
-        let fallback_logical_block_size = if inline_measurement.line_count() > 0 {
-            inline_measurement
-                .height()
-                .max(inline_measurement.line_count() as f32 * used_line_height)
-        } else if element.children.is_empty() && child_intrinsic.max_content == 0.0 {
-            // CSS Flexbox determines the hypothetical cross size by laying the
-            // item out as a block. A genuinely empty block has zero content
-            // height, allowing align-content/stretch to distribute the flex
-            // container's cross size across wrapped lines.
-            // https://www.w3.org/TR/css-flexbox-1/#algo-cross-item
+        let inline_block_contribution = if inline_measurement.line_count() > 0 {
+            // The selected line sequence owns every used line-box extent.
+            // In particular, a terminal forced break can leave a zero-height
+            // empty record after the final painted line. Reconstructing the
+            // block size as `line_count * line-height` would turn that record
+            // into spurious flex-item height.
+            // <https://www.w3.org/TR/css-inline-3/#line-layout>
+            inline_measurement.height()
+        } else {
+            // A block-only formatting context has no inline line box or
+            // inherited line strut of its own. Its automatic block-size is
+            // the block-stack contribution of its in-flow descendants. In
+            // particular, an auto-height flex item containing a fixed-height
+            // block must not grow to the item's inherited `line-height`.
+            // <https://www.w3.org/TR/CSS22/visudet.html#normal-block> and
+            // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+            0.0
+        };
+        let fallback_logical_block_size = if inline_measurement.line_count() == 0
+            && element.children.is_empty()
+            && child_intrinsic.max_content.points() == 0.0
+        {
+            // A genuinely empty block has zero content height, allowing
+            // align-content/stretch to distribute a flex line's cross size.
             0.0
         } else {
-            used_line_height
+            inline_block_contribution
         };
-        let logical_block_size = definition_list_column_height
-            .unwrap_or_else(|| fallback_logical_block_size.max(child_preferred_block_height));
+        let logical_block_size = definition_list_column_height.unwrap_or_else(|| {
+            LogicalBlockContentSize::new(content_box_pt(
+                fallback_logical_block_size.max(child_preferred_block_height.points()),
+            ))
+        });
         let mut physical_intrinsic = flex_item_physical_intrinsic_sizes(
             style.writing_mode,
-            logical_inline_size,
-            logical_min_inline_size,
-            logical_block_size,
+            FlexItemLogicalIntrinsicSizes {
+                preferred_inline: logical_inline_size,
+                min_inline: logical_min_inline_size,
+                block: logical_block_size,
+            },
         );
-        if (inline_measurement.line_count() == 0 || inline_measurement.line_count() > 1)
+        // An orthogonal item's own inline formatting context can be empty
+        // even when an in-flow descendant gives it a definite physical block
+        // extent. The block-stack estimator currently has no orthogonal-child
+        // projection, so retain that intrinsic fallback only for a genuinely
+        // empty block contribution. In particular, never project a multi-line
+        // vertical item's *inline* max-content length onto physical width:
+        // vertical inline size maps to physical height.
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+        if inline_measurement.line_count() == 0
+            && logical_block_size.points() <= 0.01
             && matches!(
                 style.writing_mode,
                 WritingMode::VerticalRl
@@ -758,18 +1061,10 @@ impl<'a> LayoutBuilder<'a> {
                     | WritingMode::SidewaysLr
             )
         {
-            physical_intrinsic.preferred_width = PhysicalContentWidth::new(content_box_pt(
-                physical_intrinsic
-                    .preferred_width
-                    .points()
-                    .max(child_intrinsic.max_content),
-            ));
-            physical_intrinsic.preferred_min_width = PhysicalContentWidth::new(content_box_pt(
-                physical_intrinsic
-                    .preferred_min_width
-                    .points()
-                    .max(child_intrinsic.min_content),
-            ));
+            physical_intrinsic.preferred_width =
+                PhysicalContentWidth::new(content_box_pt(child_intrinsic.max_content.points()));
+            physical_intrinsic.preferred_min_width =
+                PhysicalContentWidth::new(content_box_pt(child_intrinsic.min_content.points()));
         }
         let mut content_width = used_length_percentage_or_auto_with_basis(
             style.box_values.width.clone(),
@@ -790,7 +1085,7 @@ impl<'a> LayoutBuilder<'a> {
             // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
             content_width
         } else if style.box_values.width.is_auto() {
-            containing_inline_size
+            containing_inline_size_points
         } else {
             content_width
         };
@@ -799,37 +1094,35 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             child_boxes,
-            block_height_probe_width,
+            PhysicalContentWidth::new(content_box_pt(block_height_probe_width)),
             inline_measurement.line_count(),
         ) && matches!(style.writing_mode, WritingMode::HorizontalTb)
         {
-            physical_intrinsic.intrinsic_content_height =
-                PhysicalContentHeight::new(content_box_pt(block_height));
+            physical_intrinsic.intrinsic_content_height = block_height;
             physical_intrinsic.min_content_height =
-                PhysicalContentHeight::new(content_box_pt(block_height.max(0.0)));
+                PhysicalContentHeight::new(content_box_pt(block_height.points().max(0.0)));
         }
         if style.box_values.height.is_auto()
             && matches!(style.writing_mode, WritingMode::HorizontalTb)
             && let Some(multicol_height) = self.estimate_child_multicol_inline_height(
                 child,
                 stylesheets,
-                constrain_content_width(
+                LogicalInlineContentSize::new(constrain_content_width(
                     style,
                     content_box_pt(content_width),
-                    PercentageBasis::definite(layout_pt(containing_width)),
-                )
-                .points(),
+                    PercentageBasis::definite(containing_width),
+                )),
             )
         {
             physical_intrinsic.intrinsic_content_height =
-                PhysicalContentHeight::new(content_box_pt(multicol_height));
+                PhysicalContentHeight::new(multicol_height.content_box_length());
             physical_intrinsic.min_content_height =
-                PhysicalContentHeight::new(content_box_pt(multicol_height.max(0.0)));
+                PhysicalContentHeight::new(content_box_pt(multicol_height.points().max(0.0)));
         }
         let mut content_height = used_content_box_height_or_auto_with_basis(
             style,
             containing_height_basis,
-            non_content_pt(vertical_non_content),
+            vertical_non_content,
         )
         .map(SemanticLengthExt::points)
         .unwrap_or(physical_intrinsic.intrinsic_content_height.points());
@@ -917,7 +1210,7 @@ impl<'a> LayoutBuilder<'a> {
                 (true, true) => {
                     let stretched_height = available
                         .stretched_height
-                        .map(|height| (height.points() - vertical_non_content).max(0.0));
+                        .map(|height| (height.points() - vertical_non_content.points()).max(0.0));
                     let stretched_width = available.stretched_width.map(|width| {
                         let horizontal_non_content = style.padding.left
                             + style.padding.right
@@ -971,14 +1264,16 @@ impl<'a> LayoutBuilder<'a> {
         let mut width = constrain_content_width(
             style,
             content_box_pt(content_width),
-            PercentageBasis::definite(layout_pt(containing_width)),
+            PercentageBasis::definite(containing_width),
         )
         .points();
         let height = constrain_flex_item_estimated_height(
             style,
-            content_height,
-            physical_intrinsic.min_content_height.points(),
-            physical_intrinsic.intrinsic_content_height.points(),
+            content_box_pt(content_height),
+            physical_intrinsic.min_content_height.content_box_length(),
+            physical_intrinsic
+                .intrinsic_content_height
+                .content_box_length(),
             containing_height_basis,
             vertical_non_content,
         );
@@ -1009,7 +1304,7 @@ impl<'a> LayoutBuilder<'a> {
             width = constrain_content_width(
                 style,
                 content_box_pt(transferred_width),
-                PercentageBasis::definite(layout_pt(containing_width)),
+                PercentageBasis::definite(containing_width),
             )
             .points();
             physical_intrinsic.preferred_width = PhysicalContentWidth::new(content_box_pt(
@@ -1028,18 +1323,21 @@ impl<'a> LayoutBuilder<'a> {
         let min_width = constrain_content_width(
             style,
             physical_intrinsic.preferred_min_width.content_box_length(),
-            PercentageBasis::definite(layout_pt(containing_width)),
+            PercentageBasis::definite(containing_width),
         )
         .points();
         let min_height = constrain_flex_item_estimated_height(
             style,
-            physical_intrinsic.min_content_height.points(),
-            physical_intrinsic.min_content_height.points(),
-            physical_intrinsic.intrinsic_content_height.points(),
+            physical_intrinsic.min_content_height.content_box_length(),
+            physical_intrinsic.min_content_height.content_box_length(),
+            physical_intrinsic
+                .intrinsic_content_height
+                .content_box_length(),
             containing_height_basis,
             vertical_non_content,
         );
-        let fallback_line_baseline_offset = self.inline_box_text_line_layout_baseline_offset(style);
+        let fallback_line_baseline_offset =
+            layout_pt(self.inline_box_text_line_layout_baseline_offset(style));
         let first_line_baseline_offset = first_sequence_line_baseline_offset(
             &inline_measurement.sequence,
             fallback_line_baseline_offset,
@@ -1056,20 +1354,20 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 child_boxes,
                 stylesheets,
-                containing_width,
+                available.width,
             )
         } else {
             FlexItemBaselineEstimate::default()
         };
 
         let baseline_edge = used_border_widths(style).top + style.padding.top;
-        let first_text_baseline = baseline_edge + first_line_baseline_offset;
+        let first_text_baseline = baseline_edge + first_line_baseline_offset.points();
         let last_text_baseline = baseline_edge
             + inline_measurement
                 .sequence
-                .last_line_baseline_offset(fallback_line_baseline_offset);
-        FlexItemEstimate {
-            metrics: IntrinsicItemMetrics {
+                .last_line_baseline_offset(fallback_line_baseline_offset.points());
+        FlexItemEstimate::new(
+            IntrinsicItemMetrics {
                 width: content_box_pt(width),
                 height,
                 min_width: content_box_pt(min_width),
@@ -1081,36 +1379,58 @@ impl<'a> LayoutBuilder<'a> {
                 preferred_aspect_ratio: style.aspect_ratio.preferred_ratio(false, None),
                 first_baseline: (inline_measurement.line_count() > 0)
                     .then_some(first_text_baseline)
-                    .or(descendant_baselines.first_baseline),
+                    .or(descendant_baselines
+                        .vertical
+                        .first
+                        .map(FlexVerticalBaselineOffset::points)),
                 last_baseline: (inline_measurement.line_count() > 0)
                     .then_some(last_text_baseline)
-                    .or(descendant_baselines.last_baseline),
+                    .or(descendant_baselines
+                        .vertical
+                        .last
+                        .map(FlexVerticalBaselineOffset::points)),
             },
-            first_horizontal_baseline: (inline_measurement.line_count() > 0)
-                .then(|| {
-                    first_horizontal_text_baseline_offset(style, width, first_line_baseline_offset)
-                })
-                .flatten()
-                .or(descendant_baselines.first_horizontal_baseline),
-            last_horizontal_baseline: (inline_measurement.line_count() > 0)
-                .then(|| {
-                    last_horizontal_text_baseline_offset(
-                        style,
-                        width,
-                        preceding_line_height,
-                        last_line_baseline_offset,
-                    )
-                })
-                .flatten()
-                .or(descendant_baselines.last_horizontal_baseline),
-        }
+            FlexItemBaselineEstimate {
+                vertical: FlexItemBaselinePair {
+                    first: (inline_measurement.line_count() > 0)
+                        .then_some(FlexVerticalBaselineOffset::new(first_text_baseline))
+                        .or(descendant_baselines.vertical.first),
+                    last: (inline_measurement.line_count() > 0)
+                        .then_some(FlexVerticalBaselineOffset::new(last_text_baseline))
+                        .or(descendant_baselines.vertical.last),
+                },
+                horizontal: FlexItemBaselinePair {
+                    first: (inline_measurement.line_count() > 0)
+                        .then(|| {
+                            first_horizontal_text_baseline_offset(
+                                style,
+                                flex_estimated_border_box_width(style, content_box_pt(width)),
+                                first_line_baseline_offset,
+                            )
+                        })
+                        .flatten()
+                        .or(descendant_baselines.horizontal.first),
+                    last: (inline_measurement.line_count() > 0)
+                        .then(|| {
+                            last_horizontal_text_baseline_offset(
+                                style,
+                                flex_estimated_border_box_width(style, content_box_pt(width)),
+                                preceding_line_height,
+                                last_line_baseline_offset,
+                            )
+                        })
+                        .flatten()
+                        .or(descendant_baselines.horizontal.last),
+                },
+            },
+        )
     }
 
     pub(in crate::layout::flex) fn estimate_child_inline_measurement(
         &mut self,
         child: &StyledChild<'_>,
         stylesheets: &[Stylesheet],
-        available_width: f32,
+        available_inline_size: LogicalInlineContentSize,
     ) -> inline_layout::InlineIntrinsicMeasurement {
         let Some((element, signature, child_boxes)) = child.element_parts() else {
             return child
@@ -1120,7 +1440,7 @@ impl<'a> LayoutBuilder<'a> {
                         children,
                         &child.style,
                         stylesheets,
-                        available_width,
+                        available_inline_size.content_box_length().points(),
                     )
                 })
                 .unwrap_or_default();
@@ -1131,7 +1451,7 @@ impl<'a> LayoutBuilder<'a> {
                 &child.style,
                 stylesheets,
                 child_boxes,
-                available_width,
+                available_inline_size.content_box_length().points(),
             )
         })
     }
@@ -1147,8 +1467,9 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &StyledChild<'_>,
         stylesheets: &[Stylesheet],
-        content_width: f32,
-    ) -> Option<f32> {
+        content_width: LogicalInlineContentSize,
+    ) -> Option<LogicalBlockContentSize> {
+        let content_width_points = content_width.points();
         let multicol_style = self.multicol_used_style(&child.style);
         let style = &multicol_style;
         let (_, _, child_boxes) = child.element_parts()?;
@@ -1159,33 +1480,41 @@ impl<'a> LayoutBuilder<'a> {
             // measurement performed earlier; a trailing inline line must not
             // replace the height of preceding column sets.
             // <https://www.w3.org/TR/css-multicol-1/#spanning-columns>
-            return self.estimate_multicol_auto_block_size(
-                style,
-                stylesheets,
-                child_boxes,
-                content_width,
-            );
+            return self
+                .estimate_multicol_auto_block_size(
+                    style,
+                    stylesheets,
+                    child_boxes,
+                    content_width_points,
+                )
+                .map(|height| LogicalBlockContentSize::new(content_box_pt(height)));
         }
         let gap = used_multicol_column_gap(
             style.column_gap.clone(),
-            PercentageBasis::definite(content_box_pt(content_width)),
+            PercentageBasis::definite(content_width.content_box_length()),
             style.font_size,
         )
         .points();
-        let column_count =
-            used_multicol_column_count(style, content_width, gap).filter(|count| *count > 1)?;
+        let column_count = used_multicol_column_count(style, content_width_points, gap)
+            .filter(|count| *count > 1)?;
         let total_gap = gap * column_count.saturating_sub(1) as f32;
-        let column_width = ((content_width - total_gap) / column_count as f32).max(1.0);
+        let column_width = ((content_width_points - total_gap) / column_count as f32).max(1.0);
         let available_column_width =
             (column_width - style.padding.left - style.padding.right).max(1.0);
-        let measurement =
-            self.estimate_child_inline_measurement(child, stylesheets, available_column_width);
+        let measurement = self.estimate_child_inline_measurement(
+            child,
+            stylesheets,
+            LogicalInlineContentSize::new(content_box_pt(available_column_width)),
+        );
 
         (measurement.line_count() > 0).then(|| {
-            measurement
-                .sequence
-                .balanced_multicolumn_height(column_count, style)
-                .max(style.line_height)
+            let block_size = match style.column_fill {
+                css::ColumnFill::Auto => measurement.sequence.total_height(),
+                css::ColumnFill::Balance | css::ColumnFill::BalanceAll => measurement
+                    .sequence
+                    .balanced_multicolumn_height(column_count, style),
+            };
+            LogicalBlockContentSize::new(content_box_pt(block_size.max(style.line_height)))
         })
     }
 
@@ -1200,7 +1529,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &StyledChild<'_>,
         stylesheets: &[Stylesheet],
-        containing_width: f32,
+        containing_inline_size: LogicalInlineContentSize,
         inline_contribution: inline_layout::InlineIntrinsicContribution,
     ) -> inline_layout::InlineIntrinsicContribution {
         let Some((element, signature, child_boxes)) = child.element_parts() else {
@@ -1234,12 +1563,12 @@ impl<'a> LayoutBuilder<'a> {
                     &child.style,
                     stylesheets,
                     &fragment,
-                    containing_width,
+                    containing_inline_size.points(),
                 );
-                inline_layout::InlineIntrinsicContribution {
-                    min_content,
-                    max_content,
-                }
+                inline_layout::InlineIntrinsicContribution::new(
+                    LogicalInlineContentSize::new(content_box_pt(min_content)),
+                    LogicalInlineContentSize::new(content_box_pt(max_content)),
+                )
             });
         }
         self.with_ancestor_signature(signature.clone(), |layout| {
@@ -1248,7 +1577,7 @@ impl<'a> LayoutBuilder<'a> {
                 &child.style,
                 stylesheets,
                 child_boxes,
-                containing_width,
+                containing_inline_size,
                 inline_contribution,
             )
         })
@@ -1260,7 +1589,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
-        containing_width: f32,
+        containing_inline_size: LogicalInlineContentSize,
         inline_contribution: inline_layout::InlineIntrinsicContribution,
     ) -> inline_layout::InlineIntrinsicContribution {
         if style.contain.size {
@@ -1272,14 +1601,16 @@ impl<'a> LayoutBuilder<'a> {
                 child_boxes,
                 style,
                 stylesheets,
-                containing_width,
+                containing_inline_size.points(),
             );
-            contribution.min_content = contribution.min_content.max(float_min);
-            contribution.max_content = contribution.max_content.max(float_max);
+            contribution.include_max(inline_layout::InlineIntrinsicContribution::new(
+                LogicalInlineContentSize::new(content_box_pt(float_min)),
+                LogicalInlineContentSize::new(content_box_pt(float_max)),
+            ));
             self.merge_box_children_flex_intrinsic_widths(
                 child_boxes,
                 stylesheets,
-                containing_width,
+                containing_inline_size,
                 &mut contribution,
             );
         } else {
@@ -1287,7 +1618,7 @@ impl<'a> LayoutBuilder<'a> {
                 element,
                 style,
                 stylesheets,
-                containing_width,
+                containing_inline_size,
                 &mut contribution,
             );
         }
@@ -1298,7 +1629,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child_boxes: &[box_tree::FormattingBox<'_>],
         stylesheets: &[Stylesheet],
-        containing_width: f32,
+        containing_inline_size: LogicalInlineContentSize,
         contribution: &mut inline_layout::InlineIntrinsicContribution,
     ) {
         for child_box in child_boxes {
@@ -1326,7 +1657,7 @@ impl<'a> LayoutBuilder<'a> {
                             child_style,
                             stylesheets,
                             &fragment,
-                            containing_width,
+                            containing_inline_size.points(),
                         );
                     let (_, max_content) = layout
                         .table_parent_intrinsic_content_widths_from_fragment(
@@ -1334,28 +1665,37 @@ impl<'a> LayoutBuilder<'a> {
                             child_style,
                             stylesheets,
                             &fragment,
-                            containing_width,
+                            containing_inline_size.points(),
                         );
-                    (min_content, max_content)
+                    inline_layout::InlineIntrinsicContribution::new(
+                        LogicalInlineContentSize::new(content_box_pt(min_content)),
+                        LogicalInlineContentSize::new(content_box_pt(max_content)),
+                    )
                 })
             } else {
-                explicit_child_intrinsic_width(child_style, containing_width).unwrap_or_else(|| {
-                    self.with_ancestor_signature(signature.clone(), |layout| {
-                        layout.block_intrinsic_content_widths(
-                            child_element,
-                            child_style,
-                            stylesheets,
-                            Some(child_children),
-                            containing_width,
-                        )
-                    })
-                })
+                explicit_child_intrinsic_width(child_style, containing_inline_size).unwrap_or_else(
+                    || {
+                        self.with_ancestor_signature(signature.clone(), |layout| {
+                            let (min_content, max_content) = layout.block_intrinsic_content_widths(
+                                child_element,
+                                child_style,
+                                stylesheets,
+                                Some(child_children),
+                                containing_inline_size.points(),
+                            );
+                            inline_layout::InlineIntrinsicContribution::new(
+                                LogicalInlineContentSize::new(content_box_pt(min_content)),
+                                LogicalInlineContentSize::new(content_box_pt(max_content)),
+                            )
+                        })
+                    },
+                )
             };
             merge_outer_intrinsic_widths(
                 contribution,
                 child_contribution,
                 child_style,
-                containing_width,
+                containing_inline_size,
             );
         }
     }
@@ -1365,7 +1705,7 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         parent_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        containing_width: f32,
+        containing_inline_size: LogicalInlineContentSize,
         contribution: &mut inline_layout::InlineIntrinsicContribution,
     ) {
         let sibling_tags = element_sibling_signature_list(element);
@@ -1411,7 +1751,7 @@ impl<'a> LayoutBuilder<'a> {
                             &child_style,
                             stylesheets,
                             &fragment,
-                            containing_width,
+                            containing_inline_size.points(),
                         );
                     let (_, max_content) = layout
                         .table_parent_intrinsic_content_widths_from_fragment(
@@ -1419,20 +1759,27 @@ impl<'a> LayoutBuilder<'a> {
                             &child_style,
                             stylesheets,
                             &fragment,
-                            containing_width,
+                            containing_inline_size.points(),
                         );
-                    (min_content, max_content)
+                    inline_layout::InlineIntrinsicContribution::new(
+                        LogicalInlineContentSize::new(content_box_pt(min_content)),
+                        LogicalInlineContentSize::new(content_box_pt(max_content)),
+                    )
                 })
             } else {
-                explicit_child_intrinsic_width(&child_style, containing_width).unwrap_or_else(
+                explicit_child_intrinsic_width(&child_style, containing_inline_size).unwrap_or_else(
                     || {
                         self.with_ancestor_signature(signature, |layout| {
-                            layout.block_intrinsic_content_widths(
+                            let (min_content, max_content) = layout.block_intrinsic_content_widths(
                                 child_element,
                                 &child_style,
                                 stylesheets,
                                 None,
-                                containing_width,
+                                containing_inline_size.points(),
+                            );
+                            inline_layout::InlineIntrinsicContribution::new(
+                                LogicalInlineContentSize::new(content_box_pt(min_content)),
+                                LogicalInlineContentSize::new(content_box_pt(max_content)),
                             )
                         })
                     },
@@ -1442,7 +1789,7 @@ impl<'a> LayoutBuilder<'a> {
                 contribution,
                 child_contribution,
                 &child_style,
-                containing_width,
+                containing_inline_size,
             );
         }
     }
@@ -1458,9 +1805,9 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &StyledChild<'_>,
         stylesheets: &[Stylesheet],
-        containing_width: f32,
-        inline_content_height: f32,
-    ) -> f32 {
+        containing_inline_size: LogicalInlineContentSize,
+        inline_content_height: LogicalBlockContentSize,
+    ) -> LogicalBlockContentSize {
         let Some((element, signature, child_boxes)) = child.element_parts() else {
             return inline_content_height;
         };
@@ -1476,7 +1823,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 child_boxes,
                 FlexMinContentBlockContainingSpace {
-                    width: PhysicalContentWidth::new(content_box_pt(containing_width)),
+                    inline_size: containing_inline_size,
                     height_percentage_basis: containing_height_basis,
                 },
                 inline_content_height,
@@ -1499,12 +1846,12 @@ impl<'a> LayoutBuilder<'a> {
         stylesheets: &[Stylesheet],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         containing_space: FlexMinContentBlockContainingSpace,
-        inline_content_height: f32,
-    ) -> f32 {
+        inline_content_height: LogicalBlockContentSize,
+    ) -> LogicalBlockContentSize {
         if parent_style.contain.size {
-            return 0.0;
+            return LogicalBlockContentSize::new(content_box_pt(0.0));
         }
-        let mut block_size = inline_content_height;
+        let mut block_size = FlexBlockStackContribution::from_content_size(inline_content_height);
 
         if let Some(child_boxes) = child_boxes {
             for child_box in child_boxes {
@@ -1516,18 +1863,20 @@ impl<'a> LayoutBuilder<'a> {
                 if !flex_min_content_block_child_participates(child_element, child_style) {
                     continue;
                 }
-                block_size += self.with_ancestor_signature(signature.clone(), |layout| {
-                    layout.flex_child_outer_min_content_block_size(
-                        child_element,
-                        child_style,
-                        stylesheets,
-                        Some(child_children),
-                        containing_space.width.points(),
-                        containing_space.height_percentage_basis,
-                    )
-                });
+                let child_contribution =
+                    self.with_ancestor_signature(signature.clone(), |layout| {
+                        layout.flex_child_outer_min_content_block_size(
+                            child_element,
+                            child_style,
+                            stylesheets,
+                            Some(child_children),
+                            containing_space.inline_size,
+                            containing_space.height_percentage_basis,
+                        )
+                    });
+                block_size = block_size.plus(child_contribution);
             }
-            return block_size;
+            return block_size.as_content_size();
         }
 
         let sibling_tags = element_sibling_signature_list(element);
@@ -1552,29 +1901,30 @@ impl<'a> LayoutBuilder<'a> {
             if !flex_min_content_block_child_participates(child_element, &child_style) {
                 continue;
             }
-            block_size += self.with_ancestor_signature(signature, |layout| {
+            let child_contribution = self.with_ancestor_signature(signature, |layout| {
                 layout.flex_child_outer_min_content_block_size(
                     child_element,
                     &child_style,
                     stylesheets,
                     None,
-                    containing_space.width.points(),
+                    containing_space.inline_size,
                     containing_space.height_percentage_basis,
                 )
             });
+            block_size = block_size.plus(child_contribution);
         }
-        block_size
+        block_size.as_content_size()
     }
 
-    pub(in crate::layout::flex) fn flex_child_outer_min_content_block_size(
+    fn flex_child_outer_min_content_block_size(
         &mut self,
         child_element: &Element,
         child_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
-        containing_width: f32,
+        containing_inline_size: LogicalInlineContentSize,
         containing_height_basis: BlockSizePercentageBasis,
-    ) -> f32 {
+    ) -> FlexBlockStackContribution {
         // Flex intrinsic estimation can visit a nested block before its
         // ordinary formatting-context replay. Resolve viewport units at this
         // page-context boundary so an explicit `height: 350vh` contributes
@@ -1583,18 +1933,21 @@ impl<'a> LayoutBuilder<'a> {
         // <https://www.w3.org/TR/css-values-4/#viewport-relative-lengths>
         // <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>
         let child_style = self.style_with_current_viewport_lengths(child_style);
-        let vertical_non_content = child_style.padding.top
-            + child_style.padding.bottom
-            + vertical_border_width(&child_style);
+        let vertical_non_content = non_content_pt(
+            child_style.padding.top
+                + child_style.padding.bottom
+                + vertical_border_width(&child_style),
+        );
         let content_size = used_content_box_height_or_auto_with_basis(
             &child_style,
             containing_height_basis,
-            non_content_pt(vertical_non_content),
+            vertical_non_content,
         )
-        .map(SemanticLengthExt::points)
         .unwrap_or_else(|| {
-            let inline_width =
-                (containing_width - child_style.padding.left - child_style.padding.right).max(1.0);
+            let inline_width = (containing_inline_size.points()
+                - child_style.padding.left
+                - child_style.padding.right)
+                .max(1.0);
             let inline_measurement = self.intrinsic_inline_measurement_for_element(
                 child_element,
                 &child_style,
@@ -1608,11 +1961,12 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 child_boxes,
                 FlexMinContentBlockContainingSpace {
-                    width: PhysicalContentWidth::new(content_box_pt(containing_width)),
+                    inline_size: containing_inline_size,
                     height_percentage_basis: PercentageBasis::indefinite(),
                 },
-                inline_measurement.height(),
+                LogicalBlockContentSize::new(content_box_pt(inline_measurement.height())),
             )
+            .content_box_length()
         });
         let constrained_content_size = constrain_flex_item_estimated_height(
             &child_style,
@@ -1623,13 +1977,15 @@ impl<'a> LayoutBuilder<'a> {
             vertical_non_content,
         );
         let border_widths = used_border_widths(&child_style);
-        child_style.margin.top
-            + child_style.padding.top
-            + border_widths.top
-            + constrained_content_size.points()
-            + child_style.padding.bottom
-            + border_widths.bottom
-            + child_style.margin.bottom
+        FlexBlockStackContribution::from_outer_extent(layout_pt(
+            child_style.margin.top
+                + child_style.padding.top
+                + border_widths.top
+                + constrained_content_size.points()
+                + child_style.padding.bottom
+                + border_widths.bottom
+                + child_style.margin.bottom,
+        ))
     }
 
     /// Measure an auto-height flex item as block layout when float placement affects flex basis.
@@ -1646,9 +2002,9 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
-        content_width: f32,
+        content_width: PhysicalContentWidth,
         inline_line_count: usize,
-    ) -> Option<f32> {
+    ) -> Option<PhysicalContentHeight> {
         if !style.box_values.height.is_auto()
             || !style.display.is_block_level()
             || !matches!(
@@ -1668,14 +2024,36 @@ impl<'a> LayoutBuilder<'a> {
 
         let mut measured_style = style.clone();
         measured_style.display.inner = DisplayInner::FlowRoot;
-        Some(self.measure_auto_positioned_block_height(
-            element,
-            &measured_style,
-            stylesheets,
-            content_width.max(0.0),
-            child_boxes,
-            None,
-        ))
+        // `measure_auto_positioned_block_height` establishes the supplied
+        // width as this box's containing block.  `content_width` instead is
+        // the already-resolved content-box width of this flex item, so pass
+        // its border-box width at that boundary.  Otherwise re-entered block
+        // layout subtracts the item's padding and border a second time and a
+        // row of floats can spuriously wrap while deriving the flex cross
+        // size.
+        // <https://www.w3.org/TR/css-box-3/#box-model>
+        let measurement_space = PositionedAutoBlockMeasurementSpace {
+            content_width: PhysicalContentWidth::new(content_box_pt(
+                (content_width.points()
+                    + style.padding.left
+                    + style.padding.right
+                    + horizontal_border_width(style))
+                .max(0.0),
+            )),
+            available_physical_height: self
+                .current_child_available_space()
+                .available_physical_height(),
+        };
+        Some(PhysicalContentHeight::new(content_box_pt(
+            self.measure_auto_positioned_block_height(
+                element,
+                &measured_style,
+                stylesheets,
+                measurement_space,
+                child_boxes,
+                None,
+            ),
+        )))
     }
 
     /// Estimate a flex container's intrinsic size and exported row baselines.
@@ -1719,7 +2097,11 @@ impl<'a> LayoutBuilder<'a> {
             available.cross_basis(physical_direction),
         )
         .map(|cross_size| {
-            flex_available_with_definite_cross_size(available, physical_direction, cross_size)
+            flex_available_with_definite_cross_size(
+                available,
+                physical_direction,
+                flex_cross_size_from_content_box(cross_size),
+            )
         })
         .unwrap_or(available);
         let (mut intrinsic_items, estimated_baseline_items) = self.estimate_flex_intrinsic_items(
@@ -1751,17 +2133,16 @@ impl<'a> LayoutBuilder<'a> {
                     item_available,
                     physical_direction,
                 );
-                estimated_outer_cross_size(&child.style, estimate, physical_direction).points()
+                flex_cross_size_from_layout_extent(estimated_outer_cross_size(
+                    &child.style,
+                    estimate,
+                    physical_direction,
+                ))
             })
-            .fold(0.0f32, f32::max);
+            .fold(FlexCrossSize::new(0.0), FlexCrossSize::max);
         if style.flex_wrap == FlexWrap::NoWrap || intrinsic_items.len() == 1 {
-            let available_main_size = if physical_direction.is_row_axis() {
-                Some(intrinsic_item_available.width.points())
-            } else {
-                intrinsic_item_available
-                    .height
-                    .map(PhysicalContentHeight::points)
-            };
+            let available_main_size =
+                intrinsic_item_available.definite_main_size(physical_direction);
             apply_single_line_flexed_main_cross_contributions(
                 &mut intrinsic_items,
                 physical_direction,
@@ -1774,47 +2155,48 @@ impl<'a> LayoutBuilder<'a> {
                 physical_gap_height.clone()
             } else {
                 physical_gap_width.clone()
-            })
-            .points();
+            });
         let intrinsic_cross_gap =
             estimated_intrinsic_flex_gap(if physical_direction.is_column_axis() {
                 physical_gap_width
             } else {
                 physical_gap_height
-            })
-            .points();
+            });
         let min_main = intrinsic_flex_container_min_main_size(
             style,
             physical_direction,
             &intrinsic_items,
-            intrinsic_main_gap,
+            flex_main_gap_size(intrinsic_main_gap),
             intrinsic_item_available,
         );
         let max_main = intrinsic_flex_container_max_main_size(
             style,
             physical_direction,
             &intrinsic_items,
-            intrinsic_main_gap,
+            flex_main_gap_size(intrinsic_main_gap),
             intrinsic_item_available,
         );
         let (mut min_cross, mut max_cross) = intrinsic_flex_container_cross_sizes(
             style,
             physical_direction,
             &intrinsic_items,
-            intrinsic_cross_gap,
-            intrinsic_item_available,
-            min_main,
-            max_main,
+            IntrinsicFlexCrossSizeInputs {
+                main_gap: flex_main_gap_size(intrinsic_main_gap),
+                cross_gap: flex_cross_gap_size(intrinsic_cross_gap),
+                available: intrinsic_item_available,
+                min_main,
+                max_main,
+            },
         );
-        if style.flex_direction.is_column_axis()
+        if physical_direction.is_column_axis()
             && style.flex_wrap != FlexWrap::NoWrap
             && !style.flex_wrap.balances_lines()
         {
             let available_cross_size = intrinsic_items
                 .iter()
                 .map(|item| item.max_cross_contribution)
-                .fold(0.0f32, f32::max);
-            if available_cross_size > 0.0 {
+                .fold(FlexCrossSize::new(0.0), FlexCrossSize::max);
+            if available_cross_size.is_positive() {
                 let constrained_available = flex_available_with_definite_cross_size(
                     intrinsic_item_available,
                     physical_direction,
@@ -1831,36 +2213,40 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     physical_direction,
                     &max_content_items,
-                    intrinsic_main_gap,
+                    flex_main_gap_size(intrinsic_main_gap),
                     constrained_available,
                 );
                 let max_content_max_main = intrinsic_flex_container_max_main_size(
                     style,
                     physical_direction,
                     &max_content_items,
-                    intrinsic_main_gap,
+                    flex_main_gap_size(intrinsic_main_gap),
                     constrained_available,
                 );
                 let (_, max_content_cross) = intrinsic_flex_container_cross_sizes(
                     style,
                     physical_direction,
                     &max_content_items,
-                    intrinsic_cross_gap,
-                    constrained_available,
-                    max_content_min_main,
-                    max_content_max_main,
+                    IntrinsicFlexCrossSizeInputs {
+                        main_gap: flex_main_gap_size(intrinsic_main_gap),
+                        cross_gap: flex_cross_gap_size(intrinsic_cross_gap),
+                        available: constrained_available,
+                        min_main: max_content_min_main,
+                        max_main: max_content_max_main,
+                    },
                 );
                 max_cross = max_content_cross;
             }
         }
         min_cross = min_cross.max(collapsed_cross_strut);
         max_cross = max_cross.max(collapsed_cross_strut);
-        let (mut min_width, mut width, mut min_height, mut height) =
-            if physical_direction.is_column_axis() {
-                (min_cross, max_cross, min_main, max_main)
-            } else {
-                (min_main, max_main, min_cross, max_cross)
-            };
+        let mut physical_sizes = FlexIntrinsicContainerPhysicalSizes::from_axis_contributions(
+            physical_direction,
+            min_main,
+            max_main,
+            min_cross,
+            max_cross,
+        );
 
         let line_metrics = estimate_row_flex_container_line_metrics(
             style,
@@ -1871,73 +2257,54 @@ impl<'a> LayoutBuilder<'a> {
             && style.flex_wrap != FlexWrap::NoWrap
             && metrics.line_count > 1
         {
-            if physical_direction.is_row_axis() {
-                height = height.max(metrics.cross_size);
-                min_height = min_height.max(metrics.cross_size);
-            } else {
-                width = width.max(metrics.cross_size);
-                min_width = min_width.max(metrics.cross_size);
-            }
+            physical_sizes.include_multiline_cross_size(physical_direction, metrics.cross_size);
         }
 
-        let content_width = width;
-        let content_height = height;
         let (first_baseline, last_baseline) = line_metrics
             .map(|metrics| (metrics.first_baseline, metrics.last_baseline))
             .unwrap_or((None, None));
-        let (first_baseline, last_baseline, first_horizontal_baseline, last_horizontal_baseline) =
-            if physical_direction.is_row_axis() {
-                (
-                    first_baseline.map(|baseline| border_widths.top + style.padding.top + baseline),
-                    last_baseline.map(|baseline| border_widths.top + style.padding.top + baseline),
-                    None,
-                    None,
-                )
-            } else if style.flex_direction.is_row_axis() {
-                (
-                    None,
-                    None,
-                    first_baseline
-                        .map(|baseline| border_widths.left + style.padding.left + baseline),
-                    last_baseline
-                        .map(|baseline| border_widths.left + style.padding.left + baseline),
-                )
-            } else {
-                (None, None, None, None)
-            };
-        let width = used_length_percentage_or_auto_with_basis(
-            style.box_values.width.clone(),
-            available.width_basis,
+        let baselines = if physical_direction.is_row_axis() {
+            let border_box_cross_inset =
+                FlexCrossLength::new(border_widths.top + style.padding.top);
+            FlexItemBaselineEstimate {
+                vertical: FlexItemBaselinePair {
+                    first: first_baseline.map(|baseline| {
+                        flex_vertical_baseline_from_cross_offset(baseline + border_box_cross_inset)
+                    }),
+                    last: last_baseline.map(|baseline| {
+                        flex_vertical_baseline_from_cross_offset(baseline + border_box_cross_inset)
+                    }),
+                },
+                horizontal: FlexItemBaselinePair::default(),
+            }
+        } else if style.flex_direction.is_row_axis() {
+            let border_box_cross_inset =
+                FlexCrossLength::new(border_widths.left + style.padding.left);
+            FlexItemBaselineEstimate {
+                vertical: FlexItemBaselinePair::default(),
+                horizontal: FlexItemBaselinePair {
+                    first: first_baseline.map(|baseline| {
+                        flex_horizontal_baseline_from_cross_offset(
+                            baseline + border_box_cross_inset,
+                        )
+                    }),
+                    last: last_baseline.map(|baseline| {
+                        flex_horizontal_baseline_from_cross_offset(
+                            baseline + border_box_cross_inset,
+                        )
+                    }),
+                },
+            }
+        } else {
+            FlexItemBaselineEstimate::default()
+        };
+        let width = physical_sizes.resolved_width(style, available);
+        let height = physical_sizes.resolved_height(style, available);
+        FlexItemEstimate::from_physical_intrinsic_metrics(
+            physical_sizes.intrinsic_metrics(width, height),
+            style.aspect_ratio.preferred_ratio(false, None),
+            baselines,
         )
-        .map(|width| width.points())
-        .unwrap_or(width);
-        let height = used_length_percentage_or_auto(
-            style.box_values.height.clone(),
-            PercentageBasis::definite(layout_pt(
-                available
-                    .height
-                    .map(PhysicalContentHeight::points)
-                    .unwrap_or_else(|| available.width.points()),
-            )),
-        )
-        .map(|height| height.points())
-        .or_else(|| available.height.map(PhysicalContentHeight::points))
-        .unwrap_or(height);
-        FlexItemEstimate {
-            metrics: IntrinsicItemMetrics {
-                width: content_box_pt(width),
-                height: content_box_pt(height),
-                min_width: content_box_pt(min_width),
-                min_height: content_box_pt(min_height),
-                content_width: content_box_pt(content_width),
-                content_height: content_box_pt(content_height),
-                preferred_aspect_ratio: style.aspect_ratio.preferred_ratio(false, None),
-                first_baseline,
-                last_baseline,
-            },
-            first_horizontal_baseline,
-            last_horizontal_baseline,
-        }
     }
 
     fn estimate_flex_intrinsic_items(
@@ -1950,10 +2317,6 @@ impl<'a> LayoutBuilder<'a> {
     ) -> (Vec<FlexIntrinsicItem>, Vec<EstimatedFlexBaselineItem>) {
         let mut intrinsic_items = Vec::with_capacity(children.len());
         let mut estimated_baseline_items = Vec::with_capacity(children.len());
-        let container_inline_size = FlexItemAvailableSpace::from_container(available)
-            .inline_size(style)
-            .points()
-            .max(0.0);
 
         for child in children {
             // Collapsed flex items are removed from flex layout before the
@@ -1978,24 +2341,27 @@ impl<'a> LayoutBuilder<'a> {
                 item_available,
                 physical_direction,
             );
-            let item = FlexIntrinsicItem::new(
-                child,
-                size,
-                physical_direction,
-                available,
-                container_inline_size,
-            );
+            let item = FlexIntrinsicItem::new(child, size, physical_direction, available);
             let (first_baseline, last_baseline) =
                 estimated_flex_item_cross_axis_baselines(size, physical_direction);
             estimated_baseline_items.push(EstimatedFlexBaselineItem {
                 outer_main_size: item.flex_base_size,
                 outer_cross_size: item.max_cross_contribution,
                 margin_cross_start: if physical_direction.is_row_axis() {
-                    child.style.margin.top
+                    FlexCrossLength::new(child.style.margin.top)
                 } else {
-                    child.style.margin.left
+                    FlexCrossLength::new(child.style.margin.left)
                 },
                 cross_alignment: estimated_flex_item_cross_alignment(&child.style, style),
+                baseline_set: flex_baseline_set(&child.style, style).filter(|_| {
+                    flex_item_baseline_axis_is_parallel_to_main_axis(
+                        &child.style,
+                        physical_direction,
+                    ) && !estimated_flex_item_has_auto_cross_margin(
+                        &child.style,
+                        physical_direction,
+                    )
+                }),
                 first_baseline,
                 last_baseline,
             });
@@ -2009,8 +2375,9 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &StyledChild<'_>,
         stylesheets: &[Stylesheet],
-        containing_width: f32,
-    ) -> Option<f32> {
+        containing_inline_size: LogicalInlineContentSize,
+    ) -> Option<LogicalBlockContentSize> {
+        let containing_width = containing_inline_size.points();
         let multicol_style = self.multicol_used_style(&child.style);
         let style = &multicol_style;
         let (element, _, child_boxes) = child.element_parts()?;
@@ -2043,27 +2410,35 @@ impl<'a> LayoutBuilder<'a> {
             used_multicol_column_count(style, containing_width, gap).filter(|count| *count > 1)?;
         let total_gap = gap * column_count.saturating_sub(1) as f32;
         let column_width = ((containing_width - total_gap) / column_count as f32).max(1.0);
-        let mut column_heights = vec![0.0f32; column_count];
+        let mut column_heights = vec![FlexBlockStackContribution::zero(); column_count];
 
         for (group_index, group) in groups.iter().enumerate() {
             let column_index = group_index % column_count;
             for item in group {
-                column_heights[column_index] +=
-                    self.estimate_flex_column_item_height(item, stylesheets, column_width);
+                let item_height = self.estimate_flex_column_item_height(
+                    item,
+                    stylesheets,
+                    LogicalInlineContentSize::new(content_box_pt(column_width)),
+                );
+                column_heights[column_index] = column_heights[column_index].plus(item_height);
             }
         }
 
-        column_heights.into_iter().reduce(f32::max)
+        column_heights
+            .into_iter()
+            .reduce(FlexBlockStackContribution::max)
+            .map(FlexBlockStackContribution::as_content_size)
     }
 
-    pub(in crate::layout::flex) fn estimate_flex_column_item_height(
+    fn estimate_flex_column_item_height(
         &mut self,
         item: &DefinitionListColumnItem<'_>,
         stylesheets: &[Stylesheet],
-        available_width: f32,
-    ) -> f32 {
+        available_inline_size: LogicalInlineContentSize,
+    ) -> FlexBlockStackContribution {
         let content_width =
-            (available_width - item.style.padding.left - item.style.padding.right).max(1.0);
+            (available_inline_size.points() - item.style.padding.left - item.style.padding.right)
+                .max(1.0);
         let content_height = item
             .children
             .map(|children| {
@@ -2087,11 +2462,13 @@ impl<'a> LayoutBuilder<'a> {
             })
             .max(self.font_system.used_line_height(&item.style).points());
 
-        item.style.margin.top
-            + vertical_border_width(&item.style)
-            + item.style.padding.top
-            + content_height
-            + item.style.padding.bottom
-            + item.style.margin.bottom
+        FlexBlockStackContribution::from_outer_extent(layout_pt(
+            item.style.margin.top
+                + vertical_border_width(&item.style)
+                + item.style.padding.top
+                + content_height
+                + item.style.padding.bottom
+                + item.style.margin.bottom,
+        ))
     }
 }

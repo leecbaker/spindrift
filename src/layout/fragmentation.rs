@@ -28,7 +28,7 @@ pub(in crate::layout) const MAX_MULTICOL_BALANCE_PROBE_FRAGMENTAINERS: usize = 4
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct ColumnContinuationMaterialization {
     pub(in crate::layout) pages_to_push: usize,
-    pub(in crate::layout) last_fragment_used_block_size: f32,
+    pub(in crate::layout) last_fragment_used_block_size: LayoutLength,
     pub(in crate::layout) has_unmaterialized_tail: bool,
 }
 
@@ -40,8 +40,8 @@ pub(in crate::layout) struct ColumnContinuationMaterialization {
 /// off-canvas flow ordered while bounding temporary memory and runtime.
 /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
 pub(in crate::layout) fn column_continuation_materialization(
-    remaining_block_size: f32,
-    continuation_block_size: f32,
+    remaining_block_size: LayoutLength,
+    continuation_block_size: LayoutLength,
     already_materialized: usize,
 ) -> ColumnContinuationMaterialization {
     continuation_materialization(
@@ -54,22 +54,22 @@ pub(in crate::layout) fn column_continuation_materialization(
 
 /// Plan a bounded continuation run for any equal-size fragmentainer sequence.
 pub(in crate::layout) fn continuation_materialization(
-    remaining_block_size: f32,
-    continuation_block_size: f32,
+    remaining_block_size: LayoutLength,
+    continuation_block_size: LayoutLength,
     already_materialized: usize,
     materialization_limit: usize,
 ) -> ColumnContinuationMaterialization {
-    let continuation_block_size = continuation_block_size.max(css::CSS_PX_TO_PT);
-    let remaining_block_size = remaining_block_size.max(0.0);
+    let continuation_block_size = continuation_block_size.points().max(css::CSS_PX_TO_PT);
+    let remaining_block_size = remaining_block_size.points().max(0.0);
     let required =
         ((remaining_block_size - 0.01).max(0.0) / continuation_block_size).ceil() as usize;
     let available = materialization_limit.saturating_sub(already_materialized.max(1));
     let pages_to_push = required.min(available);
     let last_fragment_used_block_size = if required == 0 {
-        0.0
+        layout_pt(0.0)
     } else {
         let preceding = continuation_block_size * required.saturating_sub(1) as f32;
-        (remaining_block_size - preceding).clamp(0.0, continuation_block_size)
+        layout_pt((remaining_block_size - preceding).clamp(0.0, continuation_block_size))
     };
     ColumnContinuationMaterialization {
         pages_to_push,
@@ -88,8 +88,8 @@ pub(in crate::layout) fn continuation_materialization(
 /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct Fragmentainer {
-    fragmentainer_block_size: f32,
-    available_block_size: f32,
+    fragmentainer_block_size: LayoutLength,
+    available_block_size: LayoutLength,
 }
 
 /// Fragmentation context targeted by a break decision.
@@ -114,6 +114,19 @@ pub(in crate::layout) enum FragmentainerAdvance {
 }
 
 impl LayoutBuilder<'_> {
+    /// Build a fragmentainer from a page-top cursor position and the current
+    /// page's block-end edge.
+    pub(in crate::layout) fn fragmentainer_from_page_cursor(
+        &self,
+        content_block_start: PageTopBlockPosition,
+    ) -> Fragmentainer {
+        Fragmentainer::from_page_cursor_bounds(
+            layout_pt(self.page_area_height()),
+            content_block_start,
+            PageTopBlockPosition::new(self.page_bottom()),
+        )
+    }
+
     /// Materialize a layout algorithm's transition to another fragmentainer.
     ///
     /// CSS Fragmentation defines the distinction between ordinary and forced
@@ -123,15 +136,47 @@ impl LayoutBuilder<'_> {
         fragmentainer_kind: FragmentainerKind,
         advance: FragmentainerAdvance,
     ) -> Option<f32> {
-        if !self.fragmentainer_materializes_cursor(fragmentainer_kind) {
-            return None;
-        }
-
-        match advance {
-            FragmentainerAdvance::Unforced => self.push_page(),
-            FragmentainerAdvance::Forced(page_break) => {
-                self.apply_forced_break_in(fragmentainer_kind, page_break);
+        match fragmentainer_kind {
+            // A multicolumn layout uses temporary pages as its concrete
+            // fragmentainers.  `push_page` already selects the next
+            // `FragmentainerOverride` context and records the source column
+            // for later projection, so flex/grid fragmentation must advance
+            // it just as ordinary block flow does.  Treating a column break
+            // as metadata-only leaves a committed source slice with no
+            // destination fragmentainer in which to replay it.
+            // <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
+            FragmentainerKind::Column
+                if !self
+                    .fragmentainer_override
+                    .is_some_and(|override_| override_.kind == FragmentainerKind::Column) =>
+            {
+                return None;
             }
+            FragmentainerKind::Column => {
+                // A zero-capacity first column can require a transition
+                // before flex has any item paint to commit.  `push_page`
+                // normally replaces an empty page in that situation, which
+                // is correct for a redundant page break but loses this real
+                // anonymous-column fragmentainer and aliases the next source
+                // slice back onto column zero.  Structural occupancy makes
+                // the temporary page a durable destination record; it is
+                // later projected to the next column by the existing
+                // multicolumn replay machinery.
+                // <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
+                self.mark_current_page_flow_content();
+                match advance {
+                    FragmentainerAdvance::Unforced => self.push_page(),
+                    FragmentainerAdvance::Forced(page_break) => {
+                        self.apply_forced_break_in(fragmentainer_kind, page_break);
+                    }
+                }
+            }
+            FragmentainerKind::Page => match advance {
+                FragmentainerAdvance::Unforced => self.push_page(),
+                FragmentainerAdvance::Forced(page_break) => {
+                    self.apply_forced_break_in(fragmentainer_kind, page_break);
+                }
+            },
         }
 
         Some(self.cursor_y)
@@ -264,6 +309,104 @@ pub(in crate::layout) struct FragmentSourceSliceInput {
     pub(in crate::layout) available_block_end: f32,
 }
 
+/// Maps one logical fragmentainer slice from its captured source canvas to
+/// its destination fragmentainer canvas.
+///
+/// The generic fragmentation algorithms choose source ranges in logical block
+/// coordinates.  Paint replay, however, must clip and translate physical PDF
+/// primitives.  Keeping that conversion here means multicol, tables, and
+/// future fragmenting layout modes share the same Writing Modes boundary
+/// instead of each matching physical `x`/`y` axes independently:
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box> and
+/// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct FragmentainerProjection {
+    source_clip: PaintClip,
+    destination_translation: PaintTranslation,
+    destination_page_clip_in_source_space: PaintClip,
+}
+
+/// Inputs for projecting an equal logical source/destination fragment slice.
+///
+/// Source and destination containers may have different logical extents: a
+/// temporary multicol source can retain overflow slices while the destination
+/// belongs to a wrapped column row.  The two slice rectangles describe the
+/// same source content in their respective containers.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct FragmentainerProjectionInput {
+    pub(in crate::layout) axes: FlowAxes,
+    pub(in crate::layout) source_origin: PageTopPoint,
+    pub(in crate::layout) source_extent: LogicalSize,
+    pub(in crate::layout) source_slice: LogicalRect,
+    pub(in crate::layout) destination_origin: PageTopPoint,
+    pub(in crate::layout) destination_extent: LogicalSize,
+    pub(in crate::layout) destination_slice: LogicalRect,
+    pub(in crate::layout) destination_page_area: PageTopRect,
+}
+
+impl FragmentainerProjection {
+    pub(in crate::layout) fn new(input: FragmentainerProjectionInput) -> Self {
+        let source = page_top_rect_from_logical_fragment(
+            input.axes,
+            input.source_origin,
+            input.source_extent,
+            input.source_slice,
+        );
+        let destination = page_top_rect_from_logical_fragment(
+            input.axes,
+            input.destination_origin,
+            input.destination_extent,
+            input.destination_slice,
+        );
+        let destination_translation = PaintTranslation::new(
+            destination.x() - source.x(),
+            destination.top_y() - source.top_y(),
+        );
+        Self {
+            source_clip: source.paint_clip(),
+            destination_translation,
+            destination_page_clip_in_source_space: PageTopRect::new(
+                input.destination_page_area.x() - destination_translation.x,
+                input.destination_page_area.top_y() - destination_translation.y,
+                input.destination_page_area.width(),
+                input.destination_page_area.height(),
+            )
+            .paint_clip(),
+        }
+    }
+
+    pub(in crate::layout) fn source_clip(self) -> PaintClip {
+        self.source_clip
+    }
+
+    pub(in crate::layout) fn destination_translation(self) -> PaintTranslation {
+        self.destination_translation
+    }
+
+    pub(in crate::layout) fn destination_page_clip_in_source_space(self) -> PaintClip {
+        self.destination_page_clip_in_source_space
+    }
+}
+
+fn page_top_rect_from_logical_fragment(
+    axes: FlowAxes,
+    origin: PageTopPoint,
+    extent: LogicalSize,
+    logical: LogicalRect,
+) -> PageTopRect {
+    let physical_extent = axes.physical_size_from_logical(extent);
+    let physical = axes.rect_from_logical(
+        ContainerRect::new(ContainerPoint::new(0.0, 0.0), physical_extent),
+        logical,
+    );
+    PageTopRect::new(
+        origin.x() + physical.origin.x,
+        origin.top_y() - physical.origin.y,
+        physical.size.width,
+        physical.size.height,
+    )
+}
+
 /// Whole-source prebreak decision for a keepable unit.
 ///
 /// CSS Fragmentation may choose an unforced break before a source box or run
@@ -281,9 +424,9 @@ pub(in crate::layout) struct FragmentPrebreakDecision {
 pub(in crate::layout) struct FragmentPrebreakInput {
     pub(in crate::layout) can_advance: bool,
     pub(in crate::layout) current_fragmentainer: Fragmentainer,
-    pub(in crate::layout) required_block_size: f32,
+    pub(in crate::layout) required_block_size: LayoutLength,
     pub(in crate::layout) empty_fragmentainer: Fragmentainer,
-    pub(in crate::layout) empty_fit_block_size: f32,
+    pub(in crate::layout) empty_fit_block_size: LayoutLength,
 }
 
 /// Decision to advance to another fragmentainer before a source unit.
@@ -307,10 +450,13 @@ pub(in crate::layout) struct FragmentAdvanceInput {
 }
 
 impl Fragmentainer {
-    pub(in crate::layout) fn new(fragmentainer_block_size: f32, available_block_size: f32) -> Self {
+    pub(in crate::layout) fn new(
+        fragmentainer_block_size: LayoutLength,
+        available_block_size: LayoutLength,
+    ) -> Self {
         Self {
             fragmentainer_block_size,
-            available_block_size: available_block_size.max(0.0),
+            available_block_size: layout_pt(available_block_size.points().max(0.0)),
         }
     }
 
@@ -322,42 +468,38 @@ impl Fragmentainer {
     /// physical cursor uses the same block-axis coordinates; callers remain
     /// responsible for passing target-specific bounds:
     /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
-    pub(in crate::layout) fn from_cursor_bounds(
-        fragmentainer_block_size: f32,
-        content_block_start: f32,
-        fragmentainer_block_end: f32,
+    pub(in crate::layout) fn from_page_cursor_bounds(
+        fragmentainer_block_size: LayoutLength,
+        content_block_start: PageTopBlockPosition,
+        fragmentainer_block_end: PageTopBlockPosition,
     ) -> Self {
         Self::new(
             fragmentainer_block_size,
-            content_block_start - fragmentainer_block_end,
+            content_block_start.block_extent_to(fragmentainer_block_end),
         )
     }
 
-    pub(in crate::layout) fn fragmentainer_block_size(self) -> f32 {
+    pub(in crate::layout) fn fragmentainer_block_size(self) -> LayoutLength {
         self.fragmentainer_block_size
     }
 
-    pub(in crate::layout) fn available_block_size(self) -> f32 {
+    pub(in crate::layout) fn available_block_size(self) -> LayoutLength {
         self.available_block_size
     }
 
     pub(in crate::layout) fn available_block_size_after_reservation(
         self,
-        reserved_block_size: f32,
-    ) -> f32 {
-        (self.available_block_size - reserved_block_size).max(0.0)
+        reserved_block_size: LayoutLength,
+    ) -> LayoutLength {
+        layout_pt((self.available_block_size.points() - reserved_block_size.points()).max(0.0))
     }
 
-    pub(in crate::layout) fn required_block_size_overflows(self, block_size: f32) -> bool {
-        block_size > self.available_block_size + 0.01
+    pub(in crate::layout) fn required_block_size_overflows(self, block_size: LayoutLength) -> bool {
+        block_size.points() > self.available_block_size.points() + 0.01
     }
 
-    pub(in crate::layout) fn block_size_fits_empty(self, block_size: f32) -> bool {
-        block_size <= self.fragmentainer_block_size + 0.01
-    }
-
-    pub(in crate::layout) fn available_block_end_from(self, block_offset: f32) -> f32 {
-        block_offset + self.available_block_size
+    pub(in crate::layout) fn block_size_fits_empty(self, block_size: LayoutLength) -> bool {
+        block_size.points() <= self.fragmentainer_block_size.points() + 0.01
     }
 }
 
@@ -831,6 +973,10 @@ impl ForcedBreakCarryState {
 mod tests {
     use super::*;
 
+    fn fragmentainer(block_size: f32, available_size: f32) -> Fragmentainer {
+        Fragmentainer::new(layout_pt(block_size), layout_pt(available_size))
+    }
+
     fn test_layout_builder<'a>(
         options: &'a RenderOptions,
         stylesheets: &'a [Stylesheet],
@@ -901,30 +1047,73 @@ mod tests {
     }
 
     #[test]
-    fn fragmentainer_capacity_uses_empty_and_remaining_block_sizes() {
-        let fragmentainer = Fragmentainer::new(100.0, 40.0);
+    fn fragmentainer_advance_materializes_column_override_continuations() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let initial_context = builder.current_page_context;
+        builder.fragmentainer_override = Some(FragmentainerOverride {
+            kind: FragmentainerKind::Column,
+            initial_context,
+            initial_fragmentainer_count: 1,
+            context: initial_context,
+            relax_widows_orphans: false,
+        });
+        builder.mark_current_page_flow_content();
+        let page_count = builder.pages.len();
 
-        assert_eq!(fragmentainer.fragmentainer_block_size(), 100.0);
-        assert_eq!(fragmentainer.available_block_size(), 40.0);
-        assert!(fragmentainer.block_size_fits_empty(100.0));
-        assert!(!fragmentainer.block_size_fits_empty(101.0));
-        assert!(fragmentainer.required_block_size_overflows(41.0));
+        let content_top = builder
+            .materialize_fragmentainer_advance(
+                FragmentainerKind::Column,
+                FragmentainerAdvance::Unforced,
+            )
+            .expect("column override materializes its temporary page cursor");
+
+        assert_eq!(builder.pages.len(), page_count + 1);
+        assert_eq!(content_top, builder.cursor_y);
+    }
+
+    #[test]
+    fn fragmentainer_capacity_uses_empty_and_remaining_block_sizes() {
+        let fragmentainer = fragmentainer(100.0, 40.0);
+
+        assert_eq!(fragmentainer.fragmentainer_block_size(), layout_pt(100.0));
+        assert_eq!(fragmentainer.available_block_size(), layout_pt(40.0));
+        assert!(fragmentainer.block_size_fits_empty(layout_pt(100.0)));
+        assert!(!fragmentainer.block_size_fits_empty(layout_pt(101.0)));
+        assert!(fragmentainer.required_block_size_overflows(layout_pt(41.0)));
         assert_eq!(
-            fragmentainer.available_block_size_after_reservation(15.0),
-            25.0
+            fragmentainer.available_block_size_after_reservation(layout_pt(15.0)),
+            layout_pt(25.0)
         );
         assert_eq!(
-            fragmentainer.available_block_size_after_reservation(80.0),
-            0.0
+            fragmentainer.available_block_size_after_reservation(layout_pt(80.0)),
+            layout_pt(0.0)
         );
     }
 
     #[test]
-    fn fragmentainer_capacity_can_derive_remaining_size_from_cursor_bounds() {
-        let fragmentainer = Fragmentainer::from_cursor_bounds(200.0, 640.0, 500.0);
+    fn fragmentainer_capacity_derives_remaining_size_from_page_cursor_bounds() {
+        let fragmentainer = Fragmentainer::from_page_cursor_bounds(
+            layout_pt(200.0),
+            PageTopBlockPosition::new(640.0),
+            PageTopBlockPosition::new(500.0),
+        );
 
-        assert_eq!(fragmentainer.fragmentainer_block_size(), 200.0);
-        assert_eq!(fragmentainer.available_block_size(), 140.0);
+        assert_eq!(fragmentainer.fragmentainer_block_size(), layout_pt(200.0));
+        assert_eq!(fragmentainer.available_block_size(), layout_pt(140.0));
+    }
+
+    #[test]
+    fn fragmentainer_capacity_clamps_when_page_cursor_is_past_block_end() {
+        let fragmentainer = Fragmentainer::from_page_cursor_bounds(
+            layout_pt(200.0),
+            PageTopBlockPosition::new(480.0),
+            PageTopBlockPosition::new(500.0),
+        );
+
+        assert_eq!(fragmentainer.available_block_size(), layout_pt(0.0));
     }
 
     #[test]
@@ -979,10 +1168,10 @@ mod tests {
     fn prebreak_moves_keepable_unit_that_overflows_remaining_space() {
         let decision = FragmentPrebreakDecision::choose(FragmentPrebreakInput {
             can_advance: true,
-            current_fragmentainer: Fragmentainer::new(100.0, 40.0),
-            required_block_size: 60.0,
-            empty_fragmentainer: Fragmentainer::new(100.0, 100.0),
-            empty_fit_block_size: 80.0,
+            current_fragmentainer: fragmentainer(100.0, 40.0),
+            required_block_size: layout_pt(60.0),
+            empty_fragmentainer: fragmentainer(100.0, 100.0),
+            empty_fit_block_size: layout_pt(80.0),
         });
 
         assert!(decision.should_break);
@@ -992,10 +1181,10 @@ mod tests {
     fn prebreak_stays_when_unit_fits_remaining_space() {
         let decision = FragmentPrebreakDecision::choose(FragmentPrebreakInput {
             can_advance: true,
-            current_fragmentainer: Fragmentainer::new(100.0, 40.0),
-            required_block_size: 40.0,
-            empty_fragmentainer: Fragmentainer::new(100.0, 100.0),
-            empty_fit_block_size: 80.0,
+            current_fragmentainer: fragmentainer(100.0, 40.0),
+            required_block_size: layout_pt(40.0),
+            empty_fragmentainer: fragmentainer(100.0, 100.0),
+            empty_fit_block_size: layout_pt(80.0),
         });
 
         assert!(!decision.should_break);
@@ -1005,10 +1194,10 @@ mod tests {
     fn prebreak_stays_when_kept_unit_cannot_fit_empty_fragmentainer() {
         let decision = FragmentPrebreakDecision::choose(FragmentPrebreakInput {
             can_advance: true,
-            current_fragmentainer: Fragmentainer::new(100.0, 40.0),
-            required_block_size: 60.0,
-            empty_fragmentainer: Fragmentainer::new(100.0, 100.0),
-            empty_fit_block_size: 120.0,
+            current_fragmentainer: fragmentainer(100.0, 40.0),
+            required_block_size: layout_pt(60.0),
+            empty_fragmentainer: fragmentainer(100.0, 100.0),
+            empty_fit_block_size: layout_pt(120.0),
         });
 
         assert!(!decision.should_break);
@@ -1018,10 +1207,10 @@ mod tests {
     fn prebreak_uses_explicit_empty_fragmentainer_capacity() {
         let decision = FragmentPrebreakDecision::choose(FragmentPrebreakInput {
             can_advance: true,
-            current_fragmentainer: Fragmentainer::new(100.0, 40.0),
-            required_block_size: 60.0,
-            empty_fragmentainer: Fragmentainer::new(50.0, 50.0),
-            empty_fit_block_size: 80.0,
+            current_fragmentainer: fragmentainer(100.0, 40.0),
+            required_block_size: layout_pt(60.0),
+            empty_fragmentainer: fragmentainer(50.0, 50.0),
+            empty_fit_block_size: layout_pt(80.0),
         });
 
         assert!(!decision.should_break);
@@ -1031,10 +1220,10 @@ mod tests {
     fn prebreak_stays_when_fragmentainer_cannot_advance() {
         let decision = FragmentPrebreakDecision::choose(FragmentPrebreakInput {
             can_advance: false,
-            current_fragmentainer: Fragmentainer::new(100.0, 40.0),
-            required_block_size: 60.0,
-            empty_fragmentainer: Fragmentainer::new(100.0, 100.0),
-            empty_fit_block_size: 80.0,
+            current_fragmentainer: fragmentainer(100.0, 40.0),
+            required_block_size: layout_pt(60.0),
+            empty_fragmentainer: fragmentainer(100.0, 100.0),
+            empty_fit_block_size: layout_pt(80.0),
         });
 
         assert!(!decision.should_break);
@@ -1577,23 +1766,170 @@ mod tests {
 
     #[test]
     fn column_continuation_plan_materializes_normal_runs_exactly() {
-        let plan = column_continuation_materialization(250.0, 100.0, 1);
+        let plan = column_continuation_materialization(layout_pt(250.0), layout_pt(100.0), 1);
 
         assert_eq!(plan.pages_to_push, 3);
-        assert_eq!(plan.last_fragment_used_block_size, 50.0);
+        assert_eq!(plan.last_fragment_used_block_size, layout_pt(50.0));
+        assert!(!plan.has_unmaterialized_tail);
+    }
+
+    #[test]
+    fn column_continuation_plan_keeps_empty_runs_empty() {
+        let plan = column_continuation_materialization(layout_pt(0.0), layout_pt(100.0), 1);
+
+        assert_eq!(plan.pages_to_push, 0);
+        assert_eq!(plan.last_fragment_used_block_size, layout_pt(0.0));
         assert!(!plan.has_unmaterialized_tail);
     }
 
     #[test]
     fn column_continuation_plan_bounds_extreme_authored_lengths() {
-        let plan = column_continuation_materialization(1_000_000_000.0, 100.0, 1);
+        let plan =
+            column_continuation_materialization(layout_pt(1_000_000_000.0), layout_pt(100.0), 1);
 
         assert_eq!(
             plan.pages_to_push,
             MAX_MATERIALIZED_COLUMN_FRAGMENTAINERS - 1
         );
-        assert!(plan.last_fragment_used_block_size > 0.0);
-        assert!(plan.last_fragment_used_block_size <= 100.0);
+        assert!(plan.last_fragment_used_block_size > layout_pt(0.0));
+        assert!(plan.last_fragment_used_block_size <= layout_pt(100.0));
         assert!(plan.has_unmaterialized_tail);
+    }
+
+    #[test]
+    fn fragmentainer_projection_preserves_horizontal_column_replay_coordinates() {
+        let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
+            axes: FlowAxes::new(WritingMode::HorizontalTb, Direction::Ltr),
+            source_origin: PageTopPoint::new(10.0, 200.0),
+            source_extent: LogicalSize {
+                inline: 100.0,
+                block: 200.0,
+            },
+            source_slice: LogicalRect {
+                origin: LogicalPoint {
+                    inline: 0.0,
+                    block: 100.0,
+                },
+                size: LogicalSize {
+                    inline: 100.0,
+                    block: 100.0,
+                },
+            },
+            destination_origin: PageTopPoint::new(10.0, 200.0),
+            destination_extent: LogicalSize {
+                inline: 400.0,
+                block: 100.0,
+            },
+            destination_slice: LogicalRect {
+                origin: LogicalPoint {
+                    inline: 100.0,
+                    block: 0.0,
+                },
+                size: LogicalSize {
+                    inline: 100.0,
+                    block: 100.0,
+                },
+            },
+            destination_page_area: PageTopRect::new(0.0, 300.0, 400.0, 300.0),
+        });
+
+        assert_eq!(
+            projection.source_clip(),
+            PageTopRect::new(10.0, 100.0, 100.0, 100.0).paint_clip()
+        );
+        assert_eq!(
+            projection.destination_translation(),
+            PaintTranslation::new(100.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn fragmentainer_projection_maps_vertical_rl_rtl_block_slices_to_x() {
+        let source_slice = LogicalRect {
+            origin: LogicalPoint {
+                inline: 0.0,
+                block: 20.0,
+            },
+            size: LogicalSize {
+                inline: 100.0,
+                block: 40.0,
+            },
+        };
+        let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
+            axes: FlowAxes::new(WritingMode::VerticalRl, Direction::Rtl),
+            source_origin: PageTopPoint::new(10.0, 500.0),
+            source_extent: LogicalSize {
+                inline: 400.0,
+                block: 100.0,
+            },
+            source_slice,
+            destination_origin: PageTopPoint::new(10.0, 500.0),
+            destination_extent: LogicalSize {
+                inline: 400.0,
+                block: 100.0,
+            },
+            destination_slice: LogicalRect {
+                origin: LogicalPoint {
+                    inline: 100.0,
+                    block: 20.0,
+                },
+                size: source_slice.size,
+            },
+            destination_page_area: PageTopRect::new(0.0, 600.0, 100.0, 400.0),
+        });
+
+        assert_eq!(
+            projection.source_clip(),
+            PageTopRect::new(50.0, 200.0, 40.0, 100.0).paint_clip()
+        );
+        assert_eq!(
+            projection.destination_translation(),
+            PaintTranslation::new(0.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn fragmentainer_projection_maps_vertical_lr_rtl_block_slices_from_left() {
+        let source_slice = LogicalRect {
+            origin: LogicalPoint {
+                inline: 0.0,
+                block: 20.0,
+            },
+            size: LogicalSize {
+                inline: 100.0,
+                block: 40.0,
+            },
+        };
+        let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
+            axes: FlowAxes::new(WritingMode::VerticalLr, Direction::Rtl),
+            source_origin: PageTopPoint::new(10.0, 500.0),
+            source_extent: LogicalSize {
+                inline: 400.0,
+                block: 100.0,
+            },
+            source_slice,
+            destination_origin: PageTopPoint::new(10.0, 500.0),
+            destination_extent: LogicalSize {
+                inline: 400.0,
+                block: 100.0,
+            },
+            destination_slice: LogicalRect {
+                origin: LogicalPoint {
+                    inline: 100.0,
+                    block: 20.0,
+                },
+                size: source_slice.size,
+            },
+            destination_page_area: PageTopRect::new(0.0, 600.0, 100.0, 400.0),
+        });
+
+        assert_eq!(
+            projection.source_clip(),
+            PageTopRect::new(30.0, 200.0, 40.0, 100.0).paint_clip()
+        );
+        assert_eq!(
+            projection.destination_translation(),
+            PaintTranslation::new(0.0, 100.0)
+        );
     }
 }

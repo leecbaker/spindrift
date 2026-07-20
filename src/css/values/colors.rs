@@ -1,64 +1,81 @@
 use super::*;
+use palette::{
+    Lab, Oklab, Xyz,
+    convert::FromColorUnclamped,
+    white_point::{D50, D65},
+};
 
-pub(crate) fn parse_color(value: &str) -> Option<Color> {
-    let value = remove_css_comments(trim_css_value(value)).to_ascii_lowercase();
-    if value == "transparent" {
-        return Some(Color::TRANSPARENT);
-    }
-    if value == "none" {
-        return None;
+pub(crate) fn parse_color(value: &str) -> Option<CssColor> {
+    let value = normalize_css_comments(trim_css_value(value));
+    let value = value.trim();
+    if let Some(ident) = crate::css::component_values::css_single_ident(value) {
+        let ident = ident.to_ascii_lowercase();
+        if ident == "transparent" {
+            return Some(CssColor::TRANSPARENT);
+        }
+        if ident == "none" {
+            return None;
+        }
+        if let Some(color) = parse_system_color(&ident) {
+            return Some(color);
+        }
+        let (r, g, b) = cssparser::color::parse_named_color(&ident).ok()?;
+        return Some(CssColor::new(r, g, b));
     }
     if let Some(hex) = value.strip_prefix('#') {
         let (r, g, b, a) = cssparser::color::parse_hash_color(hex.as_bytes()).ok()?;
-        return Some(Color::rgba(r, g, b, a));
+        return Some(CssColor::rgba(r, g, b, a));
     }
-    if let Some(rgb) = parse_rgb_function(&value) {
+    if let Some(rgb) = parse_rgb_function(value) {
         return Some(rgb);
     }
-    if let Some(hsl) = parse_hsl_function(&value) {
+    if let Some(hsl) = parse_hsl_function(value) {
         return Some(hsl);
     }
-    if let Some(hwb) = parse_hwb_function(&value) {
+    if let Some(hwb) = parse_hwb_function(value) {
         return Some(hwb);
     }
-    if let Some(lab) = parse_lab_function(&value) {
+    if let Some(lab) = parse_lab_function(value) {
         return Some(lab);
     }
-    if let Some(lch) = parse_lch_function(&value) {
+    if let Some(relative_lch) = parse_relative_lch_function(value) {
+        return Some(relative_lch);
+    }
+    if let Some(lch) = parse_lch_function(value) {
         return Some(lch);
     }
-    if let Some(oklab) = parse_oklab_function(&value) {
+    if let Some(oklab) = parse_oklab_function(value) {
         return Some(oklab);
     }
-    if let Some(oklch) = parse_oklch_function(&value) {
+    if let Some(oklch) = parse_oklch_function(value) {
         return Some(oklch);
     }
-    if let Some(color_function) = parse_color_function(&value) {
+    if let Some(color_function) = parse_color_function(value) {
         return Some(color_function);
     }
-    if !value.contains("currentcolor") {
-        if let Some(color_mix) = parse_color_mix(&value, Color::BLACK) {
+    if !value.to_ascii_lowercase().contains("currentcolor") {
+        if let Some(color_mix) = parse_color_mix(value, CssColor::BLACK) {
             return Some(color_mix);
         }
-        if !value.contains("currentcolor")
-            && let Some(contrast_color) = parse_contrast_color(&value, Color::BLACK)
+        if !value.to_ascii_lowercase().contains("currentcolor")
+            && let Some(contrast_color) = parse_contrast_color(value, CssColor::BLACK)
         {
             return Some(contrast_color);
         }
     }
-    if let Some(color) = parse_system_color(&value) {
-        return Some(color);
-    }
-    let (r, g, b) = cssparser::color::parse_named_color(&value).ok()?;
-    Some(Color::new(r, g, b))
+    None
 }
 
 /// Resolve the relative-color forms whose origin is `currentcolor` against a
-/// computed foreground color. CSS Color 5 retains the relative syntax through
+/// computed foreground color. CSS CssColor 5 retains the relative syntax through
 /// inheritance and resolves its origin at used-value time:
 /// <https://www.w3.org/TR/css-color-5/#relative-colors>.
-pub(crate) fn parse_color_from_currentcolor(value: &str, current: Color) -> Option<Color> {
-    let value = remove_css_comments(trim_css_value(value)).to_ascii_lowercase();
+pub(crate) fn parse_color_from_currentcolor(value: &str, current: CssColor) -> Option<CssColor> {
+    let value = normalize_css_comments(trim_css_value(value));
+    let value = value.trim().to_ascii_lowercase();
+    if value == "currentcolor" {
+        return Some(current);
+    }
     if let Some(contrast_color) = parse_contrast_color(&value, current) {
         return Some(contrast_color);
     }
@@ -68,22 +85,30 @@ pub(crate) fn parse_color_from_currentcolor(value: &str, current: Color) -> Opti
     if let Some(color_mix) = parse_color_mix(&value, current) {
         return Some(color_mix);
     }
-    let (function, components) = value.split_once("(from currentcolor ")?;
-    let components = components.strip_suffix(')')?;
-    let components = components.split_whitespace().collect::<Vec<_>>();
-    match function {
+    let (function, body) = crate::css::component_values::css_single_function(&value)?;
+    let components = crate::css::component_values::split_css_component_values(body);
+    let [from, origin, components @ ..] = components.as_slice() else {
+        return None;
+    };
+    if !from.eq_ignore_ascii_case("from") || !origin.eq_ignore_ascii_case("currentcolor") {
+        return None;
+    }
+    match function.to_ascii_lowercase().as_str() {
         "rgb" | "rgba" if components.len() == 3 => {
+            let current = current.to_rgb_space(RgbColorSpace::Srgb);
+            let current_components = current.components();
             let channel = |name: &str| match name {
-                "r" => Some(current.r),
-                "g" => Some(current.g),
-                "b" => Some(current.b),
+                "r" => Some(current_components[0]),
+                "g" => Some(current_components[1]),
+                "b" => Some(current_components[2]),
                 _ => None,
             };
-            Some(Color::srgb(
+            Some(CssColor::rgb(
+                RgbColorSpace::Srgb,
                 channel(components[0])?,
                 channel(components[1])?,
                 channel(components[2])?,
-                current.a,
+                current.alpha(),
             ))
         }
         "hsl" | "hsla" if components.len() == 3 => {
@@ -100,12 +125,12 @@ pub(crate) fn parse_color_from_currentcolor(value: &str, current: Color) -> Opti
                 "l" => lightness,
                 _ => return None,
             };
-            let (r, g, b) = hsl_to_rgb_units(hue, saturation, lightness);
-            Some(Color::srgb(r, g, b, current.a))
+            let (r, g, b) = hsl_to_rgb_units_unclamped(hue, saturation, lightness);
+            Some(CssColor::rgb(RgbColorSpace::Srgb, r, g, b, current.alpha()))
         }
-        "hwb" if components.as_slice() == ["h", "w", "b"] => Some(current),
-        "lab" | "oklab" if components.as_slice() == ["l", "a", "b"] => Some(current),
-        "lch" | "oklch" if components.as_slice() == ["l", "c", "h"] => Some(current),
+        "hwb" if components == ["h", "w", "b"] => Some(current),
+        "lab" | "oklab" if components == ["l", "a", "b"] => Some(current),
+        "lch" | "oklch" if components == ["l", "c", "h"] => Some(current),
         "color"
             if components.len() == 4
                 && matches!(
@@ -127,15 +152,15 @@ pub(crate) fn parse_color_from_currentcolor(value: &str, current: Color) -> Opti
     }
 }
 
-/// Parse CSS Color 5 `contrast-color()`.
+/// Parse CSS CssColor 5 `contrast-color()`.
 ///
 /// The function must resolve to whichever of black and white has the greater
 /// contrast against its argument. CSS leaves the exact contrast algorithm to
 /// the user agent; Quire uses the WCAG relative-luminance contrast ratio,
 /// whose monotonic ordering makes this choice well-defined:
 /// <https://www.w3.org/TR/css-color-5/#contrast-color>.
-fn parse_contrast_color(value: &str, current: Color) -> Option<Color> {
-    let inner = value.strip_prefix("contrast-color(")?.strip_suffix(')')?;
+fn parse_contrast_color(value: &str, current: CssColor) -> Option<CssColor> {
+    let inner = crate::css::component_values::css_function_body(value, "contrast-color")?;
     let background = if inner.trim().eq_ignore_ascii_case("currentcolor") {
         current
     } else {
@@ -145,26 +170,27 @@ fn parse_contrast_color(value: &str, current: Color) -> Option<Color> {
     let black_contrast = (luminance + 0.05) / 0.05;
     let white_contrast = 1.05 / (luminance + 0.05);
     Some(if black_contrast >= white_contrast {
-        Color::BLACK
+        CssColor::BLACK
     } else {
-        Color::WHITE
+        CssColor::WHITE
     })
 }
 
-fn relative_luminance(color: Color) -> f32 {
-    // The WCAG contrast calculation is defined for sRGB. CSS Color 5 does
+fn relative_luminance(color: CssColor) -> f32 {
+    // The WCAG contrast calculation is defined for sRGB. CSS CssColor 5 does
     // not yet define the color-space selection for this function.
-    let color = color_to_srgb(color);
-    0.2126 * srgb_component_to_linear(color.r as f64) as f32
-        + 0.7152 * srgb_component_to_linear(color.g as f64) as f32
-        + 0.0722 * srgb_component_to_linear(color.b as f64) as f32
+    let color = color_to_predefined_rgb(color, CssColorSpace::Srgb)
+        .expect("sRGB is a predefined CSS RGB space");
+    0.2126 * srgb_component_to_linear(color.components()[0] as f64) as f32
+        + 0.7152 * srgb_component_to_linear(color.components()[1] as f64) as f32
+        + 0.0722 * srgb_component_to_linear(color.components()[2] as f64) as f32
 }
 
 /// Resolve the light branch of `light-dark()` in Quire's fixed light print
-/// color scheme. CSS Color Adjustment selects the branch from the used
+/// color scheme. CSS CssColor Adjustment selects the branch from the used
 /// `color-scheme`: <https://www.w3.org/TR/css-color-adjust-1/#color-scheme-effect>.
-fn parse_light_dark(value: &str, current: Color) -> Option<Color> {
-    let inner = value.strip_prefix("light-dark(")?.strip_suffix(')')?;
+fn parse_light_dark(value: &str, current: CssColor) -> Option<CssColor> {
+    let inner = crate::css::component_values::css_function_body(value, "light-dark")?;
     let components = split_top_level_commas(inner);
     let [light, _dark] = components.as_slice() else {
         return None;
@@ -176,240 +202,380 @@ fn parse_light_dark(value: &str, current: Color) -> Option<Color> {
     }
 }
 
-/// Parse `color-mix(in srgb, <color> <percentage>?, <color> <percentage>?)`.
+/// Parse a CSS CssColor 5 `color-mix()` value.
 ///
-/// The mixing calculation uses premultiplied alpha and the normalization rules
-/// from CSS Color 5: <https://www.w3.org/TR/css-color-5/#color-mix>.
-pub(crate) fn parse_color_mix(value: &str, current: Color) -> Option<Color> {
-    let inner = value.strip_prefix("color-mix(")?.strip_suffix(')')?;
+/// The mixing calculation shares the CSS CssColor interpolation implementation
+/// used by generated gradients. This keeps the interpolation color space,
+/// polar hue route, premultiplied alpha, and missing-component handling
+/// consistent for every consumer of a CSS color.
+/// <https://drafts.csswg.org/css-color-5/#color-mix>
+pub(crate) fn parse_color_mix(value: &str, current: CssColor) -> Option<CssColor> {
+    let inner = crate::css::component_values::css_function_body(value, "color-mix")?;
     let arguments = split_top_level_commas(inner);
-    let [interpolation, left, right] = arguments.as_slice() else {
+    if arguments.is_empty() {
+        return None;
+    }
+    let (method, items) = match parse_color_mix_interpolation_method(arguments[0]) {
+        Some(method) => (method, &arguments[1..]),
+        None if !arguments[0].trim_start().starts_with("in ") => (
+            crate::css::GradientInterpolationMethod::default(),
+            arguments.as_slice(),
+        ),
+        None => return None,
+    };
+    let items = items
+        .iter()
+        .map(|item| parse_color_mix_item(item, current))
+        .collect::<Option<Vec<_>>>()?;
+    if items.is_empty() {
+        return None;
+    }
+    mix_colors(items, method)
+}
+
+/// Parse the optional `in <color-space> [<hue-interpolation-method> hue]?`
+/// prefix used by `color-mix()`. The equivalent gradient grammar is parsed in
+/// the background cascade, but color values need the same semantic method.
+fn parse_color_mix_interpolation_method(
+    value: &str,
+) -> Option<crate::css::GradientInterpolationMethod> {
+    use crate::css::{GradientInterpolationSpace as Space, HueInterpolationMethod as Hue};
+
+    let tokens = crate::css::component_values::split_css_component_values(value);
+    let [in_keyword, space, tail @ ..] = tokens.as_slice() else {
         return None;
     };
-    let interpolation = interpolation.trim().to_ascii_lowercase();
-    if !matches!(interpolation.as_str(), "in srgb" | "in lch") {
+    if !in_keyword.eq_ignore_ascii_case("in") {
         return None;
     }
-    let (left, left_percentage) = split_color_mix_component(left)?;
-    let (right, right_percentage) = split_color_mix_component(right)?;
-    let left = parse_color_mix_input(left, current)?;
-    let right = parse_color_mix_input(right, current)?;
-    match interpolation.as_str() {
-        "in srgb" => mix_srgb(left, right, left_percentage, right_percentage),
-        "in lch" => mix_lch(left, right, left_percentage, right_percentage),
-        _ => unreachable!(),
-    }
+    let space = match space.to_ascii_lowercase().as_str() {
+        "srgb" => Space::Srgb,
+        "srgb-linear" => Space::SrgbLinear,
+        "display-p3" => Space::DisplayP3,
+        "display-p3-linear" => Space::DisplayP3Linear,
+        "a98-rgb" => Space::A98Rgb,
+        "prophoto-rgb" => Space::ProphotoRgb,
+        "rec2020" => Space::Rec2020,
+        "xyz-d50" => Space::XyzD50,
+        "xyz" | "xyz-d65" => Space::XyzD65,
+        "lab" => Space::Lab,
+        "oklab" => Space::Oklab,
+        "hsl" => Space::Hsl,
+        "hwb" => Space::Hwb,
+        "lch" => Space::Lch,
+        "oklch" => Space::Oklch,
+        _ => return None,
+    };
+    let hue = match tail {
+        [] => Hue::Shorter,
+        [method, keyword] if space.is_polar() && keyword.eq_ignore_ascii_case("hue") => {
+            match method.to_ascii_lowercase().as_str() {
+                "shorter" => Hue::Shorter,
+                "longer" => Hue::Longer,
+                "increasing" => Hue::Increasing,
+                "decreasing" => Hue::Decreasing,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some(crate::css::GradientInterpolationMethod { space, hue })
 }
 
 fn split_top_level_commas(value: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut depth = 0;
-    for (index, character) in value.char_indices() {
-        match character {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                parts.push(value[start..index].trim());
-                start = index + character.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(value[start..].trim());
-    parts
+    crate::css::component_values::split_css_top_level_delimiter(value, ',')
 }
 
 fn split_color_mix_component(value: &str) -> Option<(&str, Option<f32>)> {
-    let value = value.trim();
-    let mut depth = 0;
-    let mut split = None;
-    for (index, character) in value.char_indices() {
-        match character {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            character if character.is_ascii_whitespace() && depth == 0 => split = Some(index),
-            _ => {}
+    let components = crate::css::component_values::split_css_component_values(value);
+    match components.as_slice() {
+        [color] => Some((*color, None)),
+        [color, percentage] => {
+            let percentage = percentage.strip_suffix('%')?.trim().parse::<f32>().ok()?;
+            (0.0..=100.0)
+                .contains(&percentage)
+                .then_some((*color, Some(percentage)))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ColorMixItem {
+    color: CssColor,
+    percentage: Option<f32>,
+    missing: crate::css::GradientMissingComponents,
+    missing_source: crate::css::GradientMissingComponentSpace,
+}
+
+fn parse_color_mix_item(value: &str, current: CssColor) -> Option<ColorMixItem> {
+    let (value, percentage) = split_color_mix_component(value)?;
+    let (color, missing, missing_source) = if value.eq_ignore_ascii_case("currentcolor") {
+        (
+            current,
+            crate::css::GradientMissingComponents::default(),
+            crate::css::GradientMissingComponentSpace::Rgb,
+        )
+    } else {
+        let color = parse_color_mix(value, current).or_else(|| parse_color(value))?;
+        let (missing, missing_source) = color_missing_components(value);
+        (color, missing, missing_source)
+    };
+    Some(ColorMixItem {
+        color,
+        percentage,
+        missing,
+        missing_source,
+    })
+}
+
+/// Normalize percentages, reduce the color list in source order, then apply
+/// the alpha multiplier for an underspecified total.
+/// <https://drafts.csswg.org/css-color-5/#color-mix>
+fn mix_colors(
+    mut items: Vec<ColorMixItem>,
+    method: crate::css::GradientInterpolationMethod,
+) -> Option<CssColor> {
+    let specified = items.iter().filter_map(|item| item.percentage).sum::<f32>();
+    let omitted = items
+        .iter()
+        .filter(|item| item.percentage.is_none())
+        .count();
+    let implied = (100.0 - specified) / omitted.max(1) as f32;
+    if omitted > 0 && implied < 0.0 {
+        return None;
+    }
+    for item in &mut items {
+        item.percentage = Some(item.percentage.unwrap_or(implied));
+    }
+    let total = items
+        .iter()
+        .map(|item| item.percentage.unwrap())
+        .sum::<f32>();
+    if total == 0.0 {
+        return Some(CssColor::TRANSPARENT);
+    }
+    let alpha_multiplier = (total / 100.0).min(1.0);
+    let mut accumulated = items.remove(0);
+    let mut accumulated_percentage = accumulated.percentage.unwrap();
+    for item in items {
+        let percentage = item.percentage.unwrap();
+        let combined = accumulated_percentage + percentage;
+        let progress = if combined == 0.0 {
+            0.5
+        } else {
+            percentage / combined
+        };
+        accumulated.color = crate::color::interpolate_color_with_missing(
+            accumulated.color,
+            item.color,
+            method,
+            progress,
+            missing_components_for_color_mix(accumulated, method),
+            missing_components_for_color_mix(item, method),
+        );
+        accumulated.missing = crate::css::GradientMissingComponents::default();
+        accumulated.missing_source = crate::css::GradientMissingComponentSpace::Rgb;
+        accumulated_percentage = combined;
+    }
+    accumulated.color = accumulated
+        .color
+        .with_alpha(accumulated.color.alpha() * alpha_multiplier);
+    // A computed CSS color retains its interpolation space. Gamut mapping and
+    // quantization are output operations, not part of `color-mix()`.
+    Some(accumulated.color)
+}
+
+/// Record `none` components before ordinary color parsing substitutes their
+/// numeric fallback. CSS CssColor applies the analogous-component fixup only in
+/// the selected interpolation space.
+/// <https://www.w3.org/TR/css-color-4/#interpolation-missing>
+fn missing_components_for_color_mix(
+    item: ColorMixItem,
+    method: crate::css::GradientInterpolationMethod,
+) -> u8 {
+    crate::css::GradientColor::ColorWithMissing {
+        color: item.color,
+        missing: item.missing,
+        source: item.missing_source,
+    }
+    .missing_components_for(method)
+    .bits()
+}
+
+fn color_missing_components(
+    value: &str,
+) -> (
+    crate::css::GradientMissingComponents,
+    crate::css::GradientMissingComponentSpace,
+) {
+    use crate::css::{GradientMissingComponentSpace as Space, GradientMissingComponents};
+
+    let Some((name, inner)) = crate::css::component_values::css_single_function(value.trim())
+    else {
+        return (GradientMissingComponents::default(), Space::Rgb);
+    };
+    let name = name.to_ascii_lowercase();
+    if !matches!(
+        name.as_str(),
+        "rgb" | "rgba" | "hsl" | "hsla" | "hwb" | "lab" | "lch" | "oklab" | "oklch" | "color"
+    ) {
+        return (GradientMissingComponents::default(), Space::Rgb);
+    }
+    let (components, slash_alpha) =
+        crate::css::component_values::split_css_top_level_once(inner, '/')
+            .map(|(components, alpha)| (components, Some(alpha.trim())))
+            .unwrap_or((inner, None));
+    let tokens = crate::css::component_values::split_css_top_level_delimiter(components, ',')
+        .into_iter()
+        .flat_map(crate::css::component_values::split_css_component_values)
+        .collect::<Vec<_>>();
+    let component_offset = usize::from(name == "color");
+    if tokens.len() < component_offset + 3 {
+        return (GradientMissingComponents::default(), Space::Rgb);
+    }
+    let source = match name.as_str() {
+        "rgb" | "rgba" => Space::Rgb,
+        "hsl" | "hsla" => Space::Hsl,
+        "hwb" => Space::Hwb,
+        "lab" => Space::Lab,
+        "lch" => Space::Lch,
+        "oklab" => Space::Oklab,
+        "oklch" => Space::Oklch,
+        "color" => match tokens.first().copied() {
+            Some("xyz") | Some("xyz-d50") | Some("xyz-d65") => Space::Xyz,
+            _ => Space::Rgb,
+        },
+        _ => unreachable!("validated color function"),
+    };
+    let mut bits = 0;
+    for component in 0..3 {
+        if tokens[component + component_offset].eq_ignore_ascii_case("none") {
+            bits |= 1 << component;
         }
     }
-    let Some(split) = split else {
-        return Some((value, None));
-    };
-    let color = value[..split].trim_end();
-    let suffix = value[split..].trim();
-    let percentage = suffix.strip_suffix('%')?.trim().parse::<f32>().ok()?;
-    Some((color, Some(percentage)))
+    if slash_alpha.is_some_and(|alpha| alpha.eq_ignore_ascii_case("none"))
+        || slash_alpha.is_none()
+            && tokens
+                .get(component_offset + 3)
+                .is_some_and(|alpha| alpha.eq_ignore_ascii_case("none"))
+    {
+        bits |= 1 << 3;
+    }
+    (GradientMissingComponents::new(bits), source)
 }
 
-fn parse_color_mix_input(value: &str, current: Color) -> Option<Color> {
-    if value.eq_ignore_ascii_case("currentcolor") {
-        Some(current)
-    } else {
-        parse_color_mix(value, current).or_else(|| parse_color(value))
-    }
-}
-
-fn mix_srgb(
-    left: Color,
-    right: Color,
-    left_percentage: Option<f32>,
-    right_percentage: Option<f32>,
-) -> Option<Color> {
-    // This initial color-mix implementation supports the legacy `in srgb`
-    // path only. Convert retained CSS Color 4 coordinates at that boundary.
-    let left = color_to_srgb(left);
-    let right = color_to_srgb(right);
-    let (left_percentage, right_percentage) = match (left_percentage, right_percentage) {
-        (Some(left), Some(right)) => (left, right),
-        (Some(left), None) => (left, 100.0 - left),
-        (None, Some(right)) => (100.0 - right, right),
-        (None, None) => (50.0, 50.0),
-    };
-    if left_percentage < 0.0 || right_percentage < 0.0 {
-        return None;
-    }
-    let total = left_percentage + right_percentage;
-    if total == 0.0 {
-        return None;
-    }
-    let alpha_multiplier = (total / 100.0).min(1.0);
-    let left_weight = left_percentage / total;
-    let right_weight = right_percentage / total;
-    let alpha = (left.a * left_weight + right.a * right_weight) * alpha_multiplier;
-    if alpha == 0.0 {
-        return Some(Color::TRANSPARENT);
-    }
-    let mix = |left_channel: f32, right_channel: f32| {
-        (left_channel * left.a * left_weight + right_channel * right.a * right_weight)
-            * alpha_multiplier
-            / alpha
-    };
-    Some(Color::srgb(
-        mix(left.r, right.r),
-        mix(left.g, right.g),
-        mix(left.b, right.b),
-        alpha,
-    ))
-}
-
-fn mix_lch(
-    left: Color,
-    right: Color,
-    left_percentage: Option<f32>,
-    right_percentage: Option<f32>,
-) -> Option<Color> {
-    let (left_percentage, right_percentage) =
-        normalize_color_mix_percentages(left_percentage, right_percentage)?;
-    let total = left_percentage + right_percentage;
-    let alpha_multiplier = (total / 100.0).min(1.0);
-    let left_weight = left_percentage / total;
-    let right_weight = right_percentage / total;
-    let alpha = (left.a * left_weight + right.a * right_weight) * alpha_multiplier;
-    if alpha == 0.0 {
-        return Some(Color::TRANSPARENT);
-    }
-    let [left_lightness, left_chroma, left_hue] = srgb_to_lch(left);
-    let [right_lightness, right_chroma, right_hue] = srgb_to_lch(right);
-    let component = |left_component: f64, right_component: f64| {
-        (left_component * left.a as f64 * left_weight as f64
-            + right_component * right.a as f64 * right_weight as f64)
-            * alpha_multiplier as f64
-            / alpha as f64
-    };
-    let hue_difference = (right_hue - left_hue + 180.0).rem_euclid(360.0) - 180.0;
-    let hue = (left_hue + hue_difference * right_weight as f64).rem_euclid(360.0);
-    let rgb = lch_to_srgb(
-        component(left_lightness, right_lightness),
-        component(left_chroma, right_chroma),
-        hue,
-    );
-    Some(Color::srgb(
-        rgb[0] as f32,
-        rgb[1] as f32,
-        rgb[2] as f32,
-        alpha,
-    ))
-}
-
-fn normalize_color_mix_percentages(
-    left_percentage: Option<f32>,
-    right_percentage: Option<f32>,
-) -> Option<(f32, f32)> {
-    let (left, right) = match (left_percentage, right_percentage) {
-        (Some(left), Some(right)) => (left, right),
-        (Some(left), None) => (left, 100.0 - left),
-        (None, Some(right)) => (100.0 - right, right),
-        (None, None) => (50.0, 50.0),
-    };
-    (left >= 0.0 && right >= 0.0 && left + right > 0.0).then_some((left, right))
-}
-
-/// CSS Syntax Level 3 comments are whitespace tokens, including inside color
-/// functions: <https://www.w3.org/TR/css-syntax-3/#comment-diagram>.
-fn remove_css_comments(value: &str) -> String {
+/// Normalize CSS comments to a single whitespace character without touching
+/// comment-looking text inside quoted strings or escaped source text.
+///
+/// CSS Syntax consumes comments as whitespace between component values. The
+/// returned string is deliberately not trimmed: callers decide whether the
+/// consuming grammar permits leading or trailing whitespace.
+/// <https://www.w3.org/TR/css-syntax-3/#comment-diagram>
+pub(crate) fn normalize_css_comments(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
-    let mut remainder = value;
-    while let Some(start) = remainder.find("/*") {
-        result.push_str(&remainder[..start]);
-        let after_start = &remainder[start + 2..];
-        let Some(end) = after_start.find("*/") else {
-            return value.to_string();
-        };
-        result.push(' ');
-        remainder = &after_start[end + 2..];
+    let mut characters = value.chars().peekable();
+    let mut quote = None;
+    while let Some(character) = characters.next() {
+        if let Some(active_quote) = quote {
+            result.push(character);
+            if character == '\\' {
+                if let Some(escaped) = characters.next() {
+                    result.push(escaped);
+                }
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\\' => {
+                result.push(character);
+                if let Some(escaped) = characters.next() {
+                    result.push(escaped);
+                }
+            }
+            '"' | '\'' => {
+                quote = Some(character);
+                result.push(character);
+            }
+            '/' if characters.peek() == Some(&'*') => {
+                characters.next();
+                let mut previous_was_star = false;
+                for comment_character in characters.by_ref() {
+                    if previous_was_star && comment_character == '/' {
+                        break;
+                    }
+                    previous_was_star = comment_character == '*';
+                }
+                result.push(' ');
+            }
+            _ => result.push(character),
+        }
     }
-    result.push_str(remainder);
     result
 }
 
 /// Resolve CSS system colors to Quire's deterministic print palette.
 ///
-/// CSS Color 4 leaves these colors dependent on the user agent and operating
+/// CSS CssColor 4 leaves these colors dependent on the user agent and operating
 /// system, while requiring deprecated system-color aliases to equal their
 /// modern counterparts: <https://www.w3.org/TR/css-color-4/#css-system-colors>.
-fn parse_system_color(value: &str) -> Option<Color> {
-    let color = match value {
-        "canvas" | "buttonface" | "buttonhighlight" | "buttonshadow" | "threedface" | "field"
-        | "mark" | "highlight" | "selecteditem" | "accentcolor" | "activetext"
-        | "activecaption" | "inactivecaption" | "appworkspace" | "background"
-        | "infobackground" | "menu" | "scrollbar" | "window" => Color::WHITE,
+fn parse_system_color(value: &str) -> Option<CssColor> {
+    use crate::css::{ForcedColorPalette, SystemColor};
+
+    let system = match value {
+        "canvas" | "buttonhighlight" | "buttonshadow" | "threedface" | "activecaption"
+        | "inactivecaption" | "appworkspace" | "background" | "infobackground" | "menu"
+        | "scrollbar" | "window" => SystemColor::Canvas,
         "canvastext"
-        | "buttontext"
-        | "fieldtext"
-        | "marktext"
-        | "highlighttext"
-        | "selecteditemtext"
-        | "accentcolortext"
-        | "linktext"
-        | "visitedtext"
-        | "graytext"
         | "captiontext"
         | "inactivecaptiontext"
         | "infotext"
         | "menutext"
-        | "windowtext" => Color::BLACK,
+        | "windowtext" => SystemColor::CanvasText,
+        "linktext" => SystemColor::LinkText,
+        "visitedtext" => SystemColor::VisitedText,
+        "activetext" => SystemColor::ActiveText,
+        "buttonface" => SystemColor::ButtonFace,
+        "buttontext" => SystemColor::ButtonText,
         "buttonborder" | "activeborder" | "inactiveborder" | "threeddarkshadow"
         | "threedhighlight" | "threedlightshadow" | "threedshadow" | "windowframe" => {
-            Color::new(128, 128, 128)
+            SystemColor::ButtonBorder
         }
+        "field" => SystemColor::Field,
+        "fieldtext" => SystemColor::FieldText,
+        "highlight" => SystemColor::Highlight,
+        "highlighttext" => SystemColor::HighlightText,
+        "mark" => SystemColor::Mark,
+        "marktext" => SystemColor::MarkText,
+        "graytext" => SystemColor::GrayText,
+        "accentcolor" => SystemColor::AccentColor,
+        "accentcolortext" => SystemColor::AccentColorText,
+        "selecteditem" => SystemColor::SelectedItem,
+        "selecteditemtext" => SystemColor::SelectedItemText,
         _ => return None,
     };
-    Some(color)
+    Some(CssColor::system(
+        system,
+        ForcedColorPalette::LIGHT.color(system),
+    ))
 }
 
-/// Parses the currently modeled sRGB subset of CSS Color syntax.
+/// Parses the currently modeled sRGB subset of CSS CssColor syntax.
 ///
-/// CSS Color Level 4 allows both legacy comma-separated and modern
+/// CSS CssColor Level 4 allows both legacy comma-separated and modern
 /// whitespace-separated `rgb()`/`rgba()` forms:
 /// <https://www.w3.org/TR/css-color-4/#rgb-functions>.
-pub(crate) fn parse_rgb_function(value: &str) -> Option<Color> {
-    let inner = value
-        .strip_prefix("rgb(")
-        .or_else(|| value.strip_prefix("rgba("))
-        .and_then(|value| value.strip_suffix(')'))?;
+pub(crate) fn parse_rgb_function(value: &str) -> Option<CssColor> {
+    let (name, inner) = crate::css::component_values::css_single_function(value)?;
+    if !matches!(name.to_ascii_lowercase().as_str(), "rgb" | "rgba") {
+        return None;
+    }
     let (rgb, alpha) = split_rgb_alpha(inner);
-    let channels = if rgb.contains(',') {
-        let parts = rgb.split(',').map(str::trim).collect::<Vec<_>>();
+    let comma_parts = split_top_level_commas(rgb);
+    let channels = if comma_parts.len() > 1 {
+        let parts = comma_parts;
         if !(parts.len() == 3 || parts.len() == 4) {
             return None;
         }
@@ -426,7 +592,7 @@ pub(crate) fn parse_rgb_function(value: &str) -> Option<Color> {
             alpha_part,
         )
     } else {
-        let parts = rgb.split_whitespace().collect::<Vec<_>>();
+        let parts = crate::css::component_values::split_css_component_values(rgb);
         if parts.len() != 3 {
             return None;
         }
@@ -444,20 +610,22 @@ pub(crate) fn parse_rgb_function(value: &str) -> Option<Color> {
         1.0
     };
     match channels.0.as_slice() {
-        [r, g, b] => Some(Color::rgba(*r, *g, *b, alpha)),
+        [r, g, b] => Some(CssColor::rgba(*r, *g, *b, alpha)),
         _ => None,
     }
 }
 
 fn split_rgb_alpha(value: &str) -> (&str, Option<&str>) {
-    value
-        .split_once('/')
-        .map(|(rgb, alpha)| (rgb.trim(), Some(alpha.trim())))
+    crate::css::component_values::split_css_top_level_once(value, '/')
+        .map(|(components, alpha)| (components, Some(alpha.trim())))
         .unwrap_or((value.trim(), None))
 }
 
 fn parse_rgb_channel(value: &str) -> Option<u8> {
     let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Some(0);
+    }
     let channel = if let Some(percent) = value.strip_suffix('%') {
         percent.trim().parse::<f32>().ok()? * 255.0 / 100.0
     } else {
@@ -468,17 +636,18 @@ fn parse_rgb_channel(value: &str) -> Option<u8> {
 
 /// Parse `hsl()` and `hsla()` color functions.
 ///
-/// CSS Color Level 4 allows both legacy comma-separated and modern
+/// CSS CssColor Level 4 allows both legacy comma-separated and modern
 /// whitespace-separated HSL forms, with optional slash alpha:
 /// <https://www.w3.org/TR/css-color-4/#the-hsl-notation>.
-pub(crate) fn parse_hsl_function(value: &str) -> Option<Color> {
-    let inner = value
-        .strip_prefix("hsl(")
-        .or_else(|| value.strip_prefix("hsla("))
-        .and_then(|value| value.strip_suffix(')'))?;
+pub(crate) fn parse_hsl_function(value: &str) -> Option<CssColor> {
+    let (name, inner) = crate::css::component_values::css_single_function(value)?;
+    if !matches!(name.to_ascii_lowercase().as_str(), "hsl" | "hsla") {
+        return None;
+    }
     let (hsl, slash_alpha) = split_rgb_alpha(inner);
-    let (hue, saturation, lightness, alpha) = if hsl.contains(',') {
-        let parts = hsl.split(',').map(str::trim).collect::<Vec<_>>();
+    let comma_parts = split_top_level_commas(hsl);
+    let (hue, saturation, lightness, alpha) = if comma_parts.len() > 1 {
+        let parts = comma_parts;
         if !(parts.len() == 3 || parts.len() == 4) {
             return None;
         }
@@ -493,14 +662,14 @@ pub(crate) fn parse_hsl_function(value: &str) -> Option<Color> {
                 .or(slash_alpha),
         )
     } else {
-        let parts = hsl.split_whitespace().collect::<Vec<_>>();
+        let parts = crate::css::component_values::split_css_component_values(hsl);
         if parts.len() != 3 {
             return None;
         }
         (
             parse_hue_degrees(parts[0])?,
-            parse_percentage(parts[1])?,
-            parse_percentage(parts[2])?,
+            parse_modern_hsl_hwb_component(parts[1])?,
+            parse_modern_hsl_hwb_component(parts[2])?,
             slash_alpha,
         )
     };
@@ -510,22 +679,21 @@ pub(crate) fn parse_hsl_function(value: &str) -> Option<Color> {
         1.0
     };
     let (r, g, b) = hsl_to_rgb(hue, saturation, lightness);
-    Some(Color::rgba(r, g, b, alpha))
+    Some(CssColor::rgba(r, g, b, alpha))
 }
 
 /// Parse `hwb()` color functions into sRGB.
 ///
-/// CSS Color Level 4 defines HWB as a cylindrical sRGB color notation whose
+/// CSS CssColor Level 4 defines HWB as a cylindrical sRGB color notation whose
 /// hue is mixed with whiteness and blackness; when whiteness plus blackness is
 /// at least 100%, the result is the corresponding gray:
 /// <https://www.w3.org/TR/css-color-4/#the-hwb-notation>.
-pub(crate) fn parse_hwb_function(value: &str) -> Option<Color> {
-    let inner = value
-        .strip_prefix("hwb(")
-        .and_then(|value| value.strip_suffix(')'))?;
+pub(crate) fn parse_hwb_function(value: &str) -> Option<CssColor> {
+    let inner = crate::css::component_values::css_function_body(value, "hwb")?;
     let (hwb, slash_alpha) = split_rgb_alpha(inner);
-    let (hue, whiteness, blackness, alpha) = if hwb.contains(',') {
-        let parts = hwb.split(',').map(str::trim).collect::<Vec<_>>();
+    let comma_parts = split_top_level_commas(hwb);
+    let (hue, whiteness, blackness, alpha) = if comma_parts.len() > 1 {
+        let parts = comma_parts;
         if !(parts.len() == 3 || parts.len() == 4) {
             return None;
         }
@@ -540,14 +708,14 @@ pub(crate) fn parse_hwb_function(value: &str) -> Option<Color> {
                 .or(slash_alpha),
         )
     } else {
-        let parts = hwb.split_whitespace().collect::<Vec<_>>();
+        let parts = crate::css::component_values::split_css_component_values(hwb);
         if parts.len() != 3 {
             return None;
         }
         (
             parse_hue_degrees(parts[0])?,
-            parse_percentage(parts[1])?,
-            parse_percentage(parts[2])?,
+            parse_modern_hsl_hwb_component(parts[1])?,
+            parse_modern_hsl_hwb_component(parts[2])?,
             slash_alpha,
         )
     };
@@ -557,18 +725,33 @@ pub(crate) fn parse_hwb_function(value: &str) -> Option<Color> {
         1.0
     };
     let (r, g, b) = hwb_to_rgb(hue, whiteness, blackness);
-    Some(Color::rgba(r, g, b, alpha))
+    Some(CssColor::rgba(r, g, b, alpha))
 }
 
-/// Parse CSS Color 4's predefined `color()` spaces into Quire's sRGB paint
-/// representation. Color conversion follows the conversion matrices and
+/// Parse a modern HSL/HWB saturation, lightness, whiteness, or blackness
+/// component into its unit reference range.
+///
+/// CSS CssColor Level 4 permits a percentage, a number in the 0--100 reference
+/// range, or `none` in modern (space-separated) syntax. `none` has a numeric
+/// fallback of zero; gradient parsing separately preserves its missingness
+/// until interpolation.
+/// <https://www.w3.org/TR/css-color-4/#the-hsl-notation>
+/// <https://www.w3.org/TR/css-color-4/#the-hwb-notation>
+fn parse_modern_hsl_hwb_component(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Some(0.0);
+    }
+    parse_percentage(value).or_else(|| value.parse::<f32>().ok().map(|value| value / 100.0))
+}
+
+/// Parse CSS CssColor 4's predefined `color()` spaces into Quire's sRGB paint
+/// representation. CssColor conversion follows the conversion matrices and
 /// transfer functions in <https://www.w3.org/TR/css-color-4/#color-conversion-code>.
-pub(crate) fn parse_color_function(value: &str) -> Option<Color> {
-    let inner = value
-        .strip_prefix("color(")
-        .and_then(|value| value.strip_suffix(')'))?;
+pub(crate) fn parse_color_function(value: &str) -> Option<CssColor> {
+    let inner = crate::css::component_values::css_function_body(value, "color")?;
     let (components, slash_alpha) = split_rgb_alpha(inner);
-    let parts = components.split_whitespace().collect::<Vec<_>>();
+    let parts = crate::css::component_values::split_css_component_values(components);
     let [space, red, green, blue] = parts.as_slice() else {
         return None;
     };
@@ -584,55 +767,61 @@ pub(crate) fn parse_color_function(value: &str) -> Option<Color> {
     ];
     let [r, g, b] = components.map(|component| component as f32);
     match *space {
-        "srgb" => Some(Color::in_space(ColorSpace::Srgb, r, g, b, alpha)),
+        "srgb" => Some(CssColor::in_space(CssColorSpace::Srgb, r, g, b, alpha)),
         "srgb-linear" => {
             let encoded = linear_to_srgb(components);
-            Some(Color::in_space(
-                ColorSpace::Srgb,
+            Some(CssColor::in_space(
+                CssColorSpace::Srgb,
                 encoded[0] as f32,
                 encoded[1] as f32,
                 encoded[2] as f32,
                 alpha,
             ))
         }
-        "display-p3" => Some(Color::in_space(ColorSpace::DisplayP3, r, g, b, alpha)),
+        "display-p3" => Some(CssColor::in_space(CssColorSpace::DisplayP3, r, g, b, alpha)),
         "display-p3-linear" => {
             let encoded = linear_to_srgb(components);
-            Some(Color::in_space(
-                ColorSpace::DisplayP3,
+            Some(CssColor::in_space(
+                CssColorSpace::DisplayP3,
                 encoded[0] as f32,
                 encoded[1] as f32,
                 encoded[2] as f32,
                 alpha,
             ))
         }
-        "a98-rgb" => Some(Color::in_space(ColorSpace::A98Rgb, r, g, b, alpha)),
-        "prophoto-rgb" => Some(Color::in_space(ColorSpace::ProphotoRgb, r, g, b, alpha)),
-        "rec2020" => Some(Color::in_space(ColorSpace::Rec2020, r, g, b, alpha)),
+        "a98-rgb" => Some(CssColor::in_space(CssColorSpace::A98Rgb, r, g, b, alpha)),
+        "prophoto-rgb" => Some(CssColor::in_space(
+            CssColorSpace::ProphotoRgb,
+            r,
+            g,
+            b,
+            alpha,
+        )),
+        "rec2020" => Some(CssColor::in_space(CssColorSpace::Rec2020, r, g, b, alpha)),
         "xyz" | "xyz-d65" => {
             let xyz = adapt_d65_to_d50(components);
-            Some(Color::in_space(
-                ColorSpace::XyzD50,
+            Some(CssColor::in_space(
+                CssColorSpace::XyzD50,
                 xyz[0] as f32,
                 xyz[1] as f32,
                 xyz[2] as f32,
                 alpha,
             ))
         }
-        "xyz-d50" => Some(Color::in_space(ColorSpace::XyzD50, r, g, b, alpha)),
+        "xyz-d50" => Some(CssColor::in_space(CssColorSpace::XyzD50, r, g, b, alpha)),
         _ => None,
     }
 }
 
-/// Parse `lab()` using the D50 CIE Lab space defined by CSS Color 4.
-fn parse_lab_function(value: &str) -> Option<Color> {
-    let ([lightness, a, b], alpha) = parse_four_component_function(value, "lab(")?;
+/// Parse `lab()` using the D50 CIE Lab space defined by CSS CssColor 4.
+fn parse_lab_function(value: &str) -> Option<CssColor> {
+    let ([lightness, a, b], alpha) = parse_four_component_function(value, "lab")?;
     let lightness = parse_lab_lightness(lightness)? as f64;
     let a = parse_lab_axis(a)? as f64;
     let b = parse_lab_axis(b)? as f64;
     let xyz = lab_to_xyz_d50(lightness, a, b);
-    Some(Color::in_space(
-        ColorSpace::XyzD50,
+    Some(CssColor::in_space(
+        CssColorSpace::XyzD50,
         xyz[0] as f32,
         xyz[1] as f32,
         xyz[2] as f32,
@@ -640,16 +829,27 @@ fn parse_lab_function(value: &str) -> Option<Color> {
     ))
 }
 
-/// Parse `lch()` using CSS Color 4's D50 CIE LCH space.
-fn parse_lch_function(value: &str) -> Option<Color> {
-    let ([lightness, chroma, hue], alpha) = parse_four_component_function(value, "lch(")?;
+/// Parse `lch()` using CSS CssColor 4's D50 CIE LCH space.
+fn parse_lch_function(value: &str) -> Option<CssColor> {
+    let ([lightness, chroma, hue], alpha) = parse_four_component_function(value, "lch")?;
     let lightness = parse_lab_lightness(lightness)? as f64;
+    // Chroma has no physical direction at either CIE LCH lightness endpoint.
+    // CSS clamps L before conversion, so these polar endpoint values resolve
+    // to the neutral black/white colors rather than manufacturing an
+    // out-of-gamut hue from an undefined chroma direction.
+    // <https://www.w3.org/TR/css-color-4/#specifying-lab-lch>
+    if lightness == 0.0 {
+        return Some(CssColor::srgb(0.0, 0.0, 0.0, alpha));
+    }
+    if lightness == 100.0 {
+        return Some(CssColor::srgb(1.0, 1.0, 1.0, alpha));
+    }
     let chroma = parse_lch_chroma(chroma)? as f64;
     let hue = parse_hue_degrees(hue)? as f64;
     let radians = hue.to_radians();
     let xyz = lab_to_xyz_d50(lightness, chroma * radians.cos(), chroma * radians.sin());
-    Some(Color::in_space(
-        ColorSpace::XyzD50,
+    Some(CssColor::in_space(
+        CssColorSpace::XyzD50,
         xyz[0] as f32,
         xyz[1] as f32,
         xyz[2] as f32,
@@ -657,17 +857,64 @@ fn parse_lch_function(value: &str) -> Option<Color> {
     ))
 }
 
-/// Parse `oklab()` according to CSS Color 4's D65 OKLab conversion.
-fn parse_oklab_function(value: &str) -> Option<Color> {
-    let ([lightness, a, b], alpha) = parse_four_component_function(value, "oklab(")?;
-    let rgb = oklab_to_srgb(
+/// Parse a relative `lch(from <color> l c h)` color at computed-value time.
+///
+/// CSS CssColor resolves the origin in the target color space before evaluating
+/// its component expressions. This parser retains the existing `lch()` D50
+/// conversion and supports numeric multiplication of a referenced component,
+/// which is the arithmetic form used by palette overrides and other static
+/// stylesheet colors.
+/// <https://www.w3.org/TR/css-color-5/#relative-colors>
+fn parse_relative_lch_function(value: &str) -> Option<CssColor> {
+    let inner = value.strip_prefix("lch(from ")?.strip_suffix(')')?;
+    let components = split_css_component_values(inner);
+    let [origin, lightness, chroma, hue] = components.as_slice() else {
+        return None;
+    };
+    let origin = parse_color(origin)?;
+    let [origin_lightness, origin_chroma, origin_hue] = color_to_lch(origin);
+    let component = |value: &str, name: &str, origin_value: f64| {
+        if value == name {
+            return Some(origin_value);
+        }
+        let expression = value
+            .strip_prefix("calc(")
+            .and_then(|expression| expression.strip_suffix(')'))?
+            .trim();
+        let (factor, referenced) = expression.split_once('*')?;
+        (referenced.trim() == name).then(|| {
+            factor
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(|factor| factor * origin_value)
+        })?
+    };
+    let lightness = component(lightness, "l", origin_lightness)?;
+    let chroma = component(chroma, "c", origin_chroma)?;
+    let hue = component(hue, "h", origin_hue)?;
+    let radians = hue.to_radians();
+    let xyz = lab_to_xyz_d50(lightness, chroma * radians.cos(), chroma * radians.sin());
+    Some(CssColor::in_space(
+        CssColorSpace::XyzD50,
+        xyz[0] as f32,
+        xyz[1] as f32,
+        xyz[2] as f32,
+        origin.alpha(),
+    ))
+}
+
+/// Parse `oklab()` according to CSS CssColor 4's D65 OKLab conversion.
+fn parse_oklab_function(value: &str) -> Option<CssColor> {
+    let ([lightness, a, b], alpha) = parse_four_component_function(value, "oklab")?;
+    let xyz = oklab_to_xyz_d65(
         parse_oklab_lightness(lightness)? as f64,
         parse_oklab_axis(a)? as f64,
         parse_oklab_axis(b)? as f64,
     );
-    let xyz = adapt_d65_to_d50(srgb_to_xyz_d65(rgb));
-    Some(Color::in_space(
-        ColorSpace::XyzD50,
+    let xyz = adapt_d65_to_d50(xyz);
+    Some(CssColor::in_space(
+        CssColorSpace::XyzD50,
         xyz[0] as f32,
         xyz[1] as f32,
         xyz[2] as f32,
@@ -675,16 +922,29 @@ fn parse_oklab_function(value: &str) -> Option<Color> {
     ))
 }
 
-/// Parse `oklch()` according to CSS Color 4's D65 OKLCH conversion.
-fn parse_oklch_function(value: &str) -> Option<Color> {
-    let ([lightness, chroma, hue], alpha) = parse_four_component_function(value, "oklch(")?;
+/// Parse `oklch()` according to CSS CssColor 4's D65 OKLCH conversion.
+fn parse_oklch_function(value: &str) -> Option<CssColor> {
+    let ([lightness, chroma, hue], alpha) = parse_four_component_function(value, "oklch")?;
     let lightness = parse_oklab_lightness(lightness)? as f64;
+    // As in CIE LCH, chroma is powerless at the polar OKLCH lightness
+    // endpoints. Normalize after CSS lightness clamping and before polar
+    // conversion so the endpoint is a neutral color.
+    // <https://www.w3.org/TR/css-color-4/#specifying-oklab-oklch>
+    if lightness == 0.0 {
+        return Some(CssColor::srgb(0.0, 0.0, 0.0, alpha));
+    }
+    if lightness == 1.0 {
+        return Some(CssColor::srgb(1.0, 1.0, 1.0, alpha));
+    }
     let chroma = parse_oklch_chroma(chroma)? as f64;
     let radians = (parse_hue_degrees(hue)? as f64).to_radians();
-    let rgb = oklab_to_srgb(lightness, chroma * radians.cos(), chroma * radians.sin());
-    let xyz = adapt_d65_to_d50(srgb_to_xyz_d65(rgb));
-    Some(Color::in_space(
-        ColorSpace::XyzD50,
+    let xyz = adapt_d65_to_d50(oklab_to_xyz_d65(
+        lightness,
+        chroma * radians.cos(),
+        chroma * radians.sin(),
+    ));
+    Some(CssColor::in_space(
+        CssColorSpace::XyzD50,
         xyz[0] as f32,
         xyz[1] as f32,
         xyz[2] as f32,
@@ -693,10 +953,10 @@ fn parse_oklch_function(value: &str) -> Option<Color> {
 }
 
 /// Parse the modern, space-separated three-component color function grammar.
-fn parse_four_component_function<'a>(value: &'a str, prefix: &str) -> Option<([&'a str; 3], f32)> {
-    let inner = value.strip_prefix(prefix)?.strip_suffix(')')?;
+fn parse_four_component_function<'a>(value: &'a str, name: &str) -> Option<([&'a str; 3], f32)> {
+    let inner = crate::css::component_values::css_function_body(value, name)?;
     let (components, slash_alpha) = split_rgb_alpha(inner);
-    let components = components.split_whitespace().collect::<Vec<_>>();
+    let components = crate::css::component_values::split_css_component_values(components);
     let [first, second, third] = components.as_slice() else {
         return None;
     };
@@ -840,8 +1100,143 @@ fn xyz_d65_to_srgb(xyz: Triplet) -> Triplet {
     ))
 }
 
-fn linear_display_p3_to_xyz(values: Triplet) -> Triplet {
-    linear_display_p3_to_xyz_linear(values.map(srgb_component_to_linear))
+/// Convert D50 PCS coordinates to one CSS predefined RGB component space
+/// without gamut mapping or component clipping.
+///
+/// CSS CssColor 4 requires conversion between predefined spaces to preserve
+/// extended-range values until the actual output gamut mapping boundary. In
+/// particular, routing D50 XYZ through a clipped sRGB output encoding would irreversibly
+/// lose a Display-P3 green outside sRGB.
+/// <https://www.w3.org/TR/css-color-4/#color-conversion>
+pub(crate) fn color_to_predefined_rgb(color: CssColor, target: CssColorSpace) -> Option<CssColor> {
+    let target_space = match target {
+        CssColorSpace::Srgb => RgbColorSpace::Srgb,
+        CssColorSpace::DisplayP3 => RgbColorSpace::DisplayP3,
+        CssColorSpace::A98Rgb => RgbColorSpace::A98Rgb,
+        CssColorSpace::ProphotoRgb => RgbColorSpace::ProphotoRgb,
+        CssColorSpace::Rec2020 => RgbColorSpace::Rec2020,
+        CssColorSpace::XyzD50 => return None,
+    };
+    if color.space() == target {
+        return Some(color);
+    }
+
+    let xyz = color.to_xyz_d50();
+    let d50 = [xyz.x as f64, xyz.y as f64, xyz.z as f64];
+    let encoded = match target {
+        CssColorSpace::Srgb => xyz_d65_to_srgb(adapt_d50_to_d65(d50)),
+        CssColorSpace::DisplayP3 => linear_to_srgb(multiply_matrix(
+            [
+                [
+                    2.493_496_911_941_425,
+                    -0.931_383_617_919_124,
+                    -0.402_710_784_450_717,
+                ],
+                [
+                    -0.829_488_969_561_575,
+                    1.762_664_060_318_346,
+                    0.023_624_685_841_944,
+                ],
+                [
+                    0.035_845_830_243_784,
+                    -0.076_172_389_268_042,
+                    0.956_884_524_007_687,
+                ],
+            ],
+            adapt_d50_to_d65(d50),
+        )),
+        CssColorSpace::A98Rgb => multiply_matrix(
+            [
+                [
+                    2.041_587_903_810_746_5,
+                    -0.565_006_974_278_859_6,
+                    -0.344_731_350_778_329_56,
+                ],
+                [
+                    -0.969_243_636_280_879_6,
+                    1.875_967_501_507_720_2,
+                    0.041_555_057_407_175_59,
+                ],
+                [
+                    0.013_444_280_632_031_142,
+                    -0.118_362_392_231_018_38,
+                    1.015_174_994_391_205_4,
+                ],
+            ],
+            adapt_d50_to_d65(d50),
+        )
+        .map(linear_to_a98),
+        CssColorSpace::ProphotoRgb => multiply_matrix(
+            [
+                [
+                    1.345_798_973_102_828_1,
+                    -0.255_580_100_079_975_34,
+                    -0.051_106_285_067_534_01,
+                ],
+                [
+                    -0.544_622_493_902_834_7,
+                    1.508_232_741_313_278_1,
+                    0.020_536_032_391_479_73,
+                ],
+                [0.0, 0.0, 1.211_967_545_638_945_4],
+            ],
+            d50,
+        )
+        .map(linear_to_prophoto),
+        CssColorSpace::Rec2020 => multiply_matrix(
+            [
+                [
+                    1.716_651_187_971_267_4,
+                    -0.355_670_783_776_392_33,
+                    -0.253_366_281_373_659_74,
+                ],
+                [
+                    -0.666_684_351_832_489,
+                    1.616_481_236_634_939_5,
+                    0.015_768_545_813_911_13,
+                ],
+                [
+                    0.017_639_857_445_310_783,
+                    -0.042_770_613_257_808_524,
+                    0.942_103_121_235_473_8,
+                ],
+            ],
+            adapt_d50_to_d65(d50),
+        )
+        .map(linear_to_rec2020),
+        CssColorSpace::XyzD50 => unreachable!(),
+    };
+    Some(CssColor::rgb(
+        target_space,
+        encoded[0] as f32,
+        encoded[1] as f32,
+        encoded[2] as f32,
+        color.alpha(),
+    ))
+}
+
+fn linear_to_a98(value: f64) -> f64 {
+    value.signum() * value.abs().powf(256.0 / 563.0)
+}
+
+fn linear_to_prophoto(value: f64) -> f64 {
+    let sign = value.signum();
+    let magnitude = value.abs();
+    sign * if magnitude >= 1.0 / 512.0 {
+        magnitude.powf(1.0 / 1.8)
+    } else {
+        16.0 * magnitude
+    }
+}
+
+fn linear_to_rec2020(value: f64) -> f64 {
+    let sign = value.signum();
+    let magnitude = value.abs();
+    sign * if magnitude > 0.018_1 {
+        1.099_3 * magnitude.powf(0.45) - 0.099_3
+    } else {
+        4.5 * magnitude
+    }
 }
 
 fn linear_display_p3_to_xyz_linear(values: Triplet) -> Triplet {
@@ -859,7 +1254,7 @@ fn linear_display_p3_to_xyz_linear(values: Triplet) -> Triplet {
             ],
             [0.0, 0.045_113_381_858_902_64, 1.043_944_368_900_976],
         ],
-        values.map(srgb_component_to_linear),
+        values,
     )
 }
 
@@ -1004,32 +1399,49 @@ fn adapt_d65_to_d50(xyz: Triplet) -> Triplet {
     )
 }
 
-/// Convert a retained CSS color to the legacy sRGB paint boundary.
+/// Convert a retained CSS color to the D50 XYZ profile-connection space.
 ///
-/// Non-gradient raster images and advanced color operations still use the
-/// legacy sRGB boundary. Keeping the conversion explicit prevents those
-/// subsystems from silently treating wide-gamut coordinates as DeviceRGB
-/// components.
-pub(crate) fn color_to_srgb(color: Color) -> Color {
-    if color.space() == ColorSpace::Srgb {
-        return Color::srgb(color.r, color.g, color.b, color.a);
-    }
-    let source = [color.r as f64, color.g as f64, color.b as f64];
-    let rgb = match color.space() {
-        ColorSpace::Srgb => unreachable!(),
-        ColorSpace::DisplayP3 => xyz_d65_to_srgb(linear_display_p3_to_xyz(
-            source.map(srgb_component_to_linear),
-        )),
-        ColorSpace::A98Rgb => xyz_d65_to_srgb(linear_a98_rgb_to_xyz(source.map(a98_to_linear))),
-        ColorSpace::ProphotoRgb => xyz_d65_to_srgb(adapt_d50_to_d65(linear_prophoto_rgb_to_xyz(
-            source.map(prophoto_to_linear),
-        ))),
-        ColorSpace::Rec2020 => {
-            xyz_d65_to_srgb(linear_rec2020_to_xyz(source.map(rec2020_to_linear)))
+/// CSS CssColor 4 defines the predefined RGB spaces through D50 or D65 XYZ.
+/// Keeping this conversion here makes the PCS boundary explicit where an ICC
+/// engine does not provide a native XYZ identity-profile transform.
+pub(crate) fn color_to_xyz_d50(color: CssColor) -> CssColor {
+    let xyz = if let Some(xyz) = color.xyz_d50_coordinates() {
+        [xyz.x as f64, xyz.y as f64, xyz.z as f64]
+    } else {
+        let (space, coordinates) = color
+            .rgb_coordinates()
+            .expect("a CSS color must contain RGB or D50 XYZ coordinates");
+        let source = [
+            coordinates.red as f64,
+            coordinates.green as f64,
+            coordinates.blue as f64,
+        ];
+        match space {
+            // `srgb_to_xyz_d65` performs the encoded sRGB transfer itself. The
+            // other RGB-space branches call helpers that expect linear input, but
+            // applying the transfer here as well would decode sRGB twice.
+            RgbColorSpace::Srgb => adapt_d65_to_d50(srgb_to_xyz_d65(source)),
+            RgbColorSpace::DisplayP3 => adapt_d65_to_d50(linear_display_p3_to_xyz_linear(
+                source.map(srgb_component_to_linear),
+            )),
+            RgbColorSpace::A98Rgb => {
+                adapt_d65_to_d50(linear_a98_rgb_to_xyz(source.map(a98_to_linear)))
+            }
+            RgbColorSpace::ProphotoRgb => {
+                linear_prophoto_rgb_to_xyz(source.map(prophoto_to_linear))
+            }
+            RgbColorSpace::Rec2020 => {
+                adapt_d65_to_d50(linear_rec2020_to_xyz(source.map(rec2020_to_linear)))
+            }
         }
-        ColorSpace::XyzD50 => xyz_d65_to_srgb(adapt_d50_to_d65(source)),
     };
-    Color::srgb(rgb[0] as f32, rgb[1] as f32, rgb[2] as f32, color.a)
+    CssColor::in_space(
+        CssColorSpace::XyzD50,
+        xyz[0] as f32,
+        xyz[1] as f32,
+        xyz[2] as f32,
+        color.alpha(),
+    )
 }
 
 fn srgb_to_xyz_d65(rgb: Triplet) -> Triplet {
@@ -1055,83 +1467,36 @@ fn srgb_to_xyz_d65(rgb: Triplet) -> Triplet {
     )
 }
 
-fn srgb_to_lch(color: Color) -> Triplet {
-    let color = color_to_srgb(color);
-    let xyz_d65 = srgb_to_xyz_d65([color.r as f64, color.g as f64, color.b as f64]);
-    let [lightness, a, b] = xyz_d50_to_lab(adapt_d65_to_d50(xyz_d65));
+fn color_to_lch(color: CssColor) -> Triplet {
+    let color = color_to_xyz_d50(color);
+    let [lightness, a, b] = xyz_d50_to_lab([
+        color.components()[0] as f64,
+        color.components()[1] as f64,
+        color.components()[2] as f64,
+    ]);
     let chroma = a.hypot(b);
     [lightness, chroma, b.atan2(a).to_degrees().rem_euclid(360.0)]
 }
 
 fn xyz_d50_to_lab(xyz: Triplet) -> Triplet {
-    let [x, y, z] = [xyz[0] / 0.964_22, xyz[1], xyz[2] / 0.825_21];
-    let epsilon = 216.0 / 24_389.0;
-    let kappa = 24_389.0 / 27.0;
-    let xyz_to_f = |value: f64| {
-        if value > epsilon {
-            value.cbrt()
-        } else {
-            (kappa * value + 16.0) / 116.0
-        }
-    };
-    let [fx, fy, fz] = [xyz_to_f(x), xyz_to_f(y), xyz_to_f(z)];
-    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
-}
-
-fn lch_to_srgb(lightness: f64, chroma: f64, hue: f64) -> Triplet {
-    let hue = hue.to_radians();
-    xyz_d65_to_srgb(adapt_d50_to_d65(lab_to_xyz_d50(
-        lightness,
-        chroma * hue.cos(),
-        chroma * hue.sin(),
-    )))
+    let lab = Lab::from_color_unclamped(Xyz::<D50, f64>::new(xyz[0], xyz[1], xyz[2]));
+    [lab.l, lab.a, lab.b]
 }
 
 fn lab_to_xyz_d50(lightness: f64, a: f64, b: f64) -> Triplet {
-    let f1 = (lightness + 16.0) / 116.0;
-    let f0 = a / 500.0 + f1;
-    let f2 = f1 - b / 200.0;
-    let epsilon = 216.0 / 24_389.0;
-    let kappa = 24_389.0 / 27.0;
-    let f_to_xyz = |value: f64| {
-        let cube = value.powi(3);
-        if cube > epsilon {
-            cube
-        } else {
-            (116.0 * value - 16.0) / kappa
-        }
-    };
-    [
-        f_to_xyz(f0) * 0.964_22,
-        f_to_xyz(f1),
-        f_to_xyz(f2) * 0.825_21,
-    ]
+    let xyz: Xyz<D50, f64> = Xyz::from_color_unclamped(Lab::new(lightness, a, b));
+    [xyz.x, xyz.y, xyz.z]
 }
 
-fn oklab_to_srgb(lightness: f64, a: f64, b: f64) -> Triplet {
-    let l = (lightness + 0.396_337_777_376_174_9 * a + 0.215_803_757_309_913_6 * b).powi(3);
-    let m = (lightness - 0.105_561_345_815_658_6 * a - 0.063_854_172_825_813_3 * b).powi(3);
-    let s = (lightness - 0.089_484_177_529_811_9 * a - 1.291_485_548_019_409_2 * b).powi(3);
-    linear_to_srgb(multiply_matrix(
-        [
-            [
-                4.076_741_636_075_958,
-                -3.307_711_539_258_062,
-                0.230_969_903_182_104,
-            ],
-            [
-                -1.268_438_004_092_176_3,
-                2.609_757_401_154,
-                -0.341_319_397_061_877,
-            ],
-            [
-                -0.004_196_086_541_837_188,
-                -0.703_418_614_459_449_3,
-                1.707_614_700_999_286,
-            ],
-        ],
-        [l, m, s],
-    ))
+/// Convert CSS OKLab coordinates to D65 XYZ without gamut mapping.
+///
+/// CSS CssColor 4 defines OKLab relative to D65 XYZ, exactly the semantic model
+/// represented by Palette's `Oklab` and `Xyz<D65>` types. Parsing and hue
+/// grammar remain Quire-owned CSS behavior; Palette owns this standard math.
+/// <https://www.w3.org/TR/css-color-4/#ok-lab>
+fn oklab_to_xyz_d65(lightness: f64, a: f64, b: f64) -> Triplet {
+    let xyz: Xyz<D65, f64> = Xyz::from_color_unclamped(Oklab::new(lightness, a, b));
+    [xyz.x, xyz.y, xyz.z]
 }
 
 fn parse_hue_degrees(value: &str) -> Option<f32> {
@@ -1143,18 +1508,18 @@ fn parse_hue_degrees(value: &str) -> Option<f32> {
         degrees.trim().parse::<f32>().ok()
     } else if let Some(turns) = value.strip_suffix("turn") {
         turns.trim().parse::<f32>().ok().map(|turns| turns * 360.0)
-    } else if let Some(radians) = value.strip_suffix("rad") {
-        radians
-            .trim()
-            .parse::<f32>()
-            .ok()
-            .map(|radians| radians.to_degrees())
     } else if let Some(gradians) = value.strip_suffix("grad") {
         gradians
             .trim()
             .parse::<f32>()
             .ok()
             .map(|gradians| gradians * 0.9)
+    } else if let Some(radians) = value.strip_suffix("rad") {
+        radians
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|radians| radians.to_degrees())
     } else {
         value.parse::<f32>().ok()
     }
@@ -1184,9 +1549,21 @@ fn hsl_to_rgb(hue_degrees: f32, saturation: f32, lightness: f32) -> (u8, u8, u8)
 }
 
 fn hsl_to_rgb_units(hue_degrees: f32, saturation: f32, lightness: f32) -> (f32, f32, f32) {
+    hsl_to_rgb_units_unclamped(
+        hue_degrees,
+        saturation.clamp(0.0, 1.0),
+        lightness.clamp(0.0, 1.0),
+    )
+}
+
+/// Relative HSL uses the CSS Color 5 extended-range reconstruction: its
+/// component expressions are not clamped before the final output conversion.
+fn hsl_to_rgb_units_unclamped(
+    hue_degrees: f32,
+    saturation: f32,
+    lightness: f32,
+) -> (f32, f32, f32) {
     let hue = hue_degrees.rem_euclid(360.0) / 360.0;
-    let saturation = saturation.clamp(0.0, 1.0);
-    let lightness = lightness.clamp(0.0, 1.0);
     if saturation == 0.0 {
         return (lightness, lightness, lightness);
     }
@@ -1203,22 +1580,26 @@ fn hsl_to_rgb_units(hue_degrees: f32, saturation: f32, lightness: f32) -> (f32, 
     )
 }
 
-fn srgb_to_hsl(color: Color) -> (f32, f32, f32) {
-    let color = color_to_srgb(color);
-    let maximum = color.r.max(color.g).max(color.b);
-    let minimum = color.r.min(color.g).min(color.b);
+fn srgb_to_hsl(color: CssColor) -> (f32, f32, f32) {
+    let color = color.to_rgb_space(RgbColorSpace::Srgb);
+    let maximum = color.components()[0]
+        .max(color.components()[1])
+        .max(color.components()[2]);
+    let minimum = color.components()[0]
+        .min(color.components()[1])
+        .min(color.components()[2]);
     let lightness = (maximum + minimum) / 2.0;
     let delta = maximum - minimum;
     if delta == 0.0 {
         return (0.0, 0.0, lightness);
     }
     let saturation = delta / (1.0 - (2.0 * lightness - 1.0).abs());
-    let hue = if maximum == color.r {
-        60.0 * ((color.g - color.b) / delta).rem_euclid(6.0)
-    } else if maximum == color.g {
-        60.0 * ((color.b - color.r) / delta + 2.0)
+    let hue = if maximum == color.components()[0] {
+        60.0 * ((color.components()[1] - color.components()[2]) / delta).rem_euclid(6.0)
+    } else if maximum == color.components()[1] {
+        60.0 * ((color.components()[2] - color.components()[0]) / delta + 2.0)
     } else {
-        60.0 * ((color.r - color.g) / delta + 4.0)
+        60.0 * ((color.components()[0] - color.components()[1]) / delta + 4.0)
     };
     (hue, saturation, lightness)
 }
@@ -1246,6 +1627,9 @@ fn rgb_unit_to_u8(value: f32) -> u8 {
 
 fn parse_alpha_value(value: &str) -> Option<f32> {
     let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Some(0.0);
+    }
     let alpha = if let Some(percent) = value.strip_suffix('%') {
         percent.trim().parse::<f32>().ok()? / 100.0
     } else {
@@ -1259,29 +1643,56 @@ mod color_space_tests {
     use super::*;
 
     #[test]
+    fn modern_hsl_and_hwb_components_accept_numbers_and_none() {
+        assert_eq!(
+            parse_hsl_function("hsl(60deg 50 50)"),
+            parse_hsl_function("hsl(60deg 50% 50%)")
+        );
+        assert_eq!(
+            parse_hwb_function("hwb(60deg 20 30)"),
+            parse_hwb_function("hwb(60deg 20% 30%)")
+        );
+        assert_eq!(
+            parse_hsl_function("hsl(60deg none 50%)"),
+            parse_hsl_function("hsl(60deg 0% 50%)")
+        );
+        assert_eq!(
+            parse_hwb_function("hwb(60deg none none)"),
+            parse_hwb_function("hwb(60deg 0% 0%)")
+        );
+        assert!(parse_hsl_function("hsl(60deg, 50, 50)").is_none());
+    }
+
+    #[test]
     fn predefined_rgb_spaces_retain_coordinates_until_output() {
         let cases = [
-            ("color(srgb 1.2 -0.1 0.3)", ColorSpace::Srgb),
-            ("color(display-p3 1.2 -0.1 0.3)", ColorSpace::DisplayP3),
-            ("color(a98-rgb 1.1 0.2 0.3)", ColorSpace::A98Rgb),
-            ("color(prophoto-rgb 1.3 0.2 0.3)", ColorSpace::ProphotoRgb),
-            ("color(rec2020 1.1 0.2 0.3)", ColorSpace::Rec2020),
+            ("color(srgb 1.2 -0.1 0.3)", CssColorSpace::Srgb),
+            ("color(display-p3 1.2 -0.1 0.3)", CssColorSpace::DisplayP3),
+            ("color(a98-rgb 1.1 0.2 0.3)", CssColorSpace::A98Rgb),
+            (
+                "color(prophoto-rgb 1.3 0.2 0.3)",
+                CssColorSpace::ProphotoRgb,
+            ),
+            ("color(rec2020 1.1 0.2 0.3)", CssColorSpace::Rec2020),
         ];
         for (input, expected_space) in cases {
             let color = parse_color(input).unwrap();
             assert_eq!(color.space(), expected_space, "{input}");
-            assert!(color.r > 1.0 || color.g < 0.0, "{input}");
+            assert!(
+                color.components()[0] > 1.0 || color.components()[1] < 0.0,
+                "{input}"
+            );
         }
     }
 
     #[test]
     fn xyz_d65_is_adapted_to_retained_d50_pcs() {
-        // CSS Color 4's D65 reference white adapted to D50.
+        // CSS CssColor 4's D65 reference white adapted to D50.
         let color = parse_color("color(xyz-d65 .950455927 1 1.089057751)").unwrap();
-        assert_eq!(color.space(), ColorSpace::XyzD50);
-        assert!((color.r - 0.96422).abs() < 0.0001);
-        assert!((color.g - 1.0).abs() < 0.0001);
-        assert!((color.b - 0.82510).abs() < 0.0001);
+        assert_eq!(color.space(), CssColorSpace::XyzD50);
+        assert!((color.components()[0] - 0.96422).abs() < 0.0001);
+        assert!((color.components()[1] - 1.0).abs() < 0.0001);
+        assert!((color.components()[2] - 0.82510).abs() < 0.0001);
     }
 
     #[test]
@@ -1293,8 +1704,232 @@ mod color_space_tests {
             "oklch(0.7 0.4 35)",
         ] {
             let color = parse_color(input).unwrap();
-            assert_eq!(color.space(), ColorSpace::XyzD50, "{input}");
-            assert!(color.a == 1.0);
+            assert_eq!(color.space(), CssColorSpace::XyzD50, "{input}");
+            assert!(color.alpha() == 1.0);
         }
+    }
+
+    #[test]
+    fn polar_lightness_endpoints_are_neutral_after_clamping() {
+        assert_eq!(parse_color("lch(100% 110 60)"), Some(CssColor::WHITE));
+        assert_eq!(parse_color("lch(-10% 110 60)"), Some(CssColor::BLACK));
+        assert_eq!(parse_color("oklch(100% 1.1 60)"), Some(CssColor::WHITE));
+        assert_eq!(parse_color("oklch(-0.1 1.1 60)"), Some(CssColor::BLACK));
+    }
+
+    #[test]
+    fn palette_oklab_conversion_matches_the_css_green_reference() {
+        let color = parse_color("oklab(51.975% -0.1403 0.10768)").unwrap();
+        let srgb = color_to_predefined_rgb(color, CssColorSpace::Srgb).unwrap();
+        assert!(srgb.components()[0].abs() < 0.003, "{srgb:?}");
+        assert!(
+            (srgb.components()[1] - 0.501_960_8).abs() < 0.003,
+            "{srgb:?}"
+        );
+        assert!(srgb.components()[2].abs() < 0.003, "{srgb:?}");
+    }
+
+    #[test]
+    fn lab_reference_green_converts_to_equivalent_display_p3() {
+        let color = parse_color("lab(46.2775% -47.5621 48.5837)").unwrap();
+        let srgb = color_to_predefined_rgb(color, CssColorSpace::Srgb).unwrap();
+        let display_p3 = color_to_predefined_rgb(color, CssColorSpace::DisplayP3).unwrap();
+        assert!(srgb.components()[0].abs() < 0.003, "{srgb:?}");
+        assert!(
+            (srgb.components()[1] - 0.501_960_8).abs() < 0.003,
+            "{srgb:?}"
+        );
+        assert!(srgb.components()[2].abs() < 0.003, "{srgb:?}");
+        let round_trip = color_to_predefined_rgb(display_p3, CssColorSpace::Srgb).unwrap();
+        assert!(
+            round_trip.components()[0].abs() < 0.003,
+            "{display_p3:?} -> {round_trip:?}"
+        );
+        assert!(
+            (round_trip.components()[1] - 0.501_960_8).abs() < 0.003,
+            "{display_p3:?} -> {round_trip:?}"
+        );
+        assert!(
+            round_trip.components()[2].abs() < 0.003,
+            "{display_p3:?} -> {round_trip:?}"
+        );
+    }
+
+    #[test]
+    fn relative_lch_resolves_origin_components_before_math() {
+        let relative = parse_color("lch(from blue calc(0.5 * l) c h)").unwrap();
+        let reference = parse_color("lch(14.7841 131.201 301.364)").unwrap();
+        assert_eq!(relative.space(), CssColorSpace::XyzD50);
+        assert!((relative.components()[0] - reference.components()[0]).abs() < 0.0001);
+        assert!((relative.components()[1] - reference.components()[1]).abs() < 0.0001);
+        assert!((relative.components()[2] - reference.components()[2]).abs() < 0.0001);
+    }
+
+    #[test]
+    fn relative_colors_keep_unbounded_target_space_components() {
+        let display_p3_green = CssColor::rgb(RgbColorSpace::DisplayP3, 0.0, 1.0, 0.0, 1.0);
+        let relative =
+            parse_color_from_currentcolor("rgb(from currentcolor r g b)", display_p3_green)
+                .expect("relative RGB should resolve");
+        assert_eq!(relative.space(), CssColorSpace::Srgb);
+        assert!(
+            relative.components()[0] < 0.0
+                || relative.components()[1] > 1.0
+                || relative.components()[2] < 0.0,
+            "relative RGB must not clip its target-space components: {relative:?}"
+        );
+
+        let relative_hsl =
+            parse_color_from_currentcolor("hsl(from currentcolor h s l)", display_p3_green)
+                .expect("relative HSL should resolve");
+        assert!(
+            relative_hsl
+                .components()
+                .iter()
+                .any(|component| !(0.0..=1.0).contains(component)),
+            "relative HSL must use the unclamped reconstruction path: {relative_hsl:?}"
+        );
+    }
+
+    #[test]
+    fn lch_color_mix_retains_pcs_until_output_encoding() {
+        let mixed = parse_color("color-mix(in lch longer hue, color(display-p3 0 1 0), blue)")
+            .expect("LCH color mix should parse");
+        assert_eq!(mixed.space(), CssColorSpace::XyzD50);
+        assert!(mixed.xyz_d50_coordinates().is_some());
+    }
+
+    #[test]
+    fn color_mix_hsl_longer_hue_matches_gradient_midpoint() {
+        let mix = parse_color("color-mix(in hsl longer hue, red, blue)").unwrap();
+        assert!(
+            mix.components()[0] < 0.001,
+            "red component: {}",
+            mix.components()[0]
+        );
+        assert!(
+            mix.components()[1] > 0.999,
+            "green component: {}",
+            mix.components()[1]
+        );
+        assert!(
+            mix.components()[2] < 0.001,
+            "blue component: {}",
+            mix.components()[2]
+        );
+    }
+
+    #[test]
+    fn color_mix_accepts_every_gradient_interpolation_space() {
+        for method in [
+            "srgb",
+            "srgb-linear",
+            "display-p3",
+            "display-p3-linear",
+            "a98-rgb",
+            "prophoto-rgb",
+            "rec2020",
+            "xyz-d50",
+            "xyz-d65",
+            "lab",
+            "oklab",
+            "hsl longer hue",
+            "hwb increasing hue",
+            "lch decreasing hue",
+            "oklch shorter hue",
+        ] {
+            let value = format!("color-mix(in {method}, red, blue)");
+            assert!(parse_color(&value).is_some(), "{value}");
+        }
+        for value in [
+            "color-mix(in srgb longer hue, red, blue)",
+            "color-mix(in hsl hue, red, blue)",
+            "color-mix(in hsl sideways hue, red, blue)",
+        ] {
+            assert!(parse_color(value).is_none(), "{value}");
+        }
+    }
+
+    #[test]
+    fn color_mix_normalizes_ordered_lists_and_alpha() {
+        let ordered = parse_color("color-mix(in hsl longer hue, red, blue, red)").unwrap();
+        let reversed = parse_color("color-mix(in hsl longer hue, blue, red, blue)").unwrap();
+        assert_ne!(ordered, reversed);
+
+        let underspecified = parse_color("color-mix(in srgb, red 20%, blue 60%)").unwrap();
+        assert!((underspecified.alpha() - 0.8).abs() < 0.0001);
+        let lch = parse_color("color-mix(in lch, purple, plum)").unwrap();
+        assert_eq!(lch.space(), CssColorSpace::XyzD50);
+        let lch = color_to_predefined_rgb(lch, CssColorSpace::Srgb).unwrap();
+        let expected_lch = CssColor::srgb(0.684_898, 0.360_15, 0.683_102, 1.0);
+        assert!(
+            (lch.components()[0] - expected_lch.components()[0]).abs() < 0.001,
+            "actual={lch:?} expected={expected_lch:?}"
+        );
+        assert!(
+            (lch.components()[1] - expected_lch.components()[1]).abs() < 0.001,
+            "{lch:?}"
+        );
+        assert!(
+            (lch.components()[2] - expected_lch.components()[2]).abs() < 0.001,
+            "{lch:?}"
+        );
+        assert_eq!(
+            parse_color("color-mix(in srgb, red 0%, blue 0%)"),
+            Some(CssColor::TRANSPARENT)
+        );
+        for value in [
+            "color-mix(in srgb, red -1%, blue)",
+            "color-mix(in srgb, red 101%, blue)",
+            "color-mix(in srgb, red 90%, blue 90%, green)",
+        ] {
+            assert!(parse_color(value).is_none(), "{value}");
+        }
+    }
+
+    #[test]
+    fn color_mix_resolves_currentcolor_and_analogous_missing_components() {
+        let current = CssColor::new(0, 255, 0);
+        let mixed =
+            parse_color_mix("color-mix(in hsl longer hue, currentcolor, blue)", current).unwrap();
+        assert!(
+            mixed.components()[0] > 0.9
+                && mixed.components()[1] < 0.1
+                && mixed.components()[2] < 0.1,
+            "{mixed:?}"
+        );
+
+        let missing = parse_color("color-mix(in srgb, rgb(none 255 none), yellow)").unwrap();
+        assert!((missing.components()[0] - 1.0).abs() < 0.0001);
+        assert!((missing.components()[1] - 1.0).abs() < 0.0001);
+        assert!(missing.components()[2] < 0.0001);
+    }
+
+    #[test]
+    fn color_functions_use_decoded_token_names_and_component_boundaries() {
+        assert_eq!(
+            parse_color("\\72 gb(255 /* red */ 0 0 / 50%)"),
+            Some(CssColor::rgba(255, 0, 0, 0.5))
+        );
+        assert_eq!(parse_color("\\74 ransparent"), Some(CssColor::TRANSPARENT));
+        assert!(parse_color("rgb(1 2 3 / calc(1 / 2))").is_none());
+        assert_eq!(
+            parse_color_from_currentcolor(
+                "light-dark(rgb(1, 2, 3), rgb(4, 5, 6))",
+                CssColor::BLACK,
+            ),
+            Some(CssColor::rgba(1, 2, 3, 1.0))
+        );
+    }
+
+    #[test]
+    fn hue_angle_units_do_not_confuse_grad_with_rad() {
+        // `grad` has `rad` as a suffix, so it must be tested before radians.
+        // CSS Values defines 400grad as a complete turn:
+        // <https://www.w3.org/TR/css-values-4/#angles>
+        let grad = parse_hue_degrees("133.33333333grad").unwrap();
+        let rad = parse_hue_degrees("2.0943951024rad").unwrap();
+        assert!((grad - 120.0).abs() < 0.0001, "{grad}");
+        assert!((rad - 120.0).abs() < 0.0001, "{rad}");
     }
 }

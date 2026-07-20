@@ -1,5 +1,5 @@
 use super::*;
-use crate::css::parse_background_image;
+use crate::css::{ParsedImage, parse_css_image};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum BorderSide {
@@ -262,7 +262,10 @@ pub(crate) fn parse_logical_border_styles(value: &str) -> Option<[BorderStyle; 2
 /// CSS Logical Properties defines `border-block-color` and
 /// `border-inline-color` as two-value shorthands for start/end colors:
 /// <https://www.w3.org/TR/css-logical-1/#border-shorthands>.
-pub(crate) fn parse_logical_border_colors(value: &str, current_color: Color) -> Option<[Color; 2]> {
+pub(crate) fn parse_logical_border_colors(
+    value: &str,
+    current_color: CssColor,
+) -> Option<[CssColor; 2]> {
     let values = split_css_component_values(value)
         .into_iter()
         .map(|part| parse_border_color(part, current_color))
@@ -293,11 +296,11 @@ pub(crate) fn parse_border_style(value: &str) -> Option<BorderStyle> {
 /// Parses one border color component, including `currentColor`.
 ///
 /// CSS Backgrounds and Borders defines the initial border color as
-/// `currentColor`, and CSS Color defines the keyword as the element's computed
+/// `currentColor`, and CSS CssColor defines the keyword as the element's computed
 /// `color` value:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-color> and
 /// <https://www.w3.org/TR/css-color-4/#currentcolor-color>.
-pub(crate) fn parse_border_color(value: &str, current_color: Color) -> Option<Color> {
+pub(crate) fn parse_border_color(value: &str, current_color: CssColor) -> Option<CssColor> {
     if trim_css_value(value).eq_ignore_ascii_case("currentcolor") {
         Some(current_color)
     } else {
@@ -311,7 +314,7 @@ pub(crate) fn parse_border_color(value: &str, current_color: Color) -> Option<Co
 /// one-to-four-value box-edge shorthand for the physical border color
 /// longhands:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-color>.
-pub(crate) fn parse_border_colors(value: &str, current_color: Color) -> Option<BorderColors> {
+pub(crate) fn parse_border_colors(value: &str, current_color: CssColor) -> Option<BorderColors> {
     let colors = split_css_component_values(value)
         .into_iter()
         .map(|part| parse_border_color(part, current_color))
@@ -380,12 +383,15 @@ pub(crate) fn parse_border_styles(value: &str) -> Option<BorderStyles> {
 /// CSS Backgrounds and Borders defines the initial value as `none` and accepts
 /// image values:
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-image-source>.
-pub(crate) fn parse_border_image_source(value: &str) -> Option<Option<BackgroundImage>> {
+pub(crate) fn parse_border_image_source(value: &str) -> Option<ComputedImage> {
     let value = trim_css_value(value);
     if value.eq_ignore_ascii_case("none") {
-        Some(None)
+        Some(ComputedImage::None)
     } else {
-        parse_background_image(value, None, None).map(Some)
+        match parse_css_image(value, None, None) {
+            ParsedImage::Image(image) => Some(image),
+            ParsedImage::NotAnImage | ParsedImage::SyntaxError => None,
+        }
     }
 }
 
@@ -703,76 +709,11 @@ pub(in crate::css) fn parse_non_negative_number(value: &str) -> Option<f32> {
 /// shorthand component:
 /// <https://www.w3.org/TR/css-syntax-3/#component-value>.
 pub(crate) fn split_css_component_values(value: &str) -> Vec<&str> {
-    let value = trim_css_value(value);
-    let mut parts = Vec::new();
-    let mut start = None;
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in value.char_indices() {
-        if start.is_none() && !ch.is_whitespace() {
-            start = Some(index);
-        }
-        if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '"' | '\'' => quote = Some(ch),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            _ if ch.is_whitespace() && depth == 0 => {
-                if let Some(component_start) = start.take() {
-                    parts.push(value[component_start..index].trim());
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Some(component_start) = start {
-        parts.push(value[component_start..].trim());
-    }
-    parts.retain(|part| !part.is_empty());
-    parts
+    crate::css::component_values::split_css_component_values(trim_css_value(value))
 }
 
 pub(in crate::css) fn split_css_top_level_slashes(value: &str) -> Vec<&str> {
-    let value = trim_css_value(value);
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in value.char_indices() {
-        if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '"' | '\'' => quote = Some(ch),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            '/' if depth == 0 => {
-                parts.push(value[start..index].trim());
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(value[start..].trim());
-    parts
+    crate::css::component_values::split_css_top_level_delimiter(trim_css_value(value), '/')
 }
 
 /// Parse `border-radius` using the CSS Backgrounds and Borders shorthand grammar.
@@ -783,9 +724,12 @@ pub(in crate::css) fn split_css_top_level_slashes(value: &str) -> Vec<&str> {
 /// resolve against border-box height.
 pub(crate) fn parse_border_radius(value: &str, font_size: f32) -> Option<BorderRadius> {
     let value = trim_css_value(value);
-    let mut groups = value.splitn(2, '/');
-    let horizontal = parse_radius_components(groups.next()?.trim(), font_size)?;
-    let vertical = if let Some(group) = groups.next() {
+    let (horizontal_value, vertical_value) =
+        crate::css::component_values::split_css_top_level_once(value, '/')
+            .map(|(horizontal, vertical)| (horizontal, Some(vertical)))
+            .unwrap_or((value, None));
+    let horizontal = parse_radius_components(horizontal_value.trim(), font_size)?;
+    let vertical = if let Some(group) = vertical_value {
         parse_radius_components(group.trim(), font_size)?
     } else {
         horizontal.clone()

@@ -68,6 +68,14 @@ pub(in crate::css) fn supports_display_value(value: &str) -> bool {
 }
 
 pub(in crate::css) fn supported_property_name(name: &str) -> bool {
+    crate::css::cascade::is_modeled_property_name(name)
+}
+
+#[allow(
+    dead_code,
+    reason = "property identity is sourced from the cascade model"
+)]
+fn legacy_supported_property_name(name: &str) -> bool {
     matches!(
         name,
         "direction"
@@ -148,6 +156,16 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "margin-inline"
             | "margin-inline-start"
             | "margin-inline-end"
+            | "margin"
+            | "margin-top"
+            | "margin-right"
+            | "margin-bottom"
+            | "margin-left"
+            | "padding"
+            | "padding-top"
+            | "padding-right"
+            | "padding-bottom"
+            | "padding-left"
             | "padding-block"
             | "padding-block-start"
             | "padding-block-end"
@@ -159,6 +177,20 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "border-right"
             | "border-bottom"
             | "border-left"
+            | "border-radius"
+            | "border-shape"
+            | "border-top-radius"
+            | "border-right-radius"
+            | "border-bottom-radius"
+            | "border-left-radius"
+            | "border-block-start-radius"
+            | "border-block-end-radius"
+            | "border-inline-start-radius"
+            | "border-inline-end-radius"
+            | "border-top-left-radius"
+            | "border-top-right-radius"
+            | "border-bottom-right-radius"
+            | "border-bottom-left-radius"
             | "border-block"
             | "border-block-start"
             | "border-block-end"
@@ -211,6 +243,9 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "border-spacing"
             | "background"
             | "color"
+            | "fill"
+            | "stroke"
+            | "stroke-width"
             | "background-color"
             | "border-color"
             | "border-top-color"
@@ -246,6 +281,8 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "text-align-last"
             | "text-justify"
             | "text-autospace"
+            | "text-spacing-trim"
+            | "text-spacing"
             | "word-space-transform"
             | "initial-letter"
             | "initial-letter-align"
@@ -265,6 +302,7 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "font-family"
             | "font"
             | "font-feature-settings"
+            | "font-variation-settings"
             | "font-palette"
             | "font-synthesis"
             | "font-synthesis-weight"
@@ -325,6 +363,7 @@ pub(in crate::css) fn supported_property_name(name: &str) -> bool {
             | "text-shadow"
             | "box-shadow"
             | "white-space"
+            | "wrap-inside"
             | "word-break"
             | "overflow"
             | "overflow-x"
@@ -430,6 +469,52 @@ pub(in crate::css) fn supports_word_space_transform_value(value: &str) -> bool {
         }
     }
     replacement || auto_phrase
+}
+
+/// Return whether a `text-spacing-trim` declaration uses the CSS Text Level 4
+/// keyword grammar.
+///
+/// `auto` is retained as a distinct computed value so that the UA resolution
+/// policy is applied in layout, rather than accidentally accepting an
+/// unsupported declaration during `@supports` parsing:
+/// <https://drafts.csswg.org/css-text-4/#text-spacing-trim-property>.
+pub(in crate::css) fn supports_text_spacing_trim_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "space-all" | "normal" | "space-first" | "trim-start" | "trim-both" | "trim-all" | "auto"
+    )
+}
+
+/// Return whether a `text-spacing` shorthand declaration can set both of its
+/// longhands.  The shorthand grammar is an unordered combination of one
+/// `text-spacing-trim` keyword and one `text-autospace` value:
+/// <https://drafts.csswg.org/css-text-4/#text-spacing-property>.
+pub(in crate::css) fn supports_text_spacing_value(value: &str) -> bool {
+    let tokens = split_css_component_values(value);
+    if tokens.is_empty() {
+        return false;
+    }
+    if tokens.len() == 1 {
+        return matches!(
+            tokens[0].to_ascii_lowercase().as_str(),
+            "none" | "normal" | "auto"
+        ) || supports_text_spacing_trim_value(tokens[0])
+            || supports_text_autospace_value(tokens[0]);
+    }
+
+    let mut trim = false;
+    let mut autospace = Vec::new();
+    for token in tokens {
+        if supports_text_spacing_trim_value(token) {
+            if trim {
+                return false;
+            }
+            trim = true;
+        } else {
+            autospace.push(token);
+        }
+    }
+    !autospace.is_empty() && supports_text_autospace_value(&autospace.join(" "))
 }
 
 pub(in crate::css) fn supports_text_decoration_line_value(value: &str) -> bool {
@@ -564,45 +649,67 @@ pub(in crate::css) fn supports_text_decoration_value(value: &str) -> bool {
     if parts.is_empty() {
         return false;
     }
-    let mut saw_line = false;
+    let mut underline = false;
+    let mut overline = false;
+    let mut line_through = false;
+    let mut blink = false;
+    let mut spelling_error = false;
+    let mut grammar_error = false;
     let mut saw_style = false;
     let mut saw_color = false;
     let mut saw_thickness = false;
     for part in &parts {
-        if supports_text_decoration_line_value(part) {
-            if part.eq_ignore_ascii_case("none") && parts.len() > 1 {
-                return false;
+        match part.to_ascii_lowercase().as_str() {
+            "none" if parts.len() == 1 => return true,
+            "underline" if !underline => {
+                underline = true;
+                continue;
             }
-            if saw_line {
-                return false;
+            "overline" if !overline => {
+                overline = true;
+                continue;
             }
-            saw_line = true;
-            continue;
+            "line-through" if !line_through => {
+                line_through = true;
+                continue;
+            }
+            "blink" if !blink => {
+                blink = true;
+                continue;
+            }
+            "spelling-error" if !spelling_error => {
+                spelling_error = true;
+                continue;
+            }
+            "grammar-error" if !grammar_error => {
+                grammar_error = true;
+                continue;
+            }
+            _ => {}
         }
-        if supports_text_decoration_style_value(part) {
-            if saw_style {
-                return false;
-            }
+        if supports_text_decoration_style_value(part) && !saw_style {
             saw_style = true;
             continue;
         }
-        if supports_text_decoration_thickness_value(part) {
-            if saw_thickness {
-                return false;
-            }
+        if supports_text_decoration_thickness_value(part) && !saw_thickness {
             saw_thickness = true;
             continue;
         }
-        if parse_color(part).is_some() {
-            if saw_color {
-                return false;
-            }
+        if parse_color(part).is_some() && !saw_color {
             saw_color = true;
             continue;
         }
         return false;
     }
-    saw_line || saw_style || saw_color || saw_thickness
+    underline
+        || overline
+        || line_through
+        || blink
+        || spelling_error
+        || grammar_error
+        || saw_style
+        || saw_color
+        || saw_thickness
 }
 
 pub(in crate::css) fn supports_text_emphasis_style_value(value: &str) -> bool {
@@ -856,66 +963,11 @@ pub(in crate::css) fn strip_ascii_word_prefix<'a>(value: &'a str, word: &str) ->
 }
 
 pub(in crate::css) fn split_top_level_keyword<'a>(value: &'a str, keyword: &str) -> Vec<&'a str> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let bytes = value.as_bytes();
-    let keyword_bytes = keyword.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            _ if depth == 0
-                && ascii_keyword_at(bytes, index, keyword_bytes)
-                && word_boundary_before(bytes, index)
-                && word_boundary_after(bytes, index + keyword_bytes.len()) =>
-            {
-                parts.push(value[start..index].trim());
-                start = index + keyword_bytes.len();
-                index = start;
-                continue;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    parts.push(value[start..].trim());
-    parts
+    crate::css::component_values::split_css_top_level_keyword(value, keyword)
 }
 
 pub(in crate::css) fn split_top_level_delimiter(value: &str, delimiter: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let delimiter = delimiter as u8;
-    let bytes = value.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        match byte {
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 && *byte == delimiter => {
-                parts.push(value[start..index].trim());
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(value[start..].trim());
-    parts
-}
-
-pub(in crate::css) fn ascii_keyword_at(bytes: &[u8], index: usize, keyword: &[u8]) -> bool {
-    bytes
-        .get(index..index + keyword.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
-}
-
-pub(in crate::css) fn word_boundary_before(bytes: &[u8], index: usize) -> bool {
-    index == 0
-        || bytes
-            .get(index - 1)
-            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-' && *byte != b'_')
+    crate::css::component_values::split_css_top_level_delimiter(value, delimiter)
 }
 
 pub(in crate::css) fn word_boundary_after(bytes: &[u8], index: usize) -> bool {

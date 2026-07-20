@@ -70,7 +70,7 @@ impl CounterPlanBuilder {
     fn visit(&mut self, event: &box_tree::CounterEventNode<'_>) {
         let origin = CounterOriginKey::new(event.element, event.source);
         let mut temporary_counters = Vec::new();
-        for (declaration_index, reset) in event.style.counter_resets.iter().enumerate() {
+        for (declaration_index, reset) in event.counter_style.counter_resets.iter().enumerate() {
             let accumulator_id = self.accumulators.len();
             self.accumulators.push(ReversedAccumulator {
                 key: matches!(reset.kind, CounterResetKind::Reversed(None)).then_some(
@@ -92,14 +92,14 @@ impl CounterPlanBuilder {
         }
 
         let mut increments = Vec::<(String, CounterValue)>::new();
-        for change in &event.style.counter_increments {
+        for change in &event.counter_style.counter_increments {
             if let Some((_, value)) = increments.iter_mut().find(|(name, _)| name == &change.name) {
                 *value = value.add(change.value);
             } else {
                 increments.push((change.name.clone(), change.value));
             }
         }
-        if event.style.display.is_list_item()
+        if event.counter_style.is_list_item
             && !increments
                 .iter()
                 .any(|(name, _)| name == LIST_ITEM_COUNTER_NAME)
@@ -119,7 +119,7 @@ impl CounterPlanBuilder {
             .iter()
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
-        for change in &event.style.counter_sets {
+        for change in &event.counter_style.counter_sets {
             if !observed_names.contains(&change.name) {
                 observed_names.push(change.name.clone());
             }
@@ -130,7 +130,7 @@ impl CounterPlanBuilder {
                 .find(|(candidate, _)| candidate == &name)
                 .map_or(CounterValue::ZERO, |(_, value)| *value);
             let set = event
-                .style
+                .counter_style
                 .counter_sets
                 .iter()
                 .find(|change| change.name == name)
@@ -139,7 +139,7 @@ impl CounterPlanBuilder {
             self.observe(instance.id, increment, set);
         }
 
-        self.push_frame(event.style.contain.style);
+        self.push_frame(event.counter_style.style_containment);
         self.visit_siblings(&event.children);
         self.pop_frame();
         for name in temporary_counters.into_iter().rev() {
@@ -319,7 +319,7 @@ impl<'a> CounterSnapshotPlanner<'a> {
     fn visit(&mut self, event: &box_tree::CounterEventNode<'_>) {
         let origin = CounterOriginKey::new(event.element, event.source);
         let mut temporary_counters = Vec::new();
-        for (declaration_index, reset) in event.style.counter_resets.iter().enumerate() {
+        for (declaration_index, reset) in event.counter_style.counter_resets.iter().enumerate() {
             let value = reset.kind.explicit_value().unwrap_or_else(|| {
                 self.reversed_initial_values
                     .get(&CounterResetKey {
@@ -335,14 +335,14 @@ impl<'a> CounterSnapshotPlanner<'a> {
         }
 
         let mut increments = Vec::<(String, CounterValue)>::new();
-        for change in &event.style.counter_increments {
+        for change in &event.counter_style.counter_increments {
             if let Some((_, value)) = increments.iter_mut().find(|(name, _)| name == &change.name) {
                 *value = value.add(change.value);
             } else {
                 increments.push((change.name.clone(), change.value));
             }
         }
-        if event.style.display.is_list_item()
+        if event.counter_style.is_list_item
             && !increments
                 .iter()
                 .any(|(name, _)| name == LIST_ITEM_COUNTER_NAME)
@@ -360,12 +360,13 @@ impl<'a> CounterSnapshotPlanner<'a> {
         for (name, amount) in increments {
             self.counters.increment_counter(&name, amount);
         }
-        for change in &event.style.counter_sets {
+        for change in &event.counter_style.counter_sets {
             self.counters.set_counter(&change.name, change.value);
         }
 
         self.values_at_origin.insert(origin, self.counters.stacks());
-        self.counters.push_frame(event.style.contain.style);
+        self.counters
+            .push_frame(event.counter_style.style_containment);
         self.visit_siblings(&event.children);
         self.counters.pop_frame();
         for name in temporary_counters.into_iter().rev() {
@@ -439,6 +440,7 @@ impl CounterSet {
         self.values
             .get(name)
             .and_then(|values| values.last())
+            .filter(|instance| instance.creator_scope >= self.counter_mutation_floor())
             .is_some_and(|instance| instance.reversed)
     }
 
@@ -609,6 +611,52 @@ impl CounterSet {
 }
 
 impl<'a> LayoutBuilder<'a> {
+    /// Emits `string-set` assignments from a `display: none` source boundary.
+    ///
+    /// GCPM assigns these strings where the source content box would have
+    /// been created. The source has no generated box, counter effects, page
+    /// break, or paint; its zero-size marker is therefore the active layout
+    /// cursor supplied by the adjacent visible source boundary.
+    /// <https://www.w3.org/TR/css-gcpm-3/#setting-named-strings>
+    pub(in crate::layout) fn capture_suppressed_named_strings_before(
+        &mut self,
+        element: ElementId,
+    ) {
+        let events = self
+            .suppressed_named_strings_before
+            .remove(&element)
+            .unwrap_or_default();
+        self.capture_suppressed_named_string_events(events);
+    }
+
+    pub(in crate::layout) fn capture_suppressed_named_strings_after(&mut self, element: ElementId) {
+        let events = self
+            .suppressed_named_strings_after
+            .remove(&element)
+            .unwrap_or_default();
+        self.capture_suppressed_named_string_events(events);
+    }
+
+    fn capture_suppressed_named_string_events(
+        &mut self,
+        events: Vec<box_tree::SuppressedNamedStringEvent>,
+    ) {
+        for event in events {
+            let ids = self.capture_named_strings(&event.element, &event.style);
+            let placement = AssignmentPlacement {
+                page_index: self.pages.len(),
+                starts_page_fragment: !self.current_page_has_content(),
+                border_box: Some(PaintClip::from_paint_rect(paint_space_rect(
+                    self.content_left,
+                    self.cursor_y,
+                    0.0,
+                    0.0,
+                ))),
+            };
+            self.update_named_assignment_placements(&ids, placement);
+        }
+    }
+
     pub(super) fn prepare_counter_plan(&mut self, events: &[box_tree::CounterEventNode<'_>]) {
         self.counter_plan = CounterPlanBuilder::build(events);
         log::trace!(
@@ -763,7 +811,7 @@ impl<'a> LayoutBuilder<'a> {
             .unwrap_or_else(|| self.counter_set.stacks())
     }
 
-    pub(super) fn evaluate_generated_pseudo_text_rollback(
+    pub(in crate::layout) fn evaluate_generated_pseudo_text_rollback(
         &mut self,
         element: &Element,
         source: box_tree::CounterEventSource,
@@ -853,6 +901,16 @@ impl<'a> LayoutBuilder<'a> {
                     name,
                     style: counter_style,
                 } => {
+                    if name.eq_ignore_ascii_case("page") || name.eq_ignore_ascii_case("pages") {
+                        output.push(
+                            page_generated::PageMarginContentItem::NamedStringPageCounter {
+                                name: name.clone(),
+                                separator: None,
+                                style: counter_style.clone(),
+                            },
+                        );
+                        continue;
+                    }
                     let value = counter_stacks
                         .get(name)
                         .and_then(|values| values.last().cloned())
@@ -870,6 +928,16 @@ impl<'a> LayoutBuilder<'a> {
                     separator,
                     style: counter_style,
                 } => {
+                    if name.eq_ignore_ascii_case("page") || name.eq_ignore_ascii_case("pages") {
+                        output.push(
+                            page_generated::PageMarginContentItem::NamedStringPageCounter {
+                                name: name.clone(),
+                                separator: Some(separator.clone()),
+                                style: counter_style.clone(),
+                            },
+                        );
+                        continue;
+                    }
                     let style = counter_style.clone().unwrap_or(ListStyleType::Decimal);
                     let counters = counter_stacks
                         .get(name)
@@ -1282,12 +1350,12 @@ fn push_captured_assignment_values(
     output: &mut Vec<CapturedPageAssignment>,
     assignments: &HashMap<String, Vec<NamedStringAssignment>>,
 ) {
-    for (name, values) in assignments {
-        output.extend(values.iter().map(|assignment| CapturedPageAssignment {
+    output.extend(assignments.iter().flat_map(|(name, values)| {
+        values.iter().map(move |assignment| CapturedPageAssignment {
             name: name.clone(),
             value: assignment.value.clone(),
-        }));
-    }
+        })
+    }));
 }
 
 fn update_assignment_placements_for_maps(
@@ -1395,11 +1463,13 @@ fn push_named_string_items(
 }
 
 fn image_with_context_urls(
-    mut image: css::BackgroundImage,
+    mut image: css::ComputedImage,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
-) -> css::BackgroundImage {
-    let mut selected = &mut image;
+) -> css::ComputedImage {
+    let Some(mut selected) = image.as_image_mut() else {
+        return image;
+    };
     while let css::BackgroundImage::ImageSet { image, .. } = selected {
         selected = image;
     }
@@ -1435,12 +1505,12 @@ fn running_element_content_parts(
         && let Some(url) = element.attrs.get("src").filter(|value| !value.is_empty())
     {
         return vec![GeneratedContentPart::Image {
-            image: css::BackgroundImage::Url {
+            image: css::ComputedImage::image(css::BackgroundImage::Url {
                 src: url.clone(),
                 base_url: base_url.cloned(),
                 root_url: root_url.cloned(),
                 request_modifiers: css::RequestUrlModifiers::default(),
-            },
+            }),
         }];
     }
     if fallback_text.is_empty() {

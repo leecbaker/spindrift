@@ -49,6 +49,12 @@ Note that we aim to be much more spec compliant and performant than weasyprint. 
 
 When fixing a WPT test, or any other individual case, make sure that the fix is the best architectural fix, and fixes the root cause. We want to keep the approach and architecture as pure as possible in a way that makes future changes as easy as possible, and structured to best manage the complexity of rendering HTML.
 
+Tests can be found at `~/projects/quire-wpt/third_party/wpt`.
+
+The latest results for each web platform test are in `~/projects/quire-wpt/results/engine-cache/`. Use those to figure out pass rate for a group or to find tests to work on.
+
+Use `quire-wpt evaluate-test <path>` to render and evaluate one WPT test by its exact path across every configured engine, producing the normal PDFs, raster artifacts, diffs, and report. It is exact selection rather than a prefix filter; add --include-scripts only when evaluating a script-driven test.
+
 ## Tests
 
 For all tests, the files needed to run it need to be local in the repository. Don't refer on http resources, or on files outside the repo. Don't hardcode local paths.
@@ -95,3 +101,114 @@ enum PercentageBasis<T, Source = ()> {
     Definite { value: T, source: Source },
     Indefinite,
 }
+```
+
+### Semantic types
+
+Use types to make invalid layout calculations difficult or impossible. A value’s type should tell the reader:
+
+- What coordinate system it uses.
+- Whether it is a position, signed displacement, or non-negative extent.
+- Which box-model space it belongs to.
+- Whether it is a physical or logical axis.
+
+For example, a content-box width, a border-box width, a page position, and a Flex main-axis size may all be numerically 20.0, but they are not safely interchangeable.
+
+#### Reuse an existing type when the meaning matches exactly
+
+Prefer the established semantic types:
+
+- `ContentBoxLength`, `BorderBoxLength`, `NonContentLength`, `MarginBoxLength`
+- `LayoutLength`
+- `PhysicalContentWidth`, `PhysicalContentHeight`
+- `LogicalInlineContentSize`, `LogicalBlockContentSize`
+- `PageInlineSpan`, `PageBlockSpan`, `PageTopPoint`, `PageTopBlockPosition`
+- `PaintSize`, `PaintPoint`, `PaintStrokeWidth`
+
+Do not create a new wrapper merely because a variable is called width; create or reuse a type based on what the value means.
+
+#### Make a new type when it prevents a real category error
+
+Create a narrowly scoped type when values can otherwise be confused despite sharing units.
+Good examples:
+
+- Flex main size vs Flex cross size.
+- A signed margin-inclusive Flex length vs a non-negative resolved Flex size.
+- Vertical vs horizontal baseline offsets.
+- A source-local Grid offset vs a page-top position.
+- A CSS gap-rule width vs a final paint stroke width.
+
+Avoid generic names such as `Width`, `Size`, or `Length` when they hide the relevant distinction.
+
+#### Model invariants in operations
+
+The API should make valid operations easy and invalid operations unavailable.
+
+- A non-negative extent may add to another extent.
+- Subtracting two sizes should produce a signed length, not silently clamp.
+- Converting a signed length to a size should require an explicit operation such as non_negative_size().
+- Subtracting positions should yield a displacement, not a size.
+- Moving a position by a size or signed displacement is valid; adding two positions is not.
+
+Avoid convenience methods that undo type safety, such as a generic `project_to_axis<T>()`.
+
+#### Make conversions named and local
+
+Crossing a semantic boundary should use a named conversion that explains why it is valid:
+
+- Physical content box → Flex main or cross size.
+- Intrinsic gap → Flex main or cross gap.
+- Flex main size + aspect ratio → Flex cross size.
+- Typed Flex baselines → scalar Taffy metrics.
+- Margin-box child extent → parent block-stack extent.
+
+Keep `.points()` extraction inside these adapters or true backend boundaries such as Taffy, CSS scalar resolution, PDF operators, and paint rectangles. Callers should pass typed values rather than extract and reconstruct scalars.
+
+#### Keep physical, logical, and local coordinates separate
+
+Do not use a physical width where a logical inline size is required, or a page coordinate where a Grid/Flex source offset is required.
+
+Writing-mode projection is a real conversion step. Put it in one named helper rather than repeating `if row { width } else { height }` throughout callers.
+
+#### Treat box-model conversion as explicit
+
+Use helpers in `src/units.rs` to cross content-, border-, non-content-, and margin-box spaces. Do not manually add padding and borders at arbitrary call sites.
+
+If an operation combines values with different box-model meanings, stop and identify the intended result before choosing a type.
+
+#### Keep scalar values only when they are genuinely scalar
+
+Raw f32 is appropriate for:
+
+- Ratios and aspect ratios.
+- CSS numeric factors such as flex grow/shrink inputs.
+- Counts, indices, tolerances, and epsilon comparisons.
+- Local arithmetic inside one named adapter for an untyped external API.
+
+Even then, wrap values when their role is easy to confuse—for example, Flex grow factor versus shrink factor, or a grow fraction versus a shrink fraction.
+
+#### Prefer small composites over related scalar pairs
+
+If several fields jointly describe one concept, make a composite:
+
+- A placement: origin plus available span.
+- A pattern tiling: tile size, repeat step, origin.
+- A baseline estimate: vertical and horizontal first/last pairs.
+- A Flex/Grid available-space record with typed physical dimensions and percentage bases.
+
+This prevents callers from recombining unrelated `x`, `width`, `top`, and `height` values.
+
+#### Review checklist
+
+Before adding or changing geometry code, ask:
+
+1. Is this a position, a signed displacement, or a non-negative extent?
+2. Which coordinate system and axis does it use?
+3. Which box-model space does it represent?
+4. Does an existing type express that exact meaning?
+5. If not, could this value be confused with another value today?
+6. Can the operation be expressed as a named conversion instead of .points() arithmetic?
+7. Does the type preserve CSS correctness in vertical writing modes and percentage resolution?
+8. Is raw scalar extraction confined to a real external or legacy boundary?
+
+The goal is not to eliminate every f32. It is to make the important semantic boundaries visible and enforceable, so future code cannot accidentally mix incompatible layout metrics.

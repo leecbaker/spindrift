@@ -1,6 +1,66 @@
 use crate as quire;
-use crate::{BookmarkState, Color, Css, Html, RenderOptions};
+use crate::{BookmarkState, Css, CssColor, Html, RenderOptions};
 use base64::Engine as _;
+
+const ROW_SUBGRID_AUTO_FILL_WPT: &str = include_str!(
+    "../../tests/fixtures/wpt/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/row-subgrid-auto-fill-002.html"
+);
+const ROW_SUBGRID_AUTO_FILL_WPT_REFERENCE: &str = include_str!(
+    "../../tests/fixtures/wpt/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/row-subgrid-auto-fill-002-ref.html"
+);
+const CUSTOM_HIGHLIGHT_PAINTING_IFRAME_REFERENCE: &str = include_str!(
+    "../../tests/fixtures/wpt/css/css-highlight-api/painting/custom-highlight-painting-iframe-001-ref.html"
+);
+
+/// Local Grid Lanes regression derived from upstream
+/// `row-subgrid-auto-fill-002`. Keeping both inputs in the repository makes
+/// the reference comparison independent of a developer's WPT checkout.
+#[tokio::test]
+async fn grid_lanes_row_subgrid_auto_fill_matches_local_reference() {
+    let actual = Html::from_string(ROW_SUBGRID_AUTO_FILL_WPT)
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let reference = Html::from_string(ROW_SUBGRID_AUTO_FILL_WPT_REFERENCE)
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(actual.pages.len(), reference.pages.len());
+    assert_eq!(actual.pages[0].rects(), reference.pages[0].rects());
+    assert_eq!(
+        actual.pages[0].rounded_rects(),
+        reference.pages[0].rounded_rects()
+    );
+}
+
+/// WPT reference: css/css-highlight-api/painting/
+/// custom-highlight-painting-iframe-001-ref.html.
+///
+/// The reference itself uses `srcdoc` rather than a fetched `src`, so verify
+/// the nested document's paint fragment is composed into the iframe viewport.
+#[tokio::test]
+async fn iframe_srcdoc_paints_embedded_document() {
+    let document = Html::from_string(CUSTOM_HIGHLIGHT_PAINTING_IFRAME_REFERENCE)
+        .render(&RenderOptions::default())
+        .await
+        .unwrap();
+    let page = &document.pages[0];
+    let cyan = CssColor::new(0, 255, 255);
+    let blue = CssColor::new(0, 0, 255);
+
+    assert!(
+        page.rects().iter().any(|rect| rect.fill == Some(cyan)),
+        "srcdoc background was not painted: {:?}",
+        page.rects()
+    );
+    assert!(
+        page.lines()
+            .iter()
+            .any(|line| line.text == "abc" && line.color == blue),
+        "srcdoc text was not painted in blue: {:?}",
+        page.lines()
+    );
+}
 
 fn line_font<'a>(
     document: &'a quire::Document,
@@ -93,7 +153,7 @@ fn horizontal_table_border_widths(document: &quire::Document) -> Vec<f32> {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::BLACK) && rect.height() <= 1.01 && rect.width() > 1.01
+            rect.fill == Some(CssColor::BLACK) && rect.height() <= 1.01 && rect.width() > 1.01
         })
         .step_by(2)
         .map(|rect| rect.width())
@@ -105,13 +165,13 @@ fn vertical_table_border_heights(document: &quire::Document) -> Vec<f32> {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::BLACK) && rect.width() <= 1.01 && rect.height() > 1.01
+            rect.fill == Some(CssColor::BLACK) && rect.width() <= 1.01 && rect.height() > 1.01
         })
         .map(|rect| rect.height())
         .collect()
 }
 
-fn first_rect_paint_operation_index(page: &quire::Page, color: Color) -> usize {
+fn first_rect_paint_operation_index(page: &quire::Page, color: CssColor) -> usize {
     page.paint_operations()
         .iter()
         .position(|operation| {
@@ -124,7 +184,7 @@ fn first_rect_paint_operation_index(page: &quire::Page, color: Color) -> usize {
         .expect("rect with expected fill should be present in paint operations")
 }
 
-fn final_rect_fill_at(page: &quire::Page, x: f32, y: f32) -> Option<Color> {
+fn final_rect_fill_at(page: &quire::Page, x: f32, y: f32) -> Option<CssColor> {
     page.paint_operations()
         .iter()
         .filter_map(|operation| {
@@ -244,7 +304,8 @@ fn rendered_line_baseline_y_for_top(
         .font_id
         .and_then(|font_id| document.fonts.get(font_id))
         .map(|font| {
-            let ascent = font.ascender as f32 * line.font_size / font.units_per_em as f32;
+            let ascent =
+                font.layout_metrics.ascender as f32 * line.font_size / font.units_per_em as f32;
             line.font_size - ascent
         })
         .unwrap_or(0.0);
@@ -256,7 +317,8 @@ fn rendered_line_baseline_top(document: &quire::Document, line: &quire::Rendered
         .font_id
         .and_then(|font_id| document.fonts.get(font_id))
         .map(|font| {
-            let ascent = font.ascender as f32 * line.font_size / font.units_per_em as f32;
+            let ascent =
+                font.layout_metrics.ascender as f32 * line.font_size / font.units_per_em as f32;
             line.font_size - ascent
         })
         .unwrap_or(0.0);
@@ -303,7 +365,7 @@ async fn min_width_fit_content_length_clamps_block_width() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
+    let green = CssColor::new(0, 128, 0);
     let green_rect = page
         .rects()
         .iter()
@@ -349,7 +411,7 @@ async fn min_height_max_content_clamps_zero_block_height() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| panic!("expected green background: {:?}", document.pages[0].rects()));
 
     assert!(
@@ -374,7 +436,7 @@ async fn height_max_content_uses_block_child_height() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| panic!("expected green background: {:?}", document.pages[0].rects()));
 
     assert!(
@@ -399,12 +461,33 @@ async fn max_height_max_content_clamps_definite_block_height() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| panic!("expected green background: {:?}", document.pages[0].rects()));
 
     assert!(
         (green.width() - 75.0).abs() < 0.01 && (green.height() - 60.0).abs() < 0.01,
         "max-height:max-content should clamp the definite height to the child height: {green:?}",
+    );
+}
+
+#[tokio::test]
+async fn padded_bordered_definite_block_prebreaks_as_one_border_box() {
+    let document = Html::from_string(
+        "<!DOCTYPE html>\
+         <style>@page { size: 100px 100px; margin: 0 } body { margin: 0 }</style>\
+         <div style=\"height: 30px\"></div>\
+         <div style=\"height: 50px; padding: 10px; border: 10px solid red; background: green\"></div>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    assert_eq!(document.pages.len(), 2);
+    assert!(
+        document.pages[1]
+            .rects()
+            .iter()
+            .any(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
     );
 }
 
@@ -426,7 +509,7 @@ async fn intrinsic_min_height_keeps_cyclic_percentage_child_height_auto() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| panic!("expected green background: {:?}", document.pages[0].rects()));
 
     assert!(
@@ -479,11 +562,11 @@ async fn overflow_scroll_preserves_parent_paint_order() {
     .unwrap();
 
     let page = &document.pages[0];
-    let red = first_rect_paint_operation_index(page, Color::new(255, 0, 0));
-    let yellow = first_rect_paint_operation_index(page, Color::new(255, 255, 0));
-    let green = first_rect_paint_operation_index(page, Color::new(0, 128, 0));
-    let blue = first_rect_paint_operation_index(page, Color::new(0, 0, 255));
-    let magenta = first_rect_paint_operation_index(page, Color::new(255, 0, 255));
+    let red = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
+    let yellow = first_rect_paint_operation_index(page, CssColor::new(255, 255, 0));
+    let green = first_rect_paint_operation_index(page, CssColor::new(0, 128, 0));
+    let blue = first_rect_paint_operation_index(page, CssColor::new(0, 0, 255));
+    let magenta = first_rect_paint_operation_index(page, CssColor::new(255, 0, 255));
 
     assert!(red < yellow, "scroller background should paint first");
     assert!(yellow < green, "later block background should cover yellow");
@@ -496,7 +579,7 @@ async fn overflow_scroll_preserves_parent_paint_order() {
     let blue_rect = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("blue foreground rect should render");
     assert_eq!(
         final_rect_fill_at(
@@ -504,7 +587,7 @@ async fn overflow_scroll_preserves_parent_paint_order() {
             blue_rect.x() + blue_rect.width() - 1.0,
             blue_rect.y() + blue_rect.height() / 2.0,
         ),
-        Some(Color::new(0, 0, 255))
+        Some(CssColor::new(0, 0, 255))
     );
 }
 

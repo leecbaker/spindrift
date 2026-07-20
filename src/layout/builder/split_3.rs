@@ -369,7 +369,7 @@ mod tests {
         assert_eq!(builder.pages.len(), 0);
         assert_eq!(builder.current_page_name.as_deref(), Some("article"));
         builder.exit_page_name_scope(
-            scope.map(|previous| builder.page_name_scope_checkpoint(previous)),
+            scope.map(|previous_page_name| PageNameScope::Inline { previous_page_name }),
         );
 
         builder.mark_current_page_flow_content();
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn viewport_units_keep_the_initial_page_context_after_a_named_transition() {
+    fn viewport_units_use_the_destination_page_context_after_a_named_transition() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();

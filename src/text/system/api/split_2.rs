@@ -40,12 +40,32 @@ impl FontSystem {
                 if glyph.source_text() == "\t" {
                     continue;
                 }
-                let vertical_advance = face
-                    .glyph_ver_advance(ttf_parser::GlyphId(glyph.rendered.id))
-                    .map(|advance| advance as f32)
-                    .filter(|advance| *advance > 0.0)
-                    .unwrap_or(units_per_em)
-                    * scale;
+                let Some(glyph_id) = glyph.rendered.painted_id() else {
+                    continue;
+                };
+                let glyph_id = ttf_parser::GlyphId(glyph_id);
+                let synthesized_vertical_advance =
+                    (i32::from(face.ascender()) - i32::from(face.descender())).max(1) as f32;
+                // CSS Text gives several Unicode space separators a used
+                // advance independent of the selected glyph. In particular,
+                // U+3000 IDEOGRAPHIC SPACE is one em even when a font's
+                // vertical substitute is a narrow blank glyph. Preserve that
+                // CSS advance before consulting OpenType vertical metrics.
+                // <https://www.w3.org/TR/css-text-3/#white-space-processing>
+                let source_text = glyph.source_text();
+                let vertical_advance = (source_text.chars().count() == 1)
+                    .then(|| source_text.chars().next())
+                    .flatten()
+                    .and_then(|character| {
+                        css_space_separator_advance(&face, character, run.font_size, scale)
+                    })
+                    .unwrap_or_else(|| {
+                        face.glyph_ver_advance(glyph_id)
+                            .map(|advance| advance as f32)
+                            .filter(|advance| *advance > 0.0)
+                            .unwrap_or(synthesized_vertical_advance)
+                            * scale
+                    });
                 // Parley shapes this stream on a horizontal baseline. CSS
                 // Writing Modes instead positions upright glyphs from their
                 // OpenType vertical origin. Convert the shaped baseline
@@ -54,25 +74,26 @@ impl FontSystem {
                 // because PDF text positioning has no per-glyph y advance.
                 //
                 // OpenType defines the vertical origin with VORG when
-                // present, otherwise from the glyph top side bearing. Fonts
-                // without vertical metrics synthesize it at one em, the
-                // interoperable fallback for upright alphabetic text.
+                // present, otherwise from the glyph top side bearing. A font
+                // that supplies neither vertical metric has no glyph-specific
+                // vertical origin. Its used vertical advance is therefore the
+                // stable typographic-unit origin; deriving one from horizontal
+                // ink bounds would make the same one-em unit start at a
+                // different position for every glyph.
                 // <https://learn.microsoft.com/en-us/typography/opentype/spec/vorg>
                 // <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>
                 let vertical_origin = face
-                    .glyph_y_origin(ttf_parser::GlyphId(glyph.rendered.id))
+                    .glyph_y_origin(glyph_id)
                     .map(f32::from)
                     .or_else(|| {
-                        face.glyph_bounding_box(ttf_parser::GlyphId(glyph.rendered.id))
-                            .zip(
-                                face.glyph_ver_side_bearing(ttf_parser::GlyphId(glyph.rendered.id)),
-                            )
+                        face.glyph_bounding_box(glyph_id)
+                            .zip(face.glyph_ver_side_bearing(glyph_id))
                             .map(|(bounds, top_side_bearing)| {
                                 f32::from(bounds.y_max) + f32::from(top_side_bearing)
                             })
                     })
-                    .unwrap_or(units_per_em)
-                    * scale;
+                    .map(|origin| origin * scale)
+                    .unwrap_or(vertical_advance);
                 glyph.rendered.y_offset -= vertical_origin;
                 let extra_spacing =
                     (glyph.rendered.x_advance - glyph.rendered.nominal_x_advance).max(0.0);
@@ -95,7 +116,10 @@ impl FontSystem {
         &mut self,
         spans: &[StyledTextSpan<'_>],
     ) -> Vec<ShapedGlyphRun> {
-        self.shape_styled_text_runs_with_parley_at_tab_origin(spans, 0.0)
+        let Some(tab_metric_style) = spans.first().map(|span| span.style) else {
+            return Vec::new();
+        };
+        self.shape_styled_text_runs_with_parley_at_tab_origin(spans, 0.0, tab_metric_style)
     }
 
     /// Shape styled text with tabs measured from a CSS line's content edge.
@@ -107,11 +131,39 @@ impl FontSystem {
         &mut self,
         spans: &[StyledTextSpan<'_>],
         tab_origin: f32,
+        tab_metric_style: &ComputedStyle,
     ) -> Vec<ShapedGlyphRun> {
         if spans.is_empty() {
             return Vec::new();
         }
         let mut text = String::new();
+        // Expand each authored inline span through the same `unicode-range`
+        // face selection used by the single-style shaping path. Styled inline
+        // layout is the normal route for DOM text, so applying the split only
+        // in `shape_text_runs_with_parley` lets Parley select an unrestricted
+        // registered face here instead.
+        // <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>
+        let mut unicode_range_spans = Vec::<(String, ComputedStyle)>::new();
+        for span in spans.iter().filter(|span| !span.text.is_empty()) {
+            if let Some(resolved_spans) =
+                self.unicode_range_resolved_text_spans(span.text, span.style)
+            {
+                for resolved in resolved_spans {
+                    if let Some(text) = span.text.get(resolved.range) {
+                        unicode_range_spans.push((text.to_string(), resolved.style));
+                    }
+                }
+            } else {
+                unicode_range_spans.push((span.text.to_string(), span.style.clone()));
+            }
+        }
+        let spans = unicode_range_spans
+            .iter()
+            .map(|(text, style)| StyledTextSpan {
+                text: text.as_str(),
+                style,
+            })
+            .collect::<Vec<_>>();
         let mut ranges: Vec<(Range<usize>, &ComputedStyle)> = Vec::with_capacity(spans.len());
         let mut synthetic_join_controls = Vec::new();
         let spans = spans
@@ -194,35 +246,68 @@ impl FontSystem {
         let shaping_text = shaping_text.as_ref();
         let default_style = ranges[0].1;
         self.with_reusable_parley_layout(|this, layout| {
+            let parley_styles = ranges
+                .iter()
+                .map(|(_, style)| this.shaping_style_for_selected_face(style))
+                .collect::<Vec<_>>();
+            let default_parley_style = &parley_styles[0];
             let default_feature_context = this.font_feature_context_for_style(default_style);
-            let default_font_family_source = this.resolved_parley_font_family_source(default_style);
             let feature_contexts = ranges
                 .iter()
                 .map(|(_, style)| this.font_feature_context_for_style(style))
                 .collect::<Vec<_>>();
-            let font_family_sources = ranges
-                .iter()
-                .map(|(_, style)| this.resolved_parley_font_family_source(style))
-                .collect::<Vec<_>>();
-            let mut builder = this.parley_layout_context.ranged_builder(
-                &mut this.parley_font_context,
-                shaping_text,
-                1.0,
-                false,
+            let mut font_family_sources = Vec::<String>::with_capacity(ranges.len());
+            for (range, style) in &ranges {
+                let selected = this
+                    .emoji_presentation_family_source(&text[range.clone()], style)
+                    .unwrap_or_else(|| this.resolved_parley_font_family_source(style));
+                // A closing bidi formatting control has no glyph or family
+                // choice of its own. Keeping the preceding selected source
+                // prevents it from merging the final visible cluster into an
+                // enclosing element's unselected authored stack.
+                // <https://www.w3.org/TR/css-writing-modes-4/#bidi-algo>
+                if text[range.clone()]
+                    .chars()
+                    .all(character_is_bidi_format_control)
+                    && let Some(previous) = font_family_sources.last()
+                {
+                    font_family_sources.push(previous.clone());
+                } else {
+                    font_family_sources.push(selected);
+                }
+            }
+            // RangedBuilder uses the default properties at the zero-length
+            // boundary before applying the first explicit range. Keep the
+            // default family source in sync with the first selected range so
+            // a presentation-selected emoji at byte zero does not retain the
+            // authored stack's first face.
+            let default_font_family_source = font_family_sources[0].clone();
+            let mut builder: parley::RangedBuilder<'_, FontPalette> = this
+                .parley_layout_context
+                .ranged_builder(&mut this.parley_font_context, shaping_text, 1.0, false);
+            push_parley_default_style(
+                &mut builder,
+                default_parley_style,
+                &default_font_family_source,
             );
-            push_parley_default_style(&mut builder, default_style, &default_font_family_source);
             push_parley_text_spacing_default_with_context(
                 &mut builder,
                 shaping_text,
                 default_style,
                 default_feature_context.as_ref(),
             );
-            for (((range, style), feature_context), font_family_source) in ranges
+            for ((((range, style), parley_style), feature_context), font_family_source) in ranges
                 .iter()
+                .zip(&parley_styles)
                 .zip(&feature_contexts)
                 .zip(&font_family_sources)
             {
-                push_parley_style_range(&mut builder, style, font_family_source, range.clone());
+                push_parley_style_range(
+                    &mut builder,
+                    parley_style,
+                    font_family_source,
+                    range.clone(),
+                );
                 push_parley_text_spacing_range_with_context(
                     &mut builder,
                     &shaping_text[range.clone()],
@@ -243,25 +328,33 @@ impl FontSystem {
                 default_style,
             );
             if !adjustment_ranges.is_empty() {
-                let mut builder = this.parley_layout_context.ranged_builder(
-                    &mut this.parley_font_context,
-                    shaping_text,
-                    1.0,
-                    false,
+                let mut builder: parley::RangedBuilder<'_, FontPalette> = this
+                    .parley_layout_context
+                    .ranged_builder(&mut this.parley_font_context, shaping_text, 1.0, false);
+                push_parley_default_style(
+                    &mut builder,
+                    default_parley_style,
+                    &default_font_family_source,
                 );
-                push_parley_default_style(&mut builder, default_style, &default_font_family_source);
                 push_parley_text_spacing_default_with_context(
                     &mut builder,
                     shaping_text,
                     default_style,
                     default_feature_context.as_ref(),
                 );
-                for (((range, style), feature_context), font_family_source) in ranges
-                    .iter()
-                    .zip(&feature_contexts)
-                    .zip(&font_family_sources)
+                for ((((range, style), parley_style), feature_context), font_family_source) in
+                    ranges
+                        .iter()
+                        .zip(&parley_styles)
+                        .zip(&feature_contexts)
+                        .zip(&font_family_sources)
                 {
-                    push_parley_style_range(&mut builder, style, font_family_source, range.clone());
+                    push_parley_style_range(
+                        &mut builder,
+                        parley_style,
+                        font_family_source,
+                        range.clone(),
+                    );
                     push_parley_text_spacing_range_with_context(
                         &mut builder,
                         &shaping_text[range.clone()],
@@ -316,6 +409,7 @@ impl FontSystem {
                     dropped_default_ignorable_runs.push(DroppedDefaultIgnorableRun {
                         x_offset,
                         advance: run.advance(),
+                        text: run_text.clone().into(),
                     });
                     continue;
                 }
@@ -350,15 +444,20 @@ impl FontSystem {
                         dropped_default_ignorable_runs.push(DroppedDefaultIgnorableRun {
                             x_offset,
                             advance: dropped_advance,
+                            text: Rc::from(""),
                         });
                     }
                     rehomed_control_fallback_runs.push(rendered_runs.len());
                     rendered_runs.push(rehomed_run);
-                    tab_contexts.push(RenderedRunTabContext { style: run_style });
+                    tab_contexts.push(RenderedRunTabContext {
+                        style: run_style,
+                        metric_style: tab_metric_style,
+                    });
                     continue;
                 }
-                if this.document_fonts.support_kind_for_run(font_id, &run_text)
-                    == FontSupportKind::ColorOrEmojiOnlyFallback
+                if !raw_run_text.contains('\t')
+                    && this.document_fonts.support_kind_for_run(font_id, &run_text)
+                        == FontSupportKind::ColorOrEmojiOnlyFallback
                     && !this
                         .document_fonts
                         .run_has_color_glyph(font_id, raw_run_text)
@@ -392,55 +491,35 @@ impl FontSystem {
                         glyphs,
                         glyph_source_ranges,
                     });
-                    tab_contexts.push(RenderedRunTabContext { style: run_style });
+                    tab_contexts.push(RenderedRunTabContext {
+                        style: run_style,
+                        metric_style: tab_metric_style,
+                    });
                     continue;
                 }
                 let Some(font) = this.document_fonts.get(font_id) else {
                     continue;
                 };
-                if ((!run_style.font_synthesis.weight
-                    && run_style.font_weight.0 >= FontWeight::BOLD.0)
-                    || (!run_style.font_synthesis.style
-                        && run_style.font_style != FontStyle::Normal))
-                    && let Some(glyphs) = shape_text_with_document_font(
-                        font,
-                        raw_run_text,
-                        run.font_size(),
-                        run_style.used_letter_spacing().points(),
-                        run_style.used_word_spacing().points(),
-                    )
-                    && !glyphs.is_empty()
-                {
-                    let glyphs = glyphs_without_synthetic_join_controls(
-                        glyphs,
-                        raw_run_text,
-                        run_range.start,
-                        &synthetic_join_controls,
-                    );
-                    let glyph_source_ranges = vec![None; glyphs.len()];
-                    rendered_runs.push(ShapedGlyphRun {
-                        text: run_text.into(),
-                        x_offset,
-                        y_offset: 0.0,
-                        text_matrix: crate::RenderedTextMatrix::IDENTITY,
-                        font_size: run.font_size(),
-                        font_id: Some(font_id),
-                        font_palette: run_style.font_palette.clone(),
-                        glyphs,
-                        glyph_source_ranges,
-                    });
-                    tab_contexts.push(RenderedRunTabContext { style: run_style });
-                    continue;
-                }
                 let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
                     continue;
                 };
                 let units_per_em = font.units_per_em.max(1) as f32;
                 let scale = run.font_size() / units_per_em;
+                // A styled Parley run may include authored default-ignorable
+                // controls which deliberately emit no Unicode on any glyph.
+                // Remember the output boundary so that an unsplit paint run
+                // can retain its complete logical source text below.
+                let rendered_run_start = rendered_runs.len();
                 let mut glyphs = Vec::new();
                 let mut glyph_source_ranges = Vec::new();
+                // Parley keeps paint-only style transitions on glyphs rather
+                // than splitting the underlying shaping run. Retain the
+                // palette selected by each cluster so CSS `font-palette`
+                // remains independent for adjacent inline elements.
+                let mut glyph_palettes = Vec::new();
                 for cluster in run.visual_clusters() {
                     let cluster_range = cluster.text_range();
+                    let cluster_palette = cluster.first_style().brush.clone();
                     let source_range =
                         styled_cluster_source_range(cluster_range.clone(), &source_positions);
                     if range_is_synthetic_only(cluster_range.clone(), &synthetic_join_controls) {
@@ -473,8 +552,10 @@ impl FontSystem {
                         continue;
                     }
                     if cleaned_cluster_text.as_ref() == "\t" {
-                        glyphs.push(synthesized_tab_glyph(&face, scale));
+                        let provisional_advance = cluster.glyphs().map(|glyph| glyph.advance).sum();
+                        glyphs.push(synthesized_tab_glyph(provisional_advance));
                         glyph_source_ranges.push(source_range);
+                        glyph_palettes.push(cluster_palette);
                         continue;
                     }
                     let mut first_cluster_glyph = true;
@@ -509,16 +590,29 @@ impl FontSystem {
                             first_cluster_glyph = false;
                             continue;
                         }
-                        let emitted_glyph_id = unicode
-                            .chars()
-                            .next()
-                            .filter(|_| unicode.chars().count() == 1)
-                            .and_then(|character| css_space_separator_blank_glyph(&face, character))
-                            .map(|glyph| glyph.0)
-                            .unwrap_or(glyph_id);
+                        let emitted_glyph_id = if matches!(
+                            run_style.text_layout_policy(),
+                            TextLayoutPolicy::Vertical(_)
+                        ) {
+                            // Preserve the selected vertical alternate rather
+                            // than replacing it with the horizontal U+0020
+                            // glyph. See the equivalent single-style shaping
+                            // path for the CSS Writing Modes rationale.
+                            glyph_id
+                        } else {
+                            unicode
+                                .chars()
+                                .next()
+                                .filter(|_| unicode.chars().count() == 1)
+                                .and_then(|character| {
+                                    css_space_separator_blank_glyph(&face, character)
+                                })
+                                .map(|glyph| glyph.0)
+                                .unwrap_or(glyph_id)
+                        };
                         first_cluster_glyph = false;
                         glyphs.push(RenderedGlyph {
-                            id: emitted_glyph_id,
+                            kind: RenderedGlyphKind::Paint(emitted_glyph_id),
                             x_advance: glyph.advance,
                             nominal_x_advance: face
                                 .glyph_hor_advance(ttf_parser::GlyphId(emitted_glyph_id))
@@ -529,6 +623,7 @@ impl FontSystem {
                             unicode,
                         });
                         glyph_source_ranges.push(source_range.clone());
+                        glyph_palettes.push(cluster_palette.clone());
                     }
                 }
                 if glyphs.is_empty() {
@@ -542,23 +637,83 @@ impl FontSystem {
                     &face,
                     &run_text,
                 );
-                rendered_runs.push(ShapedGlyphRun {
-                    text: run_text.into(),
-                    x_offset,
-                    y_offset: 0.0,
-                    text_matrix: crate::RenderedTextMatrix::IDENTITY,
-                    font_size,
-                    font_id: Some(font_id),
-                    font_palette: run_style.font_palette.clone(),
-                    glyphs,
-                    glyph_source_ranges,
-                });
-                tab_contexts.push(RenderedRunTabContext { style: run_style });
+                debug_assert_eq!(glyphs.len(), glyph_source_ranges.len());
+                debug_assert_eq!(glyphs.len(), glyph_palettes.len());
+                let mut group_palette = glyph_palettes[0].clone();
+                let mut group_glyphs = Vec::new();
+                let mut group_source_ranges = Vec::new();
+                let mut group_text = String::new();
+                let mut group_x_offset = x_offset;
+                let mut next_x_offset = x_offset;
+                let mut push_group = |glyphs: &mut Vec<RenderedGlyph>,
+                                      source_ranges: &mut Vec<Option<Range<usize>>>,
+                                      text: &mut String,
+                                      palette: &FontPalette,
+                                      x_offset| {
+                    if glyphs.is_empty() {
+                        return;
+                    }
+                    rendered_runs.push(ShapedGlyphRun {
+                        text: std::mem::take(text).into(),
+                        x_offset,
+                        y_offset: 0.0,
+                        text_matrix: crate::RenderedTextMatrix::IDENTITY,
+                        font_size,
+                        font_id: Some(font_id),
+                        font_palette: palette.clone(),
+                        glyphs: std::mem::take(glyphs),
+                        glyph_source_ranges: std::mem::take(source_ranges),
+                    });
+                    tab_contexts.push(RenderedRunTabContext {
+                        style: run_style,
+                        metric_style: tab_metric_style,
+                    });
+                };
+                for ((glyph, source_range), palette) in glyphs
+                    .into_iter()
+                    .zip(glyph_source_ranges)
+                    .zip(glyph_palettes)
+                {
+                    if palette != group_palette {
+                        push_group(
+                            &mut group_glyphs,
+                            &mut group_source_ranges,
+                            &mut group_text,
+                            &group_palette,
+                            group_x_offset,
+                        );
+                        group_palette = palette.clone();
+                        group_x_offset = next_x_offset;
+                    }
+                    next_x_offset += glyph.x_advance;
+                    group_text.push_str(&glyph.unicode);
+                    group_glyphs.push(glyph);
+                    group_source_ranges.push(source_range);
+                }
+                push_group(
+                    &mut group_glyphs,
+                    &mut group_source_ranges,
+                    &mut group_text,
+                    &group_palette,
+                    group_x_offset,
+                );
+                // Glyph Unicode is a PDF ToUnicode summary, not the complete
+                // CSS source stream: U+200C/U+200D affect shaping but have no
+                // standalone visible glyph. When palette grouping leaves this
+                // Parley run intact, keep its authored (synthetic controls
+                // already removed) text on the shaped run for extraction and
+                // diagnostics.
+                if run_text.chars().any(character_is_join_control)
+                    && rendered_runs.len() == rendered_run_start + 1
+                {
+                    rendered_runs[rendered_run_start].text = run_text.into();
+                }
             }
             for run in &mut rendered_runs {
                 run.x_offset =
                     corrected_visual_run_x_offset(run.x_offset, &dropped_default_ignorable_runs);
             }
+            stitch_dropped_join_control_runs(&mut rendered_runs, &dropped_default_ignorable_runs);
             for index in rehomed_control_fallback_runs.into_iter().rev() {
                 if stitch_rehomed_control_fallback_run(&mut rendered_runs, index) {
                     tab_contexts.remove(index + 1);
@@ -566,6 +721,69 @@ impl FontSystem {
             }
             this.apply_css_tab_stops(&mut rendered_runs, &tab_contexts, tab_origin);
             rendered_runs
+        })
+    }
+
+    /// Resolve an explicit named emoji family stack by the effective Unicode
+    /// presentation selector. Both monochrome and color fonts can cover the
+    /// same base scalar, so ordinary cmap fallback alone cannot implement
+    /// `font-variant-emoji`.
+    /// <https://www.w3.org/TR/css-fonts-4/#font-variant-emoji-prop>
+    pub(in crate::text) fn emoji_presentation_family_source(
+        &mut self,
+        text: &str,
+        style: &ComputedStyle,
+    ) -> Option<String> {
+        let names = match &style.font_family {
+            FontFamily::Names(names) => names.clone(),
+            FontFamily::List(families) => families
+                .iter()
+                .flat_map(|family| match family {
+                    FontFamily::Names(names) => names.clone(),
+                    _ => Vec::new(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        if names.len() < 2 {
+            return None;
+        }
+        // CSS bidi isolation may wrap the first authored scalar in a
+        // directional formatting control. That control participates in UAX
+        // #9 but cannot select an emoji face; retain variation selectors so
+        // their presentation override remains observable.
+        let mut characters = text
+            .chars()
+            .filter(|character| !character_is_bidi_format_control(*character))
+            .peekable();
+        let base = characters.next()?;
+        if !character_is_emoji(base) {
+            return None;
+        }
+        let requested_color = match characters.peek().copied() {
+            Some('\u{fe0f}') => true,
+            Some('\u{fe0e}') => false,
+            _ => match style.font_variant_emoji {
+                FontVariantEmoji::Emoji => true,
+                FontVariantEmoji::Text => false,
+                FontVariantEmoji::Normal | FontVariantEmoji::Unicode => {
+                    character_has_emoji_presentation(base)
+                }
+            },
+        };
+        names.into_iter().find_map(|name| {
+            let font_id = self.resolve_single_family(
+                &name,
+                style.font_weight,
+                style.font_style,
+                style.font_width,
+            )?;
+            let is_color_face = self
+                .document_fonts
+                .run_has_color_glyph(font_id, &base.to_string());
+            (self.document_fonts.font_has_character(font_id, base)
+                && is_color_face == requested_color)
+                .then(|| parley_font_family_source(&FontFamily::Names(vec![name])))
         })
     }
 
@@ -596,8 +814,9 @@ impl FontSystem {
     /// Resolve preserved CSS tab characters to used tab-stop advances.
     ///
     /// CSS Text defines preserved tabs as invisible advances to the next
-    /// periodic tab stop, where numeric `tab-size` values are multiples of the
-    /// selected U+0020 advance and length values are absolute computed lengths:
+    /// periodic tab stop. A tab's own computed `tab-size` selects the period,
+    /// while numeric values are multiples of the nearest block container's
+    /// U+0020 advance; length values are absolute computed lengths:
     /// <https://www.w3.org/TR/css-text-3/#tab-size-property>.
     pub(in crate::text) fn apply_css_tab_stops(
         &mut self,
@@ -609,36 +828,52 @@ impl FontSystem {
             return;
         }
 
+        let mut logical_line_cursor = 0.0;
         for run_index in 0..runs.len() {
-            let Some(style) = contexts.get(run_index).map(|context| context.style) else {
+            let Some(context) = contexts.get(run_index) else {
                 continue;
             };
-            let Some(font_id) = runs[run_index].font_id else {
-                continue;
-            };
-            let Some(font) = self.document_fonts.get(font_id) else {
-                continue;
-            };
-            let Ok(face) = ttf_parser::Face::parse(&font.data, font.face_index) else {
-                continue;
-            };
-            let scale = runs[run_index].font_size / font.units_per_em.max(1) as f32;
-            let fallback_space_advance =
-                tab_stop_space_advance(&face, runs[run_index].font_size, scale, style);
-            let space_advance = self.css_tab_stop_space_advance(style, fallback_space_advance);
-            let tab_period = style
+            let space_advance = self.css_tab_stop_space_advance(context.metric_style);
+            let tab_period = context
+                .style
                 .tab_size
                 .used_tab_stop_advance(space_advance.points())
                 .points();
             let run_x_offset = runs[run_index].x_offset;
-            let mut pen_x = 0.0;
+            // A visual shaping pass can split immediately before a preserved
+            // tab and give that later run an origin of zero. Carry the
+            // selected line's cursor across that split; otherwise the tab is
+            // incorrectly treated as leading and advances a whole period.
+            // <https://www.w3.org/TR/css-text-3/#tab-size-property>
+            let tab_run_x_offset = if run_x_offset <= 0.01 && logical_line_cursor > 0.01 {
+                logical_line_cursor
+            } else {
+                run_x_offset
+            };
+            // Parley reports a run beginning with a tab after its provisional
+            // tab glyph advance. CSS instead resolves the tab from the cursor
+            // before that glyph, at the block content edge for a leading tab.
+            // Subsequent tabs in the same run retain the advances accumulated
+            // from their preceding glyphs.
+            let starts_with_tab = runs[run_index]
+                .text
+                .chars()
+                .find(|character| !character_is_bidi_format_control(*character))
+                .filter(|character| *character == '\t')
+                .is_some();
+            let mut pen_x = if starts_with_tab && logical_line_cursor <= 0.01 {
+                -tab_run_x_offset
+            } else {
+                0.0
+            };
             let mut following_run_shift = 0.0;
 
             for glyph in &mut runs[run_index].glyphs {
                 if glyph.unicode == "\t" {
                     let old_advance = glyph.x_advance;
                     let used_advance =
-                        tab_stop_advance(tab_period, tab_origin + run_x_offset + pen_x).points();
+                        tab_stop_advance(tab_period, tab_origin + tab_run_x_offset + pen_x)
+                            .points();
                     glyph.x_advance = used_advance;
                     glyph.nominal_x_advance = space_advance.points();
                     glyph.x_offset = 0.0;
@@ -653,24 +888,45 @@ impl FontSystem {
                     following_run.x_offset += following_run_shift;
                 }
             }
+            logical_line_cursor = logical_line_cursor.max(
+                tab_run_x_offset
+                    + runs[run_index]
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.x_advance)
+                        .sum::<f32>(),
+            );
         }
     }
 
-    fn css_tab_stop_space_advance(
-        &mut self,
-        style: &ComputedStyle,
-        fallback_space_advance: LayoutLength,
-    ) -> LayoutLength {
+    fn css_tab_stop_space_advance(&mut self, style: &ComputedStyle) -> LayoutLength {
+        let direct_advance = self.character_font_match(style, ' ').and_then(|matched| {
+            let (data, face_index, units_per_em) = self
+                .document_fonts
+                .get(matched.font_id)
+                .map(|font| (font.data.clone(), font.face_index, font.units_per_em))?;
+            let face = ttf_parser::Face::parse(&data, face_index).ok()?;
+            let advance = face.glyph_hor_advance(matched.glyph_id.raw())? as f32;
+            let used_font_size = self
+                .font_size_adjusted_size_for_font_id(style, matched.font_id)
+                .unwrap_or(style.font_size);
+            Some(advance * used_font_size / units_per_em.max(1) as f32)
+        });
         layout_pt(
-            self.shape_unwrapped_line(" ", style, style.line_height)
-                .map(|line| line.advance_width())
+            direct_advance
+                .or_else(|| {
+                    self.shape_unwrapped_line(" ", style, style.line_height)
+                        .map(|line| line.advance_width())
+                })
                 .filter(|advance| *advance > 0.0 && advance.is_finite())
-                .unwrap_or_else(|| fallback_space_advance.points()),
+                .unwrap_or(style.font_size * 0.25)
+                + style.used_letter_spacing().points()
+                + style.used_word_spacing().points(),
         )
     }
 
-    pub(crate) fn font_ascent_baseline_adjustment(
-        &self,
+    pub(crate) fn layout_to_program_baseline_adjustment(
+        &mut self,
         font_id: Option<usize>,
         style: &ComputedStyle,
         _line_height: f32,
@@ -678,7 +934,7 @@ impl FontSystem {
         let used_font_size = font_id
             .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
             .unwrap_or(style.font_size);
-        self.font_ascent_baseline_adjustment_for_font_size(font_id, style, used_font_size)
+        self.layout_to_program_baseline_adjustment_for_font_size(font_id, style, used_font_size)
     }
 
     /// Return the paint-origin adjustment for a shaped line's CSS baseline.
@@ -695,38 +951,39 @@ impl FontSystem {
         line_height: f32,
     ) -> LayoutLength {
         let font_id = self.resolve_metric_font_for_style(style);
-        self.font_ascent_baseline_adjustment(font_id, style, line_height)
+        self.layout_to_program_baseline_adjustment(font_id, style, line_height)
     }
 
-    pub(crate) fn font_ascent_baseline_adjustment_for_font_size(
+    /// Convert a CSS layout baseline to the selected font program's glyph origin.
+    ///
+    /// CSS metric overrides belong to `layout_metrics`; the embedded OpenType
+    /// program retains `program_metrics`.
+    pub(crate) fn layout_to_program_baseline_adjustment_for_font_size(
         &self,
         font_id: Option<usize>,
-        style: &ComputedStyle,
+        _style: &ComputedStyle,
         used_font_size: f32,
     ) -> LayoutLength {
         let Some(font) = font_id.and_then(|id| self.document_fonts.get(id)) else {
             return layout_pt(0.0);
         };
-        let ascent = font.ascender as f32 * used_font_size / font.units_per_em as f32;
-        // CSS Inline positions glyphs using selected-font metrics inside the
-        // CSS line box. The used font size can differ from the computed
-        // `font-size` when CSS Fonts `font-size-adjust` is active, while the
-        // line box anchor remains based on computed font size:
-        // https://www.w3.org/TR/css-fonts-5/#font-size-adjust-prop
-        //
-        // `used_font_size` and scaled OpenType metrics are
-        // already in PDF point/layout units here, so no CSS px conversion is
-        // applied:
-        // https://www.w3.org/TR/CSS22/visudet.html#line-height
-        layout_pt(style.font_size - ascent)
+        // CSS layout anchors a line to its resolved layout metrics, including
+        // `@font-face` metric overrides. PDF glyph programs instead retain
+        // their native coordinates. Both ascents use the selected face's used
+        // size, including `font-size-adjust`; convert only between those two
+        // coordinate systems. Using the em-box top would incorrectly raise
+        // glyphs for faces whose native ascender is shorter than one em.
+        // <https://www.w3.org/TR/css-fonts-4/#font-metrics>
+        // <https://www.w3.org/TR/CSS22/visudet.html#line-height>
+        layout_pt(layout_to_program_ascent_delta(font, used_font_size))
     }
 
     /// Return the rendered first-line text baseline offset from line-box top.
     ///
     /// CSS Inline Layout aligns inline-level boxes to line baselines. Formatting
-    /// contexts that synthesize baselines must use the same selected-font ascent
-    /// projection as text painting so their exported baselines match rendered
-    /// text lines:
+    /// contexts that synthesize baselines use CSS layout metrics. Metric
+    /// override descriptors change this baseline without changing the native
+    /// glyph-coordinate adjustment used by text painting:
     /// <https://www.w3.org/TR/css-inline-3/#line-box> and
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height>.
     pub(crate) fn rendered_first_line_baseline_offset(
@@ -734,11 +991,17 @@ impl FontSystem {
         style: &ComputedStyle,
     ) -> LayoutLength {
         let font_id = self.resolve_metric_font_for_style(style);
-        let line_height = self.line_height_for_font(font_id, style);
-        let adjustment = self
-            .font_ascent_baseline_adjustment(font_id, style, line_height.points())
-            .points();
-        layout_pt(style.font_size - adjustment)
+        let used_font_size = font_id
+            .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
+            .unwrap_or(style.font_size);
+        let ascent = font_id
+            .and_then(|font_id| self.document_fonts.get(font_id))
+            .map(|font| {
+                font.layout_metrics.ascender as f32 * used_font_size
+                    / font.units_per_em.max(1) as f32
+            })
+            .unwrap_or(style.font_size);
+        layout_pt(ascent)
     }
 
     /// Return the selected font's x-height in layout units when the font can
@@ -756,7 +1019,7 @@ impl FontSystem {
         // a stable ordinary-text selection without requiring an `x` glyph to
         // be present in the candidate face.
         // <https://www.w3.org/TR/css-values-4/#ex>
-        let font_id = self.font_for_character(style, ' ');
+        let font_id = self.resolve_metric_font_for_style(style);
         let used_font_size = font_id
             .and_then(|font_id| self.font_size_adjusted_size_for_font_id(style, font_id))
             .unwrap_or(style.font_size);
@@ -846,7 +1109,7 @@ impl FontSystem {
             .glyphs
             .iter()
             .find(|glyph| glyph.source_text() == "水")?;
-        let bbox = face.glyph_bounding_box(ttf_parser::GlyphId(glyph.rendered.id))?;
+        let bbox = face.glyph_bounding_box(ttf_parser::GlyphId(glyph.rendered.painted_id()?))?;
         let scale = run.font_size / font.units_per_em.max(1) as f32;
         let above = (bbox.y_max as f32 * scale).max(0.0);
         let below = (-bbox.y_min as f32 * scale).max(0.0);
@@ -895,17 +1158,21 @@ impl FontSystem {
     /// for glyph emission. This helper reverses that adjustment for layout
     /// code that must align atomic inline fragments to shaped text.
     /// https://www.w3.org/TR/CSS22/visudet.html#line-height
+    #[cfg(test)]
     pub(crate) fn rendered_line_alignment_y(&self, line: &RenderedLine) -> LayoutLength {
-        let adjustment = line
-            .font_id
-            .and_then(|font_id| self.document_fonts.get(font_id))
-            .map(|font| {
-                let ascent = font.ascender as f32 * line.font_size / font.units_per_em as f32;
-                line.font_size - ascent
-            })
-            .unwrap_or(0.0);
-        layout_pt(line.y() + line.font_size - adjustment)
+        layout_pt(line.y() + line.font_size - line.glyph_origin_adjustment().y)
     }
+}
+
+/// Return the signed distance from a CSS layout baseline to a native glyph
+/// program baseline at one used font size.
+///
+/// <https://www.w3.org/TR/css-fonts-4/#font-metrics>
+fn layout_to_program_ascent_delta(font: &DocumentFont, used_font_size: f32) -> f32 {
+    let units_per_em = font.units_per_em.max(1) as f32;
+    let layout_ascent = font.layout_metrics.ascender as f32 * used_font_size / units_per_em;
+    let program_ascent = font.program_metrics.ascender as f32 * used_font_size / units_per_em;
+    layout_ascent - program_ascent
 }
 
 #[derive(Debug, Clone)]
@@ -1082,7 +1349,7 @@ pub(in crate::text) fn position_shaped_runs(runs: Vec<ShapedGlyphRun>) -> Vec<Sh
                     .into_iter()
                     .enumerate()
                     .map(|(glyph_index, glyph)| ShapedInlineGlyph {
-                        paints: true,
+                        paints: !glyph.is_advance_only(),
                         rendered: glyph,
                         source_range: run.glyph_source_ranges.get(glyph_index).cloned().flatten(),
                     })
@@ -1093,38 +1360,22 @@ pub(in crate::text) fn position_shaped_runs(runs: Vec<ShapedGlyphRun>) -> Vec<Sh
         .collect()
 }
 
-pub(in crate::text) fn synthesized_tab_glyph(
-    face: &ttf_parser::Face<'_>,
-    scale: f32,
-) -> RenderedGlyph {
-    let glyph_id = face.glyph_index(' ').unwrap_or(ttf_parser::GlyphId(0));
-    let nominal_x_advance = face
-        .glyph_hor_advance(glyph_id)
-        .map(|advance| advance as f32 * scale)
-        .unwrap_or(0.0);
+/// Create a preserved CSS tab as a layout advance without a paintable glyph.
+///
+/// Its provisional advance is copied from Parley's cluster so CSS tab-stop
+/// resolution can rebase every following run from the exact cursor that the
+/// shaper used. The used advance is resolved later against the selected line
+/// cursor. This deliberately cannot fall back to `.notdef` when the shaper's
+/// temporary font run does not include U+0020.
+pub(in crate::text) fn synthesized_tab_glyph(provisional_advance: f32) -> RenderedGlyph {
     RenderedGlyph {
-        id: glyph_id.0,
-        x_advance: nominal_x_advance,
-        nominal_x_advance,
+        kind: RenderedGlyphKind::AdvanceOnly,
+        x_advance: provisional_advance,
+        nominal_x_advance: provisional_advance,
         x_offset: 0.0,
         y_offset: 0.0,
         unicode: "\t".to_string(),
     }
-}
-
-pub(in crate::text) fn tab_stop_space_advance(
-    face: &ttf_parser::Face<'_>,
-    font_size: f32,
-    scale: f32,
-    style: &ComputedStyle,
-) -> LayoutLength {
-    layout_pt(
-        face.glyph_index(' ')
-            .and_then(|glyph| face.glyph_hor_advance(glyph))
-            .map(|advance| advance as f32 * scale)
-            .unwrap_or(font_size * 0.25)
-            + style.used_word_spacing().points(),
-    )
 }
 
 pub(in crate::text) fn tab_stop_advance(period: f32, current_x: f32) -> LayoutLength {

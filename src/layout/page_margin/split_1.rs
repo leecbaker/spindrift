@@ -152,6 +152,7 @@ impl<'a> LayoutBuilder<'a> {
                 page_anchor_text: &page_anchor_text,
                 counter_styles: &counter_styles,
                 page_counters: &page_counters,
+                page_counters_by_page: &page_counter_values,
             };
             let page = self.pages[index].clone();
             let layouts = layout_page_margin_boxes(self, &page, &boxes, context);
@@ -247,7 +248,11 @@ impl<'a> LayoutBuilder<'a> {
                     &mut quote_depth,
                 ),
                 PageMarginContentItem::TargetCounter { .. }
-                | PageMarginContentItem::TargetText { .. } => {}
+                | PageMarginContentItem::TargetText { .. }
+                // Deferred named-string counters are resolved before margin
+                // box layout; retaining this arm makes that phase boundary
+                // explicit if a malformed item ever reaches painting.
+                | PageMarginContentItem::NamedStringPageCounter { .. } => {}
             }
         }
         (!items.is_empty()).then(|| {
@@ -376,6 +381,8 @@ impl<'a> LayoutBuilder<'a> {
         self.overflow_clips.clear();
         self.next_float_id = 1;
         self.float_contexts = vec![FloatContext { shapes: Vec::new() }];
+        self.active_auto_float_measurements.clear();
+        self.active_auto_float_measurement_fallbacks.clear();
         self.pending_paint_fragments.clear();
         self.pending_page_side_effects.clear();
         self.preserve_scoped_paint_public_order = false;
@@ -424,14 +431,17 @@ impl<'a> LayoutBuilder<'a> {
         let fragment = fragment.translated(PaintTranslation::new(-bounds.x(), -bounds.y()));
         let mut atom_style = (*capture.style).clone();
         atom_style.background_color = None;
-        atom_style.background_image = None;
+        atom_style.background_image = css::ComputedImage::None;
         atom_style.background_layers.clear();
         atom_style.border_width = 0.0;
         atom_style.border_widths = css::Edges::ZERO;
         atom_style.border_styles = css::BorderStyles::NONE;
         atom_style.border_image = css::BorderImage::initial();
         Some(InlineItem::Atom(Box::new(InlineAtom::new(
-            InlineAtomContent::InlineFragment(Box::new(fragment)),
+            InlineAtomContent::InlineFragment {
+                fragment: Box::new(fragment),
+                table_cell_context: None,
+            },
             atom_style,
             None,
             InlineSize::new(width, height),
@@ -581,6 +591,37 @@ pub(in crate::layout) fn page_declarations_for_rules(
         }),
     ));
     declarations
+}
+
+/// Cascades the `@footnote` page-area declarations for one generated page.
+///
+/// GCPM defines the footnote area in the page context, but it is not one of
+/// CSS Paged Media's margin boxes. It therefore shares page-selector, origin,
+/// and layer precedence while retaining a separate declaration stream for the
+/// footnote layout phase:
+/// <https://www.w3.org/TR/css-gcpm-3/#footnote-area> and
+/// <https://www.w3.org/TR/css-page-3/#cascading-in-the-page-context>.
+pub(in crate::layout) fn page_footnote_area_declarations_for_rules(
+    page_rules: &[PageRule],
+    page_number: usize,
+    page_name: Option<&str>,
+    is_blank: bool,
+    page_progression_direction: Direction,
+) -> Declarations {
+    cascade_page_rule_declarations(page_rules.iter().filter_map(|rule| {
+        rule.matching_specificity(page_number, page_name, is_blank, page_progression_direction)
+            .and_then(|specificity| {
+                rule.footnote_area.as_ref().map(|declarations| {
+                    (
+                        rule.origin,
+                        specificity,
+                        rule.layer_order,
+                        rule.order,
+                        declarations,
+                    )
+                })
+            })
+    }))
 }
 
 pub(in crate::layout) struct PageMarginCascadeContext<'a> {
@@ -849,8 +890,6 @@ pub(in crate::layout) fn page_margin_style_inheriting_page_context(
     style.list_style_type = page_style.list_style_type.clone();
     style.list_style_position = page_style.list_style_position;
     style.list_style_image = page_style.list_style_image.clone();
-    style.list_style_image_base_url = page_style.list_style_image_base_url.clone();
-    style.list_style_image_root_url = page_style.list_style_image_root_url.clone();
     style.quotes = page_style.quotes.clone();
     style.font_size = page_style.font_size;
     style.root_font_size = page_style.root_font_size;

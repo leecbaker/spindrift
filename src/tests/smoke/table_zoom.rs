@@ -1,6 +1,6 @@
 use super::*;
 
-fn filled_rects(page: &quire::Page, fill: Color) -> Vec<&quire::RenderedRect> {
+fn filled_rects(page: &quire::Page, fill: CssColor) -> Vec<&quire::RenderedRect> {
     page.rects()
         .iter()
         .filter(|rect| rect.fill == Some(fill))
@@ -24,13 +24,13 @@ async fn zoomed_separated_table_scales_parts_and_spacing_once() {
     .unwrap();
 
     let page = &document.pages[0];
-    let paint = filled_rects(page, Color::new(255, 0, 0))
+    let paint = filled_rects(page, CssColor::new(255, 0, 0))
         .into_iter()
         .next()
         .expect("zoomed table-cell descendant paint");
     assert!((paint.width() - 10.0).abs() < 0.01, "paint={paint:?}");
     assert!((paint.height() - 10.0).abs() < 0.01, "paint={paint:?}");
-    let caption = filled_rects(page, Color::new(0, 0, 255))
+    let caption = filled_rects(page, CssColor::new(0, 0, 255))
         .into_iter()
         .next()
         .expect("zoomed caption paint");
@@ -54,7 +54,7 @@ async fn explicitly_inherited_zoom_on_a_table_cell_is_applied_once() {
     .unwrap();
 
     let page = &document.pages[0];
-    let paint = filled_rects(page, Color::new(128, 0, 128))
+    let paint = filled_rects(page, CssColor::new(128, 0, 128))
         .into_iter()
         .next()
         .expect("explicitly inherited table-cell descendant paint");
@@ -78,7 +78,7 @@ async fn zoomed_table_percentages_resolve_against_the_used_table_width() {
     .unwrap();
 
     let page = &document.pages[0];
-    let paint = filled_rects(page, Color::new(255, 165, 0))
+    let paint = filled_rects(page, CssColor::new(255, 165, 0))
         .into_iter()
         .next()
         .expect("percentage-width table-cell descendant paint");
@@ -105,7 +105,7 @@ async fn zoomed_html_cellspacing_and_collapsed_borders_use_scaled_geometry() {
     .unwrap();
 
     let page = &document.pages[0];
-    let paints = filled_rects(page, Color::new(0, 255, 255));
+    let paints = filled_rects(page, CssColor::new(0, 255, 255));
     assert_eq!(paints.len(), 2, "paints={paints:?}");
     let (left, right) = if paints[0].x() <= paints[1].x() {
         (paints[0], paints[1])
@@ -119,14 +119,15 @@ async fn zoomed_html_cellspacing_and_collapsed_borders_use_scaled_geometry() {
         "paints={paints:?}"
     );
 
-    let collapsed = filled_rects(page, Color::new(0, 128, 0))
+    let collapsed = filled_rects(page, CssColor::new(0, 128, 0))
         .into_iter()
         .max_by(|left, right| left.width().total_cmp(&right.width()))
         .expect("collapsed-table background");
-    // The 50pt used table width is zoomed to 100pt and the collapsed outer
-    // border contributes two 2pt zoomed insets.
+    // A specified collapsed-table width is its wrapper width. The 50pt width
+    // therefore becomes 100pt after zoom; its 2pt outer half-insets reduce
+    // the grid width rather than expanding the wrapper background.
     assert!(
-        (collapsed.width() - 104.0).abs() < 0.01,
+        (collapsed.width() - 100.0).abs() < 0.01,
         "collapsed={collapsed:?}"
     );
 }

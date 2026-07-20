@@ -43,6 +43,11 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
                 style.font_feature_settings = font_feature_settings;
             }
         }
+        "font-variation-settings" => {
+            if let Some(font_variation_settings) = parse_font_variation_settings(value) {
+                style.font_variation_settings = font_variation_settings;
+            }
+        }
         "font-size-adjust" => {
             if let Some(font_size_adjust) = parse_font_size_adjust(value) {
                 style.font_size_adjust = font_size_adjust;
@@ -146,15 +151,13 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
                     style.list_style_position = position;
                 }
                 if components.image.eq_ignore_ascii_case("none") {
-                    style.list_style_image = None;
-                    style.list_style_image_base_url = None;
-                    style.list_style_image_root_url = None;
-                } else if let Some(Some(image)) =
-                    parse_list_style_image_component(&components.image)
-                {
-                    style.list_style_image = Some(image);
-                    style.list_style_image_base_url = declaration.base_url.cloned();
-                    style.list_style_image_root_url = declaration.root_url.cloned();
+                    style.list_style_image = ComputedImage::None;
+                } else if let Some(image) = parse_list_style_image_component(
+                    &components.image,
+                    declaration.base_url,
+                    declaration.root_url,
+                ) {
+                    style.list_style_image = image;
                 }
             }
         }
@@ -172,14 +175,10 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
             }
         }
         "list-style-image" => {
-            if value.trim().eq_ignore_ascii_case("none") {
-                style.list_style_image = None;
-                style.list_style_image_base_url = None;
-                style.list_style_image_root_url = None;
-            } else if let Some(image) = extract_css_url(value) {
-                style.list_style_image = Some(image);
-                style.list_style_image_base_url = declaration.base_url.cloned();
-                style.list_style_image_root_url = declaration.root_url.cloned();
+            if let Some(image) =
+                parse_list_style_image_component(value, declaration.base_url, declaration.root_url)
+            {
+                style.list_style_image = image;
             }
         }
         "counter-reset" => {
@@ -418,6 +417,11 @@ pub(in crate::css) fn apply_cascaded_declaration_group_3(
             "auto" => style.text_wrap_style = TextWrapStyle::Auto,
             "balance" => style.text_wrap_style = TextWrapStyle::Balance,
             "stable" => style.text_wrap_style = TextWrapStyle::Stable,
+            _ => {}
+        },
+        "wrap-inside" => match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => style.wrap_inside = WrapInside::Auto,
+            "avoid" => style.wrap_inside = WrapInside::Avoid,
             _ => {}
         },
         "line-clamp" | "-webkit-line-clamp" => {
@@ -664,6 +668,7 @@ fn parse_line_clamp(value: &str, legacy_webkit: bool) -> Option<Option<LineClamp
         max_lines,
         ellipsis,
         legacy_webkit,
+        continues_after_clamp_point: false,
     }))
 }
 

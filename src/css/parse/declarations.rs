@@ -60,7 +60,8 @@ impl<'i> cssparser::DeclarationParser<'i> for DeclarationCollector {
         // invalid-at-computed-value-time winner, so an earlier declaration may
         // still win the cascade.
         // <https://www.w3.org/TR/css-variables-1/#using-variables>
-        let contains_variable_reference = value.to_ascii_lowercase().contains("var(");
+        let contains_variable_reference =
+            crate::css::cascade::variables::contains_css_variable_reference(&value);
         if (is_custom_property_name(&name) || contains_variable_reference)
             && !custom_property_value_is_valid(&value)
         {

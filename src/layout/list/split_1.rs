@@ -58,6 +58,11 @@ impl<'a> LayoutBuilder<'a> {
             &runtime_stacks
         };
         let marker = if image.is_some() {
+            // `list-style-image` replaces the counter representation, not
+            // the marker's generated separator. An inside marker therefore
+            // still contributes the normal following U+0020 to the inline
+            // stream, where it remains available for extraction.
+            // <https://drafts.csswg.org/css-lists-3/#list-style-position-property>
             Some((String::new(), true))
         } else {
             marker_text(
@@ -128,7 +133,7 @@ impl<'a> LayoutBuilder<'a> {
                         image.decoded.pixel_height,
                         None,
                         false,
-                        Rc::clone(&image.decoded.rgb),
+                        image.decoded.rgb.shared(),
                         image.decoded.alpha.clone(),
                         None,
                     )
@@ -142,7 +147,7 @@ impl<'a> LayoutBuilder<'a> {
         self.push_inside_marker_items(marker, style, None, &mut items);
         let measurement =
             self.intrinsic_inline_measurement_for_items(items.clone(), &marker.style, f32::MAX);
-        let marker_width = measurement.contribution.max_content;
+        let marker_width = measurement.contribution.max_content.points();
         let sequence = if marker
             .text
             .chars()
@@ -205,10 +210,10 @@ impl<'a> LayoutBuilder<'a> {
                     .unwrap_or_else(|| InlineAtomContent::Image(image.decoded.clone())),
                 marker.style.clone(),
                 None,
-                InlineSize::new(
-                    image.width,
-                    image.height + inline_replaced_descent(&marker.style).points(),
-                ),
+                // The atom's content box is exactly the marker image. Line
+                // layout accounts for baseline descent separately; including
+                // it here would stretch the image's painted height.
+                InlineSize::new(image.width, image.height),
                 image.height,
                 0.0,
                 link_target.clone(),
@@ -254,16 +259,32 @@ impl<'a> LayoutBuilder<'a> {
         &self,
         style: &ComputedStyle,
     ) -> Option<MarkerImage> {
-        let src = style.list_style_image.as_ref()?;
-        let asset = load_resolved_image_source(
+        let image = style.list_style_image.as_image()?;
+        let intrinsic_resolution = image.intrinsic_resolution().max(f32::MIN_POSITIVE);
+        let css::BackgroundImage::Url {
             src,
-            style.list_style_image_base_url.as_ref().or(self.base_url),
-            style.list_style_image_root_url.as_ref(),
+            base_url,
+            root_url,
+            request_modifiers,
+        } = image.selected_image()
+        else {
+            // CSS generated images are not yet marker paint sources. They
+            // remain an invalid marker image here, allowing list-style-type
+            // fallback while that rendering path is implemented.
+            return None;
+        };
+        let asset = load_resolved_image_source_with_request(
+            src,
+            base_url.as_ref().or(self.base_url),
+            root_url.as_ref(),
             self.resource_cache,
-            true,
+            style.image_orientation == css::ImageOrientation::FromImage,
+            request_modifiers,
         )?;
         let intrinsic_size = asset.intrinsic_size();
-        if intrinsic_size.width <= 0.0 || intrinsic_size.height <= 0.0 {
+        let width = intrinsic_size.width / intrinsic_resolution;
+        let height = intrinsic_size.height / intrinsic_resolution;
+        if width <= 0.0 || height <= 0.0 {
             return None;
         }
         let (decoded, svg) = match asset {
@@ -276,8 +297,8 @@ impl<'a> LayoutBuilder<'a> {
         Some(MarkerImage {
             decoded,
             svg,
-            width: intrinsic_size.width,
-            height: intrinsic_size.height,
+            width,
+            height,
         })
     }
 }
@@ -392,23 +413,9 @@ pub(in crate::layout) fn automatic_marker_text(
         | ListStyleType::DisclosureClosed
         | ListStyleType::Anonymous(_) => Some((representation, true)),
         ListStyleType::String(_) => Some((representation, false)),
-        ListStyleType::Numeric(NumericCounterStyle::CjkDecimal)
-        | ListStyleType::Hiragana
-        | ListStyleType::HiraganaIroha
-        | ListStyleType::Katakana
-        | ListStyleType::KatakanaIroha
-        | ListStyleType::CjkEarthlyBranch
-        | ListStyleType::CjkHeavenlyStem => Some((format!("{representation}、"), false)),
-        ListStyleType::Decimal
-        | ListStyleType::DecimalLeadingZero
-        | ListStyleType::Numeric(_)
-        | ListStyleType::Additive(_)
-        | ListStyleType::LowerAlpha
-        | ListStyleType::UpperAlpha
-        | ListStyleType::LowerGreek
-        | ListStyleType::LowerRoman
-        | ListStyleType::UpperRoman
-        | ListStyleType::Named(_) => Some((format!("{representation}."), true)),
+        ListStyleType::Decimal | ListStyleType::Named(_) => {
+            Some((format!("{representation}."), true))
+        }
         ListStyleType::None => None,
     }
 }
@@ -425,28 +432,6 @@ pub(in crate::layout) fn counter_text(
         ListStyleType::DisclosureOpen => Some("\u{25be}".to_string()),
         ListStyleType::DisclosureClosed => Some("\u{25b8}".to_string()),
         ListStyleType::Decimal => Some(ordinal.to_string()),
-        ListStyleType::DecimalLeadingZero => Some(decimal_leading_zero_marker(ordinal)),
-        ListStyleType::Numeric(style) => Some(numeric_marker_i32(ordinal, numeric_digits(style))),
-        ListStyleType::Additive(style) => Some(additive_marker_i32(
-            ordinal,
-            additive_symbols(style),
-            additive_range(style),
-        )),
-        ListStyleType::LowerAlpha => Some(alpha_marker_i32(ordinal, false)),
-        ListStyleType::UpperAlpha => Some(alpha_marker_i32(ordinal, true)),
-        ListStyleType::LowerGreek => Some(alphabetic_marker_i32(ordinal, LOWER_GREEK_SYMBOLS)),
-        ListStyleType::Hiragana => Some(alphabetic_marker_i32(ordinal, HIRAGANA_SYMBOLS)),
-        ListStyleType::HiraganaIroha => {
-            Some(alphabetic_marker_i32(ordinal, HIRAGANA_IROHA_SYMBOLS))
-        }
-        ListStyleType::Katakana => Some(alphabetic_marker_i32(ordinal, KATAKANA_SYMBOLS)),
-        ListStyleType::KatakanaIroha => {
-            Some(alphabetic_marker_i32(ordinal, KATAKANA_IROHA_SYMBOLS))
-        }
-        ListStyleType::CjkEarthlyBranch => Some(fixed_marker_i32(ordinal, CJK_EARTHLY_BRANCH)),
-        ListStyleType::CjkHeavenlyStem => Some(fixed_marker_i32(ordinal, CJK_HEAVENLY_STEM)),
-        ListStyleType::LowerRoman => Some(roman_marker_i32(ordinal, false)),
-        ListStyleType::UpperRoman => Some(roman_marker_i32(ordinal, true)),
         ListStyleType::String(text) => Some(text),
         ListStyleType::Anonymous(rule) => custom_counter_text(&rule, ordinal, counter_styles),
         ListStyleType::Named(name) => counter_styles
@@ -796,21 +781,17 @@ pub(in crate::layout) fn chinese_longhand_marker(
     style: ChineseLonghandStyle,
 ) -> Option<String> {
     if !(-9999..=9999).contains(&ordinal) {
-        return Some(numeric_marker_i32(
-            ordinal,
-            numeric_digits(NumericCounterStyle::CjkDecimal),
-        ));
+        return Some(numeric_marker_i32(ordinal, CJK_DECIMAL_DIGITS));
     }
     if ordinal == 0 {
         return Some(style.digits()[0].to_string());
     }
 
-    let mut value = ordinal.abs();
-    let mut places = Vec::new();
-    for place in 0..4 {
-        places.push((value % 10, place));
-        value /= 10;
-    }
+    let mut places = std::iter::successors(Some(ordinal.abs()), |value| Some(value / 10))
+        .take(4)
+        .enumerate()
+        .map(|(place, value)| (value % 10, place))
+        .collect::<Vec<_>>();
     while matches!(places.last(), Some((0, _))) {
         places.pop();
     }
@@ -864,7 +845,7 @@ pub(in crate::layout) fn ethiopic_numeric_marker(ordinal: i32) -> Option<String>
         let odd_index = index % 2 == 1;
         let most_significant = index + 1 == groups.len();
         if group != 0 && !(most_significant && group == 1) && !(odd_index && group == 1) {
-            output.push_str(ethiopic_group_text(group));
+            output.push_str(&ethiopic_group_text(group));
         }
         if odd_index && group != 0 {
             output.push('፻');
@@ -873,4 +854,33 @@ pub(in crate::layout) fn ethiopic_numeric_marker(ordinal: i32) -> Option<String>
         }
     }
     Some(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ua_counter_styles() -> HashMap<String, CounterStyleRule> {
+        crate::css::html5_user_agent_stylesheet()
+            .counter_styles
+            .into_iter()
+            .map(|style| (style.name.clone(), style))
+            .collect()
+    }
+
+    #[test]
+    fn cjk_decimal_honors_its_ua_range_and_fallback() {
+        let counter_styles = ua_counter_styles();
+        let style = crate::css::parse_list_style_type("cjk-decimal").expect("valid style");
+
+        assert_eq!(style, ListStyleType::Named("cjk-decimal".to_string()));
+        assert_eq!(
+            counter_text(style.clone(), 12_345, &counter_styles),
+            Some("一二三四五".to_string())
+        );
+        assert_eq!(
+            counter_text(style, -1, &counter_styles),
+            Some("-1".to_string())
+        );
+    }
 }

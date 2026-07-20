@@ -10,9 +10,6 @@ pub(in crate::layout) mod state;
 
 use state::{BlockFlowChildTraversalState, ChildFlowTraversalOutcome};
 
-#[cfg(test)]
-use shared::apply_pending_normal_flow_margin_before_float;
-
 impl<'a> LayoutBuilder<'a> {
     #[expect(
         clippy::boxed_local,
@@ -31,10 +28,12 @@ impl<'a> LayoutBuilder<'a> {
             can_collapse_start_margin,
             can_collapse_end_margin,
             applied_start_margin,
+            clearance_consumed_adjoining_start_margin,
             starts_at_page_top,
             laid_out_column_children,
             use_box_inline_items,
             use_ordered_mixed_flow,
+            has_preceding_inline_flow_content,
             definite_content_height,
             descendant_percentage_height_basis,
         } = *input;
@@ -73,7 +72,9 @@ impl<'a> LayoutBuilder<'a> {
                 can_collapse_start_margin,
                 can_collapse_end_margin,
                 applied_start_margin,
+                clearance_consumed_adjoining_start_margin,
                 starts_at_page_top,
+                has_preceding_inline_flow_content,
                 &mut traversal_state,
             )
         } else {
@@ -85,6 +86,7 @@ impl<'a> LayoutBuilder<'a> {
                 can_collapse_start_margin,
                 can_collapse_end_margin,
                 applied_start_margin,
+                clearance_consumed_adjoining_start_margin,
                 starts_at_page_top,
                 &mut traversal_state,
             )
@@ -116,28 +118,6 @@ mod tests {
             .flat_map(|page| page.lines())
             .map(|line| line.text.as_str())
             .collect()
-    }
-
-    #[test]
-    fn float_hypothetical_position_includes_pending_block_margin() {
-        let mut style = ComputedStyle::initial();
-        style.float = Float::Left;
-        style.margin.top = 12.0;
-
-        apply_pending_normal_flow_margin_before_float(&mut style, Some(18.0));
-        assert_eq!(style.margin.top, 30.0);
-
-        apply_pending_normal_flow_margin_before_float(&mut style, Some(-8.0));
-        assert_eq!(style.margin.top, 22.0);
-    }
-
-    #[test]
-    fn non_float_does_not_consume_pending_block_margin() {
-        let mut style = ComputedStyle::initial();
-        style.margin.top = 12.0;
-
-        apply_pending_normal_flow_margin_before_float(&mut style, Some(18.0));
-        assert_eq!(style.margin.top, 12.0);
     }
 
     #[tokio::test]

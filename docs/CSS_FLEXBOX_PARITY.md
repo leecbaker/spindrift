@@ -1,6 +1,6 @@
 # CSS Flexbox Parity
 
-Last updated: 2026-07-18
+Last updated: 2026-07-28
 
 This document tracks Quire's implementation status for CSS Flexible Box
 Layout. The normative references are CSS Flexible Box Layout Level 1, CSS Box
@@ -19,11 +19,17 @@ references, but spec conformance is the priority when the two disagree.
   positioning, and the unfinished `flex-wrap: balance` Level 2 cases.
 
 - Flex layout is implemented under `src/layout/flex/`.
+- The raster members of the non-script `flex-aspect-ratio-img` reftest family
+  exercise correct flex/replaced-image geometry. Their former exact-PDF
+  mismatch came from raster-image XObject edge coverage versus a vector
+  reference fill, not from aspect-ratio transfer or flex sizing. Eligible
+  opaque uniform raster images now serialize as calibrated vector fills at the
+  PDF boundary, while flex layout retains its original image geometry.
 - Flex containers and items consume an effective-zoom used style at the flex
   layout boundary. Fixed flex bases, gaps, box edges, margins, and intrinsic
   replaced sizes scale once; percentages resolve against the resulting zoomed
   containing geometry, while automatic and intrinsic sizing remain algorithmic.
-- Taffy 0.11.0 remains the core engine for line formation, flexible length
+- Taffy 0.12.2 remains the core engine for line formation, flexible length
   distribution, wrapping, gaps, auto margins, and common alignment.
 - Taffy-specific limitations and Quire adapter workarounds are tracked in
   `docs/TAFFY_SHORTCOMINGS.md`.
@@ -39,6 +45,16 @@ references, but spec conformance is the priority when the two disagree.
   item paint is normalized before item layout. Anonymous flex text items are
   created for non-whitespace text runs, while CSS document-whitespace-only text
   runs are ignored even in preserved `white-space` modes.
+- Direct tree-abiding flex/grid children are blockified during box-tree
+  construction, before CSS Tables anonymous-wrapper fixup. Consequently a
+  `table-cell`, `table-row`, or row group directly inside a flex container is
+  an independent block-level item instead of becoming part of a synthetic
+  table fragment with its siblings.
+- A normal-flow flex root shares the BFC float-band placement path with block
+  layout when automatic sizing or a negative inline margin can fit beside an
+  active float. This keeps ordinary fixed-width flex roots below an obstructing
+  float while allowing a fitting negative-margin root to retain its resolved
+  inline origin.
 - Absolutely positioned flex children are collected out of flow. Their
   static-position probe uses fixed sole-item sizing and ignores authored
   flexing, including `flex-basis`, while normal absolute positioning computes
@@ -85,10 +101,45 @@ references, but spec conformance is the priority when the two disagree.
   by the independently replayed formatting context.
 - Flex item replay clears both cached and typed margins after Taffy positions
   the item's margin box, so normal-flow replay cannot reapply fixed margins.
-- An inline-flex atom now uses its captured first line only when flex layout
-  has no participating baseline and the container is not a wrapping column.
-  This preserves the dedicated multi-line column baseline algorithm while
-  allowing content-only inline flex containers to align with their parent line.
+- An auto-height physical-row flex container derives its final cross extent
+  from reconciled item margin boxes, resolving percentage margins with the
+  container's logical-inline basis. This prevents a provisional Taffy root
+  height from surviving automatic-minimum or aspect-ratio correction.
+- Flex item replay materializes each unsplit principal background and border
+  from its frozen final physical border box before replaying the independent
+  formatting context. This preserves empty-item decoration and makes
+  orthogonal flex-item paint use the same physical geometry as line formation;
+  A replaced content-box item on a physical-column main axis retains its
+  resolved outer main size during replay, so that replay does not add its
+  padding and border a second time.
+  split-item decoration remains subject to the fragmentation limitations
+  listed below.
+- Whole-flex prebreak decisions retain the distinction between a border-box
+  start and its preceding physical top margin. A flex container whose margin
+  box starts at a new page is laid out there rather than repeatedly advancing
+  to another page; this keeps vertical-writing percentage-gap cases finite.
+- Isolated float sizing and float replay suppress whole-flex prebreaks. This
+  prevents a floated orthogonal flexbox from materializing page-height replay
+  fragments merely while its auto height is being measured.
+- A nested bottom-to-top vertical block retains its horizontal parent's
+  physical block cursor. Only the principal body box is page-inline-end
+  anchored, preventing RTL vertical float replays from converting a short
+  logical inline extent into a page-height fragment.
+- Flex containers retain first/last exported baseline sets separately for
+  physical vertical and horizontal axes until the parent formatting context
+  selects a compatible baseline. Final baseline export uses reconciled flex
+  line and item geometry, so `order`, wrapping, `wrap-reverse`, and
+  `align-content` placement affect the exported coordinate. The inline-flex
+  atom no longer substitutes its captured paint fragment's first line for
+  missing flex metadata. Intrinsic nested-flex estimates use the same
+  shared-line-baseline-first selection rule as final layout, including
+  order-modified fallback selection for reversed main axes. Remaining
+  Baseline participant eligibility, synthesized-baseline selection, and CSS
+  Align fallback are resolved together after final flex-item remeasurement,
+  rather than in separate physical row/column correction passes. Remaining
+  multi-line precision issues are in final line-content/inline placement;
+  broader mixed-writing-mode baseline-set transport into parent inline layout
+  remains incomplete.
 - Replayed flex and grid item formatting contexts now retain an explicit
   physical normal-flow containing-block scope for relative/sticky descendants.
   Block, nested flex/grid/table, and inline formatting contexts consume that
@@ -149,7 +200,10 @@ references, but spec conformance is the priority when the two disagree.
   the remaining fragmentainer height. Once an auto-height row flex
   container's line cross size is final, its items replay with that final
   content-box height as a definite descendant percentage basis, including
-  lines clamped by `min-height` or `max-height`. Conversely, a percentage
+  lines clamped by `min-height` or `max-height`. Auto cross-axis margins
+  suppress stretch and therefore retain an indefinite descendant percentage
+  basis even when their content-derived used height matches the line size.
+  Conversely, a percentage
   flex-basis that falls back to `auto` against an indefinite column main size
   does not gain a definite descendant percentage basis merely because replay
   freezes the item's final used height.
@@ -188,6 +242,11 @@ references, but spec conformance is the priority when the two disagree.
   computed-value rule is applied after the cascade, so a scrollable or clipped
   axis makes the other axis's `visible`/`clip` value compute to `auto`/`hidden`
   before Flexbox selects its automatic minimum.
+- Intrinsic flex item cross contributions apply definite preferred widths and
+  heights through their used min/max constraints before a shrink-to-fit flex
+  container consumes them. This keeps a replaced column flex item with
+  `width` plus `max-width` from exporting the unconstrained preferred width
+  after final flex layout has correctly selected the clamped cross size.
 - Canvas, image-backed, and inline SVG share one replaced-element geometry
   path across flex, inline, block, grid, and table layout. Their content,
   border, and margin boxes remain distinct through flex sizing and replay, so
@@ -210,7 +269,21 @@ references, but spec conformance is the priority when the two disagree.
   Quire measures hypothetical cross-size line boxes at that resolved
   max-content base rather than at a narrower available container width. This
   avoids introducing soft wraps before the flex algorithm establishes the
-  item's main size.
+  item's main size. Float-only block items re-enter block formatting with the
+  resolved border-box containing span, rather than treating their resolved
+  content width as a parent span and subtracting their own decoration twice.
+  Once flexible lengths are known, automatic cross-size remeasurement carries
+  a typed definite `PostFlexingMainSize` basis on either physical main axis;
+  this also covers orthogonal items in physical column flex layout.
+- Wrapped column flex items with automatic, non-stretched cross sizes retain
+  their CSS fit-content used width after line-aware descendant measurement.
+  Their intrinsic min/max-content contributions remain available for later
+  sizing, but cannot overwrite the definite container-cross-size constraint
+  during final replay or line packing.
+- Replaced external SVG flex items retain a `viewBox` preferred aspect ratio
+  even when the SVG declares an external DOCTYPE. This lets a definite
+  cross-size suggestion participate in the replaced item’s automatic main
+  minimum rather than preserving the generic 300×150 fallback object size.
 - Ratio-only inline SVG roots use their available flex inline space, after
   margins, as the automatic size contribution; their `viewBox` ratio supplies
   the opposite axis. This keeps the generic default object dimensions from
@@ -269,10 +342,11 @@ references, but spec conformance is the priority when the two disagree.
   and oversized-item slice continuation now flow through committed flex
   transition decisions that own the active fragmentainer kind and next source
   block offset before replay materializes any target-specific cursor mutation.
-  Forced item transitions use the same shared page-cursor materialization gate
-  as overflow/avoid and slice continuation transitions, so column-targeted
-  forced breaks can remain committed transition records without advancing paged
-  media.
+  Forced item transitions use the same shared fragmentainer materialization
+  path as overflow/avoid and slice continuation transitions. In a multicolumn
+  context that path advances the temporary column page selected by
+  `FragmentainerOverride`, so each committed flex source slice has a concrete
+  destination fragmentainer rather than metadata-only column transitions.
   Pre-unit avoid checks now
   consume the shared target-aware
   fragmentation break-opportunity model also used by grid row-boundary
@@ -291,8 +365,9 @@ references, but spec conformance is the priority when the two disagree.
   slices and replay split visual content from the source item layout with
   page-local clipping. Fragmented block flex containers clone simple container
   backgrounds onto page-local fragments; empty flex containers now contribute
-  a fragmentable source range so their decoration can continue instead of
-  disappearing. Fragment planning also carries a non-size-contained item's
+  a fragmentable source range, whose first and final slices carry the
+  appropriate padding/border decoration, so its decoration can continue
+  instead of disappearing. Fragment planning also carries a non-size-contained item's
   measured overflowing descendant block extent separately from its used flex
   border box, so that overflow can continue into later fragmentainers.
   Document-canvas flex boxes and floated/atomic replay contexts continue to
@@ -380,21 +455,114 @@ references, but spec conformance is the priority when the two disagree.
   row-line/column-item fragments now produce page-local item slices with visual
   content continuation. Split row and wrapped-column item replay translates
   its consumed source offset before clipping, so early descendant paint is not
-  duplicated in a later fragmentainer; single-line column continuations still
-  need fragment-local main-size re-layout. The focused local runs currently
-  pass 348 of 427 `css/css-flexbox/flexbox` tests and 102 of 327
-  `css/css-break/flexbox/` reftests (450 of 754 combined). Automatic
+  duplicated in a later fragmentainer. Automatic single-line column containers
+  now extend the boundary-crossing item through the final continuation span and
+  shift following main-axis items. A definite-height single-line column box
+  also preserves its used height while extending an overflowing item's final
+  continuation. A forced break between flex items extends the preceding
+  container fragment through the remaining fragmentainer space. Wrapped-column
+  boxes whose resolved layout has one line share those continuation rules;
+  general multi-line and nested column continuations still need complete
+  fragment-local main-size re-layout. At an exhausted multicolumn boundary,
+  flex now lets its own fragment plan advance the container rather than
+  recursively prebreaking it as a whole. Positioned flex descendants measured
+  against temporary multicolumn pages now retain their final flex static
+  rectangle and replay after the enclosing real containing block is restored.
+  Wrapped-column fragmentation partitions overlapping item ranges into shared
+  vertical intervals rather than serializing cross-axis flex lines. Flex line
+  reconstruction also keeps a zero-width hypothetical stretched item with its
+  source line, so the later cross-size pass stretches every item in that line.
+  The latest full local `css/css-break/flexbox/` run passes 178 of 327
+  reftests. The most recently measured focused `css/css-flexbox/flexbox/`
+  run passes 325 of 427 tests. A final cross-size replay now reruns a
+  single-line auto-height row flex container when a binding `min-height` or
+  `max-height` establishes its used cross size, and fragment painting keeps
+  that final used border box distinct from descendant source overflow. When the next
+  whole flex line advances to a new fragmentainer, the preceding flex-box
+  fragment now paints its own background and border through that boundary,
+  including the source gap before the next line.
+  Fixed-height single-line row containers retain their declared source block
+  extent instead of being extended to fill the final continuation
+  fragmentainer; only auto-height row containers perform that continuation
+  stretch.
+  In orthogonal writing modes, a block-level flex container's automatic
+  logical inline fill enters the physical Flex adapter as a numeric physical
+  height while retaining an indefinite CSS percentage basis. This preserves
+  the final background fragment without incorrectly resolving cyclic
+  percentage gaps against that automatic used size. Its automatic physical
+  width likewise remains an indefinite percentage basis when that width is
+  the orthogonal logical block axis, while still constraining the physical
+  solver; the final intrinsic main-size pass can then resolve a cyclic gap
+  without recursive flex estimation.
+  Column-targeted `break-inside: avoid` retries retain their temporary column
+  fragmentainer context instead of rebuilding a document-page context. Direct
+  positioned multicolumn descendants with definite insets remain anchored to
+  the principal multicol containing block, while auto-inset descendants retain
+  their final source-column static position. Physical-column flex descendants
+  now also distinguish candidate-local static-position geometry from
+  source-global definite block insets before their positioned layers are
+  projected through a committed column fragment. This shares the committed
+  positioned-fragment replay path with flex descendants.
+  A shortened first multicolumn fragmentainer is now used only for the first
+  column; all continuation columns use the nominal column height, preserving
+  flex source slices across class-A avoided boundaries.
+  Synthetic multicolumn fragmentainers now preserve their local containing
+  block insets across a continuation instead of subtracting document-canvas
+  insets a second time, which had shifted later column fragments horizontally.
+  An automatic column flexbox now carries the final fragmentainer span of an
+  auto-sized item that has fragmented, including trailing empty flex space
+  after a later whole-item prebreak.
+  Split flex-item replay now uses a zero-inset off-page page context, so nested
+  multicolumn fragments retain their local origin when translated back to the
+  live page. Positioned layers that escape a split flex item now retain their
+  source-page inline coordinate during replay; only their off-page block slice
+  is translated, avoiding a duplicate item-inline offset in multicolumns.
+  Automatic
   single-line row flex containers that end at a multicolumn boundary now enter
   the fragment plan when their item subtree has no independently forced break.
+  A materialized flex-fragment record now owns its source interval,
+  destination border box, container-decoration ownership, item-local border
+  boxes, continuation state, and local-to-page translation; normal and split
+  item replay consume that record rather than independently reconstructing
+  page-local item geometry. Each committed fragment also retains explicit
+  per-line source intersections and visible item membership, so overlapping
+  wrapped-column lines are not collapsed into one enclosing source range. A sole flex line/item at an exhausted
+  fragmentainer now advances before replaying its source slice. Orthogonal
+  multicolumn continuation pages retain their complete committed destination
+  rectangle, preventing their cross-axis overflow from leaking past the
+  container after page-local translation. Direct and flex-positioned
+  descendants now both replay through the committed multicol fragment record,
+  including its containing-block scope, translation, and optional clip.
+  Physical-column flex static intervals now replay separately through every
+  intersected committed source fragment before their layers are translated and
+  clipped in the final multicolumn destination. A physical-row descendant with
+  a resolved block-start inset beyond the first committed source fragment now
+  retains candidate multicolumn fragments and replays only through its
+  final-inset owner; auto insets and the remaining nested containing-block
+  cases remain deferred.
+  A physical-column descendant with a definite block-start inset now advances
+  its source-global positioned layer by each committed source slice start
+  during destination projection; this preserves both portions of an inset box
+  that spans wrapped multicolumn fragments.
+  Auto-height single-line column continuations now consume their committed
+  source-content slice during split-item replay, preventing early descendants
+  from reappearing in later columns. Definite-height single-line column boxes
+  retain their fragment-local main-size replay because visible overflow is not
+  part of the auto-height source expansion.
+  Nested flex measurement now retains a separate fragmentable descendant-overflow
+  extent instead of overloading the normal intrinsic content height.
   Column flex replay also preserves normal items' final border-box main-size
   constraints, avoiding an erroneous padding/border-sized gap. Fragmented row
   flex items retain fragment-local stretched cross sizes and replay positioned
   descendants against the flex container's fragment-local containing block.
-  The remaining matrix shows that multi-line and column fragment-local relayout,
-  padding/border decoration slicing, and positioned-descendant containing blocks
-  inside nested multicol fragmentainers still need work. Complete fragment-plan
-  metadata for links, running elements, named pages, and other PDF side effects
-  also remains incomplete.
+  Table-item replay now retains the committed table fragments, including
+  repeated headers and footers, rather than rerunning the table from its first
+  row on every outer flex continuation. The remaining matrix shows that
+  ordinary block/inline child continuation identity, multi-line and column
+  fragment-local relayout, padding/border decoration slicing, and
+  positioned-descendant containing blocks inside nested multicol fragmentainers
+  still need work. Complete fragment-plan metadata for links, running
+  elements, named pages, and other PDF side effects also remains incomplete.
 - Baseline handling now covers horizontal and vertical-writing row
   `align-content` baseline packing. Baseline fallback alignment is
   writing-mode aware for the covered self- and content-alignment cases,
@@ -407,13 +575,21 @@ references, but spec conformance is the priority when the two disagree.
   Row flex items with normal-flow block descendants export descendant text
   baselines for first/last baseline self-alignment. Column-axis baseline
   sharing covers first and last vertical text baselines for vertical-writing
-  flex items. Rarer nested baseline edge cases still need more work.
+  flex items. Both intrinsic estimation and post-Taffy reconciliation select
+  first/last baseline contributors from the resolved physical main direction,
+  so vertical rows with reversed inline progression no longer select an item
+  from the authored logical direction. Rarer nested baseline edge cases still
+  need more work.
 - Intrinsic flex container sizing now has a dedicated contribution pipeline,
   but still needs WPT-backed auditing for the unresolved web-compatible
   algorithm, deeply nested flex/table descendants, complex block-child
   multicolumn descendants, rare
   orthogonal-flow combinations, and exact child block-size estimates for
   descendant formatting contexts beyond the covered wrapped-column float cases.
+  Orthogonal descendants still need a complete logical block-axis contribution
+  projection: the current empty-inline fallback preserves definite descendant
+  extents, but it is not a substitute for recursively projecting mixed
+  writing-mode block stacks.
 - Flex layout still needs a WPT-backed audit for generated content inside
   anonymous flex text items, absolute static-position edge cases, and remaining
   reverse/wrap-reverse combinations outside the covered vertical-writing

@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::block::child_available_space_for_formatting_context;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) enum PageStartMarginPolicy {
@@ -88,6 +89,7 @@ impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn with_formatting_context_item_placement<R>(
         &mut self,
         placement: FormattingContextItemPlacement,
+        style: &ComputedStyle,
         layout: impl FnOnce(&mut Self) -> R,
     ) -> R {
         let previous_left = self.content_left;
@@ -99,10 +101,14 @@ impl<'a> LayoutBuilder<'a> {
         // orthogonal item appear parallel to itself and loses a definite
         // physical-height inline-size basis during replay.
         // <https://www.w3.org/TR/css-writing-modes-3/#orthogonal-flows>
-        let push_child_available_space = ChildAvailableSpace::new(
-            self.containing_block_writing_mode,
+        let inherited_orthogonal_available_height = self
+            .current_child_available_space()
+            .orthogonal_available_height;
+        let push_child_available_space = child_available_space_for_formatting_context(
+            style,
             placement.content_width,
             placement.content_height,
+            inherited_orthogonal_available_height,
             PhysicalContentHeight::new(content_box_pt(self.page_area_height())),
         );
         let push_item_inline_size = placement.scope_content_logical_inline_size
@@ -189,12 +195,27 @@ impl<'a> LayoutBuilder<'a> {
             // <https://www.w3.org/TR/css-page-3/#using-named-pages>
             // <https://www.w3.org/TR/css-flexbox-1/#pagination>
             self.push_page_name_element_scope_suppression();
-            self.layout_element_with_child_boxes_without_principal_effect_context(
-                child_element,
-                placed_style,
-                stylesheets,
-                child_boxes,
-            );
+            if let Some(kind) = child.generated_pseudo_kind() {
+                self.layout_generated_pseudo_box(
+                    child_element,
+                    placed_style,
+                    kind.counter_event_source(),
+                    stylesheets,
+                    &[],
+                    child_boxes,
+                    None,
+                );
+            } else {
+                self.layout_element_with_child_boxes_run_ins_and_table_fragment_with_principal_effect_context(
+                    child_element,
+                    placed_style,
+                    stylesheets,
+                    &[],
+                    child_boxes,
+                    child.table_fragment(),
+                    false,
+                );
+            }
             self.pop_page_name_element_scope_suppression();
             self.ancestors.pop();
         } else if let Some(children) = child.anonymous_content() {

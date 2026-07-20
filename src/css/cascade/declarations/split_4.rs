@@ -109,17 +109,44 @@ pub(in crate::css) fn affected_longhands(
     if name == "inset" {
         return Some(vec!["top", "right", "bottom", "left"]);
     }
+    if matches!(
+        name,
+        "border-block-start-radius"
+            | "border-block-end-radius"
+            | "border-inline-start-radius"
+            | "border-inline-end-radius"
+    ) {
+        let corners = match name {
+            "border-block-start-radius" => ["border-start-start-radius", "border-start-end-radius"],
+            "border-block-end-radius" => ["border-end-start-radius", "border-end-end-radius"],
+            "border-inline-start-radius" => {
+                ["border-start-start-radius", "border-end-start-radius"]
+            }
+            "border-inline-end-radius" => ["border-start-end-radius", "border-end-end-radius"],
+            _ => unreachable!(),
+        };
+        return corners
+            .into_iter()
+            .map(|corner| logical_corner_radius_longhand(corner, direction, writing_mode))
+            .collect();
+    }
     if matches!(name, "border-block" | "border-inline") {
         let logical_sides = logical_axis_side_names(name)?;
-        let mut longhands = Vec::with_capacity(6);
-        for logical_side in logical_sides {
-            longhands.extend(border_side_component_longhands(logical_border_side(
-                logical_side,
-                direction,
-                writing_mode,
-            )?));
-        }
-        return Some(longhands);
+        return Some(
+            logical_sides
+                .into_iter()
+                .map(|logical_side| {
+                    Some(border_side_component_longhands(logical_border_side(
+                        logical_side,
+                        direction,
+                        writing_mode,
+                    )?))
+                })
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        );
     }
     if matches!(
         name,
@@ -286,6 +313,10 @@ pub(in crate::css) fn affected_longhands(
             "border-bottom-right-radius",
             "border-bottom-left-radius",
         ],
+        "border-top-radius" => &["border-top-left-radius", "border-top-right-radius"],
+        "border-right-radius" => &["border-top-right-radius", "border-bottom-right-radius"],
+        "border-bottom-radius" => &["border-bottom-right-radius", "border-bottom-left-radius"],
+        "border-left-radius" => &["border-top-left-radius", "border-bottom-left-radius"],
         "corner" => &[
             "border-top-left-radius",
             "corner-top-left-shape",
@@ -322,6 +353,10 @@ pub(in crate::css) fn affected_longhands(
         "border-image-width" => &["border-image-width"],
         "border-image-outset" => &["border-image-outset"],
         "border-image-repeat" => &["border-image-repeat"],
+        "outline" => &["outline-width", "outline-style", "outline-color"],
+        "outline-width" => &["outline-width"],
+        "outline-style" => &["outline-style"],
+        "outline-color" => &["outline-color"],
         "background" => &[
             "background-color",
             "background-image",
@@ -347,6 +382,9 @@ pub(in crate::css) fn affected_longhands(
         "background-origin" => &["background-origin"],
         "background-clip" => &["background-clip"],
         "text-align" => &["text-align-all", "text-align-last"],
+        "text-spacing" => &["text-spacing-trim", "text-autospace"],
+        "text-spacing-trim" => &["text-spacing-trim"],
+        "text-autospace" => &["text-autospace"],
         "text-align-all" => &["text-align-all"],
         "text-align-last" => &["text-align-last"],
         "line-fit-edge" => &["line-fit-edge"],

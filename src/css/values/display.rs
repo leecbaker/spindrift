@@ -21,6 +21,13 @@ pub(crate) fn parse_display(value: &str, current: Display) -> Display {
 
     let mut outer = None;
     let mut inner = None;
+    // CSS Display Level 4 adds `math` as an inner display type. Quire does
+    // not implement MathML layout yet, but on non-MathML elements it computes
+    // to `flow` while retaining the specified/default outer display type.
+    // Keeping this distinction here makes `display: math` preserve an
+    // inline pseudo-element's outer role, whereas `block math` is block flow.
+    // <https://drafts.csswg.org/css-display-4/#math>
+    let mut math_inner = false;
     let mut list_item = false;
     for part in parts {
         match part {
@@ -48,6 +55,12 @@ pub(crate) fn parse_display(value: &str, current: Display) -> Display {
                 if inner.replace(DisplayInner::FlowRoot).is_some() {
                     return current;
                 }
+            }
+            "math" => {
+                if inner.replace(DisplayInner::Flow).is_some() {
+                    return current;
+                }
+                math_inner = true;
             }
             "table" => {
                 if inner.replace(DisplayInner::Table).is_some() {
@@ -79,7 +92,13 @@ pub(crate) fn parse_display(value: &str, current: Display) -> Display {
         }
     }
 
-    let outer = outer.unwrap_or(DisplayOuter::Block);
+    let outer = outer.unwrap_or({
+        if math_inner {
+            current.outer
+        } else {
+            DisplayOuter::Block
+        }
+    });
     let inner = inner.unwrap_or(DisplayInner::Flow);
     if list_item && !matches!(inner, DisplayInner::Flow | DisplayInner::FlowRoot) {
         return current;

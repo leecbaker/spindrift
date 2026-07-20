@@ -171,7 +171,7 @@ capabilities that should inform Quire's public surface.
 | `HTML(base_url=...)` | `Html::with_base_url` / `with_base_path` | Available | Preserve file and URL forms with explicit error handling. |
 | `HTML(url_fetcher=...)` | `ResourcePolicy` controls built-in fetching | Partial | Define a public custom fetcher trait and response type; the built-in policy already controls redirects and strict error handling. |
 | `HTML(media_type=...)` | `RenderOptions::media_type` | Partial | Widen media type support and consider a builder to keep per-render options clear. |
-| `CSS(filename/url/string/file_obj, font_config=...)` | `Css::from_file`, `from_url_async`, `from_string` | Partial | Add reader/byte input, decoding, resource policy, and a reusable public font context. |
+| `CSS(filename/url/string/file_obj, font_config=...)` | `Css::from_file`, `from_url`, `from_string` | Partial | Add reader/byte input, decoding, resource policy, and a reusable public font context. |
 | user stylesheet origin | `Css::with_user_origin()` | Available | Make CLI and rendering-option stylesheet inputs consistently use it. |
 | `Attachment(...)` | None | Missing | Introduce a public attachment value with source, name, description, dates, and relationship. |
 | `URLFetcher`, response, fatal error | `ResourcePolicy`, `FetchErrorPolicy` | Partial | Publish a custom async fetcher interface without exposing `reqwest` types. |

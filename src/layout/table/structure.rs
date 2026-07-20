@@ -1,4 +1,5 @@
 use super::*;
+use crate::units::IntoLayoutLength;
 
 pub(super) fn table_metrics(element: &Element, style: &ComputedStyle) -> TableMetrics {
     if style.border_collapse == css::BorderCollapse::Collapse {
@@ -385,10 +386,18 @@ pub(super) fn apply_table_cellpadding(style: &mut ComputedStyle, table_cellpaddi
 pub(super) fn apply_table_cell_used_padding(
     style: &mut ComputedStyle,
     table_cellpadding: Option<f32>,
-    inline_basis: PercentageBasis<LayoutLength>,
+    inline_basis: PercentageBasis<LogicalInlineContentSize>,
 ) {
     apply_table_cellpadding(style, table_cellpadding);
-    style.padding = used_padding_edges(style, inline_basis).to_css_edges();
+    // CSS percentage padding resolves against the containing block's logical
+    // inline content box. `used_padding_edges` is the legacy layout-length
+    // boundary, so erase only the axis/box-model marker after that invariant
+    // has been recorded in the input type.
+    style.padding = used_padding_edges(
+        style,
+        inline_basis.map_value(|size| size.content_box_length().into_layout_length()),
+    )
+    .to_css_edges();
 }
 
 /// Collect the inline textual content used by anonymous and real table cells.
@@ -423,16 +432,16 @@ pub(super) fn table_cell_replaced_content_height(cell: &TableCell<'_>) -> Layout
                 .iter()
                 .filter_map(|child| match child {
                     box_tree::FormattingBox::Replaced(box_)
-                        if replaced_element_kind(box_.element)
+                        if replaced_element_kind(box_.core.element)
                             == Some(ReplacedElementKind::Svg) =>
                     {
-                        svg_rect(box_.element).map(|(_width, height, _fill)| height)
+                        svg_rect(box_.core.element).map(|(_width, height, _fill)| height)
                     }
                     box_tree::FormattingBox::AtomicInline(box_)
-                        if replaced_element_kind(box_.element)
+                        if replaced_element_kind(box_.core.element)
                             == Some(ReplacedElementKind::Svg) =>
                     {
-                        svg_rect(box_.element).map(|(_width, height, _fill)| height)
+                        svg_rect(box_.core.element).map(|(_width, height, _fill)| height)
                     }
                     _ => None,
                 })
@@ -523,19 +532,19 @@ pub(super) fn table_cell_formatting_child_outer_height(
 fn table_cell_block_child_height(child: &box_tree::FormattingBox<'_>) -> LayoutLength {
     match child {
         box_tree::FormattingBox::Block(box_) => {
-            table_cell_element_outer_height(&box_.style, &box_.children)
+            table_cell_element_outer_height(&box_.core.style, &box_.core.children)
         }
         box_tree::FormattingBox::Table(box_) => {
-            table_cell_element_outer_height(&box_.style, &box_.children)
+            table_cell_element_outer_height(&box_.core.style, &box_.core.children)
         }
         box_tree::FormattingBox::Flex(box_) => {
-            table_cell_element_outer_height(&box_.style, &box_.children)
+            table_cell_element_outer_height(&box_.core.style, &box_.core.children)
         }
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             table_cell_formatting_children_block_height(&box_.children)
         }
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-            table_cell_formatting_children_block_height(&box_.children)
+            table_cell_formatting_children_block_height(&box_.core.children)
         }
         box_tree::FormattingBox::Inline(_)
         | box_tree::FormattingBox::AtomicInline(_)
@@ -549,33 +558,33 @@ fn table_cell_inline_level_outer_height(
 ) -> Option<LayoutLength> {
     match child {
         box_tree::FormattingBox::Inline(box_) => {
-            let height = if box_.style.float != Float::None {
+            let height = if box_.core.style.float != Float::None {
                 used_content_box_height_or_auto(
-                    &box_.style,
+                    &box_.core.style,
                     layout_pt(0.0),
                     non_content_pt(
-                        box_.style.padding.top
-                            + box_.style.padding.bottom
-                            + vertical_border_width(&box_.style),
+                        box_.core.style.padding.top
+                            + box_.core.style.padding.bottom
+                            + vertical_border_width(&box_.core.style),
                     ),
                 )
                 .map(SemanticLengthExt::points)
                 .unwrap_or_else(|| {
-                    table_cell_formatting_children_block_height(&box_.children).points()
-                }) + box_.style.margin.top
-                    + box_.style.margin.bottom
+                    table_cell_formatting_children_block_height(&box_.core.children).points()
+                }) + box_.core.style.margin.top
+                    + box_.core.style.margin.bottom
             } else {
-                table_cell_formatting_children_block_height(&box_.children).points()
+                table_cell_formatting_children_block_height(&box_.core.children).points()
             };
             (height > 0.0).then_some(layout_pt(height))
         }
         box_tree::FormattingBox::AtomicInline(box_) => Some(table_cell_atomic_inline_outer_height(
-            &box_.style,
-            &box_.children,
+            &box_.core.style,
+            &box_.core.children,
         )),
         box_tree::FormattingBox::Replaced(box_) => Some(table_cell_atomic_inline_outer_height(
-            &box_.style,
-            &box_.children,
+            &box_.core.style,
+            &box_.core.children,
         )),
         box_tree::FormattingBox::AnonymousBlock(_)
         | box_tree::FormattingBox::InlineSplitBlockContext(_)
@@ -653,58 +662,6 @@ fn table_cell_element_outer_height(
         (content_height + vertical_non_content.points() + style.margin.top + style.margin.bottom)
             .max(0.0),
     )
-}
-
-pub(super) fn table_cell_content_offset(
-    style: &ComputedStyle,
-    border_insets: css::Edges,
-    content_height: f32,
-    border_box_height: f32,
-    row_baseline_offset: Option<f32>,
-    cell_baseline_offset: f32,
-) -> f32 {
-    // CSS 2.2 table height algorithms align cell boxes within row boxes using
-    // `vertical-align`; CSS Box Alignment keeps that legacy behavior for
-    // `align-content: normal`, while non-normal values align the table-cell
-    // contents in the block axis:
-    // <https://www.w3.org/TR/css-align-3/#align-content-property>.
-    let content_box_height = (border_box_height
-        - border_insets.top
-        - border_insets.bottom
-        - style.padding.top
-        - style.padding.bottom)
-        .max(0.0);
-    let free_space = content_box_height - content_height;
-    if style.align_content.keyword != ContentAlignmentKeyword::Normal {
-        if matches!(
-            style.align_content.keyword,
-            ContentAlignmentKeyword::Baseline | ContentAlignmentKeyword::LastBaseline
-        ) {
-            if let Some(baseline) = row_baseline_offset {
-                return (baseline - cell_baseline_offset).max(0.0);
-            }
-            if block_start_side(style.writing_mode).axis() == PhysicalAxis::Vertical {
-                return content_alignment_offset_toward_end(
-                    style.align_content,
-                    free_space,
-                    block_align_content_defaults_to_safe_overflow(style),
-                );
-            }
-            return 0.0;
-        }
-        return -block_align_content_y_offset_for_style(style, free_space);
-    }
-
-    let extra = free_space.max(0.0);
-    match style.vertical_align.table_cell_align {
-        TableCellVerticalAlign::Top => 0.0,
-        TableCellVerticalAlign::Middle => extra / 2.0,
-        TableCellVerticalAlign::Bottom => extra,
-        TableCellVerticalAlign::Baseline => row_baseline_offset
-            .map(|baseline| (baseline - cell_baseline_offset).max(0.0))
-            .unwrap_or(0.0)
-            .min(extra),
-    }
 }
 
 pub(super) fn table_row_span_height(

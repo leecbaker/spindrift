@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::assets::BorderPaint;
 
 /// Whether every background layer is either empty or a decoded raster URL
 /// whose source can use the independent decoration-phase painter.
@@ -11,14 +12,14 @@ fn uses_only_raster_url_background_layers(style: &ComputedStyle) -> bool {
         return style
             .background_layers
             .iter()
-            .all(|layer| match layer.image.as_ref() {
-                None => true,
+            .all(|layer| match layer.image.as_image() {
+                None => layer.image.is_none(),
                 Some(BackgroundImage::Url { src, .. }) => raster_url_suffix(src),
                 _ => false,
             });
     }
-    match style.background_image.as_ref() {
-        None => true,
+    match style.background_image.as_image() {
+        None => style.background_image.is_none(),
         Some(BackgroundImage::Url { src, .. }) => raster_url_suffix(src),
         _ => false,
     }
@@ -55,11 +56,20 @@ pub(in crate::layout) fn outline_primitives_for_border_rect(
         return Vec::new();
     }
 
+    if let Some(paths) = border_shape_outline_paths(border_rect, style) {
+        return paths.into_iter().map(PaintPrimitive::Path).collect();
+    }
+
     let mut outline_style = style.clone();
     outline_style.background_color = None;
-    outline_style.background_image = None;
+    outline_style.background_image = css::ComputedImage::None;
     outline_style.background_layers.clear();
     outline_style.border_image = css::BorderImage::initial();
+    // CSS outlines are their own final paint step. Reusing the decoration
+    // helper must not replay the element's box shadows around the synthetic
+    // outline border.
+    // <https://www.w3.org/TR/css-ui-3/#outline-props>
+    outline_style.box_shadow.clear();
     outline_style.border_width = style.outline_width;
     outline_style.border_widths = css::Edges {
         top: style.outline_width,
@@ -118,7 +128,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         start_index: usize,
         page_index: usize,
-        policy: StackingContextPolicy,
+        policy: &StackingContextPolicy,
     ) -> Vec<PaintStackingContext> {
         if !policy.captures_positioned_descendants || start_index >= self.positioned_layers.len() {
             return Vec::new();
@@ -231,7 +241,7 @@ impl<'a> LayoutBuilder<'a> {
 
     /// Scope paint emitted since `checkpoint` as an atomic/effect box.
     ///
-    /// CSS Transforms, CSS Color opacity, CSS Overflow clipping, replaced
+    /// CSS Transforms, CSS CssColor opacity, CSS Overflow clipping, replaced
     /// elements, inline-blocks, and table fragments all require descendants to
     /// paint as one isolated unit in the parent stacking order. This helper
     /// centralizes effect resolution so table/replaced/atomic callers do not
@@ -266,6 +276,13 @@ impl<'a> LayoutBuilder<'a> {
         bounds: PaintClip,
         style: &ComputedStyle,
     ) -> bool {
+        if self.float_paint_capture_depth > 0 {
+            // The enclosing float promotes this complete subtree into the
+            // Float paint band after layout. Scoping it here would remove it
+            // from that capture and leave the replaced image behind in the
+            // parent in-flow band.
+            return false;
+        }
         let fragment = self
             .current_page
             .paint_tree_fragment_since(checkpoint)
@@ -316,13 +333,19 @@ impl<'a> LayoutBuilder<'a> {
     ) -> Vec<PaintPrimitive> {
         if uses_only_raster_url_background_layers(style)
             && style.box_shadow.is_empty()
-            && style.border_image.source.is_none()
+            && !style.border_image.source.is_image()
         {
             return self.raster_background_box_primitives_in_css_paint_order(border_rect, style);
         }
 
+        let border_paint = self.border_image_paint(border_rect, style);
+        let mut normal_border_style = style.clone();
+        if matches!(&border_paint, BorderPaint::UseNormalBorder) {
+            normal_border_style.border_image.source = css::ComputedImage::None;
+        }
         let mut primitives = Vec::new();
-        let (rects, rounded_rects, paths, strokes) = block_paint_ops(border_rect, style);
+        let (rects, rounded_rects, paths, strokes) =
+            block_paint_ops(border_rect, &normal_border_style);
         primitives.extend(
             rects
                 .into_iter()
@@ -332,7 +355,12 @@ impl<'a> LayoutBuilder<'a> {
         primitives.extend(rounded_rects.into_iter().map(PaintPrimitive::RoundedRect));
         primitives.extend(paths.into_iter().map(PaintPrimitive::Path));
         primitives.extend(self.background_image_primitives(border_rect, style));
-        primitives.extend(self.border_image_slices(border_rect, style));
+        if let BorderPaint::ReplaceNormalBorder {
+            primitives: border_primitives,
+        } = border_paint
+        {
+            primitives.extend(border_primitives);
+        }
         primitives.extend(strokes.into_iter().map(PaintPrimitive::Stroke));
         primitives
     }
@@ -653,7 +681,7 @@ mod tests {
             20.0,
             10.0,
             None,
-            Color::BLACK,
+            CssColor::BLACK,
             vec![RenderedTextRun {
                 text: Rc::from("shouldbeclipped"),
                 actual_text: None,

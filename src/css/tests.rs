@@ -15,6 +15,13 @@ fn flex_basis_percentage(value: ComputedLengthPercentage) -> ComputedFlexBasis {
     ComputedFlexBasis::LengthPercentage(ComputedFlexBasisLength::new(value))
 }
 
+fn list_style_image_url(style: &ComputedStyle) -> Option<&str> {
+    match style.list_style_image.as_image()?.selected_image() {
+        BackgroundImage::Url { src, .. } => Some(src),
+        _ => None,
+    }
+}
+
 #[test]
 fn nonnegative_fixed_length_clamp_preserves_layout_length_type() {
     let clamped: LayoutLength = ComputedLengthPercentage::from_points(-3.0).length_max_zero();
@@ -384,6 +391,29 @@ async fn page_border_shorthand_uses_medium_width_when_omitted() {
 }
 
 #[tokio::test]
+async fn border_style_uses_the_initial_medium_specified_width() {
+    let mut unset = default_style_for_tag("div");
+    unset.resolve_font_metric_lengths(layout_pt(5.0));
+    assert_eq!(unset.border_widths, Edges::ZERO);
+
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &parse_declarations("border-style: double"));
+
+    assert_eq!(style.border_styles.top, BorderStyle::Double);
+    assert_eq!(style.border_styles.right, BorderStyle::Double);
+    assert_eq!(style.border_styles.bottom, BorderStyle::Double);
+    assert_eq!(style.border_styles.left, BorderStyle::Double);
+    assert_eq!(style.border_widths, edge_all(3.0 * CSS_PX_TO_PT));
+
+    let mut explicit_zero = default_style_for_tag("div");
+    apply_declarations(
+        &mut explicit_zero,
+        &parse_declarations("border-style: double; border-width: 0"),
+    );
+    assert_eq!(explicit_zero.border_widths, Edges::ZERO);
+}
+
+#[tokio::test]
 async fn page_margin_percentages_resolve_against_physical_page_dimensions() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "@page { size: 400pt 800pt; margin: 2% 8% 6% 20% }",
@@ -462,6 +492,25 @@ async fn parses_page_margin_boxes() {
     assert_eq!(
         bottom_right.get("background-color").map(String::as_str),
         Some("black")
+    );
+}
+
+#[tokio::test]
+async fn parses_gcpm_footnote_page_area_separately_from_margin_boxes() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@page { @footnote { border-top: thin solid black; max-height: 30% } \
+         @bottom-center { content: counter(page) } }",
+    ));
+
+    assert_eq!(stylesheet.page_rules[0].margin_boxes.len(), 1);
+    let footnote_area = stylesheet.page_rules[0].footnote_area.as_ref().unwrap();
+    assert_eq!(
+        footnote_area.get("border-top").map(String::as_str),
+        Some("thin solid black")
+    );
+    assert_eq!(
+        footnote_area.get("max-height").map(String::as_str),
+        Some("30%")
     );
 }
 
@@ -773,7 +822,7 @@ async fn media_not_print_does_not_apply_to_element_rules() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -789,7 +838,7 @@ async fn media_not_screen_applies_in_print_context() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -805,7 +854,7 @@ async fn media_comma_list_applies_when_one_query_matches() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -824,7 +873,7 @@ async fn invalid_media_query_syntax_does_not_apply_when_negated() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 128, 0));
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
 }
 
 #[tokio::test]
@@ -842,7 +891,7 @@ async fn media_conditions_combine_boolean_features_and_general_enclosed_syntax()
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
 }
 
 #[test]
@@ -852,6 +901,33 @@ fn media_or_condition_uses_the_valid_range_when_a_general_enclosed_term_is_false
     assert!(crate::css::media_rule_applies_in_environment(
         "(width 500px) or (min-width: 0)",
         &environment,
+    ));
+}
+
+#[test]
+fn forced_colors_media_feature_tracks_the_rendering_environment() {
+    let inactive = MediaEnvironment::new(MediaType::Print, CssViewportSize::new(800.0, 600.0));
+    let active = inactive.with_forced_colors(ForcedColorsMode::Active(ForcedColorPalette::LIGHT));
+
+    assert!(!crate::css::media_rule_applies_in_environment(
+        "(forced-colors)",
+        &inactive
+    ));
+    assert!(crate::css::media_rule_applies_in_environment(
+        "(forced-colors: none)",
+        &inactive
+    ));
+    assert!(crate::css::media_rule_applies_in_environment(
+        "(forced-colors)",
+        &active
+    ));
+    assert!(crate::css::media_rule_applies_in_environment(
+        "(forced-colors: active)",
+        &active
+    ));
+    assert!(!crate::css::media_rule_applies_in_environment(
+        "(forced-colors: invalid)",
+        &active
     ));
 }
 
@@ -887,7 +963,45 @@ async fn matching_print_media_rule_overrides_earlier_background_shorthand() {
         &[],
     );
 
-    assert_eq!(style.background_color, Some(Color::new(0, 128, 0)));
+    assert_eq!(style.background_color, Some(CssColor::new(0, 128, 0)));
+}
+
+#[test]
+fn inherited_relative_currentcolor_background_resolves_against_child_color() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "div { background-color: rgb(from currentcolor r g b); color: red } \
+         div div { color: green; background-color: inherit }",
+    ));
+    let parent = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let child = style_for_element_with_signature(
+        ElementSignature::new("div", HashMap::new()),
+        None,
+        &[stylesheet],
+        Some(&parent),
+        &[ElementSignature::new("div", HashMap::new())],
+    );
+
+    assert_eq!(parent.background_color, Some(CssColor::new(255, 0, 0)));
+    assert_eq!(
+        parent.background_color_current_color_expression.as_deref(),
+        Some("rgb(from currentcolor r g b)")
+    );
+    assert_eq!(child.color, CssColor::new(0, 128, 0));
+    assert_eq!(
+        crate::css::parse_color_from_currentcolor("rgb(from currentcolor r g b)", child.color),
+        Some(CssColor::new(0, 128, 0))
+    );
+    assert_eq!(
+        child.background_color_current_color_expression.as_deref(),
+        Some("rgb(from currentcolor r g b)")
+    );
+    assert_eq!(child.background_color, Some(CssColor::new(0, 128, 0)));
 }
 
 #[tokio::test]
@@ -907,7 +1021,7 @@ async fn screen_media_environment_applies_a_valid_or_condition() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 128, 0));
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
 }
 
 #[test]
@@ -932,7 +1046,7 @@ async fn invalid_known_media_feature_values_do_not_become_true_through_not() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 128, 0));
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
 }
 
 #[tokio::test]
@@ -959,8 +1073,8 @@ async fn inherited_background_origin_preserves_the_child_image_layers() {
     );
 
     assert_eq!(child.background_origin, BackgroundBox::Content);
-    assert!(child.background_image.is_some());
-    assert!(child.background_layers[0].image.is_some());
+    assert!(child.background_image.is_image());
+    assert!(child.background_layers[0].image.is_image());
     assert_eq!(child.background_layers[0].origin, BackgroundBox::Content);
 }
 
@@ -1012,8 +1126,25 @@ async fn dir_pseudo_class_matches_document_ltr_and_rtl_direction() {
         &[],
     );
 
-    assert_eq!(ltr.color, Color::new(0, 0, 255));
-    assert_eq!(rtl.color, Color::new(255, 0, 0));
+    assert_eq!(ltr.color, CssColor::new(0, 0, 255));
+    assert_eq!(rtl.color, CssColor::new(255, 0, 0));
+}
+
+#[tokio::test]
+async fn selector_list_cascades_with_the_specificity_of_its_matching_branch() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        ".start, .slr .start:dir(rtl) { color: red } .h .start { color: blue }",
+    ));
+    let table = ElementSignature::new("table", HashMap::from([("class".into(), "h".into())]));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("td", HashMap::from([("class".into(), "start".into())])),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[table],
+    );
+
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -1033,7 +1164,7 @@ async fn dir_pseudo_class_ignores_css_direction_property() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -1062,8 +1193,8 @@ async fn dir_pseudo_class_matches_html_auto_and_bdi_directionality() {
         &[],
     );
 
-    assert_eq!(auto.color, Color::new(255, 0, 0));
-    assert_eq!(bdi.color, Color::new(0, 0, 255));
+    assert_eq!(auto.color, CssColor::new(255, 0, 0));
+    assert_eq!(bdi.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -1135,11 +1266,26 @@ async fn has_pseudo_class_matches_descendant_dir_inherited_from_document_directi
                 .with_document_direction(Direction::Rtl)],
         );
 
-    assert_eq!(implicit_ltr.background_color, Some(Color::new(0, 255, 0)));
-    assert_eq!(explicit_ltr.background_color, Some(Color::new(0, 255, 0)));
-    assert_eq!(ancestor_ltr.background_color, Some(Color::new(0, 255, 0)));
-    assert_eq!(explicit_rtl.background_color, Some(Color::new(0, 255, 0)));
-    assert_eq!(ancestor_rtl.background_color, Some(Color::new(0, 255, 0)));
+    assert_eq!(
+        implicit_ltr.background_color,
+        Some(CssColor::new(0, 255, 0))
+    );
+    assert_eq!(
+        explicit_ltr.background_color,
+        Some(CssColor::new(0, 255, 0))
+    );
+    assert_eq!(
+        ancestor_ltr.background_color,
+        Some(CssColor::new(0, 255, 0))
+    );
+    assert_eq!(
+        explicit_rtl.background_color,
+        Some(CssColor::new(0, 255, 0))
+    );
+    assert_eq!(
+        ancestor_rtl.background_color,
+        Some(CssColor::new(0, 255, 0))
+    );
 }
 
 #[tokio::test]
@@ -1159,7 +1305,7 @@ async fn has_pseudo_class_matches_sibling_dir_from_selector_snapshot() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 255, 0));
+    assert_eq!(style.color, CssColor::new(0, 255, 0));
 }
 
 #[tokio::test]
@@ -1195,8 +1341,8 @@ async fn lang_pseudo_class_matches_basic_and_inherited_languages() {
         ],
     );
 
-    assert_eq!(english.color, Color::new(0, 0, 255));
-    assert_eq!(inherited.color, Color::new(255, 0, 0));
+    assert_eq!(english.color, CssColor::new(0, 0, 255));
+    assert_eq!(inherited.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -1256,12 +1402,15 @@ async fn lang_pseudo_class_matches_selectors_four_ranges() {
         &[],
     );
 
-    assert_eq!(regional.color, Color::new(255, 0, 0));
-    assert_eq!(regional.border_colors.top, Color::new(0, 128, 0));
-    assert_eq!(italian.background_color, Some(Color::new(0, 0, 255)));
-    assert_eq!(unknown.border_colors.right, Color::new(128, 0, 128));
-    assert_eq!(wildcard_subtag.border_colors.bottom, Color::new(0, 128, 0));
-    assert_eq!(singleton_extension.border_colors.bottom, Color::BLACK);
+    assert_eq!(regional.color, CssColor::new(255, 0, 0));
+    assert_eq!(regional.border_colors.top, CssColor::new(0, 128, 0));
+    assert_eq!(italian.background_color, Some(CssColor::new(0, 0, 255)));
+    assert_eq!(unknown.border_colors.right, CssColor::new(128, 0, 128));
+    assert_eq!(
+        wildcard_subtag.border_colors.bottom,
+        CssColor::new(0, 128, 0)
+    );
+    assert_eq!(singleton_extension.border_colors.bottom, CssColor::BLACK);
 }
 
 #[tokio::test]
@@ -1284,7 +1433,7 @@ async fn lang_pseudo_class_matches_previous_sibling_language() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -1352,12 +1501,18 @@ async fn nth_last_child_of_selector_list_counts_filtered_siblings_from_end() {
         &[],
     );
 
-    assert_eq!(first_filtered.background_color, Some(Color::new(0, 255, 0)));
+    assert_eq!(
+        first_filtered.background_color,
+        Some(CssColor::new(0, 255, 0))
+    );
     assert_eq!(
         second_filtered.background_color,
-        Some(Color::new(255, 0, 0))
+        Some(CssColor::new(255, 0, 0))
     );
-    assert_eq!(third_filtered.background_color, Some(Color::new(0, 255, 0)));
+    assert_eq!(
+        third_filtered.background_color,
+        Some(CssColor::new(0, 255, 0))
+    );
 }
 
 #[tokio::test]
@@ -1425,9 +1580,9 @@ async fn nth_child_of_selector_list_counts_filtered_siblings_from_start() {
         &[],
     );
 
-    assert_eq!(first_filtered.color, Color::new(0, 255, 0));
-    assert_eq!(second_filtered.color, Color::BLACK);
-    assert_eq!(third_filtered.color, Color::new(0, 255, 0));
+    assert_eq!(first_filtered.color, CssColor::new(0, 255, 0));
+    assert_eq!(second_filtered.color, CssColor::BLACK);
+    assert_eq!(third_filtered.color, CssColor::new(0, 255, 0));
 }
 
 #[tokio::test]
@@ -1472,7 +1627,7 @@ async fn nth_child_of_selector_list_accepts_supported_selector_forms() {
         &[ElementSignature::new("body", HashMap::new())],
     );
 
-    assert_eq!(style.color, Color::new(0, 255, 0));
+    assert_eq!(style.color, CssColor::new(0, 255, 0));
 }
 
 #[tokio::test]
@@ -1503,7 +1658,7 @@ async fn nth_child_of_selector_list_accepts_no_space_after_of() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 255, 0));
+    assert_eq!(style.color, CssColor::new(0, 255, 0));
 }
 
 #[tokio::test]
@@ -1521,7 +1676,7 @@ async fn invalid_nth_child_of_selector_list_rejects_rule_and_supports_selector()
         &[],
     );
 
-    assert_eq!(style.color, Color::BLACK);
+    assert_eq!(style.color, CssColor::BLACK);
     assert_eq!(style.background_color, None);
 }
 
@@ -1550,7 +1705,7 @@ async fn nth_child_of_selector_list_adds_selector_argument_specificity() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 255, 0));
+    assert_eq!(style.color, CssColor::new(0, 255, 0));
 }
 
 #[tokio::test]
@@ -1597,13 +1752,16 @@ async fn empty_and_has_pseudo_classes_use_child_and_sibling_snapshots() {
         &[],
     );
 
-    assert_eq!(empty.color, Color::new(0, 255, 0));
-    assert_eq!(text_only.color, Color::BLACK);
+    assert_eq!(empty.color, CssColor::new(0, 255, 0));
+    assert_eq!(text_only.color, CssColor::BLACK);
     assert_eq!(
         with_child_and_next.background_color,
-        Some(Color::new(0, 0, 255))
+        Some(CssColor::new(0, 0, 255))
     );
-    assert_eq!(with_child_and_next.border_colors.top, Color::new(255, 0, 0));
+    assert_eq!(
+        with_child_and_next.border_colors.top,
+        CssColor::new(255, 0, 0)
+    );
 }
 
 #[tokio::test]
@@ -1665,18 +1823,24 @@ async fn static_and_html_state_pseudo_classes_parse_and_match_deterministically(
         &[],
     );
 
-    assert_eq!(checked_required.color, Color::new(0, 255, 0));
+    assert_eq!(checked_required.color, CssColor::new(0, 255, 0));
     assert_eq!(
         checked_required.background_color,
-        Some(Color::new(0, 0, 255))
+        Some(CssColor::new(0, 0, 255))
     );
-    assert_eq!(checked_required.border_colors.right, Color::new(0, 255, 0));
-    assert_eq!(checked_required.border_colors.bottom, Color::new(0, 0, 255));
-    assert_eq!(checked_required.outline_color, Color::new(255, 0, 0));
-    assert_eq!(disabled.border_colors.top, Color::new(255, 0, 0));
-    assert_eq!(disabled.border_colors.right, Color::BLACK);
-    assert_eq!(readonly.outline_color, Color::new(255, 0, 0));
-    assert_eq!(writable.outline_color, Color::new(0, 0, 255));
+    assert_eq!(
+        checked_required.border_colors.right,
+        CssColor::new(0, 255, 0)
+    );
+    assert_eq!(
+        checked_required.border_colors.bottom,
+        CssColor::new(0, 0, 255)
+    );
+    assert_eq!(checked_required.outline_color, CssColor::new(255, 0, 0));
+    assert_eq!(disabled.border_colors.top, CssColor::new(255, 0, 0));
+    assert_eq!(disabled.border_colors.right, CssColor::BLACK);
+    assert_eq!(readonly.outline_color, CssColor::new(255, 0, 0));
+    assert_eq!(writable.outline_color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -1720,12 +1884,12 @@ async fn open_pseudo_class_matches_static_html_open_state() {
         &[],
     );
 
-    assert_eq!(open_details.color, Color::new(0, 255, 0));
+    assert_eq!(open_details.color, CssColor::new(0, 255, 0));
     assert_eq!(open_details.margin.left, 60.0);
-    assert_eq!(closed_details.color, Color::new(255, 0, 0));
+    assert_eq!(closed_details.color, CssColor::new(255, 0, 0));
     assert_eq!(closed_details.margin.left, 0.0);
-    assert_eq!(open_div.border_colors.top, Color::BLACK);
-    assert_eq!(section.background_color, Some(Color::new(0, 0, 255)));
+    assert_eq!(open_div.border_colors.top, CssColor::BLACK);
+    assert_eq!(section.background_color, Some(CssColor::new(0, 0, 255)));
 }
 
 #[tokio::test]
@@ -1759,10 +1923,10 @@ async fn target_pseudo_classes_match_signature_target_state() {
         &[],
     );
 
-    assert_eq!(container.background_color, Some(Color::new(0, 0, 255)));
-    assert_eq!(container.color, Color::BLACK);
-    assert_eq!(target.color, Color::new(0, 255, 0));
-    assert_eq!(target.background_color, Some(Color::new(0, 0, 255)));
+    assert_eq!(container.background_color, Some(CssColor::new(0, 0, 255)));
+    assert_eq!(container.color, CssColor::BLACK);
+    assert_eq!(target.color, CssColor::new(0, 255, 0));
+    assert_eq!(target.background_color, Some(CssColor::new(0, 0, 255)));
 }
 
 #[tokio::test]
@@ -1806,8 +1970,8 @@ async fn namespace_selectors_match_namespaced_type_and_attribute_signatures() {
     let wrong_namespace_style =
         style_for_element_with_signature(rect, None, std::slice::from_ref(&stylesheet), None, &[]);
 
-    assert_eq!(html_style.color, Color::new(0, 255, 0));
-    assert_eq!(use_style.color, Color::new(0, 0, 255));
+    assert_eq!(html_style.color, CssColor::new(0, 255, 0));
+    assert_eq!(use_style.color, CssColor::new(0, 0, 255));
     assert_eq!(wrong_namespace_style.background_color, None);
 }
 
@@ -1825,7 +1989,7 @@ async fn xml_no_namespace_elements_do_not_match_xhtml_namespace_selectors() {
         &[],
     );
 
-    assert_eq!(style.color, Color::BLACK);
+    assert_eq!(style.color, CssColor::BLACK);
 }
 
 #[tokio::test]
@@ -1844,7 +2008,7 @@ async fn xml_xhtml_namespace_elements_match_xhtml_namespace_selectors() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 255, 0));
+    assert_eq!(style.color, CssColor::new(0, 255, 0));
 }
 
 #[tokio::test]
@@ -1862,7 +2026,7 @@ async fn namespace_selectors_work_in_supports_conditions() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 255, 0));
+    assert_eq!(style.color, CssColor::new(0, 255, 0));
     assert_eq!(style.background_color, None);
 }
 
@@ -2056,25 +2220,37 @@ async fn form_state_pseudo_classes_use_html_disabled_and_local_constraint_state(
         &[],
     );
 
-    assert_eq!(disabled_by_fieldset.color, Color::new(255, 0, 0));
+    assert_eq!(disabled_by_fieldset.color, CssColor::new(255, 0, 0));
     assert_eq!(
         enabled_inside_first_legend.border_colors.top,
-        Color::new(0, 255, 0)
+        CssColor::new(0, 255, 0)
     );
-    assert_eq!(disabled_option.color, Color::new(255, 0, 0));
-    assert_eq!(invalid_required.border_colors.right, Color::new(0, 0, 255));
-    assert_eq!(invalid_required.border_colors.bottom, Color::new(255, 0, 0));
-    assert_eq!(valid_in_range.outline_color, Color::new(0, 255, 0));
-    assert_eq!(valid_in_range.background_color, Some(Color::new(0, 255, 0)));
+    assert_eq!(disabled_option.color, CssColor::new(255, 0, 0));
+    assert_eq!(
+        invalid_required.border_colors.right,
+        CssColor::new(0, 0, 255)
+    );
+    assert_eq!(
+        invalid_required.border_colors.bottom,
+        CssColor::new(255, 0, 0)
+    );
+    assert_eq!(valid_in_range.outline_color, CssColor::new(0, 255, 0));
+    assert_eq!(
+        valid_in_range.background_color,
+        Some(CssColor::new(0, 255, 0))
+    );
     assert!(checked_default.text_decoration.underline);
-    assert_eq!(unchecked.border_colors.left, Color::new(0, 0, 255));
-    assert_eq!(invalid_email.border_colors.bottom, Color::new(255, 0, 0));
-    assert_eq!(invalid_url.border_colors.bottom, Color::new(255, 0, 0));
-    assert_eq!(invalid_length.border_colors.bottom, Color::new(255, 0, 0));
-    assert_eq!(invalid_step.border_colors.bottom, Color::new(255, 0, 0));
+    assert_eq!(unchecked.border_colors.left, CssColor::new(0, 0, 255));
+    assert_eq!(invalid_email.border_colors.bottom, CssColor::new(255, 0, 0));
+    assert_eq!(invalid_url.border_colors.bottom, CssColor::new(255, 0, 0));
+    assert_eq!(
+        invalid_length.border_colors.bottom,
+        CssColor::new(255, 0, 0)
+    );
+    assert_eq!(invalid_step.border_colors.bottom, CssColor::new(255, 0, 0));
     assert_eq!(
         fallback_selected_option.outline_color,
-        Color::new(0, 0, 255)
+        CssColor::new(0, 0, 255)
     );
 }
 
@@ -2094,11 +2270,11 @@ async fn typographic_pseudo_element_rules_create_computed_style_slots() {
 
     assert_eq!(
         style.first_line_style.as_ref().unwrap().color,
-        Color::new(255, 0, 0)
+        CssColor::new(255, 0, 0)
     );
     assert_eq!(
         style.first_letter_style.as_ref().unwrap().color,
-        Color::new(0, 0, 255)
+        CssColor::new(0, 0, 255)
     );
     assert_eq!(
         style.first_line_style.as_ref().unwrap().display,
@@ -2137,7 +2313,7 @@ async fn generated_pseudo_style_inherits_without_cloning_non_inherited_propertie
     );
     let before = style.before_style.as_ref().expect("before style");
 
-    assert_eq!(before.color, Color::new(255, 0, 0));
+    assert_eq!(before.color, CssColor::new(255, 0, 0));
     assert_eq!(before.font_size, 18.0);
     assert_eq!(
         before.custom_properties.get("--accent").map(String::as_str),
@@ -2146,6 +2322,44 @@ async fn generated_pseudo_style_inherits_without_cloning_non_inherited_propertie
     assert_eq!(before.margin.left, 0.0);
     assert_eq!(before.background_color, None);
     assert_eq!(before.position, Position::Static);
+}
+
+#[tokio::test]
+async fn gcpm_footnote_pseudos_have_counter_defaults_and_author_overrides() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"aside { float: footnote; color: red; margin-left: 20pt }
+           aside::footnote-call { content: "[" counter(footnote) "]"; color: blue }
+           aside::footnote-marker { content: "* "; color: green }"#,
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("aside", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    let call = style
+        .footnote_call_style
+        .as_deref()
+        .expect("footnote call style");
+    let marker = style
+        .footnote_marker_style
+        .as_deref()
+        .expect("footnote marker style");
+
+    assert_eq!(call.color, CssColor::new(0, 0, 255));
+    assert_eq!(marker.color, CssColor::new(0, 128, 0));
+    assert_eq!(call.float, Float::None);
+    assert_eq!(marker.float, Float::None);
+    assert_eq!(call.margin.left, 0.0);
+    assert_eq!(marker.margin.left, 0.0);
+    assert_eq!(
+        marker.content,
+        Content::List {
+            parts: vec![GeneratedContentPart::Text("* ".to_string())],
+            alt: None,
+        }
+    );
 }
 
 #[tokio::test]
@@ -2202,7 +2416,7 @@ async fn marker_style_inherits_without_cloning_non_inherited_properties() {
     );
     let marker = style.marker_style.as_ref().expect("marker style");
 
-    assert_eq!(marker.color, Color::new(255, 0, 0));
+    assert_eq!(marker.color, CssColor::new(255, 0, 0));
     assert_eq!(marker.font_size, 18.0);
     assert_eq!(marker.margin.left, 0.0);
     assert_eq!(marker.background_color, None);
@@ -2288,7 +2502,7 @@ async fn media_and_requires_all_features_to_match() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -2394,10 +2608,10 @@ async fn css_url_tokens_handle_quoted_parentheses() {
     apply_declarations(&mut style, &declarations);
 
     assert!(matches!(
-        style.background_image,
-        Some(BackgroundImage::Url { ref src, .. }) if src == "images/report ) cover.png"
+        style.background_image.as_image(),
+        Some(BackgroundImage::Url { src, .. }) if src == "images/report ) cover.png"
     ));
-    assert_eq!(style.list_style_image.as_deref(), Some("markers/a)b.png"));
+    assert_eq!(list_style_image_url(&style), Some("markers/a)b.png"));
 
     let stylesheet = parse_stylesheet(&Css::from_string(
         "@font-face { font-family: ReportFont; src: url(\"fonts/report ) final.ttf\") }",
@@ -2421,13 +2635,16 @@ async fn parses_axis_aligned_linear_gradient_background_image() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image else {
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(gradient.direction, LinearGradientDirection::Angle(180.0));
     assert!(!gradient.repeating);
     assert_eq!(gradient.stops.len(), 4);
-    assert_eq!(gradient.stops[0].color, Color::new(255, 0, 0));
+    assert_eq!(
+        gradient.stops[0].color.as_color(),
+        Some(CssColor::new(255, 0, 0))
+    );
     assert_eq!(
         gradient.stops[0].position.clone().unwrap().length_points(),
         0.0
@@ -2436,7 +2653,10 @@ async fn parses_axis_aligned_linear_gradient_background_image() {
         gradient.stops[1].position.clone().unwrap().length_points(),
         37.5
     );
-    assert_eq!(gradient.stops[2].color, Color::new(0, 128, 0));
+    assert_eq!(
+        gradient.stops[2].color.as_color(),
+        Some(CssColor::new(0, 128, 0))
+    );
     assert_eq!(
         gradient.stops[2].position.clone().unwrap().length_points(),
         37.5
@@ -2453,7 +2673,7 @@ async fn parses_color_image_background_image() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
     assert!(
-        matches!(style.background_image, Some(BackgroundImage::Color(ColorImageColor::Color(color))) if color == Color::new(0, 128, 0))
+        matches!(style.background_image.as_image(), Some(BackgroundImage::CssColor(ColorImageColor::CssColor(color))) if *color == CssColor::new(0, 128, 0))
     );
 }
 
@@ -2464,10 +2684,10 @@ async fn image_set_keeps_the_selected_candidate_resolution() {
     apply_declarations(&mut style, &declarations);
 
     assert!(matches!(
-        style.background_image,
+        style.background_image.as_image(),
         Some(BackgroundImage::ImageSet { image, resolution })
-            if resolution == 0.5
-                && matches!(*image, BackgroundImage::Url { ref src, .. } if src == "green.png")
+            if *resolution == 0.5
+                && matches!(**image, BackgroundImage::Url { ref src, .. } if src == "green.png")
     ));
 }
 
@@ -2480,8 +2700,8 @@ async fn invalid_image_set_does_not_replace_the_cascaded_background_image() {
     apply_declarations(&mut style, &declarations);
 
     assert!(matches!(
-        style.background_image,
-        Some(BackgroundImage::Url { ref src, .. }) if src == "green.png"
+        style.background_image.as_image(),
+        Some(BackgroundImage::Url { src, .. }) if src == "green.png"
     ));
 }
 
@@ -2493,7 +2713,7 @@ async fn calculated_invalid_image_set_candidate_computes_to_no_image() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.background_image, None);
+    assert_eq!(style.background_image, ComputedImage::Invalid);
 }
 
 #[tokio::test]
@@ -2504,7 +2724,47 @@ async fn zero_resolution_image_set_candidate_computes_to_no_image() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.background_image, None);
+    assert_eq!(style.background_image, ComputedImage::Invalid);
+}
+
+#[tokio::test]
+async fn unknown_image_set_type_computes_to_an_invalid_image() {
+    let declarations = parse_declarations(
+        "background-image: url(red.png); background-image: image-set(url(green.png) type(\"image/unknown\"))",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.background_image, ComputedImage::Invalid);
+}
+
+#[tokio::test]
+async fn malformed_image_set_type_does_not_replace_the_cascaded_image() {
+    let declarations = parse_declarations(
+        "background-image: url(green.png); background-image: image-set(url(red.png) type(image/png))",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert!(matches!(
+        style.background_image.as_image(),
+        Some(BackgroundImage::Url { src, .. }) if src == "green.png"
+    ));
+}
+
+#[tokio::test]
+async fn supported_image_set_type_selects_its_candidate() {
+    let declarations =
+        parse_declarations("background-image: image-set(url(green.png) 1x type(\"image/png\"))");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert!(matches!(
+        style.background_image.as_image(),
+        Some(BackgroundImage::ImageSet { image, resolution })
+            if *resolution == 1.0
+                && matches!(**image, BackgroundImage::Url { ref src, .. } if src == "green.png")
+    ));
 }
 
 #[tokio::test]
@@ -2519,32 +2779,41 @@ async fn css_color_4_gradient_stops_retain_their_computed_color_spaces() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(linear)) = &style.background_layers[0].image else {
+    let Some(BackgroundImage::LinearGradient(linear)) = style.background_layers[0].image.as_image()
+    else {
         panic!("expected linear gradient");
     };
-    assert_eq!(linear.stops[0].color.space(), ColorSpace::DisplayP3);
-    assert!(linear.stops[0].color.r > 1.0);
-    assert_eq!(linear.stops[1].color.space(), ColorSpace::Rec2020);
+    let first = linear.stops[0]
+        .color
+        .as_color()
+        .expect("concrete color stop");
+    let second = linear.stops[1]
+        .color
+        .as_color()
+        .expect("concrete color stop");
+    assert_eq!(first.space(), CssColorSpace::DisplayP3);
+    assert!(first.components()[0] > 1.0);
+    assert_eq!(second.space(), CssColorSpace::Rec2020);
 
-    let Some(BackgroundImage::RadialGradient(radial)) = &style.background_layers[1].image else {
+    let Some(BackgroundImage::RadialGradient(radial)) = style.background_layers[1].image.as_image()
+    else {
         panic!("expected radial gradient");
     };
-    assert!(
-        radial
-            .stops
-            .iter()
-            .all(|stop| stop.color.space() == ColorSpace::XyzD50)
-    );
+    assert!(radial.stops.iter().all(|stop| {
+        stop.color
+            .as_color()
+            .is_some_and(|color| color.space() == CssColorSpace::XyzD50)
+    }));
 
-    let Some(BackgroundImage::ConicGradient(conic)) = &style.background_layers[2].image else {
+    let Some(BackgroundImage::ConicGradient(conic)) = style.background_layers[2].image.as_image()
+    else {
         panic!("expected conic gradient");
     };
-    assert!(
-        conic
-            .stops
-            .iter()
-            .all(|stop| stop.color.space() == ColorSpace::DisplayP3)
-    );
+    assert!(conic.stops.iter().all(|stop| {
+        stop.color
+            .as_color()
+            .is_some_and(|color| color.space() == CssColorSpace::DisplayP3)
+    }));
 }
 
 #[tokio::test]
@@ -2556,14 +2825,16 @@ async fn parses_angle_and_corner_linear_gradient_directions() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(first)) = &style.background_layers[0].image else {
+    let Some(BackgroundImage::LinearGradient(first)) = style.background_layers[0].image.as_image()
+    else {
         panic!("expected first linear gradient background image");
     };
     assert_eq!(first.direction, LinearGradientDirection::Angle(180.0));
     assert_eq!(first.stops[0].position, None);
     assert_eq!(first.stops[1].position, None);
 
-    let Some(BackgroundImage::LinearGradient(second)) = &style.background_layers[1].image else {
+    let Some(BackgroundImage::LinearGradient(second)) = style.background_layers[1].image.as_image()
+    else {
         panic!("expected second linear gradient background image");
     };
     assert_eq!(
@@ -2576,6 +2847,182 @@ async fn parses_angle_and_corner_linear_gradient_directions() {
 }
 
 #[tokio::test]
+async fn parses_css_images_4_gradient_interpolation_preludes() {
+    let declarations = parse_declarations(
+        "background-image: \
+         linear-gradient(to right in srgb, red, lime), \
+         repeating-radial-gradient(circle at center in display-p3, red, blue), \
+         conic-gradient(in oklch longer hue from .25turn at 25% 75%, red, blue)",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let Some(BackgroundImage::LinearGradient(linear)) = style.background_layers[0].image.as_image()
+    else {
+        panic!("expected linear gradient");
+    };
+    assert_eq!(linear.interpolation.space, GradientInterpolationSpace::Srgb);
+
+    let Some(BackgroundImage::RadialGradient(radial)) = style.background_layers[1].image.as_image()
+    else {
+        panic!("expected radial gradient");
+    };
+    assert_eq!(
+        radial.interpolation.space,
+        GradientInterpolationSpace::DisplayP3
+    );
+
+    let Some(BackgroundImage::ConicGradient(conic)) = style.background_layers[2].image.as_image()
+    else {
+        panic!("expected conic gradient");
+    };
+    assert_eq!(conic.interpolation.space, GradientInterpolationSpace::Oklch);
+    assert_eq!(conic.interpolation.hue, HueInterpolationMethod::Longer);
+}
+
+#[tokio::test]
+async fn rejects_invalid_gradient_interpolation_preludes() {
+    for value in [
+        "linear-gradient(in not-a-space, red, blue)",
+        "linear-gradient(in srgb longer hue, red, blue)",
+        "radial-gradient(in lch hue, red, blue)",
+        "conic-gradient(in hsl sideways hue, red, blue)",
+    ] {
+        let declarations = parse_declarations(&format!("background-image: {value}"));
+        let mut style = default_style_for_tag("div");
+        apply_declarations(&mut style, &declarations);
+        assert!(style.background_image.is_none(), "{value}");
+    }
+}
+
+#[tokio::test]
+async fn gradient_stops_retain_missing_components_and_currentcolor() {
+    let declarations = parse_declarations(
+        "background-image: linear-gradient(in srgb, color(srgb none .5 none), currentcolor)",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+        panic!("expected linear gradient");
+    };
+    assert_eq!(
+        gradient.stops[0]
+            .color
+            .missing_components_for(GradientInterpolationMethod {
+                space: GradientInterpolationSpace::Srgb,
+                hue: HueInterpolationMethod::Shorter,
+            })
+            .bits(),
+        0b0101
+    );
+    assert!(gradient.stops[1].color.is_current_color());
+    let resolved = gradient.resolve_current_color(CssColor::new(1, 2, 3));
+    assert_eq!(
+        resolved.stops[1].color.as_color(),
+        Some(CssColor::new(1, 2, 3))
+    );
+}
+
+#[tokio::test]
+async fn background_shorthand_preserves_modern_hsl_missing_components() {
+    let declarations = parse_declarations(
+        "background: linear-gradient(90deg in srgb, hsl(none none 50%), yellow)",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+        panic!("expected linear gradient");
+    };
+    assert_eq!(
+        gradient.interpolation.space,
+        GradientInterpolationSpace::Srgb
+    );
+    assert_eq!(
+        gradient.stops[0]
+            .color
+            .missing_components_for(gradient.interpolation)
+            .bits(),
+        0
+    );
+    let GradientColor::ColorWithMissing {
+        missing,
+        source: GradientMissingComponentSpace::Hsl,
+        ..
+    } = gradient.stops[0].color
+    else {
+        panic!("expected HSL missing-component metadata");
+    };
+    assert_eq!(missing.bits(), 0b0011);
+}
+
+#[tokio::test]
+async fn rgb_missing_components_do_not_become_oklab_components() {
+    let declarations = parse_declarations(
+        "background-image: linear-gradient(in oklab, rgb(none 255 0), rgb(255 0 0))",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+        panic!("expected linear gradient");
+    };
+    assert!(
+        gradient.stops[0]
+            .color
+            .missing_components_for(gradient.interpolation)
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn parses_all_polar_hue_directions() {
+    for (keyword, expected) in [
+        ("shorter", HueInterpolationMethod::Shorter),
+        ("longer", HueInterpolationMethod::Longer),
+        ("increasing", HueInterpolationMethod::Increasing),
+        ("decreasing", HueInterpolationMethod::Decreasing),
+    ] {
+        let declarations = parse_declarations(&format!(
+            "background-image: linear-gradient(to right in hsl {keyword} hue, red, orange)"
+        ));
+        let mut style = default_style_for_tag("div");
+        apply_declarations(&mut style, &declarations);
+        let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image()
+        else {
+            panic!("expected linear gradient for {keyword}");
+        };
+        assert_eq!(gradient.interpolation.hue, expected, "{keyword}");
+    }
+}
+
+#[tokio::test]
+async fn class_rule_retains_a_decreasing_hsl_gradient_method() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "div.a1 { background-image: linear-gradient(to right in hsl increasing hue, red, orange) } \
+         div.b1 { background-image: linear-gradient(to right in hsl decreasing hue, red, orange) }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new(
+            "div",
+            HashMap::from([("class".to_string(), "b1".to_string())]),
+        ),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
+        panic!("expected class background gradient");
+    };
+    assert_eq!(
+        gradient.interpolation.hue,
+        HueInterpolationMethod::Decreasing
+    );
+}
+
+#[tokio::test]
 async fn parses_repeating_linear_gradient_stops_and_hints() {
     let declarations =
         parse_declarations("background: repeating-linear-gradient(0, red, 25%, blue 50% 75%)");
@@ -2583,7 +3030,7 @@ async fn parses_repeating_linear_gradient_stops_and_hints() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image else {
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(gradient.direction, LinearGradientDirection::Angle(0.0));
@@ -2623,7 +3070,7 @@ async fn parses_radial_gradient_shape_size_position_and_stops() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::RadialGradient(gradient)) = style.background_image else {
+    let Some(BackgroundImage::RadialGradient(gradient)) = style.background_image.as_image() else {
         panic!("expected radial gradient background image");
     };
     assert_eq!(gradient.shape, RadialGradientShape::Circle);
@@ -2641,8 +3088,14 @@ async fn parses_radial_gradient_shape_size_position_and_stops() {
     );
     assert!(!gradient.repeating);
     assert_eq!(gradient.stops.len(), 2);
-    assert_eq!(gradient.stops[0].color, Color::new(255, 0, 0));
-    assert_eq!(gradient.stops[1].color, Color::new(0, 0, 255));
+    assert_eq!(
+        gradient.stops[0].color.as_color(),
+        Some(CssColor::new(255, 0, 0))
+    );
+    assert_eq!(
+        gradient.stops[1].color.as_color(),
+        Some(CssColor::new(0, 0, 255))
+    );
     assert_eq!(
         gradient.stops[1]
             .position
@@ -2668,7 +3121,7 @@ async fn parses_repeating_radial_gradient_explicit_radii() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::RadialGradient(gradient)) = style.background_image else {
+    let Some(BackgroundImage::RadialGradient(gradient)) = style.background_image.as_image() else {
         panic!("expected radial gradient background image");
     };
     assert_eq!(gradient.shape, RadialGradientShape::Ellipse);
@@ -2693,12 +3146,14 @@ async fn parses_linear_gradient_angle_units() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(first)) = &style.background_layers[0].image else {
+    let Some(BackgroundImage::LinearGradient(first)) = style.background_layers[0].image.as_image()
+    else {
         panic!("expected first gradient");
     };
     assert!((gradient_angle(first) - 90.0).abs() < 0.001);
 
-    let Some(BackgroundImage::LinearGradient(second)) = &style.background_layers[1].image else {
+    let Some(BackgroundImage::LinearGradient(second)) = style.background_layers[1].image.as_image()
+    else {
         panic!("expected second gradient");
     };
     assert!((gradient_angle(second) - 180.0).abs() < 0.001);
@@ -2719,11 +3174,14 @@ async fn parses_linear_gradient_percentage_color_stops() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image else {
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(gradient.stops.len(), 2);
-    assert_eq!(gradient.stops[0].color, Color::new(255, 0, 0));
+    assert_eq!(
+        gradient.stops[0].color.as_color(),
+        Some(CssColor::new(255, 0, 0))
+    );
     assert_eq!(
         gradient.stops[0]
             .position
@@ -2732,7 +3190,10 @@ async fn parses_linear_gradient_percentage_color_stops() {
             .percentage_coefficient_or_zero(),
         0.5
     );
-    assert_eq!(gradient.stops[1].color, Color::new(0, 128, 0));
+    assert_eq!(
+        gradient.stops[1].color.as_color(),
+        Some(CssColor::new(0, 128, 0))
+    );
     assert_eq!(
         gradient.stops[1]
             .position
@@ -2751,7 +3212,7 @@ async fn ch_linear_gradient_color_stops_resolve_before_paint() {
 
     apply_declarations(&mut style, &declarations);
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_image else {
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(
@@ -2761,14 +3222,15 @@ async fn ch_linear_gradient_color_stops_resolve_before_paint() {
 
     style.resolve_font_metric_lengths(layout_pt(6.0));
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_image else {
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(
         gradient.stops[0].position,
         Some(ComputedLengthPercentage::from_points(12.0))
     );
-    let Some(BackgroundImage::LinearGradient(layer_gradient)) = &style.background_layers[0].image
+    let Some(BackgroundImage::LinearGradient(layer_gradient)) =
+        style.background_layers[0].image.as_image()
     else {
         panic!("expected linear gradient background layer");
     };
@@ -2779,7 +3241,7 @@ async fn ch_linear_gradient_color_stops_resolve_before_paint() {
 
     style.resolve_viewport_lengths_for_viewport(LayoutSize::new(200.0, 100.0));
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_image else {
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(
@@ -2799,7 +3261,7 @@ async fn gradient_stops_resolve_em_against_the_element_font_size() {
     apply_declarations(&mut style, &declarations);
     style.finalize_computed_font_relative_lengths();
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_image else {
+    let Some(BackgroundImage::LinearGradient(gradient)) = style.background_image.as_image() else {
         panic!("expected linear gradient background image");
     };
     assert_eq!(
@@ -2811,7 +3273,9 @@ async fn gradient_stops_resolve_em_against_the_element_font_size() {
         Some(ComputedLengthPercentage::from_points(36.0))
     );
 
-    let Some(BackgroundImage::LinearGradient(gradient)) = &style.background_layers[0].image else {
+    let Some(BackgroundImage::LinearGradient(gradient)) =
+        style.background_layers[0].image.as_image()
+    else {
         panic!("expected linear gradient background layer");
     };
     assert_eq!(
@@ -2870,12 +3334,12 @@ async fn parses_comma_separated_background_layers() {
 
     assert_eq!(style.background_layers.len(), 2);
     assert!(matches!(
-        style.background_layers[0].image,
-        Some(BackgroundImage::Url { ref src, .. }) if src == "top.png"
+        style.background_layers[0].image.as_image(),
+        Some(BackgroundImage::Url { src, .. }) if src == "top.png"
     ));
     assert!(matches!(
-        style.background_layers[1].image,
-        Some(BackgroundImage::Url { ref src, .. }) if src == "bottom.png"
+        style.background_layers[1].image.as_image(),
+        Some(BackgroundImage::Url { src, .. }) if src == "bottom.png"
     ));
     assert_eq!(
         style.background_layers[0].repeat,
@@ -2908,7 +3372,7 @@ async fn background_shorthand_sets_origin_then_clip_boxes() {
 
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.background_color, Some(Color::new(255, 0, 0)));
+    assert_eq!(style.background_color, Some(CssColor::new(255, 0, 0)));
     assert_eq!(style.background_origin, BackgroundBox::Content);
     assert_eq!(style.background_clip, BackgroundBox::Border);
 }
@@ -3004,7 +3468,7 @@ async fn parses_mixed_generated_content_parts() {
                 GeneratedContentPart::Text("Chapter ".to_string()),
                 GeneratedContentPart::Counter {
                     name: "chapter".to_string(),
-                    style: Some(ListStyleType::UpperRoman),
+                    style: Some(ListStyleType::Named("upper-roman".to_string())),
                 },
                 GeneratedContentPart::Text(": ".to_string()),
                 GeneratedContentPart::Attr {
@@ -3016,12 +3480,12 @@ async fn parses_mixed_generated_content_parts() {
                     fallback: Some("Fallback".to_string()),
                 },
                 GeneratedContentPart::Image {
-                    image: BackgroundImage::Url {
+                    image: ComputedImage::image(BackgroundImage::Url {
                         src: "icon.png".to_string(),
                         base_url: None,
                         root_url: None,
                         request_modifiers: RequestUrlModifiers::default(),
-                    },
+                    }),
                 },
             ],
             alt: None,
@@ -3042,17 +3506,19 @@ async fn parses_generated_content_gradient_images() {
         panic!("expected generated content list");
     };
     assert_eq!(parts.len(), 2);
+    let GeneratedContentPart::Image { image } = &parts[0] else {
+        panic!("expected generated image");
+    };
     assert!(matches!(
-        parts[0],
-        GeneratedContentPart::Image {
-            image: BackgroundImage::LinearGradient(_)
-        }
+        image.as_image(),
+        Some(BackgroundImage::LinearGradient(_))
     ));
+    let GeneratedContentPart::Image { image } = &parts[1] else {
+        panic!("expected generated image");
+    };
     assert!(matches!(
-        parts[1],
-        GeneratedContentPart::Image {
-            image: BackgroundImage::RadialGradient(_)
-        }
+        image.as_image(),
+        Some(BackgroundImage::RadialGradient(_))
     ));
 }
 
@@ -3073,7 +3539,7 @@ async fn parses_generated_content_target_references() {
                 GeneratedContentPart::TargetCounter {
                     target: "#chapter".to_string(),
                     name: "page".to_string(),
-                    style: Some(ListStyleType::LowerRoman),
+                    style: Some(ListStyleType::Named("lower-roman".to_string())),
                 },
                 GeneratedContentPart::Text(" ".to_string()),
                 GeneratedContentPart::TargetText {
@@ -3149,12 +3615,12 @@ async fn parses_content_replacement_and_quotes_property() {
         style.content,
         Content::Replacement {
             image: GeneratedContentPart::Image {
-                image: BackgroundImage::Url {
+                image: ComputedImage::image(BackgroundImage::Url {
                     src: "icon.png".to_string(),
                     base_url: None,
                     root_url: None,
                     request_modifiers: RequestUrlModifiers::default(),
-                },
+                }),
             },
             alt: Some(vec![GeneratedAltTextPart::Text("Icon".to_string())]),
         }
@@ -3248,7 +3714,7 @@ async fn parses_css_fonts_matching_axes() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(style.font_weight, FontWeight(350));
-    assert_eq!(style.font_style, FontStyle::Oblique);
+    assert_eq!(style.font_style, FontStyle::Oblique(12.0_f32.to_bits()));
     assert_eq!(style.font_width, FontWidth::EXPANDED);
 }
 
@@ -3261,7 +3727,7 @@ async fn parses_css_font_feature_controls() {
            font-variant-position: super;
            font-variant-caps: all-small-caps;
            font-variant-numeric: oldstyle-nums tabular-nums diagonal-fractions ordinal slashed-zero;
-           font-variant-alternates: historical-forms stylistic(alt-a) styleset(alt-b alt-c) character-variant(cv-a) swash(sw-a) ornaments(orn-a) annotation(ann-a);
+           font-variant-alternates: historical-forms stylistic(alt-a) styleset(alt-b, alt-c) character-variant(cv-a) swash(sw-a) ornaments(orn-a) annotation(ann-a);
            font-variant-east-asian: jis90 proportional-width ruby;
            font-variant-emoji: text"#,
     );
@@ -3604,6 +4070,78 @@ async fn parses_font_face_descriptors_and_font_feature_values() {
             )
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn font_feature_value_aliases_preserve_case_and_decode_css_escapes() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"
+        @font-feature-values Font\62  {
+            @styleset {
+                altW: 4;
+                AlTw: 5;
+            }
+        }
+        "#,
+    ));
+
+    let values = &stylesheet.font_feature_values;
+    assert_eq!(
+        values
+            .get("fontb", FontFeatureValuesBlock::Styleset, "altW")
+            .map(|value| value.feature_index),
+        Some(4)
+    );
+    assert_eq!(
+        values
+            .get("FontB", FontFeatureValuesBlock::Styleset, "AlTw")
+            .map(|value| value.feature_index),
+        Some(5)
+    );
+    assert!(
+        values
+            .get("FontB", FontFeatureValuesBlock::Styleset, "ALTW")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn quoted_empty_font_family_is_retained_for_font_face_resources() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"
+        @font-face { font-family: ""; src: url(palette.ttf); }
+        @font-palette-values --palette { font-family: ""; base-palette: 1; }
+        "#,
+    ));
+
+    assert_eq!(stylesheet.font_faces[0].family, "");
+    assert_eq!(
+        stylesheet
+            .font_palette_values
+            .get("--palette")
+            .expect("palette definition")[0]
+            .families,
+        [""]
+    );
+}
+
+#[tokio::test]
+async fn parses_font_face_metric_override_descriptors() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        r#"
+        @font-face {
+            font-family: Metrics;
+            src: url(metrics.ttf);
+            ascent-override: 100%;
+            descent-override: 25%;
+            line-gap-override: 0%;
+        }
+        "#,
+    ));
+    let face = &stylesheet.font_faces[0];
+    assert_eq!(face.ascent_override.map(f32::from_bits), Some(1.0));
+    assert_eq!(face.descent_override.map(f32::from_bits), Some(0.25));
+    assert_eq!(face.line_gap_override.map(f32::from_bits), Some(0.0));
 }
 
 #[tokio::test]
@@ -3998,6 +4536,37 @@ async fn maps_logical_size_properties_to_physical_axes() {
 }
 
 #[tokio::test]
+async fn inherited_vertical_writing_mode_maps_inline_size_to_height() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        ".vertical { writing-mode: vertical-lr } input { inline-size: 0 }",
+    ));
+    let parent_signature =
+        ElementSignature::new("div", HashMap::from([("class".into(), "vertical".into())]));
+    let parent = style_for_element_with_signature(
+        parent_signature.clone(),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        &[],
+    );
+    let child = style_for_element_with_signature(
+        ElementSignature::new("input", HashMap::new()),
+        None,
+        &[stylesheet],
+        Some(&parent),
+        &[parent_signature],
+    );
+
+    assert_eq!(child.writing_mode, WritingMode::VerticalLr);
+    assert_eq!(
+        child.box_values.height,
+        ComputedLengthPercentageOrAuto::LengthPercentage(ComputedLengthPercentage::from_points(
+            0.0
+        ))
+    );
+}
+
+#[tokio::test]
 async fn parses_quarter_millimeter_absolute_lengths() {
     let declarations = parse_declarations("width: 40q");
     let mut style = default_style_for_tag("div");
@@ -4259,10 +4828,10 @@ async fn parses_box_declarations() {
     assert_eq!(style.padding.left, 2.25);
     assert_eq!(style.border_width, 3.0);
     assert_eq!(style.border_widths, edge_all(3.0));
-    assert_eq!(style.border_color, Color::new(255, 0, 0));
-    assert_eq!(style.border_colors.top, Color::new(255, 0, 0));
+    assert_eq!(style.border_color, CssColor::new(255, 0, 0));
+    assert_eq!(style.border_colors.top, CssColor::new(255, 0, 0));
     assert_eq!(style.border_styles.top, BorderStyle::Solid);
-    assert_eq!(style.background_color, Some(Color::new(0, 0, 255)));
+    assert_eq!(style.background_color, Some(CssColor::new(0, 0, 255)));
 }
 
 #[tokio::test]
@@ -4359,7 +4928,12 @@ async fn parses_subgrid_track_lists_for_containment_used_value_resolution() {
 
     assert!(matches!(
         style.grid_template_columns,
-        GridTrackList::Subgrid { ref line_names } if line_names == &["start", "end"]
+        GridTrackList::Subgrid { ref line_names }
+            if line_names.components
+                == vec![
+                    SubgridLineNameComponent::LineNames(vec!["start".to_string()]),
+                    SubgridLineNameComponent::LineNames(vec!["end".to_string()]),
+                ]
     ));
     assert!(matches!(
         style.grid_template_rows,
@@ -4380,6 +4954,66 @@ async fn parses_subgrid_track_lists_for_containment_used_value_resolution() {
     style.grid_template_rows.resolve_contained_subgrid();
     assert_eq!(style.grid_template_columns, GridTrackList::None);
     assert_eq!(style.grid_template_rows, GridTrackList::None);
+}
+
+#[tokio::test]
+async fn parses_and_expands_subgrid_name_repeats_against_the_used_span() {
+    let mut style = ComputedStyle::initial();
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "grid-template-rows: subgrid [x] repeat(auto-fill, [y]) repeat(100, [z])",
+        ),
+    );
+    let GridTrackList::Subgrid { line_names } = &style.grid_template_rows else {
+        panic!("expected subgrid line-name list");
+    };
+    assert_eq!(
+        line_names.expand_to_line_count(5),
+        vec![
+            vec!["x".to_string()],
+            vec!["z".to_string()],
+            vec!["z".to_string()],
+            vec!["z".to_string()],
+            vec!["z".to_string()],
+        ]
+    );
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("grid-template-columns: subgrid [] repeat(2, [a] []) [b]"),
+    );
+    let GridTrackList::Subgrid { line_names } = &style.grid_template_columns else {
+        panic!("expected subgrid line-name list with empty slots");
+    };
+    assert_eq!(
+        line_names.expand_to_line_count(6),
+        vec![
+            Vec::<String>::new(),
+            vec!["a".to_string()],
+            Vec::new(),
+            vec!["a".to_string()],
+            Vec::new(),
+            vec!["b".to_string()],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rejects_invalid_subgrid_name_repeats() {
+    for value in [
+        "subgrid repeat(auto-fit, [a])",
+        "subgrid repeat(auto-fill, [a]) repeat(auto-fill, [b])",
+        "subgrid repeat(auto-fill, 1px)",
+        "subgrid repeat(0, [a])",
+    ] {
+        let mut style = ComputedStyle::initial();
+        apply_declarations(
+            &mut style,
+            &parse_declarations(&format!("grid-template-rows: {value}")),
+        );
+        assert_eq!(style.grid_template_rows, GridTrackList::None, "{value}");
+    }
 }
 
 #[tokio::test]
@@ -4660,6 +5294,25 @@ async fn rejects_invalid_background_size_values_without_discarding_the_cascade()
 }
 
 #[tokio::test]
+async fn background_shorthand_comments_and_invalid_values_preserve_the_cascade() {
+    for value in ["/**/limegreen", "limegreen/**/"] {
+        let declarations = parse_declarations(&format!("background:{value}"));
+        let mut style = default_style_for_tag("div");
+        apply_declarations(&mut style, &declarations);
+        assert_eq!(
+            style.background_color,
+            Some(CssColor::new(50, 205, 50)),
+            "{value}"
+        );
+    }
+
+    let declarations = parse_declarations("background:limegreen; background:r/**/ed");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(style.background_color, Some(CssColor::new(50, 205, 50)));
+}
+
+#[tokio::test]
 async fn background_shorthand_size_split_ignores_url_slashes() {
     let declarations = parse_declarations(
         r#"background: url("support/1x1-green.png") 0 0 / 50px 100px no-repeat, red"#,
@@ -4668,7 +5321,7 @@ async fn background_shorthand_size_split_ignores_url_slashes() {
     apply_declarations(&mut style, &declarations);
 
     assert_eq!(style.background_layers.len(), 2);
-    assert_eq!(style.background_color, Some(Color::new(255, 0, 0)));
+    assert_eq!(style.background_color, Some(CssColor::new(255, 0, 0)));
     assert_eq!(
         style.background_layers[0].repeat,
         BackgroundRepeat::NoRepeat
@@ -4684,7 +5337,7 @@ async fn background_shorthand_size_split_ignores_url_slashes() {
             )),
         }
     );
-    assert_eq!(style.background_layers[1].image, None);
+    assert_eq!(style.background_layers[1].image, ComputedImage::None);
 }
 
 #[tokio::test]
@@ -4758,35 +5411,118 @@ async fn background_shorthand_size_split_ignores_quoted_url_parentheses() {
 async fn custom_properties_resolve_or_invalidate_declarations() {
     let mut missing = default_style_for_tag("div");
     apply_declarations(&mut missing, &parse_declarations("color: var(--missing)"));
-    assert_eq!(missing.color, Color::BLACK);
+    assert_eq!(missing.color, CssColor::BLACK);
 
     let mut duplicate = default_style_for_tag("div");
     apply_declarations(
         &mut duplicate,
         &parse_declarations("color: red; color: var(--missing)"),
     );
-    assert_eq!(duplicate.color, Color::BLACK);
+    assert_eq!(duplicate.color, CssColor::BLACK);
 
     let mut invalid_specified = default_style_for_tag("div");
     apply_declarations(
         &mut invalid_specified,
         &parse_declarations("color: red; color: definitely-not-a-color"),
     );
-    assert_eq!(invalid_specified.color, Color::new(255, 0, 0));
+    assert_eq!(invalid_specified.color, CssColor::new(255, 0, 0));
 
     let mut fallback = default_style_for_tag("div");
     apply_declarations(
         &mut fallback,
         &parse_declarations("color: var(--missing, red)"),
     );
-    assert_eq!(fallback.color, Color::new(255, 0, 0));
+    assert_eq!(fallback.color, CssColor::new(255, 0, 0));
 
     let mut nested = default_style_for_tag("div");
     apply_declarations(
         &mut nested,
         &parse_declarations("--accent: #00ff00; color: var(--accent)"),
     );
-    assert_eq!(nested.color, Color::new(0, 255, 0));
+    assert_eq!(nested.color, CssColor::new(0, 255, 0));
+}
+
+#[tokio::test]
+async fn custom_property_references_use_decoded_css_identifiers() {
+    for declarations in [
+        r"--0: green; color: var(--\30)",
+        r"--\30: green; color: var(--\30)",
+        r"--\d800: green; color: var(--\fffd)",
+        r"--\ffffff: green; color: var(--\fffd)",
+        r"--a-长-name-that-might-be-longer-than-you\27 d: green; color: var(--a-长-name-that-might-be-longer-than-you\27 d)",
+    ] {
+        let mut style = default_style_for_tag("div");
+        apply_declarations(&mut style, &parse_declarations(declarations));
+        assert_eq!(style.color, CssColor::new(0, 128, 0), "{declarations}");
+    }
+}
+
+#[tokio::test]
+async fn custom_property_resolution_uses_css_token_boundaries_and_eof_recovery() {
+    let mut escaped_function = default_style_for_tag("div");
+    apply_declarations(
+        &mut escaped_function,
+        &parse_declarations(r"--accent: green; color: v\61r(--accent)"),
+    );
+    assert_eq!(escaped_function.color, CssColor::new(0, 128, 0));
+
+    let mut eof_closed = default_style_for_tag("div");
+    apply_declarations(
+        &mut eof_closed,
+        &parse_declarations("--accent: green; color: var(--accent /* unclosed comment"),
+    );
+    assert_eq!(eof_closed.color, CssColor::new(0, 128, 0));
+
+    let mut quoted_text = default_style_for_tag("div");
+    apply_declarations(
+        &mut quoted_text,
+        &parse_declarations(r#"color: red; color: "var(--missing)""#),
+    );
+    assert_eq!(quoted_text.color, CssColor::new(255, 0, 0));
+
+    let mut cyclic = default_style_for_tag("div");
+    apply_declarations(
+        &mut cyclic,
+        &parse_declarations(r"--\30: var(--other); --other: var(--\30); color: var(--\30, green)"),
+    );
+    assert_eq!(cyclic.color, CssColor::new(0, 128, 0));
+}
+
+#[tokio::test]
+async fn variable_substitution_expands_shorthands_at_computed_value_time() {
+    let mut outline = default_style_for_tag("div");
+    apply_declarations(
+        &mut outline,
+        &parse_declarations("--color: green; outline: medium solid var(--color)"),
+    );
+    assert_eq!(outline.outline_color, CssColor::new(0, 128, 0));
+    assert_eq!(outline.outline_style, BorderStyle::Solid);
+
+    let mut logical_border = default_style_for_tag("div");
+    apply_declarations(
+        &mut logical_border,
+        &parse_declarations("--color: green; border-inline: medium solid var(--color)"),
+    );
+    assert_eq!(logical_border.border_colors.left, CssColor::new(0, 128, 0));
+    assert_eq!(logical_border.border_colors.right, CssColor::new(0, 128, 0));
+    assert_eq!(logical_border.border_styles.left, BorderStyle::Solid);
+    assert_eq!(logical_border.border_styles.right, BorderStyle::Solid);
+}
+
+#[tokio::test]
+async fn invalid_variable_shorthand_resets_every_affected_longhand() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "outline: medium solid red; outline: medium solid var(--missing); \
+             border-left: medium solid red; border: medium solid var(--missing)",
+        ),
+    );
+    assert_eq!(style.outline_style, BorderStyle::None);
+    assert_eq!(style.outline_color, CssColor::BLACK);
+    assert_eq!(style.border_styles.left, BorderStyle::None);
+    assert_eq!(style.border_colors.left, CssColor::BLACK);
 }
 
 #[tokio::test]
@@ -4803,7 +5539,7 @@ async fn invalid_custom_property_winner_does_not_fall_back_to_earlier_rule() {
         &[],
     );
 
-    assert_eq!(style.color, Color::BLACK);
+    assert_eq!(style.color, CssColor::BLACK);
 }
 
 #[tokio::test]
@@ -4813,7 +5549,7 @@ async fn important_declarations_participate_in_cascade_sorting() {
         &mut direct,
         &parse_declarations("color: red !important; color: blue"),
     );
-    assert_eq!(direct.color, Color::new(255, 0, 0));
+    assert_eq!(direct.color, CssColor::new(255, 0, 0));
 
     let stylesheet = parse_stylesheet(&Css::from_string("div { color: red !important }"));
     let inline_normal = style_for_element_with_signature(
@@ -4823,7 +5559,7 @@ async fn important_declarations_participate_in_cascade_sorting() {
         None,
         &[],
     );
-    assert_eq!(inline_normal.color, Color::new(255, 0, 0));
+    assert_eq!(inline_normal.color, CssColor::new(255, 0, 0));
 
     let inline_important = style_for_element_with_signature(
         ElementSignature::new("div", HashMap::new()),
@@ -4832,7 +5568,7 @@ async fn important_declarations_participate_in_cascade_sorting() {
         None,
         &[],
     );
-    assert_eq!(inline_important.color, Color::new(0, 0, 255));
+    assert_eq!(inline_important.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -5088,9 +5824,9 @@ async fn supports_rule_recognizes_initial_letter_properties() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
-    assert_eq!(style.border_colors.top, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.bottom, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 255));
     assert_eq!(style.background_color, None);
 }
 
@@ -5182,6 +5918,11 @@ async fn parses_display_outer_inner_model() {
         ("inline", Display::INLINE, false),
         ("run-in", Display::RUN_IN, false),
         ("run-in flow", Display::RUN_IN, false),
+        ("math", Display::INLINE, false),
+        ("inline math", Display::INLINE, false),
+        ("math inline", Display::INLINE, false),
+        ("block math", Display::BLOCK, false),
+        ("math block", Display::BLOCK, false),
         (
             "flow-root",
             Display::new(DisplayOuter::Block, DisplayInner::FlowRoot),
@@ -5327,7 +6068,10 @@ async fn parses_list_style_position_and_shorthand() {
     apply_declarations(&mut style, &declarations);
 
     assert!(style.display.is_list_item());
-    assert_eq!(style.list_style_type, ListStyleType::LowerAlpha);
+    assert_eq!(
+        style.list_style_type,
+        ListStyleType::Named("lower-alpha".to_string())
+    );
     assert_eq!(style.list_style_position, ListStylePosition::Outside);
 }
 
@@ -5343,7 +6087,7 @@ async fn parses_list_style_shorthand_string_type_in_any_order() {
             ListStyleType::String("# ".to_string())
         );
         assert_eq!(style.list_style_position, ListStylePosition::Inside);
-        assert_eq!(style.list_style_image, None);
+        assert_eq!(style.list_style_image, ComputedImage::None);
     }
 }
 
@@ -5377,7 +6121,7 @@ async fn parses_list_style_shorthand_none_ambiguity() {
         apply_declarations(&mut style, &declarations);
 
         assert_eq!(style.list_style_type, expected_type, "{value}");
-        assert_eq!(style.list_style_image.as_deref(), expected_image, "{value}");
+        assert_eq!(list_style_image_url(&style), expected_image, "{value}");
     }
 }
 
@@ -5389,15 +6133,21 @@ async fn invalid_list_style_values_do_not_partially_apply() {
     let mut style = default_style_for_tag("li");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.list_style_type, ListStyleType::LowerAlpha);
+    assert_eq!(
+        style.list_style_type,
+        ListStyleType::Named("lower-alpha".to_string())
+    );
     assert_eq!(style.list_style_position, ListStylePosition::Inside);
-    assert_eq!(style.list_style_image.as_deref(), Some("marker.png"));
+    assert_eq!(list_style_image_url(&style), Some("marker.png"));
 
     apply_declarations(
         &mut style,
         &parse_declarations("list-style-type: \"# \" inside"),
     );
-    assert_eq!(style.list_style_type, ListStyleType::LowerAlpha);
+    assert_eq!(
+        style.list_style_type,
+        ListStyleType::Named("lower-alpha".to_string())
+    );
 }
 
 #[tokio::test]
@@ -5489,38 +6239,71 @@ async fn parses_list_style_image_longhand_and_shorthand() {
 
     assert_eq!(style.list_style_type, ListStyleType::Square);
     assert_eq!(style.list_style_position, ListStylePosition::Inside);
-    assert_eq!(style.list_style_image.as_deref(), Some("other.png"));
+    assert_eq!(list_style_image_url(&style), Some("other.png"));
 
     apply_declarations(&mut style, &parse_declarations("list-style-image: none"));
-    assert_eq!(style.list_style_image, None);
+    assert_eq!(style.list_style_image, ComputedImage::None);
 }
 
 #[tokio::test]
-async fn parses_predefined_counter_style_names() {
+async fn list_style_image_preserves_image_set_resolution_and_rejects_invalid_values() {
+    let mut style = default_style_for_tag("li");
+    apply_declarations(
+        &mut style,
+        &parse_declarations(
+            "list-style-image: image-set(url(marker.png) 0.5x); \
+             list-style-image: image-set(url(ignored.png) -1x)",
+        ),
+    );
+
+    assert!(matches!(
+        style.list_style_image.as_image(),
+        Some(BackgroundImage::ImageSet { image, resolution })
+            if *resolution == 0.5
+                && matches!(**image, BackgroundImage::Url { ref src, .. } if src == "marker.png")
+    ));
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("list-style: square inside image-set(url(shorthand.png) 2x)"),
+    );
+    assert_eq!(style.list_style_type, ListStyleType::Square);
+    assert_eq!(style.list_style_position, ListStylePosition::Inside);
+    assert!(matches!(
+        style.list_style_image.as_image(),
+        Some(BackgroundImage::ImageSet { image, resolution })
+            if *resolution == 2.0
+                && matches!(**image, BackgroundImage::Url { ref src, .. } if src == "shorthand.png")
+    ));
+}
+
+#[tokio::test]
+async fn parses_overridable_predefined_counter_style_names_as_named_styles() {
     for (value, expected) in [
-        ("decimal-leading-zero", ListStyleType::DecimalLeadingZero),
-        (
-            "arabic-indic",
-            ListStyleType::Numeric(NumericCounterStyle::ArabicIndic),
-        ),
-        (
-            "khmer",
-            ListStyleType::Numeric(NumericCounterStyle::Cambodian),
-        ),
-        (
-            "lower-armenian",
-            ListStyleType::Additive(AdditiveCounterStyle::LowerArmenian),
-        ),
-        ("lower-greek", ListStyleType::LowerGreek),
-        ("hiragana-iroha", ListStyleType::HiraganaIroha),
-        ("cjk-heavenly-stem", ListStyleType::CjkHeavenlyStem),
-        ("disclosure-closed", ListStyleType::DisclosureClosed),
+        ("decimal-leading-zero", "decimal-leading-zero"),
+        ("arabic-indic", "arabic-indic"),
+        ("khmer", "khmer"),
+        ("cjk-decimal", "cjk-decimal"),
+        ("lower-armenian", "lower-armenian"),
+        ("lower-greek", "lower-greek"),
+        ("hiragana-iroha", "hiragana-iroha"),
+        ("cjk-heavenly-stem", "cjk-heavenly-stem"),
+        ("upper-roman", "upper-roman"),
     ] {
         let declarations = parse_declarations(&format!("list-style-type: {value}"));
         let mut style = default_style_for_tag("li");
         apply_declarations(&mut style, &declarations);
-        assert_eq!(style.list_style_type, expected, "{value}");
+        assert_eq!(
+            style.list_style_type,
+            ListStyleType::Named(expected.to_string()),
+            "{value}"
+        );
     }
+
+    let declarations = parse_declarations("list-style-type: disclosure-closed");
+    let mut style = default_style_for_tag("li");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(style.list_style_type, ListStyleType::DisclosureClosed);
 }
 
 #[tokio::test]
@@ -6024,7 +6807,7 @@ async fn parses_named_string_sets() {
         vec![
             NamedStringPart::Counter {
                 name: "section".to_string(),
-                style: Some(ListStyleType::UpperRoman)
+                style: Some(ListStyleType::Named("upper-roman".to_string()))
             },
             NamedStringPart::String(".".to_string()),
             NamedStringPart::Counters {
@@ -6038,12 +6821,12 @@ async fn parses_named_string_sets() {
         style.string_sets[4].parts,
         vec![
             NamedStringPart::String("Icon".to_string()),
-            NamedStringPart::Image(BackgroundImage::Url {
+            NamedStringPart::Image(ComputedImage::image(BackgroundImage::Url {
                 src: "icon.png".to_string(),
                 base_url: None,
                 root_url: None,
                 request_modifiers: RequestUrlModifiers::default(),
-            })
+            }))
         ]
     );
 }
@@ -6064,7 +6847,7 @@ async fn parses_named_string_target_references() {
             NamedStringPart::TargetCounter {
                 target: "#chapter".to_string(),
                 name: "page".to_string(),
-                style: Some(ListStyleType::UpperRoman)
+                style: Some(ListStyleType::Named("upper-roman".to_string()))
             },
             NamedStringPart::String(" ".to_string()),
             NamedStringPart::TargetText {
@@ -7514,6 +8297,93 @@ async fn parses_text_autospace_keyword_set() {
 }
 
 #[tokio::test]
+async fn parses_text_spacing_trim_and_shorthand() {
+    let mut style = default_style_for_tag("div");
+    for (value, expected) in [
+        ("space-all", TextSpacingTrim::SpaceAll),
+        ("normal", TextSpacingTrim::Normal),
+        ("space-first", TextSpacingTrim::SpaceFirst),
+        ("trim-start", TextSpacingTrim::TrimStart),
+        ("trim-both", TextSpacingTrim::TrimBoth),
+        ("trim-all", TextSpacingTrim::TrimAll),
+        ("auto", TextSpacingTrim::Auto),
+    ] {
+        apply_declarations(
+            &mut style,
+            &parse_declarations(&format!("text-spacing-trim: {value}")),
+        );
+        assert_eq!(style.text_spacing_trim, expected);
+    }
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("text-spacing-trim: trim-start trim-all"),
+    );
+    assert_eq!(style.text_spacing_trim, TextSpacingTrim::Auto);
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("text-spacing: trim-all no-autospace"),
+    );
+    assert_eq!(style.text_spacing_trim, TextSpacingTrim::TrimAll);
+    assert_eq!(style.text_autospace, TextAutospace::NONE);
+
+    apply_declarations(
+        &mut style,
+        &parse_declarations("text-spacing: trim-start trim-all"),
+    );
+    assert_eq!(style.text_spacing_trim, TextSpacingTrim::TrimAll);
+
+    apply_declarations(&mut style, &parse_declarations("text-spacing: none"));
+    assert_eq!(style.text_spacing_trim, TextSpacingTrim::SpaceAll);
+    assert_eq!(style.text_autospace, TextAutospace::NONE);
+}
+
+#[tokio::test]
+async fn text_spacing_trim_inherits_and_honors_css_wide_keywords() {
+    let parent = style_for_element_with_signature(
+        ElementSignature::new("section", HashMap::new()),
+        Some("text-spacing: trim-all no-autospace"),
+        &[],
+        None,
+        &[],
+    );
+    let inherited = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[],
+        Some(&parent),
+        &[],
+    );
+    assert_eq!(inherited.text_spacing_trim, TextSpacingTrim::TrimAll);
+    assert_eq!(inherited.text_autospace, TextAutospace::NONE);
+
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "p { text-spacing: initial } q { text-spacing: inherit } em { text-spacing: unset }",
+    ));
+    let initial = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        Some(&parent),
+        &[],
+    );
+    assert_eq!(initial.text_spacing_trim, TextSpacingTrim::Normal);
+    assert_eq!(initial.text_autospace, TextAutospace::NORMAL);
+    for tag in ["q", "em"] {
+        let style = style_for_element_with_signature(
+            ElementSignature::new(tag, HashMap::new()),
+            None,
+            std::slice::from_ref(&stylesheet),
+            Some(&parent),
+            &[],
+        );
+        assert_eq!(style.text_spacing_trim, TextSpacingTrim::TrimAll);
+        assert_eq!(style.text_autospace, TextAutospace::NONE);
+    }
+}
+
+#[tokio::test]
 async fn parses_inherited_word_space_transform_keyword_set() {
     let declarations = parse_declarations("word-space-transform: auto-phrase ideographic-space");
     let mut style = default_style_for_tag("div");
@@ -7894,6 +8764,20 @@ async fn parses_float_values() {
     let declarations = parse_declarations("float: inline-end");
     apply_declarations(&mut style, &declarations);
     assert_eq!(style.float, Float::InlineEnd);
+
+    let declarations = parse_declarations("float: footnote");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(style.float, Float::Footnote);
+}
+
+#[tokio::test]
+async fn parses_gcpm_footnote_display_and_policy() {
+    let declarations = parse_declarations("footnote-display: compact; footnote-policy: line");
+    let mut style = default_style_for_tag("span");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.footnote_display, FootnoteDisplay::Compact);
+    assert_eq!(style.footnote_policy, FootnotePolicy::Line);
 }
 
 #[tokio::test]
@@ -8286,10 +9170,10 @@ async fn table_rules_groups_presentational_hint_sets_group_border_color() {
         &[table_signature],
     );
 
-    assert_eq!(hinted.border_colors.bottom, Color::new(128, 128, 128));
+    assert_eq!(hinted.border_colors.bottom, CssColor::new(128, 128, 128));
     assert_eq!(hinted.border_styles.bottom, BorderStyle::Solid);
     assert_eq!(hinted.border_widths.bottom, 0.75);
-    assert_eq!(overridden.border_colors.bottom, Color::new(0, 0, 255));
+    assert_eq!(overridden.border_colors.bottom, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -8310,7 +9194,7 @@ async fn hr_dynamic_presentational_hints_are_optional() {
 
     assert!(style.box_values.width.is_auto());
     assert!(style.box_values.height.is_auto());
-    assert_eq!(style.color, Color::new(128, 128, 128));
+    assert_eq!(style.color, CssColor::new(128, 128, 128));
     assert_eq!(style.border_widths.top, CSS_PX_TO_PT);
 }
 
@@ -8425,9 +9309,9 @@ async fn hr_color_presentational_hint_maps_color() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
-    assert_eq!(style.border_color, Color::new(255, 0, 0));
-    assert_eq!(style.border_colors.top, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
+    assert_eq!(style.border_color, CssColor::new(255, 0, 0));
+    assert_eq!(style.border_colors.top, CssColor::new(255, 0, 0));
     assert_eq!(style.border_styles.top, BorderStyle::Solid);
 }
 
@@ -8459,8 +9343,121 @@ async fn author_css_overrides_dynamic_hr_presentational_hints() {
     };
     assert_eq!(width.length_points(), 25.0);
     assert_eq!(height.length_points(), 2.0);
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
     assert_eq!(style.border_widths.top, 1.0);
+}
+
+#[tokio::test]
+async fn table_dynamic_presentational_hints_use_css_values_and_author_precedence() {
+    let ua = html5_user_agent_stylesheet();
+    let hints = html5_presentational_hints_stylesheet();
+    let author = parse_stylesheet(&Css::from_string(
+        "table { width: 25pt; border-spacing: 2pt; border-color: blue }",
+    ));
+    let mut attrs = HashMap::new();
+    attrs.insert("width".to_string(), "150%".to_string());
+    attrs.insert("height".to_string(), "40".to_string());
+    attrs.insert("cellspacing".to_string(), "8".to_string());
+    attrs.insert("bordercolor".to_string(), "red".to_string());
+
+    let hinted = style_for_element_with_signature(
+        ElementSignature::new("table", attrs.clone()),
+        None,
+        &[ua.clone(), hints.clone()],
+        None,
+        &[],
+    );
+    let overridden = style_for_element_with_signature(
+        ElementSignature::new("table", attrs),
+        None,
+        &[ua, hints, author],
+        None,
+        &[],
+    );
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = hinted.box_values.width else {
+        panic!("table width hint should map to a CSS percentage");
+    };
+    assert!((width.percentage_coefficient_or_zero() - 1.5).abs() < 0.001);
+    assert_eq!(
+        hinted.border_spacing.horizontal.length_points(),
+        8.0 * CSS_PX_TO_PT
+    );
+    assert_eq!(hinted.border_colors.top, CssColor::new(255, 0, 0));
+    let ComputedLengthPercentageOrAuto::LengthPercentage(height) = hinted.box_values.height else {
+        panic!("table height hint should map to a CSS length");
+    };
+    assert!((height.length_points() - 40.0 * CSS_PX_TO_PT).abs() < 0.001);
+
+    let ComputedLengthPercentageOrAuto::LengthPercentage(width) = overridden.box_values.width
+    else {
+        panic!("author table width should win");
+    };
+    assert_eq!(width.length_points(), 25.0);
+    assert_eq!(overridden.border_spacing.horizontal.length_points(), 2.0);
+    assert_eq!(overridden.border_colors.top, CssColor::new(0, 0, 255));
+}
+
+#[tokio::test]
+async fn table_cellpadding_is_a_cascaded_hint_from_the_nearest_table() {
+    let ua = html5_user_agent_stylesheet();
+    let hints = html5_presentational_hints_stylesheet();
+    let author = parse_stylesheet(&Css::from_string("td { padding: 3pt }"));
+    let mut table_attrs = HashMap::new();
+    table_attrs.insert("cellpadding".to_string(), "4".to_string());
+    let table = ElementSignature::new("table", table_attrs);
+    let row = ElementSignature::new("tr", HashMap::new());
+    let table_style = style_for_element_with_signature(
+        table.clone(),
+        None,
+        &[ua.clone(), hints.clone()],
+        None,
+        &[],
+    );
+    let row_style = style_for_element_with_signature(
+        row.clone(),
+        None,
+        &[ua.clone(), hints.clone()],
+        Some(&table_style),
+        std::slice::from_ref(&table),
+    );
+    let hinted = style_for_element_with_signature(
+        ElementSignature::new("td", HashMap::new()),
+        None,
+        &[ua.clone(), hints.clone()],
+        Some(&row_style),
+        &[table.clone(), row.clone()],
+    );
+    let overridden = style_for_element_with_signature(
+        ElementSignature::new("td", HashMap::new()),
+        None,
+        &[ua, hints, author],
+        Some(&row_style),
+        &[table, row],
+    );
+
+    assert_eq!(hinted.padding.top, 4.0 * CSS_PX_TO_PT);
+    assert_eq!(hinted.padding.right, 4.0 * CSS_PX_TO_PT);
+    assert_eq!(overridden.padding.top, 3.0);
+    assert_eq!(overridden.padding.right, 3.0);
+}
+
+#[tokio::test]
+async fn table_default_border_color_tracks_the_cascaded_current_color() {
+    let ua = html5_user_agent_stylesheet();
+    let author = parse_stylesheet(&Css::from_string(
+        "* { color: teal; border-width: 2px } table { border-style: solid }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("table", HashMap::new()),
+        None,
+        &[ua, author],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.border_colors.top, CssColor::new(0, 128, 128));
+    assert_eq!(style.border_colors.right, CssColor::new(0, 128, 128));
 }
 
 #[tokio::test]
@@ -8524,6 +9521,56 @@ fn text_wrap_longhands_override_the_legacy_white_space_wrap_component() {
 }
 
 #[test]
+fn wrap_inside_parses_as_a_non_inherited_inline_box_property() {
+    let mut parent = ComputedStyle::initial();
+    apply_declarations(&mut parent, &parse_declarations("wrap-inside: avoid"));
+    assert_eq!(parent.wrap_inside, WrapInside::Avoid);
+
+    let child = style_for_element_with_signature(
+        ElementSignature::new("span", HashMap::new()),
+        None,
+        &[],
+        Some(&parent),
+        &[],
+    );
+    assert_eq!(child.wrap_inside, WrapInside::Auto);
+
+    apply_declarations(&mut parent, &parse_declarations("wrap-inside: invalid"));
+    assert_eq!(parent.wrap_inside, WrapInside::Avoid);
+}
+
+#[tokio::test]
+async fn wrap_inside_structural_wbr_selector_targets_only_the_following_span() {
+    let stylesheet = parse_stylesheet(&Css::from_string(".jp > wbr + span { wrap-inside: avoid }"));
+    let siblings = vec![
+        ElementSiblingSignature::new("wbr", HashMap::new()),
+        ElementSiblingSignature::new("span", HashMap::new()),
+        ElementSiblingSignature::new("span", HashMap::new()),
+    ];
+    let parent = ElementSignature::new(
+        "span",
+        HashMap::from([("class".to_string(), "jp".to_string())]),
+    );
+    let avoided = style_for_element_with_signature(
+        ElementSignature::with_siblings("span", HashMap::new(), 1, siblings.clone()),
+        None,
+        std::slice::from_ref(&stylesheet),
+        None,
+        std::slice::from_ref(&parent),
+    );
+    let ordinary = style_for_element_with_signature(
+        ElementSignature::with_siblings("span", HashMap::new(), 2, siblings),
+        None,
+        &[stylesheet],
+        None,
+        &[parent],
+    );
+
+    assert_eq!(avoided.wrap_inside, WrapInside::Avoid);
+    assert_eq!(ordinary.wrap_inside, WrapInside::Auto);
+}
+
+#[test]
 fn overflow_clip_margin_parses_visual_box_and_nonnegative_length_in_any_order() {
     let mut style = ComputedStyle::initial();
     let declarations = parse_declarations("overflow-clip-margin: 10px content-box");
@@ -8582,10 +9629,10 @@ async fn parses_side_specific_border_widths() {
     assert_eq!(style.border_widths.right, 0.0);
     assert_eq!(style.border_widths.bottom, 2.25);
     assert_eq!(style.border_widths.left, 0.0);
-    assert_eq!(style.border_color, Color::new(255, 0, 0));
+    assert_eq!(style.border_color, CssColor::new(255, 0, 0));
     assert_eq!(style.border_styles.top, BorderStyle::Solid);
     assert_eq!(style.border_styles.bottom, BorderStyle::None);
-    assert_eq!(style.border_colors.top, Color::new(255, 0, 0));
+    assert_eq!(style.border_colors.top, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -8625,7 +9672,7 @@ async fn parses_side_specific_dotted_border_shorthand() {
 
     assert_eq!(style.border_widths.top, 2.0);
     assert_eq!(style.border_styles.top, BorderStyle::Dotted);
-    assert_eq!(style.border_colors.top, Color::new(0, 0, 255));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -8640,7 +9687,7 @@ async fn inline_style_parses_side_specific_dotted_border_shorthand() {
 
     assert_eq!(style.border_widths.top, 2.0);
     assert_eq!(style.border_styles.top, BorderStyle::Dotted);
-    assert_eq!(style.border_colors.top, Color::new(0, 0, 255));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -8655,10 +9702,10 @@ async fn parses_border_styles_and_side_colors() {
     assert_eq!(style.border_styles.top, BorderStyle::Dashed);
     assert_eq!(style.border_widths.left, 4.0);
     assert_eq!(style.border_styles.left, BorderStyle::Double);
-    assert_eq!(style.border_colors.top, Color::new(255, 0, 0));
-    assert_eq!(style.border_colors.right, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.bottom, Color::new(0, 0, 255));
-    assert_eq!(style.border_colors.left, Color::BLACK);
+    assert_eq!(style.border_colors.top, CssColor::new(255, 0, 0));
+    assert_eq!(style.border_colors.right, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 255));
+    assert_eq!(style.border_colors.left, CssColor::BLACK);
 }
 
 #[tokio::test]
@@ -8669,7 +9716,7 @@ async fn parses_border_shorthand_color_functions_as_single_components() {
 
     assert_eq!(style.border_widths.top, 2.0);
     assert_eq!(style.border_styles.top, BorderStyle::Solid);
-    assert_eq!(style.border_colors.top, Color::new(255, 0, 0));
+    assert_eq!(style.border_colors.top, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -8680,10 +9727,37 @@ async fn parses_border_current_color_against_computed_color() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_colors.top, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.right, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.bottom, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.left, Color::new(0, 0, 255));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.right, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.bottom, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.left, CssColor::new(0, 0, 255));
+}
+
+#[tokio::test]
+async fn color_currentcolor_preserves_the_inherited_computed_color() {
+    assert_eq!(
+        crate::css::parse::declaration_operation("color", "currentcolor"),
+        Some(("color".into(), "currentcolor".into()))
+    );
+    assert_eq!(
+        crate::css::parse_color_from_currentcolor("currentcolor", CssColor::new(0, 128, 0)),
+        Some(CssColor::new(0, 128, 0))
+    );
+    let ua = html5_user_agent_stylesheet();
+    let author = parse_stylesheet(&Css::from_string("a { color: currentcolor }"));
+    let parent = ComputedStyle {
+        color: CssColor::new(0, 128, 0),
+        ..default_style_for_tag("div")
+    };
+    let style = style_for_element_with_signature(
+        ElementSignature::new("a", HashMap::from([("href".into(), "unvisited".into())])),
+        None,
+        &[ua, author],
+        Some(&parent),
+        &[],
+    );
+
+    assert_eq!(style.color, parent.color);
 }
 
 #[tokio::test]
@@ -8694,10 +9768,10 @@ async fn parses_border_color_shorthand_with_rgb_functions() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_colors.top, Color::new(255, 0, 0));
-    assert_eq!(style.border_colors.right, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.bottom, Color::new(0, 0, 255));
-    assert_eq!(style.border_colors.left, Color::BLACK);
+    assert_eq!(style.border_colors.top, CssColor::new(255, 0, 0));
+    assert_eq!(style.border_colors.right, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 255));
+    assert_eq!(style.border_colors.left, CssColor::BLACK);
 }
 
 #[tokio::test]
@@ -8712,16 +9786,16 @@ async fn maps_logical_border_properties_to_initial_physical_sides() {
 
     assert_eq!(style.border_widths.top, 2.0);
     assert_eq!(style.border_styles.top, BorderStyle::Solid);
-    assert_eq!(style.border_colors.top, Color::new(255, 0, 0));
+    assert_eq!(style.border_colors.top, CssColor::new(255, 0, 0));
     assert_eq!(style.border_widths.bottom, 3.0);
     assert_eq!(style.border_styles.bottom, BorderStyle::Dashed);
-    assert_eq!(style.border_colors.bottom, Color::new(0, 0, 255));
+    assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 255));
     assert_eq!(style.border_widths.left, 4.0);
     assert_eq!(style.border_styles.left, BorderStyle::Dotted);
-    assert_eq!(style.border_colors.left, Color::new(0, 128, 0));
+    assert_eq!(style.border_colors.left, CssColor::new(0, 128, 0));
     assert_eq!(style.border_widths.right, 4.0);
     assert_eq!(style.border_styles.right, BorderStyle::Dotted);
-    assert_eq!(style.border_colors.right, Color::BLACK);
+    assert_eq!(style.border_colors.right, CssColor::BLACK);
 }
 
 #[tokio::test]
@@ -8737,10 +9811,10 @@ async fn maps_logical_border_properties_through_rtl_direction() {
     assert_eq!(style.direction, Direction::Rtl);
     assert_eq!(style.border_widths.right, 2.0);
     assert_eq!(style.border_styles.right, BorderStyle::Solid);
-    assert_eq!(style.border_colors.right, Color::new(255, 0, 0));
+    assert_eq!(style.border_colors.right, CssColor::new(255, 0, 0));
     assert_eq!(style.border_widths.left, 3.0);
     assert_eq!(style.border_styles.left, BorderStyle::Dashed);
-    assert_eq!(style.border_colors.left, Color::new(0, 0, 255));
+    assert_eq!(style.border_colors.left, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -8756,10 +9830,10 @@ async fn maps_logical_border_properties_through_vertical_writing_mode() {
     assert_eq!(style.writing_mode, WritingMode::VerticalRl);
     assert_eq!(style.border_widths.right, 2.0);
     assert_eq!(style.border_styles.right, BorderStyle::Solid);
-    assert_eq!(style.border_colors.right, Color::new(255, 0, 0));
+    assert_eq!(style.border_colors.right, CssColor::new(255, 0, 0));
     assert_eq!(style.border_widths.top, 3.0);
     assert_eq!(style.border_styles.top, BorderStyle::Dashed);
-    assert_eq!(style.border_colors.top, Color::new(0, 0, 255));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -8775,10 +9849,10 @@ async fn maps_logical_borders_through_sideways_lr_inline_reversal() {
     assert_eq!(style.writing_mode, WritingMode::SidewaysLr);
     assert_eq!(style.border_widths.left, 2.0);
     assert_eq!(style.border_styles.left, BorderStyle::Solid);
-    assert_eq!(style.border_colors.left, Color::new(255, 0, 0));
+    assert_eq!(style.border_colors.left, CssColor::new(255, 0, 0));
     assert_eq!(style.border_widths.bottom, 3.0);
     assert_eq!(style.border_styles.bottom, BorderStyle::Dashed);
-    assert_eq!(style.border_colors.bottom, Color::new(0, 0, 255));
+    assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -8883,7 +9957,7 @@ async fn logical_border_revert_layer_rolls_back_physical_longhand() {
 
     assert_eq!(style.border_widths.left, 2.0);
     assert_eq!(style.border_styles.left, BorderStyle::Solid);
-    assert_eq!(style.border_colors.left, Color::new(255, 0, 0));
+    assert_eq!(style.border_colors.left, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -8904,7 +9978,7 @@ async fn logical_border_revert_layer_uses_directional_physical_side() {
     assert_eq!(style.direction, Direction::Rtl);
     assert_eq!(style.border_widths.right, 2.0);
     assert_eq!(style.border_styles.right, BorderStyle::Solid);
-    assert_eq!(style.border_colors.right, Color::new(255, 0, 0));
+    assert_eq!(style.border_colors.right, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -8993,7 +10067,7 @@ async fn parses_border_image_longhands() {
         style
             .border_image
             .source
-            .as_ref()
+            .as_image()
             .and_then(|source| match source.selected_image() {
                 BackgroundImage::Url { src, .. } => Some(src.as_str()),
                 _ => None,
@@ -9048,8 +10122,24 @@ async fn border_image_source_accepts_generated_images() {
     apply_declarations(&mut style, &declarations);
 
     assert!(matches!(
-        style.border_image.source,
+        style.border_image.source.as_image(),
         Some(BackgroundImage::LinearGradient(_))
+    ));
+}
+
+#[tokio::test]
+async fn invalid_image_set_is_a_valid_border_image_source() {
+    let declarations = parse_declarations(
+        "border-image-source: image-set(url(border.png) type(\"image/unknown\")); \
+         border-image: 1 / 10px image-set(url(border.png) type(\"image/unknown\"))",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.border_image.source, ComputedImage::Invalid);
+    assert!(matches!(
+        style.border_image.width.top,
+        BorderImageWidthValue::LengthPercentage(_)
     ));
 }
 
@@ -9065,7 +10155,7 @@ async fn parses_border_image_shorthand_and_resets_omitted_longhands() {
         style
             .border_image
             .source
-            .as_ref()
+            .as_image()
             .and_then(|source| match source.selected_image() {
                 BackgroundImage::Url { src, .. } => Some(src.as_str()),
                 _ => None,
@@ -9156,7 +10246,7 @@ async fn rejects_invalid_border_color_and_style_component_lists() {
     let mut style = default_style_for_tag("div");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_colors.top, Color::BLACK);
+    assert_eq!(style.border_colors.top, CssColor::BLACK);
     assert_eq!(style.border_styles.top, BorderStyle::None);
 }
 
@@ -9267,6 +10357,279 @@ async fn parses_border_radius_corner_longhands() {
         style.border_radius.bottom_right.y.value.length_points(),
         12.0
     );
+}
+
+#[tokio::test]
+async fn border_side_radius_shorthands_expand_to_adjacent_corners() {
+    let declarations = parse_declarations(
+        "border-top-radius: 1pt 2pt / 3pt 4pt; border-left-radius: 5pt 6pt / 7pt 8pt",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.border_radius.top_left.x.value.length_points(), 5.0);
+    assert_eq!(style.border_radius.top_left.y.value.length_points(), 6.0);
+    assert_eq!(style.border_radius.top_right.x.value.length_points(), 3.0);
+    assert_eq!(style.border_radius.top_right.y.value.length_points(), 4.0);
+    assert_eq!(style.border_radius.bottom_left.x.value.length_points(), 7.0);
+    assert_eq!(style.border_radius.bottom_left.y.value.length_points(), 8.0);
+}
+
+#[tokio::test]
+async fn logical_border_side_radius_shorthands_follow_writing_mode() {
+    let declarations = parse_declarations(
+        "border-block-start-radius: 1pt 2pt / 3pt 4pt; border-inline-end-radius: 5pt 6pt / 7pt 8pt",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    assert_eq!(style.border_radius.top_left.x.value.length_points(), 1.0);
+    assert_eq!(style.border_radius.top_left.y.value.length_points(), 2.0);
+    assert_eq!(style.border_radius.top_right.x.value.length_points(), 5.0);
+    assert_eq!(style.border_radius.top_right.y.value.length_points(), 6.0);
+    assert_eq!(
+        style.border_radius.bottom_right.x.value.length_points(),
+        7.0
+    );
+    assert_eq!(
+        style.border_radius.bottom_right.y.value.length_points(),
+        8.0
+    );
+}
+
+#[test]
+fn parses_polygon_clip_path_as_typed_length_percentages() {
+    let declarations =
+        parse_declarations("clip-path: polygon(0% 50%, calc(25% + 2pt) 100%, 100% 0%)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let ClipPath::Polygon(points) = style.clip_path else {
+        panic!("expected a parsed polygon clip path");
+    };
+    assert_eq!(points.len(), 3);
+    assert_eq!(points[0].x.percentage_coefficient(), Some(0.0));
+    assert_eq!(points[0].y.percentage_coefficient(), Some(0.5));
+    assert_eq!(points[1].x.percentage_coefficient(), Some(0.25));
+    assert_eq!(points[1].x.fixed_component(), layout_pt(2.0));
+    assert_eq!(points[2].x.percentage_coefficient(), Some(1.0));
+    assert_eq!(points[2].y.percentage_coefficient(), Some(0.0));
+}
+
+#[test]
+fn parses_border_shape_circles_with_typed_geometry() {
+    let declarations = parse_declarations(
+        "border-shape: circle(45px at 25% 75%) border-box circle(40%) padding-box",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let BorderShape::Pair { outer, inner } = style.border_shape else {
+        panic!("expected parsed border-shape circles");
+    };
+    let BorderShape::Circle(outer) = *outer else {
+        panic!("expected outer circle");
+    };
+    let BorderShape::Circle(inner) = *inner else {
+        panic!("expected inner circle");
+    };
+    assert_eq!(outer.geometry_box, BorderShapeGeometryBox::Border);
+    assert_eq!(inner.geometry_box, BorderShapeGeometryBox::Padding);
+    assert_eq!(outer.position.x.percentage_coefficient(), Some(0.25));
+    assert_eq!(outer.position.y.percentage_coefficient(), Some(0.75));
+    assert!(matches!(
+        outer.radius,
+        BorderShapeCircleRadius::LengthPercentage(ref value) if value.length_points() == 45.0 * CSS_PX_TO_PT
+    ));
+}
+
+#[test]
+fn parses_shape_outside_basic_shapes_with_reference_boxes() {
+    let declarations =
+        parse_declarations("shape-outside: ellipse(25% farthest-side at 20% 80%) content-box");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let ShapeOutside::Basic {
+        shape: BasicShape::Ellipse(ellipse),
+        reference_box,
+    } = style.shape_outside
+    else {
+        panic!("expected a parsed shape-outside ellipse");
+    };
+    assert_eq!(reference_box, ShapeBox::Content);
+    assert_eq!(ellipse.position.x.percentage_coefficient(), Some(0.2));
+    assert_eq!(ellipse.position.y.percentage_coefficient(), Some(0.8));
+    assert!(
+        matches!(ellipse.horizontal_radius, ShapeEllipseRadius::LengthPercentage(ref value) if value.percentage_coefficient() == Some(0.25))
+    );
+    assert_eq!(ellipse.vertical_radius, ShapeEllipseRadius::FarthestSide);
+}
+
+#[test]
+fn parses_shape_margin_as_a_non_inherited_length_percentage() {
+    let declarations = parse_declarations("shape-margin: calc(5% + 3px)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(style.shape_margin.percentage_coefficient(), Some(0.05));
+    assert_eq!(style.shape_margin.length_points(), 3.0 * CSS_PX_TO_PT);
+
+    let declarations = parse_declarations("shape-margin: -1px");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    assert_eq!(style.shape_margin, ComputedLengthPercentage::ZERO);
+}
+
+#[test]
+fn parses_image_shape_outside_and_alpha_threshold() {
+    let declarations =
+        parse_declarations("shape-outside: url(half.png); shape-image-threshold: 1.5");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    assert!(matches!(style.shape_outside, ShapeOutside::Image(_)));
+    assert_eq!(style.shape_image_threshold, 1.0);
+}
+
+#[test]
+fn parses_shape_outside_rounded_inset_and_shape_box() {
+    let declarations =
+        parse_declarations("shape-outside: border-box inset(10% 2pt 20% 4pt round 5px / 10px)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let ShapeOutside::Basic {
+        shape: BasicShape::Inset(inset),
+        reference_box,
+    } = style.shape_outside
+    else {
+        panic!("expected a parsed shape-outside inset");
+    };
+    assert_eq!(reference_box, ShapeBox::Border);
+    assert_eq!(inset.top.percentage_coefficient(), Some(0.1));
+    assert_eq!(inset.left.length_points(), 4.0);
+    assert_eq!(
+        inset.radii.top_left.x.value.length_points(),
+        5.0 * CSS_PX_TO_PT
+    );
+    assert_eq!(
+        inset.radii.top_left.y.value.length_points(),
+        10.0 * CSS_PX_TO_PT
+    );
+}
+
+#[test]
+fn parses_shape_outside_edge_offset_position() {
+    let declarations = parse_declarations("shape-outside: circle(10px at right 10% bottom 2pt)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    let ShapeOutside::Basic {
+        shape: BasicShape::Circle(circle),
+        ..
+    } = style.shape_outside
+    else {
+        panic!("expected a parsed shape-outside circle");
+    };
+    assert_eq!(circle.position.x.percentage_coefficient(), Some(0.9));
+    assert_eq!(circle.position.y.percentage_coefficient(), Some(1.0));
+    assert_eq!(circle.position.y.fixed_component(), layout_pt(-2.0));
+}
+
+#[test]
+fn parses_shape_outside_reordered_and_single_component_positions() {
+    let declarations = parse_declarations("shape-outside: margin-box circle(99% at top left)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    let ShapeOutside::Basic {
+        shape: BasicShape::Circle(circle),
+        reference_box,
+    } = style.shape_outside
+    else {
+        panic!("expected a parsed shape-outside circle");
+    };
+    assert_eq!(reference_box, ShapeBox::Margin);
+    assert_eq!(circle.position.x, ComputedLengthPercentage::ZERO);
+    assert_eq!(circle.position.y, ComputedLengthPercentage::ZERO);
+
+    let declarations = parse_declarations("shape-outside: circle(10px at 40%)");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    let ShapeOutside::Basic {
+        shape: BasicShape::Circle(circle),
+        ..
+    } = style.shape_outside
+    else {
+        panic!("expected a parsed shape-outside circle");
+    };
+    assert_eq!(circle.position.x.percentage_coefficient(), Some(0.4));
+    assert_eq!(circle.position.y.percentage_coefficient(), Some(0.5));
+}
+
+#[test]
+fn parses_shape_outside_polygon_with_fill_rule_and_percentages() {
+    let declarations =
+        parse_declarations("shape-outside: polygon(evenodd, 0% 0%, 100% 0%, 50% 100%) padding-box");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+    let ShapeOutside::Basic {
+        shape: BasicShape::Polygon(polygon),
+        reference_box,
+    } = style.shape_outside
+    else {
+        panic!("expected a parsed shape-outside polygon");
+    };
+    assert_eq!(reference_box, ShapeBox::Padding);
+    assert_eq!(polygon.fill_rule, ShapeFillRule::EvenOdd);
+    assert_eq!(polygon.vertices.len(), 3);
+    assert_eq!(polygon.vertices[1].x.percentage_coefficient(), Some(1.0));
+    assert_eq!(polygon.vertices[2].y.percentage_coefficient(), Some(1.0));
+}
+
+#[test]
+fn parses_border_shape_ellipses_with_axis_typed_radii() {
+    let declarations =
+        parse_declarations("border-shape: ellipse(25% farthest-side at 20% 80%) content-box");
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let BorderShape::Ellipse(ellipse) = style.border_shape else {
+        panic!("expected parsed border-shape ellipses");
+    };
+    assert_eq!(ellipse.geometry_box, BorderShapeGeometryBox::Content);
+    assert_eq!(ellipse.position.x.percentage_coefficient(), Some(0.2));
+    assert_eq!(ellipse.position.y.percentage_coefficient(), Some(0.8));
+    assert!(matches!(
+        ellipse.horizontal_radius,
+        BorderShapeEllipseRadius::LengthPercentage(ref value)
+            if value.percentage_coefficient() == Some(0.25)
+    ));
+    assert!(matches!(
+        ellipse.vertical_radius,
+        BorderShapeEllipseRadius::FarthestSide
+    ));
+}
+
+#[test]
+fn parses_border_shape_polygon_with_typed_geometry_and_mixed_pair() {
+    let declarations = parse_declarations(
+        "border-shape: polygon(0 0, 100% 0, 50% 100%) margin-box circle(20%) content-box",
+    );
+    let mut style = default_style_for_tag("div");
+    apply_declarations(&mut style, &declarations);
+
+    let BorderShape::Pair { outer, inner } = style.border_shape else {
+        panic!("expected a parsed border-shape pair");
+    };
+    let BorderShape::Polygon(polygon) = *outer else {
+        panic!("expected outer polygon");
+    };
+    let BorderShape::Circle(circle) = *inner else {
+        panic!("expected inner circle");
+    };
+    assert_eq!(polygon.geometry_box, BorderShapeGeometryBox::Margin);
+    assert_eq!(polygon.vertices.len(), 3);
+    assert_eq!(polygon.vertices[1].x.percentage_coefficient(), Some(1.0));
+    assert_eq!(polygon.vertices[2].y.percentage_coefficient(), Some(1.0));
+    assert_eq!(circle.geometry_box, BorderShapeGeometryBox::Content);
 }
 
 #[tokio::test]
@@ -9465,7 +10828,7 @@ async fn parses_text_decoration_longhands_and_shorthand_components() {
     assert!(style.text_decoration.overline);
     assert!(style.text_decoration.line_through);
     assert_eq!(style.text_decoration.style, TextDecorationStyle::Dashed);
-    assert_eq!(style.text_decoration.color, Some(Color::new(255, 0, 0)));
+    assert_eq!(style.text_decoration.color, Some(CssColor::new(255, 0, 0)));
     assert!(matches!(
         style.text_decoration.thickness,
         TextDecorationThickness::LengthPercentage(value)
@@ -9481,6 +10844,12 @@ async fn parses_text_decoration_longhands_and_shorthand_components() {
             if (value.length_points() - 1.5).abs() < 0.01 && value.percentage_coefficient_or_zero() == 0.0
     ));
     assert!(style.text_decoration.underline_position.under);
+
+    let declarations = parse_declarations("text-decoration: underline line-through");
+    let mut shorthand_style = default_style_for_tag("div");
+    apply_declarations(&mut shorthand_style, &declarations);
+    assert!(shorthand_style.text_decoration.underline);
+    assert!(shorthand_style.text_decoration.line_through);
 }
 
 #[tokio::test]
@@ -9522,7 +10891,7 @@ async fn parses_css_text_decoration_level_four_properties() {
     assert!((style.text_shadow[0].spread.length_points() - 3.0).abs() < 0.01);
     assert_eq!(
         style.text_shadow[0].color,
-        TextShadowColor::Color(Color::new(255, 0, 0))
+        TextShadowColor::CssColor(CssColor::new(255, 0, 0))
     );
     assert!(!style.text_shadow[0].inset);
     assert!(style.text_shadow[1].inset);
@@ -9532,13 +10901,13 @@ async fn parses_css_text_decoration_level_four_properties() {
     assert!((style.box_shadow[0].offset_y.length_points() - 0.0).abs() < 0.01);
     assert_eq!(
         style.box_shadow[0].color,
-        BoxShadowColor::Color(Color::new(0, 128, 0))
+        BoxShadowColor::CssColor(CssColor::new(0, 128, 0))
     );
     assert_eq!(style.box_shadow[1].color, BoxShadowColor::CurrentColor);
     assert!((style.box_shadow[1].offset_x.length_points() + 1.5).abs() < 0.01);
     assert!((style.box_shadow[1].offset_y.length_points() - 2.25).abs() < 0.01);
     assert!((style.box_shadow[1].spread.length_points() + 0.75).abs() < 0.01);
-    assert_eq!(style.text_emphasis_color, Some(Color::new(0, 128, 0)));
+    assert_eq!(style.text_emphasis_color, Some(CssColor::new(0, 128, 0)));
     assert_eq!(
         style
             .text_emphasis_style
@@ -9653,13 +11022,13 @@ async fn active_text_decoration_layers_preserve_originating_box_values() {
     assert!(child.text_decoration_layers[0].underline);
     assert_eq!(
         child.text_decoration_layers[0].color,
-        Some(Color::new(255, 0, 0))
+        Some(CssColor::new(255, 0, 0))
     );
     assert_eq!(
         child.text_decoration_layers[0].style,
         TextDecorationStyle::Solid
     );
-    assert_eq!(child.text_decoration.color, Some(Color::new(0, 0, 255)));
+    assert_eq!(child.text_decoration.color, Some(CssColor::new(0, 0, 255)));
     assert_eq!(child.text_decoration.style, TextDecorationStyle::Wavy);
     assert!(!child.text_decoration.underline);
 }
@@ -9685,12 +11054,12 @@ async fn css_text_decoration_level_three_currentcolor_is_frozen_on_originating_b
         &[ElementSignature::new("p", HashMap::new())],
     );
 
-    assert_eq!(child.color, Color::new(255, 0, 0));
+    assert_eq!(child.color, CssColor::new(255, 0, 0));
     assert_eq!(
         child.text_decoration_layers[0].color,
-        Some(Color::new(0, 0, 255))
+        Some(CssColor::new(0, 0, 255))
     );
-    assert_eq!(child.text_emphasis_color, Some(Color::new(255, 0, 0)));
+    assert_eq!(child.text_emphasis_color, Some(CssColor::new(255, 0, 0)));
 }
 
 #[tokio::test]
@@ -9718,7 +11087,7 @@ async fn text_shadow_currentcolor_remains_symbolic_through_inheritance() {
     assert_eq!(child.text_shadow[0].color, TextShadowColor::CurrentColor);
     assert_eq!(
         child.text_shadow[0].color.resolve(child.color),
-        Color::new(0, 128, 0)
+        CssColor::new(0, 128, 0)
     );
 
     let mut omitted = default_style_for_tag("div");
@@ -9820,7 +11189,7 @@ async fn text_decoration_shorthand_resets_omitted_components_and_rejects_duplica
     );
     assert!(style.text_decoration.underline);
     assert_eq!(style.text_decoration.style, TextDecorationStyle::Dotted);
-    assert_eq!(style.text_decoration.color, Some(Color::new(255, 0, 0)));
+    assert_eq!(style.text_decoration.color, Some(CssColor::new(255, 0, 0)));
 
     apply_declarations(&mut style, &parse_declarations("text-decoration: overline"));
     assert!(!style.text_decoration.underline);
@@ -9949,13 +11318,11 @@ async fn parses_cssparser_colors() {
         parse_declarations("color: rebeccapurple; background: #0f08; border-color: rgb(1, 2, 3)");
     let mut style = default_style_for_tag("p");
     apply_declarations(&mut style, &declarations);
-    assert_eq!(style.color, Color::new(102, 51, 153));
+    assert_eq!(style.color, CssColor::new(102, 51, 153));
     let background = style.background_color.unwrap();
-    assert_eq!(background.r, 0.0);
-    assert_eq!(background.g, 1.0);
-    assert_eq!(background.b, 0.0);
-    assert!((background.a - 136.0 / 255.0).abs() < 0.000001);
-    assert_eq!(style.border_color, Color::new(1, 2, 3));
+    assert_eq!(background.components(), [0.0, 1.0, 0.0]);
+    assert!((background.alpha() - 136.0 / 255.0).abs() < 0.000001);
+    assert_eq!(style.border_color, CssColor::new(1, 2, 3));
 }
 
 #[tokio::test]
@@ -9966,9 +11333,12 @@ async fn parses_alpha_and_transparent_colors() {
     let mut style = default_style_for_tag("p");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.color, Color::rgba(255, 0, 0, 0.5));
-    assert_eq!(style.background_color, Some(Color::rgba(0, 0, 255, 0.25)));
-    assert_eq!(style.border_color, Color::TRANSPARENT);
+    assert_eq!(style.color, CssColor::rgba(255, 0, 0, 0.5));
+    assert_eq!(
+        style.background_color,
+        Some(CssColor::rgba(0, 0, 255, 0.25))
+    );
+    assert_eq!(style.border_color, CssColor::TRANSPARENT);
 }
 
 #[tokio::test]
@@ -9978,10 +11348,10 @@ async fn parses_hsl_border_colors() {
     let mut style = default_style_for_tag("p");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_colors.top, Color::rgba(0, 128, 0, 0.5));
-    assert_eq!(style.border_colors.bottom, Color::rgba(0, 128, 0, 0.5));
-    assert_eq!(style.border_colors.right, Color::rgba(0, 0, 255, 0.25));
-    assert_eq!(style.border_colors.left, Color::rgba(0, 0, 255, 0.25));
+    assert_eq!(style.border_colors.top, CssColor::rgba(0, 128, 0, 0.5));
+    assert_eq!(style.border_colors.bottom, CssColor::rgba(0, 128, 0, 0.5));
+    assert_eq!(style.border_colors.right, CssColor::rgba(0, 0, 255, 0.25));
+    assert_eq!(style.border_colors.left, CssColor::rgba(0, 0, 255, 0.25));
 }
 
 #[tokio::test]
@@ -9992,10 +11362,10 @@ async fn parses_hwb_border_colors() {
     let mut style = default_style_for_tag("p");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_colors.top, Color::new(255, 0, 0));
-    assert_eq!(style.border_colors.right, Color::rgba(0, 128, 0, 0.25));
-    assert_eq!(style.border_colors.bottom, Color::new(51, 51, 255));
-    assert_eq!(style.border_colors.left, Color::rgba(128, 128, 128, 0.5));
+    assert_eq!(style.border_colors.top, CssColor::new(255, 0, 0));
+    assert_eq!(style.border_colors.right, CssColor::rgba(0, 128, 0, 0.25));
+    assert_eq!(style.border_colors.bottom, CssColor::new(51, 51, 255));
+    assert_eq!(style.border_colors.left, CssColor::rgba(128, 128, 128, 0.5));
 }
 
 #[tokio::test]
@@ -10006,7 +11376,7 @@ async fn parses_hwb_in_border_shorthand_as_single_component() {
 
     assert_eq!(style.border_widths.top, 2.0);
     assert_eq!(style.border_styles.top, BorderStyle::Solid);
-    assert_eq!(style.border_colors.top, Color::rgba(51, 51, 255, 0.75));
+    assert_eq!(style.border_colors.top, CssColor::rgba(51, 51, 255, 0.75));
 }
 
 #[tokio::test]
@@ -10017,12 +11387,18 @@ async fn parses_srgb_color_function_border_colors() {
     let mut style = default_style_for_tag("p");
     apply_declarations(&mut style, &declarations);
 
-    assert_eq!(style.border_colors.top, Color::srgb(1.0, 0.0, 0.0, 1.0));
-    assert_eq!(style.border_colors.right, Color::srgb(0.0, 0.5, 0.0, 0.25));
-    assert_eq!(style.border_colors.bottom, Color::srgb(0.2, 0.2, 1.0, 1.0));
+    assert_eq!(style.border_colors.top, CssColor::srgb(1.0, 0.0, 0.0, 1.0));
+    assert_eq!(
+        style.border_colors.right,
+        CssColor::srgb(0.0, 0.5, 0.0, 0.25)
+    );
+    assert_eq!(
+        style.border_colors.bottom,
+        CssColor::srgb(0.2, 0.2, 1.0, 1.0)
+    );
     assert_eq!(
         style.border_colors.left,
-        Color::in_space(ColorSpace::Srgb, 0.0, 1.5, -1.0, 0.5)
+        CssColor::in_space(CssColorSpace::Srgb, 0.0, 1.5, -1.0, 0.5)
     );
 }
 
@@ -10034,7 +11410,7 @@ async fn parses_srgb_color_function_in_border_shorthand_as_single_component() {
 
     assert_eq!(style.border_widths.top, 2.0);
     assert_eq!(style.border_styles.top, BorderStyle::Solid);
-    assert_eq!(style.border_colors.top, Color::srgb(0.2, 0.2, 1.0, 0.75));
+    assert_eq!(style.border_colors.top, CssColor::srgb(0.2, 0.2, 1.0, 0.75));
 }
 
 #[tokio::test]
@@ -11208,7 +12584,7 @@ async fn cascade_layers_order_normal_declarations_before_specificity() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -11224,7 +12600,7 @@ async fn unlayered_normal_declarations_outrank_layered_declarations() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -11243,7 +12619,7 @@ async fn important_cascade_layers_reverse_layer_order() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -11259,7 +12635,7 @@ async fn cascade_origin_orders_user_between_ua_and_author_for_normal_declaration
         None,
         &[],
     );
-    assert_eq!(user_over_ua.color, Color::new(0, 128, 0));
+    assert_eq!(user_over_ua.color, CssColor::new(0, 128, 0));
 
     let author_over_user = style_for_element_with_signature(
         ElementSignature::new("p", HashMap::new()),
@@ -11268,7 +12644,7 @@ async fn cascade_origin_orders_user_between_ua_and_author_for_normal_declaration
         None,
         &[],
     );
-    assert_eq!(author_over_user.color, Color::new(0, 0, 255));
+    assert_eq!(author_over_user.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -11287,7 +12663,7 @@ async fn cascade_origin_orders_important_declarations_author_user_ua() {
         None,
         &[],
     );
-    assert_eq!(user_over_author.color, Color::new(0, 128, 0));
+    assert_eq!(user_over_author.color, CssColor::new(0, 128, 0));
 
     let ua_over_user = style_for_element_with_signature(
         ElementSignature::new("p", HashMap::new()),
@@ -11296,7 +12672,7 @@ async fn cascade_origin_orders_important_declarations_author_user_ua() {
         None,
         &[],
     );
-    assert_eq!(ua_over_user.color, Color::new(255, 0, 0));
+    assert_eq!(ua_over_user.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -11349,7 +12725,7 @@ async fn layer_statement_sets_order_before_layer_blocks() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -11368,7 +12744,7 @@ async fn scoped_rule_proximity_outranks_later_unscoped_source_order() {
         )],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -11393,7 +12769,7 @@ async fn closer_scoped_rule_outranks_farther_scope_before_source_order() {
         ],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -11418,7 +12794,7 @@ async fn scoped_rule_limit_excludes_descendant_subtree() {
         ],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -11437,7 +12813,7 @@ async fn scoped_rule_scope_pseudo_matches_scoping_root() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -11456,7 +12832,7 @@ async fn scoped_rule_scope_pseudo_matches_child_combinators_from_scope_root() {
         )],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -11475,7 +12851,7 @@ async fn scoped_rule_relative_selector_uses_scope_root_as_anchor() {
         )],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -11496,7 +12872,7 @@ async fn scoped_pseudo_rules_use_originating_element_proximity() {
     );
 
     let before = style.before_style.expect("scoped before style");
-    assert_eq!(before.color, Color::new(255, 0, 0));
+    assert_eq!(before.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -11516,7 +12892,7 @@ async fn cascade_layers_apply_to_generated_pseudo_rules() {
 
     assert_eq!(
         style.before_style.as_ref().unwrap().color,
-        Color::new(0, 0, 255)
+        CssColor::new(0, 0, 255)
     );
 }
 
@@ -11538,9 +12914,9 @@ async fn supports_rule_applies_supported_declaration_conditions() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
-    assert_eq!(style.background_color, Some(Color::new(255, 0, 0)));
-    assert_eq!(style.border_colors.top, Color::new(0, 128, 0));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    assert_eq!(style.background_color, Some(CssColor::new(255, 0, 0)));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
     assert_eq!(
         style.border_spacing.horizontal,
         ComputedLengthPercentage::from_ch(1.0)
@@ -11564,6 +12940,24 @@ async fn supports_rule_applies_supported_declaration_conditions() {
 }
 
 #[tokio::test]
+async fn supports_rule_recognizes_wrap_inside_avoid() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@supports (wrap-inside: avoid) { p { color: blue } }\
+         @supports (wrap-inside: invalid) { p { background-color: red } }",
+    ));
+    let style = style_for_element_with_signature(
+        ElementSignature::new("p", HashMap::new()),
+        None,
+        &[stylesheet],
+        None,
+        &[],
+    );
+
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    assert_eq!(style.background_color, None);
+}
+
+#[tokio::test]
 async fn supports_rule_recognizes_stacking_context_trigger_properties() {
     let stylesheet = parse_stylesheet(&Css::from_string(
         "@supports (position: sticky) { p { color: blue } }\
@@ -11584,13 +12978,13 @@ async fn supports_rule_recognizes_stacking_context_trigger_properties() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
-    assert_eq!(style.background_color, Some(Color::new(255, 0, 0)));
-    assert_eq!(style.border_colors.top, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.right, Color::new(0, 0, 255));
-    assert_eq!(style.outline_color, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.bottom, Color::new(255, 0, 0));
-    assert_eq!(style.border_colors.left, Color::new(0, 128, 0));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    assert_eq!(style.background_color, Some(CssColor::new(255, 0, 0)));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.right, CssColor::new(0, 0, 255));
+    assert_eq!(style.outline_color, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.bottom, CssColor::new(255, 0, 0));
+    assert_eq!(style.border_colors.left, CssColor::new(0, 128, 0));
     assert_eq!(style.font_size, 15.0);
     assert_eq!(style.line_height, 18.0);
 }
@@ -11609,7 +13003,7 @@ async fn supports_rule_recognizes_font_size_adjust_values() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
     assert_eq!(style.background_color, None);
 }
 
@@ -11628,8 +13022,8 @@ async fn supports_rule_recognizes_text_orientation_values() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
-    assert_eq!(style.border_colors.top, Color::new(0, 128, 0));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
     assert_eq!(style.background_color, None);
 }
 
@@ -11659,16 +13053,16 @@ async fn supports_rule_recognizes_text_align_justify_all_only_on_text_align() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
-    assert_eq!(style.border_colors.top, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.bottom, Color::new(0, 0, 255));
-    assert_eq!(style.border_colors.left, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.right, Color::BLACK);
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 255));
+    assert_eq!(style.border_colors.left, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.right, CssColor::BLACK);
     assert_eq!(style.border_widths.top, 3.0);
     assert_eq!(style.border_widths.right, 3.0);
     assert_eq!(style.border_widths.bottom, 3.0);
     assert_eq!(style.border_widths.left, 3.0);
-    assert_eq!(style.outline_color, Color::new(0, 128, 0));
+    assert_eq!(style.outline_color, CssColor::new(0, 128, 0));
     assert_eq!(style.outline_style, BorderStyle::None);
     assert_eq!(style.background_color, None);
 }
@@ -11688,9 +13082,9 @@ async fn supports_rule_recognizes_text_transform_full_width() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
-    assert_eq!(style.border_colors.top, Color::new(0, 128, 0));
-    assert_eq!(style.background_color, Some(Color::new(255, 0, 0)));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
+    assert_eq!(style.background_color, Some(CssColor::new(255, 0, 0)));
 }
 
 #[tokio::test]
@@ -11714,14 +13108,14 @@ async fn supports_rule_recognizes_css_text_decoration_level_three_values() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
-    assert_eq!(style.background_color, Some(Color::new(255, 0, 0)));
-    assert_eq!(style.border_colors.top, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.bottom, Color::new(0, 0, 255));
-    assert_ne!(style.border_colors.left, Color::new(255, 0, 0));
-    assert_eq!(style.border_colors.right, Color::new(0, 0, 255));
-    assert_eq!(style.outline_color, Color::new(0, 128, 0));
-    assert_eq!(style.border_colors.left, Color::BLACK);
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    assert_eq!(style.background_color, Some(CssColor::new(255, 0, 0)));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 255));
+    assert_ne!(style.border_colors.left, CssColor::new(255, 0, 0));
+    assert_eq!(style.border_colors.right, CssColor::new(0, 0, 255));
+    assert_eq!(style.outline_color, CssColor::new(0, 128, 0));
+    assert_eq!(style.border_colors.left, CssColor::BLACK);
 }
 
 #[tokio::test]
@@ -11737,7 +13131,7 @@ async fn supports_rule_ignores_unsupported_declaration_conditions() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -11754,8 +13148,173 @@ async fn supports_rule_evaluates_not_and_or_conditions() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
-    assert_eq!(style.background_color, Some(Color::new(255, 0, 0)));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    assert_eq!(style.background_color, Some(CssColor::new(255, 0, 0)));
+}
+
+#[test]
+fn supports_condition_uses_the_conditional_rules_grammar() {
+    // Bare declaration tests, function-token spellings of logical keywords,
+    // and mixed `and`/`or` levels are invalid grammar, not false values which
+    // may be allowed to alter a cascade.
+    assert!(!supports_condition_applies("margin: 0"));
+    assert!(!supports_condition_applies("not(foo: baz)"));
+    assert!(!supports_condition_applies(
+        "((margin: 0) and (display: inline) or (width: 1em))"
+    ));
+    assert!(!supports_condition_applies(
+        "((background-color: red) or(background-color: green))"
+    ));
+    assert!(!supports_condition_applies("(margin: 0 or padding: 0)"));
+
+    assert!(supports_condition_applies(
+        "((margin: 0) and (background: blue) and (padding: inherit))"
+    ));
+    assert!(supports_condition_applies(
+        "(writing-mode: vertical-lr) and (direction: rtl)"
+    ));
+    assert!(supports_condition_applies("(margin: revert-layer)"));
+}
+
+#[test]
+fn declaration_operations_are_shared_by_supports_and_the_normal_cascade() {
+    let cases = [
+        ("width", "calc-size(any, calc(20px + 30px))", true),
+        ("margin", "auto 10%", true),
+        ("--token", "var(--other, 1px)", true),
+        ("border-shape", "circle(20%) content-box", true),
+        ("width", "not-a-size", false),
+        ("--", "1px", false),
+    ];
+    for (name, value, expected) in cases {
+        assert_eq!(
+            crate::css::parse::declaration_operation(name, value).is_some(),
+            expected,
+            "canonical operation: {name}: {value}"
+        );
+        assert_eq!(
+            supports_condition_applies(&format!("({name}: {value})")),
+            expected,
+            "feature query: {name}: {value}"
+        );
+    }
+
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations("width: calc-size(any, calc(20px + 30px)); margin-left: auto"),
+    );
+    assert!(matches!(
+        style.box_values.width,
+        ComputedLengthPercentageOrAuto::LengthPercentage(_)
+    ));
+    assert!(style.box_values.margin.left.is_auto());
+}
+
+#[test]
+fn supports_selector_condition_requires_one_complex_selector() {
+    assert!(supports_condition_applies("selector(div > span)"));
+    assert!(!supports_condition_applies("selector(div, span)"));
+}
+
+#[test]
+fn conditional_groups_activate_stylesheet_scoped_font_and_counter_resources() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@media not all { \
+             @font-face { font-family: ignored; src: url(ignored.ttf) } \
+             @counter-style ignored { system: cyclic; symbols: 'I' } \
+         } \
+         @supports (color: blue) { \
+             @font-face { font-family: active; src: url(active.ttf) } \
+             @counter-style active { system: cyclic; symbols: 'A' } \
+         }",
+    ));
+
+    assert_eq!(stylesheet.font_faces.len(), 1);
+    assert_eq!(stylesheet.font_faces[0].family, "active");
+    assert_eq!(stylesheet.counter_styles.len(), 1);
+    assert_eq!(stylesheet.counter_styles[0].name, "active");
+}
+
+#[test]
+fn conditional_groups_activate_font_palette_values() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@media not all { \
+             @font-palette-values --ignored { font-family: test; base-palette: dark } \
+         } \
+         @supports (color: blue) { \
+             @font-palette-values --active { font-family: test; base-palette: light } \
+         }",
+    ));
+
+    assert!(stylesheet.font_palette_values.get("--ignored").is_none());
+    let active = stylesheet
+        .font_palette_values
+        .get("--active")
+        .expect("active palette definition");
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].base, FontPalette::Light);
+}
+
+#[test]
+fn conditional_groups_activate_font_feature_values() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@media not all { \
+             @font-feature-values ignored { @styleset { ignored: 1 } } \
+         } \
+         @supports (color: blue) { \
+             @font-feature-values active { @styleset { active: 2 } } \
+         }",
+    ));
+
+    assert!(
+        stylesheet
+            .font_feature_values
+            .get("ignored", FontFeatureValuesBlock::Styleset, "ignored")
+            .is_none()
+    );
+    assert_eq!(
+        stylesheet
+            .font_feature_values
+            .get("active", FontFeatureValuesBlock::Styleset, "active")
+            .map(|value| value.feature_index),
+        Some(2)
+    );
+}
+
+#[test]
+fn conditional_resources_preserve_nested_layer_precedence() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@layer lower, higher; \
+         @supports (color: blue) { \
+             @layer higher { @font-feature-values family { @styleset { choice: 2 } } } \
+             @layer lower { @font-feature-values family { @styleset { choice: 1 } } } \
+         }",
+    ));
+
+    assert_eq!(
+        stylesheet
+            .font_feature_values
+            .get("family", FontFeatureValuesBlock::Styleset, "choice")
+            .map(|value| value.feature_index),
+        Some(2)
+    );
+}
+
+#[test]
+fn namespace_rules_are_limited_to_the_stylesheet_prelude() {
+    let stylesheet = parse_stylesheet(&Css::from_string(
+        "@namespace accepted 'urn:accepted'; \
+         @media all { @namespace nested 'urn:nested'; } \
+         @namespace late 'urn:late';",
+    ));
+
+    assert_eq!(
+        stylesheet.namespace_prefixes.get("accepted"),
+        Some(&"urn:accepted".to_string())
+    );
+    assert!(!stylesheet.namespace_prefixes.contains_key("nested"));
+    assert!(!stylesheet.namespace_prefixes.contains_key("late"));
 }
 
 #[tokio::test]
@@ -11775,10 +13334,10 @@ async fn supports_rule_evaluates_selector_conditions_with_selector_parser() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
-    assert_eq!(style.border_colors.top, Color::new(0, 255, 0));
-    assert_eq!(style.border_colors.right, Color::new(0, 0, 255));
-    assert_eq!(style.border_colors.bottom, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 255, 0));
+    assert_eq!(style.border_colors.right, CssColor::new(0, 0, 255));
+    assert_eq!(style.border_colors.bottom, CssColor::new(255, 0, 0));
     assert_eq!(style.background_color, None);
 }
 
@@ -11800,11 +13359,11 @@ async fn supports_rule_rejects_shadow_and_unmodeled_ui_pseudo_selectors() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
     assert_eq!(style.background_color, None);
-    assert_eq!(style.border_colors.top, Color::new(0, 0, 0));
-    assert_eq!(style.border_colors.right, Color::new(0, 0, 0));
-    assert_eq!(style.border_colors.bottom, Color::new(0, 0, 0));
+    assert_eq!(style.border_colors.top, CssColor::new(0, 0, 0));
+    assert_eq!(style.border_colors.right, CssColor::new(0, 0, 0));
+    assert_eq!(style.border_colors.bottom, CssColor::new(0, 0, 0));
 }
 
 #[tokio::test]
@@ -11822,7 +13381,7 @@ async fn supports_rule_preserves_nested_layer_order() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -11856,7 +13415,7 @@ async fn import_layer_places_imported_rules_in_named_layer() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -11892,7 +13451,7 @@ async fn import_media_not_print_keeps_import_out_of_cascade() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -11928,7 +13487,7 @@ async fn import_media_not_screen_loads_import_in_print_context() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -11964,7 +13523,7 @@ async fn anonymous_import_layer_important_beats_unlayered_important() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -11983,7 +13542,7 @@ async fn revert_layer_rolls_property_back_to_previous_layer() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -12099,7 +13658,7 @@ async fn later_declaration_in_same_layer_overrides_revert_layer() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -12115,7 +13674,7 @@ async fn unlayered_revert_layer_rolls_back_to_strongest_layered_value() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 0, 255));
+    assert_eq!(style.color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -12131,7 +13690,7 @@ async fn author_revert_rolls_property_back_to_user_origin() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 128, 0));
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
 }
 
 #[tokio::test]
@@ -12150,7 +13709,7 @@ async fn user_important_revert_rolls_property_back_to_ua_origin() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(255, 0, 0));
+    assert_eq!(style.color, CssColor::new(255, 0, 0));
 }
 
 #[tokio::test]
@@ -12242,7 +13801,7 @@ async fn unset_keyword_inherits_inherited_properties_and_initializes_others() {
         &[],
     );
 
-    assert_eq!(style.color, Color::new(0, 128, 0));
+    assert_eq!(style.color, CssColor::new(0, 128, 0));
     assert_eq!(style.display, Display::INLINE);
 }
 
@@ -12305,7 +13864,7 @@ async fn all_property_applies_css_wide_keyword_to_modeled_longhands() {
         &[],
     );
 
-    assert_eq!(style.color, Color::BLACK);
+    assert_eq!(style.color, CssColor::BLACK);
     assert_eq!(style.display, Display::INLINE);
     assert_eq!(style.margin.left, 0.0);
 }
@@ -12327,7 +13886,7 @@ async fn revert_layer_applies_to_generated_pseudo_rules() {
 
     assert_eq!(
         style.before_style.as_ref().unwrap().color,
-        Color::new(255, 0, 0)
+        CssColor::new(255, 0, 0)
     );
 }
 
@@ -12691,7 +14250,7 @@ async fn expands_deep_nested_invoice_table_cell_selectors() {
 
     assert_eq!(last.text_align, TextAlign::Right);
     assert_eq!(last.font_weight, FontWeight::BOLD);
-    assert_eq!(last.color, Color::new(30, 228, 148));
+    assert_eq!(last.color, CssColor::new(30, 228, 148));
 }
 
 #[tokio::test]
@@ -12946,6 +14505,12 @@ fn parses_object_view_box_rectangles() {
     );
     assert!(matches!(&style.object_view_box, ObjectViewBox::Rect { .. }));
 
+    apply_declarations(
+        &mut style,
+        &parse_declarations("object-view-box: rect(1pt 20pt 30pt 4pt)"),
+    );
+    assert!(matches!(&style.object_view_box, ObjectViewBox::Rect { .. }));
+
     apply_declarations(&mut style, &parse_declarations("object-view-box: none"));
     assert_eq!(style.object_view_box, ObjectViewBox::None);
 
@@ -12955,6 +14520,24 @@ fn parses_object_view_box_rectangles() {
         &parse_declarations("object-view-box: xywh(1pt 2pt 3pt);"),
     );
     assert_eq!(style.object_view_box, before);
+}
+
+#[test]
+fn parses_clip_path_inset_offsets() {
+    let mut style = default_style_for_tag("div");
+    apply_declarations(
+        &mut style,
+        &parse_declarations("clip-path: inset(10% 2pt 30% 4pt)"),
+    );
+
+    assert!(matches!(
+        style.clip_path,
+        ClipPath::Inset { top, right, bottom, left }
+            if top.percentage_coefficient_or_zero() == 0.1
+                && (right.length_points() - 2.0).abs() < 0.01
+                && bottom.percentage_coefficient_or_zero() == 0.3
+                && (left.length_points() - 4.0).abs() < 0.01
+    ));
 }
 
 #[tokio::test]
@@ -13018,7 +14601,7 @@ async fn parses_outline_properties() {
 
     assert_eq!(style.outline_width, 5.0 * CSS_PX_TO_PT);
     assert_eq!(style.outline_style, BorderStyle::Dashed);
-    assert_eq!(style.outline_color, Color::new(0x12, 0x34, 0x56));
+    assert_eq!(style.outline_color, CssColor::new(0x12, 0x34, 0x56));
     assert_eq!(
         style.outline_offset,
         ComputedLengthPercentage::from_points(2.0)
@@ -13084,8 +14667,8 @@ async fn parses_gap_decoration_rule_properties() {
     assert_eq!(column_widths[2], ComputedLengthPercentage::from_points(3.0));
     assert_eq!(column_styles[0], BorderStyle::Solid);
     assert_eq!(column_styles[2], BorderStyle::Dashed);
-    assert_eq!(column_colors[0], Color::new(255, 0, 0));
-    assert_eq!(column_colors[2], Color::new(0x12, 0x34, 0x56));
+    assert_eq!(column_colors[0], CssColor::new(255, 0, 0));
+    assert_eq!(column_colors[2], CssColor::new(0x12, 0x34, 0x56));
     assert_eq!(
         style.row_rule.widths.values_for_count(1)[0],
         ComputedLengthPercentage::from_points(22.5)
@@ -13096,7 +14679,7 @@ async fn parses_gap_decoration_rule_properties() {
     );
     assert_eq!(
         style.row_rule.colors.values_for_count(1)[0],
-        Color::new(0, 0, 255)
+        CssColor::new(0, 0, 255)
     );
     assert_eq!(
         style.column_rule.inset_cap_start,
@@ -13126,11 +14709,11 @@ async fn gap_rule_auto_repeater_truncates_trailing_colors_widths_and_styles_in_a
     assert_eq!(
         style.column_rule.colors.values_for_count(5),
         [
-            Color::new(0, 128, 128),
-            Color::new(75, 0, 130),
-            Color::new(238, 130, 238),
-            Color::new(0, 0, 255),
-            Color::new(128, 0, 128),
+            CssColor::new(0, 128, 128),
+            CssColor::new(75, 0, 130),
+            CssColor::new(238, 130, 238),
+            CssColor::new(0, 0, 255),
+            CssColor::new(128, 0, 128),
         ]
     );
     assert_eq!(

@@ -5,16 +5,16 @@
 //! the normalized tree in SVG units; conversion to Quire paint points happens
 //! only when a replaced SVG is painted.
 
-use crate::css::{self, Color};
+use crate::css::{self, CssColor};
 use crate::document::{
-    PaintBlendMode, PaintClip, PaintPoint, PaintRect, PaintSize, PaintTransform, RenderedGradient,
-    RenderedGradientKind, RenderedGradientStop, RenderedPath, RenderedPathClip,
+    PaintBlendMode, PaintClip, PaintPoint, PaintRect, PaintSize, PaintStrokeWidth, PaintTransform,
+    RenderedGradient, RenderedGradientKind, RenderedGradientStop, RenderedPath, RenderedPathClip,
     RenderedPathClipPath, RenderedPathCommand, RenderedPathFillRule, RenderedPathLineCap,
     RenderedPathLineJoin, RenderedPathPaint, RenderedPathPaintOrder, RenderedPathStrokeStyle,
     RenderedSvgPathPattern,
 };
 use crate::dom::{Element, ElementId, NodeKind};
-use crate::units::LayoutSize;
+use crate::units::{LayoutLength, LayoutSize, SemanticLengthExt, layout_pt};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -38,12 +38,43 @@ pub(crate) type SvgSourceRect = euclid::Rect<f32, SvgSourceSpace>;
 type SvgSourceToPaintTransform =
     euclid::ScaleOffset2D<f32, SvgSourceSpace, crate::document::PaintSpace>;
 
+/// Host-document CSS presentation values selected for one inline SVG node.
+///
+/// The SVG adapter consumes a standalone payload, so CSS that matched its DOM
+/// descendants must cross this boundary as SVG presentation attributes. The
+/// optional fields preserve the distinction between no host-CSS declaration
+/// and an explicit CSS `none` value:
+/// <https://www.w3.org/TR/SVG2/painting.html#SpecifyingPaint>.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SvgPresentationOverride {
+    pub(crate) display: Option<SvgDisplayOverride>,
+    pub(crate) transform: Option<String>,
+    pub(crate) fill: Option<String>,
+    pub(crate) stroke: Option<String>,
+    pub(crate) stroke_width: Option<String>,
+    /// A forced solid color replaces this element's unsupported filter result.
+    pub(crate) remove_filter: bool,
+}
+
+/// The SVG-scene equivalent of CSS box suppression.
+///
+/// Inline SVG is parsed as a standalone scene, so CSS `display` selected on
+/// SVG descendants has to cross that serialization boundary explicitly.
+/// <https://drafts.csswg.org/css-display-3/#unbox-svg>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SvgDisplayOverride {
+    None,
+    Contents,
+    UseContents,
+}
+
+pub(crate) type SvgPresentationOverrides = HashMap<ElementId, SvgPresentationOverride>;
+
 /// A parsed inline SVG plus its intrinsic viewport size in Quire points.
 #[derive(Debug, Clone)]
 pub(crate) struct SvgAsset {
     tree: usvg::Tree,
-    intrinsic_width: f32,
-    intrinsic_height: f32,
+    intrinsic_size: LayoutSize,
     intrinsic_dimensions: SvgIntrinsicDimensions,
     has_degenerate_view_box: bool,
     view_fragments: HashMap<String, SvgIntrinsicDimensions>,
@@ -62,14 +93,14 @@ pub(crate) struct SvgAsset {
 /// <https://www.w3.org/TR/SVG2/coords.html#IntrinsicSizing>
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SvgIntrinsicDimensions {
-    pub(crate) width: Option<f32>,
-    pub(crate) height: Option<f32>,
+    pub(crate) width: Option<LayoutLength>,
+    pub(crate) height: Option<LayoutLength>,
     pub(crate) aspect_ratio: Option<f32>,
 }
 
 impl SvgAsset {
     pub(crate) fn intrinsic_size(&self) -> LayoutSize {
-        LayoutSize::new(self.intrinsic_width, self.intrinsic_height)
+        self.intrinsic_size
     }
 
     /// Return the CSS intrinsic dimensions without SVG's concrete viewport
@@ -100,9 +131,20 @@ impl SvgAsset {
             .aspect_ratio
             .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
         match (dimensions.width, dimensions.height, ratio) {
-            (Some(width), Some(height), _) => LayoutSize::new(width, height),
-            (Some(width), None, Some(ratio)) => LayoutSize::new(width, width / ratio),
-            (None, Some(height), Some(ratio)) => LayoutSize::new(height * ratio, height),
+            (Some(width), Some(height), _) => LayoutSize::new(width.points(), height.points()),
+            (Some(width), None, Some(ratio)) => {
+                LayoutSize::new(width.points(), width.points() / ratio)
+            }
+            (None, Some(height), Some(ratio)) => {
+                LayoutSize::new(height.points() * ratio, height.points())
+            }
+            // Without a preferred aspect ratio, the supplied intrinsic axis
+            // combines with the corresponding default object-size axis.
+            // CSS Images does not discard a declared SVG width or height just
+            // because the other axis is absent.
+            // <https://www.w3.org/TR/css-images-3/#default-sizing>
+            (Some(width), None, None) => LayoutSize::new(width.points(), fallback.height),
+            (None, Some(height), None) => LayoutSize::new(fallback.width, height.points()),
             // The default object size supplies the fallback inline size;
             // a ratio-only SVG derives the block size from it rather than
             // retaining the SVG parser's unrelated 300 by 150 viewport.
@@ -120,24 +162,13 @@ impl SvgAsset {
     /// concrete object size.
     /// <https://www.w3.org/TR/SVG2/coords.html#ViewportSpace>
     /// <https://www.w3.org/TR/css-images-3/#the-object-fit>
-    pub(crate) fn with_replaced_viewport(&self, width: f32, height: f32) -> Self {
+    pub(crate) fn with_replaced_viewport(&self, viewport: crate::units::ContentBoxSize) -> Self {
+        let width = viewport.width;
+        let height = viewport.height;
         if width <= 0.0 || height <= 0.0 || !width.is_finite() || !height.is_finite() {
             return self.clone();
         }
-        let width = width / css::CSS_PX_TO_PT;
-        let height = height / css::CSS_PX_TO_PT;
-        let Some(source) = svg_with_replaced_viewport(&self.source, width, height) else {
-            return self.clone();
-        };
-        let Some(viewport) = usvg::Size::from_wh(width, height) else {
-            return self.clone();
-        };
-        let Ok(tree) = parse_svg_tree(&source, viewport) else {
-            return self.clone();
-        };
-        let mut asset = self.clone();
-        asset.tree = tree;
-        asset
+        self.with_css_image_viewport_px(width / css::CSS_PX_TO_PT, height / css::CSS_PX_TO_PT)
     }
 
     /// Whether the root SVG has a zero or negative `viewBox` extent.
@@ -176,33 +207,39 @@ impl SvgAsset {
         asset
     }
 
-    /// Normalize an SVG with no intrinsic dimensions or ratio against a CSS
-    /// background image's used viewport.
+    /// Reparse this SVG for a concrete CSS background-image viewport.
     ///
-    /// SVG percentage geometry is relative to the SVG viewport. For a root
-    /// SVG with no intrinsic geometry, CSS Images supplies that viewport from
-    /// the concrete background image size; it is not the parser's fallback
-    /// canvas or the SVG content bounding box.
+    /// SVG percentage geometry and `preserveAspectRatio` are relative to the
+    /// root SVG viewport. CSS Backgrounds supplies that viewport from the
+    /// concrete background image size, independently of the SVG's intrinsic
+    /// dimensions used earlier by `background-size`.
     /// <https://www.w3.org/TR/SVG2/coords.html#ViewportSpace>
     /// <https://www.w3.org/TR/css-images-3/#default-sizing>
-    pub(crate) fn with_background_viewport(&self, width: f32, height: f32) -> Self {
-        if self.intrinsic_dimensions.width.is_some()
-            || self.intrinsic_dimensions.height.is_some()
-            || self.intrinsic_dimensions.aspect_ratio.is_some()
-            || width <= 0.0
-            || height <= 0.0
-        {
+    pub(crate) fn with_background_viewport(&self, viewport: PaintSize) -> Self {
+        let width = viewport.width;
+        let height = viewport.height;
+        if width <= 0.0 || height <= 0.0 || !width.is_finite() || !height.is_finite() {
             return self.clone();
         }
-        let width = width / css::CSS_PX_TO_PT;
-        let height = height / css::CSS_PX_TO_PT;
-        let Some(source) = svg_with_embedded_viewport(&self.source, width, height) else {
+        self.with_css_image_viewport_px(width / css::CSS_PX_TO_PT, height / css::CSS_PX_TO_PT)
+    }
+
+    /// Reparse the root SVG against a used CSS image viewport in CSS pixels.
+    ///
+    /// The cloned asset deliberately retains its original intrinsic-dimension
+    /// metadata: CSS image sizing has already resolved before this paint-only
+    /// specialization, and must not observe the rewritten root dimensions.
+    fn with_css_image_viewport_px(&self, width: f32, height: f32) -> Self {
+        if width <= 0.0 || height <= 0.0 || !width.is_finite() || !height.is_finite() {
+            return self.clone();
+        }
+        let Some(source) = svg_with_css_image_viewport(&self.source, width, height) else {
             return self.clone();
         };
-        let Ok(tree) = parse_svg_tree(
-            &source,
-            usvg::Size::from_wh(300.0, 150.0).expect("default SVG viewport is valid"),
-        ) else {
+        let Some(viewport) = usvg::Size::from_wh(width, height) else {
+            return self.clone();
+        };
+        let Ok(tree) = parse_svg_tree(&source, viewport) else {
             return self.clone();
         };
         let mut asset = self.clone();
@@ -245,7 +282,7 @@ impl SvgAsset {
         if source.size.width <= 0.0 || source.size.height <= 0.0 {
             return Vec::new();
         }
-        let transform = ViewportTransform::new(destination, source);
+        let transform = ViewportTransform::new(destination, source, true);
         collect_svg_group(self.tree.root(), transform, &[]).into_paths()
     }
 
@@ -255,9 +292,29 @@ impl SvgAsset {
     /// opacity, isolation, and blend-mode boundaries for PDF compositing.
     pub(crate) fn paint_group(&self, destination: PaintRect) -> SvgPaintGroup {
         let source_size = self.source_viewport_size();
-        self.paint_group_for_source_rect(
+        self.paint_group_for_source_rect_with_viewport_clip(
             destination,
             SvgSourceRect::new(SvgSourcePoint::new(0.0, 0.0), source_size),
+            true,
+        )
+    }
+
+    /// Paint an inline SVG root with the host element's overflow policy.
+    ///
+    /// Inline SVG geometry is still projected through the root `viewBox`; the
+    /// boolean only controls whether the root viewport clips overflowing SVG
+    /// strokes and paths.  CSS `overflow: visible` must not silently regain a
+    /// replaced-image viewport clip.
+    pub(crate) fn paint_inline_group(
+        &self,
+        destination: PaintRect,
+        clip_viewport: bool,
+    ) -> SvgPaintGroup {
+        let source_size = self.source_viewport_size();
+        self.paint_group_for_source_rect_with_viewport_clip(
+            destination,
+            SvgSourceRect::new(SvgSourcePoint::new(0.0, 0.0), source_size),
+            clip_viewport,
         )
     }
 
@@ -266,6 +323,15 @@ impl SvgAsset {
         destination: PaintRect,
         source: SvgSourceRect,
     ) -> SvgPaintGroup {
+        self.paint_group_for_source_rect_with_viewport_clip(destination, source, true)
+    }
+
+    fn paint_group_for_source_rect_with_viewport_clip(
+        &self,
+        destination: PaintRect,
+        source: SvgSourceRect,
+        clip_viewport: bool,
+    ) -> SvgPaintGroup {
         if destination.size.width <= 0.0
             || destination.size.height <= 0.0
             || source.size.width <= 0.0
@@ -273,7 +339,7 @@ impl SvgAsset {
         {
             return SvgPaintGroup::empty();
         }
-        let viewport = ViewportTransform::new(destination, source);
+        let viewport = ViewportTransform::new(destination, source, clip_viewport);
         collect_svg_group(self.tree.root(), viewport, &[])
     }
 
@@ -289,7 +355,7 @@ impl SvgAsset {
     /// clips each background tile to its background painting area.
     /// <https://www.w3.org/TR/SVG2/struct.html#SVGElement>
     /// <https://www.w3.org/TR/css-backgrounds-3/#the-background-image>
-    pub(crate) fn opaque_viewport_fill(&self) -> Option<Color> {
+    pub(crate) fn opaque_viewport_fill(&self) -> Option<CssColor> {
         let group = self.paint_group(unit_paint_rect());
         let path = single_opaque_path(&group)?;
         opaque_unit_rectangle_fill(path)
@@ -303,7 +369,7 @@ impl SvgAsset {
     /// covered by exactly one opaque solid rectangle, it can be emitted as a
     /// finite CSS paint rectangle instead of retaining a PDF clip around a
     /// huge transformed SVG viewport.
-    pub(crate) fn opaque_source_rect_fill(&self, source: SvgSourceRect) -> Option<Color> {
+    pub(crate) fn opaque_source_rect_fill(&self, source: SvgSourceRect) -> Option<CssColor> {
         let group = self.paint_group_for_source_rect(unit_paint_rect(), source);
         let paths = simple_group_paths(&group)?;
         let mut color = None;
@@ -438,17 +504,80 @@ fn simple_group_paths(group: &SvgPaintGroup) -> Option<Vec<&RenderedPath>> {
 }
 
 /// Recognize a solid path which exactly covers a unit SVG viewport.
-fn opaque_unit_rectangle_fill(path: &RenderedPath) -> Option<Color> {
+fn opaque_unit_rectangle_fill(path: &RenderedPath) -> Option<CssColor> {
     let (color, bounds) = opaque_axis_aligned_rectangle(path)?;
-    ((bounds.0 - 0.0).abs() <= 0.0001
-        && (bounds.1 - 0.0).abs() <= 0.0001
-        && (bounds.2 - 1.0).abs() <= 0.0001
-        && (bounds.3 - 1.0).abs() <= 0.0001)
+    if rectangle_matches_unit_viewport(bounds) {
+        return Some(color);
+    }
+
+    // SVG painting installs the root viewport as its primary clip. A solid
+    // path can cover that viewport while its source geometry overflows it,
+    // such as an SVG without a `viewBox` used in a smaller CSS tile. That is
+    // still equivalent to a uniform color image, provided no SVG clip path
+    // further restricts the painted result.
+    let clip = path.clip.as_ref()?;
+    if clip.fill_rule != RenderedPathFillRule::NonZero || !clip.additional_clips.is_empty() {
+        return None;
+    }
+    let clip_bounds = axis_aligned_rectangle_bounds(&clip.commands)?;
+    (rectangle_matches_unit_viewport(clip_bounds) && rectangle_contains(bounds, clip_bounds))
         .then_some(color)
 }
 
+fn rectangle_matches_unit_viewport(bounds: (f32, f32, f32, f32)) -> bool {
+    (bounds.0 - 0.0).abs() <= 0.0001
+        && (bounds.1 - 0.0).abs() <= 0.0001
+        && (bounds.2 - 1.0).abs() <= 0.0001
+        && (bounds.3 - 1.0).abs() <= 0.0001
+}
+
+fn rectangle_contains(outer: (f32, f32, f32, f32), inner: (f32, f32, f32, f32)) -> bool {
+    const EPSILON: f32 = 0.0001;
+    outer.0 <= inner.0 + EPSILON
+        && outer.1 <= inner.1 + EPSILON
+        && outer.2 >= inner.2 - EPSILON
+        && outer.3 >= inner.3 - EPSILON
+}
+
+fn axis_aligned_rectangle_bounds(commands: &[RenderedPathCommand]) -> Option<(f32, f32, f32, f32)> {
+    let [
+        RenderedPathCommand::MoveTo(first),
+        RenderedPathCommand::LineTo(second),
+        RenderedPathCommand::LineTo(third),
+        RenderedPathCommand::LineTo(fourth),
+        RenderedPathCommand::Close,
+    ] = commands
+    else {
+        return None;
+    };
+    let points = [*first, *second, *third, *fourth];
+    let min_x = points.iter().map(|point| point.x).reduce(f32::min)?;
+    let min_y = points.iter().map(|point| point.y).reduce(f32::min)?;
+    let max_x = points.iter().map(|point| point.x).reduce(f32::max)?;
+    let max_y = points.iter().map(|point| point.y).reduce(f32::max)?;
+    let expected = [
+        PaintPoint::new(min_x, min_y),
+        PaintPoint::new(max_x, min_y),
+        PaintPoint::new(max_x, max_y),
+        PaintPoint::new(min_x, max_y),
+    ];
+    let mut corners = [false; 4];
+    for point in points {
+        let index = expected.iter().position(|corner| {
+            (point.x - corner.x).abs() <= 0.0001 && (point.y - corner.y).abs() <= 0.0001
+        })?;
+        if std::mem::replace(&mut corners[index], true) {
+            return None;
+        }
+    }
+    corners
+        .into_iter()
+        .all(|corner| corner)
+        .then_some((min_x, min_y, max_x, max_y))
+}
+
 /// Return a solid opaque rectangular path's color and transformed bounds.
-fn opaque_axis_aligned_rectangle(path: &RenderedPath) -> Option<(Color, (f32, f32, f32, f32))> {
+fn opaque_axis_aligned_rectangle(path: &RenderedPath) -> Option<(CssColor, (f32, f32, f32, f32))> {
     let RenderedPathPaint::Solid(color) = path.fill_paint.as_ref()? else {
         return None;
     };
@@ -472,36 +601,21 @@ fn opaque_axis_aligned_rectangle(path: &RenderedPath) -> Option<(Color, (f32, f3
     else {
         return None;
     };
-    let points = [first, second, third, fourth].map(|point| path.transform.apply_point(*point));
-    let min_x = points.iter().map(|point| point.x).reduce(f32::min)?;
-    let min_y = points.iter().map(|point| point.y).reduce(f32::min)?;
-    let max_x = points.iter().map(|point| point.x).reduce(f32::max)?;
-    let max_y = points.iter().map(|point| point.y).reduce(f32::max)?;
-    let expected = [
-        PaintPoint::new(min_x, min_y),
-        PaintPoint::new(max_x, min_y),
-        PaintPoint::new(max_x, max_y),
-        PaintPoint::new(min_x, max_y),
+    let commands = [
+        RenderedPathCommand::MoveTo(path.transform.apply_point(*first)),
+        RenderedPathCommand::LineTo(path.transform.apply_point(*second)),
+        RenderedPathCommand::LineTo(path.transform.apply_point(*third)),
+        RenderedPathCommand::LineTo(path.transform.apply_point(*fourth)),
+        RenderedPathCommand::Close,
     ];
-    let mut corners = [false; 4];
-    for point in points {
-        let index = expected.iter().position(|corner| {
-            (point.x - corner.x).abs() <= 0.0001 && (point.y - corner.y).abs() <= 0.0001
-        })?;
-        if std::mem::replace(&mut corners[index], true) {
-            return None;
-        }
-    }
-    corners
-        .into_iter()
-        .all(|corner| corner)
-        .then_some((*color, (min_x, min_y, max_x, max_y)))
+    axis_aligned_rectangle_bounds(&commands).map(|bounds| (*color, bounds))
 }
 
 #[derive(Clone, Copy)]
 struct ViewportTransform {
     destination: PaintRect,
     source_to_paint: SvgSourceToPaintTransform,
+    clip_viewport: bool,
 }
 
 impl ViewportTransform {
@@ -509,7 +623,7 @@ impl ViewportTransform {
     ///
     /// The negative y scale is the sole coordinate-system conversion between
     /// SVG's top-left source space and PDF paint space.
-    fn new(destination: PaintRect, source: SvgSourceRect) -> Self {
+    fn new(destination: PaintRect, source: SvgSourceRect, clip_viewport: bool) -> Self {
         let scale_x = destination.size.width / source.size.width;
         let scale_y = destination.size.height / source.size.height;
         Self {
@@ -520,6 +634,7 @@ impl ViewportTransform {
                 destination.origin.x - scale_x * source.origin.x,
                 destination.max_y() + scale_y * source.origin.y,
             ),
+            clip_viewport,
         }
     }
 }
@@ -688,13 +803,24 @@ fn render_path_with_clips(
     // PDF stroke widths are in transformed user space. The geometric mean is
     // exact for uniform scale and is the least-distorting interim mapping for
     // non-uniform SVG viewports until paths carry a local PDF CTM.
-    let stroke_width = path
-        .stroke()
-        .map(|stroke| stroke.width().get())
-        .unwrap_or(0.0);
-    let mut clip = viewport_clip(viewport);
-    clip.additional_clips.extend_from_slice(additional_clips);
-    let rendered = RenderedPath::new(commands, None, fill_rule, None, stroke_width, Some(clip))
+    let stroke_width = PaintStrokeWidth::new(
+        path.stroke()
+            .map(|stroke| stroke.width().get())
+            .unwrap_or(0.0),
+    );
+    let clip = if viewport.clip_viewport {
+        let mut clip = viewport_clip(viewport);
+        clip.additional_clips.extend_from_slice(additional_clips);
+        Some(clip)
+    } else {
+        let mut clips = additional_clips.iter().cloned();
+        clips.next().map(|primary| {
+            let mut clip = RenderedPathClip::new(primary.commands, primary.fill_rule, Vec::new());
+            clip.additional_clips.extend(clips);
+            clip
+        })
+    };
+    let rendered = RenderedPath::new(commands, None, fill_rule, None, stroke_width, clip)
         .with_paints(fill, stroke)
         .with_transform(path_transform);
     let rendered = if let Some(stroke) = path.stroke() {
@@ -788,8 +914,7 @@ fn svg_pattern(
     }
     let paths = svg_pattern_group_paths(pattern.root())?;
     Some(RenderedSvgPathPattern {
-        tile_width,
-        tile_height,
+        tile_size: PaintSize::new(tile_width, tile_height),
         origin: PaintPoint::new(rect.x(), rect.y()),
         transform: path_transform.multiply(svg_gradient_transform(pattern.transform())),
         paths,
@@ -847,10 +972,11 @@ fn svg_pattern_path(path: &usvg::Path) -> Option<RenderedPath> {
         Some(usvg::FillRule::EvenOdd) => RenderedPathFillRule::EvenOdd,
         _ => RenderedPathFillRule::NonZero,
     };
-    let stroke_width = path
-        .stroke()
-        .map(|stroke| stroke.width().get())
-        .unwrap_or(0.0);
+    let stroke_width = PaintStrokeWidth::new(
+        path.stroke()
+            .map(|stroke| stroke.width().get())
+            .unwrap_or(0.0),
+    );
     let transform = path.abs_transform();
     let rendered = RenderedPath::new(commands, fill, fill_rule, stroke, stroke_width, None)
         .with_transform(PaintTransform::new(
@@ -886,7 +1012,7 @@ fn svg_pattern_path(path: &usvg::Path) -> Option<RenderedPath> {
     }))
 }
 
-fn svg_pattern_solid_paint(fill: &usvg::Fill) -> Option<Color> {
+fn svg_pattern_solid_paint(fill: &usvg::Fill) -> Option<CssColor> {
     let usvg::Paint::Color(color) = fill.paint() else {
         return None;
     };
@@ -894,7 +1020,7 @@ fn svg_pattern_solid_paint(fill: &usvg::Fill) -> Option<Color> {
     color.is_opaque().then_some(color)
 }
 
-fn svg_pattern_stroke_paint(stroke: &usvg::Stroke) -> Option<Color> {
+fn svg_pattern_stroke_paint(stroke: &usvg::Stroke) -> Option<CssColor> {
     let usvg::Paint::Color(color) = stroke.paint() else {
         return None;
     };
@@ -909,7 +1035,7 @@ fn svg_linear_gradient(gradient: &usvg::LinearGradient, opacity: f32) -> Option<
     svg_gradient_spread(gradient.spread_method())?;
     Some(RenderedGradient {
         kind: RenderedGradientKind::Linear { start, end },
-        color_space: crate::css::ColorSpace::Srgb,
+        color_space: crate::css::CssColorSpace::Srgb,
         stops,
         periodic: None,
         transform: svg_gradient_transform(gradient.transform()),
@@ -931,7 +1057,7 @@ fn svg_radial_gradient(gradient: &usvg::RadialGradient, opacity: f32) -> Option<
             end_center,
             end_radius: gradient.r().get(),
         },
-        color_space: crate::css::ColorSpace::Srgb,
+        color_space: crate::css::CssColorSpace::Srgb,
         stops,
         periodic: None,
         transform: svg_gradient_transform(gradient.transform()),
@@ -947,30 +1073,25 @@ fn svg_radial_gradient(gradient: &usvg::RadialGradient, opacity: f32) -> Option<
 /// <https://www.w3.org/TR/SVG2/pservers.html#GradientStops>
 fn svg_gradient_stops(stops: &[usvg::Stop], opacity: f32) -> Option<Vec<RenderedGradientStop>> {
     let first = stops.first()?;
-    let mut rendered = Vec::with_capacity(stops.len() + 2);
-    if first.offset().get() > 0.0 {
-        rendered.push(RenderedGradientStop {
+    let last = stops.last()?;
+    let rendered = (first.offset().get() > 0.0)
+        .then_some(RenderedGradientStop {
             offset: 0.0,
             color: svg_color(first.color(), first.opacity().get() * opacity),
             interpolation_exponent: 1.0,
-        });
-    }
-    for stop in stops {
-        let alpha = stop.opacity().get() * opacity;
-        rendered.push(RenderedGradientStop {
+        })
+        .into_iter()
+        .chain(stops.iter().map(|stop| RenderedGradientStop {
             offset: stop.offset().get(),
-            color: svg_color(stop.color(), alpha),
+            color: svg_color(stop.color(), stop.opacity().get() * opacity),
             interpolation_exponent: 1.0,
-        });
-    }
-    let last = stops.last()?;
-    if last.offset().get() < 1.0 {
-        rendered.push(RenderedGradientStop {
+        }))
+        .chain((last.offset().get() < 1.0).then_some(RenderedGradientStop {
             offset: 1.0,
             color: svg_color(last.color(), last.opacity().get() * opacity),
             interpolation_exponent: 1.0,
-        });
-    }
+        }))
+        .collect::<Vec<_>>();
     (rendered.len() >= 2).then_some(rendered)
 }
 
@@ -1100,8 +1221,8 @@ fn unit_paint_rect() -> PaintRect {
     PaintRect::new(PaintPoint::new(0.0, 0.0), PaintSize::new(1.0, 1.0))
 }
 
-fn svg_color(color: usvg::Color, opacity: f32) -> Color {
-    Color::rgba(color.red, color.green, color.blue, opacity)
+fn svg_color(color: usvg::Color, opacity: f32) -> CssColor {
+    CssColor::rgba(color.red, color.green, color.blue, opacity)
 }
 
 pub(crate) fn parse_inline_svg(element: &Element) -> Result<SvgAsset, String> {
@@ -1115,11 +1236,11 @@ pub(crate) fn parse_inline_svg(element: &Element) -> Result<SvgAsset, String> {
 /// so the layout phase supplies only the transform declarations that apply to
 /// SVG descendants. They are serialized as presentation attributes with the
 /// CSS cascade's higher-priority result already selected.
-pub(crate) fn parse_inline_svg_with_transform_overrides(
+pub(crate) fn parse_inline_svg_with_presentation_overrides(
     element: &Element,
-    transform_overrides: &HashMap<ElementId, String>,
+    overrides: &SvgPresentationOverrides,
 ) -> Result<SvgAsset, String> {
-    let xml = serialize_inline_svg_with_transform_overrides(element, transform_overrides);
+    let xml = serialize_inline_svg_with_presentation_overrides(element, overrides);
     parse_svg_bytes(xml.as_bytes())
 }
 
@@ -1139,8 +1260,10 @@ pub(crate) fn parse_svg_bytes(bytes: &[u8]) -> Result<SvgAsset, String> {
     let view_fragments = svg_view_fragments(bytes);
     Ok(SvgAsset {
         tree,
-        intrinsic_width: size.width() * css::CSS_PX_TO_PT,
-        intrinsic_height: size.height() * css::CSS_PX_TO_PT,
+        intrinsic_size: LayoutSize::new(
+            size.width() * css::CSS_PX_TO_PT,
+            size.height() * css::CSS_PX_TO_PT,
+        ),
         intrinsic_dimensions,
         has_degenerate_view_box,
         view_fragments,
@@ -1148,42 +1271,10 @@ pub(crate) fn parse_svg_bytes(bytes: &[u8]) -> Result<SvgAsset, String> {
     })
 }
 
-/// Add explicit root viewport dimensions before SVG normalization.
-///
-/// `usvg` replaces an omitted root viewport with its content bounds after
-/// parsing. Injecting the used CSS viewport before parsing preserves the SVG
-/// coordinate system in which percentage lengths and strokes are defined.
-fn svg_with_embedded_viewport(bytes: &[u8], width: f32, height: f32) -> Option<Vec<u8>> {
-    let source = std::str::from_utf8(bytes).ok()?;
-    let document = usvg::roxmltree::Document::parse(source).ok()?;
-    let root = document.root_element();
-    if root.tag_name().name() != "svg"
-        || root.attribute("width").is_some()
-        || root.attribute("height").is_some()
-        || root.attribute("viewBox").is_some()
-        || !width.is_finite()
-        || !height.is_finite()
-    {
-        return None;
-    }
-    let start = root.range().start;
-    let close = svg_start_tag_close(source.get(start..)?)? + start;
-    let insert_at = source[..close]
-        .trim_end_matches(char::is_whitespace)
-        .strip_suffix('/')
-        .map_or(close, |prefix| prefix.len());
-    let mut normalized = source.as_bytes().to_vec();
-    normalized.splice(
-        insert_at..insert_at,
-        format!(" width=\"{width}px\" height=\"{height}px\"").bytes(),
-    );
-    Some(normalized)
-}
-
-/// Substitute the used CSS replaced-object viewport for an SVG root's own
-/// viewport dimensions. The source stays otherwise byte-for-byte intact, so
-/// parsing continues to handle namespaces, style, and child geometry.
-fn svg_with_replaced_viewport(bytes: &[u8], width: f32, height: f32) -> Option<Vec<u8>> {
+/// Substitute the used CSS image viewport for an SVG root's own viewport
+/// dimensions. The source stays otherwise byte-for-byte intact, so parsing
+/// continues to handle namespaces, style, and child geometry.
+fn svg_with_css_image_viewport(bytes: &[u8], width: f32, height: f32) -> Option<Vec<u8>> {
     let source = std::str::from_utf8(bytes).ok()?;
     let document = usvg::roxmltree::Document::parse(source).ok()?;
     let root = document.root_element();
@@ -1337,7 +1428,13 @@ fn svg_intrinsic_dimensions(bytes: &[u8], viewport: usvg::Size) -> SvgIntrinsicD
             aspect_ratio: None,
         };
     };
-    let Ok(document) = usvg::roxmltree::Document::parse(source) else {
+    // `usvg` accepts SVG documents with an external DTD, but `roxmltree`
+    // intentionally does not resolve external subsets. The DTD has no role
+    // in the root geometry we read here, so remove its declaration before
+    // extracting the root dimensions and `viewBox` ratio.
+    // <https://www.w3.org/TR/SVG2/coords.html#IntrinsicSizing>
+    let source = svg_source_without_doctype(source);
+    let Ok(document) = usvg::roxmltree::Document::parse(&source) else {
         return SvgIntrinsicDimensions {
             width: None,
             height: None,
@@ -1356,11 +1453,11 @@ fn svg_intrinsic_dimensions(bytes: &[u8], viewport: usvg::Size) -> SvgIntrinsicD
     let width = root
         .attribute("width")
         .filter(|value| svg_length_is_intrinsic(value))
-        .map(|_| viewport.width() * css::CSS_PX_TO_PT);
+        .map(|_| layout_pt(viewport.width() * css::CSS_PX_TO_PT));
     let height = root
         .attribute("height")
         .filter(|value| svg_length_is_intrinsic(value))
-        .map(|_| viewport.height() * css::CSS_PX_TO_PT);
+        .map(|_| layout_pt(viewport.height() * css::CSS_PX_TO_PT));
     // Explicit intrinsic dimensions establish the image's intrinsic ratio.
     // A `viewBox` only supplies the ratio when those dimensions do not both
     // exist; with `preserveAspectRatio="none"`, the viewBox can be stretched
@@ -1368,7 +1465,10 @@ fn svg_intrinsic_dimensions(bytes: &[u8], viewport: usvg::Size) -> SvgIntrinsicD
     // <https://www.w3.org/TR/SVG2/coords.html#IntrinsicSizing>
     let aspect_ratio = width
         .zip(height)
-        .and_then(|(width, height)| (width > 0.0 && height > 0.0).then_some(width / height))
+        .and_then(|(width, height)| {
+            (width > layout_pt(0.0) && height > layout_pt(0.0))
+                .then_some(width.points() / height.points())
+        })
         .or_else(|| svg_view_box_aspect_ratio(root.attribute("viewBox")));
 
     SvgIntrinsicDimensions {
@@ -1376,6 +1476,35 @@ fn svg_intrinsic_dimensions(bytes: &[u8], viewport: usvg::Size) -> SvgIntrinsicD
         height,
         aspect_ratio,
     }
+}
+
+/// Remove one XML doctype declaration without interpreting its external or
+/// internal subset. XML declarations can contain quoted `>` characters and an
+/// internal subset, so the terminator is the first unquoted `>` outside `[]`.
+fn svg_source_without_doctype(source: &str) -> std::borrow::Cow<'_, str> {
+    let Some(start) = source.find("<!DOCTYPE") else {
+        return std::borrow::Cow::Borrowed(source);
+    };
+    let mut quote = None;
+    let mut subset_depth = 0usize;
+    for (relative_end, character) in source[start..].char_indices() {
+        match (quote, character) {
+            (Some(delimiter), character) if character == delimiter => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '\"') => quote = Some(character),
+            (None, '[') => subset_depth += 1,
+            (None, ']') => subset_depth = subset_depth.saturating_sub(1),
+            (None, '>') if subset_depth == 0 => {
+                let end = start + relative_end + character.len_utf8();
+                let mut stripped = String::with_capacity(source.len() - (end - start));
+                stripped.push_str(&source[..start]);
+                stripped.push_str(&source[end..]);
+                return std::borrow::Cow::Owned(stripped);
+            }
+            (None, _) => {}
+        }
+    }
+    std::borrow::Cow::Borrowed(source)
 }
 
 /// Whether an SVG root `width` or `height` attribute supplies an intrinsic
@@ -1460,7 +1589,7 @@ fn svg_paint_is_supported(paint: &usvg::Paint, opacity: f32) -> bool {
 }
 
 pub(crate) fn serialize_inline_svg(element: &Element) -> String {
-    serialize_inline_svg_with_transform_overrides(element, &HashMap::new())
+    serialize_inline_svg_with_presentation_overrides(element, &SvgPresentationOverrides::new())
 }
 
 /// Compose an SVG presentation `transform-origin` around an existing SVG
@@ -1605,16 +1734,16 @@ fn svg_user_length(value: &str) -> Option<f32> {
     value.parse::<f32>().ok()
 }
 
-fn serialize_inline_svg_with_transform_overrides(
+fn serialize_inline_svg_with_presentation_overrides(
     element: &Element,
-    transform_overrides: &HashMap<ElementId, String>,
+    overrides: &SvgPresentationOverrides,
 ) -> String {
     let mut output = String::new();
     serialize_element(
         element,
         true,
         &mut NamespacePrefixes::default(),
-        transform_overrides,
+        overrides,
         &mut output,
     );
     output
@@ -1641,9 +1770,25 @@ fn serialize_element(
     element: &Element,
     root: bool,
     prefixes: &mut NamespacePrefixes,
-    transform_overrides: &HashMap<ElementId, String>,
+    overrides: &SvgPresentationOverrides,
     output: &mut String,
 ) {
+    let override_values = overrides.get(&element.id);
+    match override_values.and_then(|values| values.display) {
+        Some(SvgDisplayOverride::None) => return,
+        Some(SvgDisplayOverride::Contents) => {
+            for child in &element.children {
+                match &child.kind {
+                    NodeKind::Text(text) => push_escaped_text(output, text),
+                    NodeKind::Element(child) => {
+                        serialize_element(child, false, prefixes, overrides, output)
+                    }
+                }
+            }
+            return;
+        }
+        Some(SvgDisplayOverride::UseContents) | None => {}
+    }
     let mut namespace_declarations = Vec::new();
     let tag = if root || element.namespace_url.is_empty() || element.namespace_url == SVG_NAMESPACE
     {
@@ -1662,9 +1807,8 @@ fn serialize_element(
     }
     let mut attrs: Vec<_> = element.attrs.iter().collect();
     attrs.sort_unstable_by_key(|(name, _)| *name);
-    let transform_override = transform_overrides.get(&element.id);
-    let source_transform = transform_override
-        .cloned()
+    let source_transform = override_values
+        .and_then(|values| values.transform.clone())
         .or_else(|| element.attrs.get("transform").cloned());
     let resolved_transform = source_transform
         .as_deref()
@@ -1680,7 +1824,43 @@ fn serialize_element(
             // wrapped around the selected CSS reference box.
             continue;
         }
-        if name == "transform" {
+        if name == "filter" && override_values.is_some_and(|values| values.remove_filter) {
+            continue;
+        }
+        if name == "style"
+            && override_values.is_some_and(|values| {
+                matches!(values.display, Some(SvgDisplayOverride::UseContents))
+            })
+        {
+            // A stripped `<use>` retains its referenced shadow content but
+            // not its own non-inherited layout/visual style. The host cascade
+            // separately serializes computed inherited presentation values.
+            continue;
+        }
+        if matches!(name.as_str(), "fill" | "stroke" | "stroke-width")
+            && ((name == "fill"
+                && override_values
+                    .and_then(|values| values.fill.as_ref())
+                    .is_some())
+                || (name == "stroke"
+                    && override_values
+                        .and_then(|values| values.stroke.as_ref())
+                        .is_some())
+                || (name == "stroke-width"
+                    && override_values
+                        .and_then(|values| values.stroke_width.as_ref())
+                        .is_some()))
+        {
+            // The host CSS declaration has author origin and therefore
+            // overrides this SVG presentation attribute.
+            continue;
+        }
+        if name == "style" && override_values.is_some_and(|values| values.remove_filter) {
+            // A CSS parser in usvg retains the source filter even when a
+            // later declaration resets it. These forced-solid cases have no
+            // other presentation declaration, so omit the source style.
+            continue;
+        } else if name == "transform" {
             emitted_transform = true;
             push_attribute(output, name, resolved_transform.as_deref().unwrap_or(value));
         } else {
@@ -1689,6 +1869,24 @@ fn serialize_element(
     }
     if !emitted_transform && let Some(transform) = resolved_transform.as_deref() {
         push_attribute(output, "transform", transform);
+    }
+    for (name, value) in [
+        (
+            "fill",
+            override_values.and_then(|values| values.fill.as_deref()),
+        ),
+        (
+            "stroke",
+            override_values.and_then(|values| values.stroke.as_deref()),
+        ),
+        (
+            "stroke-width",
+            override_values.and_then(|values| values.stroke_width.as_deref()),
+        ),
+    ] {
+        if let Some(value) = value {
+            push_attribute(output, name, value);
+        }
     }
     let mut namespaced = element.namespace_attrs.clone();
     namespaced.sort_unstable_by(|left, right| {
@@ -1726,7 +1924,7 @@ fn serialize_element(
         match &child.kind {
             NodeKind::Text(text) => push_escaped_text(output, text),
             NodeKind::Element(child) => {
-                serialize_element(child, false, prefixes, transform_overrides, output)
+                serialize_element(child, false, prefixes, overrides, output)
             }
         }
     }
@@ -1783,6 +1981,8 @@ pub(crate) type SharedSvgAsset = Rc<SvgAsset>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dom::Node;
+    use crate::units::content_box_size_pt;
 
     #[test]
     fn presentation_origin_rotates_svg_rect_about_its_fill_box_center() {
@@ -1819,14 +2019,92 @@ mod tests {
             children: Vec::new(),
             is_target: false,
         };
-        let mut overrides = HashMap::new();
-        overrides.insert(rect.id, "matrix(0 1 -1 0 0 0)".to_owned());
-        let xml = serialize_inline_svg_with_transform_overrides(&rect, &overrides);
+        let mut overrides = SvgPresentationOverrides::new();
+        overrides.insert(
+            rect.id,
+            SvgPresentationOverride {
+                transform: Some("matrix(0 1 -1 0 0 0)".to_owned()),
+                ..SvgPresentationOverride::default()
+            },
+        );
+        let xml = serialize_inline_svg_with_presentation_overrides(&rect, &overrides);
 
         assert!(
             xml.contains("transform=\"translate(75 75) matrix(0 1 -1 0 0 0) translate(-75 -75)\"")
         );
         assert!(!xml.contains("transform-origin="));
+    }
+
+    #[test]
+    fn host_css_presentation_overrides_replace_svg_paint_attributes() {
+        let circle = Element {
+            id: ElementId::next(),
+            tag: "circle".to_owned(),
+            namespace_url: "http://www.w3.org/2000/svg".to_owned(),
+            document_syntax: crate::dom::DocumentSyntax::Html,
+            attrs: HashMap::from([
+                ("fill".to_owned(), "red".to_owned()),
+                ("stroke".to_owned(), "black".to_owned()),
+            ]),
+            namespace_attrs: Vec::new(),
+            children: Vec::new(),
+            is_target: false,
+        };
+        let mut overrides = SvgPresentationOverrides::new();
+        overrides.insert(
+            circle.id,
+            SvgPresentationOverride {
+                fill: Some("green".to_owned()),
+                stroke: Some("purple".to_owned()),
+                stroke_width: Some("10px".to_owned()),
+                ..SvgPresentationOverride::default()
+            },
+        );
+        let xml = serialize_inline_svg_with_presentation_overrides(&circle, &overrides);
+
+        assert_eq!(xml.matches("fill=").count(), 1);
+        assert_eq!(xml.matches("stroke=").count(), 1);
+        assert!(xml.contains("fill=\"green\""));
+        assert!(xml.contains("stroke=\"purple\""));
+        assert!(xml.contains("stroke-width=\"10px\""));
+    }
+
+    #[test]
+    fn display_contents_svg_override_hoists_children_without_wrapper_style() {
+        let text = Element {
+            id: ElementId::next(),
+            tag: "text".to_owned(),
+            namespace_url: SVG_NAMESPACE.to_owned(),
+            document_syntax: crate::dom::DocumentSyntax::Html,
+            attrs: HashMap::from([("style".to_owned(), "opacity: 0".to_owned())]),
+            namespace_attrs: Vec::new(),
+            children: vec![Node::text("P")],
+            is_target: false,
+        };
+        let group = Element {
+            id: ElementId::next(),
+            tag: "g".to_owned(),
+            namespace_url: SVG_NAMESPACE.to_owned(),
+            document_syntax: crate::dom::DocumentSyntax::Html,
+            attrs: HashMap::from([("style".to_owned(), "opacity: 0".to_owned())]),
+            namespace_attrs: Vec::new(),
+            children: vec![Node {
+                kind: NodeKind::Element(text),
+            }],
+            is_target: false,
+        };
+        let mut overrides = SvgPresentationOverrides::new();
+        overrides.insert(
+            group.id,
+            SvgPresentationOverride {
+                display: Some(SvgDisplayOverride::Contents),
+                ..SvgPresentationOverride::default()
+            },
+        );
+
+        let xml = serialize_inline_svg_with_presentation_overrides(&group, &overrides);
+        assert!(!xml.contains("<g"));
+        assert!(xml.contains("<text style=\"opacity: 0\">P</text>"));
     }
 
     #[test]
@@ -1869,11 +2147,43 @@ mod tests {
         assert_eq!(
             asset.intrinsic_dimensions(),
             SvgIntrinsicDimensions {
-                width: Some(72.0),
-                height: Some(36.0),
+                width: Some(layout_pt(72.0)),
+                height: Some(layout_pt(36.0)),
                 aspect_ratio: Some(2.0),
             }
         );
+    }
+
+    #[test]
+    fn external_doctype_does_not_hide_an_svg_view_box_ratio() {
+        let asset = parse_svg_bytes(
+            br#"<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.0//EN" "http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><rect width="200" height="100"/></svg>"#,
+        )
+        .expect("test SVG parses");
+
+        assert_eq!(asset.intrinsic_dimensions().width, None);
+        assert_eq!(asset.intrinsic_dimensions().height, None);
+        assert_eq!(asset.intrinsic_dimensions().aspect_ratio, Some(2.0));
+    }
+
+    #[test]
+    fn inline_svg_viewport_clip_follows_host_overflow() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><circle cx="5" cy="5" r="8" fill="green"/></svg>"#,
+        )
+        .expect("test SVG parses");
+        let destination = paint_rect(0.0, 0.0, 10.0, 10.0);
+        let clipped = asset.paint_inline_group(destination, true);
+        let visible = asset.paint_inline_group(destination, false);
+        let [SvgPaintItem::Path(clipped_path)] = clipped.items.as_slice() else {
+            panic!("expected one clipped SVG path");
+        };
+        let [SvgPaintItem::Path(visible_path)] = visible.items.as_slice() else {
+            panic!("expected one visible SVG path");
+        };
+        assert!(clipped_path.clip.is_some());
+        assert!(visible_path.clip.is_none());
     }
 
     #[test]
@@ -1911,7 +2221,7 @@ mod tests {
         assert_eq!(
             percentage_height.intrinsic_dimensions(),
             SvgIntrinsicDimensions {
-                width: Some(8.0 * css::CSS_PX_TO_PT),
+                width: Some(layout_pt(8.0 * css::CSS_PX_TO_PT)),
                 height: None,
                 aspect_ratio: None,
             }
@@ -1930,8 +2240,10 @@ mod tests {
             LayoutSize::new(50.0 * css::CSS_PX_TO_PT, 100.0 * css::CSS_PX_TO_PT)
         );
 
-        let viewport =
-            asset.with_replaced_viewport(50.0 * css::CSS_PX_TO_PT, 100.0 * css::CSS_PX_TO_PT);
+        let viewport = asset.with_replaced_viewport(content_box_size_pt(
+            50.0 * css::CSS_PX_TO_PT,
+            100.0 * css::CSS_PX_TO_PT,
+        ));
         assert_eq!(
             viewport.source_viewport_size(),
             SvgSourceSize::new(50.0, 100.0)
@@ -1948,6 +2260,27 @@ mod tests {
         assert_eq!(
             asset.replaced_intrinsic_size(),
             LayoutSize::new(300.0 * css::CSS_PX_TO_PT, 300.0 * css::CSS_PX_TO_PT)
+        );
+    }
+
+    #[test]
+    fn one_axis_svg_intrinsic_size_preserves_that_axis_without_a_ratio() {
+        let height_only = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" height="25"><rect width="100%" height="100%"/></svg>"#,
+        )
+        .unwrap();
+        let width_only = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="50"><rect width="100%" height="100%"/></svg>"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            height_only.replaced_intrinsic_size(),
+            LayoutSize::new(300.0 * css::CSS_PX_TO_PT, 25.0 * css::CSS_PX_TO_PT)
+        );
+        assert_eq!(
+            width_only.replaced_intrinsic_size(),
+            LayoutSize::new(50.0 * css::CSS_PX_TO_PT, 150.0 * css::CSS_PX_TO_PT)
         );
     }
 
@@ -1977,12 +2310,12 @@ mod tests {
 
         assert_eq!(
             asset
-                .with_background_viewport(150.0, 300.0)
+                .with_background_viewport(PaintSize::new(150.0, 300.0))
                 .source_viewport_size(),
             SvgSourceSize::new(200.0, 400.0)
         );
 
-        let self_closing = svg_with_embedded_viewport(
+        let self_closing = svg_with_css_image_viewport(
             br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#,
             200.0,
             400.0,
@@ -1993,6 +2326,73 @@ mod tests {
                 .unwrap()
                 .contains("width=\"200px\" height=\"400px\"/")
         );
+    }
+
+    fn assert_opaque_rect_bounds(asset: &SvgAsset, expected: (f32, f32, f32, f32)) {
+        let paths = asset.paint_paths(paint_rect(0.0, 0.0, 12.0, 12.0));
+        let [path] = paths.as_slice() else {
+            panic!("expected one opaque SVG rectangle");
+        };
+        let (_, actual) = opaque_axis_aligned_rectangle(path)
+            .expect("expected an opaque axis-aligned SVG rectangle");
+        for (actual, expected) in [actual.0, actual.1, actual.2, actual.3]
+            .into_iter()
+            .zip([expected.0, expected.1, expected.2, expected.3])
+        {
+            assert!(
+                (actual - expected).abs() < 0.0001,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn background_viewport_honors_default_preserve_aspect_ratio_for_view_box_only_svg() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 8"><rect width="16" height="8" fill="orange"/></svg>"#,
+        )
+        .unwrap();
+        let intrinsic_dimensions = asset.intrinsic_dimensions();
+        let viewport = asset.with_background_viewport(PaintSize::new(12.0, 12.0));
+
+        assert_eq!(
+            viewport.source_viewport_size(),
+            SvgSourceSize::new(16.0, 16.0)
+        );
+        assert_eq!(viewport.intrinsic_dimensions(), intrinsic_dimensions);
+        assert_opaque_rect_bounds(&viewport, (0.0, 3.0, 12.0, 9.0));
+    }
+
+    #[test]
+    fn background_viewport_honors_default_preserve_aspect_ratio_for_sized_svg() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="8" viewBox="0 0 16 8"><rect width="16" height="8" fill="orange"/></svg>"#,
+        )
+        .unwrap();
+        let intrinsic_dimensions = asset.intrinsic_dimensions();
+        let viewport = asset.with_background_viewport(PaintSize::new(12.0, 12.0));
+
+        assert_eq!(
+            viewport.source_viewport_size(),
+            SvgSourceSize::new(16.0, 16.0)
+        );
+        assert_eq!(viewport.intrinsic_dimensions(), intrinsic_dimensions);
+        assert_opaque_rect_bounds(&viewport, (0.0, 3.0, 12.0, 9.0));
+    }
+
+    #[test]
+    fn background_viewport_preserves_none_aspect_ratio_stretching() {
+        let asset = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="8" viewBox="0 0 16 8" preserveAspectRatio="none"><rect width="16" height="8" fill="orange"/></svg>"#,
+        )
+        .unwrap();
+        let viewport = asset.with_background_viewport(PaintSize::new(12.0, 12.0));
+
+        assert_eq!(
+            viewport.source_viewport_size(),
+            SvgSourceSize::new(16.0, 16.0)
+        );
+        assert_opaque_rect_bounds(&viewport, (0.0, 0.0, 12.0, 12.0));
     }
 
     #[test]
@@ -2016,7 +2416,7 @@ mod tests {
             br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2147483647 1" preserveAspectRatio="none"><rect width="100%" height="100%" fill="lime"/></svg>"#,
         )
         .unwrap();
-        assert_eq!(fill.opaque_viewport_fill(), Some(Color::new(0, 255, 0)));
+        assert_eq!(fill.opaque_viewport_fill(), Some(CssColor::new(0, 255, 0)));
 
         let tall_fill = parse_svg_bytes(
             br#"<svg xmlns="http://www.w3.org/2000/svg" height="8px" viewBox="0 0 1 2147483647" preserveAspectRatio="none"><rect width="100%" height="100%" fill="lime"/></svg>"#,
@@ -2024,7 +2424,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             tall_fill.opaque_viewport_fill(),
-            Some(Color::new(0, 255, 0))
+            Some(CssColor::new(0, 255, 0))
         );
 
         let translucent = parse_svg_bytes(
@@ -2032,6 +2432,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(translucent.opaque_viewport_fill(), None);
+    }
+
+    #[test]
+    fn concrete_replaced_viewport_keeps_a_partial_root_rect_partial() {
+        let partial = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="100" height="100" fill="lime"/></svg>"#,
+        )
+        .unwrap()
+        .with_replaced_viewport(content_box_size_pt(150.0, 150.0));
+        assert_eq!(partial.opaque_viewport_fill(), None);
+        assert_opaque_rect_bounds(&partial, (0.0, 6.0, 6.0, 12.0));
+
+        let viewport_fill = parse_svg_bytes(
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="lime"/></svg>"#,
+        )
+        .unwrap()
+        .with_replaced_viewport(content_box_size_pt(150.0, 150.0));
+        assert_eq!(
+            viewport_fill.opaque_viewport_fill(),
+            Some(CssColor::new(0, 255, 0))
+        );
     }
 
     #[test]
@@ -2078,7 +2499,7 @@ mod tests {
             br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="200" height="200"/></svg>"#,
         )
         .unwrap()
-        .with_replaced_viewport(300.0, 300.0);
+        .with_replaced_viewport(content_box_size_pt(300.0, 300.0));
 
         assert_eq!(
             asset.source_viewport_size(),
@@ -2100,12 +2521,11 @@ mod tests {
             panic!("expected an SVG tiling paint");
         };
 
-        assert_eq!(pattern.tile_width, 50.0);
-        assert_eq!(pattern.tile_height, 100.0);
+        assert_eq!(pattern.tile_size, PaintSize::new(50.0, 100.0));
         assert_eq!(pattern.paths.len(), 4);
         assert_eq!(pattern.transform, path.transform);
-        assert_eq!(pattern.paths[0].fill, Some(Color::new(0, 128, 0)));
-        assert_eq!(pattern.paths[3].fill, Some(Color::new(0, 0, 255)));
+        assert_eq!(pattern.paths[0].fill, Some(CssColor::new(0, 128, 0)));
+        assert_eq!(pattern.paths[3].fill, Some(CssColor::new(0, 0, 255)));
     }
 
     #[test]
@@ -2147,8 +2567,8 @@ mod tests {
         assert!((gradient.stops[1].offset - 0.5).abs() < 1e-5);
         assert!((gradient.stops[2].offset - 0.5).abs() < 1e-5);
         assert_eq!(gradient.stops[3].offset, 1.0);
-        assert_eq!(gradient.stops[0].color, Color::new(0, 128, 0));
-        assert_eq!(gradient.stops[3].color, Color::new(255, 255, 0));
+        assert_eq!(gradient.stops[0].color, CssColor::new(0, 128, 0));
+        assert_eq!(gradient.stops[3].color, CssColor::new(255, 255, 0));
     }
 
     #[test]
@@ -2236,12 +2656,12 @@ mod tests {
         assert!(
             paths
                 .iter()
-                .any(|path| path.stroke == Some(Color::new(0, 0, 255)))
+                .any(|path| path.stroke == Some(CssColor::new(0, 0, 255)))
         );
         assert!(
             paths
                 .iter()
-                .any(|path| path.fill == Some(Color::new(255, 0, 0)))
+                .any(|path| path.fill == Some(CssColor::new(255, 0, 0)))
         );
     }
 

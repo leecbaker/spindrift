@@ -39,6 +39,35 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
                 style.border_radius = radius;
             }
         }
+        "border-shape" => {
+            if let Some(shape) = parse_border_shape(value, style.font_size) {
+                style.border_shape = shape;
+            }
+        }
+        "shape-outside" => {
+            if let Some(shape) = parse_shape_outside_with_urls(
+                value,
+                style.font_size,
+                declaration.base_url,
+                declaration.root_url,
+            ) {
+                style.shape_outside = shape;
+            }
+        }
+        "shape-margin" => {
+            if let Some(margin) = parse_computed_length_percentage(value, style.font_size)
+                && !margin.is_definitely_negative()
+            {
+                style.shape_margin = margin;
+            }
+        }
+        "shape-image-threshold" => {
+            if let Some(threshold) = parse_css_number(value)
+                && threshold.is_finite()
+            {
+                style.shape_image_threshold = threshold.clamp(0.0, 1.0);
+            }
+        }
         "corner" => {
             if let Some((radius, shapes)) = parse_corner_shorthand(value, style.font_size) {
                 style.border_radius = radius;
@@ -227,12 +256,14 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
             if let Some(mut border_image) = parse_border_image(value, style.font_size) {
                 border_image.source_base_url = border_image
                     .source
-                    .as_ref()
-                    .and_then(|_| declaration.base_url.cloned());
+                    .is_image()
+                    .then(|| declaration.base_url.cloned())
+                    .flatten();
                 border_image.source_root_url = border_image
                     .source
-                    .as_ref()
-                    .and_then(|_| declaration.root_url.cloned());
+                    .is_image()
+                    .then(|| declaration.root_url.cloned())
+                    .flatten();
                 style.border_image = border_image;
             }
         }
@@ -242,13 +273,15 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
                 style.border_image.source_base_url = style
                     .border_image
                     .source
-                    .as_ref()
-                    .and_then(|_| declaration.base_url.cloned());
+                    .is_image()
+                    .then(|| declaration.base_url.cloned())
+                    .flatten();
                 style.border_image.source_root_url = style
                     .border_image
                     .source
-                    .as_ref()
-                    .and_then(|_| declaration.root_url.cloned());
+                    .is_image()
+                    .then(|| declaration.root_url.cloned())
+                    .flatten();
             }
         }
         "border-image-slice" => {
@@ -272,8 +305,53 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
             }
         }
         "color" => {
-            if let Some(color) = parse_color(value) {
-                style.color = color;
+            // The color prepass resolves this property before every dependent
+            // `currentcolor` property. Reapplying the whole declaration list
+            // here would let a lower-priority declaration overwrite its
+            // winning computed value.
+            // <https://drafts.csswg.org/css-color-4/#currentcolor-color>
+        }
+        "forced-color-adjust" => {
+            style.forced_color_adjust = match value.to_ascii_lowercase().as_str() {
+                "auto" => ForcedColorAdjust::Auto,
+                "none" => ForcedColorAdjust::None,
+                "preserve-parent-color" => ForcedColorAdjust::PreserveParentColor,
+                _ => style.forced_color_adjust,
+            };
+        }
+        "fill" => {
+            if value.eq_ignore_ascii_case("none") {
+                style.svg_fill = None;
+                style.svg_fill_is_current_color = false;
+                style.svg_fill_overridden = true;
+            } else if let Some(color) =
+                parse_color_from_currentcolor(value, style.color).or_else(|| parse_color(value))
+            {
+                style.svg_fill = Some(color);
+                style.svg_fill_is_current_color = value.eq_ignore_ascii_case("currentcolor");
+                style.svg_fill_overridden = true;
+            }
+        }
+        "stroke" => {
+            if value.eq_ignore_ascii_case("none") {
+                style.svg_stroke = None;
+                style.svg_stroke_is_current_color = false;
+                style.svg_stroke_overridden = true;
+            } else if let Some(color) =
+                parse_color_from_currentcolor(value, style.color).or_else(|| parse_color(value))
+            {
+                style.svg_stroke = Some(color);
+                style.svg_stroke_is_current_color = value.eq_ignore_ascii_case("currentcolor");
+                style.svg_stroke_overridden = true;
+            }
+        }
+        "stroke-width" => {
+            if let Some(width) = parse_computed_length_percentage(value, style.font_size)
+                && !width.contains_percentage()
+                && !width.is_definitely_negative()
+            {
+                style.svg_stroke_width = width;
+                style.svg_stroke_width_overridden = true;
             }
         }
         "-webkit-text-fill-color" => {
@@ -351,9 +429,12 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
                     .unwrap_or(style.box_values.width.clone());
         }
         "height" => {
-            style.box_values.height =
+            if let Some(height) =
                 parse_computed_box_size(value, style.font_size, style.root_font_size)
-                    .unwrap_or(style.box_values.height.clone());
+            {
+                style.physical_height_has_font_metric = height.requires_ch_advance();
+                style.box_values.height = height;
+            }
         }
         "aspect-ratio" => {
             if let Some(aspect_ratio) = parse_aspect_ratio(value) {
@@ -457,8 +538,25 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
                 "right" => Float::Right,
                 "inline-start" => Float::InlineStart,
                 "inline-end" => Float::InlineEnd,
+                "footnote" => Float::Footnote,
                 "none" => Float::None,
                 _ => style.float,
+            };
+        }
+        "footnote-display" => {
+            style.footnote_display = match value.to_ascii_lowercase().as_str() {
+                "block" => FootnoteDisplay::Block,
+                "inline" => FootnoteDisplay::Inline,
+                "compact" => FootnoteDisplay::Compact,
+                _ => style.footnote_display,
+            };
+        }
+        "footnote-policy" => {
+            style.footnote_policy = match value.to_ascii_lowercase().as_str() {
+                "auto" => FootnotePolicy::Auto,
+                "line" => FootnotePolicy::Line,
+                "block" => FootnotePolicy::Block,
+                _ => style.footnote_policy,
             };
         }
         "clear" => {
@@ -543,7 +641,7 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
             };
         }
         "clip-path" => {
-            if let Some(clip_path) = parse_clip_path(value) {
+            if let Some(clip_path) = parse_clip_path(value, style.font_size) {
                 style.clip_path = clip_path;
             }
         }
@@ -619,6 +717,17 @@ pub(in crate::css) fn apply_cascaded_declaration_group_2(
         }
         "text-autospace" => {
             if let Some(text_autospace) = parse_text_autospace(value) {
+                style.text_autospace = text_autospace;
+            }
+        }
+        "text-spacing-trim" => {
+            if let Some(text_spacing_trim) = parse_text_spacing_trim(value) {
+                style.text_spacing_trim = text_spacing_trim;
+            }
+        }
+        "text-spacing" => {
+            if let Some((text_spacing_trim, text_autospace)) = parse_text_spacing(value) {
+                style.text_spacing_trim = text_spacing_trim;
                 style.text_autospace = text_autospace;
             }
         }

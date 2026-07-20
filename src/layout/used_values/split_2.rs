@@ -2,11 +2,13 @@
 mod tests {
     use super::super::split_1::*;
     use crate::css;
-    use crate::layout::{BoxSizing, ComputedStyle, Direction, PhysicalContentWidth};
+    use crate::layout::{
+        BoxSizing, ComputedStyle, Direction, PageInlineSpan, PhysicalContentWidth,
+    };
     use crate::units::layout_pt;
     use crate::units::{
-        ContentBoxLength, LayoutLength, PercentageBasis, SemanticLengthExt, content_box_pt,
-        layout_points, non_content_pt,
+        ContentBoxLength, LayoutLength, PercentageBasis, SemanticLengthExt, border_box_pt,
+        content_box_pt, layout_points, non_content_pt,
     };
 
     fn style_with_horizontal_margins(
@@ -90,10 +92,9 @@ mod tests {
             layout_pt(100.0),
             horizontal_non_content,
         );
-        let width = resolve_normal_flow_block_width(
+        let width = resolve_normal_flow_block_inline_geometry(
             &mut style,
-            0.0,
-            100.0,
+            PageInlineSpan::from_edges(0.0, 100.0),
             PhysicalContentWidth::new(requested),
             horizontal_non_content,
             Direction::Ltr,
@@ -102,8 +103,8 @@ mod tests {
 
         assert_eq!(requested.points(), 150.0);
         assert_eq!(width.content_width.points(), 150.0);
-        assert_eq!(width.border_box_width.points(), 170.0);
-        assert_eq!(width.border_box_x, -20.0);
+        assert_eq!(width.border_box_width().points(), 170.0);
+        assert_eq!(width.border_box_inline_span.left_x(), -20.0);
     }
 
     #[test]
@@ -118,10 +119,9 @@ mod tests {
             layout_pt(100.0),
             horizontal_non_content,
         );
-        let width = resolve_normal_flow_block_width(
+        let width = resolve_normal_flow_block_inline_geometry(
             &mut style,
-            0.0,
-            100.0,
+            PageInlineSpan::from_edges(0.0, 100.0),
             PhysicalContentWidth::new(requested),
             horizontal_non_content,
             Direction::Ltr,
@@ -130,8 +130,8 @@ mod tests {
 
         assert_eq!(requested.points(), 50.0);
         assert_eq!(width.content_width.points(), 50.0);
-        assert_eq!(width.border_box_width.points(), 50.0);
-        assert_eq!(width.border_box_x, -20.0);
+        assert_eq!(width.border_box_width().points(), 50.0);
+        assert_eq!(width.border_box_inline_span.left_x(), -20.0);
     }
 
     #[test]
@@ -146,10 +146,9 @@ mod tests {
             layout_pt(100.0),
             horizontal_non_content,
         );
-        let width = resolve_normal_flow_block_width(
+        let width = resolve_normal_flow_block_inline_geometry(
             &mut style,
-            0.0,
-            100.0,
+            PageInlineSpan::from_edges(0.0, 100.0),
             PhysicalContentWidth::new(requested),
             horizontal_non_content,
             Direction::Rtl,
@@ -158,8 +157,8 @@ mod tests {
 
         assert_eq!(requested.points(), 80.0);
         assert_eq!(width.content_width.points(), 80.0);
-        assert_eq!(width.border_box_width.points(), 80.0);
-        assert_eq!(width.border_box_x, 0.0);
+        assert_eq!(width.border_box_width().points(), 80.0);
+        assert_eq!(width.border_box_inline_span.left_x(), 0.0);
     }
 
     #[test]
@@ -172,10 +171,9 @@ mod tests {
             layout_pt(300.0),
             horizontal_non_content,
         );
-        let width = resolve_normal_flow_block_width(
+        let width = resolve_normal_flow_block_inline_geometry(
             &mut style,
-            0.0,
-            300.0,
+            PageInlineSpan::from_edges(0.0, 300.0),
             PhysicalContentWidth::new(requested),
             horizontal_non_content,
             Direction::Ltr,
@@ -183,9 +181,9 @@ mod tests {
         );
 
         let _content: crate::units::ContentBoxLength = width.content_width;
-        let _border: crate::units::BorderBoxLength = width.border_box_width;
+        let _border: crate::units::BorderBoxLength = width.border_box_width();
         assert_eq!(width.content_width.points(), 150.0);
-        assert_eq!(width.border_box_width.points(), 170.0);
+        assert_eq!(width.border_box_width().points(), 170.0);
     }
 
     #[test]
@@ -204,17 +202,16 @@ mod tests {
             horizontal_non_content,
         );
 
-        let width = resolve_normal_flow_block_width(
+        let width = resolve_normal_flow_block_inline_geometry(
             &mut style,
-            0.0,
-            200.0,
+            PageInlineSpan::from_edges(0.0, 200.0),
             PhysicalContentWidth::new(requested),
             horizontal_non_content,
             Direction::Ltr,
             true,
         );
 
-        assert_eq!(width.border_box_width.points(), 170.0);
+        assert_eq!(width.border_box_width().points(), 170.0);
         assert_eq!(style.margin.left, 15.0);
         assert_eq!(style.margin.right, 15.0);
     }
@@ -339,7 +336,12 @@ mod tests {
             0.0,
         );
 
-        resolve_normal_flow_auto_margins_for_known_width(&mut style, 100.0, 200.0, Direction::Ltr);
+        resolve_normal_flow_auto_margins_for_known_width(
+            &mut style,
+            PageInlineSpan::new(0.0, 100.0),
+            border_box_pt(200.0),
+            Direction::Ltr,
+        );
 
         assert_eq!(style.margin.left, 0.0);
         assert_eq!(style.margin.right, -100.0);
@@ -356,7 +358,12 @@ mod tests {
             0.0,
         );
 
-        resolve_normal_flow_auto_margins_for_known_width(&mut style, 100.0, 200.0, Direction::Ltr);
+        resolve_normal_flow_auto_margins_for_known_width(
+            &mut style,
+            PageInlineSpan::new(0.0, 100.0),
+            border_box_pt(200.0),
+            Direction::Ltr,
+        );
 
         assert_eq!(style.margin.left, 25.0);
         assert_eq!(style.margin.right, -125.0);
@@ -373,7 +380,12 @@ mod tests {
             25.0,
         );
 
-        resolve_normal_flow_auto_margins_for_known_width(&mut style, 100.0, 200.0, Direction::Ltr);
+        resolve_normal_flow_auto_margins_for_known_width(
+            &mut style,
+            PageInlineSpan::new(0.0, 100.0),
+            border_box_pt(200.0),
+            Direction::Ltr,
+        );
 
         assert_eq!(style.margin.left, 0.0);
         assert_eq!(style.margin.right, -100.0);
@@ -388,7 +400,12 @@ mod tests {
             0.0,
         );
 
-        resolve_normal_flow_auto_margins_for_known_width(&mut style, 100.0, 200.0, Direction::Rtl);
+        resolve_normal_flow_auto_margins_for_known_width(
+            &mut style,
+            PageInlineSpan::new(0.0, 100.0),
+            border_box_pt(200.0),
+            Direction::Rtl,
+        );
 
         assert_eq!(style.margin.left, -100.0);
         assert_eq!(style.margin.right, 0.0);
@@ -625,12 +642,33 @@ mod tests {
 
         let metrics = intrinsic_box_metrics(&style);
 
-        assert_eq!(metrics.margin.left, 10.0);
-        assert_eq!(metrics.padding.left, 20.0);
+        assert_eq!(metrics.margin.left, layout_pt(10.0));
+        assert_eq!(metrics.padding.left, layout_pt(20.0));
+        assert_eq!(metrics.border.left, layout_pt(3.0));
+        assert_eq!(metrics.border.right, layout_pt(4.0));
         assert_eq!(
             metrics.horizontal_non_content_length(),
             non_content_pt(27.0)
         );
+    }
+
+    #[test]
+    fn applying_used_box_metrics_updates_style_only_at_the_css_edge_boundary() {
+        let mut style = ComputedStyle::initial();
+        style.box_values.margin.left = percent_auto(0.25);
+        style.box_values.padding.right = css::ComputedLengthPercentage::from_percent(0.5);
+        style.border_width_values.top = css::ComputedLengthPercentage::from_points(3.0);
+        style.border_widths.top = 3.0;
+        style.border_styles.top = css::BorderStyle::Solid;
+
+        let metrics =
+            apply_used_box_metrics(&mut style, PercentageBasis::definite(layout_pt(80.0)));
+
+        assert_eq!(metrics.margin.left, layout_pt(20.0));
+        assert_eq!(metrics.padding.right, layout_pt(40.0));
+        assert_eq!(metrics.border.top, layout_pt(3.0));
+        assert_eq!(style.margin.left, 20.0);
+        assert_eq!(style.padding.right, 40.0);
     }
 
     #[test]

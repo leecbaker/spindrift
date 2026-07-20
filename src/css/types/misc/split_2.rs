@@ -239,7 +239,7 @@ pub(crate) struct TextDecoration {
     pub skip_spaces: TextDecorationSkipSpaces,
     pub underline_offset: TextUnderlineOffset,
     pub underline_position: TextUnderlinePosition,
-    pub color: Option<Color>,
+    pub color: Option<CssColor>,
 }
 
 impl TextDecoration {
@@ -575,23 +575,23 @@ impl BoxShadow {
     }
 }
 
-/// Color component of a computed CSS `box-shadow`.
+/// CssColor component of a computed CSS `box-shadow`.
 ///
-/// CSS Color defines `currentColor` as the element's own computed `color`.
+/// CSS CssColor defines `currentColor` as the element's own computed `color`.
 /// `box-shadow` is not inherited, but `currentColor` still resolves against
 /// the box that paints the shadow:
 /// <https://www.w3.org/TR/css-color-3/#currentcolor>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum BoxShadowColor {
     CurrentColor,
-    Color(Color),
+    CssColor(CssColor),
 }
 
 impl BoxShadowColor {
-    pub(crate) fn resolve(self, current_color: Color) -> Color {
+    pub(crate) fn resolve(self, current_color: CssColor) -> CssColor {
         match self {
             Self::CurrentColor => current_color,
-            Self::Color(color) => color,
+            Self::CssColor(color) => color,
         }
     }
 }
@@ -627,23 +627,23 @@ impl TextShadow {
     }
 }
 
-/// Color component of a computed CSS `text-shadow`.
+/// CssColor component of a computed CSS `text-shadow`.
 ///
-/// CSS Color defines `currentColor` as the element's own computed `color`.
+/// CSS CssColor defines `currentColor` as the element's own computed `color`.
 /// Since `text-shadow` inherits, `currentColor` must remain symbolic until the
 /// inheriting element paints the shadow:
 /// <https://www.w3.org/TR/css-color-3/#currentcolor>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum TextShadowColor {
     CurrentColor,
-    Color(Color),
+    CssColor(CssColor),
 }
 
 impl TextShadowColor {
-    pub(crate) fn resolve(self, current_color: Color) -> Color {
+    pub(crate) fn resolve(self, current_color: CssColor) -> CssColor {
         match self {
             Self::CurrentColor => current_color,
-            Self::Color(color) => color,
+            Self::CssColor(color) => color,
         }
     }
 }

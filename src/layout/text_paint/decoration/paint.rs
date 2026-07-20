@@ -87,7 +87,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         runs: &[RenderedTextRun],
         phase: TextDecorationPaintPhase,
-        color_override: Option<Color>,
+        color_override: Option<CssColor>,
     ) {
         let decorations = active_text_decoration_layers(style);
         if decorations.is_empty() || width <= 0.0 {
@@ -117,7 +117,7 @@ impl<'a> LayoutBuilder<'a> {
         runs: &[RenderedTextRun],
         decoration: TextDecoration,
         phase: TextDecorationPaintPhase,
-        color_override: Option<Color>,
+        color_override: Option<CssColor>,
     ) {
         if !decoration.has_visible_line() || width <= 0.0 {
             return;
@@ -277,7 +277,7 @@ impl<'a> LayoutBuilder<'a> {
         block_position: f32,
         inline_length: f32,
         thickness: f32,
-        color: Color,
+        color: CssColor,
     ) {
         let rect = match axis {
             TextDecorationStrokeAxis::Horizontal => {
@@ -290,7 +290,11 @@ impl<'a> LayoutBuilder<'a> {
         self.push_text_decoration_rect(rect, color);
     }
 
-    pub(in crate::layout) fn push_text_decoration_rect(&mut self, rect: PaintRect, color: Color) {
+    pub(in crate::layout) fn push_text_decoration_rect(
+        &mut self,
+        rect: PaintRect,
+        color: CssColor,
+    ) {
         self.push_rect_in_band(
             PaintBand::Inline,
             RenderedRect::from_paint_rect(rect, Some(color)),
@@ -310,7 +314,7 @@ impl<'a> LayoutBuilder<'a> {
         block_position: f32,
         inline_length: f32,
         thickness: f32,
-        color: Color,
+        color: CssColor,
     ) {
         if inline_length <= 0.0 || thickness <= 0.0 {
             return;
@@ -364,7 +368,7 @@ impl<'a> LayoutBuilder<'a> {
                 None,
                 RenderedPathFillRule::NonZero,
                 Some(color),
-                thickness.max(0.5),
+                PaintStrokeWidth::new(thickness.max(0.5)),
                 None,
             ),
         );

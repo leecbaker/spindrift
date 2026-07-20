@@ -1,0 +1,5 @@
+[env]
+# Complex pagination regressions exercise nested layout and paint collection.
+# Keep Cargo's test-worker stack above Rust's small default so these cases
+# report layout assertions rather than aborting in the harness.
+RUST_MIN_STACK = { value = "4194304", force = false }

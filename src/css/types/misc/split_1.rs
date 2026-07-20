@@ -126,54 +126,10 @@ pub(crate) enum ListStyleType {
     DisclosureOpen,
     DisclosureClosed,
     Decimal,
-    DecimalLeadingZero,
-    Numeric(NumericCounterStyle),
-    Additive(AdditiveCounterStyle),
-    LowerAlpha,
-    UpperAlpha,
-    LowerGreek,
-    Hiragana,
-    HiraganaIroha,
-    Katakana,
-    KatakanaIroha,
-    CjkEarthlyBranch,
-    CjkHeavenlyStem,
-    LowerRoman,
-    UpperRoman,
     String(String),
     Anonymous(Box<CounterStyleRule>),
     Named(String),
     None,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NumericCounterStyle {
-    ArabicIndic,
-    Bengali,
-    Cambodian,
-    CjkDecimal,
-    Devanagari,
-    Gujarati,
-    Gurmukhi,
-    Kannada,
-    Lao,
-    Malayalam,
-    Mongolian,
-    Myanmar,
-    Oriya,
-    Persian,
-    Tamil,
-    Telugu,
-    Thai,
-    Tibetan,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AdditiveCounterStyle {
-    Armenian,
-    LowerArmenian,
-    Georgian,
-    Hebrew,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,7 +250,7 @@ pub(crate) enum GeneratedContentPart {
         keyword: NamedStringTargetTextKeyword,
     },
     Image {
-        image: BackgroundImage,
+        image: ComputedImage,
     },
     Quote(GeneratedQuote),
     Leader(String),
@@ -523,18 +479,319 @@ pub(crate) enum ContentVisibility {
     Hidden,
 }
 
-/// Computed `clip-path` support relevant to paint isolation.
+/// Computed `clip-path` support relevant to paint isolation and clipping.
 ///
-/// Non-`none` clip paths establish stacking contexts. Geometry support is kept
-/// intentionally coarse until clipping is represented as paths in paint
-/// effects:
+/// A basic-shape path establishes a stacking context and clips to the
+/// associated geometry box. CSS Masking defines the default geometry box as
+/// the border box:
 /// <https://www.w3.org/TR/css-masking-1/#the-clip-path>.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ClipPath {
     None,
-    Inset,
+    Polygon(Vec<ClipPathPolygonPoint>),
+    Inset {
+        top: ComputedLengthPercentage,
+        right: ComputedLengthPercentage,
+        bottom: ComputedLengthPercentage,
+        left: ComputedLengthPercentage,
+    },
     Shape,
     Url,
+}
+
+/// One `<length-percentage> <length-percentage>` vertex of `polygon()`.
+///
+/// Keeping each coordinate as a computed length percentage delays resolution
+/// until the relevant `clip-path` geometry box is known.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ClipPathPolygonPoint {
+    pub(crate) x: ComputedLengthPercentage,
+    pub(crate) y: ComputedLengthPercentage,
+}
+
+/// Computed CSS Shapes Level 1 `shape-outside` value.
+///
+/// Percentages deliberately remain unresolved until float layout has selected
+/// the shape reference box. CSS Shapes changes a float's wrapping area, not
+/// its margin-box placement or painting:
+/// <https://drafts.csswg.org/css-shapes-1/#shape-outside-property>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ShapeOutside {
+    None,
+    Box(ShapeBox),
+    /// An image alpha contour. CSS Shapes sizes this image as a replaced
+    /// element with the float's used content-box dimensions.
+    /// <https://drafts.csswg.org/css-shapes-1/#shapes-from-image>
+    Image(BackgroundImage),
+    Basic {
+        shape: BasicShape,
+        reference_box: ShapeBox,
+    },
+}
+
+impl ShapeOutside {
+    pub(crate) const NONE: Self = Self::None;
+}
+
+/// The reference box used by CSS Shapes float-area geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShapeBox {
+    Margin,
+    Border,
+    Padding,
+    Content,
+}
+
+/// Basic shapes implemented for the first CSS Shapes milestone.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BasicShape {
+    Inset(ShapeInset),
+    Circle(ShapeCircle),
+    Ellipse(ShapeEllipse),
+    Polygon(ShapePolygon),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShapeInset {
+    pub(crate) top: ComputedLengthPercentage,
+    pub(crate) right: ComputedLengthPercentage,
+    pub(crate) bottom: ComputedLengthPercentage,
+    pub(crate) left: ComputedLengthPercentage,
+    pub(crate) radii: BorderRadius,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShapeCircle {
+    pub(crate) radius: ShapeCircleRadius,
+    pub(crate) position: ShapePosition,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ShapeCircleRadius {
+    LengthPercentage(ComputedLengthPercentage),
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShapeEllipse {
+    pub(crate) horizontal_radius: ShapeEllipseRadius,
+    pub(crate) vertical_radius: ShapeEllipseRadius,
+    pub(crate) position: ShapePosition,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ShapeEllipseRadius {
+    LengthPercentage(ComputedLengthPercentage),
+    ClosestSide,
+    FarthestSide,
+}
+
+/// Typed CSS Shapes Level 1 `polygon()` contour.
+///
+/// Vertices retain their independent percentage bases until float layout has
+/// resolved the selected shape reference box:
+/// <https://drafts.csswg.org/css-shapes-1/#funcdef-polygon>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShapePolygon {
+    pub(crate) fill_rule: ShapeFillRule,
+    pub(crate) vertices: Vec<ShapePolygonPoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShapeFillRule {
+    NonZero,
+    EvenOdd,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShapePolygonPoint {
+    pub(crate) x: ComputedLengthPercentage,
+    pub(crate) y: ComputedLengthPercentage,
+}
+
+/// A basic-shape center expressed as coordinates in its reference box.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShapePosition {
+    pub(crate) x: ComputedLengthPercentage,
+    pub(crate) y: ComputedLengthPercentage,
+}
+
+impl ShapePosition {
+    pub(crate) fn center() -> Self {
+        Self {
+            x: ComputedLengthPercentage::from_percent(0.5),
+            y: ComputedLengthPercentage::from_percent(0.5),
+        }
+    }
+}
+
+/// Computed CSS Borders 4 `border-shape` value.
+///
+/// `border-shape` changes only painting and overflow clipping; it does not
+/// alter box layout. Basic-shape coordinates stay as typed computed lengths
+/// until their selected geometry box is available during paint:
+/// <https://drafts.csswg.org/css-borders-4/#border-shape>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BorderShape {
+    None,
+    Circle(BorderShapeCircle),
+    Ellipse(BorderShapeEllipse),
+    Path(BorderShapePath),
+    Inset(BorderShapeInset),
+    Polygon(BorderShapePolygon),
+    /// The outer and inner contours of a CSS Borders 4 `border-shape`.
+    ///
+    /// Keeping the pair heterogeneous avoids encoding an artificial
+    /// same-primitive restriction in the computed value: the grammar permits
+    /// any two basic shapes, each with its own geometry box.
+    Pair {
+        outer: Box<BorderShape>,
+        inner: Box<BorderShape>,
+    },
+}
+
+impl BorderShape {
+    /// Assign the geometry box parsed immediately after this basic shape.
+    /// A pair is not a single basic shape and cannot receive one.
+    pub(crate) fn set_geometry_box(&mut self, geometry_box: BorderShapeGeometryBox) -> Option<()> {
+        match self {
+            Self::Circle(shape) => shape.geometry_box = geometry_box,
+            Self::Ellipse(shape) => shape.geometry_box = geometry_box,
+            Self::Path(shape) => shape.geometry_box = geometry_box,
+            Self::Inset(shape) => shape.geometry_box = geometry_box,
+            Self::Polygon(shape) => shape.geometry_box = geometry_box,
+            Self::None | Self::Pair { .. } => return None,
+        }
+        Some(())
+    }
+
+    /// Apply the distinct default geometry boxes for the outer and inner
+    /// basic shapes of a `border-shape` pair.
+    pub(crate) fn replace_half_border_box(&mut self, geometry_box: BorderShapeGeometryBox) {
+        let current = match self {
+            Self::Circle(shape) => &mut shape.geometry_box,
+            Self::Ellipse(shape) => &mut shape.geometry_box,
+            Self::Path(shape) => &mut shape.geometry_box,
+            Self::Inset(shape) => &mut shape.geometry_box,
+            Self::Polygon(shape) => &mut shape.geometry_box,
+            Self::None | Self::Pair { .. } => return,
+        };
+        if *current == BorderShapeGeometryBox::HalfBorder {
+            *current = geometry_box;
+        }
+    }
+}
+
+/// A closed line-only CSS basic shape retained for `border-shape` painting.
+///
+/// Each vertex remains a typed computed length percentage until its geometry
+/// box is known, matching the percentage-resolution boundary for the other
+/// border-shape primitives:
+/// <https://drafts.csswg.org/css-shapes-2/#shape-function>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BorderShapePath {
+    pub(crate) vertices: Vec<BorderShapePosition>,
+    pub(crate) geometry_box: BorderShapeGeometryBox,
+}
+
+/// Typed inset distances for a CSS `inset()` border shape.
+///
+/// Percentages resolve against their respective geometry-box axes at paint
+/// time, so this deliberately stores physical sides rather than an eagerly
+/// resolved rectangle:
+/// <https://drafts.csswg.org/css-shapes-1/#funcdef-inset>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BorderShapeInset {
+    pub(crate) top: ComputedLengthPercentage,
+    pub(crate) right: ComputedLengthPercentage,
+    pub(crate) bottom: ComputedLengthPercentage,
+    pub(crate) left: ComputedLengthPercentage,
+    /// Uniform `round <length-percentage>` radius, retained for paint-time
+    /// resolution against the inset rectangle's axes.
+    pub(crate) corner_radius: Option<ComputedLengthPercentage>,
+    pub(crate) geometry_box: BorderShapeGeometryBox,
+}
+
+/// Typed vertices of the CSS `polygon()` basic shape for `border-shape`.
+///
+/// The fill rule is intentionally not represented yet: values that request a
+/// non-default rule are rejected by the parser until paint can preserve that
+/// choice. Coordinates stay typed through percentage resolution.
+/// <https://drafts.csswg.org/css-shapes-1/#funcdef-polygon>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BorderShapePolygon {
+    pub(crate) vertices: Vec<BorderShapePosition>,
+    pub(crate) geometry_box: BorderShapeGeometryBox,
+}
+
+/// One currently-supported circular basic shape in `border-shape`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BorderShapeCircle {
+    pub(crate) radius: BorderShapeCircleRadius,
+    pub(crate) position: BorderShapePosition,
+    pub(crate) geometry_box: BorderShapeGeometryBox,
+}
+
+/// Circle radius syntax retained until geometry-box resolution.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BorderShapeCircleRadius {
+    LengthPercentage(ComputedLengthPercentage),
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
+}
+
+/// One currently-supported elliptical basic shape in `border-shape`.
+///
+/// Ellipse radii are preserved independently because CSS percentage radii
+/// resolve against their respective geometry-box axes:
+/// <https://drafts.csswg.org/css-shapes-1/#funcdef-ellipse>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BorderShapeEllipse {
+    pub(crate) horizontal_radius: BorderShapeEllipseRadius,
+    pub(crate) vertical_radius: BorderShapeEllipseRadius,
+    pub(crate) position: BorderShapePosition,
+    pub(crate) geometry_box: BorderShapeGeometryBox,
+}
+
+/// One axis radius of a CSS `ellipse()` basic shape.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BorderShapeEllipseRadius {
+    LengthPercentage(ComputedLengthPercentage),
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
+}
+
+/// Basic-shape center relative to its selected geometry box.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BorderShapePosition {
+    pub(crate) x: ComputedLengthPercentage,
+    pub(crate) y: ComputedLengthPercentage,
+}
+
+impl BorderShapePosition {
+    pub(crate) fn center() -> Self {
+        Self {
+            x: ComputedLengthPercentage::from_percent(0.5),
+            y: ComputedLengthPercentage::from_percent(0.5),
+        }
+    }
+}
+
+/// Reference rectangle for a `border-shape` basic shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BorderShapeGeometryBox {
+    Border,
+    Padding,
+    Content,
+    Margin,
+    HalfBorder,
 }
 
 /// Computed `will-change` features relevant to stacking-context prediction.
@@ -589,11 +846,9 @@ impl CssAffineMatrix {
         Self(CssTransform::new(a, b, c, d, e, f))
     }
 
-    /// Project this CSS matrix into `Space` using an explicit CSS-unit basis.
-    ///
-    /// Uniformly changing the coordinate unit leaves the linear coefficients
-    /// unchanged but scales the translation components. In matrix notation,
-    /// this is `S · M · S⁻¹`, where `S` is `css_unit_to_target`.
+    /// Project this CSS matrix into another y-down coordinate space using an
+    /// explicit CSS-unit basis. SVG source coordinates share CSS's y-down
+    /// orientation and therefore do not use the paint-space projection.
     pub(crate) fn into_space<Space>(
         self,
         css_unit_to_target: euclid::Scale<f32, CssTransformSpace, Space>,
@@ -605,6 +860,27 @@ impl CssAffineMatrix {
             self.0.m22,
             self.0.m31 * css_unit_to_target.0,
             self.0.m32 * css_unit_to_target.0,
+        )
+    }
+
+    /// Project this CSS y-down affine matrix into a y-up target space.
+    ///
+    /// Page paint coordinates use PDF's upward-positive y axis.  The
+    /// projection is therefore `S · M · S⁻¹`, with `S =
+    /// diag(css_unit_to_target, -css_unit_to_target)`, rather than a unit
+    /// conversion of only the translation terms.
+    /// <https://drafts.csswg.org/css-transforms-1/#mathematical-description>
+    pub(crate) fn into_y_up_space<Space>(
+        self,
+        css_unit_to_target: euclid::Scale<f32, CssTransformSpace, Space>,
+    ) -> euclid::Transform2D<f32, Space, Space> {
+        euclid::Transform2D::new(
+            self.0.m11,
+            -self.0.m12,
+            -self.0.m21,
+            self.0.m22,
+            self.0.m31 * css_unit_to_target.0,
+            -self.0.m32 * css_unit_to_target.0,
         )
     }
 }
@@ -1016,8 +1292,10 @@ impl TransformOrigin {
 /// Computed `float` value.
 ///
 /// CSS 2.2 defines left and right floats as boxes shifted to the containing
-/// block edge with following flow content shortened around them:
-/// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
+/// block edge with following flow content shortened around them. GCPM extends
+/// the same property with page-footnote extraction:
+/// <https://www.w3.org/TR/CSS22/visuren.html#floats> and
+/// <https://www.w3.org/TR/css-gcpm-3/#footnotes>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Float {
     None,
@@ -1025,6 +1303,31 @@ pub(crate) enum Float {
     Right,
     InlineStart,
     InlineEnd,
+    Footnote,
+}
+
+/// Computed `footnote-display` value.
+///
+/// GCPM selects block, inline, or UA-compacted layout after the footnote body
+/// has been moved into the page's footnote area:
+/// <https://www.w3.org/TR/css-gcpm-3/#footnote-display>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FootnoteDisplay {
+    Block,
+    Inline,
+    Compact,
+}
+
+/// Computed `footnote-policy` value.
+///
+/// This controls the page-break retry point when a footnote body cannot fit
+/// alongside its call:
+/// <https://www.w3.org/TR/css-gcpm-3/#footnote-policy>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FootnotePolicy {
+    Auto,
+    Line,
+    Block,
 }
 
 /// Computed `clear` value.
@@ -1137,7 +1440,7 @@ pub(crate) enum NamedStringPart {
         name: String,
         fallback: Option<String>,
     },
-    Image(BackgroundImage),
+    Image(ComputedImage),
     Quote(GeneratedQuote),
     Leader(String),
     Counter {

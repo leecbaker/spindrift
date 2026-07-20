@@ -76,6 +76,7 @@ impl PagePaintTree {
 pub(crate) enum PaintBand {
     PageBackground,
     BackgroundBorder,
+    TableCellBorder,
     NegativeZ,
     InFlowBlock,
     TableCollapsedBorder,
@@ -88,9 +89,10 @@ pub(crate) enum PaintBand {
 }
 
 impl PaintBand {
-    pub(crate) const ORDER: [Self; 11] = [
+    pub(crate) const ORDER: [Self; 12] = [
         Self::PageBackground,
         Self::BackgroundBorder,
+        Self::TableCellBorder,
         Self::NegativeZ,
         Self::InFlowBlock,
         Self::TableCollapsedBorder,
@@ -106,15 +108,16 @@ impl PaintBand {
         match self {
             Self::PageBackground => 0,
             Self::BackgroundBorder => 1,
-            Self::NegativeZ => 2,
-            Self::InFlowBlock => 3,
-            Self::TableCollapsedBorder => 4,
-            Self::Float => 5,
-            Self::Inline => 6,
-            Self::AutoZeroZ => 7,
-            Self::PositiveZ => 8,
-            Self::Outline => 9,
-            Self::ViewportChrome => 10,
+            Self::TableCellBorder => 2,
+            Self::NegativeZ => 3,
+            Self::InFlowBlock => 4,
+            Self::TableCollapsedBorder => 5,
+            Self::Float => 6,
+            Self::Inline => 7,
+            Self::AutoZeroZ => 8,
+            Self::PositiveZ => 9,
+            Self::Outline => 10,
+            Self::ViewportChrome => 11,
         }
     }
 }
@@ -122,7 +125,7 @@ impl PaintBand {
 /// Ordered paint-band buckets for a fragment-local display list.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct PaintBandList {
-    pub(crate) bands: [Vec<PaintDisplayItem>; 11],
+    pub(crate) bands: [Vec<PaintDisplayItem>; 12],
 }
 
 impl PaintBandList {
@@ -168,6 +171,13 @@ impl PaintBandList {
             PaintBand::NegativeZ,
             PaintBand::AutoZeroZ,
             PaintBand::PositiveZ,
+            // Floats do not create stacking contexts solely by floating, but
+            // captured/overhanging float fragments are represented as atomic
+            // contexts in this band. Their capture can complete after a
+            // later sibling has been recorded, so Appendix E's tree order
+            // must be restored before flattening the band.
+            // <https://www.w3.org/TR/CSS22/zindex.html>
+            PaintBand::Float,
         ] {
             self.bands[band.index()].sort_by_key(|item| match item {
                 PaintDisplayItem::StackingContext(context) => {
@@ -231,12 +241,11 @@ impl PaintBandList {
     }
 
     pub(in crate::document) fn into_items_in_order(self) -> Vec<PaintDisplayItem> {
-        let mut ordered = Vec::new();
         let mut bands = self.bands;
-        for band in PaintBand::ORDER {
-            ordered.extend(std::mem::take(&mut bands[band.index()]));
-        }
-        ordered
+        PaintBand::ORDER
+            .into_iter()
+            .flat_map(|band| std::mem::take(&mut bands[band.index()]))
+            .collect()
     }
 
     pub(in crate::document) fn push_flattened_primitives(
@@ -477,6 +486,35 @@ impl PaintDisplayItem {
         }
     }
 
+    /// Bounds of this recorded subtree after any of its own rectangular clips.
+    ///
+    /// This intentionally rejects transforms and non-rectangular effects:
+    /// their visible ink cannot be established from the page operations alone.
+    pub(in crate::document) fn recorded_paint_bounds(
+        &self,
+        page: &Page,
+    ) -> std::result::Result<Option<PaintClip>, ()> {
+        match self {
+            Self::Operation(operation) => page
+                .paint_primitive(operation)
+                .and_then(|primitive| primitive.bounds())
+                .map(Some)
+                .ok_or(()),
+            Self::Primitive(primitive) => primitive.bounds().map(Some).ok_or(()),
+            Self::Link(link) => Ok(Some(PaintClip::from_paint_rect(link.paint_rect()))),
+            Self::StackingContext(context) => recorded_context_paint_bounds(
+                page,
+                &context.effects,
+                crate::document::PaintBand::ORDER
+                    .into_iter()
+                    .flat_map(|band| context.bands.bands[band.index()].iter()),
+            ),
+            Self::EffectScope(scope) => {
+                recorded_context_paint_bounds(page, &scope.effects, scope.items.iter())
+            }
+        }
+    }
+
     fn clipped_primitives_to_rect(
         self,
         clip: PaintClip,
@@ -581,6 +619,54 @@ impl PaintDisplayItem {
             Self::Operation(_) | Self::Primitive(_) => {}
         }
     }
+}
+
+fn recorded_context_paint_bounds<'a>(
+    page: &Page,
+    effects: &PaintEffects,
+    items: impl Iterator<Item = &'a PaintDisplayItem>,
+) -> std::result::Result<Option<PaintClip>, ()> {
+    if !effects_have_only_rectangular_clips(effects) {
+        return Err(());
+    }
+    let mut bounds = None;
+    for item in items {
+        let Some(item_bounds) = item.recorded_paint_bounds(page)? else {
+            continue;
+        };
+        bounds = Some(union_paint_clips(bounds, item_bounds));
+    }
+    for clip in [effects.absolute_clip, effects.overflow_clip]
+        .into_iter()
+        .flatten()
+    {
+        bounds = bounds.and_then(|bounds| bounds.intersect(clip));
+    }
+    Ok(bounds)
+}
+
+fn effects_have_only_rectangular_clips(effects: &PaintEffects) -> bool {
+    effects.opacity >= 1.0
+        && effects.transform.is_none()
+        && !effects.suppress_paint
+        && effects.overflow_clip_union.is_none()
+        && effects.rounded_overflow_clip.is_none()
+        && !effects.clip_path.is_active()
+        && !effects.mask.is_active()
+        && !effects.filter.is_active()
+        && effects.blend_mode == PaintBlendMode::Normal
+        && !effects.isolation
+}
+
+fn union_paint_clips(left: Option<PaintClip>, right: PaintClip) -> PaintClip {
+    let Some(left) = left else {
+        return right;
+    };
+    let x = left.x().min(right.x());
+    let y = left.y().min(right.y());
+    let right_edge = (left.x() + left.width()).max(right.x() + right.width());
+    let top_edge = (left.y() + left.height()).max(right.y() + right.height());
+    PaintClip::new(x, y, right_edge - x, top_edge - y)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,7 +808,7 @@ impl PaintEffectScope {
 
     pub(in crate::document) fn into_recorded_nodes(self, page: &mut Page) -> Self {
         Self {
-            effects: self.effects,
+            effects: self.effects.clone(),
             bounds: self.bounds,
             fragmentation: self.fragmentation,
             items: self
@@ -748,7 +834,7 @@ impl PaintEffectScope {
 
     pub(in crate::document) fn primitive_node_copy(&self, page: &Page) -> Self {
         Self {
-            effects: self.effects,
+            effects: self.effects.clone(),
             bounds: self.bounds,
             fragmentation: self.fragmentation,
             items: self
@@ -817,13 +903,13 @@ impl StackLevel {
 
 /// Effects applied to a whole stacking context before PDF emission.
 ///
-/// CSS Transforms, CSS Color opacity, and CSS Overflow act on stacking-context
+/// CSS Transforms, CSS CssColor opacity, and CSS Overflow act on stacking-context
 /// contents as a group. The current flattening path keeps these defaults until
 /// PDF group and matrix emission are wired through page streams:
 /// <https://www.w3.org/TR/css-transforms-1/>,
 /// <https://www.w3.org/TR/css-color-4/#transparency>, and
 /// <https://www.w3.org/TR/css-overflow-3/>.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PaintEffects {
     pub(crate) opacity: f32,
     pub(crate) transform: Option<PaintTransform>,
@@ -832,6 +918,9 @@ pub(crate) struct PaintEffects {
     /// <https://www.w3.org/TR/css-transforms-1/#transform-rendering>
     pub(crate) suppress_paint: bool,
     pub(crate) overflow_clip: Option<PaintClip>,
+    /// A disjoint union of rectangular overflow clips. This keeps table-cell
+    /// rowspan holes intact through retained paint and PDF serialization.
+    pub(crate) overflow_clip_union: Option<PaintClipUnion>,
     pub(crate) rounded_overflow_clip: Option<RenderedRoundedRect>,
     pub(crate) absolute_clip: Option<PaintClip>,
     pub(crate) clip_path: PaintClipPathEffect,
@@ -848,6 +937,7 @@ impl Default for PaintEffects {
             transform: None,
             suppress_paint: false,
             overflow_clip: None,
+            overflow_clip_union: None,
             rounded_overflow_clip: None,
             absolute_clip: None,
             clip_path: PaintClipPathEffect::None,
@@ -860,20 +950,30 @@ impl Default for PaintEffects {
 }
 
 impl PaintEffects {
-    pub(crate) const fn suppresses_paint(self) -> bool {
+    pub(crate) const fn suppresses_paint(&self) -> bool {
         self.suppress_paint
     }
 
     pub(crate) fn translated(mut self, offset: PaintTranslation) -> Self {
         self.overflow_clip = self.overflow_clip.map(|clip| clip.translated(offset));
+        self.overflow_clip_union = self
+            .overflow_clip_union
+            .map(|clips| clips.translated(offset));
         self.rounded_overflow_clip = self
             .rounded_overflow_clip
             .map(|clip| clip.translated(offset));
         self.absolute_clip = self.absolute_clip.map(|clip| clip.translated(offset));
+        self.clip_path = match self.clip_path {
+            PaintClipPathEffect::Polygon(polygon) => {
+                PaintClipPathEffect::Polygon(Box::new((*polygon).translated(offset)))
+            }
+            PaintClipPathEffect::Path(path) => PaintClipPathEffect::Path(path.translated(offset)),
+            effect => effect,
+        };
         self
     }
 
-    pub(crate) fn needs_group(self) -> bool {
+    pub(crate) fn needs_group(&self) -> bool {
         self.opacity < 1.0
             || self.filter.is_active()
             || self.mask.is_active()
@@ -890,22 +990,30 @@ impl PaintEffects {
         self
     }
 
-    pub(crate) fn ordered_steps(self) -> Vec<PaintEffectStep> {
+    pub(crate) fn ordered_steps(&self) -> Vec<PaintEffectStep> {
         let mut steps = Vec::new();
+        // CSS transforms establish the local coordinate system for all of an
+        // element's painting effects.  PDF freezes a clipping path in the
+        // current CTM when it is installed, so writing clips first would
+        // leave them page-aligned while the subtree moves independently.
+        // <https://drafts.csswg.org/css-transforms-1/#transform-rendering>
+        if let Some(transform) = self.transform {
+            steps.push(PaintEffectStep::Transform(transform));
+        }
         if let Some(clip) = self.absolute_clip {
             steps.push(PaintEffectStep::Clip(clip));
         }
         if let Some(clip) = self.overflow_clip {
             steps.push(PaintEffectStep::Clip(clip));
         }
+        if let Some(clips) = &self.overflow_clip_union {
+            steps.push(PaintEffectStep::ClipUnion(*clips));
+        }
         if let Some(clip) = self.rounded_overflow_clip {
             steps.push(PaintEffectStep::RoundedClip(clip));
         }
         if self.clip_path.is_active() {
-            steps.push(PaintEffectStep::ClipPath(self.clip_path));
-        }
-        if let Some(transform) = self.transform {
-            steps.push(PaintEffectStep::Transform(transform));
+            steps.push(PaintEffectStep::ClipPath(self.clip_path.clone()));
         }
         if self.filter.is_active() {
             steps.push(PaintEffectStep::Filter(self.filter));
@@ -928,21 +1036,21 @@ impl PaintEffects {
 
 /// Shape source for a context-level CSS `clip-path`.
 ///
-/// The current renderer records the source category so stacking and PDF group
-/// construction are deterministic. Geometry emission is implemented later for
-/// each non-`None` variant:
+/// A resolved polygon carries typed page-local geometry ready for PDF clipping;
+/// unsupported CSS forms preserve their category for stacking behavior:
 /// <https://www.w3.org/TR/css-masking-1/#the-clip-path>.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PaintClipPathEffect {
     None,
-    Inset,
+    Polygon(Box<RenderedClipPathPolygon>),
+    Path(RenderedPathClip),
     Shape,
     Url,
     WillChange,
 }
 
 impl PaintClipPathEffect {
-    pub(crate) const fn is_active(self) -> bool {
+    pub(crate) const fn is_active(&self) -> bool {
         !matches!(self, Self::None)
     }
 }
@@ -1035,9 +1143,10 @@ impl PaintBlendMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PaintEffectStep {
     Clip(PaintClip),
+    ClipUnion(PaintClipUnion),
     RoundedClip(RenderedRoundedRect),
     ClipPath(PaintClipPathEffect),
     Transform(PaintTransform),
@@ -1046,6 +1155,49 @@ pub(crate) enum PaintEffectStep {
     Opacity(f32),
     Blend(PaintBlendMode),
     Isolation,
+}
+
+/// Resolved CSS `polygon()` geometry in page-local paint space.
+///
+/// The fixed inline capacity preserves the copyable paint-effect contract used
+/// by fragmented layout. It covers ordinary basic-shape polygons while larger
+/// polygons retain their CSS stacking effect until arbitrary basic-shape
+/// storage is available.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RenderedClipPathPolygon {
+    points: [PaintPoint; Self::MAX_POINTS],
+    len: u8,
+}
+
+impl RenderedClipPathPolygon {
+    /// Retained contours are also used for circular `border-shape` overflow
+    /// clips.  Sixty-four points keep the maximum chord error below a raster
+    /// pixel at ordinary CSS page scales while retaining fixed-size, copyable
+    /// storage for paint-effect translation.
+    pub(crate) const MAX_POINTS: usize = 64;
+
+    pub(crate) fn new(points: &[PaintPoint]) -> Option<Self> {
+        if !(3..=Self::MAX_POINTS).contains(&points.len()) {
+            return None;
+        }
+        let mut stored = [PaintPoint::new(0.0, 0.0); Self::MAX_POINTS];
+        stored[..points.len()].copy_from_slice(points);
+        Some(Self {
+            points: stored,
+            len: points.len() as u8,
+        })
+    }
+
+    pub(crate) fn points(&self) -> &[PaintPoint] {
+        &self.points[..usize::from(self.len)]
+    }
+
+    pub(in crate::document) fn translated(mut self, offset: PaintTranslation) -> Self {
+        for point in &mut self.points[..usize::from(self.len)] {
+            *point = offset.transform_point(*point);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1196,6 +1348,43 @@ pub(crate) struct PaintClip {
     pub(in crate::document) rect: PaintRect,
 }
 
+/// Retained union of disjoint rectangular clip regions. Table cells rarely
+/// span many visible row fragments; preserving up to 8 regions avoids
+/// approximating an interior collapsed row as a single bounding rectangle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PaintClipUnion {
+    clips: [PaintClip; Self::MAX_REGIONS],
+    len: u8,
+}
+
+impl PaintClipUnion {
+    pub(crate) const MAX_REGIONS: usize = 8;
+
+    pub(crate) fn from_clips(clips: &[PaintClip]) -> Option<Self> {
+        let first = *clips.first()?;
+        let mut union = Self {
+            clips: [first; Self::MAX_REGIONS],
+            len: 0,
+        };
+        for clip in clips.iter().copied().take(Self::MAX_REGIONS) {
+            union.clips[usize::from(union.len)] = clip;
+            union.len += 1;
+        }
+        Some(union)
+    }
+
+    pub(crate) fn clips(&self) -> &[PaintClip] {
+        &self.clips[..usize::from(self.len)]
+    }
+
+    fn translated(mut self, offset: PaintTranslation) -> Self {
+        for clip in &mut self.clips[..usize::from(self.len)] {
+            *clip = clip.translated(offset);
+        }
+        self
+    }
+}
+
 impl PaintClip {
     pub(crate) fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
         Self::from_paint_rect(PaintRect::new(
@@ -1264,6 +1453,25 @@ impl PaintClip {
             && other.y() >= self.y()
             && other.x() + other.width() <= self.x() + self.width()
             && other.y() + other.height() <= self.y() + self.height()
+    }
+}
+
+#[cfg(test)]
+mod paint_effect_tests {
+    use super::*;
+
+    #[test]
+    fn transform_establishes_the_coordinate_system_before_overflow_clip() {
+        let effects = PaintEffects {
+            transform: Some(PaintTransform::scale(2.0, 2.0)),
+            overflow_clip: Some(PaintClip::new(10.0, 20.0, 30.0, 40.0)),
+            ..PaintEffects::default()
+        };
+
+        assert!(matches!(
+            effects.ordered_steps().as_slice(),
+            [PaintEffectStep::Transform(_), PaintEffectStep::Clip(_)]
+        ));
     }
 }
 

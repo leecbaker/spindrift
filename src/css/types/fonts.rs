@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::Color;
+use crate::CssColor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FontWeight(pub u16);
@@ -45,7 +45,20 @@ impl FontWeight {
 pub(crate) enum FontStyle {
     Normal,
     Italic,
-    Oblique,
+    /// CSS oblique angle in degrees, stored as IEEE-754 bits to keep
+    /// computed styles hashable and comparable.
+    Oblique(u32),
+}
+
+impl FontStyle {
+    pub(crate) const DEFAULT_OBLIQUE: Self = Self::Oblique(14.0_f32.to_bits());
+
+    pub(crate) const fn oblique_angle(self) -> Option<f32> {
+        match self {
+            Self::Oblique(angle) => Some(f32::from_bits(angle)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -71,7 +84,7 @@ impl FontWidth {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum FontFamily {
     SansSerif,
     Serif,
@@ -173,6 +186,24 @@ impl FontFeatureSetting {
 pub(crate) struct FontFeatureSettings(pub(crate) Vec<FontFeatureSetting>);
 
 impl FontFeatureSettings {
+    pub(crate) const NORMAL: Self = Self(Vec::new());
+}
+
+/// A low-level OpenType variation-axis coordinate from
+/// `font-variation-settings`.
+/// <https://www.w3.org/TR/css-fonts-4/#font-variation-settings-def>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FontVariationSetting {
+    pub(crate) tag: [u8; 4],
+    /// IEEE-754 bits retain CSS's computed numeric value while allowing the
+    /// inherited computed style to remain comparable.
+    pub(crate) value: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FontVariationSettings(pub(crate) Vec<FontVariationSetting>);
+
+impl FontVariationSettings {
     pub(crate) const NORMAL: Self = Self(Vec::new());
 }
 
@@ -293,8 +324,9 @@ pub(crate) enum FontVariantEmoji {
 /// flags, while numeric and named selections refer to author-visible palette
 /// entries and `@font-palette-values` rules respectively.
 /// <https://www.w3.org/TR/css-fonts-4/#font-palette-prop>
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum FontPalette {
+    #[default]
     Normal,
     Light,
     Dark,
@@ -312,7 +344,7 @@ pub(crate) enum FontPalette {
 pub(crate) struct FontPaletteDefinition {
     pub(crate) families: Vec<String>,
     pub(crate) base: FontPalette,
-    pub(crate) overrides: HashMap<u16, Color>,
+    pub(crate) overrides: HashMap<u16, CssColor>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

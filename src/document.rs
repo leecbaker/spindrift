@@ -2,19 +2,21 @@ mod paint;
 
 pub use paint::LinkAnnotation;
 pub(crate) use paint::PaintSpace;
+pub use paint::PaintStrokeWidth;
 pub(crate) use paint::RenderedImageSource;
 pub(crate) use paint::{
     PagePaintTree, PaintBand, PaintBlendMode, PaintCheckpoint, PaintClip, PaintClipPathEffect,
-    PaintDisplacement, PaintDisplayItem, PaintEffectScope, PaintEffectStep, PaintEffects,
-    PaintFilterEffect, PaintFragment, PaintMaskEffect, PaintPrimitive, PaintStackingContext,
-    PaintTransform, PaintTranslation, RenderedGradient, RenderedGradientKind, RenderedGradientStop,
-    RenderedLineSource, RenderedPathCommandPoints, RenderedPathLineCap, RenderedPathLineJoin,
-    RenderedPathPaint, RenderedPathPaintOrder, RenderedPathStrokeStyle, RenderedPeriodicGradient,
-    RenderedSvgPathPattern, StackLevel, paint_point_to_pdf, paint_rect_path_commands,
-    paint_rect_to_pdf,
+    PaintClipUnion, PaintDisplacement, PaintDisplayItem, PaintEffectScope, PaintEffectStep,
+    PaintEffects, PaintFilterEffect, PaintFragment, PaintMaskEffect, PaintPrimitive,
+    PaintStackingContext, PaintTransform, PaintTranslation, RenderedGradient, RenderedGradientKind,
+    RenderedGradientStop, RenderedLineSource, RenderedPathCommandPoints, RenderedPathLineCap,
+    RenderedPathLineJoin, RenderedPathPaint, RenderedPathPaintOrder, RenderedPathStrokeStyle,
+    RenderedPeriodicGradient, RenderedSvgPathPattern, StackLevel, paint_point_to_pdf,
+    paint_rect_path_commands, paint_rect_to_pdf,
 };
 pub(crate) use paint::{
-    PaintOperation, PaintPoint, PaintRect, PaintSize, RenderedCornerRadius, RenderedGlyph,
+    PaintOperation, PaintPatternTiling, PaintPoint, PaintRect, PaintSize, PdfSize,
+    RenderedClipPathPolygon, RenderedCornerRadius, RenderedGlyph, RenderedGlyphKind,
     RenderedGradientPattern, RenderedImage, RenderedImagePattern, RenderedImageSourceRect,
     RenderedLine, RenderedLink, RenderedPath, RenderedPathClip, RenderedPathClipPath,
     RenderedPathCommand, RenderedPathFillRule, RenderedRect, RenderedRoundedRect,
@@ -22,11 +24,14 @@ pub(crate) use paint::{
     RenderedTextRun, TextRunPoint,
 };
 
-use crate::{Error, Result, image_store::DocumentImageStore, pdf, timing::DebugTimer};
+use crate::css::CssColorSpace;
+use crate::{CssColor, Error, Result, image_store::DocumentImageStore, pdf, timing::DebugTimer};
 use fontique::Blob as FontiqueBlob;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt;
 use std::ops::Deref;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::str::FromStr;
 
@@ -48,6 +53,21 @@ pub struct Document {
 }
 
 impl Document {
+    /// Materialize page images before the document is embedded in an iframe.
+    ///
+    /// Page paint stores only document-local image IDs. An embedded page is
+    /// replayed into its parent's paint tree, where the same numeric ID may
+    /// name a different image; converting to inline samples preserves the
+    /// child browsing context's resource identity.
+    /// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element>
+    pub(crate) fn materialize_images_for_embedding(&mut self) {
+        for page in &mut self.pages {
+            for image in &mut page.images {
+                image.materialize_store_backing(&self.image_store);
+            }
+        }
+    }
+
     /// Returns the rendered pages in document order.
     ///
     /// ```no_run
@@ -115,6 +135,7 @@ impl Document {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn write_pdf<P: AsRef<Path>>(&self, target: P, options: &PdfOptions) -> Result<()> {
         let target = target.as_ref();
         log::debug!("writing PDF file {}", target.display());
@@ -179,11 +200,11 @@ pub enum FontEmbeddingMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum PdfProfile {
     /// A regular PDF document without a PDF/A conformance target.
+    #[default]
     Pdf,
     /// A PDF/A-1b document.
     PdfA1B,
     /// A PDF/A-2b document.
-    #[default]
     PdfA2B,
     /// A PDF/A-3b document.
     PdfA3B,
@@ -645,6 +666,75 @@ impl Page {
     pub(crate) fn has_fragmentation_content(&self) -> bool {
         self.has_fragmentation_content
     }
+
+    /// Return the CSS component spaces referenced by vector paint on this page.
+    ///
+    /// Ordinary PDF preserves an authored CSS color space with an ICCBased
+    /// resource, whereas PDF/A converts all paint to its sRGB output intent.
+    /// Planning this from retained paint values keeps ordinary PDFs calibrated
+    /// without embedding unused profiles for every CSS CssColor 4 space.
+    pub(crate) fn used_css_color_spaces(&self) -> HashSet<CssColorSpace> {
+        let mut spaces = HashSet::new();
+        for rect in &self.rects {
+            collect_optional_color_space(rect.fill, &mut spaces);
+            collect_optional_color_space(rect.stroke, &mut spaces);
+        }
+        for rect in &self.rounded_rects {
+            collect_optional_color_space(rect.fill, &mut spaces);
+            collect_optional_color_space(rect.stroke, &mut spaces);
+        }
+        for path in &self.paths {
+            collect_path_color_spaces(path, &mut spaces);
+        }
+        for stroke in &self.strokes {
+            spaces.insert(stroke.color.space());
+        }
+        for line in &self.lines {
+            spaces.insert(line.color.space());
+        }
+        for pattern in &self.gradient_patterns {
+            collect_gradient_color_spaces(&pattern.gradient, &mut spaces);
+        }
+        for pattern in &self.svg_patterns {
+            for path in &pattern.paths {
+                collect_path_color_spaces(path, &mut spaces);
+            }
+        }
+        spaces
+    }
+}
+
+fn collect_optional_color_space(color: Option<CssColor>, spaces: &mut HashSet<CssColorSpace>) {
+    if let Some(color) = color {
+        spaces.insert(color.space());
+    }
+}
+
+fn collect_gradient_color_spaces(gradient: &RenderedGradient, spaces: &mut HashSet<CssColorSpace>) {
+    spaces.insert(gradient.color_space);
+}
+
+fn collect_path_color_spaces(path: &RenderedPath, spaces: &mut HashSet<CssColorSpace>) {
+    collect_optional_color_space(path.fill, spaces);
+    collect_optional_color_space(path.stroke, spaces);
+    for paint in [path.fill_paint.as_ref(), path.stroke_paint.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        match paint {
+            RenderedPathPaint::Solid(color) => {
+                spaces.insert(color.space());
+            }
+            RenderedPathPaint::Gradient(gradient) => {
+                collect_gradient_color_spaces(gradient, spaces)
+            }
+            RenderedPathPaint::SvgPattern(pattern) => {
+                for path in &pattern.paths {
+                    collect_path_color_spaces(path, spaces);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -713,6 +803,31 @@ impl PartialEq for DocumentFontData {
 
 impl Eq for DocumentFontData {}
 
+/// Native OpenType vertical metrics in font units.
+///
+/// These describe the coordinate system of the embedded glyph program. CSS
+/// `@font-face` metric override descriptors must not alter them: glyph paths,
+/// ink bounds, and font-table-backed decoration metrics remain in this space.
+/// <https://drafts.csswg.org/css-fonts-5/#font-metric-override-desc>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenTypeVerticalMetrics {
+    pub(crate) ascender: i16,
+    pub(crate) descender: i16,
+    pub(crate) line_gap: i16,
+}
+
+/// CSS inline-layout vertical metrics in font units.
+///
+/// An `@font-face` ascent, descent, or line-gap override changes this metric
+/// set without changing the OpenType glyph coordinate system.
+/// <https://drafts.csswg.org/css-fonts-5/#font-metric-override-desc>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CssFontVerticalMetrics {
+    pub(crate) ascender: i16,
+    pub(crate) descender: i16,
+    pub(crate) line_gap: i16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DocumentFont {
     pub(crate) id: usize,
@@ -722,8 +837,8 @@ pub(crate) struct DocumentFont {
     pub(crate) data: DocumentFontData,
     pub(crate) face_index: u32,
     pub(crate) units_per_em: u16,
-    pub(crate) ascender: i16,
-    pub(crate) descender: i16,
+    pub(crate) program_metrics: OpenTypeVerticalMetrics,
+    pub(crate) layout_metrics: CssFontVerticalMetrics,
     pub(crate) cap_height: i16,
     pub(crate) italic_angle: i16,
     pub(crate) bbox: [i16; 4],

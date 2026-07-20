@@ -74,8 +74,17 @@ impl FontProgramCache {
 
 impl FontSystem {
     pub(crate) fn start_loading() -> FontSystemLoad {
-        FontSystemLoad {
-            parley_font_context: tokio::task::spawn_blocking(load_parley_font_context),
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            FontSystemLoad {
+                parley_font_context: tokio::task::spawn_blocking(load_parley_font_context),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            FontSystemLoad {
+                parley_font_context: load_parley_font_context(),
+            }
         }
     }
 
@@ -87,7 +96,6 @@ impl FontSystem {
             registered_font_faces: HashMap::new(),
             font_feature_values: FontFeatureValues::default(),
             font_palette_values: FontPaletteValues::default(),
-            font_feature_defaults_by_family: HashMap::new(),
         }
     }
 
@@ -101,7 +109,6 @@ impl FontSystem {
             fallback_cache: HashMap::new(),
             font_feature_values: seed.font_feature_values,
             font_palette_values: seed.font_palette_values,
-            font_feature_defaults_by_family: seed.font_feature_defaults_by_family,
         }
     }
 }
@@ -134,11 +141,24 @@ impl FontSystemLoad {
             font_feature_values.extend(stylesheet.font_feature_values.clone());
             font_palette_values.extend(stylesheet.font_palette_values.clone());
         }
-        FontSystemSeedLoad {
-            parley_font_context: self.parley_font_context,
-            font_faces: tokio::spawn(load_font_faces(font_faces, resource_fetcher)),
-            font_feature_values,
-            font_palette_values,
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            FontSystemSeedLoad {
+                parley_font_context: self.parley_font_context,
+                font_faces: tokio::spawn(load_font_faces(font_faces, resource_fetcher)),
+                font_feature_values,
+                font_palette_values,
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            FontSystemSeedLoad {
+                parley_font_context: self.parley_font_context,
+                font_faces,
+                resource_fetcher,
+                font_feature_values,
+                font_palette_values,
+            }
         }
     }
 }
@@ -153,7 +173,6 @@ impl FontSystemSeedLoad {
                 registered_font_faces: HashMap::new(),
                 font_feature_values: FontFeatureValues::default(),
                 font_palette_values: FontPaletteValues::default(),
-                font_feature_defaults_by_family: HashMap::new(),
             })
         })
     }
@@ -163,66 +182,116 @@ impl FontSystemSeedLoad {
     }
 
     async fn finish_inner(self, fail_on_font_error: bool) -> crate::Result<FontSystem> {
-        let (loaded_context, font_faces) = tokio::join!(self.parley_font_context, self.font_faces);
-        let font_faces = match font_faces {
-            Ok(Ok(font_faces)) => font_faces,
-            Ok(Err(error)) if fail_on_font_error => return Err(error),
-            Ok(Err(error)) => {
-                log::warn!("@font-face loading failed: {error}");
-                Vec::new()
+        let (mut loaded_context, font_faces, font_feature_values, font_palette_values) = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let Self {
+                    parley_font_context,
+                    font_faces,
+                    font_feature_values,
+                    font_palette_values,
+                } = self;
+                // Both tasks were started before this future is polled. Awaiting them
+                // in sequence therefore only chooses the order in which their results
+                // are observed; it does not serialize their loading work.
+                let loaded_context = parley_font_context.await;
+                let font_faces = font_faces.await;
+                let font_faces = match font_faces {
+                    Ok(Ok(font_faces)) => font_faces,
+                    Ok(Err(error)) if fail_on_font_error => return Err(error),
+                    Ok(Err(error)) => {
+                        log::warn!("@font-face loading failed: {error}");
+                        Vec::new()
+                    }
+                    Err(error) => {
+                        log::warn!("@font-face loading task failed: {error}");
+                        Vec::new()
+                    }
+                };
+                let loaded_context = match loaded_context {
+                    Ok(loaded_context) => loaded_context,
+                    Err(error) => {
+                        log::warn!("Parley font context loading task failed: {error}");
+                        load_parley_font_context()
+                    }
+                };
+                (
+                    loaded_context,
+                    font_faces,
+                    font_feature_values,
+                    font_palette_values,
+                )
             }
-            Err(error) => {
-                log::warn!("@font-face loading task failed: {error}");
-                Vec::new()
-            }
-        };
-        let loaded_context = match loaded_context {
-            Ok(loaded_context) => loaded_context,
-            Err(error) => {
-                log::warn!("Parley font context loading task failed: {error}");
-                load_parley_font_context()
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                let Self {
+                    parley_font_context,
+                    font_faces,
+                    resource_fetcher,
+                    font_feature_values,
+                    font_palette_values,
+                } = self;
+                let font_faces = match load_font_faces(font_faces, resource_fetcher).await {
+                    Ok(font_faces) => font_faces,
+                    Err(error) if fail_on_font_error => return Err(error),
+                    Err(error) => {
+                        log::warn!("@font-face loading failed: {error}");
+                        Vec::new()
+                    }
+                };
+                (
+                    parley_font_context,
+                    font_faces,
+                    font_feature_values,
+                    font_palette_values,
+                )
             }
         };
         if font_faces.is_empty() {
             return Ok(FontSystem::from_seed(FontSystemSeed {
                 parley_font_context: loaded_context.parley_font_context,
                 registered_font_faces: HashMap::new(),
-                font_feature_values: self.font_feature_values,
-                font_palette_values: self.font_palette_values,
-                font_feature_defaults_by_family: HashMap::new(),
+                font_feature_values,
+                font_palette_values,
             }));
         }
 
-        let seed =
-            tokio::task::spawn_blocking(|| register_loaded_font_faces(loaded_context, font_faces))
+        let registered_font_faces = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let registration = tokio::task::spawn_blocking(|| {
+                    register_loaded_font_faces(loaded_context, font_faces)
+                })
                 .await;
-        match seed {
-            Ok((loaded_context, registered_font_faces)) => {
-                Ok(FontSystem::from_seed(FontSystemSeed {
-                    parley_font_context: loaded_context.parley_font_context,
-                    font_feature_defaults_by_family: registered_font_face_defaults_by_family(
-                        &registered_font_faces,
-                    ),
-                    registered_font_faces: registered_font_faces
-                        .into_iter()
-                        .map(|face| (face.key, face.metadata))
-                        .collect(),
-                    font_feature_values: self.font_feature_values,
-                    font_palette_values: self.font_palette_values,
-                }))
+                match registration {
+                    Ok((context, font_faces)) => {
+                        loaded_context = context;
+                        font_faces
+                    }
+                    Err(error) => {
+                        log::warn!("@font-face registration task failed: {error}");
+                        loaded_context = load_parley_font_context();
+                        Vec::new()
+                    }
+                }
             }
-            Err(error) => {
-                log::warn!("@font-face registration task failed: {error}");
-                let loaded_context = load_parley_font_context();
-                Ok(FontSystem::from_seed(FontSystemSeed {
-                    parley_font_context: loaded_context.parley_font_context,
-                    registered_font_faces: HashMap::new(),
-                    font_feature_values: self.font_feature_values,
-                    font_palette_values: self.font_palette_values,
-                    font_feature_defaults_by_family: HashMap::new(),
-                }))
+            #[cfg(target_arch = "wasm32")]
+            {
+                let (context, font_faces) = register_loaded_font_faces(loaded_context, font_faces);
+                loaded_context = context;
+                font_faces
             }
-        }
+        };
+        Ok(FontSystem::from_seed(FontSystemSeed {
+            parley_font_context: loaded_context.parley_font_context,
+            registered_font_faces: registered_font_faces
+                .into_iter()
+                .map(|face| (face.key, face.metadata))
+                .collect(),
+            font_feature_values,
+            font_palette_values,
+        }))
     }
 }
 
@@ -249,28 +318,41 @@ async fn load_font_faces(
         font_faces.len()
     );
     let cache = FontProgramCache::new();
-    let mut handles = Vec::with_capacity(font_faces.len());
-    for font_face in font_faces {
-        handles.push(tokio::spawn(load_font_face(
-            font_face,
-            resource_fetcher.clone(),
-            cache.clone(),
-        )));
-    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let handles = font_faces
+            .into_iter()
+            .map(|font_face| {
+                tokio::spawn(load_font_face(
+                    font_face,
+                    resource_fetcher.clone(),
+                    cache.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
 
-    let mut loaded = Vec::with_capacity(handles.len());
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(font_face)) => loaded.push(font_face),
-            Ok(Err(error)) => return Err(error),
-            Err(error) => {
-                return Err(crate::Error::InvalidInput(format!(
-                    "@font-face source loading task failed: {error}"
-                )));
+        let mut loaded = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(font_face)) => loaded.push(font_face),
+                Ok(Err(error)) => return Err(error),
+                Err(error) => {
+                    return Err(crate::Error::InvalidInput(format!(
+                        "@font-face source loading task failed: {error}"
+                    )));
+                }
             }
         }
+        Ok(loaded)
     }
-    Ok(loaded)
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut loaded = Vec::with_capacity(font_faces.len());
+        for font_face in font_faces {
+            loaded.push(load_font_face(font_face, resource_fetcher.clone(), cache.clone()).await?);
+        }
+        Ok(loaded)
+    }
 }
 
 async fn load_font_face(
@@ -309,7 +391,7 @@ async fn load_first_font_face_source(
             font_face.family,
             source
         );
-        match load_font_source_async(source, resource_fetcher, cache).await {
+        match load_font_source(source, resource_fetcher, cache).await {
             Ok(Some(data)) => {
                 log::trace!(
                     "@font-face family {} source {:?} loaded and decoded ({} byte(s))",
@@ -342,7 +424,7 @@ async fn load_first_font_face_source(
     Ok(None)
 }
 
-async fn load_font_source_async(
+async fn load_font_source(
     source: &FontFaceSource,
     resource_fetcher: &crate::resource::ResourceFetcher,
     cache: &FontProgramCache,
@@ -358,7 +440,7 @@ async fn load_font_source_async(
                 display_optional_url(base_url.as_ref()),
                 display_optional_url(root_url.as_ref())
             );
-            load_font_url_async(
+            load_font_url(
                 value,
                 base_url.as_ref(),
                 root_url.as_ref(),
@@ -370,7 +452,7 @@ async fn load_font_source_async(
     }
 }
 
-async fn load_font_url_async(
+async fn load_font_url(
     value: &str,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
@@ -427,14 +509,16 @@ fn register_loaded_font_faces(
     mut loaded_context: LoadedParleyFontContext,
     font_faces: Vec<LoadedFontFace>,
 ) -> (LoadedParleyFontContext, Vec<RegisteredFontFace>) {
-    let mut registered_faces = Vec::new();
-    for loaded in font_faces {
-        registered_faces.extend(register_loaded_font_face(
-            &mut loaded_context.parley_font_context,
-            &loaded.font_face,
-            loaded.data,
-        ));
-    }
+    let registered_faces = font_faces
+        .into_iter()
+        .flat_map(|loaded| {
+            register_loaded_font_face(
+                &mut loaded_context.parley_font_context,
+                &loaded.font_face,
+                loaded.data,
+            )
+        })
+        .collect::<Vec<_>>();
     (loaded_context, registered_faces)
 }
 
@@ -452,14 +536,23 @@ fn register_loaded_font_face(
         font_face.family,
         blob.len()
     );
+    let axis_defaults = fontique_fixed_standard_axis_defaults(
+        font_face.weight,
+        font_face.weight_is_variable,
+        font_face.width,
+        font_face.width_is_variable,
+    );
     let registered = parley_font_context.collection.register_fonts(
         blob,
         Some(FontInfoOverride {
-            family_name: Some(&font_face.family),
+            family_name: Some(fontique_family_name(&font_face.family)),
             width: (!font_face.width_is_variable).then(|| fontique_width(font_face.width)),
             style: Some(fontique_style(font_face.style)),
             weight: (!font_face.weight_is_variable).then(|| fontique_weight(font_face.weight)),
-            axes: None,
+            // Fontique ignores a supplied axis tag when the program does not
+            // expose that axis, preserving fixed-descriptor behavior for
+            // ordinary non-variable fonts.
+            axes: (!axis_defaults.is_empty()).then_some(axis_defaults.as_slice()),
         }),
     );
     let font_count = registered
@@ -496,29 +589,21 @@ fn register_loaded_font_face(
                     },
                     metadata: RegisteredFontFaceMetadata {
                         family: font_face.family.clone(),
+                        weight: font_face.weight,
+                        style: font_face.style,
+                        weight_is_variable: font_face.weight_is_variable,
                         feature_defaults: FontFaceFeatureDefaults::from_font_face(font_face),
                         unicode_range: font_face.unicode_range.clone(),
                         size_adjust: font_face.size_adjust,
+                        ascent_override: font_face.ascent_override,
+                        descent_override: font_face.descent_override,
+                        line_gap_override: font_face.line_gap_override,
+                        font_variation_settings: font_face.font_variation_settings.clone(),
                     },
                 })
             })
         })
         .collect()
-}
-
-fn registered_font_face_defaults_by_family(
-    faces: &[RegisteredFontFace],
-) -> HashMap<String, FontFaceFeatureDefaults> {
-    let mut defaults = HashMap::new();
-    for face in faces {
-        if !face.metadata.feature_defaults.is_normal() {
-            defaults.insert(
-                face.metadata.family.trim().to_ascii_lowercase(),
-                face.metadata.feature_defaults.clone(),
-            );
-        }
-    }
-    defaults
 }
 
 impl FontSystem {
@@ -626,6 +711,7 @@ impl FontSystem {
         weight: FontWeight,
         style: FontStyle,
         width: FontWidth,
+        locale: Option<&fontique::Language>,
     ) -> Vec<FontiqueQueryFont> {
         let mut fonts = Vec::new();
         let mut query = self
@@ -641,7 +727,7 @@ impl FontSystem {
         }
         query.set_fallbacks(FontiqueFallbackKey::new(
             fontique_script_for_character(character),
-            None,
+            locale,
         ));
         query.matches_with(|font| {
             fonts.push(font.clone());
@@ -752,7 +838,7 @@ impl FontSystem {
         style: FontStyle,
         width: FontWidth,
     ) -> Option<FontiqueQueryFont> {
-        let fonts = self.query_platform_fallback_fonts(character, weight, style, width);
+        let fonts = self.query_platform_fallback_fonts(character, weight, style, width, None);
         fonts
             .iter()
             .filter(|font| !font.synthesis.any())
@@ -787,7 +873,7 @@ fn font_families_for_style(
             Cow::Owned(
                 names
                     .iter()
-                    .map(|name| FontiqueQueryFamily::Named(name))
+                    .map(|name| FontiqueQueryFamily::Named(fontique_family_name(name)))
                     .collect(),
             )
         }
@@ -797,7 +883,7 @@ fn font_families_for_style(
                 .flat_map(|family| match family {
                     FontFamily::Names(names) => names
                         .iter()
-                        .map(|name| FontiqueQueryFamily::Named(name))
+                        .map(|name| FontiqueQueryFamily::Named(fontique_family_name(name)))
                         .collect::<Vec<_>>(),
                     generic => generic_query_families(generic, weight)
                         .unwrap_or(&[])

@@ -135,9 +135,9 @@ pub(super) struct TableColumnGroup<'a> {
 
 #[derive(Debug, Clone)]
 pub(super) struct TableColumnPlan {
-    pub(super) widths: Vec<f32>,
-    pub(super) offsets: Vec<f32>,
-    pub(super) horizontal_spacing: f32,
+    pub(super) widths: Vec<TableGridLength>,
+    pub(super) offsets: Vec<TableGridLength>,
+    pub(super) horizontal_spacing: TableGridLength,
     pub(super) collapsed: Vec<bool>,
     pub(super) axes: TableAxes,
 }
@@ -150,15 +150,15 @@ impl TableColumnPlan {
     /// collapsed border model passes zero spacing through `TableMetrics`.
     /// https://www.w3.org/TR/CSS22/tables.html#separated-borders
     pub(super) fn with_collapsed(
-        mut widths: Vec<f32>,
-        horizontal_spacing: f32,
+        mut widths: Vec<TableGridLength>,
+        horizontal_spacing: TableGridLength,
         mut collapsed: Vec<bool>,
         axes: TableAxes,
     ) -> Self {
         collapsed.resize(widths.len(), false);
         for (index, width) in widths.iter_mut().enumerate() {
             if collapsed[index] {
-                *width = 0.0;
+                *width = TableGridLength::new(0.0);
             }
         }
         let visible_columns = collapsed.iter().filter(|collapsed| !**collapsed).count();
@@ -166,7 +166,7 @@ impl TableColumnPlan {
         let mut offset = if visible_columns > 0 {
             horizontal_spacing
         } else {
-            0.0
+            TableGridLength::new(0.0)
         };
         for (index, width) in widths.iter().enumerate() {
             offsets.push(offset);
@@ -191,16 +191,16 @@ impl TableColumnPlan {
         }
     }
 
-    pub(super) fn width_for_span(&self, column: usize, colspan: usize) -> f32 {
+    pub(super) fn width_for_span(&self, column: usize, colspan: usize) -> TableGridLength {
         if column >= self.widths.len() {
-            return 0.0;
+            return TableGridLength::new(0.0);
         }
         let end = (column + colspan.max(1)).min(self.widths.len());
         let visible_columns = self.collapsed[column..end]
             .iter()
             .filter(|collapsed| !**collapsed)
             .count();
-        let column_widths = self.widths[column..end].iter().sum::<f32>();
+        let column_widths = self.widths[column..end].iter().sum::<TableGridLength>();
         column_widths + self.horizontal_spacing * visible_columns.saturating_sub(1) as f32
     }
 
@@ -215,16 +215,18 @@ impl TableColumnPlan {
         Some(self.inline_bounds_for_span(start_column, end_column - start_column))
     }
 
-    pub(super) fn total_width(&self) -> f32 {
+    pub(super) fn total_width(&self) -> LogicalInlineContentSize {
         let visible_columns = self
             .collapsed
             .iter()
             .filter(|collapsed| !**collapsed)
             .count();
         if visible_columns == 0 {
-            0.0
+            LogicalInlineContentSize::new(content_box_pt(0.0))
         } else {
-            self.widths.iter().sum::<f32>() + self.horizontal_spacing * (visible_columns + 1) as f32
+            let total = self.widths.iter().sum::<TableGridLength>()
+                + self.horizontal_spacing * (visible_columns + 1) as f32;
+            LogicalInlineContentSize::new(total.cast_unit())
         }
     }
 
@@ -265,7 +267,7 @@ impl TableColumnPlan {
         let logical_start = self.logical_boundary_offset(column);
         let logical_end = logical_start + width;
         let start = self.axes.span_start_x(
-            self.total_width(),
+            self.grid_inline_extent(),
             logical_start,
             logical_end.min(self.logical_boundary_offset(end)),
         );
@@ -280,10 +282,12 @@ impl TableColumnPlan {
     ///
     /// The returned value is table-grid local; use `TableGridPlacement` before
     /// writing it into paint or layout-builder fields.
-    pub(super) fn boundary_x(&self, boundary: usize) -> f32 {
+    pub(super) fn boundary_x(&self, boundary: usize) -> TableGridLength {
         let boundary = boundary.min(self.widths.len());
-        self.axes
-            .boundary_x(self.total_width(), self.logical_boundary_offset(boundary))
+        self.axes.boundary_x(
+            self.grid_inline_extent(),
+            self.logical_boundary_offset(boundary),
+        )
     }
 
     pub(super) fn cell_border_box(
@@ -294,15 +298,32 @@ impl TableColumnPlan {
         TableCellBorderBox::from_bounds(self.inline_bounds_for_area(area), row_bounds)
     }
 
-    fn logical_offset_for_column(&self, column: usize) -> f32 {
-        self.offsets.get(column).cloned().unwrap_or(0.0)
+    fn logical_offset_for_column(&self, column: usize) -> TableGridLength {
+        self.offsets
+            .get(column)
+            .cloned()
+            .unwrap_or_else(|| TableGridLength::new(0.0))
     }
 
-    fn logical_boundary_offset(&self, boundary: usize) -> f32 {
+    fn logical_boundary_offset(&self, boundary: usize) -> TableGridLength {
         if boundary == self.widths.len() {
-            return self.total_width();
+            return self.grid_inline_extent();
         }
         self.logical_offset_for_column(boundary)
+    }
+
+    fn grid_inline_extent(&self) -> TableGridLength {
+        let visible_columns = self
+            .collapsed
+            .iter()
+            .filter(|collapsed| !**collapsed)
+            .count();
+        if visible_columns == 0 {
+            TableGridLength::new(0.0)
+        } else {
+            self.widths.iter().sum::<TableGridLength>()
+                + self.horizontal_spacing * (visible_columns + 1) as f32
+        }
     }
 }
 
@@ -332,10 +353,14 @@ impl<'a> TableLayoutInput<'a> {
 mod tests {
     use super::*;
 
+    fn grid_length(value: f32) -> TableGridLength {
+        TableGridLength::new(value)
+    }
+
     fn column_plan(direction: Direction) -> TableColumnPlan {
         TableColumnPlan::with_collapsed(
-            vec![10.0, 20.0, 30.0],
-            5.0,
+            vec![grid_length(10.0), grid_length(20.0), grid_length(30.0)],
+            grid_length(5.0),
             vec![false, false, false],
             TableAxes::for_direction(direction),
         )
@@ -344,13 +369,13 @@ mod tests {
     #[test]
     fn ltr_column_span_bounds_stay_in_logical_order() {
         let plan = column_plan(Direction::Ltr);
-        assert_eq!(plan.total_width(), 80.0);
+        assert_eq!(plan.total_width().points(), 80.0);
         assert_eq!(
             plan.inline_bounds_for_span(1, 2),
-            TableInlineBounds::new(20.0, 55.0)
+            TableInlineBounds::new(grid_length(20.0), grid_length(55.0))
         );
-        assert_eq!(plan.boundary_x(0), 5.0);
-        assert_eq!(plan.boundary_x(3), 80.0);
+        assert_eq!(plan.boundary_x(0), grid_length(5.0));
+        assert_eq!(plan.boundary_x(3), grid_length(80.0));
     }
 
     #[test]
@@ -358,10 +383,10 @@ mod tests {
         let plan = column_plan(Direction::Rtl);
         assert_eq!(
             plan.inline_bounds_for_span(0, 1),
-            TableInlineBounds::new(65.0, 10.0)
+            TableInlineBounds::new(grid_length(65.0), grid_length(10.0))
         );
-        assert_eq!(plan.boundary_x(0), 75.0);
-        assert_eq!(plan.boundary_x(3), 0.0);
+        assert_eq!(plan.boundary_x(0), grid_length(75.0));
+        assert_eq!(plan.boundary_x(3), grid_length(0.0));
     }
 
     #[test]
@@ -369,30 +394,30 @@ mod tests {
         let plan = column_plan(Direction::Rtl);
         assert_eq!(
             plan.inline_bounds_for_span(1, 2),
-            TableInlineBounds::new(5.0, 55.0)
+            TableInlineBounds::new(grid_length(5.0), grid_length(55.0))
         );
     }
 
     #[test]
     fn collapsed_columns_keep_logical_indices_but_do_not_add_span_width() {
         let plan = TableColumnPlan::with_collapsed(
-            vec![10.0, 20.0, 30.0],
-            5.0,
+            vec![grid_length(10.0), grid_length(20.0), grid_length(30.0)],
+            grid_length(5.0),
             vec![false, true, false],
             TableAxes::for_direction(Direction::Ltr),
         );
-        assert_eq!(plan.total_width(), 55.0);
+        assert_eq!(plan.total_width().points(), 55.0);
         assert_eq!(
             plan.inline_bounds_for_span(1, 1),
-            TableInlineBounds::new(20.0, 0.0)
+            TableInlineBounds::new(grid_length(20.0), grid_length(0.0))
         );
         assert_eq!(
             plan.inline_bounds_for_span(0, 3),
-            TableInlineBounds::new(5.0, 45.0)
+            TableInlineBounds::new(grid_length(5.0), grid_length(45.0))
         );
         assert_eq!(
             plan.occupied_inline_bounds(),
-            Some(TableInlineBounds::new(5.0, 45.0))
+            Some(TableInlineBounds::new(grid_length(5.0), grid_length(45.0)))
         );
     }
 

@@ -118,15 +118,16 @@ impl<'a> LayoutBuilder<'a> {
             style,
             &children,
             stylesheets,
-            content_width,
-            definite_content_height,
+            PhysicalContentWidth::new(content_box_pt(content_width)),
+            definite_content_height
+                .map(|height| PhysicalContentHeight::new(content_box_pt(height))),
             GridLayoutPurpose::IntrinsicProbe,
         )?;
         Some(GridContainerFlexItemEstimate {
             min_width: content_box_pt(min_width.max(0.0)),
             max_width: content_box_pt(max_width.max(min_width).max(0.0)),
             content_width: content_box_pt(content_width),
-            intrinsic_height: content_box_pt(layout.height.max(0.0)),
+            intrinsic_height: content_box_pt(layout.height.points().max(0.0)),
             definite_content_height: definite_content_height.map(content_box_pt),
             first_baseline: layout.first_baseline,
             last_baseline: layout.last_baseline,
@@ -183,6 +184,52 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
     ) -> (f32, f32) {
+        self.estimate_grid_intrinsic_axis_sizes(
+            element,
+            style,
+            stylesheets,
+            available_width,
+            child_boxes,
+            GridIntrinsicAxis::Inline,
+        )
+    }
+
+    /// Estimate a grid container's intrinsic logical block sizes.
+    ///
+    /// Grid's rows are its logical block-axis tracks.  A vertical grid uses
+    /// those tracks for its physical width, so this probe transposes the
+    /// grid-only track and placement representation before reusing the
+    /// column-oriented intrinsic track algorithm.  Item measurements remain
+    /// in their original writing mode; only the contribution axis changes.
+    /// <https://www.w3.org/TR/css-grid-1/#intrinsic-sizes> and
+    /// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>.
+    pub(in crate::layout) fn estimate_grid_intrinsic_block_sizes(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+    ) -> (f32, f32) {
+        self.estimate_grid_intrinsic_axis_sizes(
+            element,
+            style,
+            stylesheets,
+            available_width,
+            child_boxes,
+            GridIntrinsicAxis::Block,
+        )
+    }
+
+    fn estimate_grid_intrinsic_axis_sizes(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        available_width: f32,
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        axis: GridIntrinsicAxis,
+    ) -> (f32, f32) {
         let used_style = self.grid_used_style(style);
         let style = used_style.as_computed();
         let built_child_boxes;
@@ -195,6 +242,38 @@ impl<'a> LayoutBuilder<'a> {
         };
         let (children, _) = grid_child_lists_from_boxes(child_boxes);
         let children = self.prepare_grid_children(children);
+        let estimates = children
+            .iter()
+            .map(|child| {
+                self.estimate_grid_item_size(
+                    child,
+                    stylesheets,
+                    available_width,
+                    GridPercentageBasis::indefinite(),
+                    GridPercentageBasis::indefinite(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let transposed_style;
+        let transposed_children;
+        let transposed_estimates;
+        let (style, children, estimates) = match axis {
+            GridIntrinsicAxis::Inline => (style, children, estimates),
+            GridIntrinsicAxis::Block => {
+                transposed_style = transposed_intrinsic_grid_style(style);
+                transposed_children = transposed_intrinsic_grid_children(&children);
+                transposed_estimates = estimates
+                    .into_iter()
+                    .zip(children.iter())
+                    .map(|(estimate, child)| {
+                        estimate.logical_block_contribution(
+                            grid_item_logical_block_outer_non_content(&child.style),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (&transposed_style, transposed_children, transposed_estimates)
+            }
+        };
         let mut explicit_row_count = intrinsic_explicit_grid_track_count(&style.grid_template_rows)
             .unwrap_or(1)
             .max(grid_template_area_row_count(&style.grid_template_areas));
@@ -202,17 +281,6 @@ impl<'a> LayoutBuilder<'a> {
             intrinsic_grid_line_names(&style.grid_template_rows, &style.grid_template_areas)
                 .unwrap_or_else(|| vec![Vec::new(); explicit_row_count + 1]);
         explicit_row_count = explicit_row_count.max(row_line_names.len().saturating_sub(1).max(1));
-        let mut estimates = Vec::with_capacity(children.len());
-        for child in &children {
-            let estimate = self.estimate_grid_item_size(
-                child,
-                stylesheets,
-                available_width,
-                GridPercentageBasis::indefinite(),
-                GridPercentageBasis::indefinite(),
-            );
-            estimates.push(estimate);
-        }
         let (min_width, max_width) = grid_track_list_intrinsic_widths(GridTrackIntrinsicInputs {
             tracks: &style.grid_template_columns,
             auto_tracks: &style.grid_auto_columns,
@@ -226,6 +294,111 @@ impl<'a> LayoutBuilder<'a> {
         });
         (min_width.max(0.0), max_width.max(min_width).max(0.0))
     }
+}
+
+/// Which logical Grid track axis supplies an intrinsic contribution.
+///
+/// The intrinsic-track helper uses a column-oriented placement model; block
+/// sizing presents a transposed Grid view at that narrow boundary instead of
+/// leaking physical-axis swaps into track sizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridIntrinsicAxis {
+    Inline,
+    Block,
+}
+
+impl GridItemEstimate {
+    /// Present this item's logical block measurements as the intrinsic
+    /// track algorithm's logical inline measurements, including the item's
+    /// logical block-axis outer contribution required by Grid track sizing.
+    fn logical_block_contribution(self, outer_non_content: f32) -> Self {
+        let mut metrics = self.metrics.swapped_axes();
+        let outer_non_content = outer_non_content.max(0.0);
+        metrics.width = content_box_pt(metrics.width.points() + outer_non_content);
+        metrics.min_width = content_box_pt(metrics.min_width.points() + outer_non_content);
+        metrics.content_width = content_box_pt(metrics.content_width.points() + outer_non_content);
+        Self {
+            metrics,
+            swaps_physical_axes: false,
+        }
+    }
+}
+
+/// Return a Grid item's logical block-axis border, padding, and margins.
+///
+/// The scalar intrinsic track estimator receives its contribution after the
+/// item's content probe, so it must add the outer size that Taffy normally
+/// applies at its physical Grid boundary.
+/// <https://www.w3.org/TR/css-grid-1/#algo-content> and
+/// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>.
+fn grid_item_logical_block_outer_non_content(style: &ComputedStyle) -> f32 {
+    let metrics = intrinsic_box_metrics(style);
+    if style.writing_mode.has_vertical_lines() {
+        metrics.horizontal_non_content_length().points()
+            + metrics.margin.left.points()
+            + metrics.margin.right.points()
+    } else {
+        metrics.vertical_non_content_length().points()
+            + metrics.margin.top.points()
+            + metrics.margin.bottom.points()
+    }
+}
+
+/// Transpose the Grid-only state required by the intrinsic column-track
+/// algorithm.  CSS Grid rows and columns exchange their placement, track,
+/// gap, auto-flow, and template-area dimensions as one operation.
+/// <https://www.w3.org/TR/css-grid-1/#grid-placement-property> and
+/// <https://www.w3.org/TR/css-grid-1/#track-sizing>.
+fn transposed_intrinsic_grid_style(style: &ComputedStyle) -> ComputedStyle {
+    let mut transposed = style.clone();
+    std::mem::swap(
+        &mut transposed.grid_template_columns,
+        &mut transposed.grid_template_rows,
+    );
+    std::mem::swap(
+        &mut transposed.grid_auto_columns,
+        &mut transposed.grid_auto_rows,
+    );
+    std::mem::swap(&mut transposed.column_gap, &mut transposed.row_gap);
+    transposed.grid_auto_flow = match transposed.grid_auto_flow {
+        css::GridAutoFlow::Row => css::GridAutoFlow::Column,
+        css::GridAutoFlow::Column => css::GridAutoFlow::Row,
+        css::GridAutoFlow::RowDense => css::GridAutoFlow::ColumnDense,
+        css::GridAutoFlow::ColumnDense => css::GridAutoFlow::RowDense,
+    };
+    transposed.grid_template_areas =
+        transposed_grid_template_areas(&transposed.grid_template_areas);
+    transposed
+}
+
+fn transposed_intrinsic_grid_children<'a>(children: &[GridChild<'a>]) -> Vec<GridChild<'a>> {
+    children
+        .iter()
+        .cloned()
+        .map(|mut child| {
+            let style = &mut *child.style;
+            std::mem::swap(&mut style.grid_column_start, &mut style.grid_row_start);
+            std::mem::swap(&mut style.grid_column_end, &mut style.grid_row_end);
+            child
+        })
+        .collect()
+}
+
+fn transposed_grid_template_areas(areas: &css::GridTemplateAreas) -> css::GridTemplateAreas {
+    let css::GridTemplateAreas::Areas(rows) = areas else {
+        return css::GridTemplateAreas::None;
+    };
+    let column_count = rows.iter().map(|row| row.cells.len()).max().unwrap_or(0);
+    css::GridTemplateAreas::Areas(
+        (0..column_count)
+            .map(|column| css::GridTemplateAreaRow {
+                cells: rows
+                    .iter()
+                    .map(|row| row.cells.get(column).cloned().unwrap_or(None))
+                    .collect(),
+            })
+            .collect(),
+    )
 }
 
 impl<'a> LayoutBuilder<'a> {
@@ -272,7 +445,7 @@ impl<'a> LayoutBuilder<'a> {
         let layout_style = grid_item_layout_style(&child.style);
         let style = &layout_style;
         let available_height = available_height_basis.points();
-        let axes = WritingModeAxes::new(style.writing_mode, style.direction);
+        let axes = WritingModeAxes::new(style.writing_mode, style.used_direction());
         let inline_available = if axes.swaps_physical_axes() {
             available_height.unwrap_or(available_width)
         } else {
@@ -299,8 +472,8 @@ impl<'a> LayoutBuilder<'a> {
                 available_width,
                 inline_basis,
                 block_basis,
-                measurement.contribution.min_content,
-                measurement.contribution.max_content,
+                measurement.contribution.min_content.points(),
+                measurement.contribution.max_content.points(),
                 measurement.height().max(style.line_height),
             );
             set_grid_item_text_baselines(
@@ -337,14 +510,19 @@ impl<'a> LayoutBuilder<'a> {
                 )
             {
                 let content_size = image.content_size;
+                let (inline_size, block_size) = grid_item_logical_sizes_from_physical(
+                    style,
+                    content_size.width.max(1.0),
+                    content_size.height.max(1.0),
+                );
                 return grid_item_estimate_from_intrinsic(
                     style,
                     available_width,
                     inline_basis,
                     block_basis,
-                    content_size.width.max(1.0),
-                    content_size.width.max(1.0),
-                    content_size.height.max(1.0),
+                    inline_size,
+                    inline_size,
+                    block_size,
                 );
             }
 
@@ -359,14 +537,19 @@ impl<'a> LayoutBuilder<'a> {
                     ),
                 );
                 let content_size = canvas.content_size;
+                let (inline_size, block_size) = grid_item_logical_sizes_from_physical(
+                    style,
+                    content_size.width.max(1.0),
+                    content_size.height.max(1.0),
+                );
                 return grid_item_estimate_from_intrinsic(
                     style,
                     available_width,
                     inline_basis,
                     block_basis,
-                    content_size.width.max(1.0),
-                    content_size.width.max(1.0),
-                    content_size.height.max(1.0),
+                    inline_size,
+                    inline_size,
+                    block_size,
                 );
             }
 
@@ -383,14 +566,16 @@ impl<'a> LayoutBuilder<'a> {
             {
                 let width = svg.content_size.width;
                 let height = svg.content_size.height;
+                let (inline_size, block_size) =
+                    grid_item_logical_sizes_from_physical(style, width.max(1.0), height.max(1.0));
                 return grid_item_estimate_from_intrinsic(
                     style,
                     available_width,
                     inline_basis,
                     block_basis,
-                    width.max(1.0),
-                    width.max(1.0),
-                    height.max(1.0),
+                    inline_size,
+                    inline_size,
+                    block_size,
                 );
             }
 
@@ -417,7 +602,7 @@ impl<'a> LayoutBuilder<'a> {
                 };
                 let intrinsic_metrics = intrinsic_box_metrics(style);
                 let horizontal_margin =
-                    layout_pt(intrinsic_metrics.margin.left + intrinsic_metrics.margin.right);
+                    intrinsic_metrics.margin.left + intrinsic_metrics.margin.right;
                 let horizontal_non_content = intrinsic_metrics.horizontal_non_content_length();
                 let requested_content_width =
                     crate::layout::intrinsic::content_box_width_from_intrinsic_in_margin_box(
@@ -435,8 +620,8 @@ impl<'a> LayoutBuilder<'a> {
                     PercentageBasis::definite(layout_pt(available_width.max(0.0))),
                 )
                 .points();
-                let vertical_extras = intrinsic_metrics.margin.top
-                    + intrinsic_metrics.margin.bottom
+                let vertical_extras = intrinsic_metrics.margin.top.points()
+                    + intrinsic_metrics.margin.bottom.points()
                     + intrinsic_metrics.vertical_non_content_length().points();
                 let definite_content_height = used_content_box_height_or_auto(
                     style,
@@ -466,12 +651,16 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     intrinsic_grid_children,
                     stylesheets,
-                    content_width,
-                    definite_content_height,
+                    PhysicalContentWidth::new(content_box_pt(content_width)),
+                    definite_content_height
+                        .map(|height| PhysicalContentHeight::new(content_box_pt(height))),
                     GridLayoutPurpose::IntrinsicProbe,
                 ) {
-                    let content_height =
-                        constrain_grid_intrinsic_height(style, grid_layout.height, block_basis);
+                    let content_height = constrain_grid_intrinsic_height(
+                        style,
+                        grid_layout.height.points(),
+                        block_basis,
+                    );
                     let mut estimate = grid_item_estimate_from_intrinsic(
                         style,
                         available_width,
@@ -482,7 +671,7 @@ impl<'a> LayoutBuilder<'a> {
                         content_height,
                     );
                     let baseline_offset =
-                        intrinsic_metrics.border.top + intrinsic_metrics.padding.top;
+                        (intrinsic_metrics.border.top + intrinsic_metrics.padding.top).points();
                     estimate.first_baseline = grid_layout
                         .first_baseline
                         .map(|baseline| baseline_offset + baseline);
@@ -500,8 +689,8 @@ impl<'a> LayoutBuilder<'a> {
                 child_boxes,
                 inline_available,
             );
-            let mut min_content = inline_measurement.contribution.min_content;
-            let mut max_content = inline_measurement.contribution.max_content;
+            let mut min_content = inline_measurement.contribution.min_content.points();
+            let mut max_content = inline_measurement.contribution.max_content.points();
             if min_content == 0.0 && max_content == 0.0 {
                 let (block_min, block_max) = layout.block_intrinsic_content_widths(
                     element,
@@ -517,12 +706,35 @@ impl<'a> LayoutBuilder<'a> {
                 .estimate_element_height(element, style, stylesheets, available_width, child_boxes)
                 .map(|height| {
                     let intrinsic_metrics = intrinsic_box_metrics(style);
-                    let vertical_non_content = intrinsic_metrics.margin.top
-                        + intrinsic_metrics.margin.bottom
+                    let vertical_non_content = intrinsic_metrics.margin.top.points()
+                        + intrinsic_metrics.margin.bottom.points()
                         + intrinsic_metrics.vertical_non_content_length().points();
                     (height - vertical_non_content).max(0.0)
                 })
                 .unwrap_or_else(|| inline_measurement.height().max(style.line_height));
+            let content_height = if axes.swaps_physical_axes() {
+                // `GridItemEstimate` carries logical inline/block metrics.
+                // The ordinary height probe is physical, so it is an inline
+                // extent in vertical writing modes and cannot size a row.
+                // Ask the block intrinsic model for the physical-width
+                // projection, which is precisely this item's logical block
+                // contribution.
+                // <https://www.w3.org/TR/css-grid-1/#intrinsic-sizes> and
+                // <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+                layout
+                    .block_intrinsic_content_sizes(
+                        element,
+                        style,
+                        stylesheets,
+                        child_boxes,
+                        available_width,
+                    )
+                    .physical_width_min_max(FlowAxes::for_style(style))
+                    .1
+                    .points()
+            } else {
+                content_height
+            };
             // A tree-abiding generated pseudo can have an empty formatting
             // child list even though its `content` produces an inline line.
             // Its element-height probe then reports the empty principal box;
@@ -559,6 +771,21 @@ impl<'a> LayoutBuilder<'a> {
             );
             estimate
         })
+    }
+}
+
+/// Project an intrinsic replaced object's physical size into a Grid item's
+/// logical inline/block measurement pair.
+/// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>.
+fn grid_item_logical_sizes_from_physical(
+    style: &ComputedStyle,
+    physical_width: f32,
+    physical_height: f32,
+) -> (f32, f32) {
+    if WritingModeAxes::new(style.writing_mode, style.used_direction()).swaps_physical_axes() {
+        (physical_height, physical_width)
+    } else {
+        (physical_width, physical_height)
     }
 }
 
@@ -2381,6 +2608,35 @@ mod tests {
         assert_eq!(estimate.min_height.points(), 36.0);
         assert_eq!(estimate.content_width.points(), 24.0);
         assert_eq!(estimate.content_height.points(), 36.0);
+    }
+
+    #[test]
+    fn replaced_grid_item_sizes_are_projected_into_logical_axes() {
+        let horizontal = ComputedStyle::initial();
+        assert_eq!(
+            grid_item_logical_sizes_from_physical(&horizontal, 200.0, 100.0),
+            (200.0, 100.0)
+        );
+
+        let mut vertical = ComputedStyle::initial();
+        vertical.writing_mode = WritingMode::VerticalLr;
+        assert_eq!(
+            grid_item_logical_sizes_from_physical(&vertical, 200.0, 100.0),
+            (100.0, 200.0)
+        );
+    }
+
+    #[test]
+    fn block_track_contribution_swaps_grid_item_intrinsic_axes() {
+        let estimate = GridItemEstimate {
+            metrics: IntrinsicItemMetrics::fixed(40.0, 60.0),
+            swaps_physical_axes: true,
+        };
+
+        let contribution = estimate.logical_block_contribution(3.0);
+        assert_eq!(contribution.min_width.points(), 63.0);
+        assert_eq!(contribution.content_width.points(), 63.0);
+        assert!(!contribution.swaps_physical_axes);
     }
 
     #[test]

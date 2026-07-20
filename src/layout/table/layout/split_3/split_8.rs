@@ -1,4 +1,33 @@
 use super::*;
+use crate::layout::block::child_available_space_for_formatting_context;
+
+/// The intrinsic state contributed to one CSS table track distribution.
+///
+/// CSS Tables keeps a declared non-percentage width as a preferred track
+/// contribution in addition to intrinsic min/max-content and percentage
+/// contributions. A preferred cell width must not become a hard min-content
+/// floor: an empty `width: 100px` cell may still shrink into a narrower float
+/// exclusion band. Keeping these four values together also prevents `width:
+/// 0` (or a small fixed width) from replacing an unbreakable cell's intrinsic
+/// minimum:
+/// <https://drafts.csswg.org/css-tables-3/#computing-column-measures>.
+#[derive(Debug, Clone, Copy)]
+struct TableTrackMeasure {
+    min_content: f32,
+    max_content: f32,
+    declared_non_percentage_minimum: f32,
+    percentage: f32,
+}
+
+impl TableTrackMeasure {
+    fn min_target(self) -> f32 {
+        self.min_content.max(self.declared_non_percentage_minimum)
+    }
+
+    fn max_target(self) -> f32 {
+        self.max_content.max(self.min_target())
+    }
+}
 
 /// A table-cell contribution to CSS Tables auto column measures.
 ///
@@ -13,9 +42,7 @@ struct TableCellColumnContribution {
     start: usize,
     end: usize,
     colspan: usize,
-    min_target_width: f32,
-    max_target_width: f32,
-    percentage: f32,
+    measure: TableTrackMeasure,
     explicit_non_percentage_width: bool,
     internal_spacing: f32,
 }
@@ -197,14 +224,14 @@ impl<'a> LayoutBuilder<'a> {
                     // cell padding as zero at this stage, then resolves it
                     // after the track widths have been finalized.
                     // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
-                    PercentageBasis::definite(layout_pt(0.0)),
+                    PercentageBasis::definite(LogicalInlineContentSize::new(content_box_pt(0.0))),
                 );
 
                 // A cell's physical width only constrains a table column when
                 // the table root inline axis is physical horizontal. For an
                 // orthogonal table it contributes to the row/block track.
                 let table_inline_is_physical_width =
-                    !WritingModeAxes::new(table_style.writing_mode, table_style.direction)
+                    !WritingModeAxes::new(table_style.writing_mode, table_style.used_direction())
                         .swaps_physical_axes();
                 let explicit_width = table_inline_is_physical_width
                     .then(|| {
@@ -230,8 +257,8 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                     border_insets,
                 );
-                let min_content_width = track_inline_size.min_content;
-                let max_content_width = track_inline_size.max_content;
+                let min_content_width = track_inline_size.min_content.points();
+                let max_content_width = track_inline_size.max_content.points();
                 let width_floor = explicit_width
                     .clone()
                     .map(|width| {
@@ -239,29 +266,17 @@ impl<'a> LayoutBuilder<'a> {
                             .points()
                     })
                     .unwrap_or(0.0);
-                let min_target_width = constrain_table_intrinsic_width_with_floor(
+                let min_content =
+                    constrain_table_intrinsic_width_with_floor(&cell_style, min_content_width, 0.0);
+                // A definite cell width is a minimum table-track constraint.
+                // A zero width cannot replace the cell's intrinsic minimum,
+                // while an unbreakable item can still require a wider track.
+                // <https://www.w3.org/TR/CSS22/tables.html#auto-table-layout>
+                let max_content = constrain_table_intrinsic_width_with_floor(
                     &cell_style,
-                    min_content_width,
+                    max_content_width.max(min_content),
                     width_floor,
                 );
-                // A non-percentage specified cell width constrains an auto
-                // table's preferred track width. Its min-content contribution
-                // can still exceed that width for unbreakable content, but
-                // optional CSS Text breaks (including `break-spaces`) must not
-                // make the table choose the cell's unwrapped max-content size.
-                // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
-                let max_target_width = if explicit_width
-                    .as_ref()
-                    .is_some_and(|width| declared_table_width_is_non_percentage(width.clone()))
-                {
-                    min_target_width
-                } else {
-                    constrain_table_intrinsic_width_with_floor(
-                        &cell_style,
-                        max_content_width.max(min_target_width),
-                        width_floor,
-                    )
-                };
                 let percentage = intrinsic_percentage_contribution(&cell_style).max(
                     explicit_width
                         .clone()
@@ -286,9 +301,12 @@ impl<'a> LayoutBuilder<'a> {
                     start: placement.column,
                     end,
                     colspan,
-                    min_target_width,
-                    max_target_width,
-                    percentage,
+                    measure: TableTrackMeasure {
+                        min_content,
+                        max_content,
+                        declared_non_percentage_minimum: width_floor,
+                        percentage,
+                    },
                     explicit_non_percentage_width: explicit_width
                         .is_some_and(declared_table_width_is_non_percentage),
                     internal_spacing,
@@ -300,12 +318,15 @@ impl<'a> LayoutBuilder<'a> {
             .iter()
             .filter(|contribution| contribution.colspan == 1)
         {
-            measures.min_content_widths[contribution.start] =
-                measures.min_content_widths[contribution.start].max(contribution.min_target_width);
-            measures.max_content_widths[contribution.start] =
-                measures.max_content_widths[contribution.start].max(contribution.max_target_width);
-            measures.intrinsic_percentages[contribution.start] =
-                measures.intrinsic_percentages[contribution.start].max(contribution.percentage);
+            measures.min_content_widths[contribution.start] = measures.min_content_widths
+                [contribution.start]
+                .max(contribution.measure.min_target());
+            measures.max_content_widths[contribution.start] = measures.max_content_widths
+                [contribution.start]
+                .max(contribution.measure.max_target());
+            measures.intrinsic_percentages[contribution.start] = measures.intrinsic_percentages
+                [contribution.start]
+                .max(contribution.measure.percentage);
             if contribution.explicit_non_percentage_width {
                 measures.constrained[contribution.start] = true;
             }
@@ -322,20 +343,20 @@ impl<'a> LayoutBuilder<'a> {
                 &mut measures,
                 contribution.start,
                 contribution.end,
-                contribution.percentage,
+                contribution.measure.percentage,
             );
             distribute_spanned_measure(
                 &mut measures,
                 contribution.start,
                 contribution.end,
-                (contribution.min_target_width - contribution.internal_spacing).max(0.0),
+                (contribution.measure.min_target() - contribution.internal_spacing).max(0.0),
                 true,
             );
             distribute_spanned_measure(
                 &mut measures,
                 contribution.start,
                 contribution.end,
-                (contribution.max_target_width - contribution.internal_spacing).max(0.0),
+                (contribution.measure.max_target() - contribution.internal_spacing).max(0.0),
                 false,
             );
         }
@@ -386,6 +407,45 @@ impl<'a> LayoutBuilder<'a> {
         let horizontal_non_content =
             horizontal_border_non_content + table_width.padding.left + table_width.padding.right;
         let mut content_width = table_width.content_width.points();
+        // In the collapsed-border model, a specified table inline size is the
+        // wrapper's used size, including the resolved outer border halves.
+        // Track distribution, however, operates on the grid content span.
+        // Remove those insets exactly once before the free inline span is
+        // assigned to unconstrained columns.  Auto tables keep their
+        // intrinsic grid width, so there is no specified wrapper span to
+        // convert here.
+        // <https://www.w3.org/TR/CSS22/tables.html#collapsing-borders>
+        // <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>
+        if !table_root_inline_size(table_style).is_auto()
+            && let Some(geometry) = collapsed_geometry
+        {
+            let axes = TableAxes::for_style(table_style);
+            let inline_outer_half_insets = if axes.flow.writing_mode().has_vertical_lines() {
+                geometry.outer_insets.top + geometry.outer_insets.bottom
+            } else {
+                geometry.outer_insets.left + geometry.outer_insets.right
+            };
+            // `CollapsedTableGeometry` stores the visual outer half at each
+            // edge.  Together those halves are wrapper non-content rather
+            // than column-track space, so remove the combined inset before
+            // distributing the specified wrapper width to tracks.
+            content_width = (content_width - inline_outer_half_insets).max(0.0);
+        }
+        // `used_table_width` starts an auto table from the available inline
+        // span so the ordinary intrinsic path can shrink it. A non-zero
+        // wrapper min-inline constraint instead establishes the grid's
+        // definite target; preserve that target before distributing tracks.
+        if table_root_inline_size(table_style).is_auto()
+            && table_root_distributes_extra_inline_space(table_style)
+            && let Some(min_inline_size) = used_content_box_size(
+                table_root_min_inline_size(table_style),
+                table_style.box_sizing,
+                PercentageBasis::definite(content_box_pt(available_outer_width)),
+                non_content_pt(horizontal_non_content),
+            )
+        {
+            content_width = min_inline_size.points().max(0.0);
+        }
         if let Some(width) = intrinsic::intrinsic_content_box_width_keyword(
             table_root_inline_size(table_style),
             content_box_pt(min_content),
@@ -401,8 +461,12 @@ impl<'a> LayoutBuilder<'a> {
             .points()
             .max(table_style.font_size);
         }
-        content_width =
-            table_content_width_clamped_to_min_content(table_style, content_width, min_content);
+        content_width = table_content_width_clamped_to_min_content(
+            table_style,
+            LogicalInlineContentSize::new(content_box_pt(content_width)),
+            LogicalInlineContentSize::new(content_box_pt(min_content)),
+        )
+        .points();
         table_width.content_width = content_box_pt(content_width);
     }
 
@@ -414,12 +478,14 @@ impl<'a> LayoutBuilder<'a> {
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         columns: &[TableColumn<'_>],
-        table_width: f32,
+        table_width: LogicalInlineContentSize,
         distribute_extra_width: bool,
         table_cellpadding: Option<f32>,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
     ) -> TableColumnPlan {
+        let table_inline_size = table_width;
+        let table_width = table_inline_size.points();
         let column_count = grid.column_count;
         if table_style.table_layout == TableLayout::Fixed {
             return self.fixed_table_column_plan(
@@ -428,7 +494,7 @@ impl<'a> LayoutBuilder<'a> {
                 table_style,
                 stylesheets,
                 columns,
-                table_width,
+                table_inline_size,
                 distribute_extra_width,
                 table_cellpadding,
                 table_metrics,
@@ -467,8 +533,8 @@ impl<'a> LayoutBuilder<'a> {
         let collapsed_columns =
             self.collapsed_table_columns(columns, table_style, stylesheets, column_count);
         TableColumnPlan::with_collapsed(
-            widths,
-            table_metrics.spacing.horizontal.length_points(),
+            widths.into_iter().map(TableGridLength::new).collect(),
+            TableGridLength::new(table_metrics.spacing.horizontal.length_points()),
             collapsed_columns,
             TableAxes::for_style(table_style),
         )
@@ -482,13 +548,14 @@ impl<'a> LayoutBuilder<'a> {
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         columns: &[TableColumn<'_>],
-        table_width: f32,
+        table_width: LogicalInlineContentSize,
         distribute_extra_width: bool,
         table_cellpadding: Option<f32>,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
         column_count: usize,
     ) -> TableColumnPlan {
+        let table_width = table_width.points();
         // CSS 2.2 fixed table layout uses column widths from column elements,
         // then first-row cells, then divides remaining space equally.
         let collapsed_columns =
@@ -546,7 +613,9 @@ impl<'a> LayoutBuilder<'a> {
                 apply_table_cell_used_padding(
                     &mut cell_style,
                     table_cellpadding,
-                    PercentageBasis::definite(layout_pt(content_table_width)),
+                    PercentageBasis::definite(LogicalInlineContentSize::new(content_box_pt(
+                        content_table_width,
+                    ))),
                 );
                 if let Some(explicit_width) = cell
                     .element
@@ -613,8 +682,8 @@ impl<'a> LayoutBuilder<'a> {
         }
 
         TableColumnPlan::with_collapsed(
-            widths,
-            table_metrics.spacing.horizontal.length_points(),
+            widths.into_iter().map(TableGridLength::new).collect(),
+            TableGridLength::new(table_metrics.spacing.horizontal.length_points()),
             collapsed_columns,
             TableAxes::for_style(table_style),
         )
@@ -659,13 +728,13 @@ impl<'a> LayoutBuilder<'a> {
     /// Cross the table used-value boundary without changing the style retained
     /// by the table fragment for later cascade reconstruction.
     pub(in crate::layout::table) fn table_used_style(
-        &self,
+        &mut self,
         source: &ComputedStyle,
     ) -> TableUsedStyle {
         let used = if source.zoom_applied {
             source.clone()
         } else {
-            self.style_with_current_viewport_lengths(source)
+            self.style_with_current_used_lengths(source)
         };
         TableUsedStyle::from_source_and_normalized(source.clone(), used)
     }
@@ -858,6 +927,9 @@ impl<'a> LayoutBuilder<'a> {
         let scope = TableCellContentScope {
             content_left: self.content_left,
             content_right: self.content_right,
+            table_cell_content_coordinate_contexts: self
+                .table_cell_content_coordinate_contexts
+                .clone(),
             cursor_y: self.cursor_y,
             ancestors: self.ancestors.clone(),
             containing_block_direction: self.containing_block_direction,
@@ -869,27 +941,36 @@ impl<'a> LayoutBuilder<'a> {
         let content_width = content_box.width().max(0.0);
         let content_height = content_box.height().max(0.0);
         let content_logical_inline_size =
-            if WritingModeAxes::new(cell_style.writing_mode, cell_style.direction)
+            if WritingModeAxes::new(cell_style.writing_mode, cell_style.used_direction())
                 .swaps_physical_axes()
             {
                 content_height
             } else {
                 content_width
             };
-
         self.content_left = content_box.left();
         self.content_right = content_box.right();
+        self.table_cell_content_coordinate_contexts
+            .push(TableCellContentCoordinateContext {
+                origin: PageTopPoint::new(content_box.left(), content_box.top_y()),
+                writing_mode: cell_style.writing_mode,
+                direction: cell_style.used_direction(),
+            });
         self.cursor_y = content_box.top_y();
         self.ancestors = ancestors;
-        self.containing_block_direction = cell_style.direction;
+        self.containing_block_direction = cell_style.used_direction();
         self.containing_block_writing_mode = cell_style.writing_mode;
         self.content_logical_inline_size_stack
             .push(content_logical_inline_size.max(1.0));
+        let inherited_orthogonal_available_height = self
+            .current_child_available_space()
+            .orthogonal_available_height;
         self.child_available_space_stack
-            .push(ChildAvailableSpace::new(
-                cell_style.writing_mode,
+            .push(child_available_space_for_formatting_context(
+                cell_style,
                 PhysicalContentWidth::new(content_box_pt(content_width)),
                 Some(PhysicalContentHeight::new(content_box_pt(content_height))),
+                inherited_orthogonal_available_height,
                 PhysicalContentHeight::new(content_box_pt(content_height)),
             ));
         self.definite_block_size_stack.push(definite_block_size);
@@ -920,6 +1001,7 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         self.content_left = scope.content_left;
         self.content_right = scope.content_right;
+        self.table_cell_content_coordinate_contexts = scope.table_cell_content_coordinate_contexts;
         self.cursor_y = scope.cursor_y;
         self.ancestors = scope.ancestors;
         self.containing_block_direction = scope.containing_block_direction;
@@ -929,45 +1011,48 @@ impl<'a> LayoutBuilder<'a> {
         self.definite_block_size_stack = scope.definite_block_size_stack;
     }
 
-    pub(in crate::layout::table) fn table_cell_content_x_offset(
-        &mut self,
-        cell: &TableCell<'_>,
+    /// Resolve table-cell content alignment as a distance toward the cell's
+    /// logical block end.
+    ///
+    /// The caller projects this displacement through `TableCellAxisAdapter`.
+    /// Keeping it logical prevents a vertical cell's legacy `vertical-align`
+    /// from being treated as a physical-Y adjustment merely because its table
+    /// root happens to be horizontal:
+    /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layout::table) fn table_cell_content_block_offset(
+        &self,
         cell_style: &ComputedStyle,
-        stylesheets: &[Stylesheet],
-        cell_width: f32,
-        border_insets: css::Edges,
+        content_geometry: TableCellContentGeometry,
+        subject_block_size: f32,
+        row_baseline_offset: Option<f32>,
+        cell_baseline_offset: f32,
     ) -> f32 {
-        if !WritingModeAxes::new(cell_style.writing_mode, cell_style.direction)
-            .swaps_physical_axes()
-            || cell_style.align_content.keyword == ContentAlignmentKeyword::Normal
-        {
-            return 0.0;
+        let free_space = content_geometry.block_size().points() - subject_block_size;
+        if cell_style.align_content.keyword == ContentAlignmentKeyword::Normal {
+            let extra = free_space.max(0.0);
+            return match cell_style.vertical_align.table_cell_align {
+                TableCellVerticalAlign::Top => 0.0,
+                TableCellVerticalAlign::Middle => extra / 2.0,
+                TableCellVerticalAlign::Bottom => extra,
+                TableCellVerticalAlign::Baseline => row_baseline_offset
+                    .map(|baseline| (baseline - cell_baseline_offset).max(0.0))
+                    .unwrap_or(0.0)
+                    .min(extra),
+            };
         }
-
-        let content_box_width = (cell_width
-            - border_insets.left
-            - border_insets.right
-            - cell_style.padding.left
-            - cell_style.padding.right)
-            .max(0.0);
-        let subject_width = self.table_cell_content_alignment_subject_width(
-            cell,
-            cell_style,
-            stylesheets,
-            border_insets,
-        );
-        let free_space = content_box_width - subject_width;
-        let toward_block_end = content_alignment_offset_toward_end(
+        if matches!(
+            cell_style.align_content.keyword,
+            ContentAlignmentKeyword::Baseline | ContentAlignmentKeyword::LastBaseline
+        ) && let Some(baseline) = row_baseline_offset
+        {
+            return (baseline - cell_baseline_offset).max(0.0);
+        }
+        content_alignment_offset_toward_end(
             cell_style.align_content,
             free_space,
             block_align_content_defaults_to_safe_overflow(cell_style),
-        );
-
-        match block_start_side(cell_style.writing_mode) {
-            PhysicalSide::Left => toward_block_end,
-            PhysicalSide::Right => free_space - toward_block_end,
-            PhysicalSide::Top | PhysicalSide::Bottom => 0.0,
-        }
+        )
     }
 
     pub(in crate::layout::table) fn table_cell_content_alignment_subject_width(
@@ -976,6 +1061,7 @@ impl<'a> LayoutBuilder<'a> {
         cell_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         border_insets: css::Edges,
+        available_block_width: f32,
     ) -> f32 {
         let non_content = cell_style.padding.left
             + cell_style.padding.right
@@ -989,18 +1075,30 @@ impl<'a> LayoutBuilder<'a> {
             Some(border_insets),
         ) - non_content)
             .max(0.0);
-        if !WritingModeAxes::new(cell_style.writing_mode, cell_style.direction)
+        if !WritingModeAxes::new(cell_style.writing_mode, cell_style.used_direction())
             .swaps_physical_axes()
         {
             return fallback_width;
         }
 
+        // The alignment subject is the fragment produced with the same
+        // definite logical inline constraint used for the cell's intrinsic
+        // table measure. For a vertical cell that constraint is physical
+        // height, so `max-height` can wrap text into several physical-width
+        // columns before `vertical-align` distributes the remaining block
+        // space. Measuring it unconstrained would center one column inside a
+        // multi-column fragment.
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+        // <https://drafts.csswg.org/css-tables-3/#computing-cell-measures>
+        let available_inline_size = table_cell_inline_intrinsic_measure(cell_style)
+            .map(LogicalInlineContentSize::points)
+            .unwrap_or(f32::MAX);
         let inline_measurement = if let Some(children) = cell.children.as_deref() {
             Some(self.intrinsic_inline_measurement_for_boxes(
                 children,
                 cell_style,
                 stylesheets,
-                f32::MAX,
+                available_inline_size,
             ))
         } else {
             cell.element.map(|element| {
@@ -1009,34 +1107,99 @@ impl<'a> LayoutBuilder<'a> {
                     cell_style,
                     stylesheets,
                     None,
-                    f32::MAX,
+                    available_inline_size,
                 )
             })
         };
-        inline_measurement
-            .map(|measurement| measurement.physical_height(cell_style))
-            .filter(|width| *width > 0.0)
-            .unwrap_or(fallback_width)
+        let inline_subject_width = inline_measurement
+            // In a vertical cell, table-cell `vertical-align` distributes
+            // content along the cell's logical block axis. Its subject is the
+            // selected line stack's logical block span, not the inline
+            // progression extent contributed by `line-height`.
+            // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+            // <https://www.w3.org/TR/CSS22/tables.html#height-layout>
+            .map(|measurement| measurement.logical_block_span(cell_style))
+            .unwrap_or(0.0);
+        let block_subject_width = cell
+            .children
+            .as_deref()
+            .map(|children| {
+                self.table_cell_block_children_alignment_subject_width(
+                    children,
+                    available_block_width,
+                )
+            })
+            .unwrap_or(0.0);
+        let measured_subject_width = inline_subject_width.max(block_subject_width);
+        if measured_subject_width > 0.0 {
+            measured_subject_width
+        } else {
+            fallback_width
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Return the physical-width contribution of in-flow block descendants.
+    ///
+    /// A vertical table cell aligns content on its logical block axis, which
+    /// is physical width. Inline intrinsic measurement deliberately omits
+    /// block children, so using only it makes a `width: 40pt` child appear to
+    /// be no wider than a `width: 20pt` cell and incorrectly suppresses
+    /// unsafe overflow alignment. This measures the same used horizontal box
+    /// geometry that the later block-child pass paints.
+    fn table_cell_block_children_alignment_subject_width(
+        &mut self,
+        children: &[box_tree::FormattingBox<'_>],
+        containing_width: f32,
+    ) -> f32 {
+        children
+            .iter()
+            .map(|child| {
+                self.table_cell_block_child_alignment_subject_width(child, containing_width)
+            })
+            .fold(0.0, f32::max)
+    }
+
+    fn table_cell_block_child_alignment_subject_width(
+        &mut self,
+        child: &box_tree::FormattingBox<'_>,
+        containing_width: f32,
+    ) -> f32 {
+        match child {
+            box_tree::FormattingBox::AnonymousBlock(box_) => self
+                .table_cell_block_children_alignment_subject_width(
+                    &box_.children,
+                    containing_width,
+                ),
+            box_tree::FormattingBox::InlineSplitBlockContext(box_) => self
+                .table_cell_block_children_alignment_subject_width(
+                    &box_.core.children,
+                    containing_width,
+                ),
+            box_tree::FormattingBox::Text(_) | box_tree::FormattingBox::Inline(_) => 0.0,
+            _ if !table_cell_has_in_flow_layout_child(child) => 0.0,
+            _ => {
+                let mut style = self.style_with_current_used_lengths(child.style());
+                let percentage_basis = PercentageBasis::definite(layout_pt(containing_width));
+                let metrics = apply_used_box_metrics(&mut style, percentage_basis);
+                let horizontal_non_content = metrics.horizontal_non_content_length();
+                let available_outer_width =
+                    normal_flow_block_available_outer_width(&style, layout_pt(containing_width));
+                let content_width =
+                    used_content_box_width(&style, available_outer_width, horizontal_non_content);
+                content_width.points()
+                    + horizontal_non_content.points()
+                    + metrics.margin.left.points()
+                    + metrics.margin.right.points()
+            }
+        }
+    }
+
     pub(in crate::layout::table) fn layout_table_cell_replaced_children(
         &mut self,
         cell: &TableCell<'_>,
         cell_style: &ComputedStyle,
-        cell_borders: css::Edges,
-        border_box: TableCellBorderBox,
-        placement: TableGridPlacement,
-        content_offset: f32,
-        content_x_offset: f32,
+        content_box: TableCellContentBox,
     ) {
-        let content_box = border_box.content_box(
-            placement,
-            cell_style.padding,
-            cell_borders,
-            content_offset,
-            content_x_offset,
-        );
         let content_bounds = content_box.page_top_rect();
         let mut x = content_bounds.x();
         let y_top = content_bounds.top_y();
@@ -1098,4 +1261,34 @@ fn table_internal_flow_style(style: &ComputedStyle, table_style: &ComputedStyle)
     flow_style.direction = table_style.direction;
     flow_style.text_orientation = table_style.text_orientation;
     flow_style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_track_measure_keeps_intrinsic_minimum_above_a_zero_preference() {
+        let measure = TableTrackMeasure {
+            min_content: 12.0,
+            max_content: 20.0,
+            declared_non_percentage_minimum: 0.0,
+            percentage: 0.0,
+        };
+        assert_eq!(measure.min_target(), 12.0);
+        assert_eq!(measure.max_target(), 20.0);
+    }
+
+    #[test]
+    fn table_track_measure_includes_a_definite_cell_width_in_its_minimum() {
+        let measure = TableTrackMeasure {
+            min_content: 12.0,
+            max_content: 20.0,
+            declared_non_percentage_minimum: 16.0,
+            percentage: 0.5,
+        };
+        assert_eq!(measure.min_target(), 16.0);
+        assert_eq!(measure.max_target(), 20.0);
+        assert_eq!(measure.percentage, 0.5);
+    }
 }

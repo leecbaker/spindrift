@@ -509,12 +509,15 @@ fn collect_operation_used_glyphs(
             continue;
         };
         for glyph in run.glyphs {
+            let Some(glyph_id) = glyph.painted_id() else {
+                continue;
+            };
             let unicode = if glyph.unicode.is_empty() {
                 run.actual_text.unwrap_or_default().to_owned()
             } else {
                 glyph.unicode.clone()
             };
-            font_glyphs.entry(glyph.id).or_insert(unicode);
+            font_glyphs.entry(glyph_id).or_insert(unicode);
         }
         if run.glyphs.is_empty() {
             log::debug!("empty shaped text line {:?}", line.text);
@@ -588,11 +591,11 @@ fn font_descriptor_metrics_from_face(
             ]
         });
     let ascent = face.map_or_else(
-        || scale_f32(font.ascender),
+        || scale_f32(font.program_metrics.ascender),
         |face| scale_f32(face.ascender()),
     );
     let descent = face.map_or_else(
-        || scale_f32(font.descender),
+        || scale_f32(font.program_metrics.descender),
         |face| scale_f32(face.descender()),
     );
     let cap_height = face
@@ -770,17 +773,15 @@ fn pdf_font_program_label(font: &DocumentFont, face: Option<&ttf_parser::Face<'_
 }
 
 fn subset_prefix(font: &DocumentFont, post_script_name: &str) -> String {
-    let mut hash = font.data.blob_id()
+    let hash = font.data.blob_id()
         ^ ((font.face_index as u64) << 32)
         ^ post_script_name.bytes().fold(0u64, |hash, byte| {
             hash.wrapping_mul(33).wrapping_add(byte as u64)
         });
-    let mut prefix = String::with_capacity(6);
-    for _ in 0..6 {
-        prefix.push((b'A' + (hash % 26) as u8) as char);
-        hash /= 26;
-    }
-    prefix
+    std::iter::successors(Some(hash), |hash| Some(hash / 26))
+        .take(6)
+        .map(|hash| (b'A' + (hash % 26) as u8) as char)
+        .collect()
 }
 
 fn sanitize_pdf_font_name(name: &str) -> String {

@@ -1,3 +1,4 @@
+use crate::css::layout_pt;
 use crate::{
     Css, Document, PdfOptions, RenderOptions, ResourcePolicy, Result, css, dom, layout, resource,
     timing::DebugTimer,
@@ -86,6 +87,7 @@ impl Html {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let _timer = DebugTimer::start(format!("reading HTML file {}", path.display()));
@@ -112,6 +114,7 @@ impl Html {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn from_xml_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(Self::from_file(path)
             .await?
@@ -219,6 +222,7 @@ impl Html {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_base_path<P: AsRef<Path>>(mut self, base_path: P) -> Result<Self> {
         let base_url = resource::directory_url_from_path(base_path.as_ref())?;
         if self.base_url.is_none() {
@@ -282,8 +286,7 @@ impl Html {
         dom::mark_target_fragment(&mut root, target_fragment);
         let mut stylesheets = {
             let _timer = DebugTimer::start("loading author stylesheets in document order");
-            self.author_stylesheets_async(&root, &resource_fetcher)
-                .await?
+            self.author_stylesheets(&root, &resource_fetcher).await?
         };
         stylesheets.extend(
             self.stylesheets
@@ -296,7 +299,7 @@ impl Html {
                 "resolving imports for {} stylesheet(s)",
                 stylesheets.len()
             ));
-            resolve_stylesheet_imports_async(stylesheets).await?
+            resolve_stylesheet_imports(stylesheets).await?
         };
         // Media features describe the renderer-provided output viewport. An
         // author `@page` rule may subsequently choose the page box used for
@@ -316,7 +319,10 @@ impl Html {
             parsed_stylesheets.push(css::html_document_important_user_agent_stylesheet());
         }
         if options.presentational_hints {
-            parsed_stylesheets.push(css::html5_presentational_hints_stylesheet());
+            parsed_stylesheets.push(css::html5_presentational_hints_stylesheet_with_urls(
+                self.base_url.as_ref(),
+                self.root_url.as_ref(),
+            ));
         }
         {
             let _timer = DebugTimer::start(format!(
@@ -453,6 +459,7 @@ impl Html {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn write_pdf<P: AsRef<Path>>(
         &self,
         target: P,
@@ -502,7 +509,7 @@ impl Html {
         styles
     }
 
-    async fn author_stylesheets_async(
+    async fn author_stylesheets(
         &self,
         root: &dom::Node,
         resource_fetcher: &resource::ResourceFetcher,
@@ -528,7 +535,7 @@ impl Html {
                         continue;
                     };
                     log::debug!("loading linked stylesheet {path}");
-                    match Css::from_url_async_with_fetcher(path, resource_fetcher).await {
+                    match Css::from_url_with_fetcher(path, resource_fetcher).await {
                         Ok(stylesheet) => {
                             styles.push(stylesheet.with_root_url(self.root_url.clone()))
                         }
@@ -589,24 +596,45 @@ impl Html {
             let Some((width, height)) = viewports.get(&element_id).copied() else {
                 continue;
             };
-            // Resource fetching deliberately removes a URL fragment because it
-            // does not identify a distinct network resource. Keep it here for
-            // the embedded browsing context's initial fragment navigation.
-            let Some(resolved_url) =
-                resource::resolve_url(&source, self.base_url(), self.root_url())
-            else {
-                continue;
-            };
-            let target_fragment = resolved_url.fragment().map(str::to_owned);
-            let Some(url) = resource::fetch_url(&resolved_url) else {
-                continue;
-            };
             let mut iframe_options = options.clone();
             iframe_options.page_size =
                 layout::PageSize::from_points(width.max(1.0), height.max(10_000.0));
-            iframe_options.set_margin_points(0.0);
-            iframe_options.target_fragment = target_fragment;
-            match Html::from_url_with_resource_policy(url, self.resource_policy).await {
+            iframe_options.set_margin(layout_pt(0.0));
+            let iframe_result = match source {
+                // `srcdoc` wins over `src` and its URL is `about:srcdoc`; its
+                // fallback base URL is inherited from the embedding document.
+                // <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>
+                IframeSource::Srcdoc(source) => Ok(Html {
+                    source,
+                    input_syntax: InputSyntax::Html,
+                    base_url: self.base_url.clone(),
+                    root_url: self.root_url.clone(),
+                    stylesheets: Vec::new(),
+                    resource_policy: self.resource_policy,
+                    iframe_depth: self.iframe_depth + 1,
+                    iframe_viewport: Some(layout::PageSize::from_points(
+                        width.max(1.0),
+                        height.max(1.0),
+                    )),
+                }),
+                IframeSource::Url(source) => {
+                    // Resource fetching deliberately removes a URL fragment
+                    // because it does not identify a distinct network
+                    // resource. Keep it for the embedded browsing context's
+                    // initial fragment navigation.
+                    let Some(resolved_url) =
+                        resource::resolve_url(&source, self.base_url(), self.root_url())
+                    else {
+                        continue;
+                    };
+                    iframe_options.target_fragment = resolved_url.fragment().map(str::to_owned);
+                    let Some(url) = resource::fetch_url(&resolved_url) else {
+                        continue;
+                    };
+                    Html::from_url_with_resource_policy(url, self.resource_policy).await
+                }
+            };
+            match iframe_result {
                 Ok(mut iframe) => {
                     iframe.iframe_depth = self.iframe_depth + 1;
                     iframe.iframe_viewport = Some(layout::PageSize::from_points(
@@ -614,7 +642,8 @@ impl Html {
                         height.max(1.0),
                     ));
                     match Box::pin(iframe.render(&iframe_options)).await {
-                        Ok(document) => {
+                        Ok(mut document) => {
+                            document.materialize_images_for_embedding();
                             documents.insert(element_id, document);
                         }
                         Err(error) => log::debug!("failed to render iframe subdocument: {error}"),
@@ -636,13 +665,13 @@ fn resource_paths(
 ) -> Vec<Url> {
     let mut paths = Vec::new();
     collect_html_resource_paths(root, base_url, root_url, &mut paths);
-    for stylesheet in source_stylesheets {
-        paths.extend(resource::css_resource_urls(
+    paths.extend(source_stylesheets.iter().flat_map(|stylesheet| {
+        resource::css_resource_urls(
             stylesheet.source(),
             stylesheet.base_url(),
             stylesheet.root_url(),
-        ));
-    }
+        )
+    }));
     for stylesheet in parsed_stylesheets {
         for font_face in &stylesheet.font_faces {
             for source in &font_face.sources {
@@ -676,6 +705,17 @@ fn collect_html_resource_paths(
     // have the same resource availability as stylesheet backgrounds.
     if let Some(style) = element.attrs.get("style") {
         paths.extend(resource::css_resource_urls(style, base_url, root_url));
+    }
+    // `background` is a legacy presentational hint on table structure boxes.
+    // It becomes `background-image` during cascade, but assets are collected
+    // before cascade/layout so it must participate in this HTML preload pass.
+    if matches!(
+        element.tag.as_str(),
+        "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
+    ) && let Some(background) = element.attrs.get("background")
+        && let Some(path) = resource::resolve_fetchable_url(background, base_url, root_url)
+    {
+        paths.push(path);
     }
     if matches!(element.tag.as_str(), "img" | "input" | "video")
         && let Some(src) = element
@@ -713,21 +753,30 @@ fn collect_html_resource_paths(
     }
 }
 
-fn collect_iframe_sources(node: &dom::Node, sources: &mut Vec<(dom::ElementId, String)>) {
+enum IframeSource {
+    Srcdoc(String),
+    Url(String),
+}
+
+fn collect_iframe_sources(node: &dom::Node, sources: &mut Vec<(dom::ElementId, IframeSource)>) {
     let dom::NodeKind::Element(element) = &node.kind else {
         return;
     };
-    if element.tag.eq_ignore_ascii_case("iframe")
-        && let Some(source) = element.attrs.get("src")
-    {
-        sources.push((element.id, source.clone()));
+    if element.tag.eq_ignore_ascii_case("iframe") {
+        // `srcdoc` takes precedence even if its value is the empty string.
+        // <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>
+        if let Some(source) = element.attrs.get("srcdoc") {
+            sources.push((element.id, IframeSource::Srcdoc(source.clone())));
+        } else if let Some(source) = element.attrs.get("src") {
+            sources.push((element.id, IframeSource::Url(source.clone())));
+        }
     }
     for child in &element.children {
         collect_iframe_sources(child, sources);
     }
 }
 
-async fn resolve_stylesheet_imports_async(stylesheets: Vec<Css>) -> Result<Vec<Css>> {
+async fn resolve_stylesheet_imports(stylesheets: Vec<Css>) -> Result<Vec<Css>> {
     let mut resolved = Vec::new();
     for stylesheet in stylesheets {
         resolved.extend(stylesheet.with_imports().await?);
@@ -827,7 +876,7 @@ mod tests {
     #[tokio::test]
     async fn rendered_gradient_is_kept_as_a_vector_paint_source() {
         let html = Html::from_string(
-            "<div style=\"width: 24pt; height: 24pt; background: linear-gradient(red, blue) no-repeat\"></div>",
+            "<div style=\"width: 24pt; height: 24pt; background: linear-gradient(in srgb, red, blue) no-repeat\"></div>",
         );
         let document = html.render(&RenderOptions::default()).await.unwrap();
 

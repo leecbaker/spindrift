@@ -32,10 +32,16 @@ Quire currently passes **138 of 145 (95.2%)** runnable
   items use inside marker participation.
 - Outside-marker baseline alignment includes half-leading, and vertical inside
   markers contribute their full marker-plus-content inline-axis extent.
+- URL-backed `image-set()` markers preserve the selected candidate's intrinsic
+  resolution, so their inside and outside marker boxes use the correct CSS
+  intrinsic dimensions.
 - Pseudo selectors after combinators preserve their implicit universal selector
   (for example, `.list > ::before` routes as `.list > *::before`).
 - Generated `content` on an inline flex pseudo is materialized as an anonymous
   flex item, including visible overflow from an authored zero-width container.
+- Overridable predefined counter styles resolve through the cascaded UA and
+  author `@counter-style` rules, so their descriptors (including range and
+  fallback) apply consistently to markers and generated counters.
 
 ## Remaining WPT clusters
 

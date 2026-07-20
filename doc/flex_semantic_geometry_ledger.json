@@ -1,0 +1,2612 @@
+{
+  "api-f32|src/layout/flex/estimate/split_2.rs|fn constrain_with_aspect_ratio(|aspect_ratio: f32,|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "api-f32|src/layout/flex/estimate/split_2.rs|fn height_at_ratio(height: ContentBoxLength, ratio: f32) -> Self {|fn height_at_ratio(height: ContentBoxLength, ratio: f32) -> Self {|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "api-f32|src/layout/flex/estimate/split_2.rs|fn width_at_ratio(width: ContentBoxLength, ratio: f32) -> Self {|fn width_at_ratio(width: ContentBoxLength, ratio: f32) -> Self {|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "api-f32|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) struct FlexIntrinsicItem {|pub(in crate::layout::flex) preferred_aspect_ratio: Option<f32>,|0": {
+    "outcome": "scalar-factor",
+    "reason": "Intrinsic preferred aspect ratio is dimensionless.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|baseline_shift: f32,|0": {
+    "outcome": "adapter",
+    "reason": "Inline-layout baseline shift is forwarded at its established legacy boundary.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(in crate::layout::flex) const fn new(points: f32) -> Self {|pub(in crate::layout::flex) const fn new(points: f32) -> Self {|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(in crate::layout::flex) const fn points(self) -> f32 {|pub(in crate::layout::flex) const fn points(self) -> f32 {|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn new(points: f32) -> Self {|pub(super) const fn new(points: f32) -> Self {|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn new(points: f32) -> Self {|pub(super) const fn new(points: f32) -> Self {|1": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn new(points: f32) -> Self {|pub(super) const fn new(points: f32) -> Self {|2": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn new(points: f32) -> Self {|pub(super) const fn new(points: f32) -> Self {|3": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn points(self) -> f32 {|pub(super) const fn points(self) -> f32 {|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn points(self) -> f32 {|pub(super) const fn points(self) -> f32 {|1": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn points(self) -> f32 {|pub(super) const fn points(self) -> f32 {|2": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn points(self) -> f32 {|pub(super) const fn points(self) -> f32 {|3": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn points(self) -> f32 {|pub(super) const fn points(self) -> f32 {|4": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn points(self) -> f32 {|pub(super) const fn points(self) -> f32 {|5": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn points(self) -> f32 {|pub(super) const fn points(self) -> f32 {|6": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn value(self) -> f32 {|pub(super) const fn value(self) -> f32 {|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) const fn value(self) -> f32 {|pub(super) const fn value(self) -> f32 {|1": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn abs(self) -> f32 {|pub(super) fn abs(self) -> f32 {|0": {
+    "outcome": "scalar-factor",
+    "reason": "A dimensionless Flex algorithm factor, ratio, or tolerance magnitude.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn flex_available_percentage_basis_from_legacy_points(|value: Option<f32>,|0": {
+    "outcome": "adapter",
+    "reason": "Named Flex bridge to the established scalar legacy metric API.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn flex_available_percentage_basis_from_points(|value: Option<f32>,|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn flex_cross_size_from_main_aspect_ratio(|ratio: f32,|0": {
+    "outcome": "scalar-factor",
+    "reason": "A dimensionless Flex algorithm factor, ratio, or tolerance magnitude.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn from_algorithm_value(value: f32) -> Self {|pub(super) fn from_algorithm_value(value: f32) -> Self {|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn from_physical_intrinsic_metrics(|preferred_aspect_ratio: Option<f32>,|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn new(points: f32) -> Self {|pub(super) fn new(points: f32) -> Self {|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn new(points: f32) -> Self {|pub(super) fn new(points: f32) -> Self {|1": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn new(points: f32) -> Self {|pub(super) fn new(points: f32) -> Self {|2": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn new(value: f32) -> Self {|pub(super) fn new(value: f32) -> Self {|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn new(value: f32) -> Self {|pub(super) fn new(value: f32) -> Self {|1": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/model.rs|pub(super) fn scale(self, factor: f32) -> Self {|pub(super) fn scale(self, factor: f32) -> Self {|0": {
+    "outcome": "scalar-factor",
+    "reason": "A dimensionless Flex algorithm factor, ratio, or tolerance magnitude.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/taffy.rs|fn aspect_ratio_transferred_flex_basis(|preferred_aspect_ratio: Option<f32>,|0": {
+    "outcome": "scalar-factor",
+    "reason": "CSS preferred aspect ratio is a dimensionless scalar factor.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/taffy.rs|fn flex_aspect_ratio_transferred_cross_content_size(|ratio: f32,|0": {
+    "outcome": "scalar-factor",
+    "reason": "CSS preferred aspect ratio is a dimensionless scalar factor.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/taffy.rs|pub(in crate::layout::flex) fn flex_aspect_ratio_transferred_content_main_size(|ratio: f32,|0": {
+    "outcome": "scalar-factor",
+    "reason": "CSS preferred aspect ratio is a dimensionless scalar factor.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/taffy.rs|pub(super) fn aspect_ratio_transferred_content_main_size(|preferred_aspect_ratio: Option<f32>,|0": {
+    "outcome": "scalar-factor",
+    "reason": "CSS preferred aspect ratio is a dimensionless scalar factor.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/taffy.rs|pub(super) fn aspect_ratio_transferred_content_main_size_with_cross_constraints(|preferred_aspect_ratio: Option<f32>,|0": {
+    "outcome": "scalar-factor",
+    "reason": "CSS preferred aspect ratio is a dimensionless scalar factor.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/taffy.rs|pub(super) fn automatic_minimum_transferred_size_suggestion(|preferred_aspect_ratio: Option<f32>,|0": {
+    "outcome": "scalar-factor",
+    "reason": "CSS preferred aspect ratio is a dimensionless scalar factor.",
+    "reviewed": true
+  },
+  "api-f32|src/layout/flex/taffy.rs|pub(super) struct FlexBasisContext {|pub(super) preferred_aspect_ratio: Option<f32>,|0": {
+    "outcome": "scalar-factor",
+    "reason": "CSS preferred aspect ratio is a dimensionless scalar factor.",
+    "reviewed": true
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|fn balanced_taffy_line_layouts(|width: taffy_layout::AvailableSpace::Definite(context.available.width.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|fn flex_item_final_percentage_height_basis(|border_box_pt(stretched_height.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn assign_flex_item_fragmentation_heights(|let content_overflow = estimate.content_height.points().max(0.0); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn automatic_minimum_main_size(|PercentageBasis::definite(layout_pt(percentage_basis.points().unwrap_or(0.0))), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn automatic_minimum_main_size(|max_content.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn automatic_minimum_main_size(|min_content.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn automatic_minimum_main_size(|minimum.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn automatic_minimum_main_size(|minimum.points(), [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn automatic_minimum_main_size(|stretch.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.map(|baseline| FlexVerticalBaselineOffset::new(baseline.points())), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.map(|item| item.y().points() + item.height().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.map(|item| item.y().points() + item.height().points()) [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.map(|line| line.largest_collapsed_strut().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.max(estimated_size.min_width.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.max(estimated_size.min_width.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.points() [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.points() [points extraction 1 on this line]|2": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.points(), [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|.unwrap_or_else(|| estimated_size.content_height.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|FlexMainSize::new(available.width.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|PercentageBasis::definite(layout_pt(available.width.points().max(0.0))), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|width: taffy_layout::AvailableSpace::Definite(available.width.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn compute_flex_layout_internal(|width: taffy_layout::Dimension::length(available.width.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_1.rs|pub(in crate::layout::flex) fn flex_item_estimate_available_space(|content_box_pt(height.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_2.rs|fn balanced_flex_line_partitions(|let candidate = costs[line - 1][start] + error.points().powi(2); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_2.rs|pub(in crate::layout::flex) fn estimated_outer_cross_size(|estimate.height.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_2.rs|pub(in crate::layout::flex) fn estimated_outer_cross_size(|estimate.width.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|&& max_cross_size + 0.01 < border_cross_size.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|.points(), [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|.points(), [points extraction 1 on this line]|2": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|.points(), [points extraction 1 on this line]|3": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|border_cross_size.points() + child.style.margin.left + child.style.margin.right [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|border_cross_size.points() + child.style.margin.top + child.style.margin.bottom [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|if (items[index].cross_size(axes) - FlexCrossSize::new(border_cross_size.points())) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|if (used_line_cross_size - line_cross_size.points()).abs() > 0.01 { [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|items[index].set_cross_size(axes, FlexCrossSize::new(border_cross_size.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|remeasured.height.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_line_cross_size_dependent_item_remeasurements(|remeasured.width.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_main_size_aspect_ratio_cross_size_corrections(|let main_size = item.main_size(axes).points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_main_size_aspect_ratio_cross_size_corrections(|let percentage_basis = available.width.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn remeasured_flex_item_cross_border_size(|estimate.height.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn remeasured_flex_item_cross_border_size(|estimate.width.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn stretched_flex_item_line_cross_border_size(|(line_cross_size.points() - style.margin.left - style.margin.right).max(0.0); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn stretched_flex_item_line_cross_border_size(|(line_cross_size.points() - style.margin.top - style.margin.bottom).max(0.0); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn stretched_flex_item_line_cross_border_size(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn stretched_flex_item_line_cross_border_size(|.points() [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|fn estimate_flex_column_item_height(|(available_inline_size.points() - item.style.padding.left - item.style.padding.right) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|fn estimate_flex_column_item_height(|.max(self.font_system.used_line_height(&item.style).points()); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|fn flex_child_outer_min_content_block_size(|+ constrained_content_size.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|fn flex_child_outer_min_content_block_size(|let inline_width = (containing_inline_size.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_child_inline_measurement(|available_inline_size.content_box_length().points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_child_inline_measurement(|available_inline_size.content_box_length().points(), [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_child_intrinsic_widths(|containing_inline_size.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_child_multicol_inline_height(|.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_child_multicol_inline_height(|let content_width_points = content_width.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_definition_list_column_height(|.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_definition_list_column_height(|let containing_width = containing_inline_size.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_element_flex_intrinsic_widths(|containing_inline_size.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|&& child_intrinsic.max_content.points() > inline_content_width + 0.01; [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|(width.points() - horizontal_non_content).max(0.0) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.last_line_baseline_offset(fallback_line_baseline_offset.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.last_line_baseline_offset(fallback_line_baseline_offset.points()); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.map(|height| (height.points() - vertical_non_content.points()).max(0.0)); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.map(|height| (height.points() - vertical_non_content.points()).max(0.0)); [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.map(|width| width.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.map(|width| width.points()) [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.map(|width| width.points()) [points extraction 1 on this line]|2": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.map(|width| width.points()) [points extraction 1 on this line]|3": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.map(|width| width.points()) [points extraction 1 on this line]|4": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.max(child_intrinsic.max_content.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.max(child_intrinsic.min_content.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|10": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|11": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|12": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|2": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|3": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|4": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|5": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|6": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|7": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|8": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points() [points extraction 1 on this line]|9": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points(); [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points(); [points extraction 1 on this line]|2": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points(); [points extraction 1 on this line]|3": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points(); [points extraction 1 on this line]|4": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points(); [points extraction 1 on this line]|5": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points(); [points extraction 1 on this line]|6": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points(); [points extraction 1 on this line]|7": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.points(); [points extraction 1 on this line]|8": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.unwrap_or(physical_intrinsic.intrinsic_content_height.points()); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.unwrap_or(physical_intrinsic.preferred_width.points()); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.unwrap_or_else(|| intrinsic_size.height.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|.unwrap_or_else(|| intrinsic_size.width.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|PhysicalContentHeight::new(content_box_pt(block_height.points().max(0.0))); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|PhysicalContentHeight::new(content_box_pt(multicol_height.points().max(0.0))); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|baseline_edge + first_line_baseline_offset.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|fallback_logical_block_size.max(child_preferred_block_height.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|let containing_inline_size_points = containing_inline_size.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|let containing_width = available.width.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|let first_text_baseline = baseline_edge + first_line_baseline_offset.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|let used_line_height = self.font_system.used_line_height(style).points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|let used_line_height = self.font_system.used_line_height(style).points(); [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|vertical_non_content.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|} else if element.children.is_empty() && child_intrinsic.max_content.points() == 0.0 { [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn measure_flex_item_auto_block_height_for_flex_basis(|content_width.points().max(0.0), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn merge_box_children_flex_intrinsic_widths(|containing_inline_size.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn merge_box_children_flex_intrinsic_widths(|containing_inline_size.points(), [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn merge_box_children_flex_intrinsic_widths(|containing_inline_size.points(), [points extraction 1 on this line]|2": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn merge_dom_children_flex_intrinsic_widths(|containing_inline_size.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn merge_dom_children_flex_intrinsic_widths(|containing_inline_size.points(), [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn merge_dom_children_flex_intrinsic_widths(|containing_inline_size.points(), [points extraction 1 on this line]|2": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|fn constrain_with_aspect_ratio(|let mut height = self.height.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|fn constrain_with_aspect_ratio(|let mut width = self.width.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|fn constrained_flex_intrinsic_cross_content_sizes(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|fn height_at_ratio(height: ContentBoxLength, ratio: f32) -> Self {|Self::new(content_box_pt(height.points() * ratio), height) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|fn width_at_ratio(width: ContentBoxLength, ratio: f32) -> Self {|Self::new(width, content_box_pt(width.points() / ratio)) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn apply_single_line_flexed_main_cross_contributions(|if free_space.points() <= 0.0 { [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn definite_flex_container_axis_size(|let percentage_basis = percentage_basis.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn definite_flex_item_cross_content_size(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn definite_flex_item_main_axis_content_size(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn definite_flex_item_main_content_size(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn estimate_replaced_flex_item(|.map(|height| content_box_pt((height.points() - vertical_non_content).max(0.0))) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn estimate_replaced_flex_item(|.map(|height| height.points().max(0.0)), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn estimate_replaced_flex_item(|.map(|height| height.points().max(0.0)), [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn estimate_replaced_flex_item(|.map(|width| content_box_pt((width.points() - horizontal_non_content).max(0.0))) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn estimate_replaced_flex_item(|PercentageBasis::definite(content_box_pt(containing_width.points().max(1.0))), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn estimate_replaced_flex_item(|let available_width = (available.width.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn estimated_flex_item_cross_axis_baselines(|.map(|baseline| FlexCrossOffset::new(baseline.points())), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn estimated_flex_item_cross_axis_baselines(|.map(|baseline| FlexCrossOffset::new(baseline.points())), [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn estimated_flex_item_cross_axis_baselines(|.map(|baseline| FlexCrossOffset::new(baseline.points())), [points extraction 1 on this line]|2": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn estimated_flex_item_cross_axis_baselines(|.map(|baseline| FlexCrossOffset::new(baseline.points())), [points extraction 1 on this line]|3": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn explicit_child_intrinsic_width(|layout_pt(containing_inline_size.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn horizontal_text_baseline_offset(|border_box_width.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn horizontal_text_baseline_offset(|let content_baseline_offset = line_stack_offset.points() + line_baseline_offset.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn horizontal_text_baseline_offset(|let content_baseline_offset = line_stack_offset.points() + line_baseline_offset.points(); [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_flex_container_line_limit(|.or(percentage_basis.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_flex_container_line_limit(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_flex_container_line_limit(|Some(limit.length_max_zero().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_flex_container_line_limit(|percentage_basis.points().map(|basis| { [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_flex_lines(|if index > line_start && candidate.points() > line_limit.points() + 0.01 { [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_flex_lines(|if index > line_start && candidate.points() > line_limit.points() + 0.01 { [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_horizontal_non_content(|PercentageBasis::definite(layout_pt(containing_inline_size.points())), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_horizontal_outer_edges(|+ metrics.margin.left.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_horizontal_outer_edges(|+ metrics.margin.right.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_horizontal_outer_edges(|intrinsic_horizontal_non_content(style, containing_inline_size).points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_max_content_flex_fraction(|(item.max_main_contribution - item.flex_base_size).points() / item.grow.value() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_max_content_flex_fraction(|(item.max_main_contribution - item.flex_base_size).points() / scaled_shrink [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn intrinsic_max_content_flex_fraction(|let scaled_shrink = item.shrink.value() * item.flex_base_size.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn preceding_line_height_before_last(|layout_pt(sum.points() + height.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_2.rs|pub(in crate::layout::flex) fn preceding_line_height_before_last(|layout_pt(sum.points() + height.points()) [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimate_row_flex_container_line_metrics(|PercentageBasis::definite(content_box_pt(available_cross_size.points())), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimate_row_flex_container_line_metrics(|main_size.unwrap_or(available_main_size).points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimate_wrapped_row_flex_lines(|if index > line_start && candidate_main_size.points() > main_size.points() + 0.01 { [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimate_wrapped_row_flex_lines(|if index > line_start && candidate_main_size.points() > main_size.points() + 0.01 { [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimated_flex_main_content_size(|let percentage_basis_points = percentage_basis.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimated_intrinsic_length_percentage_or_auto(|.map(|length| content_box_pt(length.points().max(0.0))) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimated_intrinsic_length_percentage_or_auto(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimated_intrinsic_length_percentage_or_auto(|.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimated_intrinsic_length_percentage_or_auto(|Some(content_box_pt(value.length_max_zero().points())) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimated_intrinsic_length_percentage_or_auto(|let max_content_points = max_content.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimated_intrinsic_length_percentage_or_auto(|let min_content_points = min_content.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_3.rs|pub(in crate::layout::flex) fn estimated_intrinsic_length_percentage_or_auto(|let percentage_basis = percentage_basis.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|fn estimate_flex_anonymous_outer_height(|available_content_width.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|fn estimate_flex_anonymous_outer_height(|margin_box_pt((inline_stack_height + block_stack_height).points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|fn estimate_flex_dom_children_baselines(|available_content_width.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|fn estimate_flex_formatting_child_outer_height(|available_content_width.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|fn estimate_flex_formatting_child_outer_height(|available_content_width.points(), [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|fn estimate_flex_formatting_child_outer_height(|available_content_width.points(), [points extraction 1 on this line]|2": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|fn estimate_flex_formatting_child_outer_height(|available_content_width.points(), [points extraction 1 on this line]|3": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|fn estimate_flex_inline_children_baselines(|available_content_width.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|fn estimate_nested_flex_baselines(|.map(|height| height.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|fn estimate_nested_flex_baselines(|PercentageBasis::definite(layout_pt(available_content_width.points())), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|fn estimate_nested_flex_baselines(|available_content_width.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/estimate/split_4.rs|pub(in crate::layout::flex) fn flex_estimated_content_width(|(available_content_width.points() - horizontal_non_content).max(1.0), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|fn flex_container_shrink_to_fit_max_content_width(|(available_outer_width.points() - horizontal_non_content.points()).max(0.0); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|fn flex_container_shrink_to_fit_max_content_width(|(available_outer_width.points() - horizontal_non_content.points()).max(0.0); [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|fn flex_container_shrink_to_fit_max_content_width(|if available_content_width > max_content.points() + 0.01 { [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|pub(in crate::layout::flex) fn choose(input: FlexUnitPrebreakDecisionInput) -> Self {|.required_block_size_overflows(layout_pt(required_block_size.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|pub(in crate::layout::flex) fn choose(input: FlexUnitSliceDecisionInput) -> Self {|available_block_end: input.available_block_end.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|pub(in crate::layout::flex) fn choose(input: FlexUnitSliceDecisionInput) -> Self {|slice_start: input.slice_start.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|pub(in crate::layout::flex) fn choose(input: FlexUnitSliceDecisionInput) -> Self {|source_block_end: input.unit_block_end.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|pub(in crate::layout::flex) fn flex_container_content_width_from_intrinsic(|intrinsic.width.points().max(min_content.points()).max(0.0), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|pub(in crate::layout::flex) fn flex_container_content_width_from_intrinsic(|intrinsic.width.points().max(min_content.points()).max(0.0), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|pub(in crate::layout::flex) fn flex_source_block_end_after_available_capacity(|source_block_offset + FlexFragmentBlockSize::new(fragmentainer.available_block_size().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|pub(in crate::layout::flex) fn placed_flex_item_style(|let item_height = item_height.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_1.rs|pub(in crate::layout::flex) fn placed_flex_item_style(|let item_width = item_width.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|+ horizontal_non_content.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|+ horizontal_non_content.points() [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|.map(|_| available_outer_width.points().max(0.0)), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|.map(|baseline| border_widths.top + style.padding.top + baseline.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|.unwrap_or_else(|| content_box_pt(available_outer_width.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|available_outer_width.points().max(0.0), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|content_left: inner_x + item.x().points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|cursor_y: content_top - item.y().points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|inline_flex_synthesized_baseline_offset(style, border_box_height).points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|layout_pt(available_outer_width.points().max(0.0)), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|let border_box_height = content_height + vertical_non_content.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|let border_box_height_points = border_box_height.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|let content_width_points = content_width.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|let item_height = item.height().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|let item_width = item.width().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|let natural_width = measurement.contribution.max_content.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|self.current_page = Page::new(content_width_points + horizontal_non_content.points(), top); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn inline_flex_synthesized_baseline_offset(|FlexVerticalBaselineOffset::new(border_box_height.points() + style.margin.bottom) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn inline_flex_synthesized_baseline_offset(|| WritingMode::SidewaysLr => FlexVerticalBaselineOffset::new(border_box_height.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn layout_positioned_flex_child(|(hypothetical.height().points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn layout_positioned_flex_child(|+ hypothetical.width().points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn layout_positioned_flex_child(|+ hypothetical.x().points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn layout_positioned_flex_child(|context.content_top.points() - hypothetical.y().points() + child.style.margin.top; [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn layout_positioned_flex_child(|context.content_top.points() - hypothetical.y().points() + child.style.margin.top; [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn layout_positioned_flex_child(|let static_left = context.inner_inline_span.left_x() + hypothetical.x().points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn paint_split_flex_item_fragment(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn paint_split_flex_item_fragment(|let item_height = context.item_height.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn paint_split_flex_item_fragment(|let item_width = context.item_width.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn paint_split_flex_item_fragment(|let source_item_top = context.source_item_top.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|&& (total_content_height - first_fragment_capacity.points()).abs() <= 0.01 [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|&& unit.block_size().points() > self.page_area_height() + 0.01, [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|(slice_end - committed_slice_start).points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|+ vertical_non_content.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|- (item.y().points() - fragment_cursor.block_offset.points()); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|- (item.y().points() - fragment_cursor.block_offset.points()); [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|- (item_y - fragment_cursor.block_offset.points()); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|.map(|width| width.border_box_width().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|.points(); [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|.points(); [points extraction 1 on this line]|2": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|.unwrap_or(flex_content_height.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|.unwrap_or_else(|| (content_width_points + horizontal_non_content.points()).max(0.0)); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|PhysicalContentHeight::new(content_box_pt(fragmented_cross_size.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|candidate_geometry.outer_inline().width().points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|flex_content_height.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|fragment_cursor.content_top.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|fragment_cursor.content_top.points() [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|fragmented_cross_size.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|if slice_end.points() >= unit.block_end.points() - 0.01 { [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|if slice_end.points() >= unit.block_end.points() - 0.01 { [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|item_fragment.content_slice.block_end.points() < item_height - 0.01; [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|item_fragment.content_slice.block_start.points() > 0.01; [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|let content_width_points = content_width.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|let item_cursor_y = fragment_cursor.content_top.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|let item_height = original_item.height().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|let item_width = original_item.width().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|let item_x = original_item.x().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|let item_y = original_item.y().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|let mut total_content_height = total_content_height.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|let unit_is_oversized = unit.block_size().points() > self.page_area_height() + 0.01; [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|let visible_item_height = item.height().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|let visible_item_top = fragment_cursor.content_top.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|line.cross_start.points() + fragmented_cross_size.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|line.cross_start.points() + fragmented_cross_size.points(), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|total_content_height - fragment_cursor.block_offset.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|total_content_height = fragmented_cross_size.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|unit.block_start.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout::flex) fn used_flex_container_content_width(|.map(|_| available_outer_width.points().max(0.0)), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout::flex) fn used_flex_container_content_width(|available_outer_width.points().max(0.0), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout::flex) fn used_flex_container_content_width(|layout_pt(available_outer_width.points().max(0.0)), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|fn push_unique_flex_gap_gutter(|FlexGapDecorationGutterWidth::Fixed(width) => width.points().min(available).max(0.0), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|fn push_unique_flex_gap_gutter(||| matches!(used_gap, FlexGapDecorationGutterWidth::Fixed(width) if width.points() <= 0.01) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|fn push_unique_flex_gap_gutter_with_segment(|FlexGapDecorationGutterWidth::Fixed(width) => width.points().min(available).max(0.0), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|fn push_unique_flex_gap_gutter_with_segment(||| matches!(used_gap, FlexGapDecorationGutterWidth::Fixed(width) if width.points() <= 0.01) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_break_units(|&& (unit.block_end - block_bounds.end()).points().abs() <= 0.01 [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_break_units(|(unit.block_start - block_bounds.start()).points().abs() <= 0.01 [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_break_units(|block_end: FlexFragmentBlockOffset::new(line.cross_end.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_break_units(|block_start: FlexFragmentBlockOffset::new(line.cross_start.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_cross_axis_gap_gutters(|FlexGapDecorationGutterWidth::Fixed(layout_pt(used_gap.points())) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_cross_axis_gap_gutters(|let end = (item.cross_start(axes) + item.cross_size(axes)).points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_cross_axis_gap_gutters(|let start = item.cross_start(axes).points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_cross_axis_gap_gutters(|line.cross_start.points().max(line.cross_end.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_cross_axis_gap_gutters(|line.cross_start.points().max(line.cross_end.points()), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_cross_axis_gap_gutters(|line.cross_start.points().min(line.cross_end.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_cross_axis_gap_gutters(|line.cross_start.points().min(line.cross_end.points()), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_from_break_unit(|(slice_end - item_block_start).min(item.height().points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_from_break_unit(|.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_from_break_unit(|.toward_block_end(layout_pt((unit.block_end - context.block_offset).points())) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_from_break_unit(|context.continuation_fragmentainer_capacity.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_from_break_unit(|context.first_fragmentainer_capacity.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_from_break_unit(|fragment_height.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_from_break_unit(|item.fragmentation_height().points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_from_break_unit(|let item_block_end = item_block_bounds.end().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_from_break_unit(|let item_block_start = item_block_bounds.start().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_from_break_unit(|let slice_end = item_block_end.min(unit.block_end.points()); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_from_break_unit(|let slice_start = item_block_start.max(unit.block_start.points()); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_gap_gutters(|let block_end = fragment_block_bounds.end().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_fragment_gap_gutters(|let block_start = fragment_block_bounds.start().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_gap_decoration_gutters(|main_gap.points() <= 0.01 [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_gap_decoration_items(|GapDecorationPoint::new(item.x().points(), item.y().points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_gap_decoration_items(|GapDecorationPoint::new(item.x().points(), item.y().points()), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_gap_decoration_items(|GapDecorationSize::new(item.width().points(), item.height().points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_gap_decoration_items(|GapDecorationSize::new(item.width().points(), item.height().points()), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_gap_decoration_primitives_for_page(|GapDecorationPoint::new(item.x().points(), item.y().points() - block_start), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_gap_decoration_primitives_for_page(|GapDecorationPoint::new(item.x().points(), item.y().points() - block_start), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_gap_decoration_primitives_for_page(|GapDecorationSize::new(item.width().points(), item.height().points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_gap_decoration_primitives_for_page(|GapDecorationSize::new(item.width().points(), item.height().points()), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_gap_decoration_primitives_for_page(|let block_end = fragment_block_bounds.end().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_gap_decoration_primitives_for_page(|let block_start = fragment_block_bounds.start().points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_item_block_bounds(|FlexFragmentBlockOffset::new(item.y().points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_item_block_bounds(|FlexFragmentBlockSize::new(item.fragmentation_height().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_item_block_bounds(|FlexFragmentBlockSize::new(item.height().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_main_axis_gap_gutters(|&& previous_segment.start <= segment.end + cross_gap.points() + 0.01 [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_main_axis_gap_gutters(|&& segment.start <= previous_segment.end + cross_gap.points() + 0.01 [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_main_axis_gap_gutters(|.filter(|item| item.main_size(axes).points() > 0.01) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_main_axis_gap_gutters(|.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_main_axis_gap_gutters(|FlexGapDecorationGutterWidth::Fixed(layout_pt(used_gap.points())) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_main_axis_gap_gutters(|let end = (pair[1].main_start(axes) + FlexMainLength::new(remainder_offset)).points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_main_axis_gap_gutters(|line_cross_range.map(|(start, end)| (start.points(), end.points())) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_main_axis_gap_gutters(|line_cross_range.map(|(start, end)| (start.points(), end.points())) [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_page_fragment_block_range(|.filter(|next_start| next_start.points() > range.end().points() + 0.01) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn flex_page_fragment_block_range(|.filter(|next_start| next_start.points() > range.end().points() + 0.01) [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn should_move_flex_container_to_next_page(|&& total_height.points() <= page_area_height.points() + 0.01 [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn should_move_flex_container_to_next_page(|&& total_height.points() <= page_area_height.points() + 0.01 [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn should_move_flex_container_to_next_page(|let starts_at_page_top = (block_top.points() - page_top.points()).abs() < 0.01; [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn should_move_flex_container_to_next_page(|let starts_at_page_top = (block_top.points() - page_top.points()).abs() < 0.01; [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn single_line_row_fragmented_cross_size(|+ continuation_count * continuation_fragment_capacity.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn single_line_row_fragmented_cross_size(|/ continuation_fragment_capacity.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn single_line_row_fragmented_cross_size(|first_fragment_capacity.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn single_line_row_fragmented_cross_size(|if source_cross_size.points() <= first_fragment_capacity.points() + 0.01 [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn single_line_row_fragmented_cross_size(|if source_cross_size.points() <= first_fragment_capacity.points() + 0.01 [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn single_line_row_fragmented_cross_size(|let continuation_count = ((source_cross_size.points() - first_fragment_capacity.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn single_line_row_fragmented_cross_size(|let continuation_count = ((source_cross_size.points() - first_fragment_capacity.points()) [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/layout/split_3.rs|pub(in crate::layout::flex) fn single_line_row_fragmented_cross_size(||| continuation_fragment_capacity.points() <= 0.01 [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(in crate::layout::flex) fn balanced_flex_item_measure_available_space(|FlexCrossSize::new(available.width.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(in crate::layout::flex) fn balanced_flex_item_measure_available_space(|FlexCrossSize::new(height.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(in crate::layout::flex) fn balanced_flex_item_measure_available_space(|item_available.width = PhysicalContentWidth::new(content_box_pt(item_cross_size.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(in crate::layout::flex) fn balanced_flex_item_measure_available_space(|item_cross_size.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(in crate::layout::flex) fn flex_cross_length_from_horizontal_baseline(|FlexCrossLength::new(baseline.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(in crate::layout::flex) fn flex_cross_length_from_vertical_baseline(|FlexCrossLength::new(baseline.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(in crate::layout::flex) fn flex_horizontal_baseline_from_cross_offset(|FlexHorizontalBaselineOffset::new(offset.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(in crate::layout::flex) fn flex_horizontal_baseline_from_physical_width(|FlexHorizontalBaselineOffset::new(width.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(in crate::layout::flex) fn flex_vertical_baseline_from_cross_offset(|FlexVerticalBaselineOffset::new(offset.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(in crate::layout::flex) fn flex_vertical_baseline_from_physical_height(|FlexVerticalBaselineOffset::new(height.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(in crate::layout::flex) fn offset_by(self, distance: LayoutLength) -> Self {|Self::new(self.0 + distance.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn cross_size(&self, axes: FlexAxes) -> FlexCrossSize {|FlexCrossSize::new(self.height().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn cross_size(&self, axes: FlexAxes) -> FlexCrossSize {|FlexCrossSize::new(self.width().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn cross_start(&self, axes: FlexAxes) -> FlexCrossOffset {|FlexCrossOffset::new(self.x().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn cross_start(&self, axes: FlexAxes) -> FlexCrossOffset {|FlexCrossOffset::new(self.y().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn fixed(width: PhysicalContentWidth, height: PhysicalContentHeight) -> Self {|IntrinsicItemMetrics::fixed(width.points(), height.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn fixed(width: PhysicalContentWidth, height: PhysicalContentHeight) -> Self {|IntrinsicItemMetrics::fixed(width.points(), height.points()), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn flex_cross_content_box_length(size: FlexCrossSize) -> ContentBoxLength {|content_box_pt(size.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn flex_cross_gap_size(length: LayoutLength) -> FlexCrossSize {|FlexCrossSize::new(length.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn flex_cross_size_from_content_box(length: ContentBoxLength) -> FlexCrossSize {|FlexCrossSize::new(length.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn flex_cross_size_from_layout_extent(length: LayoutLength) -> FlexCrossSize {|FlexCrossSize::new(length.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn flex_cross_size_from_main_aspect_ratio(|FlexCrossSize::new(main.points() * ratio) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn flex_cross_size_from_main_aspect_ratio(|FlexCrossSize::new(main.points() / ratio) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn flex_main_content_box_length(size: FlexMainSize) -> ContentBoxLength {|content_box_pt(size.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn flex_main_gap_size(length: LayoutLength) -> FlexMainSize {|FlexMainSize::new(length.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn flex_main_size_from_content_box(length: ContentBoxLength) -> FlexMainSize {|FlexMainSize::new(length.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn flex_main_size_from_layout_extent(length: LayoutLength) -> FlexMainSize {|FlexMainSize::new(length.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn fragmentation_height(&self) -> PhysicalContentHeight {|.max(self.height().points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn fragmentation_height(&self) -> PhysicalContentHeight {|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn from_free_space(|(total_grow.0 > 0.0).then(|| Self(free_space.points() / total_grow.0)) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn main_size(&self, axes: FlexAxes) -> FlexMainSize {|FlexMainSize::new(self.height().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn main_size(&self, axes: FlexAxes) -> FlexMainSize {|FlexMainSize::new(self.width().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn main_start(&self, axes: FlexAxes) -> FlexMainOffset {|FlexMainOffset::new(self.x().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn main_start(&self, axes: FlexAxes) -> FlexMainOffset {|FlexMainOffset::new(self.y().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_cross_bounds(|FlexCrossOffset::new(self.x().points() - style.margin.left), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_cross_bounds(|FlexCrossOffset::new(self.y().points() - style.margin.top), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_cross_bounds(|self.x().points() + self.width().points() + style.margin.right, [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_cross_bounds(|self.x().points() + self.width().points() + style.margin.right, [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_cross_bounds(|self.y().points() + self.height().points() + style.margin.bottom, [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_cross_bounds(|self.y().points() + self.height().points() + style.margin.bottom, [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_main_bounds(|FlexMainOffset::new(self.x().points() + self.width().points() + style.margin.right), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_main_bounds(|FlexMainOffset::new(self.x().points() + self.width().points() + style.margin.right), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_main_bounds(|FlexMainOffset::new(self.x().points() - style.margin.left), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_main_bounds(|FlexMainOffset::new(self.y().points() - style.margin.top), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_main_bounds(|self.y().points() + self.height().points() + style.margin.bottom, [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn outer_main_bounds(|self.y().points() + self.height().points() + style.margin.bottom, [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn prepare_materialized_fragment(&self, fragment: &mut FlexFragmentLayout) {|&& previous.content_slice.block_end.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn prepare_materialized_fragment(&self, fragment: &mut FlexFragmentLayout) {|<= item.content_slice.block_start.points() + 0.01 [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn resolve(self, base: FlexMainSize, fraction: FlexGrowFraction) -> FlexMainSize {|FlexMainSize::new(base.points() + self.0 * fraction.0) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn resolve(self, base: FlexMainSize, fraction: FlexShrinkFraction) -> FlexMainSize {|FlexMainSize::new(base.points() + self.0 * base.points() * fraction.0) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn resolve(self, base: FlexMainSize, fraction: FlexShrinkFraction) -> FlexMainSize {|FlexMainSize::new(base.points() + self.0 * base.points() * fraction.0) [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_cross_size(&mut self, axes: FlexAxes, size: FlexCrossSize) {|self.set_height(FlexPhysicalVerticalSize::new(size.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_cross_size(&mut self, axes: FlexAxes, size: FlexCrossSize) {|self.set_width(FlexPhysicalHorizontalSize::new(size.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_cross_start(&mut self, axes: FlexAxes, cross_start: FlexCrossOffset) {|self.set_x(FlexPhysicalHorizontalOffset::new(cross_start.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_cross_start(&mut self, axes: FlexAxes, cross_start: FlexCrossOffset) {|self.set_y(FlexPhysicalVerticalOffset::new(cross_start.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_fragmentation_height(&mut self, height: PhysicalContentHeight) {|height.points().max(self.height().points()).max(0.0), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_fragmentation_height(&mut self, height: PhysicalContentHeight) {|height.points().max(self.height().points()).max(0.0), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_height(&mut self, height: FlexPhysicalVerticalSize) {|self.fragmentation_height.points().max(height.points()), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_height(&mut self, height: FlexPhysicalVerticalSize) {|self.fragmentation_height.points().max(height.points()), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_height(&mut self, height: FlexPhysicalVerticalSize) {|self.rect.size.height = height.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_main_size(&mut self, axes: FlexAxes, size: FlexMainSize) {|self.set_height(FlexPhysicalVerticalSize::new(size.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_main_size(&mut self, axes: FlexAxes, size: FlexMainSize) {|self.set_width(FlexPhysicalHorizontalSize::new(size.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_main_start(&mut self, axes: FlexAxes, main_start: FlexMainOffset) {|self.set_x(FlexPhysicalHorizontalOffset::new(main_start.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_main_start(&mut self, axes: FlexAxes, main_start: FlexMainOffset) {|self.set_y(FlexPhysicalVerticalOffset::new(main_start.points())); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_width(&mut self, width: FlexPhysicalHorizontalSize) {|self.rect.size.width = width.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_x(&mut self, x: FlexPhysicalHorizontalOffset) {|self.rect.origin.x = x.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn set_y(&mut self, y: FlexPhysicalVerticalOffset) {|self.rect.origin.y = y.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn with_definite_cross_size(|PhysicalContentHeight::new(content_box_pt(cross_size.points())), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/model.rs|pub(super) fn with_definite_cross_size(|PhysicalContentWidth::new(content_box_pt(cross_size.points())), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn fit_content_basis(|.min(min_content.points().max(0.0).max(limit.points().max(0.0))), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn fit_content_basis(|.min(min_content.points().max(0.0).max(limit.points().max(0.0))), [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn fit_content_basis(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn flex_aspect_ratio_basis_from_content_box(|let length = content_box_pt(length.points().max(0.0)); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn flex_aspect_ratio_transferred_cross_content_size(|content_box_pt((cross_border_box - cross_axis_extras(style, direction).points()).max(0.0)) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn flex_aspect_ratio_transferred_cross_content_size(|content_box_pt(main_content_size.points() * ratio) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn flex_aspect_ratio_transferred_cross_content_size(|content_box_pt(main_content_size.points() / ratio) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn flex_aspect_ratio_transferred_cross_content_size(|main_content_size.points() + main_axis_extras(style, direction).points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn flex_aspect_ratio_transferred_cross_content_size(|main_content_size.points() + main_axis_extras(style, direction).points(); [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn flex_auto_content_basis_from_content_box(|length.points().max(0.0) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn flex_auto_content_basis_from_content_box(|length.points().max(0.0).ceil() + style.font_size.ceil() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn taffy_dimension_from_length_percentage(|taffy_layout::Dimension::length(value.length_max_zero().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn taffy_flex_basis_from_main_size(|flex_auto_content_basis(style, max_content, direction).points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn taffy_margin_length_percentage_auto(|return taffy_layout::LengthPercentageAuto::length(resolved.points()); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn taffy_padding_length_percentage(|&& let Some(basis) = percentage_basis.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn taffy_padding_length_percentage(|used_length_percentage(value, PercentageBasis::definite(layout_pt(basis))).points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn taffy_stretch_fit_dimension(context: FlexStretchFitContext) -> taffy_layout::Dimension {|BoxSizing::ContentBox => content_size.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|fn taffy_stretch_fit_dimension(context: FlexStretchFitContext) -> taffy_layout::Dimension {|content_box_to_border_box_length(content_size, context.non_content_size).points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(in crate::layout::flex) fn flex_aspect_ratio_transferred_content_main_size(|content_box_pt((main_border_box - main_axis_extras(style, direction).points()).max(0.0)) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(in crate::layout::flex) fn flex_aspect_ratio_transferred_content_main_size(|content_box_pt(cross_content_size.points() * ratio) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(in crate::layout::flex) fn flex_aspect_ratio_transferred_content_main_size(|content_box_pt(cross_content_size.points() / ratio) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(in crate::layout::flex) fn flex_aspect_ratio_transferred_content_main_size(|cross_content_size.points() + cross_axis_extras(style, direction).points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(in crate::layout::flex) fn flex_aspect_ratio_transferred_content_main_size(|cross_content_size.points() + cross_axis_extras(style, direction).points(); [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn aspect_ratio_transferred_content_main_size(|.map(|size| content_box_pt((size.points() - cross_non_content.points()).max(0.0))) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn aspect_ratio_transferred_content_main_size(|.map(|size| content_box_pt((size.points() - cross_non_content.points()).max(0.0))) [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn aspect_ratio_transferred_content_main_size(|.map(|size| content_box_pt((size.points() - cross_non_content.points()).max(0.0))) [points extraction 2 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn aspect_ratio_transferred_content_main_size(|.map(|size| content_box_pt((size.points() - cross_non_content.points()).max(0.0))) [points extraction 2 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn automatic_minimum_transferred_size_suggestion(|(constrained_minimum_cross.points() > 0.0).then(|| { [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn flex_item_size_dimension(|.map(|size| taffy_layout::Dimension::length(size.points().max(0.0))) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn flex_item_size_dimension(|taffy_layout::Dimension::length(fallback.points().max(1.0)) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn flex_item_used_margin(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn flex_item_used_padding(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn flex_min_size_dimension(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn flex_min_size_dimension(|automatic_minimum = automatic_minimum.min(preferred_size.points().max(0.0)); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn flex_min_size_dimension(|content_size_suggestion.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn flex_min_size_dimension(|context.percentage_basis.points().unwrap_or(0.0), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn flex_min_size_dimension(|estimated_max_content.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn flex_min_size_dimension(|let mut automatic_minimum = content_size_suggestion.points().max(0.0); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn flex_min_size_dimension(|let transferred = transferred.points().max(0.0); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn measure_flex_item(|height: metrics.height.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn measure_flex_item(|width: metrics.width.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|.map(|length| content_box_pt(length.points())) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|.points(), [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|.points(), [points extraction 1 on this line]|2": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|Some(content_box_pt(limit.length_max_zero().points())) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|context.main_size_basis.points().and_then(|basis| { [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|flex_auto_content_basis(style, estimate.content_height, FlexDirection::Column).points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|flex_auto_content_basis(style, estimate.content_width, FlexDirection::Row).points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|flex_content_basis_with_aspect_ratio(style, estimate, context).points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|let main_size_basis = context.main_size_basis.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|taffy_layout::Dimension::length(transferred.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_flex_basis(|taffy_layout::Dimension::length(transferred.points()) [points extraction 1 on this line]|1": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_gap(|.points() [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_gap(|.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_gap(|taffy_layout::LengthPercentage::length(value.length_max_zero().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_intrinsic_dimension_with_basis_and_stretch(|.map(|length| length.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_intrinsic_dimension_with_basis_and_stretch(|.map(|value| value.points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_intrinsic_dimension_with_basis_and_stretch(|.points(), [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_intrinsic_dimension_with_basis_and_stretch(|Some(value.length_max_zero().points()) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_intrinsic_dimension_with_basis_and_stretch(|let max_content = max_content.points().max(min_content); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_intrinsic_dimension_with_basis_and_stretch(|let min_content = min_content.points().max(0.0); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_intrinsic_dimension_with_basis_and_stretch(|let percentage_basis = percentage_basis.points().unwrap_or(0.0); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_intrinsic_dimension_with_basis_and_stretch(|percentage_basis.points().and_then(|basis| { [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_min_dimension(|.map(|length| taffy_layout::Dimension::length(length.points())) [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_optional_dimension_with_basis(|let percentage_basis = percentage_basis.points(); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "points-extraction|src/layout/flex/taffy.rs|pub(super) fn taffy_optional_dimension_with_basis(|return taffy_layout::Dimension::length(resolved.points()); [points extraction 1 on this line]|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "scalar-funnel|src/layout/flex/compute/split_4.rs|pub(in crate::layout::flex) fn apply_main_size_aspect_ratio_cross_size_corrections(|raw local `percentage_basis` discards typed value: let percentage_basis = available.width.points();; typed reconstruction: line 427: PercentageBasis::definite(layout_pt(percentage_basis)),; line 432: PercentageBasis::definite(layout_pt(percentage_basis)),; line 440: PercentageBasis::definite(layout_pt(percentage_basis)),; line 445: PercentageBasis::definite(layout_pt(percentage_basis)),|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "scalar-funnel|src/layout/flex/estimate/split_1.rs|pub(in crate::layout::flex) fn estimate_flex_item_size_with_percentage_basis(|raw local `containing_width` discards typed value: let containing_width = available.width.points();; typed reconstruction: line 517: PercentageBasis::definite(layout_pt(containing_width.max(0.0))),; line 529: PercentageBasis::definite(layout_pt(containing_width.max(0.0))),; line 560: PercentageBasis::definite(layout_pt(containing_width)),; line 586: PercentageBasis::definite(layout_pt(containing_width)),; line 636: width: PhysicalContentWidth::new(content_box_pt(containing_width)),; line 677: PercentageBasis::definite(layout_pt(containing_width)),; line 682: PercentageBasis::definite(layout_pt(containing_width)),; line 687: PercentageBasis::definite(layout_pt(containing_width)),; line 692: PercentageBasis::definite(layout_pt(containing_width)),; line 732: PercentageBasis::definite(layout_pt(containing_width)),; line 746: PercentageBasis::definite(layout_pt(containing_width)),; line 831: PercentageBasis::definite(layout_pt(containing_width)),; line 845: PercentageBasis::definite(layout_pt(containing_width)),; line 1042: PercentageBasis::definite(layout_pt(containing_width)),; line 1196: PercentageBasis::definite(layout_pt(containing_width)),; line 1236: PercentageBasis::definite(layout_pt(containing_width)),; line 1255: PercentageBasis::definite(layout_pt(containing_width)),|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "scalar-funnel|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|raw local `item_height` discards typed value: let item_height = item.height().points();; typed reconstruction: line 316: border_box_pt(item_height),; line 323: content_height: Some(PhysicalContentHeight::new(content_box_pt(item_height))),; line 326: border_box_pt(item_height),|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "scalar-funnel|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout) fn inline_flex_atom_for_element(|raw local `item_width` discards typed value: let item_width = item.width().points();; typed reconstruction: line 315: border_box_pt(item_width),; line 322: content_width: PhysicalContentWidth::new(content_box_pt(item_width)),|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "scalar-funnel|src/layout/flex/layout/split_2/inline_flex.rs|pub(in crate::layout::flex) fn paint_split_flex_item_fragment(|raw local `item_height` discards typed value: let item_height = context.item_height.points();; typed reconstruction: line 601: content_height: Some(PhysicalContentHeight::new(content_box_pt(item_height))),; line 604: border_box_pt(item_height),|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "scalar-funnel|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|raw local `item_height` discards typed value: let item_height = original_item.height().points();; typed reconstruction: line 961: border_box_pt(item_height),; line 974: border_box_pt(item_height),; line 991: item_height: border_box_pt(item_height),|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "scalar-funnel|src/layout/flex/layout/split_2/split_1.rs|pub(in crate::layout) fn layout_flex_with_descendant_percentage_height_basis(|raw local `item_width` discards typed value: let item_width = original_item.width().points();; typed reconstruction: line 960: border_box_pt(item_width),; line 967: content_width: PhysicalContentWidth::new(content_box_pt(item_width)),; line 990: item_width: border_box_pt(item_width),|0": {
+    "outcome": "requires-refactor",
+    "reason": "Unreviewed candidate; classify before accepting this scalar boundary.",
+    "reviewed": false
+  },
+  "tuple-field-f32|src/layout/flex/model.rs|pub(super) struct FlexAxisLength<Axis>(f32, std::marker::PhantomData<Axis>);|pub(super) struct FlexAxisLength<Axis>(f32, std::marker::PhantomData<Axis>);|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "tuple-field-f32|src/layout/flex/model.rs|pub(super) struct FlexAxisOffset<Axis>(f32, std::marker::PhantomData<Axis>);|pub(super) struct FlexAxisOffset<Axis>(f32, std::marker::PhantomData<Axis>);|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "tuple-field-f32|src/layout/flex/model.rs|pub(super) struct FlexAxisSize<Axis>(f32, std::marker::PhantomData<Axis>);|pub(super) struct FlexAxisSize<Axis>(f32, std::marker::PhantomData<Axis>);|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "tuple-field-f32|src/layout/flex/model.rs|pub(super) struct FlexFragmentBlockOffset(f32);|pub(super) struct FlexFragmentBlockOffset(f32);|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "tuple-field-f32|src/layout/flex/model.rs|pub(super) struct FlexFragmentBlockSize(f32);|pub(super) struct FlexFragmentBlockSize(f32);|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "tuple-field-f32|src/layout/flex/model.rs|pub(super) struct FlexGrowFactor(f32);|pub(super) struct FlexGrowFactor(f32);|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "tuple-field-f32|src/layout/flex/model.rs|pub(super) struct FlexGrowFraction(f32);|pub(super) struct FlexGrowFraction(f32);|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "tuple-field-f32|src/layout/flex/model.rs|pub(super) struct FlexPhysicalOffset<Axis>(f32, std::marker::PhantomData<Axis>);|pub(super) struct FlexPhysicalOffset<Axis>(f32, std::marker::PhantomData<Axis>);|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "tuple-field-f32|src/layout/flex/model.rs|pub(super) struct FlexPhysicalSize<Axis>(f32, std::marker::PhantomData<Axis>);|pub(super) struct FlexPhysicalSize<Axis>(f32, std::marker::PhantomData<Axis>);|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "tuple-field-f32|src/layout/flex/model.rs|pub(super) struct FlexShrinkFactor(f32);|pub(super) struct FlexShrinkFactor(f32);|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  },
+  "tuple-field-f32|src/layout/flex/model.rs|pub(super) struct FlexShrinkFraction(f32);|pub(super) struct FlexShrinkFraction(f32);|0": {
+    "outcome": "wrapper-storage",
+    "reason": "Private semantic-wrapper storage or a named projection between typed Flex coordinate systems.",
+    "reviewed": true
+  }
+}

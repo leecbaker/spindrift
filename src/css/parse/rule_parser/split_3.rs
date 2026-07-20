@@ -13,13 +13,14 @@ pub(in crate::css) fn parse_keyframes_rule(name: &str, body: &str) -> Option<Key
     }
     let mut steps = Vec::new();
     let mut rest = body;
-    while let Some(open) = rest.find('{') {
+    while let Some(open) = crate::css::component_values::find_next_top_level_open_brace(rest, 0) {
         let selectors = rest[..open].trim();
         let Some(close) = find_matching_brace(rest, open) else {
             break;
         };
         let declarations = parse_declarations(&rest[open + 1..close]);
-        for selector in selectors.split(',') {
+        for selector in crate::css::component_values::split_css_top_level_delimiter(selectors, ',')
+        {
             let offset = match selector.trim().to_ascii_lowercase().as_str() {
                 "from" => Some(0.0),
                 "to" => Some(1.0),
@@ -48,7 +49,6 @@ pub(in crate::css) fn split_pseudo_element_rule(
     selector_text: &str,
     selector_parser: &QuireSelectorParser,
     declarations: &Declarations,
-    specificity: u32,
     layer_name: Option<String>,
     scopes: Vec<ScopeRule>,
 ) -> Vec<ParsedCssRule> {
@@ -61,6 +61,8 @@ pub(in crate::css) fn split_pseudo_element_rule(
         (RoutedPseudoElement::Marker, "marker"),
         (RoutedPseudoElement::Before, "before"),
         (RoutedPseudoElement::After, "after"),
+        (RoutedPseudoElement::FootnoteCall, "footnote-call"),
+        (RoutedPseudoElement::FootnoteMarker, "footnote-marker"),
         (RoutedPseudoElement::FirstLine, "first-line"),
         (RoutedPseudoElement::FirstLetter, "first-letter"),
     ];
@@ -87,6 +89,12 @@ pub(in crate::css) fn split_pseudo_element_rule(
     if !normal_selectors.is_empty() {
         let selector_text = normal_selectors.join(", ");
         if let Some(selector) = parse_selector_list_text(&selector_text, selector_parser) {
+            let specificity = selector
+                .slice()
+                .iter()
+                .map(|branch| branch.specificity())
+                .max()
+                .unwrap_or(0);
             rules.push(ParsedCssRule::Style(StyleRule {
                 selector_text,
                 selector,
@@ -111,6 +119,12 @@ pub(in crate::css) fn split_pseudo_element_rule(
         let Some(selector) = parse_selector_list_text(&selector_text, selector_parser) else {
             continue;
         };
+        let specificity = selector
+            .slice()
+            .iter()
+            .map(|branch| branch.specificity())
+            .max()
+            .unwrap_or(0);
         let rule = StyleRule {
             selector_text,
             selector,
@@ -126,6 +140,8 @@ pub(in crate::css) fn split_pseudo_element_rule(
             RoutedPseudoElement::AfterMarker => ParsedCssRule::AfterMarker(rule),
             RoutedPseudoElement::Before => ParsedCssRule::Before(rule),
             RoutedPseudoElement::After => ParsedCssRule::After(rule),
+            RoutedPseudoElement::FootnoteCall => ParsedCssRule::FootnoteCall(rule),
+            RoutedPseudoElement::FootnoteMarker => ParsedCssRule::FootnoteMarker(rule),
             RoutedPseudoElement::FirstLine => ParsedCssRule::FirstLine(rule),
             RoutedPseudoElement::FirstLetter => ParsedCssRule::FirstLetter(rule),
         });

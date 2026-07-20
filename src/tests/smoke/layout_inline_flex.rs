@@ -49,7 +49,7 @@ fn bottom_lightgray_spacer_y(document: &quire::Document) -> f32 {
     document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(211, 211, 211)))
+        .filter(|rect| rect.fill == Some(CssColor::new(211, 211, 211)))
         .map(|rect| rect.y())
         .min_by(f32::total_cmp)
         .expect("bottom lightgray spacer should paint")
@@ -149,7 +149,7 @@ fn inline_trim_background_rect(document: &quire::Document) -> (f32, f32, f32, f3
     let rect = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(10, 20, 30)))
+        .find(|rect| rect.fill == Some(CssColor::new(10, 20, 30)))
         .expect("inline background should paint");
     (rect.x(), rect.y(), rect.width(), rect.height())
 }
@@ -158,7 +158,7 @@ fn inline_trim_background_rects(document: &quire::Document) -> Vec<(f32, f32, f3
     document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(10, 20, 30)))
+        .filter(|rect| rect.fill == Some(CssColor::new(10, 20, 30)))
         .map(|rect| (rect.x(), rect.y(), rect.width(), rect.height()))
         .collect()
 }
@@ -167,7 +167,7 @@ fn inline_trim_decoration_rect(document: &quire::Document) -> (f32, f32, f32, f3
     let rect = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("inline decoration should paint");
     (rect.x(), rect.y(), rect.width(), rect.height())
 }
@@ -1368,7 +1368,7 @@ async fn split_inline_after_block_omits_inline_start_border_for_wpt_case() {
     let all_blue_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .collect::<Vec<_>>();
     let blue_rects = all_blue_rects
         .iter()
@@ -1427,7 +1427,7 @@ p { display: none }
     let green_index = page
         .rects()
         .iter()
-        .position(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .position(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("split inline end border should paint green");
     let green = &page.rects()[green_index];
 
@@ -1487,7 +1487,7 @@ inner.bfc {
     .await
     .unwrap();
 
-    let orange = Color::new(255, 165, 0);
+    let orange = CssColor::new(255, 165, 0);
     let orange_rects = document.pages[0]
         .rects()
         .iter()
@@ -1605,7 +1605,7 @@ async fn inline_flex_paints_gap_decorations() {
 
     assert!(
         document.pages[0].rects().iter().any(|rect| {
-            rect.fill == Some(Color::new(255, 0, 0))
+            rect.fill == Some(CssColor::new(255, 0, 0))
                 && (rect.width() - 4.0).abs() < 0.01
                 && rect.height() > 0.0
         }),
@@ -1654,7 +1654,7 @@ body { margin: 0 }
     let page = &document.pages[0];
     assert!(
         page.rects().iter().any(|rect| {
-            rect.fill == Some(Color::new(255, 0, 0))
+            rect.fill == Some(CssColor::new(255, 0, 0))
                 && (rect.width() - 7.5).abs() < 0.01
                 && rect.height() > 0.0
         }),
@@ -1663,7 +1663,7 @@ body { margin: 0 }
     );
     assert!(
         page.rects().iter().any(|rect| {
-            rect.fill == Some(Color::new(0, 0, 255))
+            rect.fill == Some(CssColor::new(0, 0, 255))
                 && (rect.height() - 22.5).abs() < 0.01
                 && rect.width() > 0.0
         }),
@@ -1692,12 +1692,12 @@ async fn grid_places_children_in_explicit_columns() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first grid item background should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second grid item background should paint");
 
     assert!((red.x() - 10.0).abs() < 0.01, "red item: {red:?}");
@@ -1722,7 +1722,7 @@ async fn inline_grid_paints_gap_decorations() {
 
     assert!(
         document.pages[0].rects().iter().any(|rect| {
-            rect.fill == Some(Color::new(255, 0, 0))
+            rect.fill == Some(CssColor::new(255, 0, 0))
                 && (rect.width() - 4.0).abs() < 0.01
                 && rect.height() > 0.0
         }),
@@ -1751,12 +1751,12 @@ async fn grid_template_areas_place_named_items() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("left named grid area background should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("right named grid area background should paint");
 
     assert!((red.x() - 10.0).abs() < 0.01, "left item: {red:?}");
@@ -1783,7 +1783,7 @@ async fn grid_template_area_generates_named_start_and_end_lines() {
     let rect = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("template-area generated-line grid item should paint");
 
     assert!(
@@ -1814,7 +1814,7 @@ async fn grid_template_area_generated_lines_accept_escaped_names() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("escaped template-area line grid item should paint");
 
     assert!(
@@ -1845,7 +1845,7 @@ async fn grid_named_line_occurrence_places_item() {
     let rect = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("named-line occurrence grid item background should paint");
 
     assert!((rect.x() - 40.0).abs() < 0.01, "item: {rect:?}");
@@ -1872,12 +1872,12 @@ async fn grid_spanning_item_includes_track_gaps() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("spanning grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("single-cell grid item should paint");
 
     assert!((red.x() - 10.0).abs() < 0.01, "spanning item: {red:?}");
@@ -1913,12 +1913,12 @@ async fn grid_flexible_tracks_distribute_remaining_width() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first flexible-track grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second flexible-track grid item should paint");
 
     assert!((red.x() - 10.0).abs() < 0.01, "first item: {red:?}");
@@ -1957,9 +1957,9 @@ async fn grid_auto_fill_repeats_fixed_tracks_to_fill_definite_width() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!((red.x() - 10.0).abs() < 0.01, "first track: {red:?}");
     assert!((red.width() - 20.0).abs() < 0.01, "first track: {red:?}");
@@ -1993,12 +1993,12 @@ async fn grid_auto_fit_collapses_empty_fixed_repeat_tracks() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first auto-fit grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second auto-fit grid item should paint");
 
     assert!(
@@ -2035,22 +2035,22 @@ async fn grid_auto_template_rows_and_columns_size_to_items() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first auto-track grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second auto-track grid item should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("third auto-track grid item should paint");
     let yellow = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("fourth auto-track grid item should paint");
 
     assert!((red.x() - 10.0).abs() < 0.01, "first column: {red:?}");
@@ -2098,12 +2098,12 @@ async fn grid_justify_content_space_evenly_distributes_column_tracks() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first space-evenly grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second space-evenly grid item should paint");
 
     assert!(
@@ -2138,12 +2138,12 @@ async fn grid_align_content_space_evenly_distributes_row_tracks() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first space-evenly row item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second space-evenly row item should paint");
 
     assert!(
@@ -2182,9 +2182,9 @@ async fn rtl_grid_auto_placement_starts_at_inline_start_column() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.x() - 50.0).abs() < 0.01,
@@ -2217,7 +2217,7 @@ async fn grid_justify_self_self_start_uses_rtl_item_inline_start() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("rtl self-start grid item should paint");
     assert!(
         (green.x() - 50.0).abs() < 0.01,
@@ -2242,7 +2242,7 @@ async fn grid_justify_self_self_end_uses_rtl_item_inline_end() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("rtl self-end grid item should paint");
     assert!(
         (green.x() - 10.0).abs() < 0.01,
@@ -2267,7 +2267,7 @@ async fn grid_justify_items_self_start_uses_rtl_item_inline_start() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("rtl justify-items:self-start grid item should paint");
     assert!(
         (green.x() - 50.0).abs() < 0.01,
@@ -2292,7 +2292,7 @@ async fn grid_justify_items_self_end_uses_rtl_item_inline_end() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("rtl justify-items:self-end grid item should paint");
     assert!(
         (green.x() - 10.0).abs() < 0.01,
@@ -2317,7 +2317,7 @@ async fn rtl_grid_justify_self_left_uses_physical_left_edge() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("rtl justify-self:left grid item should paint");
     assert!(
         (green.x() - 10.0).abs() < 0.01,
@@ -2342,7 +2342,7 @@ async fn rtl_grid_justify_self_right_uses_physical_right_edge() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("rtl justify-self:right grid item should paint");
     assert!(
         (green.x() - 50.0).abs() < 0.01,
@@ -2367,7 +2367,7 @@ async fn rtl_grid_justify_items_left_uses_physical_left_edge() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("rtl justify-items:left grid item should paint");
     assert!(
         (green.x() - 10.0).abs() < 0.01,
@@ -2392,7 +2392,7 @@ async fn rtl_grid_justify_items_right_uses_physical_right_edge() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("rtl justify-items:right grid item should paint");
     assert!(
         (green.x() - 50.0).abs() < 0.01,
@@ -2417,7 +2417,7 @@ async fn grid_align_self_self_start_uses_vertical_rtl_item_inline_start() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("vertical rtl align-self:self-start grid item should paint");
     assert!(
         (green.y() - 30.0).abs() < 0.01,
@@ -2442,7 +2442,7 @@ async fn grid_align_self_self_end_uses_vertical_rtl_item_inline_end() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("vertical rtl align-self:self-end grid item should paint");
     assert!(
         ((green.y() + green.height()) - 90.0).abs() < 0.01,
@@ -2474,9 +2474,9 @@ async fn grid_auto_flow_column_places_items_down_rows() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!((red.x() - 10.0).abs() < 0.01, "first item: {red:?}");
     assert!(
@@ -2517,9 +2517,9 @@ async fn grid_auto_rows_size_implicit_row_tracks() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.y() - green.y()).abs() < 0.01,
@@ -2567,10 +2567,10 @@ async fn grid_auto_rows_cycles_implicit_track_list() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
-    let magenta = rect(Color::new(255, 0, 255));
-    let black = rect(Color::new(0, 0, 0));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
+    let magenta = rect(CssColor::new(255, 0, 255));
+    let black = rect(CssColor::new(0, 0, 0));
 
     assert!(
         (red.height() - 10.0).abs() < 0.01,
@@ -2618,10 +2618,10 @@ async fn grid_auto_columns_cycles_implicit_track_list() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
-    let magenta = rect(Color::new(255, 0, 255));
-    let black = rect(Color::new(0, 0, 0));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
+    let magenta = rect(CssColor::new(255, 0, 255));
+    let black = rect(CssColor::new(0, 0, 0));
 
     assert!(
         (red.width() - 12.0).abs() < 0.01,
@@ -2665,9 +2665,9 @@ async fn grid_auto_flow_dense_backfills_earlier_row_holes() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!((red.x() - 10.0).abs() < 0.01, "first wide item: {red:?}");
     assert!(
@@ -2708,7 +2708,7 @@ async fn grid_creates_anonymous_items_for_non_whitespace_text_runs() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("grid item after anonymous text should paint");
 
     assert!(
@@ -2783,7 +2783,7 @@ async fn grid_item_blocks_descendant_margin_escape_and_container_first_letter() 
     assert!(
         grid_lines
             .iter()
-            .all(|line| line.color == Color::new(0, 128, 0)),
+            .all(|line| line.color == CssColor::new(0, 128, 0)),
         "grid container ::first-letter should not style grid item text: {grid_lines:?}"
     );
 }
@@ -2808,12 +2808,12 @@ async fn grid_ignores_whitespace_only_anonymous_text_runs() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first non-whitespace grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second non-whitespace grid item should paint");
 
     assert!(
@@ -2844,7 +2844,7 @@ async fn grid_ignores_preserved_document_whitespace_text_runs() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("non-whitespace grid item should paint");
 
     assert!(
@@ -2871,7 +2871,7 @@ async fn grid_creates_anonymous_items_for_nbsp_text_runs() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("grid item after anonymous NBSP text should paint");
 
     assert!(
@@ -2901,12 +2901,12 @@ async fn grid_display_contents_children_participate_as_grid_items() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first display: contents child should paint as a grid item");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second display: contents child should paint as a grid item");
 
     assert!((red.x() - 10.0).abs() < 0.01, "first child: {red:?}");
@@ -2933,12 +2933,12 @@ async fn generated_after_pseudo_participates_as_grid_item() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("real grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("generated ::after grid item should paint");
 
     assert!((red.x() - 10.0).abs() < 0.01, "real item: {red:?}");
@@ -3008,7 +3008,7 @@ async fn grid_blockified_inline_item_paints_source_background_once() {
     let painted = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(10, 20, 30)))
+        .filter(|rect| rect.fill == Some(CssColor::new(10, 20, 30)))
         .collect::<Vec<_>>();
     assert_eq!(
         painted.len(),
@@ -3037,12 +3037,12 @@ async fn grid_min_content_track_uses_item_intrinsic_width() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("min-content grid item background should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second grid item background should paint");
 
     assert!(red.width() > 40.0, "min-content item: {red:?}");
@@ -3082,9 +3082,9 @@ async fn grid_fit_content_track_clamps_between_min_and_max_content() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let min = rect(Color::new(255, 0, 0));
-    let fit = rect(Color::new(0, 128, 0));
-    let max = rect(Color::new(0, 0, 255));
+    let min = rect(CssColor::new(255, 0, 0));
+    let fit = rect(CssColor::new(0, 128, 0));
+    let max = rect(CssColor::new(0, 0, 255));
 
     assert!(
         min.width() < fit.width(),
@@ -3119,7 +3119,7 @@ async fn grid_fit_content_intrinsic_width_caps_at_max_content() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("fit-content intrinsic grid item should paint");
 
     assert!(
@@ -3152,12 +3152,12 @@ async fn grid_min_content_row_uses_item_intrinsic_height() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("min-content row grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second row grid item should paint");
 
     assert!(
@@ -3190,12 +3190,12 @@ async fn grid_min_content_row_treats_indefinite_percentage_item_height_as_auto()
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("percentage-height min-content row grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second row grid item should paint");
 
     assert!(
@@ -3228,12 +3228,12 @@ async fn grid_min_content_rows_distribute_spanning_item_intrinsic_height() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("spanning min-content row grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("post-span row grid item should paint");
 
     assert!(
@@ -3266,17 +3266,17 @@ async fn grid_min_content_height_treats_percentage_row_gap_as_cyclic() {
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("percentage-row-gap min-content grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first percentage-row-gap grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second percentage-row-gap grid item should paint");
 
     assert!(
@@ -3314,10 +3314,10 @@ async fn grid_percentage_gap_final_layout_resolves_against_content_box() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("expected rect for color {color:?}: {:?}", page.rects()))
     };
-    let grid = rect(Color::new(0, 128, 0));
-    let first = rect(Color::new(255, 0, 0));
-    let second = rect(Color::new(0, 0, 255));
-    let third = rect(Color::new(0, 255, 255));
+    let grid = rect(CssColor::new(0, 128, 0));
+    let first = rect(CssColor::new(255, 0, 0));
+    let second = rect(CssColor::new(0, 0, 255));
+    let third = rect(CssColor::new(0, 255, 255));
 
     assert!(
         (grid.height() - 180.0).abs() < 0.01,
@@ -3358,9 +3358,9 @@ async fn inline_grid_percentage_gap_overflows_intrinsic_width() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("expected rect for color {color:?}: {:?}", page.rects()))
     };
-    let grid = rect(Color::new(0, 0, 0));
-    let first = rect(Color::new(255, 0, 0));
-    let second = rect(Color::new(0, 0, 255));
+    let grid = rect(CssColor::new(0, 0, 0));
+    let first = rect(CssColor::new(255, 0, 0));
+    let second = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (grid.width() - 200.0).abs() < 0.01,
@@ -3392,17 +3392,17 @@ async fn grid_container_min_content_width_uses_tracks() {
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("min-content grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first grid item background should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second grid item background should paint");
 
     assert!(
@@ -3436,17 +3436,17 @@ async fn grid_container_min_content_width_uses_per_track_item_contributions() {
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("min-content grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first intrinsic grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second intrinsic grid item should paint");
 
     assert!(
@@ -3483,12 +3483,12 @@ async fn grid_container_min_content_width_treats_percentage_gap_as_cyclic() {
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("percentage-gap intrinsic grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first percentage-gap intrinsic grid item should paint");
 
     assert!(
@@ -3521,12 +3521,12 @@ async fn grid_container_min_content_width_treats_percentage_tracks_as_auto() {
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("percentage-track intrinsic grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first percentage-track intrinsic grid item should paint");
 
     assert!(
@@ -3559,17 +3559,17 @@ async fn grid_container_min_content_width_places_mixed_auto_and_explicit_contrib
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("mixed auto/explicit intrinsic grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("auto intrinsic grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("explicit intrinsic grid item should paint");
 
     assert!(
@@ -3607,17 +3607,17 @@ async fn grid_container_min_content_width_uses_dense_auto_placement_contribution
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("dense intrinsic grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("spanning dense intrinsic grid item should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("dense backfilled intrinsic grid item should paint");
 
     assert!(
@@ -3651,22 +3651,22 @@ async fn grid_container_min_content_width_uses_column_auto_flow_contributions() 
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("column-flow intrinsic grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first column-flow intrinsic grid item should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("second column-flow intrinsic grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("third column-flow intrinsic grid item should paint");
 
     assert!(
@@ -3703,17 +3703,17 @@ async fn grid_container_min_content_width_uses_column_dense_auto_placement_contr
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("column-dense intrinsic grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("spanning column-dense intrinsic grid item should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("column-dense backfilled intrinsic grid item should paint");
 
     assert!(
@@ -3751,10 +3751,10 @@ async fn grid_container_min_content_width_column_auto_flow_honors_definite_rows(
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let grid = rect(Color::new(255, 255, 0));
-    let red = rect(Color::new(255, 0, 0));
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let grid = rect(CssColor::new(255, 255, 0));
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (grid.width() - 100.0).abs() < 0.01,
@@ -3799,10 +3799,10 @@ async fn grid_container_min_content_width_row_auto_flow_honors_definite_rows() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let grid = rect(Color::new(255, 255, 0));
-    let red = rect(Color::new(255, 0, 0));
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let grid = rect(CssColor::new(255, 255, 0));
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (grid.width() - 100.0).abs() < 0.01,
@@ -3847,10 +3847,10 @@ async fn grid_container_min_content_width_row_auto_flow_honors_area_row_lines() 
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let grid = rect(Color::new(255, 255, 0));
-    let red = rect(Color::new(255, 0, 0));
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let grid = rect(CssColor::new(255, 255, 0));
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (grid.width() - 100.0).abs() < 0.01,
@@ -3895,10 +3895,10 @@ async fn grid_container_min_content_width_row_auto_flow_honors_named_row_lines()
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let grid = rect(Color::new(255, 255, 0));
-    let red = rect(Color::new(255, 0, 0));
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let grid = rect(CssColor::new(255, 255, 0));
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (grid.width() - 100.0).abs() < 0.01,
@@ -3940,8 +3940,8 @@ async fn grid_container_min_content_width_honors_positive_named_implicit_columns
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let grid = rect(Color::new(255, 255, 0));
-    let red = rect(Color::new(255, 0, 0));
+    let grid = rect(CssColor::new(255, 255, 0));
+    let red = rect(CssColor::new(255, 0, 0));
 
     assert!(
         (grid.width() - 100.0).abs() < 0.01,
@@ -3976,9 +3976,9 @@ async fn grid_layout_places_positive_named_implicit_column_after_explicit_grid()
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let grid = rect(Color::new(255, 255, 0));
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let grid = rect(CssColor::new(255, 255, 0));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (grid.width() - 100.0).abs() < 0.01,
@@ -4017,8 +4017,8 @@ async fn grid_layout_places_forward_named_implicit_column_span_after_explicit_gr
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.x() - 10.0).abs() < 0.01 && (red.width() - 55.0).abs() < 0.01,
@@ -4053,8 +4053,8 @@ async fn grid_layout_places_positive_named_implicit_row_after_explicit_grid() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (blue.y() + blue.height() - 170.0).abs() < 0.01 && (blue.height() - 10.0).abs() < 0.01,
@@ -4089,8 +4089,8 @@ async fn grid_layout_places_positive_named_implicit_column_after_auto_fill_grid(
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (blue.x() - 10.0).abs() < 0.01 && (blue.width() - 20.0).abs() < 0.01,
@@ -4125,8 +4125,8 @@ async fn grid_layout_places_positive_named_implicit_row_after_auto_fill_grid() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (blue.y() + blue.height() - 210.0).abs() < 0.01 && (blue.height() - 20.0).abs() < 0.01,
@@ -4161,8 +4161,8 @@ async fn grid_layout_places_positive_named_implicit_column_after_auto_fit_grid()
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (blue.x() - 10.0).abs() < 0.01 && (blue.width() - 20.0).abs() < 0.01,
@@ -4197,8 +4197,8 @@ async fn grid_layout_places_positive_named_implicit_row_after_auto_fit_grid() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (blue.y() + blue.height() - 210.0).abs() < 0.01 && (blue.height() - 20.0).abs() < 0.01,
@@ -4229,7 +4229,7 @@ async fn grid_layout_places_forward_named_implicit_column_span_after_auto_fill_g
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap_or_else(|| panic!("red rect should paint: {:?}", page.rects()));
 
     assert!(
@@ -4257,7 +4257,7 @@ async fn grid_layout_places_forward_named_implicit_row_span_after_auto_fill_grid
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap_or_else(|| panic!("red rect should paint: {:?}", page.rects()));
 
     assert!(
@@ -4289,8 +4289,8 @@ async fn grid_layout_places_positive_named_implicit_column_after_multi_track_aut
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (blue.x() - 50.0).abs() < 0.01 && (blue.width() - 10.0).abs() < 0.01,
@@ -4325,8 +4325,8 @@ async fn grid_layout_places_positive_named_implicit_row_after_multi_track_auto_f
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (blue.y() + blue.height() - 210.0).abs() < 0.01 && (blue.height() - 10.0).abs() < 0.01,
@@ -4360,7 +4360,7 @@ async fn grid_container_min_content_width_honors_forward_named_implicit_spans() 
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
+    let red = rect(CssColor::new(255, 0, 0));
 
     assert!(
         (red.x() - 10.0).abs() < 0.01 && (red.width() - 55.0).abs() < 0.01,
@@ -4387,7 +4387,7 @@ async fn grid_container_min_content_width_honors_backward_named_implicit_spans()
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("min-content backward named implicit grid item should paint");
 
     assert!(
@@ -4415,7 +4415,7 @@ async fn grid_container_min_content_width_backward_named_implicit_spans_cycle_au
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("min-content cycled backward named implicit grid item should paint");
 
     assert!(
@@ -4447,8 +4447,8 @@ async fn grid_layout_places_backward_named_implicit_span_before_explicit_grid() 
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.x() - 10.0).abs() < 0.01 && (red.width() - 65.0).abs() < 0.01,
@@ -4483,8 +4483,8 @@ async fn grid_layout_places_backward_named_implicit_span_before_template_area_gr
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.x() - 10.0).abs() < 0.01 && (red.width() - 100.0).abs() < 0.01,
@@ -4519,8 +4519,8 @@ async fn grid_layout_places_backward_named_implicit_row_span_before_template_are
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.height() - 100.0).abs() < 0.01,
@@ -4555,8 +4555,8 @@ async fn grid_layout_places_backward_named_implicit_span_before_numbered_repeat_
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.x() - 10.0).abs() < 0.01 && (red.width() - 65.0).abs() < 0.01,
@@ -4591,8 +4591,8 @@ async fn grid_layout_places_backward_named_implicit_row_span_before_numbered_rep
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.height() - 65.0).abs() < 0.01,
@@ -4631,8 +4631,8 @@ async fn grid_layout_places_backward_named_implicit_row_span_before_auto_fill_gr
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.height() - 65.0).abs() < 0.01,
@@ -4671,8 +4671,8 @@ async fn grid_layout_places_backward_named_implicit_span_before_auto_fill_grid()
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.x() - 10.0).abs() < 0.01 && (red.width() - 65.0).abs() < 0.01,
@@ -4707,8 +4707,8 @@ async fn grid_layout_places_backward_named_implicit_row_span_before_auto_fit_gri
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.height() - 65.0).abs() < 0.01,
@@ -4747,8 +4747,8 @@ async fn grid_layout_places_backward_named_implicit_span_before_auto_fit_grid() 
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.x() - 10.0).abs() < 0.01 && (red.width() - 65.0).abs() < 0.01,
@@ -4783,8 +4783,8 @@ async fn grid_layout_places_backward_named_implicit_span_before_end_aligned_auto
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.x() + 10.0).abs() < 0.01 && (red.width() - 65.0).abs() < 0.01,
@@ -4819,8 +4819,8 @@ async fn grid_layout_places_negative_named_implicit_row_before_auto_fit_grid() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.height() - 40.0).abs() < 0.01,
@@ -4859,8 +4859,8 @@ async fn grid_layout_places_negative_named_implicit_column_before_auto_fit_grid(
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.x() - 10.0).abs() < 0.01 && (red.width() - 40.0).abs() < 0.01,
@@ -4892,17 +4892,17 @@ async fn grid_container_min_content_width_uses_named_line_item_contributions() {
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("min-content named-line grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first named-line intrinsic grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second named-line intrinsic grid item should paint");
 
     assert!(
@@ -4939,17 +4939,17 @@ async fn grid_container_min_content_width_uses_negative_line_item_contributions(
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("min-content negative-line grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first negative-line intrinsic grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second negative-line intrinsic grid item should paint");
 
     assert!(
@@ -4986,17 +4986,17 @@ async fn grid_container_min_content_width_uses_negative_named_line_item_contribu
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("min-content negative named-line grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first negative named-line intrinsic grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second negative named-line intrinsic grid item should paint");
 
     assert!(
@@ -5032,7 +5032,7 @@ async fn grid_container_min_content_width_distributes_simple_spanning_contributi
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("spanning intrinsic grid item should paint");
 
     assert!(
@@ -5064,7 +5064,7 @@ async fn grid_container_min_content_width_distributes_backward_spanning_contribu
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("backward spanning intrinsic grid item should paint");
 
     assert!(
@@ -5096,7 +5096,7 @@ async fn grid_container_min_content_width_distributes_named_spanning_contributio
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("named spanning intrinsic grid item should paint");
 
     assert!(
@@ -5128,7 +5128,7 @@ async fn grid_container_min_content_width_distributes_backward_named_spanning_co
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("backward named spanning intrinsic grid item should paint");
 
     assert!(
@@ -5160,7 +5160,7 @@ async fn grid_container_min_content_width_uses_template_area_generated_lines() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("area-line intrinsic grid item should paint");
 
     assert!(
@@ -5192,7 +5192,7 @@ async fn grid_container_min_content_width_uses_template_area_auto_columns() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("template-area auto-column grid item should paint");
 
     assert!(
@@ -5221,17 +5221,17 @@ async fn grid_container_min_content_width_uses_template_area_extra_auto_columns(
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("template-area extra auto-column grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("authored template-area column item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("area-created auto-column item should paint");
 
     assert!(
@@ -5269,7 +5269,7 @@ async fn grid_container_min_content_width_uses_one_fixed_auto_fill_repetition() 
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first auto-fill grid item should paint");
 
     assert!(
@@ -5306,8 +5306,8 @@ async fn grid_container_min_content_width_uses_implicit_auto_columns() {
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let grid = rect(Color::new(255, 255, 0));
-    let red = rect(Color::new(255, 0, 0));
+    let grid = rect(CssColor::new(255, 255, 0));
+    let red = rect(CssColor::new(255, 0, 0));
 
     assert!(
         (grid.width() - 80.0).abs() < 0.01,
@@ -5336,7 +5336,7 @@ async fn grid_container_min_content_width_uses_positive_implicit_column_lines() 
     let grid = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("positive implicit-line intrinsic grid background should paint");
 
     assert!(
@@ -5368,9 +5368,9 @@ async fn grid_container_min_content_width_extends_explicit_columns_for_positive_
             .find(|rect| rect.fill == Some(color))
             .unwrap_or_else(|| panic!("rect {color:?} should paint: {:?}", page.rects()))
     };
-    let grid = rect(Color::new(255, 255, 0));
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let grid = rect(CssColor::new(255, 255, 0));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (grid.width() - 100.0).abs() < 0.01,
@@ -5413,12 +5413,12 @@ async fn inline_grid_paints_atomically_and_exports_item_baseline() {
     let yellow = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .expect("inline-grid background should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("inline-grid item background should paint");
 
     assert!(
@@ -5496,7 +5496,7 @@ async fn grid_justify_items_aligns_item_inside_grid_area() {
     let rect = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("aligned grid item background should paint");
 
     assert!((rect.x() - 40.0).abs() < 0.01, "item: {rect:?}");
@@ -5737,17 +5737,17 @@ async fn absolute_grid_child_uses_grid_static_position_without_participating() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned grid child should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first normal grid item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal grid item should paint");
 
     assert!((red.x() - 25.0).abs() < 0.01, "red item: {red:?}");
@@ -5778,12 +5778,12 @@ async fn absolute_grid_child_static_position_uses_auto_fill_track() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned auto-fill grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("third normal auto-fill grid item should paint");
 
     assert!(
@@ -5816,12 +5816,12 @@ async fn absolute_grid_child_static_position_uses_named_auto_fill_column_line() 
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned named auto-fill grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("named auto-fill peer should paint");
 
     assert!(
@@ -5850,12 +5850,12 @@ async fn absolute_grid_child_static_position_uses_named_multi_track_auto_fill_co
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned multi-track auto-fill grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("multi-track named auto-fill peer should paint");
 
     assert!(
@@ -5884,7 +5884,7 @@ async fn absolute_grid_child_static_position_uses_named_auto_fill_after_implicit
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned after-implicit auto-fill grid child should paint");
 
     assert!(
@@ -5913,12 +5913,12 @@ async fn absolute_grid_child_static_position_uses_named_auto_fill_row_line() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned named auto-fill row grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("named auto-fill row peer should paint");
 
     assert!(
@@ -5947,7 +5947,7 @@ async fn absolute_grid_child_static_position_uses_named_auto_fill_after_implicit
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned after-implicit auto-fill row grid child should paint");
 
     assert!(
@@ -5977,12 +5977,12 @@ async fn absolute_grid_child_static_position_uses_collapsed_auto_fit_line() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned auto-fit grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal auto-fit grid item should paint");
 
     assert!(
@@ -6012,12 +6012,12 @@ async fn absolute_grid_child_static_position_uses_named_collapsed_auto_fit_line(
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned named auto-fit grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal named auto-fit grid item should paint");
 
     assert!(
@@ -6047,12 +6047,12 @@ async fn absolute_grid_child_static_position_uses_named_multi_track_collapsed_au
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned multi-track auto-fit grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second occupied multi-track auto-fit item should paint");
 
     assert!(
@@ -6082,12 +6082,12 @@ async fn absolute_grid_child_static_position_uses_collapsed_auto_fit_row_line() 
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned row auto-fit grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal row auto-fit grid item should paint");
 
     assert!(
@@ -6117,12 +6117,12 @@ async fn absolute_grid_child_static_position_uses_named_multi_track_collapsed_au
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned multi-track row auto-fit grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second occupied multi-track row auto-fit item should paint");
 
     assert!(
@@ -6152,12 +6152,12 @@ async fn absolute_grid_child_static_position_uses_named_collapsed_auto_fit_row_l
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned named row auto-fit grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal named row auto-fit grid item should paint");
 
     assert!(
@@ -6187,12 +6187,12 @@ async fn absolute_grid_child_static_position_uses_content_aligned_auto_fit_row_l
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned content-aligned row auto-fit grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal content-aligned row auto-fit grid item should paint");
 
     assert!(
@@ -6222,12 +6222,12 @@ async fn absolute_grid_child_static_position_uses_distributed_auto_fit_row_line(
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned distributed row auto-fit grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal distributed row auto-fit grid item should paint");
 
     assert!(
@@ -6257,12 +6257,12 @@ async fn absolute_grid_child_static_position_uses_content_aligned_auto_fit_line(
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned content-aligned auto-fit grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal content-aligned auto-fit grid item should paint");
 
     assert!(
@@ -6292,12 +6292,12 @@ async fn absolute_grid_child_static_position_uses_distributed_auto_fit_line() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned distributed auto-fit grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal distributed auto-fit grid item should paint");
 
     assert!(
@@ -6327,12 +6327,12 @@ async fn absolute_grid_child_static_position_uses_content_aligned_fixed_line() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned content-aligned fixed-line grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second content-aligned fixed-line grid item should paint");
 
     assert!(
@@ -6367,10 +6367,10 @@ async fn absolute_grid_child_left_offset_resolves_against_grid_area() {
             .find(|rect| rect.fill == Some(color) && rect.width() > 0.0 && rect.height() > 0.0)
             .unwrap_or_else(|| panic!("expected visible rect for color {color:?}"))
     };
-    let first = item(Color::new(255, 0, 255));
-    let second = item(Color::new(0, 255, 255));
-    let third = item(Color::new(255, 255, 0));
-    let fourth = item(Color::new(0, 255, 0));
+    let first = item(CssColor::new(255, 0, 255));
+    let second = item(CssColor::new(0, 255, 255));
+    let third = item(CssColor::new(255, 255, 0));
+    let fourth = item(CssColor::new(0, 255, 0));
 
     assert!(
         (second.x() - first.x() - 200.0).abs() < 0.01,
@@ -6402,7 +6402,7 @@ async fn absolute_grid_child_static_position_uses_positive_implicit_auto_columns
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned positive implicit-line grid child should paint");
 
     assert!(
@@ -6430,7 +6430,7 @@ async fn absolute_grid_child_static_position_after_explicit_line_omits_following
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned after-explicit grid child should paint");
 
     assert!(
@@ -6458,7 +6458,7 @@ async fn rtl_absolute_grid_child_static_position_uses_grid_area_end_line() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("rtl absolutely positioned grid child should paint");
 
     assert!(
@@ -6487,7 +6487,7 @@ async fn absolute_grid_child_static_position_uses_positive_named_implicit_auto_c
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned positive named implicit-line grid child should paint");
 
     assert!(
@@ -6516,12 +6516,12 @@ async fn absolute_grid_child_static_position_uses_numbered_repeat_named_column_l
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned numbered-repeat named-column grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("numbered-repeat named-column peer should paint");
 
     assert!(
@@ -6550,12 +6550,12 @@ async fn absolute_grid_child_static_position_uses_numbered_repeat_named_row_line
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned numbered-repeat named-row grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("numbered-repeat named-row peer should paint");
 
     assert!(
@@ -6584,12 +6584,12 @@ async fn absolute_grid_child_static_position_uses_positive_implicit_auto_rows() 
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned positive implicit-row grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("positive implicit-row peer should paint");
 
     assert!(
@@ -6618,12 +6618,12 @@ async fn absolute_grid_child_static_position_uses_positive_named_implicit_auto_r
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned positive named implicit-row grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("positive named implicit-row peer should paint");
 
     assert!(
@@ -6652,7 +6652,7 @@ async fn absolute_grid_child_static_position_uses_negative_named_implicit_auto_c
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned negative named implicit-line grid child should paint");
 
     assert!(
@@ -6681,12 +6681,12 @@ async fn absolute_grid_child_static_position_uses_negative_implicit_auto_rows() 
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned negative implicit-row grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("negative implicit-row peer should paint");
 
     assert!(
@@ -6715,12 +6715,12 @@ async fn absolute_grid_child_static_position_uses_negative_named_implicit_auto_r
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned negative named implicit-row grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("negative named implicit-row peer should paint");
 
     assert!(
@@ -6750,12 +6750,12 @@ async fn absolute_grid_child_static_position_uses_named_line() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned named-line grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal grid item should paint");
 
     assert!((blue.x() - 50.0).abs() < 0.01, "blue item: {blue:?}");
@@ -6786,12 +6786,12 @@ async fn inline_source_absolute_grid_child_uses_inline_static_position() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("inline-source absolutely positioned grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal grid item should paint");
 
     assert!((blue.x() - 50.0).abs() < 0.01, "blue item: {blue:?}");
@@ -6822,7 +6822,7 @@ async fn absolute_grid_child_static_position_uses_negative_line() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned negative-line grid child should paint");
 
     assert!(
@@ -6851,7 +6851,7 @@ async fn absolute_grid_child_static_position_uses_negative_named_line() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned negative named-line grid child should paint");
 
     assert!(
@@ -6881,12 +6881,12 @@ async fn absolute_grid_child_static_position_uses_template_area() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned template-area grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("normal grid area child should paint");
 
     assert!(
@@ -6916,12 +6916,12 @@ async fn absolute_grid_child_static_position_uses_template_area_generated_line()
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned generated-line grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("normal grid area child should paint");
 
     assert!(
@@ -6951,12 +6951,12 @@ async fn absolute_grid_child_static_position_uses_flexible_tracks() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned flexible-track grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal grid item should paint");
 
     assert!(
@@ -6986,12 +6986,12 @@ async fn absolute_grid_child_static_position_uses_intrinsic_tracks() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolutely positioned intrinsic-track grid child should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second normal grid item should paint");
 
     assert!(
@@ -7014,7 +7014,7 @@ async fn rtl_fixed_width_flex_container_uses_physical_right_edge() {
     let flex_background = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("flex background should paint");
     assert!(
         (flex_background.x() - 90.0).abs() < 0.01,
@@ -7038,7 +7038,7 @@ async fn flex_row_space_between_single_item_falls_back_to_start() {
     let white = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 255)))
         .expect("single flex item background should paint");
     assert!(
         (white.x() - 22.75).abs() < 0.01,
@@ -7066,7 +7066,7 @@ async fn flex_row_single_item_space_around_and_evenly_fall_back_to_center() {
         let green = document.pages[0]
             .rects()
             .iter()
-            .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+            .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
             .unwrap();
         assert!(
             (green.x() - 90.0).abs() < 0.01,
@@ -7116,7 +7116,7 @@ async fn flex_basis_min_content_counts_inline_atoms() {
     let item = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     assert!(
         item.width() >= 37.5,
@@ -7142,7 +7142,7 @@ async fn flex_max_content_uses_graph_generated_inline_edges_and_atoms() {
     let item = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     assert!(
         item.width() > 68.0,
@@ -7165,7 +7165,7 @@ async fn anonymous_flex_text_preserves_graph_measured_spaces() {
     let marker = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     assert!(
         marker.x() > 35.0,
@@ -7189,7 +7189,7 @@ async fn column_flex_min_content_height_uses_graph_selected_atom_lines() {
     let item = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     assert!(
         item.height() > 19.0 && item.height() < 31.0,
@@ -7216,7 +7216,7 @@ async fn nested_flex_intrinsics_use_styled_inline_graph_contributions() {
     let nested = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     assert!(
         nested.width() > 48.0,
@@ -7240,7 +7240,7 @@ async fn flex_min_content_block_size_uses_wrapped_graph_fragments() {
     let item = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     assert!(
         item.height() > 23.0 && item.height() < 40.0,
@@ -7264,7 +7264,7 @@ async fn direct_inline_replaced_row_height_uses_graph_atomic_metrics() {
     let item = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     assert!(
         item.height() > 31.0,
@@ -7287,17 +7287,17 @@ async fn justify_content_left_uses_physical_left_in_row_reverse() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!((blue.x() - 10.0).abs() < 0.01, "blue={blue:?}");
@@ -7320,17 +7320,17 @@ async fn justify_content_end_uses_logical_end_in_rtl_row_reverse() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!((red.x() - 10.0).abs() < 0.01, "red={red:?}");
@@ -7354,17 +7354,17 @@ async fn justify_content_physical_left_right_fall_back_to_start_on_column_axis()
         let red = document.pages[0]
             .rects()
             .iter()
-            .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+            .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
             .unwrap();
         let green = document.pages[0]
             .rects()
             .iter()
-            .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+            .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
             .unwrap();
         let blue = document.pages[0]
             .rects()
             .iter()
-            .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+            .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
             .unwrap();
 
         assert!(
@@ -7396,7 +7396,7 @@ async fn adjacent_flex_container_vertical_margins_collapse_as_block_siblings() {
     let blue_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .collect::<Vec<_>>();
 
     assert_eq!(blue_rects.len(), 2);
@@ -7442,7 +7442,7 @@ async fn column_flex_overflow_hidden_clips_centered_item_border_box() {
     .await
     .unwrap();
 
-    let coral = Color::new(255, 127, 80);
+    let coral = CssColor::new(255, 127, 80);
     let coral_rects = document.pages[0]
         .rects()
         .iter()
@@ -7484,12 +7484,12 @@ async fn align_self_self_end_uses_item_writing_mode_on_row_cross_axis() {
     let yellow = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .unwrap();
     let purple = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(128, 0, 128)))
+        .find(|rect| rect.fill == Some(CssColor::new(128, 0, 128)))
         .unwrap();
 
     assert!(
@@ -7515,12 +7515,12 @@ async fn align_self_self_end_can_target_row_cross_end_from_item_writing_mode() {
     let reference = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let target = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -7546,12 +7546,12 @@ async fn align_self_self_end_uses_item_writing_mode_on_column_cross_axis() {
     let reference = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let target = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -7577,12 +7577,12 @@ async fn align_items_self_end_is_inherited_by_auto_align_self() {
     let reference = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let target = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -7607,12 +7607,12 @@ async fn safe_self_end_falls_back_to_cross_start_when_item_overflows() {
     let start = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let target = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -7636,7 +7636,7 @@ async fn shrink_to_fit_inline_block_includes_consecutive_float_row_width() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -7661,7 +7661,7 @@ async fn shrink_to_fit_float_includes_same_line_float_and_inline_block() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     assert!(
         (red.width() - 200.0).abs() < 0.01,
@@ -7671,7 +7671,7 @@ async fn shrink_to_fit_float_includes_same_line_float_and_inline_block() {
     let mut green = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
     green.sort_by(|left, right| left.x().total_cmp(&right.x()));
     assert_eq!(green.len(), 2, "green rects={green:?}");
@@ -7718,7 +7718,7 @@ async fn inline_block_auto_height_expands_to_contain_internal_float() {
     let atom = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!(
@@ -7835,7 +7835,7 @@ async fn floats_after_a_block_start_below_that_block() {
     let green_tops = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .map(|rect| rect.y() + rect.height())
         .collect::<Vec<_>>();
 
@@ -7860,7 +7860,7 @@ async fn adjacent_left_floats_share_row_and_overflow_moves_down() {
     let rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
 
     assert_eq!(rects.len(), 3);
@@ -7885,12 +7885,12 @@ async fn mixed_left_and_right_floats_use_opposite_edges() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!((green.x() - 10.0).abs() < 0.01, "green={green:?}");
@@ -7916,12 +7916,12 @@ async fn clear_both_moves_block_below_active_float() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -7977,7 +7977,7 @@ async fn inline_float_after_text_does_not_shift_previous_text() {
     let green_top = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .map(|rect| rect.y() + rect.height())
         .unwrap();
 
@@ -8018,7 +8018,7 @@ async fn inline_float_after_text_defers_when_remaining_band_is_too_narrow() {
     let green_top = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .map(|rect| rect.y() + rect.height())
         .unwrap();
 
@@ -8071,7 +8071,7 @@ async fn inline_float_rolled_to_next_line_stays_below_earlier_line_box() {
     let orange = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 165, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 165, 0)))
         .unwrap();
     let orange_top = orange.y() + orange.height();
 
@@ -8138,7 +8138,7 @@ async fn inline_float_nowrap_does_not_break_before_float() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
     assert!(
         blue.x() > text_lines[0].x() + 20.0,
@@ -8218,7 +8218,7 @@ async fn inline_left_float_nowrap_keeps_text_unbroken() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     assert!(
         green.x() <= text_lines[0].x() + 0.01,
@@ -8256,12 +8256,12 @@ async fn multiple_inline_floats_nowrap_preserve_same_side_order() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     assert!(
         blue.x() > red.x(),
@@ -8304,7 +8304,7 @@ async fn flex_container_avoids_active_float() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!(blue.x() >= 39.0, "flex should avoid active float: {blue:?}");
@@ -8325,7 +8325,7 @@ async fn table_wrapper_avoids_active_left_float() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!(
@@ -8350,12 +8350,12 @@ async fn table_wrapper_moves_below_floats_when_band_is_too_narrow() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -8379,12 +8379,12 @@ async fn clear_both_moves_table_wrapper_below_active_float() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -8408,12 +8408,12 @@ async fn clear_left_moves_table_wrapper_below_left_float() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -8437,12 +8437,12 @@ async fn clear_right_moves_table_wrapper_below_right_float() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -8466,7 +8466,7 @@ async fn empty_table_wrapper_uses_float_avoidance() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -8553,17 +8553,17 @@ async fn clear_both_after_fragmented_float_starts_below_current_fragment() {
     .await
     .unwrap();
 
-    let red = document
+    let (red_page_index, red) = document
         .pages
         .iter()
-        .flat_map(|page| page.rects())
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .enumerate()
+        .flat_map(|(page_index, page)| page.rects().iter().map(move |rect| (page_index, rect)))
+        .find(|(_, rect)| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
-    let last_green = document
-        .pages
+    let continued_green = document.pages[red_page_index]
+        .rects()
         .iter()
-        .flat_map(|page| page.rects())
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .min_by(|left, right| {
             (left.y() + left.height())
                 .partial_cmp(&(right.y() + right.height()))
@@ -8572,8 +8572,8 @@ async fn clear_both_after_fragmented_float_starts_below_current_fragment() {
         .unwrap();
 
     assert!(
-        red.y() + red.height() <= last_green.y() + 0.01,
-        "clear after a fragmented float should start below the continued fragment: red={red:?} green={last_green:?}"
+        red.y() + red.height() <= continued_green.y() + 0.01,
+        "clear after a fragmented float should start below the continued fragment on its page: red={red:?} green={continued_green:?}"
     );
 }
 
@@ -8595,14 +8595,14 @@ async fn clear_both_after_three_fragment_float_clears_final_continuation() {
         .iter()
         .enumerate()
         .flat_map(|(page_index, page)| page.rects().iter().map(move |rect| (page_index, rect)))
-        .find(|(_, rect)| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|(_, rect)| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     let (green_page, last_green) = document
         .pages
         .iter()
         .enumerate()
         .flat_map(|(page_index, page)| page.rects().iter().map(move |rect| (page_index, rect)))
-        .filter(|(_, rect)| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|(_, rect)| rect.fill == Some(CssColor::new(0, 128, 0)))
         .max_by(|(left_page, left), (right_page, right)| {
             left_page.cmp(right_page).then_with(|| {
                 left.y()
@@ -8708,7 +8708,7 @@ async fn fragmented_float_preserves_svg_replaced_descendant() {
             .pages
             .iter()
             .flat_map(|page| page.paths())
-            .any(|path| path.fill == Some(Color::new(0, 0, 255))),
+            .any(|path| path.fill == Some(CssColor::new(0, 0, 255))),
         "replaced SVG descendant inside a fragmented float should survive replay"
     );
 }
@@ -8781,12 +8781,12 @@ async fn vertical_writing_inline_start_float_does_not_match_physical_clear_left(
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -8816,7 +8816,7 @@ async fn vertical_writing_text_avoids_inline_start_top_float() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let after = document.pages[0]
         .lines()
@@ -8890,7 +8890,7 @@ div > div { margin: .5em; padding: .5em; background: yellow; }
             .pages
             .iter()
             .flat_map(|page| page.rects())
-            .filter(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+            .filter(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
             .count(),
         4,
         "each logical inline float should paint its yellow background"
@@ -8912,12 +8912,12 @@ async fn vertical_writing_over_tall_bfc_moves_past_top_float() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -8941,12 +8941,12 @@ async fn orthogonal_bfc_consumes_parent_vertical_float_band() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -8970,12 +8970,12 @@ async fn vertical_writing_bfc_moves_past_bottom_side_insufficient_span() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -8999,12 +8999,12 @@ async fn vertical_writing_bfc_root_avoids_inline_start_top_float() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -9028,12 +9028,12 @@ async fn vertical_writing_table_wrapper_moves_past_over_tall_top_float() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -9057,12 +9057,12 @@ async fn vertical_writing_flex_container_moves_past_over_tall_top_float() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -9113,12 +9113,12 @@ body { margin: 0 }
     let black_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::BLACK))
+        .filter(|rect| rect.fill == Some(CssColor::BLACK))
         .collect::<Vec<_>>();
     let color_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill.is_some_and(|color| color != Color::BLACK))
+        .filter(|rect| rect.fill.is_some_and(|color| color != CssColor::BLACK))
         .collect::<Vec<_>>();
     assert_eq!(
         color_rects.len(),
@@ -9131,8 +9131,8 @@ body { margin: 0 }
         .fold(0.0f32, f32::max);
 
     assert!(
-        (border_width - 49.0).abs() < 0.01,
-        "vertical row flex auto width should shrink-wrap its intrinsic cross-size plus 2pt borders, not fill the page: colors={color_rects:?}, borders={black_rects:?}"
+        (border_width - 34.0).abs() < 0.01,
+        "vertical row flex auto width should shrink-wrap its 30pt physical cross-size plus 2pt borders, not fill the page: colors={color_rects:?}, borders={black_rects:?}"
     );
 }
 
@@ -9150,7 +9150,7 @@ async fn vertical_lr_inline_end_float_uses_bottom_side() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!(
@@ -9174,7 +9174,7 @@ async fn table_float_exclusions_do_not_leak_to_next_page() {
     let blue = document.pages[1]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!((blue.x() - 10.0).abs() < 0.01, "blue={blue:?}");
@@ -9196,7 +9196,7 @@ async fn broken_left_float_excludes_lines_on_each_visible_fragment_page() {
     for page_index in 0..2 {
         assert!(
             document.pages[page_index].rects().iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 128, 0))
+                rect.fill == Some(CssColor::new(0, 128, 0))
                     && rect.width() > 0.0
                     && rect.height() > 0.0
             }),
@@ -9253,8 +9253,8 @@ async fn positioned_descendant_stays_inside_broken_float_fragment() {
     .unwrap();
 
     let page = &document.pages[1];
-    let float_background = first_rect_paint_operation_index(page, Color::new(0, 0, 255));
-    let positioned_child = first_rect_paint_operation_index(page, Color::new(255, 0, 0));
+    let float_background = first_rect_paint_operation_index(page, CssColor::new(0, 0, 255));
+    let positioned_child = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
 
     assert!(
         float_background < positioned_child,
@@ -9373,13 +9373,15 @@ async fn assert_column_wrap_intrinsic_flex_covers_reference(
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap_or_else(|| panic!("reference red square should paint: {:?}", page.rects()));
     let green = page
         .rects()
         .iter()
         .find(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0)) && rect.width() > 50.0 && rect.height() > 50.0
+            rect.fill == Some(CssColor::new(0, 128, 0))
+                && rect.width() > 50.0
+                && rect.height() > 50.0
         })
         .unwrap_or_else(|| panic!("green flex container should paint: {:?}", page.rects()));
 
@@ -9402,7 +9404,7 @@ async fn assert_column_wrap_intrinsic_flex_covers_reference(
         "green should cover the full reference height: green={green:?}, red={red:?}"
     );
 
-    let expected = Some(Color::new(0, 128, 0));
+    let expected = Some(CssColor::new(0, 128, 0));
     for x in [
         red.x() + 1.0,
         red.x() + red.width() / 2.0,
@@ -9448,17 +9450,17 @@ async fn flex_order_sorts_items_and_preserves_source_order_ties() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!((green.x() - 10.0).abs() < 0.01, "green={green:?}");
@@ -9487,7 +9489,7 @@ async fn flex_auto_minimum_is_capped_by_definite_width() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0)) && (rect.height() - 10.0).abs() < 0.01
+            rect.fill == Some(CssColor::new(0, 128, 0)) && (rect.height() - 10.0).abs() < 0.01
         })
         .collect::<Vec<_>>();
 
@@ -9558,17 +9560,17 @@ async fn flex_baseline_alignment_reserves_largest_top_margin() {
     let yellow = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .unwrap();
     let pink = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 192, 203)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 192, 203)))
         .unwrap();
     let lightblue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(173, 216, 230)))
+        .find(|rect| rect.fill == Some(CssColor::new(173, 216, 230)))
         .unwrap();
 
     let yellow_top = yellow.y() + yellow.height();
@@ -9628,7 +9630,7 @@ async fn baseline_aligned_vertical_column_flex_item_falls_back_to_inline_start()
     let mut green_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .cloned()
         .collect::<Vec<_>>();
     green_rects.sort_by(|a, b| a.y().partial_cmp(&b.y()).unwrap());
@@ -9664,17 +9666,17 @@ async fn column_flex_baseline_items_fall_back_to_inline_start() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("flex background should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("first baseline item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second baseline item should paint");
 
     assert!(
@@ -9700,17 +9702,17 @@ async fn column_flex_baseline_wrap_reverse_aligns_synthesized_baselines_to_cross
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("flex background should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("first baseline item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second baseline item should paint");
 
     assert!(
@@ -9736,17 +9738,17 @@ async fn column_flex_last_baseline_items_fall_back_to_inline_end() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("flex background should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("first last-baseline item should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second last-baseline item should paint");
 
     assert!(
@@ -9770,7 +9772,7 @@ async fn align_content_last_baseline_single_line_falls_back_to_logical_end() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!(
@@ -9794,7 +9796,7 @@ async fn align_content_baseline_wrap_reverse_single_line_falls_back_to_logical_s
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!(
@@ -9819,7 +9821,7 @@ async fn baseline_aligned_vertical_row_flex_item_falls_back_to_block_start() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!(
@@ -9853,7 +9855,7 @@ p { display: none }
     let mut green_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .cloned()
         .collect::<Vec<_>>();
     green_rects.sort_by(|a, b| a.y().partial_cmp(&b.y()).unwrap());
@@ -9895,7 +9897,7 @@ p { display: none }
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("flex background should render");
 
     for (x, y) in [
@@ -9906,7 +9908,7 @@ p { display: none }
     ] {
         assert_eq!(
             final_rect_fill_at(page, x, y),
-            Some(Color::new(0, 128, 0)),
+            Some(CssColor::new(0, 128, 0)),
             "sideways vertical-rl flex baseline synthesis should cover red at ({x}, {y})"
         );
     }
@@ -9935,7 +9937,7 @@ p { display: none }
     let mut green_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .cloned()
         .collect::<Vec<_>>();
     green_rects.sort_by(|a, b| a.y().total_cmp(&b.y()));
@@ -9971,7 +9973,7 @@ async fn last_baseline_single_item_falls_back_to_self_end() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!(
@@ -10005,12 +10007,12 @@ async fn explicit_baseline_align_self_uses_same_fallback_sides() {
     let first_green = first.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let last_green = last.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!(
@@ -10034,7 +10036,7 @@ async fn baseline_fallback_does_not_override_auto_cross_margin() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!(
@@ -10058,7 +10060,7 @@ async fn zero_percent_flex_basis_overrides_authored_main_size_for_empty_item() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("container background should paint");
 
     assert!((green.width() - 75.0).abs() < 0.01);
@@ -10067,7 +10069,7 @@ async fn zero_percent_flex_basis_overrides_authored_main_size_for_empty_item() {
         !document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(255, 0, 0)) && rect.width() > 0.01)
+            .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0)) && rect.width() > 0.01)
     );
 }
 
@@ -10086,12 +10088,12 @@ async fn flex_basis_content_ignores_authored_main_size_for_base_size() {
     let content = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     let auto = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!(
@@ -10235,7 +10237,7 @@ async fn collapsed_flex_item_before_replaced_item_keeps_source_indexed_auto_mini
         !document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(255, 0, 0))),
+            .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0))),
         "collapsed flex item must not paint"
     );
     assert_eq!(document.pages[0].images().len(), 1);
@@ -10261,12 +10263,12 @@ async fn flex_basis_intrinsic_keywords_use_min_and_max_content_sizes() {
     let min = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     let max = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!(
@@ -10298,17 +10300,17 @@ async fn flex_basis_fit_content_clamps_between_min_and_max_content() {
     let min = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     let fit = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let max = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!(
@@ -10335,7 +10337,7 @@ async fn flex_item_mixed_percentage_max_width_resolves_against_container() {
     let item = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!((item.width() - 110.0).abs() < 0.1, "item={item:?}");
@@ -10355,7 +10357,7 @@ async fn flex_item_mixed_percentage_min_width_resolves_against_container() {
     let item = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!((item.width() - 110.0).abs() < 0.1, "item={item:?}");
@@ -10376,7 +10378,7 @@ async fn flex_basis_mixed_percentage_resolves_against_definite_main_size() {
     let item = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!((item.width() - 110.0).abs() < 0.1, "item={item:?}");
@@ -10397,7 +10399,7 @@ async fn column_flex_basis_mixed_percentage_resolves_against_definite_main_size(
     let item = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!((item.height() - 60.0).abs() < 0.1, "item={item:?}");
@@ -10419,7 +10421,7 @@ async fn column_flex_item_definite_flex_basis_resolves_child_percentage_height()
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!(
@@ -10443,12 +10445,12 @@ async fn column_flex_item_mixed_percentage_min_max_height_resolves_against_conta
     let min = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let max = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!((min.height() - 60.0).abs() < 0.1, "min={min:?}");
@@ -10472,7 +10474,7 @@ async fn flex_auto_minimum_size_is_zero_for_scrollable_overflow() {
     let red_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .collect::<Vec<_>>();
 
     assert_eq!(red_rects.len(), 2);
@@ -10505,7 +10507,7 @@ async fn row_flex_auto_minimum_size_uses_overflow_x() {
     let red_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .collect::<Vec<_>>();
 
     assert_eq!(red_rects.len(), 2);
@@ -10541,7 +10543,7 @@ async fn row_flex_min_width_auto_uses_zero_for_non_visible_overflow_x() {
     let red_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .collect::<Vec<_>>();
 
     assert_eq!(red_rects.len(), 4);
@@ -10578,7 +10580,7 @@ async fn column_flex_auto_minimum_size_uses_overflow_y() {
     let red_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .collect::<Vec<_>>();
 
     assert_eq!(red_rects.len(), 2);
@@ -10605,7 +10607,7 @@ async fn flex_main_axis_auto_margin_absorbs_free_space() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!((blue.x() - 180.0).abs() < 0.01);
@@ -10622,17 +10624,17 @@ async fn supports_flex_wrap_and_flex_basis() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert_eq!(red.width(), 50.0);
@@ -10658,7 +10660,7 @@ async fn row_flex_item_page_break_before_does_not_create_standalone_pages() {
     let item_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(173, 216, 230)))
+        .filter(|rect| rect.fill == Some(CssColor::new(173, 216, 230)))
         .collect::<Vec<_>>();
     assert_eq!(item_rects.len(), 7);
     assert!((item_rects[0].height() - 20.0).abs() < 0.01);
@@ -10699,7 +10701,7 @@ async fn column_flex_item_page_break_before_does_not_create_standalone_pages() {
     let item_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(173, 216, 230)))
+        .filter(|rect| rect.fill == Some(CssColor::new(173, 216, 230)))
         .collect::<Vec<_>>();
     assert_eq!(item_rects.len(), 7);
     assert!(
@@ -10735,7 +10737,7 @@ async fn oversized_flex_container_at_page_top_does_not_create_leading_blank_page
         document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 128, 0))
+            .any(|rect| rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.height() - 80.0).abs() < 0.01),
         "oversized flex container should start on the first page without a leading blank page"
     );
@@ -10743,7 +10745,7 @@ async fn oversized_flex_container_at_page_top_does_not_create_leading_blank_page
         document.pages[1]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 128, 0))
+            .any(|rect| rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.height() - 60.0).abs() < 0.01),
         "oversized flex container should continue on the next page"
     );
@@ -10767,7 +10769,7 @@ async fn column_wrapped_flex_container_honors_min_height_without_wrapping() {
     let mut item_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(173, 216, 230)))
+        .filter(|rect| rect.fill == Some(CssColor::new(173, 216, 230)))
         .map(|rect| (rect.x(), rect.y(), rect.width(), rect.height()))
         .collect::<Vec<_>>();
     item_rects.sort_by(|a, b| {
@@ -10836,13 +10838,13 @@ async fn column_flex_auto_height_treats_zero_percent_flex_basis_as_content() {
     let target_border = target.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(128, 0, 128)))
+        .filter(|rect| rect.fill == Some(CssColor::new(128, 0, 128)))
         .map(|rect| (rect.x(), rect.y(), rect.width(), rect.height()))
         .collect::<Vec<_>>();
     let reference_border = reference.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(128, 0, 128)))
+        .filter(|rect| rect.fill == Some(CssColor::new(128, 0, 128)))
         .map(|rect| (rect.x(), rect.y(), rect.width(), rect.height()))
         .collect::<Vec<_>>();
 
@@ -10867,9 +10869,9 @@ async fn flex_container_creates_anonymous_items_for_nbsp_text_runs() {
             .find(|rect| rect.fill == Some(color))
             .unwrap()
     };
-    let red = rect(Color::new(255, 0, 0));
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!((blue.x() - 260.0).abs() < 0.01);
     assert!(red.x() < 160.0, "anonymous NBSP items must consume width");
@@ -10898,8 +10900,8 @@ async fn flex_container_ignores_preserved_document_whitespace_text_runs() {
             .find(|rect| rect.fill == Some(color))
             .unwrap()
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!(
         (red.x() - 70.0).abs() < 0.01,
@@ -10918,7 +10920,7 @@ async fn flex_column_item_definite_height_resolves_anonymous_descendant_percenta
          <style>@page { size: 300px 260px; margin: 0 } body { margin: 0 }\
          .flexbox { display: flex; flex-direction: column; width: 200px; height: 200px }</style>\
          <div class=\"flexbox\"><div style=\"height: 50%\">\
-         <button style=\"width: 200px; height: 100%\">\
+         <button style=\"box-sizing: border-box; width: 200px; height: 100%; padding: 0; border: 0\">\
          <div style=\"width: 200px; height: 100%; background-color: green\"></div>\
          </button></div></div>",
     )
@@ -10929,7 +10931,7 @@ async fn flex_column_item_definite_height_resolves_anonymous_descendant_percenta
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("percentage-height descendant should paint green");
 
     assert!(
@@ -10960,9 +10962,9 @@ async fn inline_block_fragment_lays_out_atomic_inline_children_in_one_line() {
             .find(|rect| rect.fill == Some(color))
             .unwrap()
     };
-    let red = rect(Color::new(255, 0, 0));
-    let green = rect(Color::new(0, 128, 0));
-    let blue = rect(Color::new(0, 0, 255));
+    let red = rect(CssColor::new(255, 0, 0));
+    let green = rect(CssColor::new(0, 128, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
 
     assert!((blue.x() - 260.0).abs() < 0.01);
     assert!(
@@ -11105,7 +11107,7 @@ async fn empty_inline_flex_synthesizes_baseline_from_margin_box() {
     .await
     .unwrap();
 
-    let purple = Color::new(128, 0, 128);
+    let purple = CssColor::new(128, 0, 128);
     let purple_rects = document.pages[0]
         .rects()
         .iter()
@@ -11142,12 +11144,12 @@ async fn flex_flow_wrap_align_content_stretch_stretches_lines() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     let green_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
 
     assert_eq!(green_rects.len(), 4);
@@ -11184,12 +11186,12 @@ async fn column_reverse_wrap_reverse_places_lines_in_reversed_cross_axis_order()
             .find(|rect| rect.fill == Some(color))
             .unwrap()
     };
-    let a = rect(Color::new(255, 0, 0));
-    let b = rect(Color::new(0, 128, 0));
-    let c = rect(Color::new(0, 0, 255));
-    let d = rect(Color::new(255, 255, 0));
-    let e = rect(Color::new(255, 0, 255));
-    let f = rect(Color::new(0, 255, 255));
+    let a = rect(CssColor::new(255, 0, 0));
+    let b = rect(CssColor::new(0, 128, 0));
+    let c = rect(CssColor::new(0, 0, 255));
+    let d = rect(CssColor::new(255, 255, 0));
+    let e = rect(CssColor::new(255, 0, 255));
+    let f = rect(CssColor::new(0, 255, 255));
 
     assert!((a.x() - b.x()).abs() < 0.01);
     assert!((b.x() - c.x()).abs() < 0.01);
@@ -11220,7 +11222,7 @@ async fn row_reverse_wrap_places_multiline_items_in_reverse_main_axis_order() {
     let rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(204, 204, 204)))
+        .filter(|rect| rect.fill == Some(CssColor::new(204, 204, 204)))
         .collect::<Vec<_>>();
 
     assert_eq!(rects.len(), 6);
@@ -11317,12 +11319,12 @@ async fn floated_flex_container_min_content_contains_inflexible_auto_basis_item_
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("floated flex container background should paint");
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("absolute red reference should paint behind it");
 
     assert!((green.width() - 75.0).abs() < 0.01, "green={green:?}");
@@ -11342,12 +11344,12 @@ async fn absolute_flex_children_use_flex_static_position_and_ignore_justify_self
     let yellow_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .collect::<Vec<_>>();
     let teal_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 128)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 128)))
         .collect::<Vec<_>>();
 
     assert_eq!(yellow_rects.len(), 3);
@@ -11372,12 +11374,12 @@ async fn floated_empty_block_children_preserve_backgrounds_in_scoped_paint() {
     let yellow_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .collect::<Vec<_>>();
     let teal_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 128)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 128)))
         .collect::<Vec<_>>();
 
     assert_eq!(yellow_rects.len(), 2);
@@ -11440,10 +11442,10 @@ async fn absolute_flex_children_ignore_flex_basis_for_auto_width() {
         .collect::<Vec<_>>();
     let purple_rects = visible_rects
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(128, 0, 128)));
+        .filter(|rect| rect.fill == Some(CssColor::new(128, 0, 128)));
     let teal_rects = visible_rects
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 128)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 128)))
         .collect::<Vec<_>>();
 
     assert_eq!(purple_rects.count(), 12);
@@ -11495,7 +11497,7 @@ async fn column_flex_indefinite_percentage_flex_basis_uses_content() {
     let red_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .collect::<Vec<_>>();
 
     assert_eq!(red_rects.len(), 2);
@@ -11527,20 +11529,20 @@ async fn column_flex_indefinite_zero_percent_flex_basis_ignores_authored_height(
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("content-height child should paint");
 
     assert!((green.width() - 75.0).abs() < 0.01, "green={green:?}");
     assert!((green.height() - 75.0).abs() < 0.01, "green={green:?}");
     assert_eq!(
         final_rect_fill_at(&document.pages[0], green.x() + 37.5, green.y() + 37.5),
-        Some(Color::new(0, 128, 0))
+        Some(CssColor::new(0, 128, 0))
     );
     assert!(
         document.pages[0]
             .rects()
             .iter()
-            .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+            .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
             .all(|rect| rect.height() <= 75.0 + 0.01),
         "indefinite 0% flex-basis should use content height, not the authored height: {:?}",
         document.pages[0].rects()
@@ -11569,12 +11571,12 @@ async fn column_flex_zero_percent_flex_basis_only_falls_back_when_indefinite() {
     let green_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
     let red_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .collect::<Vec<_>>();
 
     assert_eq!(
@@ -11606,14 +11608,14 @@ async fn flex_start_items_cover_cross_start_gradient_band() {
     let red_band_index = page
         .rects()
         .iter()
-        .position(|rect| rect.fill == Some(Color::new(255, 0, 0)) && rect.height() == 37.5)
+        .position(|rect| rect.fill == Some(CssColor::new(255, 0, 0)) && rect.height() == 37.5)
         .expect("gradient red band should be painted");
     let green_items = page
         .rects()
         .iter()
         .enumerate()
         .filter(|(_, rect)| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.width() - 112.5).abs() < 0.01
                 && (rect.height() - 38.25).abs() < 0.01
         })
@@ -11644,7 +11646,7 @@ async fn align_content_flex_end_packs_lines_against_cross_end() {
     let red_band_index = page
         .rects()
         .iter()
-        .position(|rect| rect.fill == Some(Color::new(255, 0, 0)) && rect.height() == 37.5)
+        .position(|rect| rect.fill == Some(CssColor::new(255, 0, 0)) && rect.height() == 37.5)
         .expect("gradient red band should be painted");
     let red = &page.rects()[red_band_index];
     let green_items = page
@@ -11652,7 +11654,7 @@ async fn align_content_flex_end_packs_lines_against_cross_end() {
         .iter()
         .enumerate()
         .filter(|(_, rect)| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.width() - 112.5).abs() < 0.01
                 && (rect.height() - 19.5).abs() < 0.01
         })
@@ -11689,7 +11691,7 @@ async fn flex_place_content_expands_to_align_and_justify_content() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.width() - 40.0).abs() < 0.01
                 && (rect.height() - 10.0).abs() < 0.01
         })
@@ -11722,12 +11724,12 @@ async fn flex_gap_accepts_css_math_functions() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!((blue.x() - (green.x() + green.width() + 10.0)).abs() < 0.1);
@@ -11752,9 +11754,9 @@ async fn vertical_rl_column_flex_gap_uses_physical_horizontal_axis() {
             .find(|rect| rect.fill == Some(color))
             .unwrap()
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
-    let black = rect(Color::new(0, 0, 0));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
+    let black = rect(CssColor::new(0, 0, 0));
 
     assert!((red.x() - 70.0).abs() < 0.01, "red={red:?}");
     assert!((blue.x() - 40.0).abs() < 0.01, "blue={blue:?}");
@@ -11784,10 +11786,10 @@ async fn vertical_rl_row_wrap_stacks_lines_from_physical_right() {
             .filter(|rect| rect.fill == Some(color))
             .collect::<Vec<_>>()
     };
-    let cyans = rects(Color::new(0, 255, 255));
-    let magentas = rects(Color::new(255, 0, 255));
-    let yellows = rects(Color::new(255, 255, 0));
-    let blacks = rects(Color::new(0, 0, 0));
+    let cyans = rects(CssColor::new(0, 255, 255));
+    let magentas = rects(CssColor::new(255, 0, 255));
+    let yellows = rects(CssColor::new(255, 255, 0));
+    let blacks = rects(CssColor::new(0, 0, 0));
 
     assert_eq!(cyans.len(), 2, "{:?}", page.rects());
     assert_eq!(magentas.len(), 2, "{:?}", page.rects());
@@ -11840,10 +11842,10 @@ async fn vertical_rl_row_wrap_reverse_stacks_lines_from_physical_left() {
             .find(|rect| rect.fill == Some(color))
             .unwrap()
     };
-    let cyan = rect(Color::new(0, 255, 255));
-    let magenta = rect(Color::new(255, 0, 255));
-    let yellow = rect(Color::new(255, 255, 0));
-    let black = rect(Color::new(0, 0, 0));
+    let cyan = rect(CssColor::new(0, 255, 255));
+    let magenta = rect(CssColor::new(255, 0, 255));
+    let yellow = rect(CssColor::new(255, 255, 0));
+    let black = rect(CssColor::new(0, 0, 0));
 
     assert!((cyan.x() - 0.0).abs() < 0.01, "cyan={cyan:?}");
     assert!((magenta.x() - 0.0).abs() < 0.01, "magenta={magenta:?}");
@@ -11866,7 +11868,7 @@ async fn vertical_rl_row_align_items_flex_start_uses_physical_right() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!((green.x() - 20.0).abs() < 0.01, "green={green:?}");
@@ -11896,10 +11898,10 @@ async fn vertical_rl_row_flex_items_use_vertical_inline_forced_breaks() {
             .find(|rect| rect.fill == Some(color))
             .unwrap()
     };
-    let grey = rect(Color::new(128, 128, 128));
-    let orange = rect(Color::new(255, 165, 0));
-    let blue = rect(Color::new(0, 0, 255));
-    let yellow = rect(Color::new(255, 255, 0));
+    let grey = rect(CssColor::new(128, 128, 128));
+    let orange = rect(CssColor::new(255, 165, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
+    let yellow = rect(CssColor::new(255, 255, 0));
 
     assert!(
         (grey.y() - orange.y()).abs() < 0.01 && (yellow.y() - blue.y()).abs() < 0.01,
@@ -11939,10 +11941,10 @@ async fn vertical_lr_row_wrap_stacks_lines_from_physical_left() {
             .find(|rect| rect.fill == Some(color))
             .unwrap()
     };
-    let cyan = rect(Color::new(0, 255, 255));
-    let magenta = rect(Color::new(255, 0, 255));
-    let yellow = rect(Color::new(255, 255, 0));
-    let black = rect(Color::new(0, 0, 0));
+    let cyan = rect(CssColor::new(0, 255, 255));
+    let magenta = rect(CssColor::new(255, 0, 255));
+    let yellow = rect(CssColor::new(255, 255, 0));
+    let black = rect(CssColor::new(0, 0, 0));
 
     assert!((cyan.x() - 0.0).abs() < 0.01, "cyan={cyan:?}");
     assert!((magenta.x() - 0.0).abs() < 0.01, "magenta={magenta:?}");
@@ -11969,9 +11971,9 @@ async fn vertical_rl_column_flex_ignores_direction_for_block_axis() {
             .find(|rect| rect.fill == Some(color))
             .unwrap()
     };
-    let red = rect(Color::new(255, 0, 0));
-    let blue = rect(Color::new(0, 0, 255));
-    let black = rect(Color::new(0, 0, 0));
+    let red = rect(CssColor::new(255, 0, 0));
+    let blue = rect(CssColor::new(0, 0, 255));
+    let black = rect(CssColor::new(0, 0, 0));
 
     assert!((red.x() - 60.0).abs() < 0.01, "red={red:?}");
     assert!((blue.x() - 30.0).abs() < 0.01, "blue={blue:?}");
@@ -11984,37 +11986,37 @@ async fn vertical_rl_rtl_column_wrapping_uses_vertical_inline_cross_start() {
         (
             "column wrap",
             [
-                (Color::new(0, 0, 0), 0.0, 15.0),
-                (Color::new(255, 255, 0), 20.0, 15.0),
-                (Color::new(255, 0, 255), 0.0, 0.0),
-                (Color::new(0, 255, 255), 20.0, 0.0),
+                (CssColor::new(0, 0, 0), 0.0, 15.0),
+                (CssColor::new(255, 255, 0), 20.0, 15.0),
+                (CssColor::new(255, 0, 255), 0.0, 0.0),
+                (CssColor::new(0, 255, 255), 20.0, 0.0),
             ],
         ),
         (
             "column wrap-reverse",
             [
-                (Color::new(255, 0, 255), 0.0, 15.0),
-                (Color::new(0, 255, 255), 20.0, 15.0),
-                (Color::new(0, 0, 0), 0.0, 0.0),
-                (Color::new(255, 255, 0), 20.0, 0.0),
+                (CssColor::new(255, 0, 255), 0.0, 15.0),
+                (CssColor::new(0, 255, 255), 20.0, 15.0),
+                (CssColor::new(0, 0, 0), 0.0, 0.0),
+                (CssColor::new(255, 255, 0), 20.0, 0.0),
             ],
         ),
         (
             "column-reverse wrap",
             [
-                (Color::new(255, 255, 0), 0.0, 15.0),
-                (Color::new(0, 0, 0), 20.0, 15.0),
-                (Color::new(0, 255, 255), 0.0, 0.0),
-                (Color::new(255, 0, 255), 20.0, 0.0),
+                (CssColor::new(255, 255, 0), 0.0, 15.0),
+                (CssColor::new(0, 0, 0), 20.0, 15.0),
+                (CssColor::new(0, 255, 255), 0.0, 0.0),
+                (CssColor::new(255, 0, 255), 20.0, 0.0),
             ],
         ),
         (
             "column-reverse wrap-reverse",
             [
-                (Color::new(0, 255, 255), 0.0, 15.0),
-                (Color::new(255, 0, 255), 20.0, 15.0),
-                (Color::new(255, 255, 0), 0.0, 0.0),
-                (Color::new(0, 0, 0), 20.0, 0.0),
+                (CssColor::new(0, 255, 255), 0.0, 15.0),
+                (CssColor::new(255, 0, 255), 20.0, 15.0),
+                (CssColor::new(255, 255, 0), 0.0, 0.0),
+                (CssColor::new(0, 0, 0), 20.0, 0.0),
             ],
         ),
     ] {
@@ -12103,7 +12105,7 @@ async fn vertical_inline_block_and_inline_flex_atoms_use_logical_inline_size() {
     let mut green_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .cloned()
         .collect::<Vec<_>>();
     green_rects.sort_by(|a, b| a.y().partial_cmp(&b.y()).unwrap());
@@ -12127,7 +12129,7 @@ async fn vertical_inline_block_and_inline_flex_atoms_use_logical_inline_size() {
             lower.x() + lower.width() / 2.0,
             lower.y() + lower.height() / 2.0
         ),
-        Some(Color::new(0, 128, 0))
+        Some(CssColor::new(0, 128, 0))
     );
     assert_eq!(
         final_rect_fill_at(
@@ -12135,7 +12137,7 @@ async fn vertical_inline_block_and_inline_flex_atoms_use_logical_inline_size() {
             upper.x() + upper.width() / 2.0,
             upper.y() + upper.height() / 2.0
         ),
-        Some(Color::new(0, 128, 0))
+        Some(CssColor::new(0, 128, 0))
     );
 }
 
@@ -12155,7 +12157,7 @@ async fn column_inline_flex_logical_block_margins_match_gap_spacing() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("inline-flex background should paint");
     assert!(
         (green.height() - 60.0).abs() < 0.01,
@@ -12165,7 +12167,7 @@ async fn column_inline_flex_logical_block_margins_match_gap_spacing() {
     let gray_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(128, 128, 128)))
+        .filter(|rect| rect.fill == Some(CssColor::new(128, 128, 128)))
         .collect::<Vec<_>>();
     assert_eq!(gray_rects.len(), 3);
     assert!(
@@ -12190,12 +12192,12 @@ async fn flex_visibility_collapse_removes_item_from_main_axis_layout() {
         !document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+            .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
     );
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
 
     assert!((blue.x() - 50.0).abs() < 0.1, "blue.x()={}", blue.x());
@@ -12217,7 +12219,7 @@ async fn flex_visibility_collapse_preserves_row_cross_size_strut() {
     let flex_background = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK))
+        .find(|rect| rect.fill == Some(CssColor::BLACK))
         .unwrap();
 
     assert!((flex_background.height() - 40.0).abs() < 0.1);
@@ -12251,7 +12253,7 @@ async fn flex_root_preserves_subpoint_absolute_lengths() {
     let body = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::WHITE))
+        .find(|rect| rect.fill == Some(CssColor::WHITE))
         .unwrap();
 
     // CSS Values and Units defines 1in = 96px = 72pt; flex layout must not
@@ -12276,7 +12278,7 @@ async fn flex_root_paints_html_background_on_page_canvas() {
             && rect.y() == 0.0
             && rect.width() == 100.0
             && rect.height() == 100.0
-            && rect.fill == Some(Color::new(238, 241, 245))
+            && rect.fill == Some(CssColor::new(238, 241, 245))
     }));
 }
 
@@ -12291,12 +12293,12 @@ async fn flex_parent_background_paints_before_child_backgrounds() {
     let white_index = document.pages[0]
         .rects()
         .iter()
-        .position(|rect| rect.fill == Some(Color::WHITE))
+        .position(|rect| rect.fill == Some(CssColor::WHITE))
         .unwrap();
     let black_index = document.pages[0]
         .rects()
         .iter()
-        .position(|rect| rect.fill == Some(Color::BLACK))
+        .position(|rect| rect.fill == Some(CssColor::BLACK))
         .unwrap();
 
     assert!(white_index < black_index);
@@ -12313,7 +12315,7 @@ async fn nested_column_flex_item_uses_intrinsic_auto_width() {
     let stub = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK))
+        .find(|rect| rect.fill == Some(CssColor::BLACK))
         .unwrap();
 
     assert!(stub.width() > 20.0);
@@ -12367,7 +12369,10 @@ async fn flex_auto_basis_border_box_includes_padding_and_border() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(42, 50, 57))
+            rect.fill == Some(CssColor::new(42, 50, 57))
+                // The sample authors a 1pt border. Used border widths are
+                // layout geometry, so it remains one PDF point at the paint
+                // boundary rather than being converted as a CSS pixel.
                 && (rect.width() - 1.0).abs() < 0.01
                 && rect.height() > 2.0
                 && rect.height() < 4.0
@@ -12496,15 +12501,15 @@ async fn inline_block_block_child_paints_above_atom_background() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("inline-block background should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("block child background should paint");
-    let red_index = first_rect_paint_operation_index(page, Color::new(255, 0, 0));
-    let green_index = first_rect_paint_operation_index(page, Color::new(0, 128, 0));
+    let red_index = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
+    let green_index = first_rect_paint_operation_index(page, CssColor::new(0, 128, 0));
 
     assert!(
         red_index < green_index,
@@ -12516,7 +12521,7 @@ async fn inline_block_block_child_paints_above_atom_background() {
             red.x() + red.width() / 2.0,
             red.y() + red.height() / 2.0
         ),
-        Some(Color::new(0, 128, 0)),
+        Some(CssColor::new(0, 128, 0)),
     );
     assert!((green.x() - red.x()).abs() < 0.01);
     assert!((green.y() - red.y()).abs() < 0.01);
@@ -12535,12 +12540,12 @@ async fn inline_block_absolute_child_escapes_pseudo_context_at_static_position()
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("inline-block background should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolute child background should paint");
 
     assert_eq!(
@@ -12549,7 +12554,7 @@ async fn inline_block_absolute_child_escapes_pseudo_context_at_static_position()
             red.x() + red.width() / 2.0,
             red.y() + red.height() / 2.0
         ),
-        Some(Color::new(0, 128, 0)),
+        Some(CssColor::new(0, 128, 0)),
     );
     assert!((green.x() - red.x()).abs() < 0.01);
     assert!((green.y() - red.y()).abs() < 0.01);
@@ -12575,12 +12580,12 @@ async fn inline_block_absolute_child_static_position_uses_atom_origin_after_text
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("inline-block background should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolute child background should paint");
 
     assert_eq!(
@@ -12589,7 +12594,7 @@ async fn inline_block_absolute_child_static_position_uses_atom_origin_after_text
             red.x() + red.width() / 2.0,
             red.y() + red.height() / 2.0
         ),
-        Some(Color::new(0, 128, 0)),
+        Some(CssColor::new(0, 128, 0)),
     );
     assert!((green.x() - red.x()).abs() < 0.01);
     assert!((green.y() - red.y()).abs() < 0.01);
@@ -12615,12 +12620,12 @@ async fn inline_block_explicit_absolute_child_keeps_page_resolved_insets() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("inline-block background should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolute child background should paint");
 
     assert!(
@@ -12644,7 +12649,7 @@ async fn inline_block_does_not_create_implicit_spaces() {
     let background = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK))
+        .find(|rect| rect.fill == Some(CssColor::BLACK))
         .unwrap();
     let after = document.pages[0]
         .lines()
@@ -12666,7 +12671,7 @@ async fn inline_block_preserves_explicit_collapsed_spaces() {
     let background = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK))
+        .find(|rect| rect.fill == Some(CssColor::BLACK))
         .unwrap();
     let after = document.pages[0]
         .lines()
@@ -12688,7 +12693,7 @@ async fn inline_block_paints_atomic_box_before_following_inline_text() {
     let background = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK) && rect.width() > 40.0)
+        .find(|rect| rect.fill == Some(CssColor::BLACK) && rect.width() > 40.0)
         .unwrap();
     let before = document.pages[0]
         .lines()
@@ -12723,7 +12728,7 @@ async fn inline_block_explicit_height_is_not_expanded_by_line_height() {
     let background = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!((background.height() - 30.0).abs() < 0.01);
@@ -12746,13 +12751,13 @@ async fn inline_block_middle_alignment_does_not_inflate_wrapped_rows() {
     let wrapper = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("wrapper background should paint");
     let mut green_rects = page
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.width() - 30.0).abs() < 0.01
                 && (rect.height() - 30.0).abs() < 0.01
         })
@@ -12795,7 +12800,7 @@ async fn inline_block_lays_out_block_children_as_atomic_fragment() {
     let background = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK) && rect.width() > 40.0)
+        .find(|rect| rect.fill == Some(CssColor::BLACK) && rect.width() > 40.0)
         .unwrap();
     let before = document.pages[0]
         .lines()
@@ -12839,7 +12844,7 @@ async fn inline_block_fragment_replays_through_paint_operation_stream() {
     let background_index = page
         .rects()
         .iter()
-        .position(|rect| rect.fill == Some(Color::BLACK) && rect.width() > 40.0)
+        .position(|rect| rect.fill == Some(CssColor::BLACK) && rect.width() > 40.0)
         .unwrap();
     let one_index = page
         .lines()
@@ -12889,7 +12894,7 @@ async fn flex_items_are_blockified_for_painting() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert_eq!(red.width(), 100.0);
@@ -13056,8 +13061,8 @@ async fn block_outline_paints_after_child_content() {
     .unwrap();
     let page = &document.pages[0];
 
-    let child_operation = first_rect_paint_operation_index(page, Color::new(0, 0, 255));
-    let outline_operation = first_rect_paint_operation_index(page, Color::new(255, 0, 0));
+    let child_operation = first_rect_paint_operation_index(page, CssColor::new(0, 0, 255));
+    let outline_operation = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
 
     assert!(
         outline_operation > child_operation,
@@ -13078,8 +13083,8 @@ async fn inline_block_outline_paints_after_atomic_content() {
     .unwrap();
     let page = &document.pages[0];
 
-    let child_operation = first_rect_paint_operation_index(page, Color::new(0, 0, 255));
-    let outline_operation = first_rect_paint_operation_index(page, Color::new(255, 0, 0));
+    let child_operation = first_rect_paint_operation_index(page, CssColor::new(0, 0, 255));
+    let outline_operation = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
 
     assert!(
         outline_operation > child_operation,
@@ -13109,7 +13114,7 @@ async fn zero_font_separators_still_create_atomic_inline_break_opportunities() {
     let mut orange_rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 165, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 165, 0)))
         .collect::<Vec<_>>();
     orange_rects.sort_by(|left, right| right.y().total_cmp(&left.y()));
 
@@ -13157,9 +13162,9 @@ async fn float_band_paints_between_in_flow_block_and_inline_content() {
     .unwrap();
     let page = &document.pages[0];
 
-    let block_operation = first_rect_paint_operation_index(page, Color::new(255, 0, 0));
-    let float_operation = first_rect_paint_operation_index(page, Color::new(0, 128, 0));
-    let inline_operation = first_rect_paint_operation_index(page, Color::new(0, 0, 255));
+    let block_operation = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
+    let float_operation = first_rect_paint_operation_index(page, CssColor::new(0, 128, 0));
+    let inline_operation = first_rect_paint_operation_index(page, CssColor::new(0, 0, 255));
 
     assert!(block_operation < float_operation);
     assert!(float_operation < inline_operation);
@@ -13186,23 +13191,23 @@ async fn bfc_root_separates_adjoining_float_replay_when_it_cannot_fit() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("green float should paint");
 
     assert!((green.width() - 150.0).abs() < 0.01, "{green:?}");
     assert!((green.height() - 150.0).abs() < 0.01, "{green:?}");
     assert_eq!(
         final_rect_fill_at(page, green.x() + 75.0, green.y() + 75.0),
-        Some(Color::new(0, 128, 0))
+        Some(CssColor::new(0, 128, 0))
     );
     assert_eq!(
         final_rect_fill_at(page, 75.0, 300.0),
-        Some(Color::new(0, 128, 0)),
+        Some(CssColor::new(0, 128, 0)),
         "the float must not be replayed below the adjoining BFC margin"
     );
 }
 
-fn colored_rect_width(document: &quire::Document, color: Color) -> f32 {
+fn colored_rect_width(document: &quire::Document, color: CssColor) -> f32 {
     document.pages[0]
         .rects()
         .iter()
@@ -13230,9 +13235,9 @@ async fn inline_block_width_intrinsic_keywords_use_min_fit_and_max_content() {
     .await
     .unwrap();
 
-    let min = colored_rect_width(&document, Color::new(0, 128, 0));
-    let fit = colored_rect_width(&document, Color::new(0, 0, 255));
-    let max = colored_rect_width(&document, Color::new(0, 0, 0));
+    let min = colored_rect_width(&document, CssColor::new(0, 128, 0));
+    let fit = colored_rect_width(&document, CssColor::new(0, 0, 255));
+    let max = colored_rect_width(&document, CssColor::new(0, 0, 0));
     assert!(
         min < fit && fit < max,
         "inline-block intrinsic widths should order min < fit < max: min={min}, fit={fit}, max={max}"
@@ -13253,9 +13258,9 @@ async fn abspos_width_intrinsic_keywords_use_min_fit_and_max_content() {
     .await
     .unwrap();
 
-    let min = colored_rect_width(&document, Color::new(0, 128, 0));
-    let fit = colored_rect_width(&document, Color::new(0, 0, 255));
-    let max = colored_rect_width(&document, Color::new(0, 0, 0));
+    let min = colored_rect_width(&document, CssColor::new(0, 128, 0));
+    let fit = colored_rect_width(&document, CssColor::new(0, 0, 255));
+    let max = colored_rect_width(&document, CssColor::new(0, 0, 0));
     assert!(
         min < fit && fit < max,
         "abspos intrinsic widths should order min < fit < max: min={min}, fit={fit}, max={max}"
@@ -13276,9 +13281,9 @@ async fn float_width_intrinsic_keywords_use_min_fit_and_max_content() {
     .await
     .unwrap();
 
-    let min = colored_rect_width(&document, Color::new(0, 128, 0));
-    let fit = colored_rect_width(&document, Color::new(0, 0, 255));
-    let max = colored_rect_width(&document, Color::new(0, 0, 0));
+    let min = colored_rect_width(&document, CssColor::new(0, 128, 0));
+    let fit = colored_rect_width(&document, CssColor::new(0, 0, 255));
+    let max = colored_rect_width(&document, CssColor::new(0, 0, 0));
     assert!(
         min < fit && fit < max,
         "float intrinsic widths should order min < fit < max: min={min}, fit={fit}, max={max}"
@@ -13301,9 +13306,9 @@ async fn inline_table_width_intrinsic_keywords_use_min_fit_and_max_content() {
     .await
     .unwrap();
 
-    let min = colored_rect_width(&document, Color::new(0, 128, 0));
-    let fit = colored_rect_width(&document, Color::new(0, 0, 255));
-    let max = colored_rect_width(&document, Color::new(0, 0, 0));
+    let min = colored_rect_width(&document, CssColor::new(0, 128, 0));
+    let fit = colored_rect_width(&document, CssColor::new(0, 0, 255));
+    let max = colored_rect_width(&document, CssColor::new(0, 0, 0));
     assert!(
         min < fit && fit < max,
         "inline-table intrinsic widths should order min < fit < max: min={min}, fit={fit}, max={max}"
@@ -13336,7 +13341,7 @@ body { margin: 0 }
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| panic!("expected green flex item background: {:?}", page.rects()));
 
     assert!(

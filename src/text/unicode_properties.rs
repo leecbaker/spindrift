@@ -1,4 +1,5 @@
 use super::*;
+use icu_locale_core::LanguageIdentifier;
 
 static JOINING_TYPES: OnceLock<CodePointMapDataBorrowed<'static, JoiningType>> = OnceLock::new();
 static JOIN_CONTROLS: OnceLock<CodePointSetDataBorrowed<'static>> = OnceLock::new();
@@ -17,6 +18,146 @@ static GENERAL_CATEGORIES: OnceLock<CodePointMapDataBorrowed<'static, GeneralCat
     OnceLock::new();
 static DEFAULT_IGNORABLE_CODE_POINTS: OnceLock<CodePointSetDataBorrowed<'static>> = OnceLock::new();
 static EMOJI_CODE_POINTS: OnceLock<CodePointSetDataBorrowed<'static>> = OnceLock::new();
+static EMOJI_PRESENTATION_CODE_POINTS: OnceLock<CodePointSetDataBorrowed<'static>> =
+    OnceLock::new();
+
+/// The CSS Text writing system inferred from a declared BCP 47 content
+/// language.
+///
+/// The writing system, rather than the language alone, controls the
+/// language-sensitive line-breaking and segment-break tailoring.  An explicit
+/// ISO 15924 script subtag takes precedence over the language's usual writing
+/// system, for example `ja-Hang` is Korean while `en-Hrkt` is Japanese.
+/// <https://drafts.csswg.org/css-text-3/#script-tagging>
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContentWritingSystem {
+    Unknown,
+    Chinese,
+    Japanese,
+    Korean,
+    Yi,
+    Other,
+}
+
+/// CSS Text 4's relevant CJK punctuation classes.
+///
+/// The classification is deliberately narrower than generic Unicode
+/// punctuation: `text-spacing-trim` operates only on the CJK/fullwidth
+/// punctuation classes defined by CSS Text, with language-sensitive treatment
+/// for colon and dot punctuation:
+/// <https://drafts.csswg.org/css-text-4/#text-spacing-character-classes>.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextSpacingPunctuationClass {
+    Opening,
+    Closing,
+    MiddleDot,
+    IdeographicSpace,
+    NarrowOpening,
+    NarrowClosing,
+}
+
+/// Classify one base character for CSS `text-spacing-trim`.
+pub(crate) fn text_spacing_punctuation_class(
+    character: char,
+    language: Option<&str>,
+    vertical: bool,
+) -> Option<TextSpacingPunctuationClass> {
+    if matches!(character, '(' | '[' | '{') {
+        return Some(TextSpacingPunctuationClass::NarrowOpening);
+    }
+    if matches!(character, ')' | ']' | '}') {
+        return Some(TextSpacingPunctuationClass::NarrowClosing);
+    }
+    if character == '\u{3000}' {
+        return Some(TextSpacingPunctuationClass::IdeographicSpace);
+    }
+    if matches!(character, '\u{2018}' | '\u{201c}') {
+        return Some(TextSpacingPunctuationClass::Opening);
+    }
+    if matches!(character, '\u{2019}' | '\u{201d}') {
+        return Some(TextSpacingPunctuationClass::Closing);
+    }
+    if matches!(character, '\u{00b7}' | '\u{2027}' | '\u{30fb}') {
+        return Some(TextSpacingPunctuationClass::MiddleDot);
+    }
+    if matches!(character, '\u{ff1a}' | '\u{ff1b}') {
+        return Some(colon_or_dot_spacing_class(language, vertical, true));
+    }
+    if matches!(character, '\u{3001}' | '\u{3002}' | '\u{ff0c}' | '\u{ff0e}') {
+        return Some(colon_or_dot_spacing_class(language, vertical, false));
+    }
+
+    let east_asian_width = EAST_ASIAN_WIDTHS
+        .get_or_init(CodePointMapData::<EastAsianWidth>::new)
+        .get(character);
+    let is_fullwidth_cjk_punctuation = matches!(east_asian_width, EastAsianWidth::Fullwidth)
+        || ('\u{3000}'..='\u{303f}').contains(&character);
+    if !is_fullwidth_cjk_punctuation {
+        return None;
+    }
+    match general_category(character) {
+        GeneralCategory::OpenPunctuation => Some(TextSpacingPunctuationClass::Opening),
+        GeneralCategory::ClosePunctuation => Some(TextSpacingPunctuationClass::Closing),
+        _ => None,
+    }
+}
+
+fn colon_or_dot_spacing_class(
+    language: Option<&str>,
+    _vertical: bool,
+    colon: bool,
+) -> TextSpacingPunctuationClass {
+    let language = language.unwrap_or_default().trim().to_ascii_lowercase();
+    // CSS Text permits language and writing-mode conventions here. These are
+    // the normative informative defaults: simplified Chinese places both on
+    // the closing side, traditional Chinese centers both, Japanese centers
+    // colons and treats dots as closing, and Korean follows the same split.
+    if language.starts_with("zh-hant") || language.starts_with("zh-tw") {
+        TextSpacingPunctuationClass::MiddleDot
+    } else if language.starts_with("ja") || language.starts_with("ko") {
+        if colon {
+            TextSpacingPunctuationClass::MiddleDot
+        } else {
+            TextSpacingPunctuationClass::Closing
+        }
+    } else {
+        TextSpacingPunctuationClass::Closing
+    }
+}
+
+/// Resolve the CSS Text content writing system from a declared BCP 47 tag.
+///
+/// Unknown or malformed language tags remain unknown.  A recognized script
+/// subtag always wins over the language's customary writing system, so callers
+/// cannot accidentally apply Japanese behavior to `ja-Latn` or `ja-Hang`.
+/// <https://drafts.csswg.org/css-text-3/#script-tagging>
+pub(crate) fn content_writing_system(language: Option<&str>) -> ContentWritingSystem {
+    let Some(language) = language else {
+        return ContentWritingSystem::Unknown;
+    };
+    let normalized = language.trim().replace('_', "-");
+    let Ok(identifier) = normalized.parse::<LanguageIdentifier>() else {
+        return ContentWritingSystem::Unknown;
+    };
+    if let Some(script) = identifier.script {
+        return match script.as_str() {
+            "Hant" | "Hans" | "Hani" | "Hanb" | "Bopo" => ContentWritingSystem::Chinese,
+            "Jpan" | "Hrkt" | "Hira" | "Kana" => ContentWritingSystem::Japanese,
+            "Kore" | "Hang" | "Jamo" => ContentWritingSystem::Korean,
+            "Yiii" => ContentWritingSystem::Yi,
+            "Zzzz" => ContentWritingSystem::Unknown,
+            _ => ContentWritingSystem::Other,
+        };
+    }
+    match identifier.language.as_str() {
+        "zh" => ContentWritingSystem::Chinese,
+        "ja" => ContentWritingSystem::Japanese,
+        "ko" => ContentWritingSystem::Korean,
+        "ii" => ContentWritingSystem::Yi,
+        "und" => ContentWritingSystem::Unknown,
+        _ => ContentWritingSystem::Other,
+    }
+}
 
 /// Return whether a character participates in cursive joining.
 ///
@@ -172,31 +313,10 @@ pub(crate) fn segment_break_is_removable(context: SegmentBreakContext<'_>) -> bo
 /// subtags independently of their primary language, such as `ain-Kana`.
 /// <https://drafts.csswg.org/css-text-3/#script-tagging>
 fn writing_system_omits_word_separators(language: Option<&str>) -> bool {
-    let Some(language) = language else {
-        return false;
-    };
-    let mut subtags = language.split(['-', '_']);
-    let Some(primary) = subtags.next() else {
-        return false;
-    };
-    if primary.eq_ignore_ascii_case("zh")
-        || primary.eq_ignore_ascii_case("ja")
-        || primary.eq_ignore_ascii_case("ii")
-    {
-        return true;
-    }
-    subtags.any(|subtag| {
-        subtag.eq_ignore_ascii_case("hant")
-            || subtag.eq_ignore_ascii_case("hans")
-            || subtag.eq_ignore_ascii_case("hani")
-            || subtag.eq_ignore_ascii_case("hanb")
-            || subtag.eq_ignore_ascii_case("bopo")
-            || subtag.eq_ignore_ascii_case("jpan")
-            || subtag.eq_ignore_ascii_case("hrkt")
-            || subtag.eq_ignore_ascii_case("hira")
-            || subtag.eq_ignore_ascii_case("kana")
-            || subtag.eq_ignore_ascii_case("yiii")
-    })
+    matches!(
+        content_writing_system(language),
+        ContentWritingSystem::Chinese | ContentWritingSystem::Japanese | ContentWritingSystem::Yi
+    )
 }
 
 /// Return whether a scalar has Unicode General_Category `Sc`.
@@ -253,6 +373,29 @@ pub(crate) fn typographic_unit_is_upright_in_mixed_orientation(text: &str) -> bo
             matches!(
                 character_vertical_orientation(character),
                 VerticalOrientation::Upright | VerticalOrientation::TransformedUpright
+            )
+        })
+}
+
+/// Return whether one typographic unit selects OpenType vertical glyph forms
+/// under `text-orientation: mixed`.
+///
+/// CSS Writing Modes keeps `Vertical_Orientation=Tr` units sideways, but they
+/// are *transformed rotated*: their vertical glyph form is selected before
+/// the sideways rotation. `U` and `Tu` units likewise select vertical forms
+/// while remaining upright. `R` units use their ordinary horizontal glyphs.
+/// Combining marks and default-ignorable controls inherit the first visible
+/// base character in the unit.
+/// <https://www.w3.org/TR/css-writing-modes-4/#text-orientation>
+pub(crate) fn typographic_unit_uses_vertical_forms_in_mixed_orientation(text: &str) -> bool {
+    text.chars()
+        .find(|character| !character_inherits_vertical_orientation(*character))
+        .is_some_and(|character| {
+            matches!(
+                character_vertical_orientation(character),
+                VerticalOrientation::Upright
+                    | VerticalOrientation::TransformedUpright
+                    | VerticalOrientation::TransformedRotated
             )
         })
 }
@@ -602,6 +745,15 @@ pub(crate) fn character_is_emoji(character: char) -> bool {
         .contains(character)
 }
 
+/// Return whether an emoji character has Unicode emoji presentation by
+/// default, before an explicit U+FE0E/U+FE0F selector is applied.
+/// <https://unicode.org/reports/tr51/#Emoji_Presentation>
+pub(crate) fn character_has_emoji_presentation(character: char) -> bool {
+    EMOJI_PRESENTATION_CODE_POINTS
+        .get_or_init(CodePointSetData::new::<EmojiPresentation>)
+        .contains(character)
+}
+
 /// Return whether a default-ignorable control is neutral for font selection.
 ///
 /// CSS Text shaping must preserve controls that affect glyph selection or
@@ -701,6 +853,19 @@ mod tests {
         assert!(typographic_unit_is_upright_in_mixed_orientation(
             "\u{200d}中"
         ));
+
+        assert!(!typographic_unit_uses_vertical_forms_in_mixed_orientation(
+            "a"
+        ));
+        assert!(typographic_unit_uses_vertical_forms_in_mixed_orientation(
+            "§"
+        ));
+        assert!(typographic_unit_uses_vertical_forms_in_mixed_orientation(
+            "、"
+        ));
+        assert!(typographic_unit_uses_vertical_forms_in_mixed_orientation(
+            "\u{2329}"
+        ));
     }
 
     #[test]
@@ -744,8 +909,44 @@ mod tests {
             before: 'E',
             after: '～',
             before_is_currency_amount: false,
+            language: Some("ja-Hang"),
+        }));
+        assert!(segment_break_is_removable(SegmentBreakContext {
+            before: 'E',
+            after: '～',
+            before_is_currency_amount: false,
+            language: Some("ko-Hani"),
+        }));
+        assert!(!segment_break_is_removable(SegmentBreakContext {
+            before: 'E',
+            after: '～',
+            before_is_currency_amount: false,
             language: Some("en"),
         }));
+    }
+
+    #[test]
+    fn explicit_script_subtags_override_the_language_writing_system() {
+        assert_eq!(
+            content_writing_system(Some("ja")),
+            ContentWritingSystem::Japanese
+        );
+        assert_eq!(
+            content_writing_system(Some("ja-Hang")),
+            ContentWritingSystem::Korean
+        );
+        assert_eq!(
+            content_writing_system(Some("en-Hrkt")),
+            ContentWritingSystem::Japanese
+        );
+        assert_eq!(
+            content_writing_system(Some("ko-Hani")),
+            ContentWritingSystem::Chinese
+        );
+        assert_eq!(
+            content_writing_system(Some("ja-Latn")),
+            ContentWritingSystem::Other
+        );
     }
 
     #[test]
@@ -753,5 +954,43 @@ mod tests {
         assert!(!character_is_css_other_space_separator('\u{00a0}'));
         assert!(character_is_css_word_separator('\u{00a0}'));
         assert!(character_is_css_other_space_separator('\u{3000}'));
+    }
+
+    #[test]
+    fn text_spacing_punctuation_classes_follow_cjk_language_conventions() {
+        assert_eq!(
+            text_spacing_punctuation_class('（', Some("ja"), false),
+            Some(TextSpacingPunctuationClass::Opening)
+        );
+        assert_eq!(
+            text_spacing_punctuation_class('(', Some("ja"), false),
+            Some(TextSpacingPunctuationClass::NarrowOpening)
+        );
+        assert_eq!(
+            text_spacing_punctuation_class('）', Some("ja"), false),
+            Some(TextSpacingPunctuationClass::Closing)
+        );
+        assert_eq!(
+            text_spacing_punctuation_class('　', Some("ja"), false),
+            Some(TextSpacingPunctuationClass::IdeographicSpace)
+        );
+        assert_eq!(
+            text_spacing_punctuation_class('：', Some("ja"), false),
+            Some(TextSpacingPunctuationClass::MiddleDot)
+        );
+        assert_eq!(
+            text_spacing_punctuation_class('：', Some("zh-hans"), false),
+            Some(TextSpacingPunctuationClass::Closing)
+        );
+        assert_eq!(
+            text_spacing_punctuation_class('。', Some("zh-hant"), true),
+            Some(TextSpacingPunctuationClass::MiddleDot)
+        );
+    }
+
+    #[test]
+    fn emoji_presentation_distinguishes_emoji_and_text_default_scalars() {
+        assert!(character_has_emoji_presentation('\u{1fae8}'));
+        assert!(!character_has_emoji_presentation('\u{2139}'));
     }
 }

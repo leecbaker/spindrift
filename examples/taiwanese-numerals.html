@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<title>臺灣語數詞比較表</title>
+<style>
+  @page {
+    size: a4 portrait;
+    margin: 10pt 8pt 7pt;
+    @footnote {
+      margin-top: 3pt;
+      padding-top: 2pt;
+      border-top: .55pt solid #080806;
+    }
+  }
+
+  :root { color: #080806; }
+  html, body { margin: 0; background: #fffef9; }
+  body {
+    font-family: "Hiragino Mincho ProN", "Songti TC", serif;
+    font-kerning: normal;
+  }
+  .sheet { width: 100%; }
+  h1 {
+    margin: 3pt 0 5pt;
+    font-size: 21pt;
+    font-weight: 600;
+    letter-spacing: .31em;
+    line-height: 1.05;
+    text-align: center;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    border: 1.15pt solid #080806;
+  }
+  /* The source has an outer Taiwan-language grouping and a nested
+     生蕃語／熟蕃語 grouping.  These are real table columns, not text
+     positioned inside one cell. */
+  col.group { width: 2.65%; }
+  col.people { width: 8.9%; }
+  col.place { width: 8.3%; }
+  col.number { width: 7.75%; }
+  th, td {
+    border: .55pt solid #080806;
+    padding: .55pt 1.1pt .4pt;
+    overflow: hidden;
+    vertical-align: middle;
+  }
+  thead th {
+    font-size: 10pt;
+    font-weight: 600;
+    line-height: 1.05;
+    padding: 2pt .8pt;
+    text-align: center;
+  }
+  tbody tr { height: 20.5pt; }
+  tbody tr.short { height: 18.2pt; }
+  /* The source table uses column rules for ordinary records. Horizontal
+     rules appear only at the header, section dividers, and outer frame. */
+  tbody tr:not(.divider) > td {
+    border-top: 0;
+    border-bottom: 0;
+  }
+  td.group {
+    /* A row-spanning cell owns both vertical grid edges for its whole span. */
+    border-top: 0;
+    border-right: .55pt solid #080806;
+    border-bottom: 0;
+    border-left: .55pt solid #080806;
+    padding: 0;
+    font-size: 9.7pt;
+    font-weight: 600;
+    letter-spacing: .1em;
+    text-align: center;
+    writing-mode: vertical-rl;
+    text-orientation: upright;
+  }
+  /* Grouping is carried by row spans with continuous vertical rules, without
+     added ornamentation.  Do not target :first-child here: after a rowspan
+     starts, the first DOM cell does not necessarily begin in the first grid
+     column. */
+  td.identity { text-align: center; }
+  /* The numbered language entries have a narrow ordinal gutter. It reserves
+     space beside the centered two-line label, as in the source table. */
+  td.identity:has(> .ordinal) {
+    position: relative;
+    padding-left: 7.4pt;
+  }
+  .ordinal {
+    position: absolute;
+    top: 50%;
+    left: 1pt;
+    width: 5.6pt;
+    transform: translateY(-50%);
+    font-family: "Times New Roman", serif;
+    font-size: 5.7pt;
+    font-weight: 600;
+    line-height: 1;
+    text-align: left;
+  }
+  .ordinal + .jp {
+    display: block;
+    margin-left: 0;
+  }
+  .name, .place {
+    display: block;
+    font-size: 6.8pt;
+    font-weight: 600;
+    line-height: 1.01;
+  }
+  .place { font-size: 6.5pt; }
+  .jp {
+    display: block;
+    font-family: "Hiragino Mincho ProN", "Songti TC", serif;
+    font-size: 5.25pt;
+    font-weight: 500;
+    line-height: .94;
+  }
+  /* CSS Text 4: each direct span immediately after a Japanese <wbr> is a
+     parenthetical transcription that stays together when another break fits. */
+  .jp > wbr + span { wrap-inside: avoid; }
+  .extinct-marker {
+    font-family: "Times New Roman", serif;
+    font-size: .82em;
+    vertical-align: super;
+    margin-right: .18em;
+  }
+  .roman {
+    display: block;
+    font-family: "Times New Roman", "Hiragino Mincho ProN", serif;
+    font-size: 6.2pt;
+    font-weight: 600;
+    line-height: .97;
+  }
+  .divider td {
+    height: 5pt;
+    padding: 0;
+    border-left: 0;
+    border-right: 0;
+  }
+  .divider .ornament {
+    position: relative;
+    display: block;
+    top: -4.4pt;
+    color: #080806;
+    font-family: "Times New Roman", serif;
+    font-size: 6pt;
+    letter-spacing: 1.2pt;
+    line-height: 1;
+    text-align: center;
+  }
+  .divider .ornament::before,
+  .divider .ornament::after {
+    position: absolute;
+    top: 3pt;
+    width: 32%;
+    border-top: .55pt solid #080806;
+    content: "";
+  }
+  .divider .ornament::before { left: 0; }
+  .divider .ornament::after { right: 0; }
+  /* The first existing asterisk is the source footnote call. Its explanatory
+     text is detached into the page footnote area; later asterisks repeat the
+     table notation without creating duplicate note bodies. */
+  .extinct-footnote {
+    float: footnote;
+    display: block;
+    margin: 0;
+    font-family: "Hiragino Mincho ProN", "Songti TC", serif;
+    font-size: 6.3pt;
+    font-weight: 600;
+    letter-spacing: .05em;
+    text-align: center;
+  }
+  .extinct-footnote::footnote-call {
+    content: "*";
+    font-family: "Times New Roman", serif;
+    font-size: .82em;
+    vertical-align: super;
+  }
+  .extinct-footnote::footnote-marker { content: "*　"; }
+</style>
+
+<body>
+  <main class="sheet">
+    <h1>臺灣語數詞比較表</h1>
+    <table aria-label="Comparison of Taiwanese numeral words">
+      <colgroup>
+        <col class="group"><col class="group"><col class="people"><col class="place">
+        <col class="number"><col class="number"><col class="number"><col class="number"><col class="number">
+        <col class="number"><col class="number"><col class="number"><col class="number"><col class="number">
+      </colgroup>
+      <thead><tr>
+        <th colspan="2"></th><th>種族名</th><th>地名又社名</th>
+        <th>一</th><th>二</th><th>三</th><th>四</th><th>五</th><th>六</th><th>七</th><th>八</th><th>九</th><th>十</th>
+      </tr></thead>
+      <tbody>
+        <tr class="short">
+          <td class="group" rowspan="29">臺灣語</td>
+          <td class="group" rowspan="3">支那語</td>
+          <td class="identity"><span class="ordinal">1.</span><span class="jp">漳州</span><span class="name">Tsiang-tsin</span></td>
+          <td class="identity"><span class="jp">八芝蘭</span><span class="place">Pat-tsi-nâ</span></td>
+          <td><span class="jp">チッ<wbr><span>（イッ）</span></span><span class="roman">tsit, (it)</span></td>
+<td><span class="jp">ヌン、ノォ、<wbr><span>（ヂィ）</span></span><span class="roman">nng, no, (jī)</span></td>
+<td><span class="jp">サア、<wbr><span>（サム）</span></span><span class="roman">saⁿ, (sam)</span></td>
+<td><span class="jp">シィ、<wbr><span>（スゥ）</span></span><span class="roman">sì, (su)</span></td>
+<td><span class="jp">ゴォ、<wbr><span>（ゴォォ）</span></span><span class="roman">gō, (ngō)</span></td>
+<td><span class="jp">ラッ、<wbr><span>（リョッ）</span></span><span class="roman">la̍k, (lio̍k)</span></td>
+<td><span class="jp">チヒッ</span><span class="roman">ts'it</span></td>
+<td><span class="jp">ペェ、<wbr><span>（パッ）</span></span><span class="roman">peh, (pat)</span></td>
+<td><span class="jp">カウ、<wbr><span>（キウ）</span></span><span class="roman">kàu, (kiu)</span></td>
+<td><span class="jp">ツァㇷ、<wbr><span>（シㇷ）</span></span><span class="roman">tsa̍p, (sip)</span></td>
+        </tr>
+        <tr class="short">
+          <td class="identity"><span class="ordinal">2.</span><span class="jp">泉州</span><span class="name">Tsoan-tsiu</span></td>
+          <td class="identity"><span class="jp">艋舺</span><span class="place">Bang-kah</span></td>
+          <td><span class="jp">チッ、<wbr><span>（イッ）</span></span><span class="roman">tsit, (it)</span></td>
+<td><span class="jp">ヌン、<wbr><span>（ヂィ、リィ）</span></span><span class="roman">nng, (jī, lī)</span></td>
+<td><span class="jp">サア、<wbr><span>（サム）</span></span><span class="roman">saⁿ, (sam)</span></td>
+<td><span class="jp">シィ、<wbr><span>（スゥ）</span></span><span class="roman">sì, (su)</span></td>
+<td><span class="jp">ゴォ、<wbr><span>（ゴォォ）</span></span><span class="roman">gō, (ngō)</span></td>
+<td><span class="jp">ラッ、<wbr><span>（リョッ）</span></span><span class="roman">la̍k, (lio̍k)</span></td>
+<td><span class="jp">チヒッ</span><span class="roman">ts'it</span></td>
+<td><span class="jp">ポェ、<wbr><span>（パッ）</span></span><span class="roman">poeh, (pat)</span></td>
+<td><span class="jp">カウ、<wbr><span>（キウ）</span></span><span class="roman">kàu, (kiu)</span></td>
+<td><span class="jp">ツァㇷ、<wbr><span>（シㇷ）</span></span><span class="roman">tsa̍p, (sip)</span></td>
+        </tr>
+        <tr class="short">
+          <td class="identity"><span class="ordinal">3.</span><span class="jp">客人</span><span class="name">Hak-nyin</span></td>
+          <td class="identity"><span class="jp">楊梅壢</span><span class="place">Yong-mui-lek</span></td>
+          <td><span class="jp">イッ、<wbr><span>（ジッ）</span></span><span class="roman">yit, (jit)</span></td>
+<td><span class="jp">リャン、<wbr><span>（ニィ）</span></span><span class="roman">liong, (nyi)</span></td>
+<td><span class="jp">サム</span><span class="roman">sam</span></td>
+<td><span class="jp">スゥ</span><span class="roman">su</span></td>
+<td><span class="jp">ン</span><span class="roman">ng</span></td>
+<td><span class="jp">リウク</span><span class="roman">liuk</span></td>
+<td><span class="jp">チヒッ</span><span class="roman">ts'it</span></td>
+<td><span class="jp">パッ</span><span class="roman">pat</span></td>
+<td><span class="jp">キウ</span><span class="roman">kiu</span></td>
+<td><span class="jp">シㇷ</span><span class="roman">ship</span></td>
+        </tr>
+        <!-- 臺灣語 continues across both section dividers. -->
+        <tr class="divider"><td colspan="13"><span class="ornament">* * * * *</span></td>
+</tr>
+        <tr>
+          <td class="group" rowspan="13">生蕃語</td>
+          <td class="identity"><span class="ordinal">4.</span><span class="jp">アタヤル</span><span class="name">Attayal</span></td><td class="identity"><span class="jp">竹頭角社</span><span class="place">Tiek-t'au-kak</span></td>
+          <td><span class="jp">コトㇰ</span><span class="roman">kotox</span></td>
+<td><span class="jp">サジン、<wbr><span>（ルサ）</span></span><span class="roman">sajing, (lusa)</span></td>
+<td><span class="jp">チュンガル</span><span class="roman">chun'gal</span></td>
+<td><span class="jp">パヤッ</span><span class="roman">payat</span></td>
+<td><span class="jp">マガル</span><span class="roman">maⁿgal</span></td>
+<td><span class="jp">テイユ</span><span class="roman">teiyu</span></td>
+<td><span class="jp">ピトゥ</span><span class="roman">pitu</span></td>
+<td><span class="jp">シパッ</span><span class="roman">sipat</span></td>
+<td><span class="jp">タイス、<wbr><span>（マケイル）</span></span><span class="roman">taisu, (ma-keilu)</span></td>
+<td><span class="jp">マルプ</span><span class="roman">malpu</span></td>
+        </tr>
+        <tr>
+          <td class="identity"><span class="ordinal">5.</span><span class="jp">セディアッカ</span><span class="name">Sediàkka</span></td><td class="identity"><span class="jp">霧社</span><span class="place">Bu-hoan</span></td>
+          <td><span class="jp">ケヤリ、<wbr><span>（ウイン）</span></span><span class="roman">keyal, (uin)</span></td>
+<td><span class="jp">ダハ</span><span class="roman">daha</span></td>
+<td><span class="jp">テル</span><span class="roman">telu</span></td>
+<td><span class="jp">セパッ</span><span class="roman">sepat</span></td>
+<td><span class="jp">リマ</span><span class="roman">rima</span></td>
+<td><span class="jp">マテル</span><span class="roman">matelu</span></td>
+<td><span class="jp">ピトゥ、<wbr><span>（マピトゥ）</span></span><span class="roman">pitu, (mapitu)</span></td>
+<td><span class="jp">マセパッ</span><span class="roman">masepat</span></td>
+<td><span class="jp">マガリ</span><span class="roman">maⁿgali</span></td>
+<td><span class="jp">マㇵカル</span><span class="roman">mahkal</span></td>
+        </tr>
+        <tr>
+          <td class="identity"><span class="ordinal">6.</span><span class="jp">ヴルン</span><span class="name">Vulung</span></td><td class="identity"><span class="jp">赤崁</span><span class="place">Tsui-hoan</span></td>
+          <td><span class="jp">タハ</span><span class="roman">taha</span></td>
+<td><span class="jp">トゥサ</span><span class="roman">tusa</span></td>
+<td><span class="jp">トロ</span><span class="roman">tolo</span></td>
+<td><span class="jp">パア</span><span class="roman">pât</span></td>
+<td><span class="jp">ヒマ</span><span class="roman">himma</span></td>
+<td><span class="jp">カトロ、<wbr><span>（ナム）</span></span><span class="roman">katolo, (nam)</span></td>
+<td><span class="jp">ピト</span><span class="roman">pito</span></td>
+<td><span class="jp">カシパト</span><span class="roman">kashpat</span></td>
+<td><span class="jp">タナソ</span><span class="roman">tanaso</span></td>
+<td><span class="jp">マシク</span><span class="roman">maksin</span></td>
+        </tr>
+        <tr>
+          <td class="identity"><span class="ordinal">7.</span><span class="jp">ヴヌン</span><span class="name">Vunung</span></td><td class="identity"><span class="jp">東埔社</span><span class="place">Tong-pu</span></td>
+          <td><span class="jp">タシャ</span><span class="roman">tasha</span></td>
+<td><span class="jp">ルシャ</span><span class="roman">lusha</span></td>
+<td><span class="jp">タウ</span><span class="roman">tâu</span></td>
+<td><span class="jp">パアト</span><span class="roman">pât</span></td>
+<td><span class="jp">ヒマ</span><span class="roman">himma</span></td>
+<td><span class="jp">ヌム</span><span class="roman">num</span></td>
+<td><span class="jp">ピト</span><span class="roman">pito</span></td>
+<td><span class="jp">ヴァウ</span><span class="roman">vau</span></td>
+<td><span class="jp">シィヴァ</span><span class="roman">shiva</span></td>
+<td><span class="jp">マサアン</span><span class="roman">masaan</span></td>
+        </tr>
+        <tr>
+          <td class="identity"><span class="ordinal">8.</span><span class="jp">ツォ</span><span class="name">Tso</span></td><td class="identity"><span class="jp">蕃瑟蘭社</span><span class="place">Ti-bu-lo</span></td>
+          <td><span class="jp">ツニ</span><span class="roman">tsuni</span></td>
+<td><span class="jp">ルソ</span><span class="roman">luso</span></td>
+<td><span class="jp">トゥル</span><span class="roman">tulu</span></td>
+<td><span class="jp">スプ</span><span class="roman">sptu</span></td>
+<td><span class="jp">リモ</span><span class="roman">limo'</span></td>
+<td><span class="jp">ヌム</span><span class="roman">numu</span></td>
+<td><span class="jp">ピトゥ</span><span class="roman">pitu</span></td>
+<td><span class="jp">ヴォユ</span><span class="roman">voyu</span></td>
+<td><span class="jp">シヨ</span><span class="roman">siyo</span></td>
+<td><span class="jp">マスク</span><span class="roman">massku</span></td>
+        </tr>
+        <tr><td class="identity"><span class="ordinal">9.</span><span class="jp">ラルア</span><span class="name">Rarua</span></td><td class="identity"><span class="jp">賊勞社</span><span class="place">Pai-tsien</span></td>
+<td><span class="jp">ウ・チャン、<wbr><span>（サアン）</span></span><span class="roman">u-chani, (sãn)</span></td>
+<td><span class="jp">ウ・スワ、<wbr><span>（ソオ）</span></span><span class="roman">u-swa, (so)</span></td>
+<td><span class="jp">ウ・トゥル、<wbr><span>（トロ）</span></span><span class="roman">u-tulu, (tolo)</span></td>
+<td><span class="jp">パトゥ</span><span class="roman">putu</span></td>
+<td><span class="jp">ウ・リマ</span><span class="roman">u-lima</span></td>
+<td><span class="jp">ウ・ルム、<wbr><span>（ネウム）</span></span><span class="roman">u-lumu, (neum)</span></td>
+<td><span class="jp">ウ・ピトゥ</span><span class="roman">u-pitu</span></td>
+<td><span class="jp">ウ・ワル</span><span class="roman">u-walu</span></td>
+<td><span class="jp">フシャ、<wbr><span>（シワ）</span></span><span class="roman">lisha, (siwa)</span></td>
+<td><span class="jp">クマル</span><span class="roman">kumal</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">10.</span><span class="jp">サリセヌ</span><span class="name">Sarisen</span></td><td class="identity"><span class="jp">化仔社</span><span class="place">Bang-a</span></td>
+<td><span class="jp">テンガ</span><span class="roman">deng'a</span></td>
+<td><span class="jp">ヌササ</span><span class="roman">nussa</span></td>
+<td><span class="jp">トロ</span><span class="roman">tolo</span></td>
+<td><span class="jp">パトゥ</span><span class="roman">patu</span></td>
+<td><span class="jp">リマ</span><span class="roman">lima</span></td>
+<td><span class="jp">ヌマ</span><span class="roman">numa</span></td>
+<td><span class="jp">ピト</span><span class="roman">pito</span></td>
+<td><span class="jp">ヴァル</span><span class="roman">valu</span></td>
+<td><span class="jp">ヴァンガトゥ</span><span class="roman">vaⁿgatu</span></td>
+<td><span class="jp">ポロコ</span><span class="roman">poloko</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">11.</span><span class="jp">ツァリセヌ</span><span class="name">Tsarisen</span></td><td class="identity"><span class="jp">口訣</span><span class="place">K'au</span></td>
+<td><span class="jp">イタ</span><span class="roman">ita</span></td>
+<td><span class="jp">ルサ</span><span class="roman">rusa</span></td>
+<td><span class="jp">トル</span><span class="roman">toru</span></td>
+<td><span class="jp">シパト</span><span class="roman">sipat</span></td>
+<td><span class="jp">リマ</span><span class="roman">rima</span></td>
+<td><span class="jp">ウヌム</span><span class="roman">unun</span></td>
+<td><span class="jp">ピト</span><span class="roman">pito</span></td>
+<td><span class="jp">ハル</span><span class="roman">haru</span></td>
+<td><span class="jp">シヴァ</span><span class="roman">siva</span></td>
+<td><span class="jp">プル</span><span class="roman">puru</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">12.</span><span class="jp">パイワン</span><span class="name">Paiwan</span></td><td class="identity"><span class="jp">搭糸蘭社</span><span class="place">Ti-lo-so</span></td>
+<td><span class="jp">イタ</span><span class="roman">ita</span></td>
+<td><span class="jp">ドゥサ</span><span class="roman">dusa</span></td>
+<td><span class="jp">チル</span><span class="roman">tsilu</span></td>
+<td><span class="jp">シパト</span><span class="roman">shpat</span></td>
+<td><span class="jp">リマ</span><span class="roman">lima</span></td>
+<td><span class="jp">ヌヌ</span><span class="roman">nnum</span></td>
+<td><span class="jp">ピティユ<wbr><span>（ピキュ）</span></span><span class="roman">pityu, (pikyu)</span></td>
+<td><span class="jp">アル</span><span class="roman">alu</span></td>
+<td><span class="jp">シヴァ</span><span class="roman">siva</span></td>
+<td><span class="jp">タ・ポロ</span><span class="roman">ta-polo</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">13.</span><span class="jp">タロマ</span><span class="name">Taloma</span></td><td class="identity"><span class="jp">大南社</span><span class="place">Tai-lam</span></td>
+<td><span class="jp">ウワ</span><span class="roman">uwa</span></td>
+<td><span class="jp">ルサ</span><span class="roman">lusa</span></td>
+<td><span class="jp">トロ</span><span class="roman">tolo</span></td>
+<td><span class="jp">ソワト</span><span class="roman">sowat</span></td>
+<td><span class="jp">リマ</span><span class="roman">lima</span></td>
+<td><span class="jp">ヌヌム</span><span class="roman">nnum</span></td>
+<td><span class="jp">イトゥ</span><span class="roman">ito</span></td>
+<td><span class="jp">ワロ</span><span class="roman">walo</span></td>
+<td><span class="jp">バカト</span><span class="roman">bakat</span></td>
+<td><span class="jp">ポロク</span><span class="roman">polok</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">14.</span><span class="jp">プユマ</span><span class="name">Puyuma</span></td><td class="identity"><span class="jp">卑南社</span><span class="place">Pi-lam</span></td>
+<td><span class="jp">サ</span><span class="roman">sa</span></td>
+<td><span class="jp">ルア</span><span class="roman">lua</span></td>
+<td><span class="jp">テレ</span><span class="roman">tele</span></td>
+<td><span class="jp">パト</span><span class="roman">pat</span></td>
+<td><span class="jp">ニマ、<wbr><span>（リマ）</span></span><span class="roman">nima, (lima)</span></td>
+<td><span class="jp">ヌヌム</span><span class="roman">nnum</span></td>
+<td><span class="jp">ピト</span><span class="roman">pito</span></td>
+<td><span class="jp">ワロ</span><span class="roman">walo</span></td>
+<td><span class="jp">エワ、<wbr><span>（シワ）</span></span><span class="roman">ewa, (siwa)</span></td>
+<td><span class="jp">プルクス</span><span class="roman">pulux</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">15.</span><span class="jp">アミ</span><span class="name">Ami</span></td><td class="identity"><span class="jp">大巴塱</span><span class="place">T'oo-pa-long</span></td>
+<td><span class="jp">ツァッタイ</span><span class="roman">tsatsai</span></td>
+<td><span class="jp">トゥサ</span><span class="roman">tusa</span></td>
+<td><span class="jp">トロ</span><span class="roman">toro</span></td>
+<td><span class="jp">スパト</span><span class="roman">spat</span></td>
+<td><span class="jp">リマ</span><span class="roman">rima</span></td>
+<td><span class="jp">ウヌム</span><span class="roman">unum</span></td>
+<td><span class="jp">ピトゥ</span><span class="roman">pitu</span></td>
+<td><span class="jp">ワロ</span><span class="roman">waro</span></td>
+<td><span class="jp">シワ</span><span class="roman">siwa</span></td>
+<td><span class="jp">プロ</span><span class="roman">puro</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">16.</span><span class="jp">ヤミ</span><span class="name">Yami</span></td><td class="identity"><span class="jp">紅頭嶼</span><span class="place">Ang-t'au-su</span></td>
+<td><span class="jp">アサ</span><span class="roman">asa</span></td>
+<td><span class="jp">ルア</span><span class="roman">rua</span></td>
+<td><span class="jp">ア・トロ</span><span class="roman">a-toro</span></td>
+<td><span class="jp">ア・パト</span><span class="roman">a-pat</span></td>
+<td><span class="jp">リマ</span><span class="roman">lima</span></td>
+<td><span class="jp">ア・ヌム</span><span class="roman">a-num</span></td>
+<td><span class="jp">ピト</span><span class="roman">pito</span></td>
+<td><span class="jp">ワクヲ</span><span class="roman">wakwo</span></td>
+<td><span class="jp">シヤム</span><span class="roman">siyam</span></td>
+<td><span class="jp">ポ</span><span class="roman">po</span></td>
+</tr>
+        <!-- 臺灣語 continues across this divider; only its nested group changes. -->
+        <tr class="divider"><td colspan="13"><span class="ornament">* * * * *</span></td>
+</tr>
+        <tr>
+          <td class="group" rowspan="11">熟蕃語</td>
+          <td class="identity"><span class="ordinal">17.</span><span class="jp">カバラン</span><span class="name">Kabalan</span></td><td class="identity"><span class="jp">十字架社</span><span class="place">Sin-na-han</span></td>
+<td><span class="jp">イサ</span><span class="roman">issa</span></td>
+<td><span class="jp">ルサ</span><span class="roman">lusa</span></td>
+<td><span class="jp">トゥル</span><span class="roman">tulu</span></td>
+<td><span class="jp">スパト</span><span class="roman">supat</span></td>
+<td><span class="jp">リマ</span><span class="roman">rima</span></td>
+<td><span class="jp">ヌヌム</span><span class="roman">nnum</span></td>
+<td><span class="jp">ピトゥ</span><span class="roman">pitu</span></td>
+<td><span class="jp">アル</span><span class="roman">aru</span></td>
+<td><span class="jp">シワ</span><span class="roman">siwa</span></td>
+<td><span class="jp">ハビティヌ、<wbr><span>（タガイ）</span></span><span class="roman">habitin, (tugai)</span></td>
+        </tr>
+        <tr><td class="identity"><span class="ordinal">18.</span><span class="jp">キワヌワン</span><span class="name">Kiwan-wan</span></td><td class="identity"><span class="jp">三貂社</span><span class="place">Sam-tiau</span></td>
+<td><span class="jp">ツァ</span><span class="roman">tsa</span></td>
+<td><span class="jp">ルサ</span><span class="roman">lusa</span></td>
+<td><span class="jp">ツゥ</span><span class="roman">tsū</span></td>
+<td><span class="jp">シパト</span><span class="roman">sipat</span></td>
+<td><span class="jp">チマ</span><span class="roman">tsima</span></td>
+<td><span class="jp">ア・ヌム</span><span class="roman">a-num</span></td>
+<td><span class="jp">ピトゥ</span><span class="roman">pitu</span></td>
+<td><span class="jp">ワツ</span><span class="roman">watsu</span></td>
+<td><span class="jp">シワ</span><span class="roman">siwa</span></td>
+<td><span class="jp">ラヴァタン、<wbr><span>（アタム）</span></span><span class="roman">lavatan, (atam)</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">19.</span><span class="jp"><span class="extinct-footnote">表中熟蕃種族名ノ左肩ニ＊ノ記號ヲ施セルハ其ノ言語ノ殆ンド死語トナルコトヲ示ス</span>タンガラン</span><span class="name">Tangalan</span></td><td class="identity"><span class="jp">秀朗社</span><span class="place">Siu-long</span></td>
+<td><span class="jp">サカ</span><span class="roman">saka</span></td>
+<td><span class="jp">ツサ</span><span class="roman">tsusa</span></td>
+<td><span class="jp">トゥル</span><span class="roman">tulu</span></td>
+<td><span class="jp">スヴァ</span><span class="roman">savu</span></td>
+<td><span class="jp">ラルプ</span><span class="roman">rarup</span></td>
+<td><span class="jp">ツルプ</span><span class="roman">tsurup</span></td>
+<td><span class="jp">セナイ</span><span class="roman">senai</span></td>
+<td><span class="jp">パ・トゥルナイ</span><span class="roman">pa-turnai</span></td>
+<td><span class="jp">サ・トゥルナイ</span><span class="roman">sa-turnai</span></td>
+<td><span class="jp">イリプ、<wbr><span>（イシト）</span></span><span class="roman">irip, (isit)</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">20.</span><span class="jp">サイセット</span><span class="name">Saiset</span></td><td class="identity"><span class="jp">頭頭屋</span><span class="place">Sui-t'au-iek</span></td>
+<td><span class="jp">アルハ</span><span class="roman">alhu</span></td>
+<td><span class="jp">ルサ</span><span class="roman">rusa</span></td>
+<td><span class="jp">トゥル</span><span class="roman">turu</span></td>
+<td><span class="jp">スパト</span><span class="roman">supat</span></td>
+<td><span class="jp">ラスブ</span><span class="roman">rasub</span></td>
+<td><span class="jp">サイブシ</span><span class="roman">saibusi</span></td>
+<td><span class="jp">サイブシ・アハ</span><span class="roman">saibusi-ahha</span></td>
+<td><span class="jp">カスパト、<wbr><span>（マカイスパト）</span></span><span class="roman">kaspat, (makais-pat)</span></td>
+<td><span class="jp">ラハ</span><span class="roman">raha</span></td>
+<td><span class="jp">ランポル</span><span class="roman">ranpol</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">21.</span><span class="jp"><sup class="extinct-marker">*</sup>タアカス</span><span class="name">Taokas</span></td><td class="identity"><span class="jp">新港社</span><span class="place">Sin-kang</span></td>
+<td><span class="jp">タアヌ</span><span class="roman">tānu</span></td>
+<td><span class="jp">ルア</span><span class="roman">rua</span></td>
+<td><span class="jp">トロ・ア</span><span class="roman">tolo-a</span></td>
+<td><span class="jp">ズパト</span><span class="roman">zupat</span></td>
+<td><span class="jp">カサプ</span><span class="roman">kasap</span></td>
+<td><span class="jp">タカプ</span><span class="roman">takap</span></td>
+<td><span class="jp">ウイトゥ</span><span class="roman">uitu</span></td>
+<td><span class="jp">マカイパト</span><span class="roman">makaipat</span></td>
+<td><span class="jp">タナス</span><span class="roman">tanasu</span></td>
+<td><span class="jp">タ・イシト</span><span class="roman">ta-isit</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">22.</span><span class="jp">パゼ</span><span class="name">Pazer</span></td><td class="identity"><span class="jp">岸裡社</span><span class="place">Gan-li</span></td>
+<td><span class="jp">イダ</span><span class="roman">ida</span></td>
+<td><span class="jp">ドゥサ</span><span class="roman">dusa</span></td>
+<td><span class="jp">トゥル</span><span class="roman">tulu</span></td>
+<td><span class="jp">スパト</span><span class="roman">spat</span></td>
+<td><span class="jp">ハスブ</span><span class="roman">xasub</span></td>
+<td><span class="jp">ハスブ・ザ</span><span class="roman">xasub-dza</span></td>
+<td><span class="jp">ハスビ・ドゥサ</span><span class="roman">xasub-i-dusa</span></td>
+<td><span class="jp">ハスビ・トゥル</span><span class="roman">xasub-i-tulu</span></td>
+<td><span class="jp">ハスビ・スパト</span><span class="roman">xasub-i-spat</span></td>
+<td><span class="jp">イシト</span><span class="roman">isit</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">23.</span><span class="jp"><sup class="extinct-marker">*</sup>パポラ</span><span class="name">Papola</span></td><td class="identity"><span class="jp">大肚社</span><span class="place">Tòa-to</span></td>
+<td><span class="jp">タヌ</span><span class="roman">tanu</span></td>
+<td><span class="jp">ニヤ</span><span class="roman">nya</span></td>
+<td><span class="jp">トゥラ</span><span class="roman">tula</span></td>
+<td><span class="jp">ネパト</span><span class="roman">nepat</span></td>
+<td><span class="jp">ネマ</span><span class="roman">nema</span></td>
+<td><span class="jp">ミヌム</span><span class="roman">minum</span></td>
+<td><span class="jp">ピトゥ</span><span class="roman">pitu</span></td>
+<td><span class="jp">メハル</span><span class="roman">mehal</span></td>
+<td><span class="jp">メシヤ</span><span class="roman">mesiya</span></td>
+<td><span class="jp">メセ</span><span class="roman">metsi</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">24.</span><span class="jp"><sup class="extinct-marker">*</sup>バブザ</span><span class="name">Babuzza</span></td><td class="identity"><span class="jp">馬芝遴社</span><span class="place">Be-tsi-lin</span></td>
+<td><span class="jp">ナ・タ</span><span class="roman">na-ta</span></td>
+<td><span class="jp">ナ・ロア</span><span class="roman">na-roa</span></td>
+<td><span class="jp">ナ・トゥラ</span><span class="roman">na-tula</span></td>
+<td><span class="jp">ナ・スパト</span><span class="roman">na-spat</span></td>
+<td><span class="jp">ナ・ホプ</span><span class="roman">na-hop</span></td>
+<td><span class="jp">ナ・タプ</span><span class="roman">na-tap</span></td>
+<td><span class="jp">ナ・イトゥ</span><span class="roman">na-ito</span></td>
+<td><span class="jp">ナ・スパト</span><span class="roman">na-aspat</span></td>
+<td><span class="jp">タヌホ</span><span class="roman">tanuxo</span></td>
+<td><span class="jp">チレト</span><span class="roman">tsilet</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">25.</span><span class="jp"><sup class="extinct-marker">*</sup>ホアンニャ</span><span class="name">Hoannya</span></td><td class="identity"><span class="jp">諸羅山社</span><span class="place">Tsu-lo-san</span></td>
+<td><span class="jp">アタ</span><span class="roman">ata</span></td>
+<td><span class="jp">リサ</span><span class="roman">lisa</span></td>
+<td><span class="jp">ティル</span><span class="roman">tilu</span></td>
+<td><span class="jp">アパ</span><span class="roman">apa</span></td>
+<td><span class="jp">リマ</span><span class="roman">lima</span></td>
+<td><span class="jp">アリム</span><span class="roman">alim</span></td>
+<td><span class="jp">ピトゥ</span><span class="roman">pitu</span></td>
+<td><span class="jp">タル</span><span class="roman">talu</span></td>
+<td><span class="jp">アシャ</span><span class="roman">asha</span></td>
+<td><span class="jp">ニヤタ・イシ</span><span class="roman">nyata-isi</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">26.</span><span class="jp"><sup class="extinct-marker">*</sup>シラヤ</span><span class="name">Siraia</span></td><td class="identity"><span class="jp">新港社</span><span class="place">Sin-kang</span></td>
+<td><span class="jp">サアイ、<wbr><span>（ササアイ）</span></span><span class="roman">sāi, (sasāi)</span></td>
+<td><span class="jp">ルハ、<wbr><span>（ドウハ）</span></span><span class="roman">rouha, (douha)</span></td>
+<td><span class="jp">トゥロ</span><span class="roman">touro</span></td>
+<td><span class="jp">ハパト</span><span class="roman">hapat</span></td>
+<td><span class="jp">リマ</span><span class="roman">rima</span></td>
+<td><span class="jp">アヌム</span><span class="roman">annum</span></td>
+<td><span class="jp">ピト</span><span class="roman">pito</span></td>
+<td><span class="jp">クイパラ</span><span class="roman">kouyhpa</span></td>
+<td><span class="jp">マトゥダ</span><span class="roman">matouda</span></td>
+<td><span class="jp">キティヤン</span><span class="roman">kittyan</span></td>
+</tr>
+        <tr><td class="identity"><span class="ordinal">27.</span><span class="jp"><sup class="extinct-marker">*</sup>マカタオ</span><span class="name">Makatao</span></td><td class="identity"><span class="jp">大傑顛社</span><span class="place">Tai-kiet-tien</span></td>
+<td><span class="jp">イサ</span><span class="roman">isa</span></td>
+<td><span class="jp">ルサ</span><span class="roman">rusa</span></td>
+<td><span class="jp">トゥム</span><span class="roman">tumu</span></td>
+<td><span class="jp">パア</span><span class="roman">pā</span></td>
+<td><span class="jp">リマ</span><span class="roman">rima</span></td>
+<td><span class="jp">—</span></td>
+<td><span class="jp">—</span></td>
+<td><span class="jp">—</span></td>
+<td><span class="jp">—</span></td>
+<td><span class="jp">プル</span><span class="roman">puru</span></td>
+</tr>
+        <tr class="divider"><td colspan="14"><span class="ornament">* * * * *</span></td>
+</tr>
+        <tr class="short"><td colspan="3" class="identity"><span class="jp">フィリッピン語　タガラ</span><span class="name">Tagala</span></td><td class="identity"><span class="jp">ルソン</span><span class="place">Luzon</span></td>
+<td><span class="jp">イ・サ</span><span class="roman">i-sa</span></td>
+<td><span class="jp">ダ・ルア</span><span class="roman">da-lua</span></td>
+<td><span class="jp">タトロ</span><span class="roman">tatlo</span></td>
+<td><span class="jp">アパト</span><span class="roman">apat</span></td>
+<td><span class="jp">リマ</span><span class="roman">lima</span></td>
+<td><span class="jp">アニム</span><span class="roman">anim</span></td>
+<td><span class="jp">ピト</span><span class="roman">pito</span></td>
+<td><span class="jp">ワロ</span><span class="roman">walo</span></td>
+<td><span class="jp">シヤム</span><span class="roman">siyam</span></td>
+<td><span class="jp">ポロ、<wbr><span>（ポウオ）</span></span><span class="roman">polo, (pouo)</span></td>
+</tr>
+        <tr class="short"><td colspan="3" class="identity"><span class="jp">馬來語</span><span class="name">Malay</span></td><td class="identity"><span class="jp">シンガポール</span><span class="place">Singapore</span></td>
+<td><span class="jp">サトゥ、<wbr><span>（ス）</span></span><span class="roman">satu, (su)</span></td>
+<td><span class="jp">ドゥア</span><span class="roman">dua</span></td>
+<td><span class="jp">ティガ</span><span class="roman">tiga</span></td>
+<td><span class="jp">アンパト</span><span class="roman">ampat</span></td>
+<td><span class="jp">リマ</span><span class="roman">lima</span></td>
+<td><span class="jp">アナム</span><span class="roman">anam</span></td>
+<td><span class="jp">トゥジュ</span><span class="roman">tujoh</span></td>
+<td><span class="jp">デラパン</span><span class="roman">delapan</span></td>
+<td><span class="jp">センビラン</span><span class="roman">sembilan</span></td>
+<td><span class="jp">サ・プル</span><span class="roman">sa-puloh</span></td>
+</tr>
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>

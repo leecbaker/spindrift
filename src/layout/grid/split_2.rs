@@ -12,7 +12,7 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(css::ComputedLengthPercentage::from_points(4.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(255, 0, 0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
         let gutters = GapDecorationGridGutters {
             columns: vec![GapDecorationGutter::with_grid_line(50.0, 60.0, Some(2))],
             rows: vec![GapDecorationGutter::with_grid_line(80.0, 90.0, Some(2))],
@@ -56,14 +56,13 @@ mod tests {
 
         let primitives = grid_gap_decoration_primitives_for_page(GridGapFragmentProjection {
             style: &style,
-            inner_x: 0.0,
-            content_top: 200.0,
-            inner_width: 110.0,
+            content_origin: PageTopPoint::new(0.0, 200.0),
+            inner_width: PhysicalContentWidth::new(content_box_pt(110.0)),
             total_content_height: 120.0,
             items: &items,
             gutters: &gutters,
-            source_block_start: 50.0,
-            source_block_end: 100.0,
+            source_block_start: GridFragmentBlockOffset::new(50.0),
+            source_block_end: GridFragmentBlockOffset::new(100.0),
             ends_at_fragment_break: true,
         });
         let strokes = solid_gap_rule_centerlines(&primitives);
@@ -72,7 +71,7 @@ mod tests {
         assert_eq!(strokes[0].x1(), 55.0);
         assert_eq!(strokes[0].y1(), 200.0);
         assert_eq!(strokes[0].y2(), 146.0);
-        assert_eq!(strokes[0].width, 4.0);
+        assert_eq!(strokes[0].stroke_width, PaintStrokeWidth::new(4.0));
     }
 
     #[test]
@@ -82,7 +81,7 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(css::ComputedLengthPercentage::from_points(4.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(0, 0, 255));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(0, 0, 255));
         let gutters = GapDecorationGridGutters {
             columns: vec![GapDecorationGutter::with_grid_line(50.0, 60.0, Some(2))],
             rows: Vec::new(),

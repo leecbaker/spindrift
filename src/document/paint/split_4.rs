@@ -1,5 +1,5 @@
 use super::*;
-use crate::image_store::ImageId;
+use crate::image_store::{DocumentImageStore, ImageId};
 use std::ops::Deref;
 use std::rc::Rc;
 
@@ -10,14 +10,14 @@ impl RenderedStroke {
         y1: f32,
         x2: f32,
         y2: f32,
-        width: f32,
-        color: Color,
+        stroke_width: PaintStrokeWidth,
+        color: CssColor,
         dash: Option<(f32, f32)>,
     ) -> Self {
         Self::from_paint_points(
             PaintPoint::new(x1, y1),
             PaintPoint::new(x2, y2),
-            width,
+            stroke_width,
             color,
             dash,
         )
@@ -26,14 +26,14 @@ impl RenderedStroke {
     pub(crate) fn from_paint_points(
         start: PaintPoint,
         end: PaintPoint,
-        width: f32,
-        color: Color,
+        stroke_width: PaintStrokeWidth,
+        color: CssColor,
         dash: Option<(f32, f32)>,
     ) -> Self {
         Self {
             start,
             end,
-            width,
+            stroke_width,
             color,
             dash,
         }
@@ -61,7 +61,7 @@ impl RenderedStroke {
 
     pub(crate) fn paint_bounds(self) -> PaintClip {
         let (start, end) = self.paint_points();
-        let half = self.width / 2.0;
+        let half = self.stroke_width.points() / 2.0;
         let left = start.x.min(end.x) - half;
         let right = start.x.max(end.x) + half;
         let bottom = start.y.min(end.y) - half;
@@ -85,9 +85,20 @@ pub struct RenderedLine {
     pub(in crate::document) origin: PaintPoint,
     pub font_size: f32,
     pub font_id: Option<usize>,
-    pub color: Color,
+    pub color: CssColor,
     pub runs: Vec<RenderedTextRun>,
+    /// Displacement applied when converting the CSS layout baseline to the
+    /// embedded font program's glyph origin. This remains private renderer
+    /// metadata so later layout code can recover the original CSS baseline
+    /// without guessing from a fallback run's font metrics.
+    pub(crate) glyph_origin_adjustment: PaintDisplacement,
     pub(crate) source: RenderedLineSource,
+    /// Source identity carried only by text prepared from inline layout.
+    ///
+    /// It allows public line metadata to join explicit tracking units from a
+    /// single authored run while keeping separately painted artifacts such as
+    /// text-emphasis marks distinct.
+    pub(crate) source_run: Option<Rc<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +117,7 @@ impl RenderedLine {
         y: f32,
         font_size: f32,
         font_id: Option<usize>,
-        color: Color,
+        color: CssColor,
         runs: Vec<RenderedTextRun>,
     ) -> Self {
         Self::from_paint_origin(text, PaintPoint::new(x, y), font_size, font_id, color, runs)
@@ -127,7 +138,7 @@ impl RenderedLine {
         origin: PaintPoint,
         font_size: f32,
         font_id: Option<usize>,
-        color: Color,
+        color: CssColor,
         runs: Vec<RenderedTextRun>,
     ) -> Self {
         Self::from_paint_origin_with_source(
@@ -146,7 +157,7 @@ impl RenderedLine {
         origin: PaintPoint,
         font_size: f32,
         font_id: Option<usize>,
-        color: Color,
+        color: CssColor,
         runs: Vec<RenderedTextRun>,
         source: RenderedLineSource,
     ) -> Self {
@@ -157,8 +168,29 @@ impl RenderedLine {
             font_id,
             color,
             runs,
+            glyph_origin_adjustment: PaintDisplacement::zero(),
             source,
+            source_run: None,
         }
+    }
+
+    /// Attach the conversion used to map this line's CSS baseline into PDF
+    /// glyph-program coordinates.
+    pub(crate) fn with_glyph_origin_adjustment(
+        mut self,
+        glyph_origin_adjustment: PaintDisplacement,
+    ) -> Self {
+        self.glyph_origin_adjustment = glyph_origin_adjustment;
+        self
+    }
+
+    pub(crate) fn with_source_run(mut self, source_run: Rc<()>) -> Self {
+        self.source_run = Some(source_run);
+        self
+    }
+
+    pub(crate) fn glyph_origin_adjustment(&self) -> PaintDisplacement {
+        self.glyph_origin_adjustment
     }
 
     pub(crate) fn origin(&self) -> PaintPoint {
@@ -224,6 +256,7 @@ pub(in crate::document) fn rendered_lines_can_merge_as_inline_continuation(
     if (left.origin.y - right.origin.y).abs() > y_tolerance
         || right.origin.x < left.origin.x
         || left.source != right.source
+        || left.glyph_origin_adjustment != right.glyph_origin_adjustment
         || (left.font_size - right.font_size).abs() >= 0.01
         || (left_text_font_id != right_text_font_id
             && !has_preserved_tab_text
@@ -346,8 +379,47 @@ fn rendered_line_segment(
                 run
             })
             .collect(),
+        glyph_origin_adjustment: source.glyph_origin_adjustment,
         source: source.source,
+        source_run: source.source_run.clone(),
     }
+}
+
+/// Return whether two adjacent visible fragments are explicit letter-spacing
+/// units from the same authored text run.
+///
+/// Graph layout splits tracked text into typographic units to apply CSS Text's
+/// inter-character spacing.  The public paint summary may join those units
+/// again only when the opaque source identity proves they came from one
+/// authored run; matching paint attributes alone would wrongly join generated
+/// emphasis marks or unrelated adjacent inline content.
+pub(in crate::document) fn rendered_lines_can_merge_as_tracking_continuation(
+    left: &RenderedLine,
+    right: &RenderedLine,
+) -> bool {
+    let (Some(left_source_run), Some(right_source_run)) = (&left.source_run, &right.source_run)
+    else {
+        return false;
+    };
+    if !Rc::ptr_eq(left_source_run, right_source_run) {
+        return false;
+    }
+    let y_tolerance = left.font_size.min(right.font_size) * 0.25;
+    if (left.origin.y - right.origin.y).abs() > y_tolerance
+        || right.origin.x < left.origin.x
+        || left.source != right.source
+        || left.glyph_origin_adjustment != right.glyph_origin_adjustment
+        || (left.font_size - right.font_size).abs() >= 0.01
+        || rendered_line_first_significant_font_id(left)
+            != rendered_line_first_significant_font_id(right)
+        || left.color != right.color
+        || left.text.chars().last().is_some_and(char::is_whitespace)
+        || right.text.chars().next().is_some_and(char::is_whitespace)
+    {
+        return false;
+    }
+    let gap = rendered_line_visual_start(right) - rendered_line_visual_end(left);
+    gap > 0.1 && gap <= left.font_size
 }
 
 pub(in crate::document) fn rendered_lines_can_merge_with_word_gap(
@@ -356,6 +428,7 @@ pub(in crate::document) fn rendered_lines_can_merge_with_word_gap(
 ) -> bool {
     if (left.origin.y - right.origin.y).abs() >= 0.01
         || right.origin.x < left.origin.x
+        || left.glyph_origin_adjustment != right.glyph_origin_adjustment
         || (left.font_size - right.font_size).abs() >= 0.01
         || left.font_id != right.font_id
         || left.color != right.color
@@ -479,7 +552,7 @@ pub(in crate::document) fn path_bounds(path: &RenderedPath) -> Option<PaintClip>
     }
     bounds.map(|bounds| {
         let bounds = bounds.paint_rect();
-        let outset = path.stroke_width.max(0.0) / 2.0;
+        let outset = path.stroke_width.points().max(0.0) / 2.0;
         PaintClip::new(
             bounds.origin.x - outset,
             bounds.origin.y - outset,
@@ -567,6 +640,21 @@ impl RenderedTextMatrix {
     }
 }
 
+/// How one shaped text record contributes to PDF text output.
+///
+/// CSS preserved tabs participate in inline layout but are not glyphs.  PDF
+/// emission must advance the text cursor for them without encoding a
+/// substitute `.notdef` glyph from whichever font happened to shape the
+/// control character:
+/// <https://drafts.csswg.org/css-text-3/#tab-size-property>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderedGlyphKind {
+    /// An ordinary paintable glyph from the selected font program.
+    Paint(u16),
+    /// A source-owned layout advance with no glyph to paint or subset.
+    AdvanceOnly,
+}
+
 /// Shaped glyph data kept with painted text for PDF emission.
 ///
 /// CSS Fonts requires text to be shaped with the selected font face before
@@ -574,12 +662,25 @@ impl RenderedTextMatrix {
 /// ToUnicode extraction data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedGlyph {
-    pub id: u16,
+    pub kind: RenderedGlyphKind,
     pub x_advance: f32,
     pub nominal_x_advance: f32,
     pub x_offset: f32,
     pub y_offset: f32,
     pub unicode: String,
+}
+
+impl RenderedGlyph {
+    pub const fn painted_id(&self) -> Option<u16> {
+        match self.kind {
+            RenderedGlyphKind::Paint(id) => Some(id),
+            RenderedGlyphKind::AdvanceOnly => None,
+        }
+    }
+
+    pub const fn is_advance_only(&self) -> bool {
+        matches!(self.kind, RenderedGlyphKind::AdvanceOnly)
+    }
 }
 
 /// Shared immutable glyph storage for painted text runs.
@@ -785,6 +886,37 @@ pub struct RenderedImage {
 
 #[allow(dead_code)]
 impl RenderedImage {
+    /// Detach this image from a document-local image store for embedding in a
+    /// different document. Image IDs are only meaningful within their owning
+    /// [`DocumentImageStore`], so an iframe page must carry samples rather
+    /// than its child's numeric handle into its parent paint tree.
+    /// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element>
+    pub(in crate::document) fn materialize_store_backing(&mut self, store: &DocumentImageStore) {
+        let RenderedImageSource::Stored {
+            image_id,
+            source_rect,
+            ..
+        } = &self.source
+        else {
+            return;
+        };
+        let image_id = *image_id;
+        let source_rect = *source_rect;
+        let Some(source) = store.with_rasterized(image_id, |raster| RenderedImageSource::Inline {
+            raster: InlineRasterImage {
+                pixel_width: raster.metadata.pixel_width,
+                pixel_height: raster.metadata.pixel_height,
+                color_space: raster.color_space,
+                rgb: Rc::from(raster.rgb),
+                alpha: raster.alpha.map(Rc::from),
+            },
+            source_rect: Some(source_rect),
+        }) else {
+            return;
+        };
+        self.source = source;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_paint_rect(
         rect: PaintRect,
@@ -1006,16 +1138,36 @@ impl RenderedImage {
     }
 }
 
+/// The tile geometry shared by CSS image, gradient, and SVG backgrounds.
+///
+/// CSS Backgrounds resolves an image tile and its repeat period independently:
+/// `space` and `no-repeat`, for example, deliberately make the period differ
+/// from the tile size. Keeping each as a paint-space size prevents callers
+/// from rebuilding a 2D pattern out of unrelated scalar axes:
+/// <https://www.w3.org/TR/css-backgrounds-3/#background-repeat>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaintPatternTiling {
+    pub tile_size: PaintSize,
+    pub step: PaintSize,
+    pub origin: PaintPoint,
+}
+
+impl PaintPatternTiling {
+    pub fn new(tile_size: PaintSize, step: PaintSize, origin: PaintPoint) -> Self {
+        Self {
+            tile_size,
+            step,
+            origin,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedImagePattern {
     pub background: bool,
     pub(crate) source: RenderedImageSource,
     pub(in crate::document) rect: PaintRect,
-    pub tile_width: f32,
-    pub tile_height: f32,
-    pub step_width: f32,
-    pub step_height: f32,
-    pub origin: PaintPoint,
+    pub tiling: PaintPatternTiling,
     pub interpolate: bool,
     clip: Option<RenderedPathClip>,
 }
@@ -1026,11 +1178,7 @@ impl RenderedImagePattern {
     pub(crate) fn from_paint_rect(
         rect: PaintRect,
         background: bool,
-        tile_width: f32,
-        tile_height: f32,
-        step_width: f32,
-        step_height: f32,
-        origin: PaintPoint,
+        tiling: PaintPatternTiling,
         pixel_width: u32,
         pixel_height: u32,
         interpolate: bool,
@@ -1050,11 +1198,7 @@ impl RenderedImagePattern {
                 source_rect: None,
             },
             rect,
-            tile_width,
-            tile_height,
-            step_width,
-            step_height,
-            origin,
+            tiling,
             interpolate,
             clip: None,
         }
@@ -1127,7 +1271,7 @@ impl RenderedImagePattern {
 
     pub(in crate::document) fn translated(mut self, offset: PaintTranslation) -> Self {
         self.rect = offset.transform_rect(&self.rect);
-        self.origin = offset.transform_point(self.origin);
+        self.tiling.origin = offset.transform_point(self.tiling.origin);
         if let Some(clip) = &mut self.clip {
             for command in &mut clip.commands {
                 command.translate(offset);
@@ -1151,11 +1295,7 @@ impl RenderedImagePattern {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedGradientPattern {
     pub(crate) rect: PaintRect,
-    pub(crate) tile_width: f32,
-    pub(crate) tile_height: f32,
-    pub(crate) step_width: f32,
-    pub(crate) step_height: f32,
-    pub(crate) origin: PaintPoint,
+    pub(crate) tiling: PaintPatternTiling,
     pub(crate) gradient: RenderedGradient,
     clip: Option<RenderedPathClip>,
 }
@@ -1165,21 +1305,13 @@ impl RenderedGradientPattern {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         rect: PaintRect,
-        tile_width: f32,
-        tile_height: f32,
-        step_width: f32,
-        step_height: f32,
-        origin: PaintPoint,
+        tiling: PaintPatternTiling,
         gradient: RenderedGradient,
         clip: Option<RenderedPathClip>,
     ) -> Self {
         Self {
             rect,
-            tile_width,
-            tile_height,
-            step_width,
-            step_height,
-            origin,
+            tiling,
             gradient,
             clip,
         }
@@ -1210,7 +1342,7 @@ impl RenderedGradientPattern {
 
     pub(in crate::document) fn translated(mut self, offset: PaintTranslation) -> Self {
         self.rect = offset.transform_rect(&self.rect);
-        self.origin = offset.transform_point(self.origin);
+        self.tiling.origin = offset.transform_point(self.tiling.origin);
         self.gradient.transform =
             PaintTransform::translate(offset).multiply(self.gradient.transform);
         if let Some(clip) = &mut self.clip {
@@ -1234,11 +1366,7 @@ impl RenderedGradientPattern {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedSvgPattern {
     pub(crate) rect: PaintRect,
-    pub(crate) tile_width: f32,
-    pub(crate) tile_height: f32,
-    pub(crate) step_width: f32,
-    pub(crate) step_height: f32,
-    pub(crate) origin: PaintPoint,
+    pub(crate) tiling: PaintPatternTiling,
     pub(crate) paths: Vec<RenderedPath>,
     clip: Option<RenderedPathClip>,
 }
@@ -1247,21 +1375,13 @@ impl RenderedSvgPattern {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         rect: PaintRect,
-        tile_width: f32,
-        tile_height: f32,
-        step_width: f32,
-        step_height: f32,
-        origin: PaintPoint,
+        tiling: PaintPatternTiling,
         paths: Vec<RenderedPath>,
         clip: Option<RenderedPathClip>,
     ) -> Self {
         Self {
             rect,
-            tile_width,
-            tile_height,
-            step_width,
-            step_height,
-            origin,
+            tiling,
             paths,
             clip,
         }
@@ -1277,7 +1397,7 @@ impl RenderedSvgPattern {
 
     pub(in crate::document) fn translated(mut self, offset: PaintTranslation) -> Self {
         self.rect = offset.transform_rect(&self.rect);
-        self.origin = offset.transform_point(self.origin);
+        self.tiling.origin = offset.transform_point(self.tiling.origin);
         // `paths` are local to the Form XObject cell and deliberately remain
         // at its origin. Only the page placement and its CSS clip move.
         if let Some(clip) = &mut self.clip {
@@ -1337,7 +1457,7 @@ mod tests {
 
     fn test_rendered_glyph(unicode: &str) -> RenderedGlyph {
         RenderedGlyph {
-            id: 42,
+            kind: RenderedGlyphKind::Paint(42),
             x_advance: 7.0,
             nominal_x_advance: 7.0,
             x_offset: 0.0,
@@ -1365,7 +1485,7 @@ mod tests {
             PaintPoint::new(10.0, 20.0),
             12.0,
             Some(0),
-            Color::BLACK,
+            CssColor::BLACK,
             vec![test_rendered_text_run()],
         )
     }
@@ -1412,10 +1532,10 @@ mod tests {
     fn paint_fragment_translation_moves_paths_patterns_and_links_together() {
         let path = RenderedPath::new(
             vec![RenderedPathCommand::move_to(PaintPoint::new(1.0, 2.0))],
-            Some(Color::BLACK),
+            Some(CssColor::BLACK),
             RenderedPathFillRule::NonZero,
             None,
-            0.0,
+            PaintStrokeWidth::ZERO,
             Some(RenderedPathClip::new(
                 vec![RenderedPathCommand::line_to(PaintPoint::new(3.0, 4.0))],
                 RenderedPathFillRule::NonZero,
@@ -1425,11 +1545,11 @@ mod tests {
         let pattern = RenderedImagePattern::from_paint_rect(
             PaintRect::new(PaintPoint::new(5.0, 6.0), PaintSize::new(7.0, 8.0)),
             true,
-            7.0,
-            8.0,
-            7.0,
-            8.0,
-            PaintPoint::new(9.0, 10.0),
+            PaintPatternTiling::new(
+                PaintSize::new(7.0, 8.0),
+                PaintSize::new(7.0, 8.0),
+                PaintPoint::new(9.0, 10.0),
+            ),
             1,
             1,
             true,
@@ -1469,7 +1589,9 @@ mod tests {
             pattern.paint_rect(),
             PaintRect::new(PaintPoint::new(25.0, -24.0), PaintSize::new(7.0, 8.0))
         );
-        assert_eq!(pattern.origin, PaintPoint::new(29.0, -20.0));
+        assert_eq!(pattern.tiling.origin, PaintPoint::new(29.0, -20.0));
+        assert_eq!(pattern.tiling.tile_size, PaintSize::new(7.0, 8.0));
+        assert_eq!(pattern.tiling.step, PaintSize::new(7.0, 8.0));
         assert_eq!(
             translated.links[0].paint_rect(),
             PaintRect::new(PaintPoint::new(31.0, -18.0), PaintSize::new(13.0, 14.0))
@@ -1482,7 +1604,7 @@ mod tests {
         let fragment = PaintFragment::from_primitives(
             vec![PaintPrimitive::Rect(RenderedRect::from_paint_rect(
                 bounds.paint_rect(),
-                Some(Color::BLACK),
+                Some(CssColor::BLACK),
             ))],
             Vec::new(),
         )
@@ -1507,7 +1629,7 @@ mod tests {
         let fragment = PaintFragment::from_primitives(
             vec![PaintPrimitive::Rect(RenderedRect::from_paint_rect(
                 bounds.paint_rect(),
-                Some(Color::BLACK),
+                Some(CssColor::BLACK),
             ))],
             Vec::new(),
         )
@@ -1598,10 +1720,10 @@ mod tests {
     #[test]
     fn rendered_rect_exposes_paint_rect() {
         let rect = PaintRect::new(PaintPoint::new(3.0, 4.0), PaintSize::new(5.0, 6.0));
-        let rendered = RenderedRect::from_paint_rect(rect, Some(Color::BLACK));
+        let rendered = RenderedRect::from_paint_rect(rect, Some(CssColor::BLACK));
 
         assert_eq!(rendered.paint_rect(), rect);
-        assert_eq!(rendered.fill, Some(Color::BLACK));
+        assert_eq!(rendered.fill, Some(CssColor::BLACK));
     }
 
     #[test]
@@ -1688,21 +1810,22 @@ mod tests {
         let stroke = RenderedStroke::from_paint_points(
             PaintPoint::new(1.0, 2.0),
             PaintPoint::new(3.0, 4.0),
-            1.0,
-            Color::BLACK,
+            PaintStrokeWidth::new(1.0),
+            CssColor::BLACK,
             None,
         );
         assert_eq!(
             stroke.paint_points(),
             (PaintPoint::new(1.0, 2.0), PaintPoint::new(3.0, 4.0))
         );
+        assert_eq!(stroke.stroke_width, PaintStrokeWidth::new(1.0));
 
         let line = RenderedLine::from_paint_origin(
             "text".to_string(),
             PaintPoint::new(5.0, 6.0),
             10.0,
             None,
-            Color::BLACK,
+            CssColor::BLACK,
             Vec::new(),
         );
         assert_eq!(line.origin(), PaintPoint::new(5.0, 6.0));
@@ -1713,8 +1836,8 @@ mod tests {
         let stroke = RenderedStroke::from_paint_points(
             PaintPoint::new(10.0, 20.0),
             PaintPoint::new(30.0, 40.0),
-            4.0,
-            Color::BLACK,
+            PaintStrokeWidth::new(4.0),
+            CssColor::BLACK,
             None,
         );
         assert_eq!(stroke.paint_bounds(), PaintClip::new(8.0, 18.0, 24.0, 24.0));

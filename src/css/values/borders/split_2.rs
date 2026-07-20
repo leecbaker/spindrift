@@ -183,9 +183,61 @@ pub(crate) fn set_border_side_style_value(
         BorderSide::Bottom => style.border_styles.bottom = border_style,
         BorderSide::Left => style.border_styles.left = border_style,
     }
+    materialize_border_width_for_visible_side(style, side);
 }
 
-pub(crate) fn set_border_side_color(style: &mut ComputedStyle, side: BorderSide, color: Color) {
+/// Materialize resolved border widths for sides whose line style can paint.
+///
+/// The CSS initial border width is `medium`, while its initial line style is
+/// `none`.  Keeping the specified value separately lets a later
+/// `border-style` declaration expose that initial width without making an
+/// unstyled border contribute to layout.
+/// <https://www.w3.org/TR/css-backgrounds-3/#border-width>
+pub(crate) fn materialize_visible_border_widths(style: &mut ComputedStyle) {
+    for side in [
+        BorderSide::Top,
+        BorderSide::Right,
+        BorderSide::Bottom,
+        BorderSide::Left,
+    ] {
+        materialize_border_width_for_visible_side(style, side);
+    }
+}
+
+fn materialize_border_width_for_visible_side(style: &mut ComputedStyle, side: BorderSide) {
+    let (border_style, value) = match side {
+        BorderSide::Top => (
+            style.border_styles.top,
+            style.border_width_values.top.clone(),
+        ),
+        BorderSide::Right => (
+            style.border_styles.right,
+            style.border_width_values.right.clone(),
+        ),
+        BorderSide::Bottom => (
+            style.border_styles.bottom,
+            style.border_width_values.bottom.clone(),
+        ),
+        BorderSide::Left => (
+            style.border_styles.left,
+            style.border_width_values.left.clone(),
+        ),
+    };
+    if border_style.suppresses_used_width() {
+        return;
+    }
+
+    let used = used_nonnegative_length(value).points();
+    match side {
+        BorderSide::Top => style.border_widths.top = used,
+        BorderSide::Right => style.border_widths.right = used,
+        BorderSide::Bottom => style.border_widths.bottom = used,
+        BorderSide::Left => style.border_widths.left = used,
+    }
+    style.border_width = max_edge(style.border_widths);
+}
+
+pub(crate) fn set_border_side_color(style: &mut ComputedStyle, side: BorderSide, color: CssColor) {
     match side {
         BorderSide::Top => {
             style.border_colors.top = color;

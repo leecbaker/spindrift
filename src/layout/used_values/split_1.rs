@@ -43,12 +43,14 @@ pub(in crate::layout) fn block_size_percentage_basis_from_points(
         .unwrap_or_else(PercentageBasis::indefinite)
 }
 
-/// Used physical margin or padding edges for a layout formatting context.
+/// Used physical margin, padding, or border edges for a layout formatting
+/// context.
 ///
 /// CSS Box Model defines physical box edges and percentage resolution for
-/// margin and padding:
+/// margin, padding, and border widths:
 /// <https://www.w3.org/TR/CSS22/box.html#margin-properties> and
-/// <https://www.w3.org/TR/CSS22/box.html#padding-properties>.
+/// <https://www.w3.org/TR/CSS22/box.html#padding-properties> and
+/// <https://www.w3.org/TR/CSS22/box.html#border-width-properties>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct UsedEdges {
     pub(in crate::layout) top: LayoutLength,
@@ -58,6 +60,19 @@ pub(in crate::layout) struct UsedEdges {
 }
 
 impl UsedEdges {
+    /// Converts the renderer's existing edge shape to typed used lengths.
+    ///
+    /// CSS Box Model defines the physical edge order used here:
+    /// <https://www.w3.org/TR/css-box-3/#box-model>.
+    pub(in crate::layout) fn from_css_edges(edges: css::Edges) -> Self {
+        Self {
+            top: layout_pt(edges.top),
+            right: layout_pt(edges.right),
+            bottom: layout_pt(edges.bottom),
+            left: layout_pt(edges.left),
+        }
+    }
+
     /// Converts used edge lengths back to the renderer's existing edge shape.
     ///
     /// CSS Box Model defines the physical edge order used here:
@@ -93,23 +108,25 @@ pub(in crate::layout) struct UsedBoxEdges {
 /// <https://www.w3.org/TR/CSS22/box.html#box-dimensions>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct UsedBoxMetrics {
-    pub(in crate::layout) margin: css::Edges,
-    pub(in crate::layout) padding: css::Edges,
-    pub(in crate::layout) border: css::Edges,
+    pub(in crate::layout) margin: UsedEdges,
+    pub(in crate::layout) padding: UsedEdges,
+    pub(in crate::layout) border: UsedEdges,
 }
 
 impl UsedBoxMetrics {
     /// Returns horizontal padding and border in non-content box-model space.
     pub(in crate::layout) fn horizontal_non_content_length(self) -> NonContentLength {
         non_content_pt(
-            self.border.left + self.border.right + self.padding.left + self.padding.right,
+            (self.border.left + self.border.right + self.padding.left + self.padding.right)
+                .points(),
         )
     }
 
     /// Returns vertical padding and border in non-content box-model space.
     pub(in crate::layout) fn vertical_non_content_length(self) -> NonContentLength {
         non_content_pt(
-            self.border.top + self.border.bottom + self.padding.top + self.padding.bottom,
+            (self.border.top + self.border.bottom + self.padding.top + self.padding.bottom)
+                .points(),
         )
     }
 }
@@ -661,9 +678,9 @@ pub(in crate::layout) fn used_box_metrics(
 ) -> UsedBoxMetrics {
     let used_edges = used_box_edges(style, inline_basis);
     UsedBoxMetrics {
-        margin: used_edges.margin.to_css_edges(),
-        padding: used_edges.padding.to_css_edges(),
-        border: used_border_widths(style),
+        margin: used_edges.margin,
+        padding: used_edges.padding,
+        border: UsedEdges::from_css_edges(used_border_widths(style)),
     }
 }
 
@@ -676,9 +693,9 @@ pub(in crate::layout) fn used_box_metrics(
 pub(in crate::layout) fn intrinsic_box_metrics(style: &ComputedStyle) -> UsedBoxMetrics {
     let intrinsic_edges = intrinsic_box_edges(style);
     UsedBoxMetrics {
-        margin: intrinsic_edges.margin.to_css_edges(),
-        padding: intrinsic_edges.padding.to_css_edges(),
-        border: used_border_widths(style),
+        margin: intrinsic_edges.margin,
+        padding: intrinsic_edges.padding,
+        border: UsedEdges::from_css_edges(used_border_widths(style)),
     }
 }
 
@@ -693,8 +710,8 @@ pub(in crate::layout) fn apply_used_box_metrics(
     inline_basis: PercentageBasis<LayoutLength>,
 ) -> UsedBoxMetrics {
     let metrics = used_box_metrics(style, inline_basis);
-    style.margin = metrics.margin;
-    style.padding = metrics.padding;
+    style.margin = metrics.margin.to_css_edges();
+    style.padding = metrics.padding.to_css_edges();
     metrics
 }
 
@@ -706,10 +723,15 @@ pub(in crate::layout) fn apply_used_box_metrics(
 /// one basis with a border box positioned from another:
 /// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth>.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::layout) struct NormalFlowBlockWidth {
+pub(in crate::layout) struct NormalFlowBlockInlineGeometry {
     pub(in crate::layout) content_width: ContentBoxLength,
-    pub(in crate::layout) border_box_width: BorderBoxLength,
-    pub(in crate::layout) border_box_x: f32,
+    pub(in crate::layout) border_box_inline_span: PageInlineSpan,
+}
+
+impl NormalFlowBlockInlineGeometry {
+    pub(in crate::layout) fn border_box_width(self) -> BorderBoxLength {
+        border_box_pt(self.border_box_inline_span.width())
+    }
 }
 
 /// Width inputs for resolving a block container's requested content size.
@@ -723,6 +745,9 @@ pub(in crate::layout) struct BlockContentWidthInputs {
     pub(in crate::layout) available_outer_width: LayoutLength,
     pub(in crate::layout) percentage_basis: PercentageBasis<LayoutLength>,
     pub(in crate::layout) horizontal_non_content: NonContentLength,
+    /// A resolved physical height, which is the logical inline-size of a
+    /// vertical block while its auto physical width is being measured.
+    pub(in crate::layout) definite_content_height: Option<PhysicalContentHeight>,
 }
 
 /// Return the outer available inline size used by `width:auto` block boxes.
@@ -740,22 +765,21 @@ pub(in crate::layout) fn normal_flow_block_available_outer_width(
     layout_pt(containing_inline_size.points() - style.margin.left - style.margin.right)
 }
 
-/// Resolve content width, border-box width, and border-box x for a normal block.
+/// Resolve a normal block's content width and page-space border-box span.
 ///
 /// Percentages in `width`, `min-width`, and `max-width` use the containing
 /// block width as their percentage basis. Only `width:auto` consumes the
 /// margin-adjusted space from the CSS 2.2 block-width equation:
 /// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth>.
-pub(in crate::layout) fn resolve_normal_flow_block_width(
+pub(in crate::layout) fn resolve_normal_flow_block_inline_geometry(
     style: &mut ComputedStyle,
-    containing_left: f32,
-    containing_right: f32,
+    containing_inline_span: PageInlineSpan,
     requested_content_width: PhysicalContentWidth,
     horizontal_non_content: NonContentLength,
     containing_direction: Direction,
     resolve_auto_margins: bool,
-) -> NormalFlowBlockWidth {
-    let containing_inline_size = (containing_right - containing_left).max(0.0);
+) -> NormalFlowBlockInlineGeometry {
+    let containing_inline_size = containing_inline_span.width();
     let content_width = constrain_width_with_stretch_fit(
         style,
         requested_content_width.content_box_length(),
@@ -767,23 +791,21 @@ pub(in crate::layout) fn resolve_normal_flow_block_width(
     if resolve_auto_margins {
         resolve_normal_flow_block_auto_margins(
             style,
-            containing_inline_size,
-            border_box_width.points(),
+            containing_inline_span,
+            border_box_width,
             containing_direction,
         );
     }
-    let border_box_x = normal_flow_block_outer_x(
-        containing_left,
-        containing_right,
+    let border_box_inline_span = normal_flow_block_border_box_span(
+        containing_inline_span,
         style,
-        border_box_width.points(),
+        border_box_width,
         containing_direction,
     );
 
-    NormalFlowBlockWidth {
+    NormalFlowBlockInlineGeometry {
         content_width,
-        border_box_width,
-        border_box_x,
+        border_box_inline_span,
     }
 }
 
@@ -822,8 +844,8 @@ pub(in crate::layout) fn used_normal_flow_block_content_box_width(
 /// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth>.
 pub(in crate::layout) fn resolve_normal_flow_block_auto_margins(
     style: &mut ComputedStyle,
-    containing_inline_size: f32,
-    border_box_width: f32,
+    containing_inline_span: PageInlineSpan,
+    border_box_width: BorderBoxLength,
     containing_direction: Direction,
 ) {
     let left_auto = style.box_values.margin.clone().left.is_auto();
@@ -834,7 +856,7 @@ pub(in crate::layout) fn resolve_normal_flow_block_auto_margins(
 
     resolve_normal_flow_auto_margins_for_known_width(
         style,
-        containing_inline_size,
+        containing_inline_span,
         border_box_width,
         containing_direction,
     );
@@ -852,8 +874,8 @@ pub(in crate::layout) fn resolve_normal_flow_block_auto_margins(
 /// <https://drafts.csswg.org/css-tables-3/#computing-the-table-width>.
 pub(in crate::layout) fn resolve_normal_flow_auto_margins_for_known_width(
     style: &mut ComputedStyle,
-    containing_inline_size: f32,
-    border_box_width: f32,
+    containing_inline_span: PageInlineSpan,
+    border_box_width: BorderBoxLength,
     containing_direction: Direction,
 ) {
     let left_auto = style.box_values.margin.clone().left.is_auto();
@@ -862,6 +884,8 @@ pub(in crate::layout) fn resolve_normal_flow_auto_margins_for_known_width(
         return;
     }
 
+    let containing_inline_size = containing_inline_span.width();
+    let border_box_width = border_box_width.points();
     let free_space =
         containing_inline_size - style.margin.left - border_box_width - style.margin.right;
     if free_space < 0.0 {
@@ -889,7 +913,7 @@ pub(in crate::layout) fn resolve_normal_flow_auto_margins_for_known_width(
     }
 }
 
-/// Return the normal-flow block border-box left edge after margin resolution.
+/// Return the normal-flow block border-box span after margin resolution.
 ///
 /// CSS 2.2 block-width resolution treats a fixed-width block with no `auto`
 /// horizontal inputs as over-constrained when the equation does not balance.
@@ -898,17 +922,18 @@ pub(in crate::layout) fn resolve_normal_flow_auto_margins_for_known_width(
 /// Given an already resolved border box width, this helper positions the box
 /// from the side that is not ignored:
 /// <https://www.w3.org/TR/CSS22/visudet.html#blockwidth>.
-pub(in crate::layout) fn normal_flow_block_outer_x(
-    containing_left: f32,
-    containing_right: f32,
+pub(in crate::layout) fn normal_flow_block_border_box_span(
+    containing_inline_span: PageInlineSpan,
     style: &ComputedStyle,
-    border_box_width: f32,
+    border_box_width: BorderBoxLength,
     containing_direction: Direction,
-) -> f32 {
-    match containing_direction {
-        Direction::Ltr => containing_left + style.margin.left,
-        Direction::Rtl => containing_right - style.margin.right - border_box_width,
-    }
+) -> PageInlineSpan {
+    let border_box_width = border_box_width.points();
+    let start = match containing_direction {
+        Direction::Ltr => containing_inline_span.left_x() + style.margin.left,
+        Direction::Rtl => containing_inline_span.right_x() - style.margin.right - border_box_width,
+    };
+    PageInlineSpan::new(start, border_box_width)
 }
 
 /// Returns whether `width` is computed as `auto`.
@@ -2085,17 +2110,20 @@ pub(in crate::layout) fn set_style_used_height(style: &mut ComputedStyle, height
     );
 }
 
-/// Freezes a temporary replay style to a resolved border-box width.
+/// Freezes a temporary replay style to a resolved content-box width bound.
 ///
-/// Flexbox resolves the item's border-box geometry before normal-flow replay.
-/// The replay style uses `box-sizing: border-box`, so the CSS min/max values
-/// must retain that same box-model space rather than subtracting its padding
-/// and borders a second time:
+/// Flexbox resolves the item's outer size before normal-flow replay, while
+/// replaced sizing consumes min/max constraints in content-box space. The
+/// semantic input prevents callers from freezing a border-box size without
+/// first converting its padding and border contribution:
 /// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm> and
 /// <https://www.w3.org/TR/css-sizing-3/#box-sizing>.
-pub(in crate::layout) fn set_style_used_width_bounds(style: &mut ComputedStyle, width: f32) {
+pub(in crate::layout) fn set_style_used_content_width_bounds(
+    style: &mut ComputedStyle,
+    width: ContentBoxLength,
+) {
     let width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
-        css::ComputedLengthPercentage::from_points(width.max(0.0)),
+        css::ComputedLengthPercentage::from_points(width.points().max(0.0)),
     );
     style.box_values.min_width = width.clone();
     style.box_values.max_width = width;
@@ -2103,13 +2131,15 @@ pub(in crate::layout) fn set_style_used_width_bounds(style: &mut ComputedStyle, 
 
 /// Freezes a temporary replay style to a resolved border-box height.
 ///
-/// The replay style uses `box-sizing: border-box`, so preserve the supplied
-/// border-box size without a second non-content conversion.
+/// Replaced sizing consumes min/max constraints in content-box space, so
+/// convert the supplied border-box size before freezing the replay bounds.
 /// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm> and
 /// <https://www.w3.org/TR/css-sizing-3/#box-sizing>.
 pub(in crate::layout) fn set_style_used_height_bounds(style: &mut ComputedStyle, height: f32) {
+    let borders = used_border_widths(style);
+    let non_content = borders.top + borders.bottom + style.padding.top + style.padding.bottom;
     let height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
-        css::ComputedLengthPercentage::from_points(height.max(0.0)),
+        css::ComputedLengthPercentage::from_points((height - non_content).max(0.0)),
     );
     style.box_values.min_height = height.clone();
     style.box_values.max_height = height;

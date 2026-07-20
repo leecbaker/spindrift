@@ -414,8 +414,8 @@ mod tests {
     fn grid_item_dimension_keeps_indefinite_percentages_auto() {
         let percent = css::ComputedLengthPercentage::from_percent(0.5);
         let indefinite_basis = PercentageBasis::indefinite();
-        let definite_basis = grid_percentage_basis_from_points(
-            Some(80.0),
+        let definite_basis = grid_percentage_basis(
+            Some(content_box_pt(80.0)),
             GridAvailableSizeSource::ContainerInlineSize,
         );
 
@@ -467,8 +467,8 @@ mod tests {
         let mixed = css::ComputedLengthPercentage::from_affine(layout_pt(4.0), 0.5, true);
         let mixed_gap = css::ComputedGap::LengthPercentage(mixed);
         let indefinite_basis = PercentageBasis::indefinite();
-        let definite_basis = grid_percentage_basis_from_points(
-            Some(40.0),
+        let definite_basis = grid_percentage_basis(
+            Some(content_box_pt(40.0)),
             GridAvailableSizeSource::ContainerInlineSize,
         );
 
@@ -789,13 +789,13 @@ impl StartwardImplicitTrackAdjustment {
 pub(super) fn taffy_startward_implicit_column_adjustment(
     style: &ComputedStyle,
     children: &[GridChild<'_>],
-    container_width: f32,
+    container_width: PhysicalContentWidth,
 ) -> StartwardImplicitTrackAdjustment {
     taffy_startward_implicit_track_adjustment(
         style,
         children,
         GridAxis::Column,
-        Some(container_width),
+        Some(container_width.points()),
     )
 }
 

@@ -18,10 +18,7 @@ impl<'a> LayoutBuilder<'a> {
         table_height_is_definite: bool,
         stylesheets: &[Stylesheet],
         cell_borders: css::Edges,
-        border_box: TableCellBorderBox,
-        placement: TableGridPlacement,
-        content_offset: f32,
-        content_x_offset: f32,
+        content_geometry: TableCellContentGeometry,
     ) {
         let built_children;
         let children = if let Some(children) = cell.children.as_deref() {
@@ -41,13 +38,7 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
 
-        let content_box = border_box.content_box(
-            placement,
-            cell_style.padding,
-            cell_borders,
-            content_offset,
-            content_x_offset,
-        );
+        let content_box = content_geometry.content_box();
         let cell_content_height = content_box.height();
         let percentage_height_basis = table_cell_percentage_height_basis(
             row_sizing_style,
@@ -130,21 +121,14 @@ impl<'a> LayoutBuilder<'a> {
         cell_borders: css::Edges,
         border_box: TableCellBorderBox,
         placement: TableGridPlacement,
-        _content_offset: f32,
-        content_x_offset: f32,
     ) {
         // A positioned descendant's static position is the position it would
         // have in normal flow before cell vertical alignment moves in-flow
         // content within the final row. The alignment offset is therefore not
         // part of this positioning scope.
         // <https://drafts.csswg.org/css-tables-3/#abspos-boxes-in-table-internal>
-        let static_content_box = border_box.content_box(
-            placement,
-            cell_style.padding,
-            cell_borders,
-            0.0,
-            content_x_offset,
-        );
+        let static_content_box =
+            border_box.content_box(placement, cell_style.padding, cell_borders);
         let cell_containing_block_scope = self.push_table_cell_containing_block_if_positioned(
             cell_style,
             border_box,
@@ -156,6 +140,30 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             None
         };
+        // Atomic inline layout uses a temporary page. A positioned table row
+        // is local to that temporary formatting context, so explicit insets
+        // on its absolutely positioned descendants must still receive the
+        // eventual inline-atom translation during paint replay.
+        // <https://www.w3.org/TR/css-position-3/#def-cb>
+        let previous_escaped_atom_containing_block = self.escaped_atom_containing_block;
+        // Table-cell positioned descendants are replayed after the cell's
+        // in-flow (and, for atomic cells, temporary-page) layout has
+        // completed.  That temporary formatting context may have installed
+        // an absolute static rectangle for an unrelated inline atom.  The
+        // table-internal algorithm instead derives this descendant's static
+        // rectangle from `static_content_box`. Keep it explicitly rather
+        // than allowing an earlier document inline line to supply an
+        // unrelated inline static position.
+        // <https://drafts.csswg.org/css-tables-3/#abspos-boxes-in-table-internal>
+        let previous_absolute_static_position = self.absolute_static_position;
+        self.absolute_static_position = Some(AbsoluteStaticPosition::from_page_rect(
+            static_content_box.left(),
+            static_content_box.right(),
+            static_content_box.top_y(),
+        ));
+        if self.escaped_atom_positioning_depth > 0 && row_containing_block_scope.is_some() {
+            self.escaped_atom_containing_block = row_containing_block;
+        }
 
         let child_ancestors = self.table_cell_child_ancestors(cell, row);
         let content_scope = self.enter_table_cell_content_scope(
@@ -202,6 +210,8 @@ impl<'a> LayoutBuilder<'a> {
         } else if let Some(scope) = row_containing_block_scope {
             self.pop_positioned_containing_block(scope);
         }
+        self.escaped_atom_containing_block = previous_escaped_atom_containing_block;
+        self.absolute_static_position = previous_absolute_static_position;
         self.restore_table_cell_content_scope(content_scope);
     }
 
@@ -221,7 +231,7 @@ impl<'a> LayoutBuilder<'a> {
                     self.layout_table_cell_positioned_boxes(&box_.children, stylesheets);
                 }
                 box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-                    self.layout_table_cell_positioned_boxes(&box_.children, stylesheets);
+                    self.layout_table_cell_positioned_boxes(&box_.core.children, stylesheets);
                 }
                 _ => {
                     let Some((child, child_signature, child_style, child_children)) =

@@ -25,6 +25,37 @@ impl InlineFloatBand {
     }
 }
 
+/// The two inline measures relevant while selecting one source line.
+///
+/// A CSS Shapes or initial-letter exclusion narrows the line's usable band,
+/// but it never changes the containing block's logical inline measure. Keeping
+/// them in one typed record prevents float retry from comparing source fit to
+/// an already-reduced band as though that band were the containing block.
+/// <https://drafts.csswg.org/css-inline-3/#line-layout>
+/// <https://drafts.csswg.org/TR/css-shapes-1/#relation-to-box-model-and-float-behavior>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct InlineSelectionMeasures {
+    containing_inline_size: f32,
+    float_band: InlineFloatBand,
+}
+
+impl InlineSelectionMeasures {
+    pub(in crate::layout) fn new(containing_inline_size: f32, float_band: InlineFloatBand) -> Self {
+        Self {
+            containing_inline_size: containing_inline_size.max(0.0),
+            float_band,
+        }
+    }
+
+    pub(in crate::layout) fn band_after_indent(self, indent: f32) -> f32 {
+        (self.float_band.width() - indent).max(0.0)
+    }
+
+    pub(in crate::layout) fn containing_after_indent(self, indent: f32) -> f32 {
+        (self.containing_inline_size - indent).max(0.0)
+    }
+}
+
 pub(in crate::layout) const INLINE_FLOAT_EPSILON: f32 = 0.01;
 
 #[derive(Debug, Clone, Copy)]

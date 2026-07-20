@@ -1,4 +1,7 @@
 use super::*;
+use crate::units::{
+    IntoLayoutLength, content_box_to_margin_box_length, layout_to_content_box_length,
+};
 
 mod children;
 mod compute;
@@ -7,9 +10,33 @@ mod layout;
 mod model;
 mod taffy;
 
+pub(in crate::layout) use children::flex_container_fragment_boundary_breaks;
 use children::*;
 use model::*;
 use taffy::*;
+
+/// The physical content-box width contributions of a flex formatting context.
+///
+/// This is intentionally a composite rather than a `(f32, f32)`: callers
+/// query Flex from physical-width sizing algorithms, whereas the estimator
+/// itself retains logical sizes until its writing-mode projection boundary.
+/// <https://www.w3.org/TR/css-sizing-3/#intrinsic>
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout) struct FlexIntrinsicWidthContributions {
+    pub(in crate::layout) min_content: PhysicalContentWidth,
+    pub(in crate::layout) max_content: PhysicalContentWidth,
+}
+
+impl FlexIntrinsicWidthContributions {
+    fn new(min_content: PhysicalContentWidth, max_content: PhysicalContentWidth) -> Self {
+        let min_content = min_content.non_negative();
+        let max_content = max_content.non_negative().max(min_content);
+        Self {
+            min_content,
+            max_content,
+        }
+    }
+}
 
 impl<'a> LayoutBuilder<'a> {
     fn flex_container_height_percentage_basis(&self) -> BlockSizePercentageBasis {
@@ -46,9 +73,9 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        available_width: f32,
+        available_width: PhysicalContentWidth,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
-    ) -> (f32, f32) {
+    ) -> FlexIntrinsicWidthContributions {
         let built_child_boxes;
         let child_boxes = if let Some(child_boxes) = child_boxes {
             child_boxes
@@ -64,40 +91,44 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             FlexAvailableSpace {
-                width: PhysicalContentWidth::new(content_box_pt(available_width.max(0.0))),
-                width_basis: flex_available_percentage_basis_from_points(
+                width: available_width.non_negative(),
+                width_basis: flex_available_percentage_basis(
                     used_content_box_width_or_auto(
                         style,
-                        layout_pt(available_width.max(0.0)),
+                        available_width.content_box_length().into_layout_length(),
                         non_content_pt(
                             style.padding.left
                                 + style.padding.right
                                 + horizontal_border_width(style),
                         ),
                     )
-                    .map(|_| available_width.max(0.0)),
+                    .map(|_| available_width.content_box_length()),
                     FlexAvailableSizeSource::IntrinsicContainerSize,
                 ),
                 height: used_length_percentage_or_auto(
                     style.box_values.height.clone(),
-                    PercentageBasis::definite(layout_pt(available_width)),
+                    PercentageBasis::definite(
+                        available_width.content_box_length().into_layout_length(),
+                    ),
                 )
                 .map(|height| {
                     PhysicalContentHeight::new(crate::units::layout_to_content_box_length(height))
                 }),
-                height_basis: flex_available_percentage_basis_from_points(
+                height_basis: flex_available_percentage_basis(
                     used_length_percentage_or_auto(
                         style.box_values.height.clone(),
-                        PercentageBasis::definite(layout_pt(available_width)),
+                        PercentageBasis::definite(
+                            available_width.content_box_length().into_layout_length(),
+                        ),
                     )
-                    .map(|height| height.points()),
+                    .map(crate::units::layout_to_content_box_length),
                     FlexAvailableSizeSource::IntrinsicContainerSize,
                 ),
             },
         );
-        (
-            intrinsic.min_width.points().max(0.0),
-            intrinsic.width.points().max(0.0),
+        FlexIntrinsicWidthContributions::new(
+            PhysicalContentWidth::new(intrinsic.min_width),
+            PhysicalContentWidth::new(intrinsic.width),
         )
     }
 
@@ -115,28 +146,33 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        margin_box_width: f32,
+        margin_box_width: MarginBoxLength,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
-    ) -> f32 {
+    ) -> MarginBoxLength {
         let border_widths = used_border_widths(style);
-        let horizontal_extras =
-            border_widths.left + border_widths.right + style.padding.left + style.padding.right;
-        let vertical_extras =
-            border_widths.top + border_widths.bottom + style.padding.top + style.padding.bottom;
+        // Computed style still stores used edge values as CSS scalars. Turn
+        // those values into a box-model quantity at this boundary so the Flex
+        // estimator cannot accidentally mix them with content or margin boxes.
+        let horizontal_non_content = non_content_pt(
+            border_widths.left + border_widths.right + style.padding.left + style.padding.right,
+        );
+        let vertical_non_content = non_content_pt(
+            border_widths.top + border_widths.bottom + style.padding.top + style.padding.bottom,
+        );
+        let available_content_width = PhysicalContentWidth::new(layout_to_content_box_length(
+            margin_box_width.into_layout_length() - horizontal_non_content.into_layout_length(),
+        ))
+        .non_negative()
+        .content_box_length();
         let content_width = used_content_box_width_or_auto(
             style,
-            layout_pt(margin_box_width),
-            non_content_pt(horizontal_extras),
+            margin_box_width.into_layout_length(),
+            horizontal_non_content,
         )
-        .map(SemanticLengthExt::points)
-        .unwrap_or_else(|| (margin_box_width - horizontal_extras).max(0.0));
+        .unwrap_or(available_content_width);
         let height_basis = self.flex_container_height_percentage_basis();
-        let explicit_content_height = used_content_box_height_or_auto_with_basis(
-            style,
-            height_basis,
-            non_content_pt(vertical_extras),
-        )
-        .map(SemanticLengthExt::points);
+        let explicit_content_height =
+            used_content_box_height_or_auto_with_basis(style, height_basis, vertical_non_content);
         let built_child_boxes;
         let child_boxes = if let Some(child_boxes) = child_boxes {
             child_boxes
@@ -152,30 +188,32 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             FlexAvailableSpace {
-                width: PhysicalContentWidth::new(content_box_pt(content_width.max(0.0))),
-                width_basis: flex_available_percentage_basis_from_points(
-                    Some(content_width.max(0.0)),
+                width: PhysicalContentWidth::new(content_width).non_negative(),
+                width_basis: flex_available_percentage_basis(
+                    Some(content_width),
                     FlexAvailableSizeSource::ContainingBlock,
                 ),
-                height: explicit_content_height
-                    .map(|height| PhysicalContentHeight::new(content_box_pt(height))),
-                height_basis: flex_available_percentage_basis_from_points(
+                height: explicit_content_height.map(PhysicalContentHeight::new),
+                height_basis: flex_available_percentage_basis(
                     explicit_content_height,
                     FlexAvailableSizeSource::ContainingBlock,
                 ),
             },
         );
-        let content_height = explicit_content_height.unwrap_or(intrinsic.height.points());
-        let height_basis = height_basis.points().unwrap_or(content_width);
-        style.margin.top
-            + vertical_extras
-            + constrain_content_height(
+        let content_height = explicit_content_height.unwrap_or(intrinsic.height);
+        let percentage_height_basis = height_basis.value().unwrap_or(content_width);
+        content_box_to_margin_box_length(
+            constrain_content_height(
                 style,
-                content_box_pt(content_height),
-                PercentageBasis::definite(layout_pt(height_basis.max(0.0))),
-            )
-            .points()
-            + style.margin.bottom
+                content_height,
+                PercentageBasis::definite(percentage_height_basis),
+            ),
+            vertical_non_content,
+            // CSS used margins are signed. Keep their scalar addition at the
+            // computed-style boundary, then carry the result as a typed layout
+            // displacement through the explicit content-to-margin conversion.
+            layout_pt(style.margin.top + style.margin.bottom),
+        )
     }
 
     fn flex_container_signature(&self, element: &Element) -> ElementSignature {
@@ -267,18 +305,16 @@ impl<'a> LayoutBuilder<'a> {
 /// <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>.
 fn flex_item_content_height_percentage_basis(
     style: &ComputedStyle,
-    border_box_height: f32,
+    border_box_height: BorderBoxLength,
     source: FlexDefiniteSizeSource,
 ) -> FlexPercentageBasis {
     let vertical_non_content =
         non_content_pt(style.padding.top + style.padding.bottom + vertical_border_width(style));
-    let content_height =
-        border_box_to_content_box_length(border_box_pt(border_box_height), vertical_non_content);
+    let content_height = border_box_to_content_box_length(border_box_height, vertical_non_content);
     PercentageBasis::definite_from(content_height, source)
 }
 
 fn flex_item_estimate_percentage_height_basis(
-    style: &ComputedStyle,
     available: FlexItemAvailableSpace,
 ) -> FlexPercentageBasis {
     // A definite preferred main size or flex base supplies the item's used
@@ -308,9 +344,12 @@ fn flex_item_estimate_percentage_height_basis(
     available
         .stretched_height
         .map(|height| {
-            flex_item_content_height_percentage_basis(
-                style,
-                height.points(),
+            // `FlexItemAvailableSpace::stretched_height` is already a
+            // physical content-box size. Re-labeling it as a border box here
+            // would subtract padding and borders a second time before
+            // descendant percentage resolution.
+            PercentageBasis::definite_from(
+                height.content_box_length(),
                 FlexDefiniteSizeSource::StretchedCrossSizeFromDefiniteSingleLineContainer,
             )
         })
@@ -319,8 +358,53 @@ fn flex_item_estimate_percentage_height_basis(
 
 fn flex_item_replay_percentage_height_basis(
     style: &ComputedStyle,
-    border_box_height: f32,
+    border_box_height: BorderBoxLength,
     source: FlexDefiniteSizeSource,
 ) -> FlexPercentageBasis {
     flex_item_content_height_percentage_basis(style, border_box_height, source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intrinsic_width_contributions_preserve_non_negative_min_max_ordering() {
+        let contributions = FlexIntrinsicWidthContributions::new(
+            PhysicalContentWidth::new(content_box_pt(24.0)),
+            PhysicalContentWidth::new(content_box_pt(12.0)),
+        );
+        assert_eq!(contributions.min_content.points(), 24.0);
+        assert_eq!(contributions.max_content.points(), 24.0);
+
+        let contributions = FlexIntrinsicWidthContributions::new(
+            PhysicalContentWidth::new(content_box_pt(-4.0)),
+            PhysicalContentWidth::new(content_box_pt(12.0)),
+        );
+        assert_eq!(contributions.min_content.points(), 0.0);
+        assert_eq!(contributions.max_content.points(), 12.0);
+    }
+
+    #[test]
+    fn stretched_content_height_is_not_reconverted_from_a_border_box() {
+        let mut style = ComputedStyle::initial();
+        style.padding.top = 10.0;
+        style.padding.bottom = 20.0;
+        let available = FlexItemAvailableSpace {
+            width: PhysicalContentWidth::new(content_box_pt(200.0)),
+            width_basis: PercentageBasis::definite_from(
+                content_box_pt(200.0),
+                FlexAvailableSizeSource::ContainingBlock,
+            ),
+            height: None,
+            height_basis: PercentageBasis::indefinite(),
+            stretched_width: None,
+            stretched_height: Some(PhysicalContentHeight::new(content_box_pt(50.0))),
+        };
+
+        assert_eq!(
+            flex_item_estimate_percentage_height_basis(available).value(),
+            Some(content_box_pt(50.0))
+        );
+    }
 }

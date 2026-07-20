@@ -94,9 +94,13 @@ impl<'a> LayoutBuilder<'a> {
             (self.cursor_y - self.page_bottom() - repeated_block_end_decoration)
                 .max(css::CSS_PX_TO_PT);
         let balanced_height = sequence.balanced_multicolumn_height(column_count, style);
+        let sequential_auto_height = sequence.total_height().max(style.line_height);
         let natural_column_height = content_height
             .or(auto_fill_max_height)
-            .unwrap_or(balanced_height);
+            .unwrap_or(match style.column_fill {
+                css::ColumnFill::Auto => sequential_auto_height,
+                css::ColumnFill::Balance | css::ColumnFill::BalanceAll => balanced_height,
+            });
         let fragmented_by_parent = self.active_fragmentainer_kind() == FragmentainerKind::Column
             && natural_column_height > remaining_parent_height + 0.01;
         let definite_fragment_height = content_height.map(|height| {
@@ -109,7 +113,7 @@ impl<'a> LayoutBuilder<'a> {
         let unconstrained_column_height = match style.column_fill {
             css::ColumnFill::Auto => definite_fragment_height
                 .or(auto_fill_max_height)
-                .unwrap_or(balanced_height),
+                .unwrap_or(sequential_auto_height),
             css::ColumnFill::Balance | css::ColumnFill::BalanceAll => definite_fragment_height
                 .map(|limit| balanced_height.min(limit))
                 .unwrap_or(balanced_height),

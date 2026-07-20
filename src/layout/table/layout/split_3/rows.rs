@@ -17,10 +17,12 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             table_x,
-            used_table_width,
+            logical_inline_extent,
+            physical_grid_width,
             table_cellpadding,
             column_plan,
             planned_row_heights,
+            source_row_heights,
             planned_row_occupancy,
             table_height_is_definite,
             table_width,
@@ -34,15 +36,22 @@ impl<'a> LayoutBuilder<'a> {
             avoid_break_row_groups,
             row_group_break_before,
             row_group_break_after,
+            ..
         } = input;
+        let physical_grid_width_points = physical_grid_width.points();
+        debug_assert!(
+            (logical_inline_extent.points() - column_plan.total_width().points()).abs() <= 0.01,
+            "body rows must retain the column plan's logical inline extent"
+        );
         let mut table_x = table_x;
         let mut table_page_content_left = self.content_left;
+        let mut table_body_fragment_started = false;
         let mut table_body_fragment: Option<TableBodyPaintFragment> = None;
         let mut current_fragment_repeat_policy = table_fragment_repeat_policy(
-            0.01,
-            self.page_area_height(),
-            0.0,
-            repeating_footer_height,
+            layout_pt(0.01),
+            layout_pt(self.page_area_height()),
+            layout_pt(0.0),
+            layout_pt(repeating_footer_height),
             false,
             true,
         );
@@ -56,6 +65,17 @@ impl<'a> LayoutBuilder<'a> {
         let mut previous_row_page_end: Option<Option<String>> = None;
         let mut avoid_row_group_keep_state = TableAvoidRowGroupKeepState::default();
         let row_group_end_indices = table_row_group_end_indices(rows);
+        // The table grid starts after its top edge spacing and must leave its
+        // matching bottom edge spacing, padding, and border before the table
+        // can end. Reserve that trailing non-content when deciding whether the
+        // final row fits; otherwise a final row may be accepted only to place
+        // the table's closing edge outside the fragmentainer.
+        // <https://www.w3.org/TR/CSS22/tables.html#separated-borders>
+        let trailing_table_non_content = non_content_pt(
+            table_vertical_edge_spacing(planned_row_occupancy, table_metrics.clone())
+                + table_width.padding.bottom
+                + table_width.border_widths.bottom,
+        );
         let mut fragment_commit_context = TableBodyFragmentCommitContext {
             rows,
             grid,
@@ -63,7 +83,8 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             table_x,
-            used_table_width,
+            logical_inline_extent,
+            physical_grid_width,
             table_cellpadding,
             column_plan,
             planned_row_heights,
@@ -85,9 +106,9 @@ impl<'a> LayoutBuilder<'a> {
             let row_is_running = row_style.running_element_name.is_some();
             let row_collapsed = table_row_is_collapsed(&row_style);
             let row_chrome_context = TableFragmentChromeContext {
-                fragmentainer_block_size: self.page_area_height(),
-                header_height: repeating_header_height,
-                footer_height: repeating_footer_height,
+                fragmentainer_block_size: layout_pt(self.page_area_height()),
+                header_height: layout_pt(repeating_header_height),
+                footer_height: layout_pt(repeating_footer_height),
                 allow_header: !row_is_repeating_header,
                 allow_footer: !row_is_repeating_footer,
             };
@@ -95,11 +116,19 @@ impl<'a> LayoutBuilder<'a> {
                 0.01
             } else {
                 row_height
+                    + if row_index + 1 == rows.len() && !row_is_repeating_header {
+                        trailing_table_non_content.points()
+                    } else {
+                        0.0
+                    }
             };
-            let (row_page_start_source, row_page_end_source) = if row_is_running {
-                ((None, false), (None, false))
+            let row_page_values = if row_is_running {
+                ResolvedPageBoundaryValues {
+                    start: None,
+                    end: None,
+                }
             } else {
-                self.table_row_page_value_sources(
+                self.table_row_page_boundary_values(
                     row_index,
                     row_group_end_indices[row_index],
                     row,
@@ -108,8 +137,8 @@ impl<'a> LayoutBuilder<'a> {
                     stylesheets,
                 )
             };
-            let row_page_start = page_boundary_name_in_parent_scope(row_page_start_source, style);
-            let row_page_end = page_boundary_name_in_parent_scope(row_page_end_source, style);
+            let row_page_start = row_page_values.start;
+            let row_page_end = row_page_values.end;
             if let Some(previous_page_end) = previous_row_page_end.clone()
                 && let Some(named_page_break) =
                     TableNamedPageBreakDecision::choose(TableNamedPageBreakInput {
@@ -188,10 +217,37 @@ impl<'a> LayoutBuilder<'a> {
                     forced_break,
                 );
             }
-            if let Some(avoid_row_group) = avoid_break_row_groups
+            // Rows and row groups are both table fragmentation containers.
+            // Represent a row-level `break-inside: avoid` as a one-row range
+            // so it shares the measured keep-together decision used for an
+            // authored row group rather than relying on the later generic row
+            // overflow path.
+            // <https://www.w3.org/TR/css-break-3/#break-within>
+            let authored_avoid_row_group = avoid_break_row_groups
                 .iter()
                 .find(|avoid_row_group| avoid_row_group.start == row_index)
-            {
+                .copied();
+            let row_level_avoid = authored_avoid_row_group.is_none()
+                && fragmentainer_kind.avoids_break_inside(&row_style);
+            let avoid_row_group = authored_avoid_row_group.or_else(|| {
+                row_level_avoid.then(|| TableAvoidRowGroup::new(row_index, row_index + 1))
+            });
+            if let Some(avoid_row_group) = avoid_row_group {
+                let authored_group_has_forced_internal_break = authored_avoid_row_group
+                    .is_some_and(|group| {
+                        (group.start + 1..group.end).any(|candidate_index| {
+                            let candidate_style = self.style_for_table_row(
+                                &rows[candidate_index],
+                                style,
+                                stylesheets,
+                            );
+                            Self::effective_table_row_break_before(
+                                candidate_index,
+                                &candidate_style,
+                                row_group_break_before,
+                            ) != PageBreak::Auto
+                        })
+                    });
                 let group_height = table_row_span_height(
                     planned_row_heights,
                     planned_row_occupancy,
@@ -199,13 +255,13 @@ impl<'a> LayoutBuilder<'a> {
                     avoid_row_group.row_span(),
                     table_metrics.clone(),
                 );
-                let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
-                    self.page_area_height(),
-                    self.cursor_y,
-                    self.page_bottom(),
+                let current_fragmentainer = TableFragmentainer::current_from_page_cursor_bounds(
+                    layout_pt(self.page_area_height()),
+                    PageTopBlockPosition::new(self.cursor_y),
+                    PageTopBlockPosition::new(self.page_bottom()),
                     current_fragment_repeat_policy,
-                    repeating_header_height,
-                    repeating_footer_height,
+                    layout_pt(repeating_header_height),
+                    layout_pt(repeating_footer_height),
                     !row_is_repeating_footer,
                 );
                 // CSS Fragmentation 3 treats `break-inside: avoid` as a
@@ -216,43 +272,114 @@ impl<'a> LayoutBuilder<'a> {
                 // https://www.w3.org/TR/css-break-3/#break-within
                 let row_group_avoid_decision =
                     TableRowGroupAvoidDecision::choose(TableRowGroupAvoidDecisionInput {
-                        group: *avoid_row_group,
+                        group: avoid_row_group,
                         group_height,
                         current_fragmentainer,
                         chrome_context: row_chrome_context,
                         can_advance: !self.cursor_is_at_page_top(),
                     });
-                if let Some(decision) = row_group_avoid_decision {
+                let oversized_authored_group_needs_fresh_start = authored_avoid_row_group.is_some()
+                    && !authored_group_has_forced_internal_break
+                    && row_group_avoid_decision.is_none()
+                    && group_height > current_fragmentainer.available_block_size().points() + 0.01
+                    && row_height
+                        <= row_chrome_context
+                            .fresh_fragmentainer(
+                                row_chrome_context.repeat_policy(layout_pt(row_height)),
+                            )
+                            .body_capacity
+                            .points()
+                            + 0.01;
+                // When an avoided group cannot remain whole after repeated
+                // chrome is accounted for, move its first source row to a
+                // fresh table fragment before relaxing the constraint at a
+                // legal child boundary. Starting the relaxed split in the
+                // previous fragment loses the group-level avoid opportunity
+                // and makes its first atomic child share unrelated header or
+                // footer chrome.
+                // <https://www.w3.org/TR/css-break-3/#break-within>
+                if let Some(decision) = row_group_avoid_decision
+                    && !(row_level_avoid && decision.keeps_with_overflow())
+                {
+                    let incoming_repeat_policy = if decision.keeps_with_overflow() {
+                        row_chrome_context.repeat_policy(layout_pt(group_height))
+                    } else {
+                        decision.repeat_policy
+                    };
                     debug_assert!(
-                        decision.group_height > current_fragmentainer.available_block_size() + 0.01
+                        decision.group_height
+                            > current_fragmentainer.available_block_size().points() + 0.01
                     );
                     let transition = Self::table_body_fragment_transition(
                         fragmentainer_kind,
                         current_fragment_repeat_policy,
                         TableFragmentBreakReason::AvoidedOverflow,
-                        decision.repeat_policy,
+                        incoming_repeat_policy,
                         !row_is_repeating_header,
                         !row_is_repeating_footer,
                     );
                     current_fragment_repeat_policy = transition.start.repeat_policy;
+                    // Only `KeptByChromeOverflow` records a range, but the
+                    // state owns that distinction. Committing every decision
+                    // here keeps the pagination decision and the row-paint
+                    // mode coupled without duplicating its predicate at the
+                    // call site.
                     avoid_row_group_keep_state.commit(decision);
                     pending_fragment_start = transition.start;
                     self.apply_table_body_fragment_transition(
                         &mut table_body_fragment,
                         &fragment_commit_context,
                         transition,
+                        !table_body_fragment_started,
                     );
+                    table_body_fragment_started = true;
+                    let header_replayed_for_body_continuation = decision.keeps_with_overflow()
+                        && !row_is_repeating_header
+                        && !row_is_repeating_footer
+                        && !repeating_header_rows.is_empty()
+                        && repeating_footer_rows.is_empty();
+                    if !header_replayed_for_body_continuation {
+                        table_x += self.content_left - table_page_content_left;
+                        fragment_commit_context.table_x = table_x;
+                        table_page_content_left = self.content_left;
+                    }
+                    start_chrome_replayed_after_break = true;
+                    broke_before_row = true;
+                }
+                if !broke_before_row && oversized_authored_group_needs_fresh_start {
+                    let incoming_repeat_policy =
+                        row_chrome_context.repeat_policy(layout_pt(row_height));
+                    let transition = Self::table_body_fragment_transition(
+                        fragmentainer_kind,
+                        current_fragment_repeat_policy,
+                        TableFragmentBreakReason::AvoidedOverflow,
+                        incoming_repeat_policy,
+                        !row_is_repeating_header,
+                        !row_is_repeating_footer,
+                    );
+                    current_fragment_repeat_policy = transition.start.repeat_policy;
+                    pending_fragment_start = transition.start;
+                    self.apply_table_body_fragment_transition(
+                        &mut table_body_fragment,
+                        &fragment_commit_context,
+                        transition,
+                        !table_body_fragment_started,
+                    );
+                    table_body_fragment_started = true;
+                    table_x += self.content_left - table_page_content_left;
+                    fragment_commit_context.table_x = table_x;
+                    table_page_content_left = self.content_left;
                     start_chrome_replayed_after_break = true;
                     broke_before_row = true;
                 }
             }
-            let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
-                self.page_area_height(),
-                self.cursor_y,
-                self.page_bottom(),
+            let current_fragmentainer = TableFragmentainer::current_from_page_cursor_bounds(
+                layout_pt(self.page_area_height()),
+                PageTopBlockPosition::new(self.cursor_y),
+                PageTopBlockPosition::new(self.page_bottom()),
                 current_fragment_repeat_policy,
-                repeating_header_height,
-                repeating_footer_height,
+                layout_pt(repeating_header_height),
+                layout_pt(repeating_footer_height),
                 !row_is_repeating_footer,
             );
             let row_break_opportunity = FragmentBreakOpportunity::before_box_boundary(
@@ -276,7 +403,8 @@ impl<'a> LayoutBuilder<'a> {
                     })
             {
                 debug_assert!(
-                    decision.avoid_run_height > current_fragmentainer.available_block_size() + 0.01
+                    decision.avoid_run_height
+                        > current_fragmentainer.available_block_size().points() + 0.01
                 );
                 let candidate_meta = decision.candidate.restore(self);
                 table_body_fragment = candidate_meta.table_body_fragment;
@@ -295,7 +423,12 @@ impl<'a> LayoutBuilder<'a> {
                     &mut table_body_fragment,
                     &fragment_commit_context,
                     transition,
+                    !table_body_fragment_started,
                 );
+                table_body_fragment_started = true;
+                table_x += self.content_left - table_page_content_left;
+                fragment_commit_context.table_x = table_x;
+                table_page_content_left = self.content_left;
                 row_index = candidate_meta.row_index;
                 avoid_break_candidates.reset();
                 continue;
@@ -307,6 +440,7 @@ impl<'a> LayoutBuilder<'a> {
                     row_required_height: row_fragment_required_height,
                     current_fragmentainer,
                     row_kept_by_avoid_group,
+                    prefer_fresh_fragment: row_level_avoid,
                     can_break: !self.cursor_is_at_page_top()
                         && self.out_of_flow_prebreak_suppression_depth == 0,
                     chrome_context: row_chrome_context,
@@ -327,7 +461,17 @@ impl<'a> LayoutBuilder<'a> {
                     &mut table_body_fragment,
                     &fragment_commit_context,
                     transition,
+                    !table_body_fragment_started,
                 );
+                table_body_fragment_started = true;
+                // An oversized row-level `avoid` prebreak moves the row's
+                // first child fragment, not the table wrapper which has
+                // already established its page-local inline origin.
+                if !row_level_avoid {
+                    table_x += self.content_left - table_page_content_left;
+                    fragment_commit_context.table_x = table_x;
+                    table_page_content_left = self.content_left;
+                }
                 start_chrome_replayed_after_break = true;
                 broke_before_row = true;
             }
@@ -338,21 +482,23 @@ impl<'a> LayoutBuilder<'a> {
                         pending_fragment_start,
                     );
                 }
-                let after_header_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
-                    self.page_area_height(),
-                    self.cursor_y,
-                    self.page_bottom(),
-                    current_fragment_repeat_policy,
-                    repeating_header_height,
-                    repeating_footer_height,
-                    !row_is_repeating_footer,
-                );
+                let after_header_fragmentainer =
+                    TableFragmentainer::current_from_page_cursor_bounds(
+                        layout_pt(self.page_area_height()),
+                        PageTopBlockPosition::new(self.cursor_y),
+                        PageTopBlockPosition::new(self.page_bottom()),
+                        current_fragment_repeat_policy,
+                        layout_pt(repeating_header_height),
+                        layout_pt(repeating_footer_height),
+                        !row_is_repeating_footer,
+                    );
                 if let Some(overflow_break) =
                     TableRowOverflowBreakDecision::choose(TableRowOverflowBreakInput {
                         row_height,
                         row_required_height: row_fragment_required_height,
                         current_fragmentainer: after_header_fragmentainer,
                         row_kept_by_avoid_group,
+                        prefer_fresh_fragment: false,
                         can_break: !self.cursor_is_at_page_top(),
                         chrome_context: TableFragmentChromeContext {
                             allow_header: false,
@@ -375,7 +521,12 @@ impl<'a> LayoutBuilder<'a> {
                         &mut table_body_fragment,
                         &fragment_commit_context,
                         transition,
+                        !table_body_fragment_started,
                     );
+                    table_body_fragment_started = true;
+                    table_x += self.content_left - table_page_content_left;
+                    fragment_commit_context.table_x = table_x;
+                    table_page_content_left = self.content_left;
                 }
             }
 
@@ -392,7 +543,7 @@ impl<'a> LayoutBuilder<'a> {
                 let decision = self.table_row_fragment_decision(
                     table_body_fragment.as_ref(),
                     table_x,
-                    used_table_width,
+                    physical_grid_width_points,
                     row_index,
                     row_top,
                     0.0,
@@ -424,31 +575,33 @@ impl<'a> LayoutBuilder<'a> {
                 row_index += 1;
                 continue;
             }
-            let row_baseline_offset = self.table_row_baseline_offset(
-                row_index,
-                row,
-                &grid.rows[row_index],
-                &row_style,
-                stylesheets,
-                table_cellpadding,
-                column_plan,
-                table_metrics.clone(),
-                collapsed_geometry,
-            );
+            let row_baseline_offset = self
+                .table_row_baseline_offset(
+                    row_index,
+                    row,
+                    &grid.rows[row_index],
+                    &row_style,
+                    stylesheets,
+                    table_cellpadding,
+                    column_plan,
+                    table_metrics.clone(),
+                    collapsed_geometry,
+                )
+                .map(|baseline| baseline.offset);
             if row_height > self.page_area_height() + 0.01 && !row_kept_by_avoid_group {
                 let mut remaining = row_height;
                 let mut piece_offset = 0.0;
                 while remaining > 0.01 {
-                    let current_fragmentainer = TableFragmentainer::current_from_cursor_bounds(
-                        self.page_area_height(),
-                        self.cursor_y,
-                        self.page_bottom(),
+                    let current_fragmentainer = TableFragmentainer::current_from_page_cursor_bounds(
+                        layout_pt(self.page_area_height()),
+                        PageTopBlockPosition::new(self.cursor_y),
+                        PageTopBlockPosition::new(self.page_bottom()),
                         current_fragment_repeat_policy,
-                        repeating_header_height,
-                        repeating_footer_height,
+                        layout_pt(repeating_header_height),
+                        layout_pt(repeating_footer_height),
                         !row_is_repeating_footer,
                     );
-                    let slice_decision =
+                    let mut slice_decision =
                         TableOversizedRowSliceDecision::choose(TableOversizedRowSliceInput {
                             remaining_height: remaining,
                             row_required_height: row_fragment_required_height,
@@ -456,8 +609,49 @@ impl<'a> LayoutBuilder<'a> {
                             chrome_context: row_chrome_context,
                             can_advance: !self.cursor_is_at_page_top(),
                         });
+                    if slice_decision.paints_slice() {
+                        let fresh_body_capacity = row_chrome_context
+                            .fresh_fragmentainer(slice_decision.incoming_repeat_policy)
+                            .body_capacity
+                            .points();
+                        // Child-boundary measurement reuses final table-cell
+                        // relayout, whose nested formatting-context probes can
+                        // otherwise append provisional paint. It is only a
+                        // break-choice query, so restore its complete page and
+                        // side-effect state before committing the selected row
+                        // piece.
+                        let child_boundary_snapshot = self.snapshot();
+                        let child_boundary_piece_height = self
+                            .table_row_child_boundary_piece_height(
+                                row,
+                                &row_style,
+                                grid,
+                                row_index,
+                                stylesheets,
+                                table_cellpadding,
+                                column_plan,
+                                table_metrics.clone(),
+                                collapsed_geometry,
+                                piece_offset,
+                                slice_decision.piece_height,
+                                remaining,
+                                fresh_body_capacity,
+                            );
+                        self.restore(child_boundary_snapshot);
+                        // A zero result is a real pre-break decision: the
+                        // next atomic cell child belongs to the destination
+                        // fragmentainer rather than a clipped source slice.
+                        if child_boundary_piece_height > 0.01 || !self.cursor_is_at_page_top() {
+                            slice_decision =
+                                slice_decision.at_child_boundary(child_boundary_piece_height);
+                        }
+                    }
                     if !slice_decision.paints_slice() {
-                        debug_assert!(slice_decision.available_body_size <= 0.01);
+                        debug_assert!(
+                            slice_decision.available_body_size <= 0.01
+                                || !self.cursor_is_at_page_top(),
+                            "a child-aware table slice may only pre-break away from a nonempty fragmentainer"
+                        );
                         let transition = Self::table_body_fragment_transition(
                             fragmentainer_kind,
                             current_fragment_repeat_policy,
@@ -472,7 +666,12 @@ impl<'a> LayoutBuilder<'a> {
                             &mut table_body_fragment,
                             &fragment_commit_context,
                             transition,
+                            !table_body_fragment_started,
                         );
+                        table_body_fragment_started = true;
+                        table_x += self.content_left - table_page_content_left;
+                        fragment_commit_context.table_x = table_x;
+                        table_page_content_left = self.content_left;
                         self.ensure_committed_table_body_fragment(
                             &mut table_body_fragment,
                             fragmentainer_kind,
@@ -497,7 +696,7 @@ impl<'a> LayoutBuilder<'a> {
                     let decision = self.table_row_fragment_decision(
                         table_body_fragment.as_ref(),
                         table_x,
-                        used_table_width,
+                        physical_grid_width_points,
                         row_index,
                         piece_top,
                         piece_height,
@@ -526,10 +725,11 @@ impl<'a> LayoutBuilder<'a> {
                         style,
                         stylesheets,
                         table_x,
-                        used_table_width,
+                        physical_grid_width_points,
                         table_cellpadding,
                         column_plan,
                         planned_row_heights,
+                        source_row_heights,
                         planned_row_occupancy,
                         table_height_is_definite,
                         table_metrics.clone(),
@@ -555,7 +755,12 @@ impl<'a> LayoutBuilder<'a> {
                             &mut table_body_fragment,
                             &fragment_commit_context,
                             transition,
+                            !table_body_fragment_started,
                         );
+                        table_body_fragment_started = true;
+                        table_x += self.content_left - table_page_content_left;
+                        fragment_commit_context.table_x = table_x;
+                        table_page_content_left = self.content_left;
                         self.ensure_committed_table_body_fragment(
                             &mut table_body_fragment,
                             fragmentainer_kind,
@@ -575,7 +780,7 @@ impl<'a> LayoutBuilder<'a> {
                 let decision = self.table_row_fragment_decision(
                     table_body_fragment.as_ref(),
                     table_x,
-                    used_table_width,
+                    physical_grid_width_points,
                     row_index,
                     row_top,
                     row_height,
@@ -604,10 +809,11 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     stylesheets,
                     table_x,
-                    used_table_width,
+                    physical_grid_width_points,
                     table_cellpadding,
                     column_plan,
                     planned_row_heights,
+                    source_row_heights,
                     planned_row_occupancy,
                     table_height_is_definite,
                     table_metrics.clone(),
@@ -655,6 +861,12 @@ impl<'a> LayoutBuilder<'a> {
         context: &TableBodyFragmentCommitContext<'_, '_>,
         boundary: TableFragmentBoundaryDecision,
     ) {
+        debug_assert!(
+            (context.logical_inline_extent.points() - context.column_plan.total_width().points())
+                .abs()
+                <= 0.01,
+            "fragment commit must retain the column plan's logical inline extent"
+        );
         let has_normal_flow_content = fragment.as_ref().is_some_and(|fragment| {
             fragment
                 .plan
@@ -685,7 +897,7 @@ impl<'a> LayoutBuilder<'a> {
             context.style,
             context.stylesheets,
             context.table_x,
-            context.used_table_width,
+            context.physical_grid_width.points(),
             context.table_cellpadding,
             context.column_plan,
             context.table_width,
@@ -706,7 +918,7 @@ impl<'a> LayoutBuilder<'a> {
                 context.style,
                 context.stylesheets,
                 context.table_x,
-                context.used_table_width,
+                context.physical_grid_width.points(),
                 context.table_cellpadding,
                 context.column_plan,
                 context.planned_row_heights,
@@ -743,7 +955,7 @@ impl<'a> LayoutBuilder<'a> {
             context.style,
             context.stylesheets,
             context.table_x,
-            context.used_table_width,
+            context.physical_grid_width.points(),
             context.table_cellpadding,
             context.column_plan,
             context.planned_row_heights,
@@ -751,7 +963,7 @@ impl<'a> LayoutBuilder<'a> {
             context.table_width,
             context.table_metrics.clone(),
             context.collapsed_geometry,
-            true,
+            false,
         );
     }
 
@@ -767,15 +979,26 @@ impl<'a> LayoutBuilder<'a> {
         fragment: &mut Option<TableBodyPaintFragment>,
         context: &TableBodyFragmentCommitContext<'_, '_>,
         transition: TableFragmentTransitionDecision,
+        _starts_table_body: bool,
     ) {
         self.commit_table_body_fragment_boundary(fragment, context, transition.boundary);
-        let Some(cursor_top) = self.materialize_fragmentainer_advance(
+        let Some(cursor_top) = self.materialize_table_fragmentainer_advance(
             transition.fragmentainer_kind,
             FragmentainerAdvance::Unforced,
         ) else {
             return;
         };
         self.cursor_y = cursor_top;
+        if transition
+            .start
+            .repeated_header_rows(context.repeating_header_rows)
+            .is_empty()
+        {
+            // The first source row starts a new table fragment but is not
+            // replayed as chrome. Recreate the wrapper's normal top
+            // border-spacing before painting that source row.
+            self.cursor_y -= table_vertical_edge_spacing(&[true], context.table_metrics.clone());
+        }
         self.replay_table_fragment_start_chrome(context, transition.start);
     }
 
@@ -875,10 +1098,31 @@ impl<'a> LayoutBuilder<'a> {
         decision: TableForcedBreakDecision,
     ) {
         self.commit_table_body_fragment_boundary(fragment, context, decision.boundary);
-        let _ = self.materialize_fragmentainer_advance(
+        let _ = self.materialize_table_fragmentainer_advance(
             decision.fragmentainer_kind,
             FragmentainerAdvance::Forced(decision.page_break),
         );
+    }
+
+    /// Advance a table body to a committed destination fragmentainer.
+    ///
+    /// Table rows own their page transition directly, so they do not naturally
+    /// re-enter the root/body canvas as ordinary block flow does. Replay the
+    /// same continuation geometry after the destination page has been chosen
+    /// before table chrome or row coordinates are calculated.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+    fn materialize_table_fragmentainer_advance(
+        &mut self,
+        fragmentainer_kind: FragmentainerKind,
+        advance: FragmentainerAdvance,
+    ) -> Option<f32> {
+        let continuation = (fragmentainer_kind == FragmentainerKind::Page)
+            .then(|| self.page_break_continuation_context());
+        self.materialize_fragmentainer_advance(fragmentainer_kind, advance)?;
+        if let Some(continuation) = continuation {
+            self.replay_fragment_continuation_on_page(&continuation, self.current_page_context);
+        }
+        Some(self.cursor_y)
     }
 
     fn effective_table_row_break_before(
@@ -986,23 +1230,30 @@ impl<'a> LayoutBuilder<'a> {
         table_cellpadding: Option<f32>,
         column_plan: &TableColumnPlan,
         planned_row_heights: &[f32],
+        source_row_heights: &[f32],
         planned_row_occupancy: &[bool],
         table_height_is_definite: bool,
         table_metrics: TableMetrics,
         collapsed_geometry: Option<&CollapsedTableGeometry>,
         row_baseline_offset: Option<f32>,
     ) {
-        if let Some(fragment) = table_body_fragment {
-            fragment.initialize_grid_placement(
-                decision,
-                table_style,
-                table_x,
-                column_plan,
-                planned_row_heights,
-                planned_row_occupancy,
-                table_metrics.clone(),
-            );
-        }
+        let grid_placement = if let Some(fragment) = table_body_fragment {
+            Some(
+                fragment.initialize_grid_placement(
+                    decision,
+                    table_style,
+                    table_x,
+                    column_plan,
+                    planned_row_heights,
+                    planned_row_occupancy,
+                    table_metrics.clone(),
+                    self.current_page_context
+                        .logical_block_size(table_style.writing_mode),
+                ),
+            )
+        } else {
+            None
+        };
         self.layout_table_row_paint_piece(
             decision.row_index,
             row,
@@ -1016,9 +1267,11 @@ impl<'a> LayoutBuilder<'a> {
             table_cellpadding,
             column_plan,
             planned_row_heights,
+            source_row_heights,
             planned_row_occupancy,
             table_height_is_definite,
             table_metrics,
+            grid_placement,
             decision.row_top,
             decision.original_row_height,
             decision.row_height,
@@ -1039,7 +1292,7 @@ impl<'a> LayoutBuilder<'a> {
     /// descendants can carry `page` values:
     /// <https://www.w3.org/TR/css-page-3/#using-named-pages> and
     /// <https://www.w3.org/TR/CSS22/tables.html#model>.
-    fn table_row_page_value_sources(
+    fn table_row_page_boundary_values(
         &mut self,
         row_index: usize,
         row_group_end: usize,
@@ -1047,21 +1300,27 @@ impl<'a> LayoutBuilder<'a> {
         row_style: &ComputedStyle,
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-    ) -> ((Option<String>, bool), (Option<String>, bool)) {
-        let own = row_style
-            .page_name_specified
-            .then(|| row_style.page_name.clone())
-            .map(|name| (name, true))
-            .unwrap_or((None, false));
-        let mut start = own.clone();
-        let mut end = own;
+    ) -> ResolvedPageBoundaryValues {
+        let inherited_page_name = self.active_page_value_scope(table_style);
+        let own_page_name = if row_style.page_name_specified {
+            row_style
+                .page_name
+                .clone()
+                .or_else(|| inherited_page_name.clone())
+        } else {
+            inherited_page_name.clone()
+        };
+        let mut values = ResolvedPageBoundaryValues {
+            start: own_page_name.clone(),
+            end: own_page_name.clone(),
+        };
         if row_style.page_name_specified {
-            return (start, end);
+            return values;
         }
 
-        let mut first_cell_source = None;
-        let mut last_cell_source = None;
-        let mut continuing_rowspan_source = None;
+        let mut first_cell = None;
+        let mut last_cell = None;
+        let mut continuing_rowspan = None;
         for cell in &row.cells {
             let cell_style = self.style_for_table_cell(cell, row, row_style, stylesheets);
             if !style_is_in_normal_flow(&cell_style) {
@@ -1069,46 +1328,54 @@ impl<'a> LayoutBuilder<'a> {
             }
             let child_boxes = cell.children.as_deref().unwrap_or_default();
             let cell_sources = page_value_sources_from_style_and_children(&cell_style, child_boxes);
-            if cell_sources.1.1
+            let cell_values = resolved_page_boundary_values_from_style_and_children(
+                &cell_style,
+                child_boxes,
+                own_page_name.as_deref(),
+            );
+            if cell_sources.end.overrides_parent_summary()
                 && cell.element.is_some_and(|element| {
                     html_table_rowspan(element, row_index, row_group_end) > 1
                 })
             {
-                continuing_rowspan_source = Some(cell_sources.1.clone());
+                continuing_rowspan = Some((cell_values.end.clone(), cell_sources.end.clone()));
             }
-            if first_cell_source.is_none() {
-                first_cell_source = Some(cell_sources.0.clone());
+            if first_cell.is_none() {
+                first_cell = Some((cell_values.start.clone(), cell_sources.start.clone()));
             }
-            last_cell_source = Some(cell_sources.1);
+            last_cell = Some((cell_values.end, cell_sources.end));
         }
-        if let Some(cell_start) = first_cell_source
-            && cell_start.1
+        if let Some((cell_start, source)) = first_cell
+            && source.overrides_parent_summary()
         {
-            start = cell_start;
+            values.start = cell_start;
         }
-        if let Some(cell_end) = last_cell_source
-            && cell_end.1
+        if let Some((cell_end, source)) = last_cell
+            && source.overrides_parent_summary()
         {
-            end = cell_end;
+            values.end = cell_end;
         }
-        if !end.1
-            && let Some(rowspan_end) = continuing_rowspan_source
+        if values.end == own_page_name
+            && let Some((rowspan_end, _source)) = continuing_rowspan
         {
-            end = rowspan_end;
+            values.end = rowspan_end;
         }
-        if !start.1
+        if values.start == own_page_name
             && let Some(group) = row.row_groups.last()
         {
             let group_style = self.style_for_table_row_group(group, table_style, stylesheets);
             if group_style.page_name_specified {
-                let group_value = (group_style.page_name.clone(), true);
-                start = group_value.clone();
-                if !end.1 {
-                    end = group_value;
+                let group_value = group_style
+                    .page_name
+                    .clone()
+                    .or_else(|| inherited_page_name.clone());
+                values.start = group_value.clone();
+                if values.end == own_page_name {
+                    values.end = group_value;
                 }
             }
         }
-        (start, end)
+        values
     }
 
     /// Returns the final GCPM assignment placement for a visible table row fragment.

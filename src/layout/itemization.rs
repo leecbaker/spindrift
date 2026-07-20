@@ -20,7 +20,10 @@ pub(in crate::layout) enum FormattingContextChildKind<'a> {
     Element {
         element: &'a Element,
         signature: Box<ElementSignature>,
+        generated_pseudo: Option<box_tree::GeneratedPseudoKind>,
         children: Option<Cow<'a, [box_tree::FormattingBox<'a>]>>,
+        /// Durable table structure for replay through a flex/grid item.
+        table_fragment: Option<Box<box_tree::TableFragment<'a>>>,
     },
     AnonymousContent {
         children: Vec<box_tree::FormattingBox<'a>>,
@@ -40,6 +43,7 @@ impl<'a> FormattingContextChild<'a> {
                 element,
                 signature,
                 children,
+                ..
             } => Some((*element, signature.as_ref(), children.as_deref())),
             FormattingContextChildKind::AnonymousContent { .. } => None,
         }
@@ -49,6 +53,27 @@ impl<'a> FormattingContextChild<'a> {
         match &self.kind {
             FormattingContextChildKind::AnonymousContent { children } => Some(children),
             FormattingContextChildKind::Element { .. } => None,
+        }
+    }
+
+    /// Returns the tree-abiding pseudo kind when this item originated from a
+    /// generated `::before` or `::after` box rather than an element's
+    /// principal box. Flex/grid replay must retain this identity so generated
+    /// content and its counter scope are laid out by the pseudo path.
+    /// <https://www.w3.org/TR/css-pseudo-4/#generated-content>
+    pub(in crate::layout) fn generated_pseudo_kind(&self) -> Option<box_tree::GeneratedPseudoKind> {
+        match &self.kind {
+            FormattingContextChildKind::Element {
+                generated_pseudo, ..
+            } => *generated_pseudo,
+            FormattingContextChildKind::AnonymousContent { .. } => None,
+        }
+    }
+
+    pub(in crate::layout) fn table_fragment(&self) -> Option<&box_tree::TableFragment<'a>> {
+        match &self.kind {
+            FormattingContextChildKind::Element { table_fragment, .. } => table_fragment.as_deref(),
+            FormattingContextChildKind::AnonymousContent { .. } => None,
         }
     }
 
@@ -76,7 +101,9 @@ pub(in crate::layout) fn itemize_blockified_children<'a>(
     let mut positioned = Vec::new();
     let mut anonymous_run = Vec::new();
     for box_ in child_boxes {
-        if matches!(box_, box_tree::FormattingBox::Text(_)) {
+        if matches!(box_, box_tree::FormattingBox::Text(_))
+            || formatting_box_is_contents_generated_pseudo(box_)
+        {
             anonymous_run.push(box_.clone());
             continue;
         }
@@ -84,6 +111,10 @@ pub(in crate::layout) fn itemize_blockified_children<'a>(
         let Some((element, signature, style, children)) = box_.element_parts() else {
             continue;
         };
+        let generated_pseudo = box_.element_core().and_then(|core| match &core.source {
+            box_tree::BoxSource::Principal => None,
+            box_tree::BoxSource::GeneratedPseudo(pseudo) => Some(pseudo.kind),
+        });
         if style.display.is_none() {
             continue;
         }
@@ -99,11 +130,17 @@ pub(in crate::layout) fn itemize_blockified_children<'a>(
         if options.establish_independent_formatting_context {
             style = independent_formatting_context_item_style(style);
         }
+        let table_fragment = match box_ {
+            box_tree::FormattingBox::Table(table) => Some(Box::new(table.fragment.clone())),
+            _ => None,
+        };
         let child = FormattingContextChild {
             kind: FormattingContextChildKind::Element {
                 element,
                 signature: Box::new(signature.clone()),
+                generated_pseudo,
                 children: Some(children),
+                table_fragment,
             },
             style,
         };
@@ -116,6 +153,18 @@ pub(in crate::layout) fn itemize_blockified_children<'a>(
     flush_anonymous_item_run(&mut in_flow, &mut anonymous_run, options);
     in_flow.sort_by_key(|child| child.style.order);
     (in_flow, positioned)
+}
+
+/// A generated pseudo-element with `display: contents` contributes generated
+/// text/atoms directly to its parent's anonymous flex or grid item. Keeping a
+/// formatting-box record preserves its counter source for evaluation, but it
+/// must not become an item of its own.
+/// <https://drafts.csswg.org/css-display-3/#valdef-display-contents>
+fn formatting_box_is_contents_generated_pseudo(box_: &box_tree::FormattingBox<'_>) -> bool {
+    box_.element_core().is_some_and(|core| {
+        core.style.display.is_contents()
+            && matches!(core.source, box_tree::BoxSource::GeneratedPseudo(_))
+    })
 }
 
 /// Build the style used when a flex/grid item lays out ordinary flow contents.
@@ -200,40 +249,24 @@ fn anonymous_item_style(tag: &'static str, source: &box_tree::FormattingBox<'_>)
         ElementSignature::new(tag, HashMap::new()),
         None,
         &[],
-        Some(formatting_box_style(source)),
+        Some(source.style()),
         &[],
     );
     style.display = Display::BLOCK;
     style
 }
 
-pub(in crate::layout) fn formatting_box_style<'a>(
-    box_: &'a box_tree::FormattingBox<'a>,
-) -> &'a ComputedStyle {
-    match box_ {
-        box_tree::FormattingBox::Block(box_) => &box_.style,
-        box_tree::FormattingBox::Inline(box_) => &box_.style,
-        box_tree::FormattingBox::InlineSplitBlockContext(box_) => &box_.style,
-        box_tree::FormattingBox::AnonymousBlock(box_) => &box_.style,
-        box_tree::FormattingBox::AtomicInline(box_) => &box_.style,
-        box_tree::FormattingBox::Text(box_) => &box_.style,
-        box_tree::FormattingBox::Table(box_) => &box_.style,
-        box_tree::FormattingBox::Flex(box_) => &box_.style,
-        box_tree::FormattingBox::Replaced(box_) => &box_.style,
-    }
-}
-
 fn strip_blockified_inline_text_paint(children: &mut [box_tree::MutableFormattingBox<'_>]) {
     for child in children {
-        if let box_tree::MutableFormattingBox::Text(text) = child {
-            strip_text_fragment_paint(&mut text.style);
+        if matches!(child, box_tree::MutableFormattingBox::Text(_)) {
+            strip_text_fragment_paint(child.style_mut());
         }
     }
 }
 
 fn strip_text_fragment_paint(style: &mut ComputedStyle) {
     style.background_color = None;
-    style.background_image = None;
+    style.background_image = css::ComputedImage::None;
     style.background_layers.clear();
     style.border_width = 0.0;
     style.border_widths = css::Edges::ZERO;

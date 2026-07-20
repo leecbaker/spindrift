@@ -368,6 +368,16 @@ pub(in crate::css) fn expand_simple_modeled_shorthand(
         }
         "outline" => expand_outline_shorthand(value),
         "border-radius" => expand_border_radius_shorthand(value),
+        "border-top-radius"
+        | "border-right-radius"
+        | "border-bottom-radius"
+        | "border-left-radius" => expand_border_side_radius_shorthand(name, value),
+        "border-block-start-radius"
+        | "border-block-end-radius"
+        | "border-inline-start-radius"
+        | "border-inline-end-radius" => {
+            expand_logical_border_side_radius_shorthand(name, value, direction, writing_mode)
+        }
         "corner" => expand_corner_shorthand(value),
         "corner-shape" => expand_corner_shape_shorthand(value),
         "border-block" | "border-inline" => {
@@ -512,7 +522,7 @@ pub(in crate::css) fn parse_list_style_shorthand(
             continue;
         }
 
-        if image.is_none() && parse_list_style_image_component(part).is_some() {
+        if image.is_none() && parse_list_style_image_component(part, None, None).is_some() {
             image = Some(part.to_string());
         } else if position.is_none() && parse_list_style_position(part).is_some() {
             position = Some(part.to_string());
@@ -542,13 +552,26 @@ pub(in crate::css) fn parse_list_style_shorthand(
     })
 }
 
-pub(in crate::css) fn parse_list_style_image_component(value: &str) -> Option<Option<String>> {
+/// Parse a `list-style-image` value while retaining its CSS image metadata.
+///
+/// CSS Lists accepts any CSS `<image>`, including `image-set()`. The latter's
+/// resolution descriptor contributes to the used intrinsic size of a marker,
+/// so reducing this to a URL would lose required layout information.
+/// <https://drafts.csswg.org/css-lists-3/#list-style-image-property>
+/// <https://drafts.csswg.org/css-images-4/#image-set-notation>
+pub(in crate::css) fn parse_list_style_image_component(
+    value: &str,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+) -> Option<ComputedImage> {
     let value = trim_css_value(value);
     if value.eq_ignore_ascii_case("none") {
-        return Some(None);
+        return Some(ComputedImage::None);
     }
-    let (url, tail) = parse_css_url_token(value)?;
-    tail.trim().is_empty().then_some(Some(url))
+    match parse_css_image(value, base_url, root_url) {
+        ParsedImage::Image(image) => Some(image),
+        ParsedImage::NotAnImage | ParsedImage::SyntaxError => None,
+    }
 }
 
 /// Expands logical margin and padding properties into physical longhands.
@@ -673,11 +696,15 @@ pub(in crate::css) fn physical_inset_side_longhand(side: BoxSide) -> &'static st
 /// resetting to their initial values:
 /// <https://www.w3.org/TR/css-backgrounds-3/#the-border-shorthands>.
 pub(in crate::css) fn expand_border_shorthand(value: &str) -> Option<Vec<(&'static str, String)>> {
-    let mut expanded = Vec::new();
-    for side in ["border-top", "border-right", "border-bottom", "border-left"] {
-        expanded.extend(expand_border_side_shorthand(side, value)?);
-    }
-    Some(expanded)
+    Some(
+        ["border-top", "border-right", "border-bottom", "border-left"]
+            .into_iter()
+            .map(|side| expand_border_side_shorthand(side, value))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect(),
+    )
 }
 
 /// Expand one physical side border shorthand into width/style/color longhands.
@@ -738,7 +765,7 @@ pub(in crate::css) fn border_shorthand_components(
             style = Some(part.to_string());
             recognized = true;
         }
-        if color.is_none() && parse_border_color(part, Color::BLACK).is_some() {
+        if color.is_none() && parse_border_color(part, CssColor::BLACK).is_some() {
             color = Some(part.to_string());
             recognized = true;
         }
@@ -784,16 +811,22 @@ pub(in crate::css) fn expand_logical_border_shorthand(
         "border-inline" => ["border-inline-start", "border-inline-end"],
         _ => return None,
     };
-    let mut expanded = Vec::new();
-    for logical_side in logical_sides {
-        let side = physical_border_side_shorthand(logical_border_side(
-            logical_side,
-            direction,
-            writing_mode,
-        )?);
-        expanded.extend(expand_border_side_shorthand(side, value)?);
-    }
-    Some(expanded)
+    Some(
+        logical_sides
+            .into_iter()
+            .map(|logical_side| {
+                let side = physical_border_side_shorthand(logical_border_side(
+                    logical_side,
+                    direction,
+                    writing_mode,
+                )?);
+                expand_border_side_shorthand(side, value)
+            })
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect(),
+    )
 }
 
 /// Expand one logical border side shorthand using computed flow direction.
@@ -922,6 +955,74 @@ pub(in crate::css) fn expand_border_radius_shorthand(
     ])
 }
 
+/// Expand one physical side radius shorthand into its two corner longhands.
+///
+/// CSS Borders and Box Decorations Level 4 defines `border-*-radius` as a
+/// pair of adjacent corner radii. Its optional slash separates the two
+/// adjacent corner values, unlike the horizontal/vertical component lists of
+/// `border-radius`:
+/// <https://drafts.csswg.org/css-borders-4/#border-radius-sides>.
+pub(in crate::css) fn expand_border_side_radius_shorthand(
+    name: &str,
+    value: &str,
+) -> Option<Vec<(&'static str, String)>> {
+    let [first, second] = match name {
+        "border-top-radius" => ["border-top-left-radius", "border-top-right-radius"],
+        "border-right-radius" => ["border-top-right-radius", "border-bottom-right-radius"],
+        "border-bottom-radius" => ["border-bottom-left-radius", "border-bottom-right-radius"],
+        "border-left-radius" => ["border-top-left-radius", "border-bottom-left-radius"],
+        _ => return None,
+    };
+    expand_two_corner_radius_shorthand(value, first, second)
+}
+
+/// Expand a logical side radius shorthand after mapping its adjacent logical
+/// corners through the element's writing mode and direction.
+pub(in crate::css) fn expand_logical_border_side_radius_shorthand(
+    name: &str,
+    value: &str,
+    direction: Direction,
+    writing_mode: WritingMode,
+) -> Option<Vec<(&'static str, String)>> {
+    let [first_logical, second_logical] = match name {
+        "border-block-start-radius" => ["border-start-start-radius", "border-start-end-radius"],
+        "border-block-end-radius" => ["border-end-start-radius", "border-end-end-radius"],
+        "border-inline-start-radius" => ["border-start-start-radius", "border-end-start-radius"],
+        "border-inline-end-radius" => ["border-start-end-radius", "border-end-end-radius"],
+        _ => return None,
+    };
+    let first = logical_corner_radius_longhand(first_logical, direction, writing_mode)?;
+    let second = logical_corner_radius_longhand(second_logical, direction, writing_mode)?;
+    expand_two_corner_radius_shorthand(value, first, second)
+}
+
+/// Expand the two adjacent corner radii of one side shorthand.
+///
+/// Unlike `border-radius`, the optional top-level slash separates the two
+/// adjacent `<length-percentage>{1,2}` corner values. It does not separate
+/// horizontal and vertical component lists:
+/// <https://drafts.csswg.org/css-borders-4/#border-radius-sides>.
+fn expand_two_corner_radius_shorthand(
+    value: &str,
+    first: &'static str,
+    second: &'static str,
+) -> Option<Vec<(&'static str, String)>> {
+    let (first_value, second_value) = split_top_level_once(value, '/').unwrap_or((value, value));
+    let first_value = trim_css_value(first_value);
+    let second_value = trim_css_value(second_value);
+    // Validate the exact corner-radius grammar before emitting physical
+    // longhands. The cascade subsequently parses the same typed values.
+    let first_components = split_css_component_values(first_value);
+    let second_components = split_css_component_values(second_value);
+    if !(1..=2).contains(&first_components.len()) || !(1..=2).contains(&second_components.len()) {
+        return None;
+    }
+    Some(vec![
+        (first, first_value.to_string()),
+        (second, second_value.to_string()),
+    ])
+}
+
 /// Split the horizontal and vertical `border-radius` component groups.
 ///
 /// The slash separator is only valid at the top level; function arguments such
@@ -943,14 +1044,7 @@ pub(in crate::css) fn split_border_radius_groups(
 }
 
 pub(in crate::css) fn split_css_top_level_slashes(value: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut rest = value;
-    while let Some((left, right)) = split_top_level_once(rest, '/') {
-        parts.push(left.trim());
-        rest = right;
-    }
-    parts.push(rest.trim());
-    parts
+    crate::css::component_values::split_css_top_level_delimiter(value, '/')
 }
 
 /// Find a top-level delimiter without splitting nested CSS component values.
@@ -959,31 +1053,7 @@ pub(in crate::css) fn split_css_top_level_slashes(value: &str) -> Vec<&str> {
 /// component values:
 /// <https://www.w3.org/TR/css-syntax-3/#component-value>.
 pub(in crate::css) fn split_top_level_once(value: &str, delimiter: char) -> Option<(&str, &str)> {
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in value.char_indices() {
-        if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '"' | '\'' => quote = Some(ch),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            _ if ch == delimiter && depth == 0 => {
-                return Some((&value[..index], &value[index + ch.len_utf8()..]));
-            }
-            _ => {}
-        }
-    }
-    None
+    crate::css::component_values::split_css_top_level_once(value, delimiter)
 }
 
 /// Expand one-to-four corner radius values using CSS box-edge ordering.

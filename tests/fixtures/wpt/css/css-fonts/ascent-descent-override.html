@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>CSS Fonts metric override baseline regression</title>
+<style>
+@font-face {
+  font-family: Ahem;
+  src: url("Ahem.ttf");
+  ascent-override: 100%;
+  descent-override: 50%;
+}
+
+.target {
+  font: 20px Ahem;
+  color: green;
+  position: absolute;
+  top: 10px;
+  left: 10px;
+}
+
+.top-aligned {
+  display: inline-block;
+  background-color: green;
+  vertical-align: top;
+  width: 1em;
+  height: 1em;
+}
+
+.bottom-aligned {
+  display: inline-block;
+  background-color: green;
+  vertical-align: bottom;
+  width: 1em;
+  height: 0.5em;
+}
+</style>
+<div class="target"><span class="top-aligned"></span>X<span class="bottom-aligned"></span></div>

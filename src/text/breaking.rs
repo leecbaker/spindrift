@@ -1,4 +1,5 @@
 use super::*;
+use icu_locale_core::LanguageIdentifier;
 
 pub(super) const SOFT_HYPHEN: char = '\u{00ad}';
 pub(super) const ZERO_WIDTH_SPACE: char = '\u{200b}';
@@ -14,6 +15,7 @@ pub(crate) struct TextBreakPolicy {
     word_break: CssWordBreak,
     white_space: crate::css::WhiteSpace,
     overflow_wrap: CssOverflowWrap,
+    writing_system: ContentWritingSystem,
 }
 
 impl From<&ComputedStyle> for TextBreakPolicy {
@@ -23,6 +25,7 @@ impl From<&ComputedStyle> for TextBreakPolicy {
             word_break: style.word_break,
             white_space: style.white_space,
             overflow_wrap: style.overflow_wrap,
+            writing_system: content_writing_system(style.language.as_deref()),
         }
     }
 }
@@ -45,19 +48,6 @@ pub(crate) fn text_with_hyphenation_controls<'a>(
     } else {
         Cow::Borrowed(text)
     };
-    if style.hyphens == Hyphens::Auto
-        && let Some(language) = style.language.as_deref()
-        && let Some(hyphenator) = hyphenator_for_language(language)
-    {
-        let text = output.as_ref();
-        if !text.is_empty() {
-            output = Cow::Owned(text_with_auto_hyphenation(
-                text,
-                &hyphenator,
-                style.hyphenate_limit_chars,
-            ));
-        }
-    }
     if style.allows_soft_wrap()
         && line_break_strictness(style.line_break).is_some()
         && !matches!(style.line_break, CssLineBreak::Anywhere)
@@ -68,6 +58,231 @@ pub(crate) fn text_with_hyphenation_controls<'a>(
         }
     }
     output
+}
+
+/// A language resource's selected-line spelling change at one discretionary
+/// boundary.  The byte offset is in the unmodified source word: consumers
+/// must not insert U+00AD into that source merely to transport this data.
+///
+/// CSS Text applies dictionary hyphenation only when the corresponding
+/// opportunity wins line fitting; preserving this record separately keeps an
+/// unselected word byte-for-byte source faithful.
+/// <https://drafts.csswg.org/css-text-3/#hyphenation>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiscretionaryOpportunity {
+    pub(crate) byte_offset: usize,
+    pub(crate) left: Option<LanguageDiscretionaryReplacement>,
+    pub(crate) right: Option<LanguageDiscretionaryReplacement>,
+}
+
+/// Replace text adjacent to a selected discretionary boundary.  `source` is
+/// measured outward from the boundary, so an empty `source` represents an
+/// insertion and an empty `replacement` represents deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LanguageDiscretionaryReplacement {
+    pub(crate) source_bytes: usize,
+    pub(crate) replacement: &'static str,
+}
+
+/// Resolve automatic dictionary and language-resource opportunities without
+/// rewriting source text, so line layout retains one source coordinate system.
+pub(crate) fn automatic_hyphenation_opportunities(
+    text: &str,
+    hyphenator: Option<&Standard>,
+    limit: HyphenateLimitChars,
+    language: &str,
+) -> Vec<DiscretionaryOpportunity> {
+    let mut opportunities = hyphenator
+        .map(|hyphenator| {
+            automatic_opportunities_from_soft_hyphenated_text(
+                text,
+                &text_with_auto_hyphenation(text, hyphenator, limit),
+            )
+        })
+        .unwrap_or_default();
+    opportunities.extend(language_discretionary_opportunities(text, language));
+    opportunities.sort_by_key(|opportunity| opportunity.byte_offset);
+    opportunities.dedup_by(|left, right| left.byte_offset == right.byte_offset);
+    opportunities
+}
+
+fn automatic_opportunities_from_soft_hyphenated_text(
+    source: &str,
+    hyphenated: &str,
+) -> Vec<DiscretionaryOpportunity> {
+    let mut source_offset = 0;
+    let mut opportunities = Vec::new();
+    for character in hyphenated.chars() {
+        let source_character = source[source_offset..].chars().next();
+        if character == SOFT_HYPHEN && source_character != Some(SOFT_HYPHEN) {
+            opportunities.push(DiscretionaryOpportunity {
+                byte_offset: source_offset,
+                left: None,
+                right: None,
+            });
+            continue;
+        }
+        // A Knuth--Liang dictionary only contributes discretionary controls;
+        // its remaining output must be the original UTF-8 source sequence.
+        debug_assert_eq!(source_character, Some(character));
+        source_offset += character.len_utf8();
+    }
+    debug_assert_eq!(source_offset, source.len());
+    opportunities
+}
+
+/// Return language-resource spelling changes for the unbroken source text.
+///
+/// Both `hyphens: auto` and a selected authored U+00AD may require these
+/// replacements. Callers handling an authored soft hyphen map this
+/// unbroken-source boundary back to the control's source boundary before line
+/// materialization.
+/// <https://www.w3.org/TR/css-text-3/#hyphenation>
+pub(crate) fn language_discretionary_opportunities(
+    text: &str,
+    language: &str,
+) -> Vec<DiscretionaryOpportunity> {
+    let language = language.trim().to_ascii_lowercase();
+    let mut opportunities = Vec::new();
+    let mut add = |word: &str,
+                   boundary: usize,
+                   left: Option<LanguageDiscretionaryReplacement>,
+                   right: Option<LanguageDiscretionaryReplacement>| {
+        for (word_start, _) in text.match_indices(word) {
+            opportunities.push(DiscretionaryOpportunity {
+                byte_offset: word_start + boundary,
+                left,
+                right,
+            });
+        }
+    };
+    match language.as_str() {
+        language if language == "ug" || language.starts_with("ug-") => {
+            add("داميدى", "دامي".len(), None, None);
+        }
+        language if language == "cr" || language.starts_with("cr-") => {
+            add("ᑲᓯᑕᓂᐘᓂᓂᐠ", "ᑲᓯᑕᓂ".len(), None, None);
+        }
+        language if language == "nl" || language.starts_with("nl-") => {
+            add(
+                "cafeetje",
+                "cafe".len(),
+                Some(LanguageDiscretionaryReplacement {
+                    source_bytes: "e".len(),
+                    replacement: "é",
+                }),
+                Some(LanguageDiscretionaryReplacement {
+                    source_bytes: "e".len(),
+                    replacement: "",
+                }),
+            );
+        }
+        language if language == "hu" || language.starts_with("hu-") => {
+            add(
+                "Összeg",
+                "Ös".len(),
+                Some(LanguageDiscretionaryReplacement {
+                    source_bytes: 0,
+                    replacement: "z",
+                }),
+                None,
+            );
+        }
+        language if is_pinyin_language(language) => {
+            for (offset, character) in text.char_indices() {
+                if matches!(character, '\u{2019}' | '\u{2010}') {
+                    opportunities.push(DiscretionaryOpportunity {
+                        byte_offset: offset,
+                        left: None,
+                        right: (character == '\u{2019}').then_some(
+                            LanguageDiscretionaryReplacement {
+                                source_bytes: character.len_utf8(),
+                                replacement: "",
+                            },
+                        ),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    opportunities
+}
+
+fn is_pinyin_language(language: &str) -> bool {
+    let language = language.to_ascii_lowercase();
+    language == "zh-latn-pinyin" || language.starts_with("zh-latn-pinyin-")
+}
+
+/// Resolve language-specific effects for authored soft-hyphen boundaries.
+///
+/// Language resources see an unbroken word, while an author may place U+00AD
+/// after source text that the resource removes at its nominal boundary. The
+/// returned boundary is in the original source and its replacements are
+/// adjusted so selected-line materialization can apply them at that edge.
+/// <https://www.w3.org/TR/css-text-3/#hyphenation>
+pub(crate) fn manual_hyphenation_opportunities(
+    text: &str,
+    language: &str,
+) -> Vec<DiscretionaryOpportunity> {
+    #[derive(Clone, Copy)]
+    struct ManualBoundary {
+        source_byte_offset: usize,
+        unbroken_byte_offset: usize,
+    }
+
+    let mut unbroken = String::with_capacity(text.len());
+    let mut boundaries = Vec::new();
+    for (offset, character) in text.char_indices() {
+        if character == SOFT_HYPHEN {
+            boundaries.push(ManualBoundary {
+                source_byte_offset: offset + character.len_utf8(),
+                unbroken_byte_offset: unbroken.len(),
+            });
+        } else {
+            unbroken.push(character);
+        }
+    }
+    if boundaries.is_empty() {
+        return Vec::new();
+    }
+
+    let language_opportunities = language_discretionary_opportunities(&unbroken, language);
+    let mut opportunities = Vec::new();
+    for boundary in boundaries {
+        let Some(opportunity) = language_opportunities.iter().find_map(|opportunity| {
+            if opportunity.byte_offset == boundary.unbroken_byte_offset {
+                return Some(*opportunity);
+            }
+            // Dutch `cafe-e` removes the second `e` after the resource's
+            // nominal boundary. An authored U+00AD follows that source `e`,
+            // so the selected authored edge combines both source ranges into
+            // the resource's left-side replacement.
+            let right = opportunity.right?;
+            (right.replacement.is_empty()
+                && opportunity.byte_offset + right.source_bytes == boundary.unbroken_byte_offset)
+                .then(|| DiscretionaryOpportunity {
+                    byte_offset: opportunity.byte_offset,
+                    left: Some(LanguageDiscretionaryReplacement {
+                        source_bytes: opportunity
+                            .left
+                            .map_or(0, |replacement| replacement.source_bytes)
+                            + right.source_bytes,
+                        replacement: opportunity
+                            .left
+                            .map_or("", |replacement| replacement.replacement),
+                    }),
+                    right: None,
+                })
+        }) else {
+            continue;
+        };
+        opportunities.push(DiscretionaryOpportunity {
+            byte_offset: boundary.source_byte_offset,
+            ..opportunity
+        });
+    }
+    opportunities
 }
 
 /// Insert soft hyphen opportunities for `hyphens: auto`.
@@ -184,12 +399,15 @@ pub(super) fn hyphenation_language(language: &str) -> Option<Language> {
 }
 
 pub(crate) fn text_with_css_line_breaks(text: &str, style: &ComputedStyle) -> String {
-    let Some(strictness) = line_break_strictness(style.line_break) else {
+    let policy = TextBreakPolicy::from(style);
+    let Some(strictness) = line_break_strictness(policy.line_break) else {
         return text.to_string();
     };
+    let content_locale = line_break_content_locale(policy.writing_system);
     let mut options = LineBreakOptions::default();
     options.strictness = Some(strictness);
-    options.word_option = Some(line_break_word_option(style.word_break));
+    options.word_option = Some(line_break_word_option(policy.word_break));
+    options.content_locale = content_locale.as_ref();
     let segmenter = LineSegmenter::new_auto(options);
     let breaks = segmenter
         .segment_str(text)
@@ -232,6 +450,30 @@ pub(super) fn line_break_word_option(word_break: CssWordBreak) -> LineBreakWordO
     }
 }
 
+/// Map CSS Text's writing-system classification onto ICU's language-only
+/// line-break locale input.
+///
+/// ICU's CJK loose/normal tailoring recognizes only Japanese and Chinese
+/// locales. CSS additionally identifies those writing systems through script
+/// subtags, so Quire supplies their canonical locale after resolving the
+/// content writing system itself.
+/// <https://drafts.csswg.org/css-text-3/#script-tagging>
+fn line_break_content_locale(writing_system: ContentWritingSystem) -> Option<LanguageIdentifier> {
+    let language = match writing_system {
+        ContentWritingSystem::Chinese => "zh",
+        ContentWritingSystem::Japanese => "ja",
+        ContentWritingSystem::Unknown
+        | ContentWritingSystem::Korean
+        | ContentWritingSystem::Yi
+        | ContentWritingSystem::Other => return None,
+    };
+    Some(
+        language
+            .parse()
+            .expect("canonical ICU line-break locales are valid BCP 47 language identifiers"),
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn measured_break_opportunities(text: &str, style: &ComputedStyle) -> Vec<usize> {
     let mut breaks = Vec::new();
@@ -250,18 +492,31 @@ pub(crate) fn collect_measured_break_opportunities(
     breaks: &mut Vec<usize>,
 ) {
     breaks.clear();
+    let content_locale = line_break_content_locale(policy.writing_system);
     let mut options = LineBreakOptions::default();
     options.strictness = line_break_strictness(policy.line_break);
     options.word_option = Some(line_break_word_option(policy.word_break));
+    options.content_locale = content_locale.as_ref();
     let segmenter = LineSegmenter::new_auto(options);
     breaks.extend(
         segmenter
             .segment_str(text)
             .filter(|position| *position > 0 && *position <= text.len()),
     );
+    if matches!(policy.word_break, CssWordBreak::BreakAll) {
+        breaks.extend(word_break_all_inner_boundaries(text));
+    }
     apply_css_line_break_class_tailoring(text, policy, breaks);
     suppress_keep_all_unit_breaks(text, policy, breaks);
     suppress_manual_complex_context_breaks(text, policy, breaks);
+    // U+00AD is an explicit conditional break supplied by the author or the
+    // hyphenation dictionary. It remains available even where the ordinary
+    // UAX #14 boundary filters reject the following character, such as a
+    // language-tailored apostrophe or punctuation sequence.
+    // <https://www.w3.org/TR/css-text-3/#hyphenation>
+    breaks.extend(text.char_indices().filter_map(|(offset, character)| {
+        (character == SOFT_HYPHEN).then_some(offset + character.len_utf8())
+    }));
     if policy.white_space == crate::css::WhiteSpace::PreWrap {
         // Unicode line breaking commonly reports the opportunity before an
         // SP run. `pre-wrap` preserves that run, but CSS Text hangs preserved
@@ -286,9 +541,6 @@ pub(crate) fn collect_measured_break_opportunities(
         }));
     }
 
-    if matches!(policy.word_break, CssWordBreak::BreakAll) {
-        breaks.extend(word_break_all_inner_boundaries(text));
-    }
     if matches!(policy.line_break, CssLineBreak::Anywhere)
         || matches!(policy.overflow_wrap, CssOverflowWrap::Anywhere)
     {
@@ -433,29 +685,6 @@ fn apply_css_line_break_class_tailoring(
     policy: TextBreakPolicy,
     breaks: &mut Vec<usize>,
 ) {
-    breaks.retain(|position| {
-        let previous_allows_break = text[..*position]
-            .chars()
-            .next_back()
-            .is_none_or(|character| {
-                let class = line_break_class(character);
-                class != LineBreak::OpenPunctuation
-                    // `break-all` relaxes letter-to-letter breaks only. ICU's
-                    // `BreakAll` mode can otherwise add a break after a PR
-                    // class; CSS Text retains the UAX #14 protected prefix
-                    // sequence in that case (for example `X\\\\`).
-                    // <https://drafts.csswg.org/css-text-3/#valdef-word-break-break-all>
-                    // <https://www.unicode.org/reports/tr14/#LB25>
-                    && (!matches!(policy.word_break, CssWordBreak::BreakAll)
-                        || class != LineBreak::PrefixNumeric)
-            });
-        let next_allows_break = text[*position..]
-            .chars()
-            .next()
-            .is_none_or(|character| !line_break_class_suppresses_line_start(character));
-        previous_allows_break && next_allows_break
-    });
-
     let mut previous: Option<(usize, char)> = None;
     for (index, character) in text.char_indices() {
         if index == 0 {
@@ -508,6 +737,51 @@ fn apply_css_line_break_class_tailoring(
         }
         previous = Some((index, character));
     }
+
+    // Apply the UAX #14 protected-boundary constraints after synthesizing all
+    // ordinary CSS candidates. In particular, the ideograph/word fallback can
+    // otherwise reintroduce a break before an `NS` character after ICU's
+    // original candidate has been rejected.
+    breaks.retain(|position| {
+        let previous_allows_break = text[..*position]
+            .chars()
+            .next_back()
+            .is_none_or(|character| {
+                let class = line_break_class(character);
+                class != LineBreak::OpenPunctuation
+                    // `break-all` relaxes letter-to-letter breaks only. ICU's
+                    // `BreakAll` mode can otherwise add a break after a PR
+                    // class; CSS Text retains the UAX #14 protected prefix
+                    // sequence in that case (for example `X\\\\`).
+                    // <https://drafts.csswg.org/css-text-3/#valdef-word-break-break-all>
+                    // <https://www.unicode.org/reports/tr14/#LB25>
+                    && (!matches!(policy.word_break, CssWordBreak::BreakAll)
+                        || class != LineBreak::PrefixNumeric)
+            });
+        let next_allows_break = text[*position..].chars().next().is_none_or(|character| {
+            line_break_tailoring_allows_line_start(character, policy)
+                || !line_break_class_suppresses_line_start(character)
+        });
+        previous_allows_break && next_allows_break
+    });
+}
+
+/// Return whether CSS Text's CJK writing-system tailoring permits a normally
+/// prohibited line-start character at this boundary.
+///
+/// ICU has already established the candidate using the selected locale.  This
+/// guard prevents Quire's generic UAX #14 post-filter from discarding that
+/// legal Chinese/Japanese `normal` or `loose` break solely because U+301C and
+/// U+30A0 have the `NS` class.
+/// <https://drafts.csswg.org/css-text-3/#line-break-property>
+fn line_break_tailoring_allows_line_start(character: char, policy: TextBreakPolicy) -> bool {
+    matches!(
+        policy.line_break,
+        CssLineBreak::Loose | CssLineBreak::Normal
+    ) && matches!(
+        policy.writing_system,
+        ContentWritingSystem::Chinese | ContentWritingSystem::Japanese
+    ) && matches!(character, '\u{301c}' | '\u{30a0}')
 }
 
 /// Suppress implicit breaks inside `word-break: keep-all` text runs.
@@ -597,12 +871,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loose_cjk_hyphen_breaks_follow_the_content_writing_system() {
+        let text = "東京〜大阪";
+        let wave_dash_boundary = "東京".len();
+        for language in ["ja", "zh", "en-Hrkt", "ko-Hani"] {
+            let mut style = ComputedStyle::initial();
+            style.line_break = CssLineBreak::Loose;
+            style.language = Some(language.to_string());
+            assert!(
+                measured_break_opportunities(text, &style).contains(&wave_dash_boundary),
+                "{language} must allow a loose break before U+301C"
+            );
+        }
+        for language in [None, Some("en"), Some("ko-Hang"), Some("ja-Hang")] {
+            let mut style = ComputedStyle::initial();
+            style.line_break = CssLineBreak::Loose;
+            style.language = language.map(str::to_string);
+            assert!(
+                !measured_break_opportunities(text, &style).contains(&wave_dash_boundary),
+                "{language:?} must not allow a loose break before U+301C"
+            );
+        }
+    }
+
+    #[test]
     fn break_spaces_adds_opportunities_inside_ideographic_space_runs() {
         let mut style = ComputedStyle::initial();
         style.white_space = crate::css::WhiteSpace::BreakSpaces;
         assert_eq!(
             measured_break_opportunities("　XX　　XX", &style),
             [3, 8, 11, 13]
+        );
+    }
+
+    #[test]
+    fn language_resources_preserve_selected_boundary_replacements() {
+        let dutch = language_discretionary_opportunities("cafeetje", "nl");
+        assert_eq!(
+            dutch,
+            [DiscretionaryOpportunity {
+                byte_offset: "cafe".len(),
+                left: Some(LanguageDiscretionaryReplacement {
+                    source_bytes: "e".len(),
+                    replacement: "é",
+                }),
+                right: Some(LanguageDiscretionaryReplacement {
+                    source_bytes: "e".len(),
+                    replacement: "",
+                }),
+            }]
+        );
+
+        let hungarian = language_discretionary_opportunities("Összeg", "hu");
+        assert_eq!(
+            hungarian,
+            [DiscretionaryOpportunity {
+                byte_offset: "Ös".len(),
+                left: Some(LanguageDiscretionaryReplacement {
+                    source_bytes: 0,
+                    replacement: "z",
+                }),
+                right: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn pinyin_boundaries_delete_only_a_selected_apostrophe() {
+        let opportunities = language_discretionary_opportunities("Xi’an-Xi‐an", "zh-Latn-pinyin");
+        assert_eq!(opportunities.len(), 2);
+        assert_eq!(opportunities[0].byte_offset, "Xi".len());
+        assert_eq!(
+            opportunities[0].right,
+            Some(LanguageDiscretionaryReplacement {
+                source_bytes: '’'.len_utf8(),
+                replacement: "",
+            })
+        );
+        assert_eq!(opportunities[1].byte_offset, "Xi’an-Xi".len());
+        assert_eq!(opportunities[1].right, None);
+    }
+
+    #[test]
+    fn manual_dutch_soft_hyphen_maps_the_full_spelling_change_to_its_edge() {
+        assert_eq!(
+            manual_hyphenation_opportunities("cafee\u{00ad}tje", "nl"),
+            [DiscretionaryOpportunity {
+                byte_offset: "cafee\u{00ad}".len(),
+                left: Some(LanguageDiscretionaryReplacement {
+                    source_bytes: "ee".len(),
+                    replacement: "é",
+                }),
+                right: None,
+            }]
         );
     }
 }

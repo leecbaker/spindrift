@@ -39,8 +39,35 @@ impl<'a> LayoutBuilder<'a> {
         let wrapper_border_box_block_size = self.take_table_wrapper_block_size_override();
         let columns = input.columns.as_slice();
 
-        let available_table_width =
-            self.content_right - self.content_left - style.margin.left - style.margin.right;
+        let containing_inline_span =
+            PageInlineSpan::from_edges(self.content_left, self.content_right);
+        // An auto-width table is a block formatting context root. Its
+        // shrink-to-fit input is therefore the complete active float band for
+        // the wrapper's prospective block range, rather than the containing
+        // block's unconstrained width or the band produced by one float.
+        // Resolving tracks at the full width and only then avoiding the
+        // combined band makes a table that could fit beside two staggered
+        // floats move below both of them.
+        // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+        // <https://www.w3.org/TR/CSS22/tables.html#auto-table-layout>
+        let active_float_band_width = (style.box_values.width.is_auto()
+            && style.writing_mode == WritingMode::HorizontalTb)
+            .then(|| {
+                self.float_contexts.last().map(|context| {
+                    context
+                        .placement_band(
+                            self.current_float_page_index(),
+                            PageBlockSpan::from_edges(self.cursor_y, self.page_bottom()),
+                            containing_inline_span,
+                        )
+                        .width()
+                })
+            })
+            .flatten();
+        let available_table_width = active_float_band_width
+            .unwrap_or_else(|| containing_inline_span.width())
+            - style.margin.left
+            - style.margin.right;
         let mut table_width = used_table_width(style, available_table_width);
         let table_cellpadding = element
             .attrs
@@ -49,6 +76,7 @@ impl<'a> LayoutBuilder<'a> {
         let table_metrics = table_metrics(element, style);
         if rows.is_empty() {
             self.layout_empty_table(
+                element,
                 captions,
                 style,
                 stylesheets,
@@ -62,6 +90,13 @@ impl<'a> LayoutBuilder<'a> {
             return;
         }
         let grid = table_grid(rows);
+        // Intrinsic width, track, and row-height probes may lay out nested
+        // formatting contexts to obtain their final used sizes. Those probes
+        // are not a table fragment boundary and must not leave page paint,
+        // assignments, or float state behind for the committed wrapper pass.
+        // <https://www.w3.org/TR/css-tables-3/#table-layout>
+        // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+        let table_measurement_snapshot = self.snapshot();
         let collapsed_geometry = (table_metrics.border_collapse == css::BorderCollapse::Collapse)
             .then(|| {
                 self.collapsed_table_geometry(
@@ -91,8 +126,8 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             columns,
-            table_width.content_width.points(),
-            !table_root_inline_size(style).is_auto(),
+            LogicalInlineContentSize::new(table_width.content_width),
+            table_root_distributes_extra_inline_space(style),
             table_cellpadding,
             table_metrics.clone(),
             collapsed_geometry.as_ref(),
@@ -101,6 +136,8 @@ impl<'a> LayoutBuilder<'a> {
             table_width.border_widths = geometry.outer_insets;
         }
         let used_table_width = column_plan.total_width();
+        let provisional_caption_width =
+            PhysicalContentWidth::new(content_box_pt(used_table_width.points()));
         let repeating_header_rows = table_repeating_header_row_indices(rows);
         let repeating_footer_rows = table_repeating_footer_row_indices(rows);
         let wrapper_non_grid_block_size = layout_pt(
@@ -108,13 +145,13 @@ impl<'a> LayoutBuilder<'a> {
                 captions,
                 style,
                 stylesheets,
-                used_table_width,
+                provisional_caption_width,
                 CaptionSide::Top,
             ) + self.estimate_table_captions_height(
                 captions,
                 style,
                 stylesheets,
-                used_table_width,
+                provisional_caption_width,
                 CaptionSide::Bottom,
             ),
         );
@@ -132,8 +169,10 @@ impl<'a> LayoutBuilder<'a> {
             wrapper_non_grid_block_size,
         };
         let table_height_plan = self.table_height_plan(&table_context);
+        self.restore(table_measurement_snapshot);
         self.fixed_layers.truncate(fixed_layer_start);
         let planned_row_heights = table_height_plan.final_row_heights();
+        let source_row_heights = table_height_plan.source_row_heights();
         let planned_row_occupancy = table_height_plan.row_occupancy();
         let table_height_is_definite = table_height_plan.target_content_height.is_some();
         let repeating_header_height = repeated_table_rows_height(
@@ -169,20 +208,6 @@ impl<'a> LayoutBuilder<'a> {
                 row_group_break_after[end - 1] = row_group_style.break_after;
             }
         }
-        let top_caption_height = self.estimate_table_captions_height(
-            captions,
-            style,
-            stylesheets,
-            used_table_width,
-            CaptionSide::Top,
-        );
-        let bottom_caption_height = self.estimate_table_captions_height(
-            captions,
-            style,
-            stylesheets,
-            used_table_width,
-            CaptionSide::Bottom,
-        );
         let table_content_height = table_content_height(
             &planned_row_heights,
             &planned_row_occupancy,
@@ -199,20 +224,37 @@ impl<'a> LayoutBuilder<'a> {
             table_x: 0.0,
             top: 0.0,
             axes: table_axes,
-            content_width: used_table_width,
-            content_height: table_content_height,
+            grid_size: TableGridLogicalSize::new(
+                used_table_width,
+                LogicalBlockContentSize::new(content_box_pt(table_content_height)),
+            ),
             table_width,
             table_metrics: table_metrics.clone(),
         };
         let physical_grid_box = wrapper_geometry.clone().grid_content_box();
+        let physical_grid_width = wrapper_geometry.clone().physical_grid_width();
         let physical_border_box = wrapper_geometry.border_box();
+        let top_caption_height = self.estimate_table_captions_height(
+            captions,
+            style,
+            stylesheets,
+            physical_grid_width,
+            CaptionSide::Top,
+        );
+        let bottom_caption_height = self.estimate_table_captions_height(
+            captions,
+            style,
+            stylesheets,
+            physical_grid_width,
+            CaptionSide::Bottom,
+        );
         let table_border_box_width = physical_border_box.width();
         let table_border_box_height = physical_border_box.height();
         let mut used_style = style.clone();
         resolve_normal_flow_auto_margins_for_known_width(
             &mut used_style,
-            (self.content_right - self.content_left).max(0.0),
-            table_border_box_width,
+            PageInlineSpan::from_edges(self.content_left, self.content_right),
+            border_box_pt(table_border_box_width),
             self.containing_block_direction,
         );
         let style = &used_style;
@@ -231,11 +273,14 @@ impl<'a> LayoutBuilder<'a> {
         // <https://drafts.csswg.org/css-tables-3/#table-layout>
         // <https://www.w3.org/TR/css-break-3/#breaks-between>
         if !style.writing_mode.has_vertical_lines() {
-            self.prebreak_bfc_margin_box_if_needed(table_collision_height, style.margin.top);
+            self.prebreak_bfc_margin_box_if_needed(
+                margin_box_pt(table_collision_height),
+                style.margin.top,
+            );
         }
-        let (margin_box_left, avoided_top, _) = self.place_float_avoiding_margin_box(
-            self.cursor_y,
-            PageTopSize::new(
+        let placement = self.place_float_avoiding_margin_box(
+            PageTopBlockPosition::new(self.cursor_y),
+            margin_box_size_pt(
                 style.margin.left + table_border_box_width + style.margin.right,
                 table_collision_height,
             ),
@@ -244,15 +289,16 @@ impl<'a> LayoutBuilder<'a> {
             style.used_direction(),
             self.containing_block_direction,
         );
-        self.cursor_y = avoided_top;
-        let table_outer_x = margin_box_left + style.margin.left + relative_offset.x();
+        self.cursor_y = placement.origin.top_y();
+        let table_outer_x = placement.origin.x() + style.margin.left + relative_offset.x();
         // CSS table wrappers paint borders/padding around the table grid; the
         // grid itself starts at the content-box inline-start edge.
         let table_x = table_width.content_x(table_outer_x);
 
         self.push_float_context();
         let table_wrapper_top = self.cursor_y;
-        let positioning_containing_block_mode = PositionedContainingBlockMode::for_style(style);
+        let positioning_containing_block_mode =
+            PositionedContainingBlockMode::for_element(element, style);
         let positioned_containing_block_scope = if let Some(mode) =
             positioning_containing_block_mode
         {
@@ -260,7 +306,7 @@ impl<'a> LayoutBuilder<'a> {
                 ContainingBlock::from_page_top_rect(table_wrapper_positioning_containing_block(
                     table_x,
                     table_wrapper_top,
-                    physical_grid_box.width(),
+                    physical_grid_width,
                     physical_grid_box.height(),
                     table_width,
                     top_caption_height,
@@ -282,7 +328,7 @@ impl<'a> LayoutBuilder<'a> {
         let top_caption_clip = PageTopRect::new(
             table_x - table_width.padding.left,
             table_wrapper_top,
-            used_table_width + table_width.padding.left + table_width.padding.right,
+            physical_grid_width.points() + table_width.padding.left + table_width.padding.right,
             top_caption_height,
         );
         let top_caption_clip_active = if style.contain.paint {
@@ -313,8 +359,10 @@ impl<'a> LayoutBuilder<'a> {
             table_x,
             top: table_box_top,
             axes: TableAxes::for_style(style),
-            content_width: used_table_width,
-            content_height: table_content_height,
+            grid_size: TableGridLogicalSize::new(
+                used_table_width,
+                LogicalBlockContentSize::new(content_box_pt(table_content_height)),
+            ),
             table_width,
             table_metrics: table_metrics.clone(),
         };
@@ -369,10 +417,12 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             table_x,
-            used_table_width,
+            logical_inline_extent: used_table_width,
+            physical_grid_width,
             table_cellpadding,
             column_plan: &column_plan,
             planned_row_heights: &planned_row_heights,
+            source_row_heights: &source_row_heights,
             planned_row_occupancy: &planned_row_occupancy,
             table_height_is_definite,
             table_width,
@@ -394,7 +444,8 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             table_x,
-            used_table_width,
+            logical_inline_extent: used_table_width,
+            physical_grid_width,
             table_cellpadding,
             column_plan: &column_plan,
             planned_row_heights: &planned_row_heights,
@@ -423,7 +474,7 @@ impl<'a> LayoutBuilder<'a> {
         let bottom_caption_clip = PageTopRect::new(
             table_x - table_width.padding.left,
             self.cursor_y,
-            used_table_width + table_width.padding.left + table_width.padding.right,
+            physical_grid_width.points() + table_width.padding.left + table_width.padding.right,
             bottom_caption_height,
         );
         let bottom_caption_clip_active = if style.contain.paint {
@@ -459,7 +510,7 @@ impl<'a> LayoutBuilder<'a> {
             let wrapper_clip = PageTopRect::new(
                 table_x - table_width.padding.left,
                 table_wrapper_top,
-                used_table_width + table_width.padding.left + table_width.padding.right,
+                physical_grid_width.points() + table_width.padding.left + table_width.padding.right,
                 top_caption_height + table_border_box_height + bottom_caption_height,
             )
             .paint_clip();
@@ -484,7 +535,7 @@ impl<'a> LayoutBuilder<'a> {
         {
             let physical_grid_height = FlowAxes::for_style(style)
                 .physical_size_from_logical(LogicalSize {
-                    inline: used_table_width,
+                    inline: used_table_width.points(),
                     block: table_content_height,
                 })
                 .height;

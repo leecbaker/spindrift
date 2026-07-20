@@ -226,7 +226,7 @@ failures are classified below rather than excluded.
   while preserving forced breaks inside a nested fragmentation context. The
   broader fragmented-flow trapping rule and principal writing-mode propagation
   from contained `html`/`body` elements remain incomplete.
-- Fragmented paint-containment effect-group semantics and non-rounded
+- Fragmented paint-containment effect-group semantics and non-polygon
   `clip-path` shapes remain part of the separate paint-effects work.
 - CSS Multicol Level 2 `column-height` and `column-wrap`, and CSS Containment
   Level 2 `inline-size`, style containment, and `content-visibility`, are not

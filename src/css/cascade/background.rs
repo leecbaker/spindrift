@@ -7,6 +7,13 @@ pub(super) fn apply_background_shorthand(
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
 ) {
+    let normalized_value = crate::css::normalize_css_comments(value);
+    let value = normalized_value.trim();
+    let Some(layers) =
+        parse_background_shorthand_layers(value, style.font_size, base_url, root_url)
+    else {
+        return;
+    };
     style.background_color_current_color_expression = None;
     style.background_color_is_current_color = background_tokens(value)
         .iter()
@@ -20,8 +27,7 @@ pub(super) fn apply_background_shorthand(
                 .find_map(|token| parse_color(token))
         })
     };
-    style.background_layers =
-        parse_background_shorthand_layers(value, style.font_size, base_url, root_url);
+    style.background_layers = layers;
     style.background_image_layer_count = style.background_layers.len().max(1);
     if style.background_layers.is_empty() {
         sync_background_layers_from_single_fields(style);
@@ -95,7 +101,7 @@ pub(super) fn apply_background_image_list(
         return;
     };
     if images.is_empty() {
-        style.background_image = None;
+        style.background_image = ComputedImage::None;
         style.background_layers.clear();
         style.background_image_layer_count = 1;
         return;
@@ -341,6 +347,14 @@ pub(crate) fn parse_background_position(value: &str, font_size: f32) -> Option<B
             y,
         });
     }
+    if !tokens.iter().all(|token| {
+        matches!(
+            token.as_str(),
+            "left" | "right" | "top" | "bottom" | "center"
+        ) || parse_computed_length_percentage(token, font_size).is_some()
+    }) {
+        return None;
+    }
     let mut position = BackgroundPosition::INITIAL;
     if tokens.iter().any(|token| token == "center") {
         position.x.origin = BackgroundPositionOrigin::Center;
@@ -424,44 +438,76 @@ fn parse_background_position_axis(
     }
 }
 
-pub(super) fn extract_css_url(value: &str) -> Option<String> {
-    parse_first_css_url(value)
-}
-
 /// Parses a single supported CSS background image.
 ///
 /// CSS Backgrounds delegates image values to CSS Images. This parser supports
 /// URL images and CSS Images Level 3 linear/radial gradients as generated images:
 /// <https://www.w3.org/TR/css-backgrounds-3/#the-background-image> and
 /// <https://www.w3.org/TR/css-images-3/#gradients>.
+/// Result of parsing a CSS `<image>` value at a property boundary.
+///
+/// `Invalid` is deliberately distinct from syntax failure: CSS Images says an
+/// exhausted `image-set()` remains a valid value that represents an invalid
+/// image.
+/// <https://drafts.csswg.org/css-images-4/#image-set-notation>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ParsedImage {
+    NotAnImage,
+    SyntaxError,
+    Image(ComputedImage),
+}
+
+/// Parse one complete CSS image value while retaining computed invalid-image
+/// state for every property that accepts `<image>`.
+pub(crate) fn parse_css_image(
+    value: &str,
+    base_url: Option<&url::Url>,
+    root_url: Option<&url::Url>,
+) -> ParsedImage {
+    match parse_image_set(value, base_url, root_url) {
+        ParsedImage::NotAnImage => {}
+        image => return image,
+    }
+    if let Some(gradient) = parse_conic_gradient(value) {
+        return ParsedImage::Image(ComputedImage::image(BackgroundImage::ConicGradient(
+            gradient,
+        )));
+    }
+    if let Some(color) = parse_color_image(value) {
+        return ParsedImage::Image(ComputedImage::image(BackgroundImage::CssColor(color)));
+    }
+    if let Some(gradient) = parse_linear_gradient(value) {
+        return ParsedImage::Image(ComputedImage::image(BackgroundImage::LinearGradient(
+            gradient,
+        )));
+    }
+    if let Some(gradient) = parse_radial_gradient(value) {
+        return ParsedImage::Image(ComputedImage::image(BackgroundImage::RadialGradient(
+            gradient,
+        )));
+    }
+    let Some(url) = parse_first_css_url_with_modifiers(value) else {
+        return ParsedImage::NotAnImage;
+    };
+    ParsedImage::Image(ComputedImage::image(BackgroundImage::Url {
+        src: url.src,
+        base_url: base_url.cloned(),
+        root_url: root_url.cloned(),
+        request_modifiers: url.modifiers,
+    }))
+}
+
+/// Parse a concrete image for legacy consumers that cannot represent invalid
+/// images. Property parsers must use [`parse_css_image`] instead.
 pub(crate) fn parse_background_image(
     value: &str,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
 ) -> Option<BackgroundImage> {
-    match parse_image_set(value, base_url, root_url) {
-        Some(Ok(Some(image))) => return Some(image),
-        Some(Ok(None) | Err(())) => return None,
-        None => {}
+    match parse_css_image(value, base_url, root_url) {
+        ParsedImage::Image(ComputedImage::Image(image)) => Some(*image),
+        ParsedImage::NotAnImage | ParsedImage::SyntaxError | ParsedImage::Image(_) => None,
     }
-    if let Some(gradient) = parse_conic_gradient(value) {
-        return Some(BackgroundImage::ConicGradient(gradient));
-    }
-    if let Some(color) = parse_color_image(value) {
-        return Some(BackgroundImage::Color(color));
-    }
-    if let Some(gradient) = parse_linear_gradient(value) {
-        return Some(BackgroundImage::LinearGradient(gradient));
-    }
-    if let Some(gradient) = parse_radial_gradient(value) {
-        return Some(BackgroundImage::RadialGradient(gradient));
-    }
-    parse_first_css_url_with_modifiers(value).map(|url| BackgroundImage::Url {
-        src: url.src,
-        base_url: base_url.cloned(),
-        root_url: root_url.cloned(),
-        request_modifiers: url.modifiers,
-    })
 }
 
 /// Parse CSS Images Level 4's `image(<color>)` subset. A color image has no
@@ -475,7 +521,7 @@ fn parse_color_image(value: &str) -> Option<ColorImageColor> {
     if argument.trim().eq_ignore_ascii_case("currentcolor") {
         Some(ColorImageColor::CurrentColor)
     } else {
-        parse_color(argument.trim()).map(ColorImageColor::Color)
+        parse_color(argument.trim()).map(ColorImageColor::CssColor)
     }
 }
 
@@ -495,7 +541,8 @@ fn parse_conic_gradient(value: &str) -> Option<ConicGradient> {
     let (arguments, tail) = split_function_argument(body)?;
     tail.trim().is_empty().then_some(())?;
     let parts = split_comma_function_args(arguments);
-    let (start_angle, position, first_stop) = parse_conic_prelude(parts.first()?.trim());
+    let (start_angle, position, interpolation, first_stop) =
+        parse_conic_prelude(parts.first()?.trim())?;
     let stop_parts = if first_stop {
         &parts[1..]
     } else {
@@ -509,18 +556,27 @@ fn parse_conic_gradient(value: &str) -> Option<ConicGradient> {
     Some(ConicGradient {
         start_angle,
         position,
+        interpolation,
         repeating,
         stops,
     })
 }
 
-fn parse_conic_prelude(value: &str) -> (f32, BackgroundPosition, bool) {
-    let tokens = split_css_top_level_whitespace(value);
+fn parse_conic_prelude(
+    value: &str,
+) -> Option<(f32, BackgroundPosition, GradientInterpolationMethod, bool)> {
+    let (interpolation, value) = split_gradient_interpolation_method(value)?;
+    let tokens = split_css_top_level_whitespace(&value);
     let Some(first) = tokens.first() else {
-        return (0.0, radial_gradient_center_position(), false);
+        return interpolation.map(|method| (0.0, radial_gradient_center_position(), method, true));
     };
-    if parse_color(first).is_some() {
-        return (0.0, radial_gradient_center_position(), false);
+    if interpolation.is_none() && parse_gradient_color(first).is_some() {
+        return Some((
+            0.0,
+            radial_gradient_center_position(),
+            GradientInterpolationMethod::default(),
+            false,
+        ));
     }
     let mut angle = 0.0;
     let mut position = radial_gradient_center_position();
@@ -542,13 +598,13 @@ fn parse_conic_prelude(value: &str) -> (f32, BackgroundPosition, bool) {
             position = parsed;
         }
     }
-    (angle, position, true)
+    Some((angle, position, interpolation.unwrap_or_default(), true))
 }
 
 fn parse_conic_gradient_stop(value: &str) -> Option<Vec<ConicGradientStop>> {
     let tokens = split_css_top_level_whitespace(value);
     for split in (1..=tokens.len()).rev() {
-        let Some(color) = parse_color(&tokens[..split].join(" ")) else {
+        let Some(color) = parse_gradient_color(&tokens[..split].join(" ")) else {
             continue;
         };
         let positions = tokens[split..]
@@ -603,7 +659,8 @@ fn parse_conic_angle_percentage(value: &str) -> Option<f32> {
 /// selection at image-value parsing time means every existing consumer of
 /// `BackgroundImage` (backgrounds and generated content) shares exactly the
 /// same selected resource without a second, property-specific image-set
-/// implementation.
+/// implementation. A valid set with no supported candidates is represented
+/// directly as [`ComputedImage::Invalid`], separate from syntax failure.
 /// <https://drafts.csswg.org/css-images-4/#image-set-notation>
 /// Parse a CSS `image-set()` image while preserving the distinction between a
 /// malformed value and a valid set for which this renderer supports no image
@@ -614,25 +671,27 @@ fn parse_image_set(
     value: &str,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
-) -> Option<Result<Option<BackgroundImage>, ()>> {
-    let body = strip_ascii_function(trim_css_value(value), "image-set")?;
+) -> ParsedImage {
+    let Some(body) = strip_ascii_function(trim_css_value(value), "image-set") else {
+        return ParsedImage::NotAnImage;
+    };
     let (body, tail) = match split_function_argument(body) {
         Some(value) => value,
-        None => return Some(Err(())),
+        None => return ParsedImage::SyntaxError,
     };
     if !tail.trim().is_empty() {
-        return Some(Err(()));
+        return ParsedImage::SyntaxError;
     }
     let mut options = Vec::new();
     for option in split_background_layer_values(body) {
         match parse_image_set_option(option, base_url, root_url) {
             Ok(Some(option)) => options.push(option),
             Ok(None) => {}
-            Err(()) => return Some(Err(())),
+            Err(()) => return ParsedImage::SyntaxError,
         }
     }
     if options.is_empty() {
-        return Some(Ok(None));
+        return ParsedImage::Image(ComputedImage::Invalid);
     }
     options.sort_by(|left, right| left.0.total_cmp(&right.0));
     let selected = options
@@ -648,12 +707,12 @@ fn parse_image_set(
                 _ => Some(candidate),
             })
         });
-    Some(Ok(selected.map(|(resolution, image)| {
-        BackgroundImage::ImageSet {
-            image: Box::new(image.clone()),
-            resolution: *resolution,
-        }
-    })))
+    let (resolution, image) =
+        selected.expect("a non-empty image-set option list has a selected candidate");
+    ParsedImage::Image(ComputedImage::image(BackgroundImage::ImageSet {
+        image: Box::new(image.clone()),
+        resolution: *resolution,
+    }))
 }
 
 fn parse_image_set_option(
@@ -663,14 +722,10 @@ fn parse_image_set_option(
 ) -> Result<Option<(f32, BackgroundImage)>, ()> {
     let value = trim_css_value(value);
     let (image, tail) = parse_image_set_option_image(value, base_url, root_url).ok_or(())?;
-    let tail = tail.trim();
-    let type_is_supported = !tail.to_ascii_lowercase().contains("image/unsupported");
-    if !type_is_supported {
-        return Ok(None);
-    }
-    let resolution = parse_image_set_resolution(tail).ok_or(())?;
+    let (resolution_descriptor, mime_type) = parse_image_set_option_descriptors(tail).ok_or(())?;
+    let resolution = parse_image_set_resolution(resolution_descriptor).ok_or(())?;
     if !resolution.is_finite() || resolution < 0.0 {
-        let descriptor = image_set_resolution_without_type(tail).ok_or(())?;
+        let descriptor = resolution_descriptor;
         // A negative literal is a parse-time grammar error, while a valid
         // `calc()` descriptor that computes negative is an invalid candidate.
         // The latter leaves a valid image-set whose result is an invalid image
@@ -683,7 +738,45 @@ fn parse_image_set_option(
     if resolution == 0.0 {
         return Ok(None);
     }
+    if let Some(mime_type) = mime_type
+        && !crate::image_store::supports_declared_image_mime_type(&mime_type)
+    {
+        return Ok(None);
+    }
     Ok(Some((resolution, image)))
+}
+
+/// Split the optional resolution and `type()` descriptors of one
+/// `image-set()` option. The descriptors are an unordered pair, but each may
+/// occur at most once.
+/// <https://drafts.csswg.org/css-images-4/#image-set-notation>
+fn parse_image_set_option_descriptors(value: &str) -> Option<(&str, Option<String>)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(("", None));
+    }
+    let tokens = split_css_component_values(value);
+    let mut resolution = None;
+    let mut mime_type = None;
+    for token in tokens {
+        if let Some(body) = strip_ascii_function(token, "type") {
+            if mime_type.is_some() {
+                return None;
+            }
+            let (argument, tail) = split_function_argument(body)?;
+            if !tail.trim().is_empty() {
+                return None;
+            }
+            let (mime, tail) = parse_css_string_token(argument.trim())?;
+            if !tail.trim().is_empty() {
+                return None;
+            }
+            mime_type = Some(mime);
+        } else if resolution.replace(token).is_some() {
+            return None;
+        }
+    }
+    Some((resolution.unwrap_or(""), mime_type))
 }
 
 fn parse_image_set_option_image<'a>(
@@ -732,7 +825,6 @@ fn parse_image_set_option_image<'a>(
 }
 
 fn parse_image_set_resolution(value: &str) -> Option<f32> {
-    let value = image_set_resolution_without_type(value)?;
     if value.is_empty() {
         // A missing descriptor computes to 1x.
         // <https://drafts.csswg.org/css-images-4/#image-set-notation>
@@ -746,25 +838,6 @@ fn parse_image_set_resolution(value: &str) -> Option<f32> {
         parse_image_set_resolution_dimension(value)?
     };
     Some(resolution)
-}
-
-fn image_set_resolution_without_type(value: &str) -> Option<&str> {
-    let value = value.trim();
-    let lower = value.to_ascii_lowercase();
-    let Some(type_start) = lower.find("type(") else {
-        return Some(value);
-    };
-    if type_start == 0 {
-        let body = strip_ascii_function(value, "type")?;
-        let (_, tail) = split_function_argument(body)?;
-        return Some(tail.trim());
-    }
-    // The `type()` descriptor follows the resolution in the common form.
-    // Parsing its balanced body rejects a dangling descriptor instead of
-    // silently accepting arbitrary trailing tokens.
-    let body = strip_ascii_function(&value[type_start..], "type")?;
-    let (_, tail) = split_function_argument(body)?;
-    tail.trim().is_empty().then_some(value[..type_start].trim())
 }
 
 fn parse_simple_image_set_resolution_expression(value: &str) -> Option<f32> {
@@ -810,7 +883,7 @@ pub(super) fn sync_background_layers_from_single_fields(style: &mut ComputedStyl
 
 pub(super) fn sync_background_single_fields_from_layers(style: &mut ComputedStyle) {
     let Some(layer) = style.background_layers.first() else {
-        style.background_image = None;
+        style.background_image = ComputedImage::None;
         style.background_size = BackgroundSize::AUTO;
         style.background_position = BackgroundPosition::INITIAL;
         style.background_repeat = BackgroundRepeat::Repeat;
@@ -892,24 +965,17 @@ fn parse_background_image_layers(
     value: &str,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
-) -> Option<Vec<Option<BackgroundImage>>> {
+) -> Option<Vec<ComputedImage>> {
     let mut images = Vec::new();
     for part in split_background_layer_values(value) {
         let image = if trim_css_value(part).eq_ignore_ascii_case("none") {
-            None
+            ComputedImage::None
         } else {
-            match parse_image_set(part, base_url, root_url) {
-                Some(Ok(image)) => image,
-                Some(Err(())) => return None,
-                None => parse_background_image(part, base_url, root_url),
+            match parse_css_image(part, base_url, root_url) {
+                ParsedImage::Image(image) => image,
+                ParsedImage::NotAnImage | ParsedImage::SyntaxError => return None,
             }
         };
-        if image.is_none()
-            && !trim_css_value(part).eq_ignore_ascii_case("none")
-            && parse_image_set(part, base_url, root_url).is_none()
-        {
-            return None;
-        }
         images.push(image);
     }
     Some(images)
@@ -920,12 +986,17 @@ fn parse_background_shorthand_layers(
     font_size: f32,
     base_url: Option<&url::Url>,
     root_url: Option<&url::Url>,
-) -> Vec<BackgroundLayer> {
+) -> Option<Vec<BackgroundLayer>> {
     split_background_layer_values(value)
         .into_iter()
         .map(|part| {
+            background_shorthand_layer_is_valid(part, font_size)?;
             let mut layer = BackgroundLayer::initial();
-            layer.image = parse_background_image(part, base_url, root_url);
+            layer.image = match parse_css_image(part, base_url, root_url) {
+                ParsedImage::Image(image) => image,
+                ParsedImage::NotAnImage => ComputedImage::None,
+                ParsedImage::SyntaxError => return None,
+            };
             layer.repeat = parse_background_repeat(part).unwrap_or(BackgroundRepeat::Repeat);
             layer.attachment = background_tokens(part)
                 .into_iter()
@@ -978,9 +1049,30 @@ fn parse_background_shorthand_layers(
                 }
                 [] => {}
             }
-            layer
+            Some(layer)
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()
+}
+
+/// Validate the still-unmodeled parts of a background layer before the
+/// shorthand resets any of its longhands. Existing component parsers provide
+/// the grammar checks; this ensures stray identifiers are not treated as an
+/// otherwise-valid color-only layer.
+fn background_shorthand_layer_is_valid(value: &str, font_size: f32) -> Option<()> {
+    let (position, size) = match split_background_position_size(value) {
+        Some((position, size)) => (position, Some(size)),
+        None => (strip_background_noise(value), None),
+    };
+    if !position.trim().is_empty() && parse_background_position(&position, font_size).is_none() {
+        return None;
+    }
+    if let Some(size) = size
+        && !size.trim().is_empty()
+        && parse_background_size(&size, font_size).is_none()
+    {
+        return None;
+    }
+    Some(())
 }
 
 fn split_background_layer_values(value: &str) -> Vec<&str> {
@@ -1053,11 +1145,15 @@ pub(crate) fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
         return None;
     }
     let mut first_stop = 0usize;
-    let direction = if let Some(direction) = parse_linear_gradient_direction(parts[0].trim()) {
-        first_stop = 1;
-        direction
-    } else {
-        LinearGradientDirection::Angle(180.0)
+    let (direction, interpolation) = match parse_linear_gradient_prelude(parts[0].trim())? {
+        Some(prelude) => {
+            first_stop = 1;
+            prelude
+        }
+        None => (
+            LinearGradientDirection::Angle(180.0),
+            GradientInterpolationMethod::default(),
+        ),
     };
     let mut stops = Vec::new();
     let mut hints = Vec::new();
@@ -1080,6 +1176,7 @@ pub(crate) fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     }
     Some(LinearGradient {
         direction,
+        interpolation,
         repeating,
         stops,
         hints,
@@ -1116,15 +1213,17 @@ pub(crate) fn parse_radial_gradient(value: &str) -> Option<RadialGradient> {
         return None;
     }
     let mut first_stop = 0usize;
-    let (shape, size, position) = if let Some(prelude) = parse_radial_gradient_prelude(&parts[0]) {
-        first_stop = 1;
-        prelude
-    } else {
-        (
+    let (shape, size, position, interpolation) = match parse_radial_gradient_prelude(&parts[0])? {
+        Some(prelude) => {
+            first_stop = 1;
+            prelude
+        }
+        None => (
             RadialGradientShape::Ellipse,
             RadialGradientSize::Extent(RadialGradientExtent::FarthestCorner),
             radial_gradient_center_position(),
-        )
+            GradientInterpolationMethod::default(),
+        ),
     };
     let mut stops = Vec::new();
     let mut hints = Vec::new();
@@ -1144,6 +1243,7 @@ pub(crate) fn parse_radial_gradient(value: &str) -> Option<RadialGradient> {
         shape,
         size,
         position,
+        interpolation,
         repeating,
         stops,
         hints,
@@ -1152,10 +1252,26 @@ pub(crate) fn parse_radial_gradient(value: &str) -> Option<RadialGradient> {
 
 fn parse_radial_gradient_prelude(
     value: &str,
-) -> Option<(RadialGradientShape, RadialGradientSize, BackgroundPosition)> {
-    let (size_text, position) = split_radial_gradient_position(value)?;
+) -> Option<
+    Option<(
+        RadialGradientShape,
+        RadialGradientSize,
+        BackgroundPosition,
+        GradientInterpolationMethod,
+    )>,
+> {
+    let (interpolation, value) = split_gradient_interpolation_method(value)?;
+    if interpolation.is_none() && parse_color(&value).is_some() {
+        return Some(None);
+    }
+    let (size_text, position) = split_radial_gradient_position(&value)?;
     let (shape, size) = parse_radial_gradient_shape_and_size(&size_text)?;
-    Some((shape, size, position))
+    Some(Some((
+        shape,
+        size,
+        position,
+        interpolation.unwrap_or_default(),
+    )))
 }
 
 fn split_radial_gradient_position(value: &str) -> Option<(String, BackgroundPosition)> {
@@ -1331,6 +1447,104 @@ fn parse_linear_gradient_direction(value: &str) -> Option<LinearGradientDirectio
     }
 }
 
+/// Split CSS Images 4's unordered `in <color-space>` production from a
+/// gradient prelude. The remaining top-level tokens are interpreted by the
+/// gradient-specific geometry parser.
+/// <https://drafts.csswg.org/css-color-4/#interpolation>
+fn split_gradient_interpolation_method(
+    value: &str,
+) -> Option<(Option<GradientInterpolationMethod>, String)> {
+    let tokens = split_css_top_level_whitespace(value);
+    let in_positions = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| token.eq_ignore_ascii_case("in").then_some(index))
+        .collect::<Vec<_>>();
+    if in_positions.is_empty() {
+        return Some((None, value.trim().to_string()));
+    }
+    if in_positions.len() != 1 {
+        return None;
+    }
+    let index = in_positions[0];
+    let space = tokens.get(index + 1)?.to_ascii_lowercase();
+    let space = match space.as_str() {
+        "srgb" => GradientInterpolationSpace::Srgb,
+        "srgb-linear" => GradientInterpolationSpace::SrgbLinear,
+        "display-p3" => GradientInterpolationSpace::DisplayP3,
+        "display-p3-linear" => GradientInterpolationSpace::DisplayP3Linear,
+        "a98-rgb" => GradientInterpolationSpace::A98Rgb,
+        "prophoto-rgb" => GradientInterpolationSpace::ProphotoRgb,
+        "rec2020" => GradientInterpolationSpace::Rec2020,
+        // CSS CssColor aliases `xyz` to the D65-referenced predefined space.
+        "xyz-d50" => GradientInterpolationSpace::XyzD50,
+        "xyz" | "xyz-d65" => GradientInterpolationSpace::XyzD65,
+        "lab" => GradientInterpolationSpace::Lab,
+        "oklab" => GradientInterpolationSpace::Oklab,
+        "hsl" => GradientInterpolationSpace::Hsl,
+        "hwb" => GradientInterpolationSpace::Hwb,
+        "lch" => GradientInterpolationSpace::Lch,
+        "oklch" => GradientInterpolationSpace::Oklch,
+        _ => return None,
+    };
+    let mut consumed = 2;
+    let hue = if space.is_polar()
+        && let (Some(method), Some(keyword)) = (tokens.get(index + 2), tokens.get(index + 3))
+        && keyword.eq_ignore_ascii_case("hue")
+    {
+        consumed += 2;
+        match method.to_ascii_lowercase().as_str() {
+            "shorter" => HueInterpolationMethod::Shorter,
+            "longer" => HueInterpolationMethod::Longer,
+            "increasing" => HueInterpolationMethod::Increasing,
+            "decreasing" => HueInterpolationMethod::Decreasing,
+            _ => return None,
+        }
+    } else {
+        HueInterpolationMethod::Shorter
+    };
+    // `hue` is only legal for polar spaces; leave no stray interpolation
+    // tokens for a geometry parser to accidentally accept.
+    if !space.is_polar()
+        && tokens.get(index + 2).is_some_and(|token| {
+            matches!(
+                token.to_ascii_lowercase().as_str(),
+                "shorter" | "longer" | "increasing" | "decreasing" | "hue"
+            )
+        })
+    {
+        return None;
+    }
+    let mut remaining = Vec::with_capacity(tokens.len().saturating_sub(consumed));
+    for (token_index, token) in tokens.into_iter().enumerate() {
+        if token_index < index || token_index >= index + consumed {
+            remaining.push(token);
+        }
+    }
+    Some((
+        Some(GradientInterpolationMethod { space, hue }),
+        remaining.join(" "),
+    ))
+}
+
+fn parse_linear_gradient_prelude(
+    value: &str,
+) -> Option<Option<(LinearGradientDirection, GradientInterpolationMethod)>> {
+    let (interpolation, geometry) = split_gradient_interpolation_method(value)?;
+    if let Some(interpolation) = interpolation {
+        let direction = if geometry.trim().is_empty() {
+            LinearGradientDirection::Angle(180.0)
+        } else {
+            parse_linear_gradient_direction(&geometry)?
+        };
+        return Some(Some((direction, interpolation)));
+    }
+    Some(
+        parse_linear_gradient_direction(&geometry)
+            .map(|direction| (direction, GradientInterpolationMethod::default())),
+    )
+}
+
 fn parse_css_angle_degrees(value: &str) -> Option<f32> {
     let value = trim_css_value(value);
     let mut input = cssparser::ParserInput::new(value);
@@ -1389,7 +1603,7 @@ fn parse_gradient_item(
         parts.pop();
     }
     let color_text = parts.join(" ");
-    let color = parse_color(&color_text)?;
+    let color = parse_gradient_color(&color_text)?;
     stops.push(GradientColorStop {
         color,
         position: first_position.clone().or(second_position.clone()),
@@ -1401,6 +1615,95 @@ fn parse_gradient_item(
         });
     }
     Some(())
+}
+
+fn parse_gradient_color(value: &str) -> Option<GradientColor> {
+    if value.trim().eq_ignore_ascii_case("currentcolor") {
+        Some(GradientColor::CurrentColor)
+    } else {
+        let color = parse_color(value)?;
+        let (missing, source) = gradient_missing_components(value);
+        (!missing.is_empty())
+            .then_some(GradientColor::ColorWithMissing {
+                color,
+                missing,
+                source,
+            })
+            .or(Some(GradientColor::CssColor(color)))
+    }
+}
+
+/// Retain `none` in a gradient stop instead of letting ordinary computed
+/// color parsing collapse it to zero. Its replacement is deliberately delayed
+/// until the selected interpolation space is known.
+/// <https://drafts.csswg.org/css-color-4/#interpolation-missing>
+fn gradient_missing_components(
+    value: &str,
+) -> (GradientMissingComponents, GradientMissingComponentSpace) {
+    let value = value.trim().to_ascii_lowercase();
+    let Some((name, inner)) = value.split_once('(') else {
+        return (
+            GradientMissingComponents::default(),
+            GradientMissingComponentSpace::Rgb,
+        );
+    };
+    let Some(inner) = inner.strip_suffix(')') else {
+        return (
+            GradientMissingComponents::default(),
+            GradientMissingComponentSpace::Rgb,
+        );
+    };
+    if !matches!(
+        name.trim(),
+        "rgb" | "rgba" | "hsl" | "hsla" | "hwb" | "lab" | "lch" | "oklab" | "oklch" | "color"
+    ) {
+        return (
+            GradientMissingComponents::default(),
+            GradientMissingComponentSpace::Rgb,
+        );
+    }
+    let (components, slash_alpha) = inner
+        .split_once('/')
+        .map(|(components, alpha)| (components, Some(alpha.trim())))
+        .unwrap_or((inner, None));
+    let tokens = components
+        .replace(',', " ")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let component_offset = usize::from(name.trim() == "color");
+    let source = match name.trim() {
+        "rgb" | "rgba" => GradientMissingComponentSpace::Rgb,
+        "hsl" | "hsla" => GradientMissingComponentSpace::Hsl,
+        "hwb" => GradientMissingComponentSpace::Hwb,
+        "lab" => GradientMissingComponentSpace::Lab,
+        "lch" => GradientMissingComponentSpace::Lch,
+        "oklab" => GradientMissingComponentSpace::Oklab,
+        "oklch" => GradientMissingComponentSpace::Oklch,
+        "color" => match tokens.first().map(String::as_str) {
+            Some("xyz") | Some("xyz-d50") | Some("xyz-d65") => GradientMissingComponentSpace::Xyz,
+            _ => GradientMissingComponentSpace::Rgb,
+        },
+        _ => unreachable!("validated gradient color function"),
+    };
+    if tokens.len() < component_offset + 3 {
+        return (GradientMissingComponents::default(), source);
+    }
+    let mut bits = 0;
+    for component in 0..3 {
+        if tokens[component + component_offset].eq_ignore_ascii_case("none") {
+            bits |= 1 << component;
+        }
+    }
+    if slash_alpha.is_some_and(|alpha| alpha.eq_ignore_ascii_case("none"))
+        || slash_alpha.is_none()
+            && tokens
+                .get(component_offset + 3)
+                .is_some_and(|alpha| alpha.eq_ignore_ascii_case("none"))
+    {
+        bits |= 1 << 3;
+    }
+    (GradientMissingComponents::new(bits), source)
 }
 
 fn find_linear_gradient_function(value: &str) -> Option<(bool, usize, usize)> {
@@ -1540,9 +1843,11 @@ pub(super) fn strip_background_noise(value: &str) -> String {
         .into_iter()
         .filter(|token| {
             !token.eq_ignore_ascii_case("none")
-                && parse_background_image(token, None, None).is_none()
+                && !matches!(parse_css_image(token, None, None), ParsedImage::Image(_))
                 && !token.eq_ignore_ascii_case("repeat")
                 && !token.eq_ignore_ascii_case("no-repeat")
+                && !token.eq_ignore_ascii_case("repeat-x")
+                && !token.eq_ignore_ascii_case("repeat-y")
                 && !matches!(
                     token.to_ascii_lowercase().as_str(),
                     "scroll" | "fixed" | "local"

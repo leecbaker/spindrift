@@ -129,14 +129,15 @@ pub(in crate::layout::table) fn table_cell_formatting_child_has_parent_percentag
 ) -> bool {
     match child {
         box_tree::FormattingBox::Block(box_) => {
-            table_cell_style_has_parent_percentage_block_size(&box_.style)
+            table_cell_style_has_parent_percentage_block_size(&box_.core.style)
                 || box_
+                    .core
                     .children
                     .iter()
                     .any(table_cell_formatting_child_has_parent_percentage_block_size)
         }
         box_tree::FormattingBox::Table(box_) => {
-            table_cell_style_has_parent_percentage_block_size(&box_.style)
+            table_cell_style_has_parent_percentage_block_size(&box_.core.style)
                 || box_
                     .fragment
                     .rows
@@ -146,29 +147,33 @@ pub(in crate::layout::table) fn table_cell_formatting_child_has_parent_percentag
                     .any(table_cell_formatting_child_has_parent_percentage_block_size)
         }
         box_tree::FormattingBox::Flex(box_) => {
-            table_cell_style_has_parent_percentage_block_size(&box_.style)
+            table_cell_style_has_parent_percentage_block_size(&box_.core.style)
                 || box_
+                    .core
                     .children
                     .iter()
                     .any(table_cell_formatting_child_has_parent_percentage_block_size)
         }
         box_tree::FormattingBox::Inline(box_) => {
-            table_cell_style_has_parent_percentage_block_size(&box_.style)
+            table_cell_style_has_parent_percentage_block_size(&box_.core.style)
                 || box_
+                    .core
                     .children
                     .iter()
                     .any(table_cell_formatting_child_has_parent_percentage_block_size)
         }
         box_tree::FormattingBox::AtomicInline(box_) => {
-            table_cell_style_has_parent_percentage_block_size(&box_.style)
+            table_cell_style_has_parent_percentage_block_size(&box_.core.style)
                 || box_
+                    .core
                     .children
                     .iter()
                     .any(table_cell_formatting_child_has_parent_percentage_block_size)
         }
         box_tree::FormattingBox::Replaced(box_) => {
-            table_cell_style_has_parent_percentage_block_size(&box_.style)
+            table_cell_style_has_parent_percentage_block_size(&box_.core.style)
                 || box_
+                    .core
                     .children
                     .iter()
                     .any(table_cell_formatting_child_has_parent_percentage_block_size)
@@ -178,6 +183,7 @@ pub(in crate::layout::table) fn table_cell_formatting_child_has_parent_percentag
             .iter()
             .any(table_cell_formatting_child_has_parent_percentage_block_size),
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
+            .core
             .children
             .iter()
             .any(table_cell_formatting_child_has_parent_percentage_block_size),
@@ -195,8 +201,8 @@ pub(in crate::layout::table) fn table_cell_participates_in_baseline(
     cell_style: &ComputedStyle,
     row_style: &ComputedStyle,
 ) -> bool {
-    if inline_start_side(cell_style.writing_mode, cell_style.direction).axis()
-        != inline_start_side(row_style.writing_mode, row_style.direction).axis()
+    if inline_start_side(cell_style.writing_mode, cell_style.used_direction()).axis()
+        != inline_start_side(row_style.writing_mode, row_style.used_direction()).axis()
     {
         return false;
     }
@@ -231,13 +237,12 @@ pub(in crate::layout::table) fn table_cell_participates_in_row_baseline(
         || table_cell_alignment_baseline_set(cell_style) == TableCellBaselineSet::First
 }
 
-/// Return whether a row baseline can be consumed as a physical Y offset.
+/// Return whether a row baseline can contribute to physical-Y row sizing.
 ///
-/// CSS Tables aligns table-cell baselines along the row's baseline-sharing
-/// axis, while CSS Writing Modes maps a vertical-writing cell baseline onto
-/// the horizontal block axis. Quire's current row-height and `content_offset`
-/// paths store only physical Y offsets, so horizontal-axis baselines must not
-/// inflate row heights or move content vertically:
+/// Final content alignment projects baseline displacement through
+/// `TableCellContentGeometry`; row-height planning still records a physical-Y
+/// scalar. A horizontal-axis baseline therefore cannot inflate that legacy
+/// row-height metric:
 /// <https://drafts.csswg.org/css-tables-3/#table-cell-baseline> and
 /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
 pub(in crate::layout::table) fn table_cell_participates_in_physical_y_row_baseline(
@@ -285,13 +290,13 @@ pub(in crate::layout::table) fn formatting_boxes_have_textual_baseline(
     children.iter().any(|child| match child {
         box_tree::FormattingBox::Text(_) => !box_tree::formatting_box_is_collapsible_space(child),
         box_tree::FormattingBox::Inline(box_) => {
-            formatting_boxes_have_textual_baseline(&box_.children)
+            formatting_boxes_have_textual_baseline(&box_.core.children)
         }
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             formatting_boxes_have_textual_baseline(&box_.children)
         }
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-            formatting_boxes_have_textual_baseline(&box_.children)
+            formatting_boxes_have_textual_baseline(&box_.core.children)
         }
         box_tree::FormattingBox::Block(_)
         | box_tree::FormattingBox::Table(_)
@@ -324,13 +329,13 @@ pub(in crate::layout::table) fn table_cell_textual_children_match_baseline_style
                 || table_cell_text_style_matches_baseline_style(&box_.style, style)
         }
         box_tree::FormattingBox::Inline(box_) => {
-            table_cell_textual_children_match_baseline_style(&box_.children, style)
+            table_cell_textual_children_match_baseline_style(&box_.core.children, style)
         }
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             table_cell_textual_children_match_baseline_style(&box_.children, style)
         }
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-            table_cell_textual_children_match_baseline_style(&box_.children, style)
+            table_cell_textual_children_match_baseline_style(&box_.core.children, style)
         }
         box_tree::FormattingBox::Block(_)
         | box_tree::FormattingBox::Table(_)
@@ -357,6 +362,7 @@ pub(in crate::layout::table) fn table_cell_first_textual_style<'a>(
             (!box_tree::formatting_box_is_collapsible_space(child)).then_some(&*box_.style)
         }
         box_tree::FormattingBox::Inline(box_) => box_
+            .core
             .children
             .iter()
             .find_map(table_cell_first_textual_style),
@@ -365,6 +371,7 @@ pub(in crate::layout::table) fn table_cell_first_textual_style<'a>(
             .iter()
             .find_map(table_cell_first_textual_style),
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
+            .core
             .children
             .iter()
             .find_map(table_cell_first_textual_style),
@@ -384,6 +391,7 @@ pub(in crate::layout::table) fn table_cell_last_textual_style<'a>(
             (!box_tree::formatting_box_is_collapsible_space(child)).then_some(&*box_.style)
         }
         box_tree::FormattingBox::Inline(box_) => box_
+            .core
             .children
             .iter()
             .rev()
@@ -394,6 +402,7 @@ pub(in crate::layout::table) fn table_cell_last_textual_style<'a>(
             .rev()
             .find_map(table_cell_last_textual_style),
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
+            .core
             .children
             .iter()
             .rev()
@@ -420,36 +429,43 @@ pub(in crate::layout::table) fn table_cell_has_in_flow_layout_child(
     child_box: &box_tree::FormattingBox<'_>,
 ) -> bool {
     match child_box {
-        box_tree::FormattingBox::Block(box_) => {
-            !matches!(box_.style.position, Position::Absolute | Position::Fixed)
-        }
-        box_tree::FormattingBox::Table(box_) => {
-            !matches!(box_.style.position, Position::Absolute | Position::Fixed)
-        }
-        box_tree::FormattingBox::Flex(box_) => {
-            !matches!(box_.style.position, Position::Absolute | Position::Fixed)
-        }
+        box_tree::FormattingBox::Block(box_) => !matches!(
+            box_.core.style.position,
+            Position::Absolute | Position::Fixed
+        ),
+        box_tree::FormattingBox::Table(box_) => !matches!(
+            box_.core.style.position,
+            Position::Absolute | Position::Fixed
+        ),
+        box_tree::FormattingBox::Flex(box_) => !matches!(
+            box_.core.style.position,
+            Position::Absolute | Position::Fixed
+        ),
         box_tree::FormattingBox::AnonymousBlock(box_) => box_
             .children
             .iter()
             .any(table_cell_has_in_flow_layout_child),
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
+            .core
             .children
             .iter()
             .any(table_cell_has_in_flow_layout_child),
         box_tree::FormattingBox::Inline(box_) => {
-            box_.style.float != Float::None
+            box_.core.style.float != Float::None
                 || box_
+                    .core
                     .children
                     .iter()
                     .any(table_cell_has_in_flow_layout_child)
         }
-        box_tree::FormattingBox::AtomicInline(box_) => {
-            !matches!(box_.style.position, Position::Absolute | Position::Fixed)
-        }
-        box_tree::FormattingBox::Replaced(box_) => {
-            !matches!(box_.style.position, Position::Absolute | Position::Fixed)
-        }
+        box_tree::FormattingBox::AtomicInline(box_) => !matches!(
+            box_.core.style.position,
+            Position::Absolute | Position::Fixed
+        ),
+        box_tree::FormattingBox::Replaced(box_) => !matches!(
+            box_.core.style.position,
+            Position::Absolute | Position::Fixed
+        ),
         box_tree::FormattingBox::Text(_) => {
             !box_tree::formatting_box_is_collapsible_space(child_box)
         }
@@ -472,27 +488,30 @@ pub(in crate::layout::table) fn table_cell_measured_inline_outer_height_without_
 ) -> Option<f32> {
     match child {
         box_tree::FormattingBox::Inline(box_) => {
-            if matches!(box_.style.position, Position::Absolute | Position::Fixed) {
+            if matches!(
+                box_.core.style.position,
+                Position::Absolute | Position::Fixed
+            ) {
                 Some(0.0)
             } else {
                 Some(table_cell_formatting_child_outer_height(child).points())
             }
         }
         box_tree::FormattingBox::AtomicInline(box_)
-            if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Canvas) =>
+            if replaced_element_kind(box_.core.element) == Some(ReplacedElementKind::Canvas) =>
         {
             Some(table_cell_canvas_first_pass_outer_height(
-                box_.element,
-                &box_.style,
+                box_.core.element,
+                &box_.core.style,
                 available_width,
             ))
         }
         box_tree::FormattingBox::Replaced(box_)
-            if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Canvas) =>
+            if replaced_element_kind(box_.core.element) == Some(ReplacedElementKind::Canvas) =>
         {
             Some(table_cell_canvas_first_pass_outer_height(
-                box_.element,
-                &box_.style,
+                box_.core.element,
+                &box_.core.style,
                 available_width,
             ))
         }
@@ -555,17 +574,21 @@ pub(in crate::layout::table) fn table_cell_children_can_use_inline_line_sequence
     children.iter().all(|child| match child {
         box_tree::FormattingBox::Text(_) => true,
         box_tree::FormattingBox::Inline(box_) => {
-            !matches!(box_.style.position, Position::Absolute | Position::Fixed)
-                && box_.style.float == Float::None
-                && table_cell_children_can_use_inline_line_sequence(&box_.children)
+            !matches!(
+                box_.core.style.position,
+                Position::Absolute | Position::Fixed
+            ) && box_.core.style.float == Float::None
+                && table_cell_children_can_use_inline_line_sequence(&box_.core.children)
         }
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             table_cell_children_can_use_inline_line_sequence(&box_.children)
         }
         box_tree::FormattingBox::InlineSplitBlockContext(_) => false,
         box_tree::FormattingBox::AtomicInline(box_) => {
-            !matches!(box_.style.position, Position::Absolute | Position::Fixed)
-                && box_.style.float == Float::None
+            !matches!(
+                box_.core.style.position,
+                Position::Absolute | Position::Fixed
+            ) && box_.core.style.float == Float::None
         }
         box_tree::FormattingBox::Block(_)
         | box_tree::FormattingBox::Table(_)

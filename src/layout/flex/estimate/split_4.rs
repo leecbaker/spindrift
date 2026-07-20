@@ -1,12 +1,5 @@
 use super::*;
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(in crate::layout::flex) struct FlexItemBaselineEstimate {
-    pub(in crate::layout::flex) first_baseline: Option<f32>,
-    pub(in crate::layout::flex) last_baseline: Option<f32>,
-    pub(in crate::layout::flex) first_horizontal_baseline: Option<f32>,
-    pub(in crate::layout::flex) last_horizontal_baseline: Option<f32>,
-}
+use crate::units::IntoLayoutLength;
 
 impl<'a> LayoutBuilder<'a> {
     /// Estimate a block-container flex item's baselines from in-flow descendants.
@@ -24,9 +17,9 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         stylesheets: &[Stylesheet],
-        available_width: f32,
+        available_content_width: PhysicalContentWidth,
     ) -> FlexItemBaselineEstimate {
-        let content_width = flex_estimated_content_width(style, available_width);
+        let content_width = flex_estimated_content_width(style, available_content_width);
         let baselines = self.with_ancestor_signature(signature.clone(), |layout| {
             layout.estimate_flex_children_baselines(
                 element,
@@ -38,18 +31,24 @@ impl<'a> LayoutBuilder<'a> {
         });
         let borders = used_border_widths(style);
         FlexItemBaselineEstimate {
-            first_baseline: baselines
-                .first_baseline
-                .map(|baseline| borders.top + style.padding.top + baseline),
-            last_baseline: baselines
-                .last_baseline
-                .map(|baseline| borders.top + style.padding.top + baseline),
-            first_horizontal_baseline: baselines
-                .first_horizontal_baseline
-                .map(|baseline| borders.left + style.padding.left + baseline),
-            last_horizontal_baseline: baselines
-                .last_horizontal_baseline
-                .map(|baseline| borders.left + style.padding.left + baseline),
+            vertical: FlexItemBaselinePair {
+                first: baselines
+                    .vertical
+                    .first
+                    .map(|baseline| baseline.offset_by(layout_pt(borders.top + style.padding.top))),
+                last: baselines
+                    .vertical
+                    .last
+                    .map(|baseline| baseline.offset_by(layout_pt(borders.top + style.padding.top))),
+            },
+            horizontal: FlexItemBaselinePair {
+                first: baselines.horizontal.first.map(|baseline| {
+                    baseline.offset_by(layout_pt(borders.left + style.padding.left))
+                }),
+                last: baselines.horizontal.last.map(|baseline| {
+                    baseline.offset_by(layout_pt(borders.left + style.padding.left))
+                }),
+            },
         }
     }
 
@@ -59,17 +58,22 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         stylesheets: &[Stylesheet],
-        available_width: f32,
+        available_content_width: PhysicalContentWidth,
     ) -> FlexItemBaselineEstimate {
         if let Some(child_boxes) = child_boxes {
             return self.estimate_flex_box_children_baselines(
                 child_boxes,
                 style,
                 stylesheets,
-                available_width,
+                available_content_width,
             );
         }
-        self.estimate_flex_dom_children_baselines(element, style, stylesheets, available_width)
+        self.estimate_flex_dom_children_baselines(
+            element,
+            style,
+            stylesheets,
+            available_content_width,
+        )
     }
 
     fn estimate_flex_box_children_baselines(
@@ -77,7 +81,7 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: &[box_tree::FormattingBox<'_>],
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        available_width: f32,
+        available_content_width: PhysicalContentWidth,
     ) -> FlexItemBaselineEstimate {
         if formatting_box_has_inline_content(child_boxes)
             && !has_non_inline_formatting_box(child_boxes)
@@ -86,11 +90,11 @@ impl<'a> LayoutBuilder<'a> {
                 child_boxes,
                 style,
                 stylesheets,
-                available_width,
+                available_content_width,
             );
         }
 
-        let mut block_offset = 0.0_f32;
+        let mut block_offset = layout_pt(0.0);
         let mut first_baseline = None;
         let mut last_baseline = None;
 
@@ -98,24 +102,31 @@ impl<'a> LayoutBuilder<'a> {
             if !formatting_box_is_in_normal_flow(child) {
                 continue;
             }
-            let child_baselines =
-                self.estimate_flex_formatting_child_baselines(child, stylesheets, available_width);
-            if let Some(baseline) = child_baselines.first_baseline {
-                first_baseline.get_or_insert(block_offset + baseline);
-            }
-            if let Some(baseline) = child_baselines.last_baseline {
-                last_baseline = Some(block_offset + baseline);
-            }
-            block_offset += self.estimate_flex_formatting_child_outer_height(
+            let child_baselines = self.estimate_flex_formatting_child_baselines(
                 child,
                 stylesheets,
-                available_width,
+                available_content_width,
             );
+            if let Some(baseline) = child_baselines.vertical.first {
+                first_baseline.get_or_insert(baseline.offset_by(block_offset));
+            }
+            if let Some(baseline) = child_baselines.vertical.last {
+                last_baseline = Some(baseline.offset_by(block_offset));
+            }
+            block_offset += self
+                .estimate_flex_formatting_child_outer_height(
+                    child,
+                    stylesheets,
+                    available_content_width,
+                )
+                .into_layout_length();
         }
 
         FlexItemBaselineEstimate {
-            first_baseline,
-            last_baseline,
+            vertical: FlexItemBaselinePair {
+                first: first_baseline,
+                last: last_baseline,
+            },
             ..Default::default()
         }
     }
@@ -125,11 +136,11 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         parent_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        available_width: f32,
+        available_content_width: PhysicalContentWidth,
     ) -> FlexItemBaselineEstimate {
         let sibling_tags = element_sibling_signature_list(element);
         let mut element_index = 0usize;
-        let mut block_offset = 0.0_f32;
+        let mut block_offset = layout_pt(0.0);
         let mut first_baseline = None;
         let mut last_baseline = None;
 
@@ -159,28 +170,31 @@ impl<'a> LayoutBuilder<'a> {
                 &child_style,
                 None,
                 stylesheets,
-                available_width,
+                available_content_width,
             );
-            if let Some(baseline) = child_baselines.first_baseline {
-                first_baseline.get_or_insert(block_offset + baseline);
+            if let Some(baseline) = child_baselines.vertical.first {
+                first_baseline.get_or_insert(baseline.offset_by(block_offset));
             }
-            if let Some(baseline) = child_baselines.last_baseline {
-                last_baseline = Some(block_offset + baseline);
+            if let Some(baseline) = child_baselines.vertical.last {
+                last_baseline = Some(baseline.offset_by(block_offset));
             }
-            block_offset += self
-                .estimate_element_height(
+            block_offset += layout_pt(
+                self.estimate_element_height(
                     child_element,
                     &child_style,
                     stylesheets,
-                    available_width,
+                    available_content_width.points(),
                     None,
                 )
-                .unwrap_or(0.0);
+                .unwrap_or(0.0),
+            );
         }
 
         FlexItemBaselineEstimate {
-            first_baseline,
-            last_baseline,
+            vertical: FlexItemBaselinePair {
+                first: first_baseline,
+                last: last_baseline,
+            },
             ..Default::default()
         }
     }
@@ -189,7 +203,7 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &box_tree::FormattingBox<'_>,
         stylesheets: &[Stylesheet],
-        available_width: f32,
+        available_content_width: PhysicalContentWidth,
     ) -> FlexItemBaselineEstimate {
         match child {
             box_tree::FormattingBox::Text(box_) => {
@@ -198,54 +212,56 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 let baseline = self.inline_box_text_line_layout_baseline_offset(&box_.style);
                 FlexItemBaselineEstimate {
-                    first_baseline: Some(baseline),
-                    last_baseline: Some(baseline),
+                    vertical: FlexItemBaselinePair {
+                        first: Some(FlexVerticalBaselineOffset::new(baseline)),
+                        last: Some(FlexVerticalBaselineOffset::new(baseline)),
+                    },
                     ..Default::default()
                 }
             }
             box_tree::FormattingBox::Inline(box_) => self.estimate_flex_inline_children_baselines(
-                &box_.children,
-                &box_.style,
+                &box_.core.children,
+                &box_.core.style,
                 stylesheets,
-                available_width,
+                available_content_width,
             ),
             box_tree::FormattingBox::AnonymousBlock(box_) => self
                 .estimate_flex_box_children_baselines(
                     &box_.children,
                     &box_.style,
                     stylesheets,
-                    available_width,
+                    available_content_width,
                 ),
             box_tree::FormattingBox::InlineSplitBlockContext(box_) => self
                 .estimate_flex_box_children_baselines(
-                    &box_.children,
-                    &box_.style,
+                    &box_.core.children,
+                    &box_.core.style,
                     stylesheets,
-                    available_width,
+                    available_content_width,
                 ),
             box_tree::FormattingBox::Block(box_) => self.estimate_flex_element_baselines(
-                box_.element,
-                &box_.signature,
-                &box_.style,
-                Some(&box_.children),
+                box_.core.element,
+                &box_.core.signature,
+                &box_.core.style,
+                Some(&box_.core.children),
                 stylesheets,
-                available_width,
+                available_content_width,
             ),
             box_tree::FormattingBox::Flex(box_) => self.estimate_flex_element_baselines(
-                box_.element,
-                &box_.signature,
-                &box_.style,
-                Some(&box_.children),
+                box_.core.element,
+                &box_.core.signature,
+                &box_.core.style,
+                Some(&box_.core.children),
                 stylesheets,
-                available_width,
+                available_content_width,
             ),
             box_tree::FormattingBox::Table(box_) => self.estimate_flex_element_baselines(
-                box_.element,
-                &box_.signature,
-                &box_.style,
-                Some(&box_.children),
+                box_.core.element,
+                &box_.core.signature,
+                &box_.core.style,
+                Some(&box_.core.children),
                 stylesheets,
-                available_width,
+                available_content_width,
             ),
             box_tree::FormattingBox::AtomicInline(_) | box_tree::FormattingBox::Replaced(_) => {
                 FlexItemBaselineEstimate::default()
@@ -260,7 +276,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         stylesheets: &[Stylesheet],
-        available_width: f32,
+        available_content_width: PhysicalContentWidth,
     ) -> FlexItemBaselineEstimate {
         if !style_is_in_normal_flow(style) {
             return FlexItemBaselineEstimate::default();
@@ -273,13 +289,13 @@ impl<'a> LayoutBuilder<'a> {
                 style,
                 child_boxes,
                 stylesheets,
-                available_width,
+                available_content_width,
             )
         {
             return baselines;
         }
 
-        let child_width = flex_estimated_content_width(style, available_width);
+        let child_width = flex_estimated_content_width(style, available_content_width);
         let borders = used_border_widths(style);
         let child_baselines = self.with_ancestor_signature(signature.clone(), |layout| {
             layout.estimate_flex_children_baselines(
@@ -292,18 +308,30 @@ impl<'a> LayoutBuilder<'a> {
         });
 
         FlexItemBaselineEstimate {
-            first_baseline: child_baselines
-                .first_baseline
-                .map(|baseline| style.margin.top + borders.top + style.padding.top + baseline),
-            last_baseline: child_baselines
-                .last_baseline
-                .map(|baseline| style.margin.top + borders.top + style.padding.top + baseline),
-            first_horizontal_baseline: child_baselines
-                .first_horizontal_baseline
-                .map(|baseline| style.margin.left + borders.left + style.padding.left + baseline),
-            last_horizontal_baseline: child_baselines
-                .last_horizontal_baseline
-                .map(|baseline| style.margin.left + borders.left + style.padding.left + baseline),
+            vertical: FlexItemBaselinePair {
+                first: child_baselines.vertical.first.map(|baseline| {
+                    baseline.offset_by(layout_pt(
+                        style.margin.top + borders.top + style.padding.top,
+                    ))
+                }),
+                last: child_baselines.vertical.last.map(|baseline| {
+                    baseline.offset_by(layout_pt(
+                        style.margin.top + borders.top + style.padding.top,
+                    ))
+                }),
+            },
+            horizontal: FlexItemBaselinePair {
+                first: child_baselines.horizontal.first.map(|baseline| {
+                    baseline.offset_by(layout_pt(
+                        style.margin.left + borders.left + style.padding.left,
+                    ))
+                }),
+                last: child_baselines.horizontal.last.map(|baseline| {
+                    baseline.offset_by(layout_pt(
+                        style.margin.left + borders.left + style.padding.left,
+                    ))
+                }),
+            },
         }
     }
 
@@ -314,7 +342,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         stylesheets: &[Stylesheet],
-        available_width: f32,
+        available_content_width: PhysicalContentWidth,
     ) -> Option<FlexItemBaselineEstimate> {
         let intrinsic = self.with_ancestor_signature(signature.clone(), |layout| {
             let built_child_boxes;
@@ -335,19 +363,21 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     stylesheets,
                     FlexAvailableSpace {
-                        width: PhysicalContentWidth::new(content_box_pt(available_width)),
-                        width_basis: flex_available_percentage_basis_from_points(
-                            used_length_percentage_or_auto_with_basis(
-                                style.box_values.width.clone(),
-                                PercentageBasis::definite(content_box_pt(available_width)),
+                        width: available_content_width,
+                        width_basis: used_length_percentage_or_auto_with_basis(
+                            style.box_values.width.clone(),
+                            PercentageBasis::definite(available_content_width.content_box_length()),
+                        )
+                        .map(|_| {
+                            PercentageBasis::definite_from(
+                                available_content_width.content_box_length(),
+                                FlexAvailableSizeSource::IntrinsicContainerSize,
                             )
-                            .map(|width| width.points())
-                            .map(|_| available_width),
-                            FlexAvailableSizeSource::IntrinsicContainerSize,
-                        ),
+                        })
+                        .unwrap_or_else(PercentageBasis::indefinite),
                         height: used_length_percentage_or_auto(
                             style.box_values.height.clone(),
-                            PercentageBasis::definite(layout_pt(available_width)),
+                            PercentageBasis::definite(layout_pt(available_content_width.points())),
                         )
                         .map(|height| {
                             PhysicalContentHeight::new(crate::units::layout_to_content_box_length(
@@ -357,7 +387,9 @@ impl<'a> LayoutBuilder<'a> {
                         height_basis: flex_available_percentage_basis_from_points(
                             used_length_percentage_or_auto(
                                 style.box_values.height.clone(),
-                                PercentageBasis::definite(layout_pt(available_width)),
+                                PercentageBasis::definite(layout_pt(
+                                    available_content_width.points(),
+                                )),
                             )
                             .map(|height| height.points()),
                             FlexAvailableSizeSource::IntrinsicContainerSize,
@@ -367,18 +399,26 @@ impl<'a> LayoutBuilder<'a> {
             })
         })?;
         Some(FlexItemBaselineEstimate {
-            first_baseline: intrinsic
-                .first_baseline
-                .map(|baseline| style.margin.top + baseline),
-            last_baseline: intrinsic
-                .last_baseline
-                .map(|baseline| style.margin.top + baseline),
-            first_horizontal_baseline: intrinsic
-                .first_horizontal_baseline
-                .map(|baseline| style.margin.left + baseline),
-            last_horizontal_baseline: intrinsic
-                .last_horizontal_baseline
-                .map(|baseline| style.margin.left + baseline),
+            vertical: FlexItemBaselinePair {
+                first: intrinsic.first_baseline.map(|baseline| {
+                    FlexVerticalBaselineOffset::new(baseline).offset_by(layout_pt(style.margin.top))
+                }),
+                last: intrinsic.last_baseline.map(|baseline| {
+                    FlexVerticalBaselineOffset::new(baseline).offset_by(layout_pt(style.margin.top))
+                }),
+            },
+            horizontal: FlexItemBaselinePair {
+                first: intrinsic
+                    .baselines
+                    .horizontal
+                    .first
+                    .map(|baseline| baseline.offset_by(layout_pt(style.margin.left))),
+                last: intrinsic
+                    .baselines
+                    .horizontal
+                    .last
+                    .map(|baseline| baseline.offset_by(layout_pt(style.margin.left))),
+            },
         })
     }
 
@@ -387,7 +427,7 @@ impl<'a> LayoutBuilder<'a> {
         children: &[box_tree::FormattingBox<'_>],
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        available_width: f32,
+        available_content_width: PhysicalContentWidth,
     ) -> FlexItemBaselineEstimate {
         if !formatting_box_has_inline_content(children) {
             return FlexItemBaselineEstimate::default();
@@ -397,7 +437,7 @@ impl<'a> LayoutBuilder<'a> {
             children,
             style,
             stylesheets,
-            available_width,
+            available_content_width.points(),
         );
         if measurement.line_count() == 0 {
             return FlexItemBaselineEstimate::default();
@@ -406,7 +446,8 @@ impl<'a> LayoutBuilder<'a> {
         let first_baseline = self.inline_box_text_line_layout_baseline_offset(style);
         let last_baseline =
             first_baseline + measurement.line_count().saturating_sub(1) as f32 * style.line_height;
-        let fallback_line_baseline_offset = self.inline_box_text_line_layout_baseline_offset(style);
+        let fallback_line_baseline_offset =
+            layout_pt(self.inline_box_text_line_layout_baseline_offset(style));
         let first_line_baseline_offset = first_sequence_line_baseline_offset(
             &measurement.sequence,
             fallback_line_baseline_offset,
@@ -416,21 +457,32 @@ impl<'a> LayoutBuilder<'a> {
             fallback_line_baseline_offset,
         );
         let preceding_line_height = preceding_line_height_before_last(&measurement.sequence);
+        let borders = used_border_widths(style);
+        let horizontal_non_content =
+            non_content_pt(borders.left + borders.right + style.padding.left + style.padding.right);
+        let border_box_width = content_box_to_border_box_length(
+            available_content_width.content_box_length(),
+            horizontal_non_content,
+        );
 
         FlexItemBaselineEstimate {
-            first_baseline: Some(first_baseline),
-            last_baseline: Some(last_baseline),
-            first_horizontal_baseline: first_horizontal_text_baseline_offset(
-                style,
-                available_width,
-                first_line_baseline_offset,
-            ),
-            last_horizontal_baseline: last_horizontal_text_baseline_offset(
-                style,
-                available_width,
-                preceding_line_height,
-                last_line_baseline_offset,
-            ),
+            vertical: FlexItemBaselinePair {
+                first: Some(FlexVerticalBaselineOffset::new(first_baseline)),
+                last: Some(FlexVerticalBaselineOffset::new(last_baseline)),
+            },
+            horizontal: FlexItemBaselinePair {
+                first: first_horizontal_text_baseline_offset(
+                    style,
+                    border_box_width,
+                    first_line_baseline_offset,
+                ),
+                last: last_horizontal_text_baseline_offset(
+                    style,
+                    border_box_width,
+                    preceding_line_height,
+                    last_line_baseline_offset,
+                ),
+            },
         }
     }
 
@@ -438,62 +490,66 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         child: &box_tree::FormattingBox<'_>,
         stylesheets: &[Stylesheet],
-        available_width: f32,
-    ) -> f32 {
+        available_content_width: PhysicalContentWidth,
+    ) -> MarginBoxLength {
         match child {
             box_tree::FormattingBox::Block(box_) => self
                 .estimate_element_height(
-                    box_.element,
-                    &box_.style,
+                    box_.core.element,
+                    &box_.core.style,
                     stylesheets,
-                    available_width,
-                    Some(&box_.children),
+                    available_content_width.points(),
+                    Some(&box_.core.children),
                 )
-                .unwrap_or(0.0),
+                .map(margin_box_pt)
+                .unwrap_or_else(|| margin_box_pt(0.0)),
             box_tree::FormattingBox::Flex(box_) => self
                 .estimate_element_height(
-                    box_.element,
-                    &box_.style,
+                    box_.core.element,
+                    &box_.core.style,
                     stylesheets,
-                    available_width,
-                    Some(&box_.children),
+                    available_content_width.points(),
+                    Some(&box_.core.children),
                 )
-                .unwrap_or(0.0),
+                .map(margin_box_pt)
+                .unwrap_or_else(|| margin_box_pt(0.0)),
             box_tree::FormattingBox::Table(box_) => self
                 .estimate_element_height(
-                    box_.element,
-                    &box_.style,
+                    box_.core.element,
+                    &box_.core.style,
                     stylesheets,
-                    available_width,
-                    Some(&box_.children),
+                    available_content_width.points(),
+                    Some(&box_.core.children),
                 )
-                .unwrap_or(0.0),
+                .map(margin_box_pt)
+                .unwrap_or_else(|| margin_box_pt(0.0)),
             box_tree::FormattingBox::Replaced(box_) => self
                 .estimate_element_height(
-                    box_.element,
-                    &box_.style,
+                    box_.core.element,
+                    &box_.core.style,
                     stylesheets,
-                    available_width,
-                    Some(&box_.children),
+                    available_content_width.points(),
+                    Some(&box_.core.children),
                 )
-                .unwrap_or(0.0),
+                .map(margin_box_pt)
+                .unwrap_or_else(|| margin_box_pt(0.0)),
             box_tree::FormattingBox::AnonymousBlock(box_) => self
                 .estimate_flex_anonymous_outer_height(
                     &box_.children,
                     &box_.style,
                     stylesheets,
-                    available_width,
+                    available_content_width,
                 ),
             box_tree::FormattingBox::InlineSplitBlockContext(box_) => self
                 .estimate_flex_anonymous_outer_height(
-                    &box_.children,
-                    &box_.style,
+                    &box_.core.children,
+                    &box_.core.style,
                     stylesheets,
-                    available_width,
+                    available_content_width,
                 ),
             box_tree::FormattingBox::Inline(_)
             | box_tree::FormattingBox::AtomicInline(_)
-            | box_tree::FormattingBox::Text(_) => 0.0,
+            | box_tree::FormattingBox::Text(_) => margin_box_pt(0.0),
         }
     }
 
@@ -502,49 +558,61 @@ impl<'a> LayoutBuilder<'a> {
         children: &[box_tree::FormattingBox<'_>],
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        available_width: f32,
-    ) -> f32 {
-        let inline_height = if formatting_box_has_inline_content(children)
+        available_content_width: PhysicalContentWidth,
+    ) -> MarginBoxLength {
+        // Inline measurement remains a legacy scalar API; immediately label
+        // its result as a parent block-stack extent before combining it with
+        // in-flow children's margin boxes.
+        let inline_stack_height = if formatting_box_has_inline_content(children)
             && !has_non_inline_formatting_box(children)
         {
-            self.intrinsic_inline_measurement_for_boxes(
-                children,
-                style,
-                stylesheets,
-                available_width,
+            layout_pt(
+                self.intrinsic_inline_measurement_for_boxes(
+                    children,
+                    style,
+                    stylesheets,
+                    available_content_width.points(),
+                )
+                .height(),
             )
-            .height()
         } else {
-            0.0
+            layout_pt(0.0)
         };
-        let block_height = children
+        let block_stack_height = children
             .iter()
             .filter(|child| formatting_box_is_in_normal_flow(child))
             .map(|child| {
                 self.estimate_flex_formatting_child_outer_height(
                     child,
                     stylesheets,
-                    available_width,
+                    available_content_width,
                 )
             })
-            .sum::<f32>();
-        inline_height + block_height
+            .fold(layout_pt(0.0), |sum, height| {
+                sum + height.into_layout_length()
+            });
+        margin_box_pt((inline_stack_height + block_stack_height).points())
     }
 }
 
 pub(in crate::layout::flex) fn flex_estimated_content_width(
     style: &ComputedStyle,
-    available_width: f32,
-) -> f32 {
+    available_content_width: PhysicalContentWidth,
+) -> PhysicalContentWidth {
     let borders = used_border_widths(style);
     let horizontal_non_content =
         borders.left + borders.right + style.padding.left + style.padding.right;
     used_content_box_width_or_auto(
         style,
-        layout_pt(available_width),
+        available_content_width
+            .content_box_length()
+            .into_layout_length(),
         non_content_pt(horizontal_non_content),
     )
-    .map(SemanticLengthExt::points)
-    .unwrap_or_else(|| (available_width - horizontal_non_content).max(1.0))
-    .max(1.0)
+    .map(PhysicalContentWidth::new)
+    .unwrap_or_else(|| {
+        PhysicalContentWidth::new(content_box_pt(
+            (available_content_width.points() - horizontal_non_content).max(1.0),
+        ))
+    })
 }

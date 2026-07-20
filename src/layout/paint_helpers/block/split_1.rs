@@ -73,17 +73,83 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
         rect,
         border_insets,
     };
+    let border_shape = resolved_single_border_shape(rect, style, border_insets);
+    let border_shape_is_empty = border_shape
+        .as_ref()
+        .is_some_and(ResolvedBorderShape::is_empty);
+    let border_shape_pair = resolved_border_shape_pair(rect, style, border_insets);
     if paint_outer_shadows {
-        paint_box_shadows(&mut rects, geometry, style, false);
+        paint_box_shadows(&mut rects, &mut paths, geometry, style, false);
     }
     if paint_backgrounds
         && let Some(fill) = style.background_color
         && fill.is_visible()
     {
         let color_clip = style.background_color_clip();
-        let area = background_rect_area_for_box(rect, style, border_insets, color_clip);
+        let mut area = background_rect_area_for_box(rect, style, border_insets, color_clip);
+        // An opaque, solid rectangular border completely hides the matching
+        // strip of an opaque background-color layer. Emit only the visible
+        // background interior so PDF edge antialiasing cannot retain a seam
+        // between two CSS paints whose final coverage is disjoint. Rounded,
+        // patterned, translucent, and image borders retain the normal
+        // background geometry because their coverage is not a rectangle.
+        //
+        // CSS Backgrounds and Borders paints the background below the border:
+        // <https://www.w3.org/TR/css-backgrounds-3/#layering>
+        if fill.alpha() >= 1.0
+            && color_clip == css::BackgroundBox::Border
+            && style.border_radius.clone().is_zero()
+            && border_shape.is_none()
+            && !style.border_image.source.is_image()
+        {
+            let borders = used_border(style);
+            let hidden_by_border = css::Edges {
+                top: opaque_solid_border_width(borders.top),
+                right: opaque_solid_border_width(borders.right),
+                bottom: opaque_solid_border_width(borders.bottom),
+                left: opaque_solid_border_width(borders.left),
+            };
+            area = inset_paint_rect(area, hidden_by_border);
+        }
         if area.size.width <= 0.0 || area.size.height <= 0.0 {
             // Nothing to paint for the solid color layer after clipping.
+        } else if let Some(pair) = border_shape_pair.clone() {
+            // With two paths, the element background fills the inner shape;
+            // the annulus itself is the border-shape fill, whose default is
+            // the relevant border side color:
+            // <https://drafts.csswg.org/css-borders-4/#border-shape>.
+            paths.push(RenderedPath::new(
+                pair.inner.commands(),
+                Some(fill),
+                RenderedPathFillRule::NonZero,
+                None,
+                PaintStrokeWidth::ZERO,
+                None,
+            ));
+            let ring_fill = if style.svg_fill_overridden {
+                style.svg_fill.unwrap_or(CssColor::TRANSPARENT)
+            } else {
+                relevant_border_shape_color(style).unwrap_or(fill)
+            };
+            if ring_fill.is_visible() {
+                paths.push(RenderedPath::new(
+                    pair.commands(),
+                    Some(ring_fill),
+                    RenderedPathFillRule::EvenOdd,
+                    None,
+                    PaintStrokeWidth::ZERO,
+                    None,
+                ));
+            }
+        } else if let Some(shape) = border_shape.clone() {
+            paths.push(RenderedPath::new(
+                shape.commands(),
+                Some(fill),
+                RenderedPathFillRule::NonZero,
+                None,
+                PaintStrokeWidth::ZERO,
+                None,
+            ));
         } else if style.border_radius.clone().is_zero() {
             rects.push(RenderedRect::from_paint_rect(area, Some(fill)));
         } else if style.corner_shapes.all_round() {
@@ -93,7 +159,7 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
                     used_rounded_rect_radii(style.border_radius.clone(), rect.size),
                     Some(fill),
                     None,
-                    0.0,
+                    PaintStrokeWidth::ZERO,
                 ));
             } else if let Some(clip) =
                 rounded_background_clip_for_box(rect, style, border_insets, color_clip)
@@ -103,7 +169,7 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
                     Some(fill),
                     clip.fill_rule,
                     None,
-                    0.0,
+                    PaintStrokeWidth::ZERO,
                     None,
                 ));
             } else {
@@ -118,7 +184,7 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
                     Some(fill),
                     clip.fill_rule,
                     None,
-                    0.0,
+                    PaintStrokeWidth::ZERO,
                     None,
                 ));
             } else {
@@ -126,8 +192,26 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
             }
         }
     }
-    if paint_backgrounds {
-        if style.border_radius.clone().is_zero() {
+    if paint_backgrounds && !border_shape_is_empty {
+        if let Some(shape) = resolved_inset_border_shape(rect, style, border_insets) {
+            // CSS Backgrounds positions the generated image in its normal
+            // origin box, then clips it to the border-shape's inner contour.
+            // Keep those concerns separate: each gradient band retains its
+            // existing image-space coordinates while this path clip supplies
+            // the visual boundary.
+            let shape_clip =
+                RenderedPathClip::new(shape.commands(), RenderedPathFillRule::NonZero, Vec::new());
+            paths.extend(
+                linear_gradient_rects(rect, style, border_insets)
+                    .into_iter()
+                    .filter_map(|band| gradient_rect_path(band, shape_clip.clone())),
+            );
+            let mut angled_paths = linear_gradient_paths(rect, style, border_insets);
+            for path in &mut angled_paths {
+                path.clip = Some(shape_clip.clone());
+            }
+            paths.extend(angled_paths);
+        } else if style.border_radius.clone().is_zero() {
             rects.extend(linear_gradient_rects(rect, style, border_insets));
         } else {
             paths.extend(linear_gradient_rect_paths(rect, style, border_insets));
@@ -135,9 +219,36 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
         paths.extend(linear_gradient_paths(rect, style, border_insets));
     }
     if paint_inset_shadows {
-        paint_box_shadows(&mut rects, geometry, style, true);
+        paint_box_shadows(&mut rects, &mut paths, geometry, style, true);
     }
-    if !paint_borders || style.border_image.source.is_some() {
+    if !paint_borders || style.border_image.source.is_image() {
+        return (rects, rounded_rects, paths, strokes);
+    }
+    if let Some(pair) = border_shape_pair {
+        // Outline synthesis clears backgrounds before reusing this paint
+        // helper. Its two-shape contour is still an annular border and must
+        // therefore paint from the relevant synthetic outline side.
+        if style.background_color.is_none() {
+            let ring_fill = if style.svg_fill_overridden {
+                style.svg_fill.unwrap_or(CssColor::TRANSPARENT)
+            } else {
+                relevant_border_shape_color(style).unwrap_or(CssColor::TRANSPARENT)
+            };
+            if ring_fill.is_visible() {
+                paths.push(RenderedPath::new(
+                    pair.commands(),
+                    Some(ring_fill),
+                    RenderedPathFillRule::EvenOdd,
+                    None,
+                    PaintStrokeWidth::ZERO,
+                    None,
+                ));
+            }
+        }
+        return (rects, rounded_rects, paths, strokes);
+    }
+    if let Some(shape) = border_shape {
+        paint_single_border_shape(&mut paths, shape, style);
         return (rects, rounded_rects, paths, strokes);
     }
     if !paint_uniform_rounded_border(&mut rounded_rects, rect, style)
@@ -159,6 +270,883 @@ pub(in crate::layout) fn block_paint_ops_with_phases(
         );
     }
     (rects, rounded_rects, paths, strokes)
+}
+
+fn opaque_solid_border_width(border: UsedBorderSide) -> f32 {
+    if border.style == BorderStyle::Solid && border.color.alpha() >= 1.0 {
+        border.used_width.get()
+    } else {
+        0.0
+    }
+}
+
+/// Used paint geometry for one CSS Borders 4 circular `border-shape`.
+///
+/// A `border-shape` is visual-only, so this is constructed at the paint
+/// boundary from the relevant border/padding/content geometry rather than
+/// leaking shape coordinates into layout sizing.
+#[derive(Debug, Clone, Copy)]
+struct ResolvedBorderShapeCircle {
+    center: PaintPoint,
+    radius: f32,
+}
+
+/// Used paint geometry for one CSS Borders 4 elliptical `border-shape`.
+#[derive(Debug, Clone, Copy)]
+struct ResolvedBorderShapeEllipse {
+    center: PaintPoint,
+    horizontal_radius: f32,
+    vertical_radius: f32,
+}
+
+/// Used paint geometry for a closed line-only CSS `shape()` border path.
+#[derive(Debug, Clone)]
+struct ResolvedBorderShapePath {
+    vertices: Vec<PaintPoint>,
+}
+
+/// A resolved uniform rounded `inset()` contour.
+#[derive(Debug, Clone, Copy)]
+struct ResolvedBorderShapeRoundedRect {
+    rect: PaintRect,
+    radius_x: f32,
+    radius_y: f32,
+}
+
+/// One resolved single-shape contour usable by background, border, and
+/// overflow paint without exposing basic-shape geometry to layout.
+#[derive(Debug, Clone)]
+enum ResolvedBorderShape {
+    /// A valid basic shape that has collapsed to an empty used contour.
+    ///
+    /// This is not the same as no `border-shape`: backgrounds and descendant
+    /// overflow must be suppressed rather than reverting to the box rectangle.
+    Empty,
+    Circle(ResolvedBorderShapeCircle),
+    Ellipse(ResolvedBorderShapeEllipse),
+    Path(ResolvedBorderShapePath),
+    RoundedRect(ResolvedBorderShapeRoundedRect),
+}
+
+/// The descendant overflow contour established by a single `border-shape`.
+///
+/// A collapsed shape still clips; it simply admits no descendant paint.
+#[derive(Debug, Clone)]
+pub(in crate::layout) enum BorderShapeOverflowClip {
+    /// Exact contour for atomic content whose paint primitive can carry a
+    /// path clip directly, without the fixed-size retained polygon limit.
+    Path(RenderedPathClip),
+    Empty,
+}
+
+/// The annular fill region bounded by two CSS Borders 4 basic-shape paths.
+#[derive(Debug, Clone)]
+struct ResolvedBorderShapePair {
+    outer: ResolvedBorderShape,
+    inner: ResolvedBorderShape,
+}
+
+impl ResolvedBorderShapePair {
+    fn commands(&self) -> Vec<RenderedPathCommand> {
+        let mut commands = self.outer.commands();
+        commands.extend(self.inner.commands());
+        commands
+    }
+}
+
+/// Builds the outline paint bands for a circular or elliptical `border-shape`.
+///
+/// An outline follows the outermost contour of a multi-path `border-shape`;
+/// it must not reuse the element's filled annulus.  In particular, a two-path
+/// shape has an outline outside the outer path only.  Circles and ellipses
+/// have a well-defined parallel contour, represented here by growing both
+/// radii by the used outline offset and width:
+/// <https://drafts.csswg.org/css-borders-4/#border-shape> and
+/// <https://drafts.csswg.org/css-ui/#outline-props>.
+pub(in crate::layout) fn border_shape_outline_paths(
+    border_rect: PaintRect,
+    style: &ComputedStyle,
+) -> Option<Vec<RenderedPath>> {
+    let outer = resolved_outer_border_shape(border_rect, style, used_border_widths(style))?;
+    let outline_offset = style.outline_offset.length_points();
+    let outline_width = style.outline_width;
+    let color = style.outline_color;
+    let paint_band = |outer: ResolvedBorderShape, inner: Option<ResolvedBorderShape>| {
+        let has_inner = inner.is_some();
+        let mut commands = outer.commands();
+        if let Some(inner) = &inner {
+            commands.extend(inner.commands());
+        }
+        RenderedPath::new(
+            commands,
+            Some(color),
+            if has_inner {
+                RenderedPathFillRule::EvenOdd
+            } else {
+                RenderedPathFillRule::NonZero
+            },
+            None,
+            PaintStrokeWidth::ZERO,
+            None,
+        )
+    };
+
+    let paths = match style.outline_style {
+        css::BorderStyle::Solid => {
+            let outer = outer.outset(outline_offset + outline_width)?;
+            let inner = outer.outset(-outline_width);
+            vec![paint_band(outer, inner)]
+        }
+        css::BorderStyle::Double => {
+            // CSS `double` divides its used width into three equal bands:
+            // the outer and inner bands are painted and the middle band is
+            // transparent.  Construct those bands directly rather than
+            // filling the element's two-path border-shape annulus.
+            // <https://www.w3.org/TR/css-backgrounds-3/#border-style>
+            let line_width = outline_width / 3.0;
+            let outer_edge = outer.outset(outline_offset + outline_width)?;
+            let outer_inner = outer_edge.outset(-line_width);
+            let inner_outer = outer.outset(outline_offset + line_width)?;
+            let inner_inner = inner_outer.outset(-line_width);
+            vec![
+                paint_band(outer_edge, outer_inner),
+                paint_band(inner_outer, inner_inner),
+            ]
+        }
+        _ => return None,
+    };
+    Some(paths)
+}
+
+impl ResolvedBorderShape {
+    fn commands(&self) -> Vec<RenderedPathCommand> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::Circle(circle) => circle.commands(),
+            Self::Ellipse(ellipse) => ellipse.commands(),
+            Self::Path(path) => path.commands(),
+            Self::RoundedRect(rounded) => rounded.commands(),
+        }
+    }
+
+    fn inner_overflow_path_clip(&self, inset: f32) -> Option<BorderShapeOverflowClip> {
+        let inner = match self {
+            Self::Empty => return Some(BorderShapeOverflowClip::Empty),
+            Self::Circle(circle) => {
+                let radius = circle.radius - inset;
+                (radius > 0.0).then_some(Self::Circle(ResolvedBorderShapeCircle {
+                    center: circle.center,
+                    radius,
+                }))
+            }
+            Self::Ellipse(ellipse) => {
+                let horizontal_radius = ellipse.horizontal_radius - inset;
+                let vertical_radius = ellipse.vertical_radius - inset;
+                (horizontal_radius > 0.0 && vertical_radius > 0.0).then_some(Self::Ellipse(
+                    ResolvedBorderShapeEllipse {
+                        center: ellipse.center,
+                        horizontal_radius,
+                        vertical_radius,
+                    },
+                ))
+            }
+            Self::Path(path) => {
+                if inset.abs() <= f32::EPSILON {
+                    Some(Self::Path(path.clone()))
+                } else {
+                    path.outset(-inset).map(Self::Path)
+                }
+            }
+            Self::RoundedRect(rounded) => Some(Self::RoundedRect(*rounded)),
+        };
+        let commands = inner?.commands();
+        (!commands.is_empty())
+            .then(|| {
+                BorderShapeOverflowClip::Path(RenderedPathClip::new(
+                    commands,
+                    RenderedPathFillRule::NonZero,
+                    Vec::new(),
+                ))
+            })
+            .or(Some(BorderShapeOverflowClip::Empty))
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    /// Returns the parallel circular or elliptical contour at `distance` from
+    /// this contour.  Positive values expand away from the center and negative
+    /// values contract toward it.
+    fn outset(&self, distance: f32) -> Option<Self> {
+        match self {
+            Self::Empty => None,
+            Self::Circle(circle) => {
+                let radius = circle.radius + distance;
+                (radius > 0.0).then_some(Self::Circle(ResolvedBorderShapeCircle {
+                    center: circle.center,
+                    radius,
+                }))
+            }
+            Self::Ellipse(ellipse) => {
+                let horizontal_radius = ellipse.horizontal_radius + distance;
+                let vertical_radius = ellipse.vertical_radius + distance;
+                (horizontal_radius > 0.0 && vertical_radius > 0.0).then_some(Self::Ellipse(
+                    ResolvedBorderShapeEllipse {
+                        center: ellipse.center,
+                        horizontal_radius,
+                        vertical_radius,
+                    },
+                ))
+            }
+            Self::Path(path) => path.outset(distance).map(Self::Path),
+            Self::RoundedRect(_) => None,
+        }
+    }
+
+    /// Translates a resolved paint contour without re-resolving its CSS
+    /// percentage geometry against a different box.
+    fn translated(&self, displacement: PaintDisplacement) -> Self {
+        match self {
+            Self::Empty => Self::Empty,
+            Self::Circle(circle) => Self::Circle(ResolvedBorderShapeCircle {
+                center: circle.center + displacement,
+                radius: circle.radius,
+            }),
+            Self::Ellipse(ellipse) => Self::Ellipse(ResolvedBorderShapeEllipse {
+                center: ellipse.center + displacement,
+                horizontal_radius: ellipse.horizontal_radius,
+                vertical_radius: ellipse.vertical_radius,
+            }),
+            Self::Path(path) => Self::Path(ResolvedBorderShapePath {
+                vertices: path
+                    .vertices
+                    .iter()
+                    .copied()
+                    .map(|vertex| vertex + displacement)
+                    .collect(),
+            }),
+            Self::RoundedRect(rounded) => Self::RoundedRect(ResolvedBorderShapeRoundedRect {
+                rect: PaintRect::new(rounded.rect.origin + displacement, rounded.rect.size),
+                radius_x: rounded.radius_x,
+                radius_y: rounded.radius_y,
+            }),
+        }
+    }
+}
+
+impl ResolvedBorderShapePath {
+    fn commands(&self) -> Vec<RenderedPathCommand> {
+        let Some((&first, rest)) = self.vertices.split_first() else {
+            return Vec::new();
+        };
+        std::iter::once(RenderedPathCommand::move_to(first))
+            .chain(rest.iter().copied().map(RenderedPathCommand::line_to))
+            .chain(std::iter::once(RenderedPathCommand::Close))
+            .collect()
+    }
+
+    /// Offset a closed polygonal contour by a physical paint-space distance.
+    ///
+    /// Each edge is shifted along its outward unit normal and adjacent shifted
+    /// lines are intersected at the vertex. This retains the CSS basic shape
+    /// as geometry rather than approximating its shadows, outlines, or clips
+    /// with the element rectangle. Degenerate edges and self-intersections are
+    /// rejected because they do not have a single well-defined miter contour.
+    fn outset(&self, distance: f32) -> Option<Self> {
+        const EPSILON: f32 = 1e-5;
+        if self.vertices.len() < 3 || !distance.is_finite() {
+            return None;
+        }
+        let signed_area_twice = self
+            .vertices
+            .iter()
+            .zip(self.vertices.iter().cycle().skip(1))
+            .take(self.vertices.len())
+            .map(|(start, end)| start.x * end.y - end.x * start.y)
+            .sum::<f32>();
+        if signed_area_twice.abs() < EPSILON {
+            return None;
+        }
+        let outward_normal = |start: PaintPoint, end: PaintPoint| {
+            let dx = end.x - start.x;
+            let dy = end.y - start.y;
+            let length = (dx * dx + dy * dy).sqrt();
+            (length >= EPSILON).then(|| {
+                let (x, y) = if signed_area_twice > 0.0 {
+                    // Counter-clockwise contours keep their interior on the
+                    // left of each edge, so the right normal is outward.
+                    (dy / length, -dx / length)
+                } else {
+                    (-dy / length, dx / length)
+                };
+                PaintDisplacement::new(x, y)
+            })
+        };
+        let mut vertices = Vec::with_capacity(self.vertices.len());
+        for index in 0..self.vertices.len() {
+            let previous = self.vertices[(index + self.vertices.len() - 1) % self.vertices.len()];
+            let current = self.vertices[index];
+            let next = self.vertices[(index + 1) % self.vertices.len()];
+            let previous_normal = outward_normal(previous, current)?;
+            let next_normal = outward_normal(current, next)?;
+            let previous_start = previous + previous_normal * distance;
+            let previous_end = current + previous_normal * distance;
+            let next_start = current + next_normal * distance;
+            let next_end = next + next_normal * distance;
+            let previous_direction = previous_end - previous_start;
+            let next_direction = next_end - next_start;
+            let denominator =
+                previous_direction.x * next_direction.y - previous_direction.y * next_direction.x;
+            if denominator.abs() < EPSILON {
+                return None;
+            }
+            let start_delta = next_start - previous_start;
+            let along_previous =
+                (start_delta.x * next_direction.y - start_delta.y * next_direction.x) / denominator;
+            let vertex = previous_start + previous_direction * along_previous;
+            if !vertex.x.is_finite() || !vertex.y.is_finite() {
+                return None;
+            }
+            vertices.push(vertex);
+        }
+        Some(Self { vertices })
+    }
+}
+
+impl ResolvedBorderShapeRoundedRect {
+    fn commands(self) -> Vec<RenderedPathCommand> {
+        rounded_rect_path_commands(
+            self.rect,
+            RenderedRoundedRectRadii {
+                top_left: RenderedCornerRadius::new(self.radius_x, self.radius_y),
+                top_right: RenderedCornerRadius::new(self.radius_x, self.radius_y),
+                bottom_right: RenderedCornerRadius::new(self.radius_x, self.radius_y),
+                bottom_left: RenderedCornerRadius::new(self.radius_x, self.radius_y),
+            },
+        )
+    }
+}
+
+impl ResolvedBorderShapeCircle {
+    fn commands(self) -> Vec<RenderedPathCommand> {
+        // The canonical cubic-circle approximation used by the SVG adapter.
+        // Keeping this shared coefficient makes CSS `circle()` and an
+        // equivalent SVG `<circle>` rasterize on the same contour.
+        const KAPPA: f32 = 0.552_284_8;
+        let radius = self.radius.max(0.0);
+        let x = self.center.x;
+        let y = self.center.y;
+        vec![
+            RenderedPathCommand::move_to(PaintPoint::new(x + radius, y)),
+            RenderedPathCommand::curve_to(
+                PaintPoint::new(x + radius, y + radius * KAPPA),
+                PaintPoint::new(x + radius * KAPPA, y + radius),
+                PaintPoint::new(x, y + radius),
+            ),
+            RenderedPathCommand::curve_to(
+                PaintPoint::new(x - radius * KAPPA, y + radius),
+                PaintPoint::new(x - radius, y + radius * KAPPA),
+                PaintPoint::new(x - radius, y),
+            ),
+            RenderedPathCommand::curve_to(
+                PaintPoint::new(x - radius, y - radius * KAPPA),
+                PaintPoint::new(x - radius * KAPPA, y - radius),
+                PaintPoint::new(x, y - radius),
+            ),
+            RenderedPathCommand::curve_to(
+                PaintPoint::new(x + radius * KAPPA, y - radius),
+                PaintPoint::new(x + radius, y - radius * KAPPA),
+                PaintPoint::new(x + radius, y),
+            ),
+            RenderedPathCommand::Close,
+        ]
+    }
+}
+
+impl ResolvedBorderShapeEllipse {
+    fn commands(self) -> Vec<RenderedPathCommand> {
+        const KAPPA: f32 = 0.552_284_8;
+        let horizontal_radius = self.horizontal_radius.max(0.0);
+        let vertical_radius = self.vertical_radius.max(0.0);
+        let x = self.center.x;
+        let y = self.center.y;
+        vec![
+            RenderedPathCommand::move_to(PaintPoint::new(x + horizontal_radius, y)),
+            RenderedPathCommand::curve_to(
+                PaintPoint::new(x + horizontal_radius, y + vertical_radius * KAPPA),
+                PaintPoint::new(x + horizontal_radius * KAPPA, y + vertical_radius),
+                PaintPoint::new(x, y + vertical_radius),
+            ),
+            RenderedPathCommand::curve_to(
+                PaintPoint::new(x - horizontal_radius * KAPPA, y + vertical_radius),
+                PaintPoint::new(x - horizontal_radius, y + vertical_radius * KAPPA),
+                PaintPoint::new(x - horizontal_radius, y),
+            ),
+            RenderedPathCommand::curve_to(
+                PaintPoint::new(x - horizontal_radius, y - vertical_radius * KAPPA),
+                PaintPoint::new(x - horizontal_radius * KAPPA, y - vertical_radius),
+                PaintPoint::new(x, y - vertical_radius),
+            ),
+            RenderedPathCommand::curve_to(
+                PaintPoint::new(x + horizontal_radius * KAPPA, y - vertical_radius),
+                PaintPoint::new(x + horizontal_radius, y - vertical_radius * KAPPA),
+                PaintPoint::new(x + horizontal_radius, y),
+            ),
+            RenderedPathCommand::Close,
+        ]
+    }
+}
+
+/// Resolve the inner edge of a single circular `border-shape` for overflow
+/// clipping. The shape path is centered on its border stroke, so the inner
+/// visible edge is half a used stroke width inward:
+/// <https://drafts.csswg.org/css-borders-4/#border-shape>.
+pub(in crate::layout) fn single_border_shape_overflow_clip(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+) -> Option<BorderShapeOverflowClip> {
+    let shape = resolved_single_border_shape(rect, style, border_insets)?;
+    // A shape without a renderable border still establishes its own overflow
+    // contour; in that case its inside edge is the path itself.
+    let stroke_width = relevant_border_shape_side(style).map_or(0.0, |side| side.used_width.get());
+    shape.inner_overflow_path_clip(stroke_width / 2.0)
+}
+
+/// Resolve the exact inner shape contour for atomic descendant content.
+///
+/// Image and inline-SVG primitives can carry a full PDF path clip, avoiding
+/// the chord error of the compact polygon retained by normal-flow effects.
+/// <https://drafts.csswg.org/css-borders-4/#border-shape>
+pub(in crate::layout) fn single_border_shape_overflow_path_clip(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+) -> Option<BorderShapeOverflowClip> {
+    let shape = resolved_single_border_shape(rect, style, border_insets)?;
+    let stroke_width = relevant_border_shape_side(style).map_or(0.0, |side| side.used_width.get());
+    shape.inner_overflow_path_clip(stroke_width / 2.0)
+}
+
+fn resolved_single_border_shape(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+) -> Option<ResolvedBorderShape> {
+    (!matches!(style.border_shape, css::BorderShape::Pair { .. }))
+        .then(|| resolved_border_shape_value(rect, style, border_insets, &style.border_shape))
+        .flatten()
+}
+
+/// Resolves the outermost path of a supported `border-shape`.
+///
+/// Multi-path shapes deliberately resolve to their first path here: outlines
+/// trace the outer edge of the shape, whereas background and border painting
+/// use the complete pair to form an annulus.
+fn resolved_outer_border_shape(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+) -> Option<ResolvedBorderShape> {
+    let shape = match &style.border_shape {
+        css::BorderShape::Pair { outer, .. } => outer,
+        shape => shape,
+    };
+    resolved_border_shape_value(rect, style, border_insets, shape)
+}
+
+/// Resolve the contour that bounds a `border-shape` background and therefore
+/// its inset shadow. Paired shapes expose the inner contour to the element's
+/// background, while a single shape uses its only contour.
+fn resolved_inset_border_shape(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+) -> Option<ResolvedBorderShape> {
+    if let Some(pair) = resolved_border_shape_pair(rect, style, border_insets) {
+        return Some(pair.inner);
+    }
+    // A single border-shape path is centered on the relevant border stroke;
+    // backgrounds and inset shadows are bounded by its inner visible edge.
+    // Preserve that distinction for arbitrary polygonal paths as well as the
+    // analytically offset circle and ellipse contours.
+    let stroke_width = relevant_border_shape_side(style).map_or(0.0, |side| side.used_width.get());
+    resolved_outer_border_shape(rect, style, border_insets)?.outset(-stroke_width / 2.0)
+}
+
+fn resolved_border_shape_pair(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+) -> Option<ResolvedBorderShapePair> {
+    let css::BorderShape::Pair { outer, inner } = &style.border_shape else {
+        return None;
+    };
+    Some(ResolvedBorderShapePair {
+        outer: resolved_border_shape_value(rect, style, border_insets, outer)?,
+        inner: resolved_border_shape_value(rect, style, border_insets, inner)?,
+    })
+}
+
+/// Resolve one non-pair basic shape at the paint-time percentage boundary.
+fn resolved_border_shape_value(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+    shape: &css::BorderShape,
+) -> Option<ResolvedBorderShape> {
+    match shape {
+        css::BorderShape::Circle(circle) => {
+            resolved_border_shape_circle(rect, style, border_insets, circle).map(|circle| {
+                if circle.radius <= 0.0 {
+                    ResolvedBorderShape::Empty
+                } else {
+                    ResolvedBorderShape::Circle(circle)
+                }
+            })
+        }
+        css::BorderShape::Ellipse(ellipse) => {
+            resolved_border_shape_ellipse(rect, style, border_insets, ellipse).map(|ellipse| {
+                if ellipse.horizontal_radius <= 0.0 || ellipse.vertical_radius <= 0.0 {
+                    ResolvedBorderShape::Empty
+                } else {
+                    ResolvedBorderShape::Ellipse(ellipse)
+                }
+            })
+        }
+        css::BorderShape::Path(path) => {
+            resolved_border_shape_path(rect, style, border_insets, path)
+                .map(ResolvedBorderShape::Path)
+        }
+        css::BorderShape::Inset(inset) => {
+            resolved_border_shape_inset_path(rect, style, border_insets, inset)
+        }
+        css::BorderShape::Polygon(polygon) => {
+            resolved_border_shape_polygon(rect, style, border_insets, polygon)
+                .map(ResolvedBorderShape::Path)
+        }
+        css::BorderShape::None | css::BorderShape::Pair { .. } => None,
+    }
+}
+
+fn resolved_border_shape_circle(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+    circle: &css::BorderShapeCircle,
+) -> Option<ResolvedBorderShapeCircle> {
+    let area = border_shape_geometry_box_rect(rect, style, border_insets, circle.geometry_box);
+    if area.size.width <= 0.0 || area.size.height <= 0.0 {
+        return None;
+    }
+    let resolve = |value: &css::ComputedLengthPercentage, basis: f32| {
+        value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(basis)))
+            .map(layout_points)
+            .unwrap_or_else(|| value.length_points())
+    };
+    let x = area.min_x() + resolve(&circle.position.x, area.size.width);
+    // CSS shape coordinates are top-left based; paint coordinates are
+    // bottom-left based.
+    let y = area.max_y() - resolve(&circle.position.y, area.size.height);
+    let distances = [
+        (x - area.min_x()).max(0.0),
+        (area.max_x() - x).max(0.0),
+        (y - area.min_y()).max(0.0),
+        (area.max_y() - y).max(0.0),
+    ];
+    let radius = match &circle.radius {
+        css::BorderShapeCircleRadius::LengthPercentage(value) => {
+            let diagonal = ((area.size.width.powi(2) + area.size.height.powi(2)) / 2.0).sqrt();
+            resolve(value, diagonal)
+        }
+        css::BorderShapeCircleRadius::ClosestSide => {
+            distances.into_iter().fold(f32::INFINITY, f32::min)
+        }
+        css::BorderShapeCircleRadius::FarthestSide => distances.into_iter().fold(0.0, f32::max),
+        css::BorderShapeCircleRadius::ClosestCorner => [
+            (x - area.min_x()).hypot(y - area.min_y()),
+            (x - area.min_x()).hypot(area.max_y() - y),
+            (area.max_x() - x).hypot(y - area.min_y()),
+            (area.max_x() - x).hypot(area.max_y() - y),
+        ]
+        .into_iter()
+        .fold(f32::INFINITY, f32::min),
+        css::BorderShapeCircleRadius::FarthestCorner => [
+            (x - area.min_x()).hypot(y - area.min_y()),
+            (x - area.min_x()).hypot(area.max_y() - y),
+            (area.max_x() - x).hypot(y - area.min_y()),
+            (area.max_x() - x).hypot(area.max_y() - y),
+        ]
+        .into_iter()
+        .fold(0.0, f32::max),
+    };
+    Some(ResolvedBorderShapeCircle {
+        center: PaintPoint::new(x, y),
+        radius: radius.max(0.0),
+    })
+}
+
+fn resolved_border_shape_ellipse(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+    ellipse: &css::BorderShapeEllipse,
+) -> Option<ResolvedBorderShapeEllipse> {
+    let area = border_shape_geometry_box_rect(rect, style, border_insets, ellipse.geometry_box);
+    if area.size.width <= 0.0 || area.size.height <= 0.0 {
+        return None;
+    }
+    let resolve = |value: &css::ComputedLengthPercentage, basis: f32| {
+        value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(basis)))
+            .map(layout_points)
+            .unwrap_or_else(|| value.length_points())
+    };
+    let x = area.min_x() + resolve(&ellipse.position.x, area.size.width);
+    let y = area.max_y() - resolve(&ellipse.position.y, area.size.height);
+    let corner_distances = [
+        (x - area.min_x()).hypot(y - area.min_y()),
+        (x - area.min_x()).hypot(area.max_y() - y),
+        (area.max_x() - x).hypot(y - area.min_y()),
+        (area.max_x() - x).hypot(area.max_y() - y),
+    ];
+    let horizontal_radius = match &ellipse.horizontal_radius {
+        css::BorderShapeEllipseRadius::LengthPercentage(value) => resolve(value, area.size.width),
+        css::BorderShapeEllipseRadius::ClosestSide => {
+            (x - area.min_x()).min(area.max_x() - x).max(0.0)
+        }
+        css::BorderShapeEllipseRadius::FarthestSide => {
+            (x - area.min_x()).max(area.max_x() - x).max(0.0)
+        }
+        css::BorderShapeEllipseRadius::ClosestCorner => {
+            corner_distances.into_iter().fold(f32::INFINITY, f32::min)
+        }
+        css::BorderShapeEllipseRadius::FarthestCorner => {
+            corner_distances.into_iter().fold(0.0, f32::max)
+        }
+    };
+    let vertical_radius = match &ellipse.vertical_radius {
+        css::BorderShapeEllipseRadius::LengthPercentage(value) => resolve(value, area.size.height),
+        css::BorderShapeEllipseRadius::ClosestSide => {
+            (y - area.min_y()).min(area.max_y() - y).max(0.0)
+        }
+        css::BorderShapeEllipseRadius::FarthestSide => {
+            (y - area.min_y()).max(area.max_y() - y).max(0.0)
+        }
+        css::BorderShapeEllipseRadius::ClosestCorner => {
+            corner_distances.into_iter().fold(f32::INFINITY, f32::min)
+        }
+        css::BorderShapeEllipseRadius::FarthestCorner => {
+            corner_distances.into_iter().fold(0.0, f32::max)
+        }
+    };
+    Some(ResolvedBorderShapeEllipse {
+        center: PaintPoint::new(x, y),
+        horizontal_radius: horizontal_radius.max(0.0),
+        vertical_radius: vertical_radius.max(0.0),
+    })
+}
+
+fn resolved_border_shape_path(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+    path: &css::BorderShapePath,
+) -> Option<ResolvedBorderShapePath> {
+    let area = border_shape_geometry_box_rect(rect, style, border_insets, path.geometry_box);
+    if area.size.width <= 0.0 || area.size.height <= 0.0 || path.vertices.len() < 3 {
+        return None;
+    }
+    let resolve = |value: &css::ComputedLengthPercentage, basis: f32| {
+        value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(basis)))
+            .map(layout_points)
+            .unwrap_or_else(|| value.length_points())
+    };
+    Some(ResolvedBorderShapePath {
+        vertices: path
+            .vertices
+            .iter()
+            .map(|vertex| {
+                PaintPoint::new(
+                    area.min_x() + resolve(&vertex.x, area.size.width),
+                    area.max_y() - resolve(&vertex.y, area.size.height),
+                )
+            })
+            .collect(),
+    })
+}
+
+fn resolved_border_shape_polygon(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+    polygon: &css::BorderShapePolygon,
+) -> Option<ResolvedBorderShapePath> {
+    let area = border_shape_geometry_box_rect(rect, style, border_insets, polygon.geometry_box);
+    if area.size.width <= 0.0 || area.size.height <= 0.0 || polygon.vertices.len() < 3 {
+        return None;
+    }
+    let resolve = |value: &css::ComputedLengthPercentage, basis: f32| {
+        value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(basis)))
+            .map(layout_points)
+            .unwrap_or_else(|| value.length_points())
+    };
+    Some(ResolvedBorderShapePath {
+        vertices: polygon
+            .vertices
+            .iter()
+            .map(|vertex| {
+                PaintPoint::new(
+                    area.min_x() + resolve(&vertex.x, area.size.width),
+                    area.max_y() - resolve(&vertex.y, area.size.height),
+                )
+            })
+            .collect(),
+    })
+}
+
+fn resolved_border_shape_inset_path(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+    inset: &css::BorderShapeInset,
+) -> Option<ResolvedBorderShape> {
+    let area = border_shape_geometry_box_rect(rect, style, border_insets, inset.geometry_box);
+    if area.size.width <= 0.0 || area.size.height <= 0.0 {
+        return None;
+    }
+    let resolve = |value: &css::ComputedLengthPercentage, basis: f32| {
+        value
+            .used_length_with_percentage_basis(PercentageBasis::definite(layout_pt(basis)))
+            .map(layout_points)
+            .unwrap_or_else(|| value.length_points())
+    };
+    let left = area.min_x() + resolve(&inset.left, area.size.width);
+    let right = area.max_x() - resolve(&inset.right, area.size.width);
+    // CSS basic-shape coordinates use a top-left origin, whereas paint uses a
+    // bottom-left origin.
+    let top = area.max_y() - resolve(&inset.top, area.size.height);
+    let bottom = area.min_y() + resolve(&inset.bottom, area.size.height);
+    if left >= right || bottom >= top {
+        return Some(ResolvedBorderShape::Empty);
+    }
+    let inset_rect = PaintRect::new(
+        PaintPoint::new(left, bottom),
+        PaintSize::new(right - left, top - bottom),
+    );
+    if let Some(radius) = &inset.corner_radius {
+        let radius_x = resolve(radius, inset_rect.size.width)
+            .max(0.0)
+            .min(inset_rect.size.width / 2.0);
+        let radius_y = resolve(radius, inset_rect.size.height)
+            .max(0.0)
+            .min(inset_rect.size.height / 2.0);
+        return Some(ResolvedBorderShape::RoundedRect(
+            ResolvedBorderShapeRoundedRect {
+                rect: inset_rect,
+                radius_x,
+                radius_y,
+            },
+        ));
+    }
+    Some(ResolvedBorderShape::Path(ResolvedBorderShapePath {
+        vertices: vec![
+            PaintPoint::new(left, top),
+            PaintPoint::new(right, top),
+            PaintPoint::new(right, bottom),
+            PaintPoint::new(left, bottom),
+        ],
+    }))
+}
+
+fn border_shape_geometry_box_rect(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+    geometry_box: css::BorderShapeGeometryBox,
+) -> PaintRect {
+    match geometry_box {
+        css::BorderShapeGeometryBox::Border => rect,
+        css::BorderShapeGeometryBox::Padding => inset_paint_rect(rect, border_insets),
+        css::BorderShapeGeometryBox::Content => inset_paint_rect(
+            rect,
+            css::Edges {
+                top: border_insets.top + style.padding.top,
+                right: border_insets.right + style.padding.right,
+                bottom: border_insets.bottom + style.padding.bottom,
+                left: border_insets.left + style.padding.left,
+            },
+        ),
+        css::BorderShapeGeometryBox::Margin => inset_paint_rect(
+            rect,
+            css::Edges {
+                top: -style.margin.top,
+                right: -style.margin.right,
+                bottom: -style.margin.bottom,
+                left: -style.margin.left,
+            },
+        ),
+        css::BorderShapeGeometryBox::HalfBorder => inset_paint_rect(
+            rect,
+            css::Edges {
+                top: border_insets.top / 2.0,
+                right: border_insets.right / 2.0,
+                bottom: border_insets.bottom / 2.0,
+                left: border_insets.left / 2.0,
+            },
+        ),
+    }
+}
+
+fn paint_single_border_shape(
+    paths: &mut Vec<RenderedPath>,
+    shape: ResolvedBorderShape,
+    style: &ComputedStyle,
+) {
+    let Some(side) = relevant_border_shape_side(style) else {
+        return;
+    };
+    paths.push(RenderedPath::new(
+        shape.commands(),
+        None,
+        RenderedPathFillRule::NonZero,
+        Some(side.color),
+        PaintStrokeWidth::new(side.used_width.get()),
+        None,
+    ));
+}
+
+fn relevant_border_shape_side(style: &ComputedStyle) -> Option<UsedBorderSide> {
+    let borders = used_border(style);
+    let logical_order = [
+        block_start_side(style.writing_mode),
+        inline_start_side(style.writing_mode, style.used_direction()),
+        block_end_side(style.writing_mode),
+        inline_end_side(style.writing_mode, style.used_direction()),
+    ];
+    logical_order.into_iter().find_map(|side| {
+        let side = match side {
+            PhysicalSide::Top => borders.top,
+            PhysicalSide::Right => borders.right,
+            PhysicalSide::Bottom => borders.bottom,
+            PhysicalSide::Left => borders.left,
+        };
+        side.is_visible().then_some(side)
+    })
+}
+
+/// Resolve the color source for a two-path `border-shape` fill.
+///
+/// The annular fill follows the first renderable logical border side, using
+/// the same relevant-side selection as a single shape's stroke. A `none` or
+/// `hidden` side therefore cannot contribute its initial (often black) color:
+/// <https://drafts.csswg.org/css-borders-4/#relevant-side-for-border-shape>.
+fn relevant_border_shape_color(style: &ComputedStyle) -> Option<CssColor> {
+    relevant_border_shape_side(style).map(|side| side.color)
 }
 
 /// Converts supported linear gradients to filled rectangle bands.
@@ -190,7 +1178,7 @@ pub(in crate::layout) fn linear_gradient_rects_with_clip(
 ) -> Vec<RenderedRect> {
     let mut rects = Vec::new();
     for layer in background_layers_for_gradient_paint(style).iter().rev() {
-        let Some(BackgroundImage::LinearGradient(gradient)) = &layer.image else {
+        let Some(BackgroundImage::LinearGradient(gradient)) = layer.image.as_image() else {
             continue;
         };
         if !linear_gradient_can_paint_as_vector(gradient, layer) {
@@ -275,7 +1263,7 @@ pub(in crate::layout) fn linear_gradient_rect_paths_with_clip(
 ) -> Vec<RenderedPath> {
     let mut paths = Vec::new();
     for layer in background_layers_for_gradient_paint(style).iter().rev() {
-        let Some(BackgroundImage::LinearGradient(gradient)) = &layer.image else {
+        let Some(BackgroundImage::LinearGradient(gradient)) = layer.image.as_image() else {
             continue;
         };
         if !linear_gradient_can_paint_as_vector(gradient, layer) {
@@ -370,7 +1358,7 @@ pub(in crate::layout) fn linear_gradient_paths_with_clip(
 ) -> Vec<RenderedPath> {
     let mut paths = Vec::new();
     for layer in background_layers_for_gradient_paint(style).iter().rev() {
-        let Some(BackgroundImage::LinearGradient(gradient)) = &layer.image else {
+        let Some(BackgroundImage::LinearGradient(gradient)) = layer.image.as_image() else {
             continue;
         };
         let area = background_rect_area_for_box(rect, style, border_insets, layer.origin);
@@ -466,7 +1454,10 @@ pub(in crate::layout) fn linear_gradient_is_painted_by_box_decoration(
         return false;
     };
     linear_gradient_can_paint_as_vector(gradient, layer)
-        && gradient.stops.iter().all(|stop| stop.color.is_opaque())
+        && gradient
+            .stops
+            .iter()
+            .all(|stop| stop.color.as_color().is_some_and(CssColor::is_opaque))
         && fixed_gradient_stops(
             gradient,
             axis_aligned_gradient_length(
@@ -492,7 +1483,8 @@ pub(in crate::layout) fn gradient_stop_position(
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::layout) struct FixedGradientStop {
-    pub(in crate::layout) color: Color,
+    pub(in crate::layout) color: CssColor,
+    pub(in crate::layout) missing_components: css::GradientMissingComponents,
     pub(in crate::layout) position: f32,
 }
 
@@ -546,17 +1538,18 @@ pub(in crate::layout) fn fixed_gradient_stops(
         }
     }
 
-    Some(
-        gradient
-            .stops
-            .iter()
-            .zip(positions)
-            .map(|(stop, position)| FixedGradientStop {
-                color: stop.color,
+    gradient
+        .stops
+        .iter()
+        .zip(positions)
+        .map(|(stop, position)| {
+            Some(FixedGradientStop {
+                color: stop.color.as_color()?,
+                missing_components: stop.color.missing_components_for(gradient.interpolation),
                 position: position.expect("all positions fixed up"),
             })
-            .collect(),
-    )
+        })
+        .collect()
 }
 
 /// Canonicalize a used gradient coordinate before color-stop fixup and raster
@@ -778,7 +1771,7 @@ pub(in crate::layout) fn rounded_background_clip_for_box(
         shaped_rect_path_commands(
             rounded_rect.paint_rect(),
             rounded_rect.radii,
-            css::CornerShapes::ROUND,
+            style.corner_shapes,
         ),
         RenderedPathFillRule::NonZero,
         Vec::new(),
@@ -834,16 +1827,55 @@ pub(in crate::layout) fn rounded_clip_rect_for_box(
     if rounded_radii_are_zero(radii) {
         return None;
     }
-    Some(RenderedRoundedRect::new(
-        area.origin.x,
-        area.origin.y,
-        area.size.width,
-        area.size.height,
-        radii,
-        None,
-        None,
-        0.0,
-    ))
+    Some(
+        RenderedRoundedRect::new(
+            area.origin.x,
+            area.origin.y,
+            area.size.width,
+            area.size.height,
+            radii,
+            None,
+            None,
+            PaintStrokeWidth::ZERO,
+        )
+        .with_corner_shapes(style.corner_shapes),
+    )
+}
+
+/// Build a rounded overflow clip expanded by an `overflow-clip-margin`.
+///
+/// CSS Overflow expands the selected clip edge and its corner contour by the
+/// used clip margin.  Expanding only the rectangular effect bounds would turn
+/// a clipped rounded or shaped corner into a square at the margin boundary:
+/// <https://drafts.csswg.org/css-overflow-4/#overflow-clip-margin-property>.
+pub(in crate::layout) fn rounded_clip_rect_for_box_with_outset(
+    rect: PaintRect,
+    style: &ComputedStyle,
+    border_insets: css::Edges,
+    clip_box: css::BackgroundBox,
+    outset: f32,
+) -> Option<RenderedRoundedRect> {
+    let clip = rounded_clip_rect_for_box(rect, style, border_insets, clip_box)?;
+    if outset <= 0.0 {
+        return Some(clip);
+    }
+    let rect = PaintRect::new(
+        clip.paint_rect().origin - PaintDisplacement::new(outset, outset),
+        PaintSize::new(
+            clip.paint_rect().size.width + outset * 2.0,
+            clip.paint_rect().size.height + outset * 2.0,
+        ),
+    );
+    Some(
+        RenderedRoundedRect::from_paint_rect(
+            rect,
+            outset_rounded_rect_radii(clip.radii, outset),
+            None,
+            None,
+            PaintStrokeWidth::ZERO,
+        )
+        .with_corner_shapes(style.corner_shapes),
+    )
 }
 
 fn background_clip_edge_insets(
@@ -894,7 +1926,7 @@ fn gradient_rect_path(rect: RenderedRect, clip: RenderedPathClip) -> Option<Rend
         Some(fill),
         RenderedPathFillRule::NonZero,
         None,
-        0.0,
+        PaintStrokeWidth::ZERO,
         Some(clip),
     ))
 }
@@ -905,7 +1937,7 @@ fn push_gradient_polygon_band(
     clip: PaintRect,
     start: f32,
     end: f32,
-    color: Color,
+    color: CssColor,
     rounded_clip: Option<RenderedPathClip>,
 ) {
     if !color.is_visible() {
@@ -930,18 +1962,21 @@ fn push_gradient_polygon_band(
     if polygon.len() < 3 {
         return;
     }
-    let mut commands = Vec::with_capacity(polygon.len() + 1);
-    commands.push(RenderedPathCommand::move_to(polygon[0]));
-    for point in &polygon[1..] {
-        commands.push(RenderedPathCommand::line_to(*point));
-    }
-    commands.push(RenderedPathCommand::Close);
+    let commands = std::iter::once(RenderedPathCommand::move_to(polygon[0]))
+        .chain(
+            polygon[1..]
+                .iter()
+                .copied()
+                .map(RenderedPathCommand::line_to),
+        )
+        .chain(std::iter::once(RenderedPathCommand::Close))
+        .collect::<Vec<_>>();
     paths.push(RenderedPath::new(
         commands,
         Some(color),
         RenderedPathFillRule::NonZero,
         None,
-        0.0,
+        PaintStrokeWidth::ZERO,
         rounded_clip,
     ));
 }
@@ -1054,6 +2089,7 @@ pub(in crate::layout) struct BoxPaintGeometry {
 
 pub(in crate::layout) fn paint_box_shadows(
     rects: &mut Vec<RenderedRect>,
+    paths: &mut Vec<RenderedPath>,
     geometry: BoxPaintGeometry,
     style: &ComputedStyle,
     inset: bool,
@@ -1065,13 +2101,24 @@ pub(in crate::layout) fn paint_box_shadows(
         .filter(|shadow| shadow.inset == inset)
     {
         let color = shadow.color.resolve(style.color);
-        if !color.is_visible()
-            || shadow.blur_radius.length_points() > 0.0
-            || !style.border_radius.clone().is_zero()
-        {
+        if !color.is_visible() || shadow.blur_radius.length_points() > 0.0 {
             continue;
         }
-        if shadow.inset {
+        if shadow.inset
+            && let Some(shape) =
+                resolved_inset_border_shape(geometry.rect, style, geometry.border_insets)
+        {
+            paint_inset_border_shape_shadow(paths, shape, shadow.clone(), color);
+        } else if shadow.inset && !style.border_radius.clone().is_zero() {
+            paint_inset_rounded_box_shadow(paths, geometry, style, shadow.clone(), color);
+        } else if !shadow.inset
+            && let Some(shape) =
+                resolved_outer_border_shape(geometry.rect, style, geometry.border_insets)
+        {
+            paint_outer_border_shape_shadow(paths, shape, shadow.clone(), color);
+        } else if !shadow.inset && !style.border_radius.clone().is_zero() {
+            paint_outer_rounded_box_shadow(paths, geometry, style, shadow.clone(), color);
+        } else if shadow.inset {
             paint_inset_box_shadow(rects, geometry, shadow.clone(), color);
         } else {
             paint_outer_box_shadow(rects, geometry, shadow.clone(), color);
@@ -1079,11 +2126,204 @@ pub(in crate::layout) fn paint_box_shadows(
     }
 }
 
+/// Paint the non-blurred outer shadow of a CSS Borders 4 basic-shape contour.
+///
+/// CSS Backgrounds defines an outer shadow as the region between the shifted,
+/// spread shadow shape and the unshifted border edge. For circles and
+/// ellipses, spread is a contour offset rather than a rectangular expansion:
+/// <https://www.w3.org/TR/css-backgrounds-3/#shadow-shape>.
+fn paint_outer_border_shape_shadow(
+    paths: &mut Vec<RenderedPath>,
+    shape: ResolvedBorderShape,
+    shadow: css::BoxShadow,
+    color: CssColor,
+) {
+    let Some(shadow_outer) = shape.outset(shadow.spread.length_points()) else {
+        return;
+    };
+    let shadow_outer = shadow_outer.translated(box_shadow_paint_offset(shadow));
+    let mut commands = shadow_outer.commands();
+    commands.extend(shape.commands());
+    paths.push(RenderedPath::new(
+        commands,
+        Some(color),
+        RenderedPathFillRule::EvenOdd,
+        None,
+        PaintStrokeWidth::ZERO,
+        None,
+    ));
+}
+
+/// Paint the non-blurred inset shadow inside the visible background contour of
+/// a CSS Borders 4 `border-shape`.
+///
+/// The shifted inset perimeter contracts by spread but preserves the resolved
+/// circle or ellipse rather than falling back to a rectangle:
+/// <https://www.w3.org/TR/css-backgrounds-3/#shadow-shape>.
+fn paint_inset_border_shape_shadow(
+    paths: &mut Vec<RenderedPath>,
+    subject: ResolvedBorderShape,
+    shadow: css::BoxShadow,
+    color: CssColor,
+) {
+    let Some(perimeter) = subject.outset(-shadow.spread.length_points()) else {
+        return;
+    };
+    let perimeter = perimeter.translated(box_shadow_paint_offset(shadow));
+    let mut commands = subject.commands();
+    commands.extend(perimeter.commands());
+    paths.push(RenderedPath::new(
+        commands,
+        Some(color),
+        RenderedPathFillRule::EvenOdd,
+        None,
+        PaintStrokeWidth::ZERO,
+        None,
+    ));
+}
+
+/// Paint the non-blurred inset shadow inside a rounded or corner-shaped box.
+///
+/// The padding edge bounds the inset shadow and the shifted perimeter keeps
+/// the same CSS Borders 4 corner contour:
+/// <https://www.w3.org/TR/css-backgrounds-3/#shadow-shape>.
+fn paint_inset_rounded_box_shadow(
+    paths: &mut Vec<RenderedPath>,
+    geometry: BoxPaintGeometry,
+    style: &ComputedStyle,
+    shadow: css::BoxShadow,
+    color: CssColor,
+) {
+    let padding = inset_paint_rect(geometry.rect, geometry.border_insets);
+    if padding.size.width <= 0.0 || padding.size.height <= 0.0 {
+        return;
+    }
+    let spread = shadow.spread.length_points();
+    let perimeter = PaintRect::new(
+        padding.origin + PaintDisplacement::new(spread, spread) + box_shadow_paint_offset(shadow),
+        PaintSize::new(
+            (padding.size.width - spread * 2.0).max(0.0),
+            (padding.size.height - spread * 2.0).max(0.0),
+        ),
+    );
+    let subject_radii = padding_edge_rounded_rect_radii(
+        used_rounded_rect_radii(style.border_radius.clone(), geometry.rect.size),
+        geometry.border_insets,
+    );
+    let perimeter_radii = outset_rounded_rect_radii(subject_radii, -spread);
+    let mut commands = shaped_rect_path_commands(padding, subject_radii, style.corner_shapes);
+    if perimeter.size.width > 0.0 && perimeter.size.height > 0.0 {
+        commands.extend(shaped_rect_path_commands(
+            perimeter,
+            perimeter_radii,
+            style.corner_shapes,
+        ));
+    }
+    paths.push(RenderedPath::new(
+        commands,
+        Some(color),
+        RenderedPathFillRule::EvenOdd,
+        None,
+        PaintStrokeWidth::ZERO,
+        None,
+    ));
+}
+
+/// Paint the non-blurred outer shadow of a rounded rectangle.
+///
+/// Positive spread grows both the shadow box and its corner radii. The path
+/// ring makes an ordinary rounded box agree with an equivalent ellipse-shaped
+/// border contour:
+/// <https://www.w3.org/TR/css-backgrounds-3/#shadow-shape>.
+fn paint_outer_rounded_box_shadow(
+    paths: &mut Vec<RenderedPath>,
+    geometry: BoxPaintGeometry,
+    style: &ComputedStyle,
+    shadow: css::BoxShadow,
+    color: CssColor,
+) {
+    let spread = shadow.spread.length_points();
+    let outer_size = PaintSize::new(
+        geometry.rect.size.width + spread * 2.0,
+        geometry.rect.size.height + spread * 2.0,
+    );
+    if outer_size.width <= 0.0 || outer_size.height <= 0.0 {
+        return;
+    }
+    let outer_rect = PaintRect::new(
+        geometry.rect.origin + box_shadow_paint_offset(shadow)
+            - PaintDisplacement::new(spread, spread),
+        outer_size,
+    );
+    let outer_radii = outset_rounded_rect_radii(
+        used_rounded_rect_radii(style.border_radius.clone(), geometry.rect.size),
+        spread,
+    );
+    let mut commands = shaped_rect_path_commands(outer_rect, outer_radii, style.corner_shapes);
+    commands.extend(rounded_box_path_commands_for_insets(
+        geometry.rect,
+        style,
+        css::Edges::ZERO,
+    ));
+    paths.push(RenderedPath::new(
+        commands,
+        Some(color),
+        RenderedPathFillRule::EvenOdd,
+        None,
+        PaintStrokeWidth::ZERO,
+        None,
+    ));
+}
+
+fn outset_rounded_rect_radii(
+    radii: RenderedRoundedRectRadii,
+    outset: f32,
+) -> RenderedRoundedRectRadii {
+    let outset_corner = |corner: RenderedCornerRadius| {
+        RenderedCornerRadius::new(corner.x() + outset, corner.y() + outset)
+    };
+    RenderedRoundedRectRadii {
+        top_left: outset_corner(radii.top_left),
+        top_right: outset_corner(radii.top_right),
+        bottom_right: outset_corner(radii.bottom_right),
+        bottom_left: outset_corner(radii.bottom_left),
+    }
+}
+
+/// Derive the padding-edge corner radii from a border-edge rounded rectangle.
+///
+/// CSS Backgrounds reduces each physical corner axis by the adjacent used
+/// border width when moving from the border edge to the padding edge:
+/// <https://www.w3.org/TR/css-backgrounds-3/#corner-shaping>.
+fn padding_edge_rounded_rect_radii(
+    radii: RenderedRoundedRectRadii,
+    inset: css::Edges,
+) -> RenderedRoundedRectRadii {
+    RenderedRoundedRectRadii {
+        top_left: RenderedCornerRadius::new(
+            radii.top_left.x() - inset.left,
+            radii.top_left.y() - inset.top,
+        ),
+        top_right: RenderedCornerRadius::new(
+            radii.top_right.x() - inset.right,
+            radii.top_right.y() - inset.top,
+        ),
+        bottom_right: RenderedCornerRadius::new(
+            radii.bottom_right.x() - inset.right,
+            radii.bottom_right.y() - inset.bottom,
+        ),
+        bottom_left: RenderedCornerRadius::new(
+            radii.bottom_left.x() - inset.left,
+            radii.bottom_left.y() - inset.bottom,
+        ),
+    }
+}
+
 pub(in crate::layout) fn paint_outer_box_shadow(
     rects: &mut Vec<RenderedRect>,
     geometry: BoxPaintGeometry,
     shadow: css::BoxShadow,
-    color: Color,
+    color: CssColor,
 ) {
     let offset = box_shadow_paint_offset(shadow.clone());
     let spread = shadow.spread.length_points();
@@ -1108,7 +2348,7 @@ pub(in crate::layout) fn paint_inset_box_shadow(
     rects: &mut Vec<RenderedRect>,
     geometry: BoxPaintGeometry,
     shadow: css::BoxShadow,
-    color: Color,
+    color: CssColor,
 ) {
     let padding = inset_paint_rect(geometry.rect, geometry.border_insets);
     if padding.size.width <= 0.0 || padding.size.height <= 0.0 {
@@ -1144,7 +2384,7 @@ pub(in crate::layout) fn push_rect_difference(
     rects: &mut Vec<RenderedRect>,
     subject: PaintRect,
     cutout: PaintRect,
-    color: Color,
+    color: CssColor,
 ) {
     let left = subject.origin.x;
     let right = subject.origin.x + subject.size.width;
@@ -1185,7 +2425,7 @@ pub(in crate::layout) fn push_rect_difference(
 pub(in crate::layout) fn push_shadow_rect(
     rects: &mut Vec<RenderedRect>,
     rect: PaintRect,
-    color: Color,
+    color: CssColor,
 ) {
     if rect.size.width > 0.0 && rect.size.height > 0.0 {
         rects.push(RenderedRect::from_paint_rect(rect, Some(color)));
@@ -1203,7 +2443,7 @@ pub(in crate::layout) fn push_gradient_band(
     rect: PaintRect,
     start: f32,
     end: f32,
-    color: Color,
+    color: CssColor,
 ) {
     if !color.is_visible() {
         return;
@@ -1298,9 +2538,9 @@ pub(crate) fn paint_uniform_rounded_border(
     {
         return false;
     }
-    if !same_width(top.used_width, right.used_width)
-        || !same_width(top.used_width, bottom.used_width)
-        || !same_width(top.used_width, left.used_width)
+    if !same_width(top.used_width.get(), right.used_width.get())
+        || !same_width(top.used_width.get(), bottom.used_width.get())
+        || !same_width(top.used_width.get(), left.used_width.get())
         || top.color != right.color
         || top.color != bottom.color
         || top.color != left.color
@@ -1308,14 +2548,25 @@ pub(crate) fn paint_uniform_rounded_border(
         return false;
     }
 
-    let border_width = top.used_width.min(rect.size.width).min(rect.size.height);
+    let border_width = top
+        .used_width
+        .get()
+        .min(rect.size.width)
+        .min(rect.size.height);
     if border_width <= 0.0 {
         return true;
     }
 
     let inset = border_width / 2.0;
-    let mut radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
-    inset_rounded_rect_radii(&mut radii, inset);
+    let radii = padding_edge_rounded_rect_radii(
+        used_rounded_rect_radii(style.border_radius.clone(), rect.size),
+        css::Edges {
+            top: inset,
+            right: inset,
+            bottom: inset,
+            left: inset,
+        },
+    );
     rounded_rects.push(RenderedRoundedRect::from_paint_rect(
         paint_space_rect(
             rect.origin.x + inset,
@@ -1326,7 +2577,7 @@ pub(crate) fn paint_uniform_rounded_border(
         radii,
         None,
         Some(top.color),
-        border_width,
+        PaintStrokeWidth::new(border_width),
     ));
     true
 }
@@ -1360,9 +2611,9 @@ pub(crate) fn paint_uniform_double_rounded_border(
     {
         return false;
     }
-    if !same_width(top.used_width, right.used_width)
-        || !same_width(top.used_width, bottom.used_width)
-        || !same_width(top.used_width, left.used_width)
+    if !same_width(top.used_width.get(), right.used_width.get())
+        || !same_width(top.used_width.get(), bottom.used_width.get())
+        || !same_width(top.used_width.get(), left.used_width.get())
         || top.color != right.color
         || top.color != bottom.color
         || top.color != left.color
@@ -1370,11 +2621,15 @@ pub(crate) fn paint_uniform_double_rounded_border(
         return false;
     }
 
-    let border_width = top.used_width.min(rect.size.width).min(rect.size.height);
+    let border_width = top
+        .used_width
+        .get()
+        .min(rect.size.width)
+        .min(rect.size.height);
     if border_width <= 0.0 || !top.color.is_visible() {
         return true;
     }
-    if border_width < 3.0 {
+    let Some(bands) = DoubleBorderBands::for_used_width(layout_pt(border_width)) else {
         let outer_radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
         paths.push(uniform_rounded_ring_path(
             rect,
@@ -1383,9 +2638,9 @@ pub(crate) fn paint_uniform_double_rounded_border(
             top.color,
         ));
         return true;
-    }
+    };
 
-    let stripe = (border_width / 3.0).max(1.0);
+    let stripe = bands.stripe.get();
     let outer_radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
     paths.push(uniform_rounded_ring_path(
         rect,
@@ -1405,8 +2660,15 @@ pub(crate) fn paint_uniform_double_rounded_border(
         },
     );
     if inner_rect.size.width > 0.0 && inner_rect.size.height > 0.0 {
-        let mut inner_outer_radii = outer_radii;
-        inset_rounded_rect_radii(&mut inner_outer_radii, inner_outer_inset);
+        let inner_outer_radii = padding_edge_rounded_rect_radii(
+            outer_radii,
+            css::Edges {
+                top: inner_outer_inset,
+                right: inner_outer_inset,
+                bottom: inner_outer_inset,
+                left: inner_outer_inset,
+            },
+        );
         paths.push(uniform_rounded_ring_path(
             inner_rect,
             inner_outer_radii,
@@ -1450,8 +2712,8 @@ pub(crate) fn paint_solid_rounded_border_ring(
         return false;
     }
 
-    let inner_width = (rect.size.width - left.used_width - right.used_width).max(0.0);
-    let inner_height = (rect.size.height - top.used_width - bottom.used_width).max(0.0);
+    let inner_width = (rect.size.width - left.used_width.get() - right.used_width.get()).max(0.0);
+    let inner_height = (rect.size.height - top.used_width.get() - bottom.used_width.get()).max(0.0);
     if rect.size.width <= 0.0 || rect.size.height <= 0.0 || !top.color.is_visible() {
         return true;
     }
@@ -1459,20 +2721,20 @@ pub(crate) fn paint_solid_rounded_border_ring(
     let outer_radii = used_rounded_rect_radii(style.border_radius.clone(), rect.size);
     let inner_radii = RenderedRoundedRectRadii {
         top_left: RenderedCornerRadius::new(
-            outer_radii.top_left.x() - left.used_width,
-            outer_radii.top_left.y() - top.used_width,
+            outer_radii.top_left.x() - left.used_width.get(),
+            outer_radii.top_left.y() - top.used_width.get(),
         ),
         top_right: RenderedCornerRadius::new(
-            outer_radii.top_right.x() - right.used_width,
-            outer_radii.top_right.y() - top.used_width,
+            outer_radii.top_right.x() - right.used_width.get(),
+            outer_radii.top_right.y() - top.used_width.get(),
         ),
         bottom_right: RenderedCornerRadius::new(
-            outer_radii.bottom_right.x() - right.used_width,
-            outer_radii.bottom_right.y() - bottom.used_width,
+            outer_radii.bottom_right.x() - right.used_width.get(),
+            outer_radii.bottom_right.y() - bottom.used_width.get(),
         ),
         bottom_left: RenderedCornerRadius::new(
-            outer_radii.bottom_left.x() - left.used_width,
-            outer_radii.bottom_left.y() - bottom.used_width,
+            outer_radii.bottom_left.x() - left.used_width.get(),
+            outer_radii.bottom_left.y() - bottom.used_width.get(),
         ),
     };
 
@@ -1481,10 +2743,10 @@ pub(crate) fn paint_solid_rounded_border_ring(
         let inner_rect = inset_paint_rect(
             rect,
             css::Edges {
-                top: top.used_width,
-                right: right.used_width,
-                bottom: bottom.used_width,
-                left: left.used_width,
+                top: top.used_width.get(),
+                right: right.used_width.get(),
+                bottom: bottom.used_width.get(),
+                left: left.used_width.get(),
             },
         );
         commands.extend(shaped_rect_path_commands(
@@ -1498,7 +2760,7 @@ pub(crate) fn paint_solid_rounded_border_ring(
         Some(top.color),
         RenderedPathFillRule::EvenOdd,
         None,
-        0.0,
+        PaintStrokeWidth::ZERO,
         None,
     ));
     true
@@ -1554,7 +2816,7 @@ pub(crate) fn paint_patterned_rounded_border_sides(
                 rect.size.width,
                 rect.size.height,
             ),
-            side.used_width,
+            side.used_width.get(),
         );
         let axis_start = geometry.axis_start();
         let axis_length = geometry.axis_length();
@@ -1579,7 +2841,7 @@ pub(crate) fn paint_patterned_rounded_border_sides(
                 cross_start,
                 cross_width,
                 horizontal,
-                side.used_width,
+                side.used_width.get(),
                 side.color,
                 Some(clip),
             ),
@@ -1594,15 +2856,19 @@ mod tests {
     use super::*;
 
     fn stop(
-        color: Color,
+        color: CssColor,
         position: Option<css::ComputedLengthPercentage>,
     ) -> css::GradientColorStop {
-        css::GradientColorStop { color, position }
+        css::GradientColorStop {
+            color: css::GradientColor::CssColor(color),
+            position,
+        }
     }
 
     fn gradient(stops: Vec<css::GradientColorStop>) -> css::LinearGradient {
         css::LinearGradient {
             direction: LinearGradientDirection::Angle(180.0),
+            interpolation: css::GradientInterpolationMethod::default(),
             repeating: false,
             stops,
             hints: Vec::new(),
@@ -1613,10 +2879,10 @@ mod tests {
     fn fixed_gradient_stops_default_and_distribute_omitted_positions() {
         let stops = fixed_gradient_stops(
             &gradient(vec![
-                stop(Color::new(255, 0, 0), None),
-                stop(Color::new(0, 128, 0), None),
+                stop(CssColor::new(255, 0, 0), None),
+                stop(CssColor::new(0, 128, 0), None),
                 stop(
-                    Color::new(0, 0, 255),
+                    CssColor::new(0, 0, 255),
                     Some(css::ComputedLengthPercentage::from_percent(1.0)),
                 ),
             ]),
@@ -1634,14 +2900,14 @@ mod tests {
         let stops = fixed_gradient_stops(
             &gradient(vec![
                 stop(
-                    Color::new(255, 0, 0),
+                    CssColor::new(255, 0, 0),
                     Some(css::ComputedLengthPercentage::from_percent(0.75)),
                 ),
                 stop(
-                    Color::new(0, 128, 0),
+                    CssColor::new(0, 128, 0),
                     Some(css::ComputedLengthPercentage::from_percent(0.25)),
                 ),
-                stop(Color::new(0, 0, 255), None),
+                stop(CssColor::new(0, 0, 255), None),
             ]),
             100.0,
         )
@@ -1667,6 +2933,34 @@ mod tests {
         assert_eq!(
             line.endpoints(),
             (PaintPoint::new(4.0, 12.0), PaintPoint::new(16.0, 28.0))
+        );
+    }
+
+    #[test]
+    fn collapsed_border_shape_retains_an_empty_overflow_contour() {
+        assert!(matches!(
+            ResolvedBorderShape::Empty.inner_overflow_path_clip(0.0),
+            Some(BorderShapeOverflowClip::Empty)
+        ));
+    }
+
+    #[test]
+    fn unstroked_polygon_uses_its_original_contour_for_overflow() {
+        let shape = ResolvedBorderShape::Path(ResolvedBorderShapePath {
+            vertices: vec![
+                PaintPoint::new(50.0, 0.0),
+                PaintPoint::new(100.0, 50.0),
+                PaintPoint::new(50.0, 100.0),
+                PaintPoint::new(0.0, 50.0),
+            ],
+        });
+        let Some(BorderShapeOverflowClip::Path(clip)) = shape.inner_overflow_path_clip(0.0) else {
+            panic!("an unstroked polygon should retain its exact vertices");
+        };
+        assert_eq!(clip.commands.len(), 5);
+        assert_eq!(
+            clip.commands[0],
+            RenderedPathCommand::move_to(PaintPoint::new(50.0, 0.0))
         );
     }
 }

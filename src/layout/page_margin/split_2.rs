@@ -17,6 +17,7 @@ pub(in crate::layout) struct PageMarginPaintContext<'a> {
     pub(in crate::layout) page_anchor_text: &'a HashMap<String, AnchorText>,
     pub(in crate::layout) counter_styles: &'a HashMap<String, CounterStyleRule>,
     pub(in crate::layout) page_counters: &'a HashMap<String, i32>,
+    pub(in crate::layout) page_counters_by_page: &'a [HashMap<String, i32>],
 }
 
 /// Computes used page-margin box rectangles for one generated page.
@@ -189,6 +190,7 @@ pub(in crate::layout) fn resolved_margin_box_content(
             page_anchor_text: context.page_anchor_text,
             counter_styles: context.counter_styles,
             page_counters: &box_counters,
+            page_counters_by_page: context.page_counters_by_page,
         },
     )
 }

@@ -2,6 +2,64 @@ use super::*;
 
 pub(in crate::layout) const GAP_RULE_EPSILON: f32 = 0.01;
 
+/// A non-negative CSS gap-rule thickness in source-local layout geometry.
+///
+/// This remains distinct from the gap span that contains the rule and from a
+/// final [`PaintStrokeWidth`] emitted for dotted rules. CSS Gaps resolves the
+/// rule width against its containing gap before the rule is expanded into
+/// paint geometry: <https://drafts.csswg.org/css-gaps-1/#gap-decorations>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct GapRuleWidth(f32);
+
+impl GapRuleWidth {
+    pub(in crate::layout) const ZERO: Self = Self(0.0);
+
+    pub(in crate::layout) fn new(value: f32) -> Self {
+        Self(value.max(0.0))
+    }
+
+    pub(in crate::layout) fn can_paint(self) -> bool {
+        self.0 > GAP_RULE_EPSILON
+    }
+
+    pub(in crate::layout) fn half(self) -> Self {
+        Self::new(self.0 / 2.0)
+    }
+
+    pub(in crate::layout) fn remainder_after(self, leading: Self) -> Self {
+        Self::new(self.0 - leading.0)
+    }
+
+    pub(in crate::layout) fn double_bands(self) -> Option<DoubleBorderBands> {
+        DoubleBorderBands::for_used_width(layout_pt(self.0))
+    }
+
+    pub(in crate::layout) fn centered_span(self, center: f32) -> GapAxisSpan {
+        let half = self.0 / 2.0;
+        GapAxisSpan::new(center - half, center + half)
+    }
+
+    pub(in crate::layout) fn center_offset(self) -> f32 {
+        self.0 / 2.0
+    }
+
+    pub(in crate::layout) fn extend_axis_position(self, position: f32) -> f32 {
+        position + self.0
+    }
+
+    pub(in crate::layout) fn overlap_with_gap_half_extent(self, gap: GapBand) -> f32 {
+        self.0.max(gap.size()) / 2.0
+    }
+
+    pub(in crate::layout) fn overlap_join_inset(self, crossing_gap: GapBand) -> f32 {
+        -(crossing_gap.size() + self.0) / 2.0
+    }
+
+    pub(in crate::layout) fn into_paint_stroke_width(self) -> PaintStrokeWidth {
+        PaintStrokeWidth::new(self.0)
+    }
+}
+
 /// Physical container-local coordinates used while resolving CSS gap rules.
 /// Local y grows from the content top toward its block end, unlike paint/PDF
 /// coordinates; projection is therefore explicit at the page boundary.
@@ -46,6 +104,10 @@ impl GapAxisSpan {
             start,
             end: end.max(start),
         }
+    }
+
+    pub(in crate::layout) fn size(self) -> f32 {
+        self.end - self.start
     }
 }
 
@@ -251,9 +313,9 @@ pub(in crate::layout) struct GapRulePaintSegment {
     pub(in crate::layout) kind: GapRuleAxisKind,
     pub(in crate::layout) gap: GapBand,
     pub(in crate::layout) segment: GapDecorationSegment,
-    pub(in crate::layout) width: f32,
+    pub(in crate::layout) width: GapRuleWidth,
     pub(in crate::layout) style: BorderStyle,
-    pub(in crate::layout) color: Color,
+    pub(in crate::layout) color: CssColor,
 }
 
 /// Resolves grid gap rules into source-coordinate centerline segments.
@@ -619,7 +681,7 @@ pub(in crate::layout) struct AxisRuleContext<'a> {
     pub(in crate::layout) rule_count: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) struct GapBand {
     pub(in crate::layout) start: f32,
     pub(in crate::layout) end: f32,
@@ -814,14 +876,19 @@ pub(in crate::layout) struct GapDecorationSegment {
 pub(in crate::layout) struct GapRuleEndpoint {
     pub(in crate::layout) position: f32,
     pub(in crate::layout) kind: GapRuleEndpointKind,
-    pub(in crate::layout) crossing_gap_width: f32,
-    pub(in crate::layout) crossing_rule_width: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::layout) enum GapRuleEndpointKind {
     Cap,
-    Junction,
+    Junction(GapRuleJunction),
+}
+
+/// The crossing geometry that exists only at a gap-rule junction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::layout) struct GapRuleJunction {
+    pub(in crate::layout) crossing_gap: GapBand,
+    pub(in crate::layout) crossing_rule_width: GapRuleWidth,
 }
 
 impl GapRuleEndpoint {
@@ -829,21 +896,20 @@ impl GapRuleEndpoint {
         Self {
             position,
             kind: GapRuleEndpointKind::Cap,
-            crossing_gap_width: 0.0,
-            crossing_rule_width: 0.0,
         }
     }
 
     pub(in crate::layout) fn junction(
         position: f32,
-        crossing_gap_width: f32,
-        crossing_rule_width: f32,
+        crossing_gap: GapBand,
+        crossing_rule_width: GapRuleWidth,
     ) -> Self {
         Self {
             position,
-            kind: GapRuleEndpointKind::Junction,
-            crossing_gap_width,
-            crossing_rule_width,
+            kind: GapRuleEndpointKind::Junction(GapRuleJunction {
+                crossing_gap,
+                crossing_rule_width,
+            }),
         }
     }
 }
@@ -880,7 +946,7 @@ pub(in crate::layout) fn axis_rule_paint_segments(
     let mut paint_segments = Vec::new();
     for (physical_index, gap) in context.gaps.iter().cloned().enumerate() {
         let index = gap.rule_index.unwrap_or(physical_index);
-        let width = used_gap_rule_length(
+        let width = used_gap_rule_width(
             context
                 .rule
                 .widths
@@ -898,29 +964,25 @@ pub(in crate::layout) fn axis_rule_paint_segments(
             .colors
             .value_for_index(index, gap_count)
             .expect("gap rule color should exist for gap index");
-        let mut segments = Vec::new();
-        for segment in gap_rule_segments(context, gap, width) {
-            let segment = offset_gap_rule_segment(context.rule, segment);
-            if segment.end.position <= segment.start.position + GAP_RULE_EPSILON
-                || !segment_is_visible(context, gap, segment)
-            {
-                continue;
-            }
-            segments.push(segment);
-        }
+        let mut segments = gap_rule_segments(context, gap, width)
+            .into_iter()
+            .map(|segment| offset_gap_rule_segment(context.rule, segment))
+            .filter(|segment| {
+                segment.end.position > segment.start.position + GAP_RULE_EPSILON
+                    && segment_is_visible(context, gap, *segment)
+            })
+            .collect::<Vec<_>>();
         if rule_style == BorderStyle::Solid {
             segments = coalesce_overlapping_solid_gap_rule_segments(segments);
         }
-        for segment in segments {
-            paint_segments.push(GapRulePaintSegment {
-                kind: context.kind,
-                gap,
-                segment,
-                width,
-                style: rule_style,
-                color: rule_color,
-            });
-        }
+        paint_segments.extend(segments.into_iter().map(|segment| GapRulePaintSegment {
+            kind: context.kind,
+            gap,
+            segment,
+            width,
+            style: rule_style,
+            color: rule_color,
+        }));
     }
     paint_segments
 }
@@ -960,7 +1022,7 @@ fn coalesce_overlapping_solid_gap_rule_segments(
 pub(in crate::layout) fn gap_rule_segments(
     context: AxisRuleContext<'_>,
     gap: GapBand,
-    own_width: f32,
+    own_width: GapRuleWidth,
 ) -> Vec<GapDecorationSegment> {
     let axis_size = context.axis_size();
     let axis_span = gap
@@ -989,12 +1051,12 @@ pub(in crate::layout) fn gap_rule_segments(
             .widths
             .value_for_index(cross_index, crossing_gap_count)
             .map(|width| {
-                used_gap_rule_length(
+                used_gap_rule_width(
                     width,
                     PercentageBasis::definite(layout_pt(crossing_gap.size())),
                 )
             })
-            .unwrap_or(0.0);
+            .unwrap_or(GapRuleWidth::ZERO);
         let crossing_rule_can_paint = crossing_rule_can_paint(
             crossing_rule_width,
             context
@@ -1028,7 +1090,6 @@ pub(in crate::layout) fn gap_rule_segments(
                     gap,
                     junction_start,
                     crossing_gap,
-                    crossing_gap.size(),
                     crossing_rule_width,
                     crossing_rule_can_paint,
                 ),
@@ -1052,8 +1113,8 @@ pub(in crate::layout) fn gap_rule_segments(
                             gap,
                             cursor,
                             crossing_gap,
-                            crossing_gap.size(),
-                            crossing_width_for_gap(context, crossing_gap).unwrap_or(0.0),
+                            crossing_width_for_gap(context, crossing_gap)
+                                .unwrap_or(GapRuleWidth::ZERO),
                             crossing_can_paint_for_gap(context, crossing_gap).unwrap_or(true),
                         )
                     })
@@ -1145,7 +1206,7 @@ pub(in crate::layout) fn should_join_across_junction(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     crossing_gap: GapBand,
-    own_width: f32,
+    own_width: GapRuleWidth,
 ) -> bool {
     match effective_rule_break(context) {
         css::GapRuleBreak::Intersection => {
@@ -1181,12 +1242,12 @@ pub(in crate::layout) fn segment_crosses_spanning_item(
     context: AxisRuleContext<'_>,
     gap: GapBand,
     crossing_gap: GapBand,
-    own_width: f32,
+    own_width: GapRuleWidth,
 ) -> bool {
     if context.items.is_empty() {
         return false;
     }
-    let half = own_width.max(gap.size()) * 0.5;
+    let half = own_width.overlap_with_gap_half_extent(gap);
     context.items.iter().any(|item| match context.kind {
         GapRuleAxisKind::Column => grid_item_spans_intersection(
             context.container_kind,

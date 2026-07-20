@@ -1,4 +1,5 @@
 use super::*;
+use crate::text::character_is_css_other_space_separator;
 use crate::text::manual_suppresses_break_between;
 use std::rc::Rc;
 
@@ -34,34 +35,53 @@ impl InlineBreakScratch {
 /// <https://www.unicode.org/reports/tr14/#LB30b>.
 #[derive(Clone, Copy)]
 enum InlineBreakBoundaryContext<'a> {
-    Text { text: &'a str },
-    Atomic,
+    Text {
+        text: &'a str,
+        style: &'a ComputedStyle,
+        scope: Option<&'a Rc<InlineTrackingScope>>,
+    },
+    Atomic {
+        style: &'a ComputedStyle,
+        scope: Option<&'a Rc<InlineTrackingScope>>,
+    },
 }
 
-impl InlineBreakBoundaryContext<'_> {
+impl<'a> InlineBreakBoundaryContext<'a> {
     fn leading_character(self) -> Option<char> {
         match self {
-            Self::Text { text } => text.chars().next(),
-            Self::Atomic => None,
+            Self::Text { text, .. } => text.chars().next(),
+            Self::Atomic { .. } => None,
         }
     }
 
     fn trailing_character(self) -> Option<char> {
         match self {
-            Self::Text { text } => text.chars().next_back(),
-            Self::Atomic => None,
+            Self::Text { text, .. } => text.chars().next_back(),
+            Self::Atomic { .. } => None,
         }
     }
 
     fn append_uax14_input(self, output: &mut String) {
         match self {
-            Self::Text { text } => output.push_str(text),
-            Self::Atomic => output.push(OBJECT_REPLACEMENT_CHARACTER),
+            Self::Text { text, .. } => output.push_str(text),
+            Self::Atomic { .. } => output.push(OBJECT_REPLACEMENT_CHARACTER),
         }
     }
 
     fn is_atomic(self) -> bool {
-        matches!(self, Self::Atomic)
+        matches!(self, Self::Atomic { .. })
+    }
+
+    fn style(self) -> &'a ComputedStyle {
+        match self {
+            Self::Text { style, .. } | Self::Atomic { style, .. } => style,
+        }
+    }
+
+    fn scope(self) -> Option<&'a Rc<InlineTrackingScope>> {
+        match self {
+            Self::Text { scope, .. } | Self::Atomic { scope, .. } => scope,
+        }
     }
 }
 
@@ -107,11 +127,11 @@ pub(in crate::layout) fn remeasure_materialized_item(
     item: &mut MeasuredInlineItem,
     font_system: &mut FontSystem,
 ) {
-    let InlineLineItem::Fragment(fragment) = &item.item else {
+    let InlineLineItem::Fragment(fragment) = &mut item.item else {
         return;
     };
     item.shaped = font_system
-        .shape_unwrapped_line(
+        .shape_untracked_inline_line(
             fragment.text(),
             fragment.style(),
             fragment.style().line_height,
@@ -122,6 +142,7 @@ pub(in crate::layout) fn remeasure_materialized_item(
         .as_deref()
         .map(ShapedInlineLine::advance_width)
         .unwrap_or(0.0);
+    fragment.mark_terminal_tracking_normalized();
 }
 
 pub(in crate::layout) fn text_for_measured_items(items: &[MeasuredInlineItem]) -> String {
@@ -168,6 +189,7 @@ pub(in crate::layout) fn inline_break_opportunities_for_runs(
             trims: false,
             hangs: false,
             soft_hyphen: false,
+            discretionary: None,
             emergency: false,
             min_content: false,
         });
@@ -209,14 +231,31 @@ fn append_inline_break_opportunities_inside_run(
             && text.is_char_boundary(*position)
             && !text[*position..].starts_with('\u{200b}')
     });
-    for &position in &scratch.break_positions {
-        output.push(inline_text_break_opportunity(
+    output.extend(scratch.break_positions.iter().copied().map(|position| {
+        inline_text_break_opportunity(
             run_index,
             text,
             fragment.style(),
             position,
             false,
             text_break_is_min_content_eligible(text, fragment.style(), position),
+        )
+    }));
+    // A soft hyphen at the end of a styled inline fragment is a break inside
+    // that source fragment, even though its selected graph position coincides
+    // with the following fragment's boundary.  UAX #14's interior iterator
+    // deliberately excludes terminal offsets; retain this CSS Text
+    // discretionary edge separately so the used hyphenate character is not
+    // lost when an inline style changes immediately after U+00AD.
+    // <https://www.w3.org/TR/css-text-3/#valdef-hyphens-manual>
+    if text.ends_with('\u{00ad}') {
+        output.push(inline_text_break_opportunity(
+            run_index,
+            text,
+            fragment.style(),
+            text.len(),
+            false,
+            text_break_is_min_content_eligible(text, fragment.style(), text.len()),
         ));
     }
     if let Some(overflow_wrap) = effective_overflow_wrap(fragment.style()) {
@@ -300,6 +339,16 @@ pub(in crate::layout) fn inline_text_break_opportunity(
         trims: false,
         hangs,
         soft_hyphen,
+        discretionary: soft_hyphen.then_some(DiscretionaryBreakEffect {
+            source_boundary: InlineGraphPosition {
+                run_index,
+                byte_offset,
+            },
+            trailing_marker: true,
+            left_replacement: None,
+            right_replacement: None,
+            leading_shaping_context: SelectedLineShapingContext::PreserveJoining,
+        }),
         emergency,
         min_content,
     }
@@ -322,11 +371,12 @@ fn inline_break_opportunity_at_boundary(
     if matches!(next, InlineLineItem::Float(_)) {
         return Some(InlineBreakOpportunity {
             position: InlineGraphPosition::at_run_start(boundary),
-            kind: InlineBreakKind::AtomicBoundary,
+            kind: InlineBreakKind::FloatPlacement,
             priority: 110,
             trims: false,
             hangs: false,
             soft_hyphen: false,
+            discretionary: None,
             emergency: false,
             min_content: true,
         });
@@ -339,6 +389,7 @@ fn inline_break_opportunity_at_boundary(
             trims: true,
             hangs: false,
             soft_hyphen: false,
+            discretionary: None,
             emergency: false,
             min_content: true,
         });
@@ -354,9 +405,44 @@ fn inline_break_opportunity_at_boundary(
             trims: true,
             hangs: false,
             soft_hyphen: false,
+            discretionary: None,
             emergency: false,
             min_content: true,
         });
+    }
+    // CSS Text collapses a document-space sequence to one space, and that
+    // retained separator supplies a soft-wrap opportunity *after* itself.
+    // Keep this boundary explicit rather than relying on the surrounding
+    // fragments' UAX #14 input: whitespace normalization may isolate the
+    // separator in its own run, in which case there is no single text run for
+    // ICU to inspect. The selected-line Phase II path owns its trimming.
+    // <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
+    if inline_line_item_ends_with_collapsible_space(previous)
+        && inline_line_item_allows_soft_wrap(previous)
+    {
+        return Some(InlineBreakOpportunity {
+            position: InlineGraphPosition::at_run_start(boundary),
+            kind: InlineBreakKind::PreservedSpace,
+            priority: 220,
+            trims: true,
+            hangs: false,
+            soft_hyphen: false,
+            discretionary: None,
+            emergency: false,
+            min_content: true,
+        });
+    }
+    // A preserved `pre-wrap` space sequence owns its soft-wrap opportunity at
+    // its end. Suppress the ordinary UAX #14 boundary before the sequence so
+    // selection retains it on the preceding line, where CSS Text Phase II can
+    // apply its conditional hanging advance.
+    // <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
+    if matches!(
+        next,
+        InlineLineItem::Fragment(fragment)
+            if inline_fragment_is_pre_wrap_hanging_space(fragment)
+    ) {
+        return None;
     }
     if matches!(
         previous,
@@ -370,6 +456,7 @@ fn inline_break_opportunity_at_boundary(
             trims: false,
             hangs: true,
             soft_hyphen: false,
+            discretionary: None,
             emergency: false,
             min_content: true,
         });
@@ -387,6 +474,7 @@ fn inline_break_opportunity_at_boundary(
             trims: false,
             hangs: false,
             soft_hyphen: false,
+            discretionary: None,
             emergency: false,
             min_content: true,
         });
@@ -422,6 +510,7 @@ fn inline_break_opportunity_at_boundary(
             trims: false,
             hangs: false,
             soft_hyphen: false,
+            discretionary: None,
             emergency: true,
             min_content: matches!(
                 next,
@@ -449,6 +538,13 @@ fn inline_break_opportunity_at_boundary(
             trims: false,
             hangs: false,
             soft_hyphen: true,
+            discretionary: Some(DiscretionaryBreakEffect {
+                source_boundary: InlineGraphPosition::at_run_start(boundary),
+                trailing_marker: true,
+                left_replacement: None,
+                right_replacement: None,
+                leading_shaping_context: SelectedLineShapingContext::PreserveJoining,
+            }),
             emergency: false,
             min_content: true,
         });
@@ -490,10 +586,11 @@ pub(in crate::layout) fn inline_line_item_allows_soft_wrap(item: &InlineLineItem
     }
 }
 
-/// Return whether an item is a preserved `break-spaces` document-space run.
+/// Return whether an item is a preserved `break-spaces` space-separator run.
 ///
-/// CSS Text gives each such character an after-character soft wrap, and lets
-/// overflow wrapping use the preceding item boundary when needed.
+/// CSS Text gives every preserved document space and other Unicode space
+/// separator an after-character soft wrap, and lets overflow wrapping use the
+/// preceding item boundary when needed.
 /// <https://www.w3.org/TR/css-text-3/#valdef-white-space-break-spaces>
 pub(in crate::layout) fn inline_line_item_is_break_spaces_preserved_space(
     item: &InlineLineItem,
@@ -502,7 +599,10 @@ pub(in crate::layout) fn inline_line_item_is_break_spaces_preserved_space(
         item,
         InlineLineItem::Fragment(fragment)
             if fragment.style().white_space == WhiteSpace::BreakSpaces
-                && fragment.text().chars().all(is_css_preserved_document_space)
+                && fragment.text().chars().all(|character| {
+                    is_css_preserved_document_space(character)
+                        || character_is_css_other_space_separator(character)
+                })
     )
 }
 
@@ -530,12 +630,8 @@ fn inline_atomic_boundary_opportunity(
     // graph's paragraph context is that ancestor for atomic participants;
     // their descendant styles still control their own internal text only.
     // <https://drafts.csswg.org/css-text-3/#line-break-details>
-    (inline_break_boundary_allows_soft_wrap(
-        before,
-        after,
-        [boundary_style, boundary_style],
-        scratch,
-    ) || inline_atomic_boundary_has_nbsp_opportunity(before, after))
+    (inline_break_boundary_allows_soft_wrap(before, after, boundary_style, scratch)
+        || inline_atomic_boundary_has_nbsp_opportunity(before, after))
     .then_some(InlineBreakOpportunity {
         position: InlineGraphPosition::at_run_start(boundary),
         kind: InlineBreakKind::AtomicBoundary,
@@ -543,6 +639,7 @@ fn inline_atomic_boundary_opportunity(
         trims: false,
         hangs: false,
         soft_hyphen: false,
+        discretionary: None,
         emergency: false,
         min_content: true,
     })
@@ -557,11 +654,16 @@ fn inline_break_context_before_boundary(
             InlineLineItem::Fragment(fragment) => {
                 return Some(InlineBreakBoundaryContext::Text {
                     text: fragment.text(),
+                    style: fragment.style(),
+                    scope: fragment.tracking_scope(),
                 });
             }
             InlineLineItem::Atom(atom) if inline_line_item_is_transparent_text_edge(atom) => {}
             InlineLineItem::Atom(atom) if inline_line_item_is_css_atomic(&run.item) => {
-                return Some(InlineBreakBoundaryContext::Atomic);
+                return Some(InlineBreakBoundaryContext::Atomic {
+                    style: atom.style(),
+                    scope: atom.tracking_scope(),
+                });
             }
             InlineLineItem::Atom(_) | InlineLineItem::Float(_) => return None,
         }
@@ -578,11 +680,16 @@ fn inline_break_context_after_boundary(
             InlineLineItem::Fragment(fragment) => {
                 return Some(InlineBreakBoundaryContext::Text {
                     text: fragment.text(),
+                    style: fragment.style(),
+                    scope: fragment.tracking_scope(),
                 });
             }
             InlineLineItem::Atom(atom) if inline_line_item_is_transparent_text_edge(atom) => {}
             InlineLineItem::Atom(atom) if inline_line_item_is_css_atomic(&run.item) => {
-                return Some(InlineBreakBoundaryContext::Atomic);
+                return Some(InlineBreakBoundaryContext::Atomic {
+                    style: atom.style(),
+                    scope: atom.tracking_scope(),
+                });
             }
             InlineLineItem::Float(_) | InlineLineItem::Atom(_) => return None,
         }
@@ -660,6 +767,7 @@ fn inline_fragment_boundary_allows_soft_wrap(
         previous.text(),
         next.text(),
         [previous.style(), next.style()],
+        inline_fragment_boundary_owner_allows_soft_wrap(previous, next),
         scratch,
     )
 }
@@ -674,13 +782,19 @@ fn inline_text_boundary_allows_soft_wrap(
     before: &str,
     after: &str,
     styles: [&ComputedStyle; 2],
+    boundary_owner_allows_soft_wrap: bool,
     scratch: &mut InlineBreakScratch,
 ) -> bool {
     if before.is_empty() || after.is_empty() {
         return false;
     }
     scratch.join(before, after);
-    inline_uax14_boundary_allows_soft_wrap(before.len(), styles, scratch)
+    inline_uax14_boundary_allows_soft_wrap(
+        before.len(),
+        styles,
+        boundary_owner_allows_soft_wrap,
+        scratch,
+    )
 }
 
 /// Resolve UAX #14 at a typed graph boundary.
@@ -692,11 +806,11 @@ fn inline_text_boundary_allows_soft_wrap(
 fn inline_break_boundary_allows_soft_wrap(
     before: InlineBreakBoundaryContext<'_>,
     after: InlineBreakBoundaryContext<'_>,
-    styles: [&ComputedStyle; 2],
+    fallback_boundary_style: &ComputedStyle,
     scratch: &mut InlineBreakScratch,
 ) -> bool {
-    if matches!(before, InlineBreakBoundaryContext::Text { text } if text.is_empty())
-        || matches!(after, InlineBreakBoundaryContext::Text { text } if text.is_empty())
+    if matches!(before, InlineBreakBoundaryContext::Text { text, .. } if text.is_empty())
+        || matches!(after, InlineBreakBoundaryContext::Text { text, .. } if text.is_empty())
     {
         return false;
     }
@@ -713,19 +827,29 @@ fn inline_break_boundary_allows_soft_wrap(
     before.append_uax14_input(&mut scratch.joined_text);
     let boundary = scratch.joined_text.len();
     after.append_uax14_input(&mut scratch.joined_text);
-    inline_uax14_boundary_allows_soft_wrap(boundary, styles, scratch)
+    inline_uax14_boundary_allows_soft_wrap(
+        boundary,
+        [before.style(), after.style()],
+        inline_boundary_owner_allows_soft_wrap(
+            before.scope(),
+            after.scope(),
+            fallback_boundary_style,
+        ),
+        scratch,
+    )
 }
 
 fn inline_uax14_boundary_allows_soft_wrap(
     boundary: usize,
     styles: [&ComputedStyle; 2],
+    boundary_owner_allows_soft_wrap: bool,
     scratch: &mut InlineBreakScratch,
 ) -> bool {
+    if !boundary_owner_allows_soft_wrap {
+        return false;
+    }
     let mut previous_policy = None;
     for (style_index, style) in styles.into_iter().enumerate() {
-        if !style.allows_soft_wrap() {
-            continue;
-        }
         if matches!(style.word_break, css::WordBreak::BreakAll)
             && style_index == 0
             && styles[0].word_break != styles[1].word_break
@@ -755,6 +879,42 @@ fn inline_uax14_boundary_allows_soft_wrap(
     false
 }
 
+/// Return whether the nearest common inline ancestor permits a cross-element
+/// soft wrap.
+///
+/// CSS Text makes `white-space` ownership explicit at a boundary between two
+/// characters or atomic inlines. The remaining line-breaking properties are
+/// intentionally still taken from the adjacent source styles, as their
+/// cross-boundary ownership is undefined at this level of the specification:
+/// <https://drafts.csswg.org/css-text-3/#line-break-details>.
+fn inline_boundary_owner_allows_soft_wrap(
+    left: Option<&Rc<InlineTrackingScope>>,
+    right: Option<&Rc<InlineTrackingScope>>,
+    fallback: &ComputedStyle,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => InlineTrackingScope::lowest_common(left, right)
+            .boundary_policy()
+            .allows_soft_wrap(),
+        _ => fallback.allows_soft_wrap(),
+    }
+}
+
+fn inline_fragment_boundary_owner_allows_soft_wrap(
+    previous: &InlineFragment,
+    next: &InlineFragment,
+) -> bool {
+    match (previous.tracking_scope(), next.tracking_scope()) {
+        (Some(left), Some(right)) => InlineTrackingScope::lowest_common(left, right)
+            .boundary_policy()
+            .allows_soft_wrap(),
+        // Unit tests and synthetic consumers can build fragments directly,
+        // without graph-owned lexical scopes. Preserve the historical local
+        // behavior there; normal graph construction always retains scopes.
+        _ => previous.style().allows_soft_wrap() || next.style().allows_soft_wrap(),
+    }
+}
+
 /// CSS Text's atomic-inline tailoring retains the NBSP exception around an
 /// atomic replacement object after normal Unicode line breaking.
 fn inline_atomic_boundary_has_nbsp_opportunity(
@@ -771,17 +931,23 @@ fn inline_fragment_boundary_opportunity(
     next: &InlineFragment,
     scratch: &mut InlineBreakScratch,
 ) -> Option<InlineBreakOpportunity> {
+    let boundary_owner_allows_soft_wrap =
+        inline_fragment_boundary_owner_allows_soft_wrap(previous, next);
     let ordinary_wrap = inline_fragment_boundary_allows_soft_wrap(previous, next, scratch);
-    let tracking_wrap = inline_fragment_boundary_has_tracking_opportunity(previous, next);
-    let overflow_wrap = inline_fragment_boundary_overflow_wrap(previous, next);
-    if !ordinary_wrap && !tracking_wrap && overflow_wrap.is_none() {
+    let overflow_wrap =
+        inline_fragment_boundary_overflow_wrap(previous, next, boundary_owner_allows_soft_wrap);
+    if !ordinary_wrap && overflow_wrap.is_none() {
         return None;
     }
-    let emergency = !ordinary_wrap && !tracking_wrap && overflow_wrap.is_some();
+    let emergency = !ordinary_wrap && overflow_wrap.is_some();
     let min_content = if emergency {
         matches!(overflow_wrap, Some(css::OverflowWrap::Anywhere))
     } else {
-        inline_fragment_boundary_is_min_content_eligible(previous, next)
+        inline_fragment_boundary_is_min_content_eligible_with_owner(
+            previous,
+            next,
+            boundary_owner_allows_soft_wrap,
+        )
     };
     Some(InlineBreakOpportunity {
         position: InlineGraphPosition::at_run_start(boundary),
@@ -794,6 +960,7 @@ fn inline_fragment_boundary_opportunity(
         trims: false,
         hangs: false,
         soft_hyphen: false,
+        discretionary: None,
         emergency,
         min_content,
     })
@@ -809,10 +976,13 @@ fn inline_fragment_boundary_opportunity(
 fn inline_fragment_boundary_overflow_wrap(
     previous: &InlineFragment,
     next: &InlineFragment,
+    boundary_owner_allows_soft_wrap: bool,
 ) -> Option<css::OverflowWrap> {
+    if !boundary_owner_allows_soft_wrap {
+        return None;
+    }
     [previous.style(), next.style()]
         .into_iter()
-        .filter(|style| style.allows_soft_wrap())
         .filter_map(effective_overflow_wrap)
         .max_by_key(|overflow_wrap| match overflow_wrap {
             css::OverflowWrap::Anywhere => 2,
@@ -853,26 +1023,29 @@ fn keep_all_allows_last_resort_breaking(style: &ComputedStyle) -> bool {
         && matches!(style.overflow_wrap, css::OverflowWrap::Normal)
 }
 
-pub(in crate::layout) fn inline_fragment_boundary_has_tracking_opportunity(
+#[cfg(test)]
+fn inline_fragment_boundary_is_min_content_eligible(
     previous: &InlineFragment,
     next: &InlineFragment,
 ) -> bool {
-    !previous.text().is_empty()
-        && !next.text().is_empty()
-        && (previous.style().used_letter_spacing() != layout_pt(0.0)
-            || next.style().used_letter_spacing() != layout_pt(0.0))
+    inline_fragment_boundary_is_min_content_eligible_with_owner(
+        previous,
+        next,
+        inline_fragment_boundary_owner_allows_soft_wrap(previous, next),
+    )
 }
 
-pub(in crate::layout) fn inline_fragment_boundary_is_min_content_eligible(
+fn inline_fragment_boundary_is_min_content_eligible_with_owner(
     previous: &InlineFragment,
     next: &InlineFragment,
+    boundary_owner_allows_soft_wrap: bool,
 ) -> bool {
+    if !boundary_owner_allows_soft_wrap {
+        return false;
+    }
     let previous_character = previous.text().chars().next_back();
     let next_character = next.text().chars().next();
     [previous.style(), next.style()].into_iter().any(|style| {
-        if !style.allows_soft_wrap() {
-            return false;
-        }
         text_break_is_min_content_eligible_at_fragment_boundary(
             previous_character,
             next_character,
@@ -925,6 +1098,40 @@ mod tests {
             InlineHangingEdges::default(),
             Vec::new(),
         )
+    }
+
+    fn scoped_fragment(
+        text: &str,
+        style: ComputedStyle,
+        scope: Rc<InlineTrackingScope>,
+    ) -> InlineFragment {
+        fragment(text, style).with_tracking_scope(scope)
+    }
+
+    fn scoped_atomic(style: ComputedStyle, scope: Rc<InlineTrackingScope>) -> InlineAtom {
+        InlineAtom::new(
+            InlineAtomContent::Canvas,
+            style.clone(),
+            None,
+            InlineSize::new(1.0, style.line_height),
+            style.font_size,
+            0.0,
+            None,
+            None,
+        )
+        .with_tracking_scope(scope)
+    }
+
+    fn atomic_text_boundary_allows_soft_wrap(style: &ComputedStyle, text: &str) -> bool {
+        let before = InlineBreakBoundaryContext::Atomic { style, scope: None };
+        let after = InlineBreakBoundaryContext::Text {
+            text,
+            style,
+            scope: None,
+        };
+        let mut scratch = InlineBreakScratch::default();
+        inline_break_boundary_allows_soft_wrap(before, after, style, &mut scratch)
+            || inline_atomic_boundary_has_nbsp_opportunity(before, after)
     }
 
     fn text_autospace_edge(style: &ComputedStyle) -> InlineAtom {
@@ -991,6 +1198,66 @@ mod tests {
     }
 
     #[test]
+    fn sibling_pre_spans_use_their_normal_common_ancestor_for_cjk_breaking() {
+        let ancestor = ComputedStyle::initial();
+        let mut descendant = ancestor.clone();
+        descendant.white_space = WhiteSpace::Pre;
+        let root = InlineTrackingScope::root(&ancestor);
+        let left_scope = InlineTrackingScope::child(Rc::clone(&root), &descendant);
+        let right_scope = InlineTrackingScope::child(root, &descendant);
+        let runs = vec![
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(scoped_fragment(
+                    "口",
+                    descendant.clone(),
+                    left_scope,
+                )),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(scoped_fragment("口", descendant, right_scope)),
+                width: 0.0,
+                shaped: None,
+            },
+        ];
+
+        let opportunities = inline_break_opportunities_for_runs(&runs, &ancestor);
+        assert!(opportunities.iter().any(|opportunity| {
+            opportunity.position == InlineGraphPosition::at_run_start(1)
+                && matches!(opportunity.kind, InlineBreakKind::SoftWrap)
+        }));
+    }
+
+    #[test]
+    fn sibling_pre_spans_use_their_normal_common_ancestor_for_atomic_breaking() {
+        let ancestor = ComputedStyle::initial();
+        let mut descendant = ancestor.clone();
+        descendant.white_space = WhiteSpace::Pre;
+        let root = InlineTrackingScope::root(&ancestor);
+        let left_scope = InlineTrackingScope::child(Rc::clone(&root), &descendant);
+        let right_scope = InlineTrackingScope::child(root, &descendant);
+        let runs = vec![
+            InlineParagraphRun {
+                item: InlineLineItem::Atom(scoped_atomic(descendant.clone(), left_scope)),
+                width: 1.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Atom(scoped_atomic(descendant, right_scope)),
+                width: 1.0,
+                shaped: None,
+            },
+        ];
+
+        let opportunities = inline_break_opportunities_for_runs(&runs, &ancestor);
+        assert!(opportunities.iter().any(|opportunity| {
+            opportunity.position == InlineGraphPosition::at_run_start(1)
+                && matches!(opportunity.kind, InlineBreakKind::AtomicBoundary)
+        }));
+    }
+
+    #[test]
     fn fragment_boundary_min_content_keeps_keep_all_cjk_unbreakable() {
         let normal = ComputedStyle::initial();
         let mut keep_all = normal.clone();
@@ -1004,6 +1271,127 @@ mod tests {
             &fragment("中", keep_all.clone()),
             &fragment("文", keep_all),
         ));
+    }
+
+    #[test]
+    fn pre_wrap_space_sequence_owns_the_break_after_itself() {
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::PreWrap;
+        let runs = vec![
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("one", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment(" ", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("two", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+        ];
+
+        let opportunities = inline_break_opportunities_for_runs(&runs, &style);
+        assert!(
+            !opportunities.iter().any(|opportunity| {
+                opportunity.position == InlineGraphPosition::at_run_start(1)
+            }),
+            "the preserved space must remain with the preceding text"
+        );
+        assert!(opportunities.iter().any(|opportunity| {
+            opportunity.position == InlineGraphPosition::at_run_start(2)
+                && matches!(opportunity.kind, InlineBreakKind::PreservedSpace)
+                && opportunity.hangs
+        }));
+    }
+
+    #[test]
+    fn break_spaces_other_space_separator_owns_the_break_after_itself() {
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::BreakSpaces;
+        let runs = vec![
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("xx", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("\u{1680}", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("あ", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+        ];
+
+        let opportunities = inline_break_opportunities_for_runs(&runs, &style);
+        assert!(
+            !opportunities.iter().any(|opportunity| {
+                opportunity.position == InlineGraphPosition::at_run_start(1)
+            }),
+            "break-spaces must not add an ordinary break before an other-space separator"
+        );
+        assert!(opportunities.iter().any(|opportunity| {
+            opportunity.position == InlineGraphPosition::at_run_start(2)
+                && matches!(opportunity.kind, InlineBreakKind::BreakSpaces)
+                && !opportunity.hangs
+        }));
+
+        let combined_runs = vec![InlineParagraphRun {
+            item: InlineLineItem::Fragment(fragment("xx\u{1680}あ", style.clone())),
+            width: 0.0,
+            shaped: None,
+        }];
+        let opportunities = inline_break_opportunities_for_runs(&combined_runs, &style);
+        assert!(
+            !opportunities.iter().any(|opportunity| {
+                opportunity.position
+                    == InlineGraphPosition {
+                        run_index: 0,
+                        byte_offset: "xx".len(),
+                    }
+            }),
+            "break-spaces must not add an ordinary break before an other-space separator"
+        );
+        assert!(opportunities.iter().any(|opportunity| {
+            opportunity.position
+                == InlineGraphPosition {
+                    run_index: 0,
+                    byte_offset: "xx\u{1680}".len(),
+                }
+                && matches!(opportunity.kind, InlineBreakKind::SoftWrap)
+                && !opportunity.hangs
+        }));
+    }
+
+    #[test]
+    fn line_break_anywhere_can_break_before_other_space_separator() {
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::BreakSpaces;
+        style.line_break = css::LineBreak::Anywhere;
+        let runs = vec![InlineParagraphRun {
+            item: InlineLineItem::Fragment(fragment("xx\u{1680}あ", style)),
+            width: 0.0,
+            shaped: None,
+        }];
+
+        let opportunities = inline_break_opportunities_for_runs(&runs, &ComputedStyle::initial());
+        assert!(opportunities.iter().any(|opportunity| {
+            opportunity.position
+                == InlineGraphPosition {
+                    run_index: 0,
+                    byte_offset: "xx".len(),
+                }
+                && matches!(opportunity.kind, InlineBreakKind::SoftWrap)
+                && !opportunity.emergency
+        }));
     }
 
     #[test]
@@ -1062,31 +1450,125 @@ mod tests {
     }
 
     #[test]
+    fn atomic_inline_breaks_before_and_after_text_at_a_normal_ancestor() {
+        let style = ComputedStyle::initial();
+        let atom = InlineLineItem::Atom(InlineAtom::new(
+            InlineAtomContent::Canvas,
+            style.clone(),
+            None,
+            InlineSize::new(1.0, style.line_height),
+            style.font_size,
+            0.0,
+            None,
+            None,
+        ));
+        let runs = vec![
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("あ", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: atom,
+                width: 1.0,
+                shaped: None,
+            },
+            InlineParagraphRun {
+                item: InlineLineItem::Fragment(fragment("あ", style.clone())),
+                width: 0.0,
+                shaped: None,
+            },
+        ];
+
+        let opportunities = inline_break_opportunities_for_runs(&runs, &style);
+        for position in [
+            InlineGraphPosition::at_run_start(1),
+            InlineGraphPosition::at_run_start(2),
+        ] {
+            assert!(opportunities.iter().any(|opportunity| {
+                opportunity.position == position
+                    && matches!(opportunity.kind, InlineBreakKind::AtomicBoundary)
+            }));
+        }
+    }
+
+    #[test]
+    fn atomic_boundaries_keep_nbsp_compatibility_and_gl_wj_zwj_suppression() {
+        let style = ComputedStyle::initial();
+
+        assert!(atomic_text_boundary_allows_soft_wrap(
+            &style,
+            "\u{00a0}word"
+        ));
+        for text in [
+            "\u{2007}word",
+            "\u{202f}word",
+            "\u{2060}word",
+            "\u{200d}word",
+        ] {
+            assert!(
+                !atomic_text_boundary_allows_soft_wrap(&style, text),
+                "{text:?} must suppress an atomic-inline boundary break"
+            );
+        }
+    }
+
+    #[test]
     fn word_joiner_blocks_soft_wraps_at_atomic_boundaries() {
         let style = ComputedStyle::initial();
         let mut scratch = InlineBreakScratch::default();
 
         assert!(!inline_break_boundary_allows_soft_wrap(
-            InlineBreakBoundaryContext::Atomic,
-            InlineBreakBoundaryContext::Text {
-                text: "\u{2060}word"
+            InlineBreakBoundaryContext::Atomic {
+                style: &style,
+                scope: None,
             },
-            [&style, &style],
+            InlineBreakBoundaryContext::Text {
+                text: "\u{2060}word",
+                style: &style,
+                scope: None,
+            },
+            &style,
             &mut scratch,
         ));
         assert!(!inline_break_boundary_allows_soft_wrap(
             InlineBreakBoundaryContext::Text {
-                text: "word\u{2060}"
+                text: "word\u{2060}",
+                style: &style,
+                scope: None,
             },
-            InlineBreakBoundaryContext::Atomic,
-            [&style, &style],
+            InlineBreakBoundaryContext::Atomic {
+                style: &style,
+                scope: None,
+            },
+            &style,
+            &mut scratch,
+        ));
+    }
+
+    #[test]
+    fn opening_cjk_bracket_does_not_break_before_an_atomic_inline() {
+        let style = ComputedStyle::initial();
+        let mut scratch = InlineBreakScratch::default();
+        assert!(!inline_break_boundary_allows_soft_wrap(
+            InlineBreakBoundaryContext::Text {
+                text: "「",
+                style: &style,
+                scope: None,
+            },
+            InlineBreakBoundaryContext::Atomic {
+                style: &style,
+                scope: None,
+            },
+            &style,
             &mut scratch,
         ));
     }
 
     #[test]
     fn static_position_placeholder_is_transparent_to_unbroken_text() {
-        let style = ComputedStyle::initial();
+        let mut style = ComputedStyle::initial();
+        style.white_space = WhiteSpace::NoWrap;
         let placeholder = InlineLineItem::Atom(InlineAtom::new(
             InlineAtomContent::StaticPositionPlaceholder,
             style.clone(),

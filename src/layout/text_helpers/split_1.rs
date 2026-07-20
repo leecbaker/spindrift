@@ -185,7 +185,7 @@ pub(in crate::layout) fn text_align_for_inline_line_text_with_state(
     let style = if style.unicode_bidi == UnicodeBidi::Plaintext {
         let direction = plaintext_direction_for_text(line_text)
             .or(*plaintext_direction_state)
-            .unwrap_or(style.direction);
+            .unwrap_or(style.used_direction());
         *plaintext_direction_state = Some(direction);
         effective_style = style.clone();
         effective_style.direction = direction;
@@ -386,17 +386,6 @@ pub(in crate::layout) fn resolved_alignment_baseline_metric(
             DominantBaseline::Auto => BaselineMetric::Alphabetic,
         },
     }
-}
-
-pub(in crate::layout) fn alpha_marker(mut index: usize, uppercase: bool) -> String {
-    let mut marker = String::new();
-    while index > 0 {
-        index -= 1;
-        let base = if uppercase { b'A' } else { b'a' };
-        marker.insert(0, char::from(base + (index % 26) as u8));
-        index /= 26;
-    }
-    marker
 }
 
 /// Stateful CSS `text-transform` word-boundary context for one inline formatting context.

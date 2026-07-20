@@ -60,10 +60,12 @@ serialization representation.
   at the resolved CSS tile size and both RGB and alpha streams use
   `/FlateDecode`.
 - Page content, Form XObjects, tiling patterns, embedded font programs,
-  ToUnicode CMaps, CIDSets, XMP metadata, and raster image streams use
-  `/FlateDecode` by default, keeping generated PDFs compact without changing
-  their logical paint operations or PDF/A metadata. `PdfCompression::Uncompressed`
-  disables the filter for every generated stream to support PDF debugging.
+  ToUnicode CMaps, CIDSets, XMP metadata, and decoded raster-image streams use
+  `/FlateDecode` by default. Eligible unchanged 8-bit RGB JPEG sources retain
+  their original `/DCTDecode` streams instead; PDF/A limits passthrough to
+  untagged sRGB sources. Cropped, oriented, generated, and tagged or
+  color-converted images remain decoded samples. `PdfCompression::Uncompressed`
+  disables the filter for generated streams to support PDF debugging.
 - Direct vector fills, strokes, text, native linear/radial shadings, and
   generated CSS-gradient images use generated ICCBased color-space resources
   for retained CSS Color 4 spaces. PDF/A converts vector paint and generated
@@ -91,6 +93,12 @@ serialization representation.
 
 ## Remaining Work
 
+- Make Quire-authored ICC profile resources byte-deterministic. Direct
+  `moxcms` 0.9 currently ignores `ColorProfile::creation_date_time` and writes
+  the current UTC time during encoding. Adopt an upstream or pinned moxcms fix
+  that preserves the supplied date, assign Quire's built-in profiles a
+  source-controlled fixed date, then add ICC/PDF byte-identity coverage and
+  re-evaluate the four `css3-text-line-break-opclns` WPTs.
 - Add visual comparison coverage for representative paint-tree output with
   clipping, transforms, opacity groups, blends, images, vector paths, and
   text, using the repo-local PDF comparison workflow.

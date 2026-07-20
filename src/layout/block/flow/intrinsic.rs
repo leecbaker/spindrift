@@ -12,6 +12,29 @@ pub(in crate::layout) struct BlockIntrinsicContentSizes {
     block_size_at_max_inline: LogicalBlockContentSize,
 }
 
+/// A physical-width result together with the orthogonal inline measure that
+/// selected it.
+///
+/// A vertical auto-width block first negotiates its logical inline measure to
+/// determine its physical block contribution. The final inline pass must use
+/// that exact same measure rather than collecting and fitting the same text a
+/// second time.
+/// <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+#[derive(Debug, Clone, Copy)]
+struct ResolvedBlockPhysicalContentWidth {
+    content_width: PhysicalContentWidth,
+    selected_logical_inline_size: Option<LogicalInlineContentSize>,
+}
+
+impl ResolvedBlockPhysicalContentWidth {
+    fn ordinary(content_width: PhysicalContentWidth) -> Self {
+        Self {
+            content_width,
+            selected_logical_inline_size: None,
+        }
+    }
+}
+
 impl BlockIntrinsicContentSizes {
     pub(in crate::layout) fn physical_width_min_max(
         self,
@@ -73,31 +96,178 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         width_inputs: BlockContentWidthInputs,
     ) -> PhysicalContentWidth {
-        let needs_intrinsic = matches!(
-            style.box_values.width,
-            css::ComputedLengthPercentageOrAuto::MinContent
-                | css::ComputedLengthPercentageOrAuto::MaxContent
-                | css::ComputedLengthPercentageOrAuto::FitContent(_)
-        );
-        if !needs_intrinsic {
-            if style.display.is_table() && has_auto_width(style) {
-                return PhysicalContentWidth::new(self.used_intrinsic_or_shrink_to_fit_width(
+        self.resolved_block_physical_content_width(
+            element,
+            style,
+            stylesheets,
+            child_boxes,
+            width_inputs,
+        )
+        .content_width
+    }
+
+    fn resolved_block_physical_content_width(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        width_inputs: BlockContentWidthInputs,
+    ) -> ResolvedBlockPhysicalContentWidth {
+        // In vertical writing modes, physical `width` maps to logical
+        // block-size. An orthogonal root with an automatic block-size must
+        // first select its fit-content inline size, then measure its wrapped
+        // block contribution at that used line measure. Measuring only at
+        // max-content inline size loses the extra line columns and lets the
+        // root stretch across its containing block.
+        // <https://www.w3.org/TR/css-writing-modes-3/#orthogonal-auto>
+        let vertical_auto_block_size =
+            style.writing_mode.has_vertical_lines() && style.box_values.width.is_auto();
+        // A horizontal child of a vertical formatting context is likewise an
+        // orthogonal flow root. Its physical `width` is its own inline size,
+        // but it occupies the parent's logical block axis; `width:auto` must
+        // therefore use its intrinsic fit-content contribution rather than
+        // the horizontal block model's fill-available default.
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+        let horizontal_orthogonal_auto_inline_size = !style.writing_mode.has_vertical_lines()
+            && self.containing_block_writing_mode.has_vertical_lines()
+            && style.box_values.width.is_auto();
+        if vertical_auto_block_size {
+            if element.tag.eq_ignore_ascii_case("html") {
+                // The root principal box is sized by the initial containing
+                // block. Its propagated vertical writing mode changes the
+                // logical axes used for layout, but does not turn the
+                // viewport-sized document canvas into a shrink-to-fit box.
+                //
+                // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+                // <https://www.w3.org/TR/css-display-3/#initial-containing-block>
+                return ResolvedBlockPhysicalContentWidth::ordinary(PhysicalContentWidth::new(
+                    content_box_pt(
+                        (width_inputs.available_outer_width.points()
+                            - width_inputs.horizontal_non_content.points())
+                        .max(0.0),
+                    ),
+                ));
+            }
+            if style.display.is_grid() {
+                // A vertical grid's physical width is its logical block
+                // size. Its track algorithm already computes that physical
+                // contribution from the items; treating it as an ordinary
+                // block stack instead measures a synthetic page-axis height
+                // and expands the grid past its intrinsic tracks.
+                // <https://www.w3.org/TR/css-grid-1/#intrinsic-sizes>
+                // <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+                let (min_content, max_content) = self.estimate_grid_intrinsic_block_sizes(
                     element,
                     style,
                     stylesheets,
+                    width_inputs.available_outer_width.points(),
+                    child_boxes,
+                );
+                let content_width = crate::layout::intrinsic::content_box_width_from_intrinsic(
+                    style,
                     width_inputs.available_outer_width,
                     width_inputs.horizontal_non_content,
-                    child_boxes,
-                    None,
+                    content_box_pt(min_content),
+                    content_box_pt(max_content),
+                    crate::layout::intrinsic::IntrinsicAutoWidth::ShrinkToFit,
+                );
+                return ResolvedBlockPhysicalContentWidth::ordinary(PhysicalContentWidth::new(
+                    constrain_width_with_intrinsic(
+                        style,
+                        content_width,
+                        content_box_pt(min_content),
+                        content_box_pt(max_content),
+                        width_inputs
+                            .percentage_basis
+                            .map_value(|basis| content_box_pt(basis.points())),
+                        width_inputs.horizontal_non_content,
+                    ),
                 ));
             }
-            return PhysicalContentWidth::new(used_normal_flow_block_content_box_width(
-                style,
-                width_inputs
-                    .percentage_basis
-                    .value()
-                    .unwrap_or(width_inputs.available_outer_width),
-                width_inputs.horizontal_non_content,
+            // The auto physical width is the logical block contribution at
+            // this box's *used* logical inline measure.  That measure is the
+            // same fit-content negotiation used by final inline layout,
+            // including an initial-containing-block fallback.  Measuring at
+            // max-content here while final layout wraps at the ICB produces
+            // columns outside the auto physical width.
+            // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-auto>
+            let inline_size = width_inputs
+                .definite_content_height
+                .map(|height| LogicalInlineContentSize::new(height.content_box_length()))
+                .unwrap_or_else(|| {
+                    self.block_content_logical_inline_size(
+                        element,
+                        style,
+                        stylesheets,
+                        child_boxes,
+                        PhysicalContentWidth::new(content_box_pt(0.0)),
+                        None,
+                    )
+                });
+            let items =
+                self.intrinsic_inline_items_for_element(element, style, stylesheets, child_boxes);
+            let items_are_empty = items.is_empty();
+            let block_size = if items_are_empty {
+                self.estimate_block_child_intrinsic_logical_block_size(
+                    element,
+                    style,
+                    stylesheets,
+                    child_boxes,
+                    width_inputs.available_outer_width.points(),
+                )
+            } else {
+                self.inline_items_logical_block_size(items, style, inline_size.points())
+            };
+            let content_width = content_box_pt(block_size.max(0.0));
+            return ResolvedBlockPhysicalContentWidth {
+                content_width: PhysicalContentWidth::new(constrain_width_with_intrinsic(
+                    style,
+                    content_width,
+                    content_width,
+                    content_width,
+                    width_inputs
+                        .percentage_basis
+                        .map_value(|basis| content_box_pt(basis.points())),
+                    width_inputs.horizontal_non_content,
+                )),
+                selected_logical_inline_size: width_inputs
+                    .definite_content_height
+                    .is_none()
+                    .then_some(inline_size),
+            };
+        }
+        let needs_intrinsic = vertical_auto_block_size
+            || horizontal_orthogonal_auto_inline_size
+            || matches!(
+                style.box_values.width,
+                css::ComputedLengthPercentageOrAuto::MinContent
+                    | css::ComputedLengthPercentageOrAuto::MaxContent
+                    | css::ComputedLengthPercentageOrAuto::FitContent(_)
+            );
+        if !needs_intrinsic {
+            if style.display.is_table() && has_auto_width(style) {
+                return ResolvedBlockPhysicalContentWidth::ordinary(PhysicalContentWidth::new(
+                    self.used_intrinsic_or_shrink_to_fit_width(
+                        element,
+                        style,
+                        stylesheets,
+                        width_inputs.available_outer_width,
+                        width_inputs.horizontal_non_content,
+                        child_boxes,
+                        None,
+                    ),
+                ));
+            }
+            return ResolvedBlockPhysicalContentWidth::ordinary(PhysicalContentWidth::new(
+                used_normal_flow_block_content_box_width(
+                    style,
+                    width_inputs
+                        .percentage_basis
+                        .value()
+                        .unwrap_or(width_inputs.available_outer_width),
+                    width_inputs.horizontal_non_content,
+                ),
             ));
         }
 
@@ -110,13 +280,19 @@ impl<'a> LayoutBuilder<'a> {
         );
         let (min_content, max_content) =
             intrinsic_sizes.physical_width_min_max(FlowAxes::for_style(style));
-        PhysicalContentWidth::new(crate::layout::intrinsic::content_box_width_from_intrinsic(
-            style,
-            width_inputs.available_outer_width,
-            width_inputs.horizontal_non_content,
-            min_content,
-            max_content,
-            crate::layout::intrinsic::IntrinsicAutoWidth::FillAvailable,
+        ResolvedBlockPhysicalContentWidth::ordinary(PhysicalContentWidth::new(
+            crate::layout::intrinsic::content_box_width_from_intrinsic(
+                style,
+                width_inputs.available_outer_width,
+                width_inputs.horizontal_non_content,
+                min_content,
+                max_content,
+                if vertical_auto_block_size || horizontal_orthogonal_auto_inline_size {
+                    crate::layout::intrinsic::IntrinsicAutoWidth::ShrinkToFit
+                } else {
+                    crate::layout::intrinsic::IntrinsicAutoWidth::FillAvailable
+                },
+            ),
         ))
     }
 
@@ -180,14 +356,13 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         available_outer_width: f32,
     ) -> (f32, f32) {
-        let sizes = self.block_intrinsic_content_sizes(
+        self.block_intrinsic_content_inline_widths(
             element,
             style,
             stylesheets,
             child_boxes,
             available_outer_width,
-        );
-        (sizes.min_inline.points(), sizes.max_inline.points())
+        )
     }
 
     fn block_intrinsic_content_inline_widths(
@@ -218,12 +393,16 @@ impl<'a> LayoutBuilder<'a> {
             return size_contained_multicol_intrinsic_inline_sizes(style).unwrap_or((0.0, 0.0));
         }
         if style.display.is_flex() {
-            return self.estimate_flex_intrinsic_widths(
+            let contributions = self.estimate_flex_intrinsic_widths(
                 element,
                 style,
                 stylesheets,
-                available_outer_width,
+                PhysicalContentWidth::new(content_box_pt(available_outer_width)),
                 child_boxes,
+            );
+            return (
+                contributions.min_content.points(),
+                contributions.max_content.points(),
             );
         }
         if style.display.is_grid() {
@@ -257,8 +436,8 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://www.w3.org/TR/css-sizing-3/#intrinsic-contribution>
                 if let box_tree::FormattingBox::Table(table) = child {
                     let (child_min, child_max) = self.table_outer_intrinsic_widths_from_fragment(
-                        table.element,
-                        &table.style,
+                        table.core.element,
+                        &table.core.style,
                         stylesheets,
                         &table.fragment,
                         available_outer_width,
@@ -280,33 +459,198 @@ impl<'a> LayoutBuilder<'a> {
                 if !child_style.display.is_block_level() {
                     continue;
                 }
-                let (child_min, child_max) = self.block_intrinsic_content_widths(
-                    child_element,
-                    child_style,
-                    stylesheets,
-                    Some(child_children),
-                    available_outer_width,
-                );
                 let metrics = intrinsic_box_metrics(child_style);
-                let horizontal_non_content = metrics.horizontal_non_content_length();
-                let (child_min, child_max) = non_replaced_intrinsic_width_contributions(
-                    child_style,
-                    content_box_pt(child_min),
-                    content_box_pt(child_max),
-                    horizontal_non_content,
-                );
-                block_child_min = block_child_min.max(
-                    child_min.points()
-                        + horizontal_non_content.points()
-                        + metrics.margin.left
-                        + metrics.margin.right,
-                );
-                block_child_max = block_child_max.max(
-                    child_max.points()
-                        + horizontal_non_content.points()
-                        + metrics.margin.left
-                        + metrics.margin.right,
-                );
+                if style.writing_mode.has_vertical_lines() {
+                    // A vertical parent's logical inline axis is physical
+                    // height. Its block children therefore contribute their
+                    // physical outer height, not their physical width. This
+                    // is essential for nested orthogonal roots: a horizontal
+                    // child can obtain its height from a vertical grandchild
+                    // even though neither child has inline text of its own.
+                    // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+                    let specified_width = used_content_box_size(
+                        child_style.box_values.width.clone(),
+                        child_style.box_sizing,
+                        PercentageBasis::definite(content_box_pt(available_outer_width)),
+                        metrics.horizontal_non_content_length(),
+                    );
+                    let horizontal_child_line_measure =
+                        (child_style.writing_mode == WritingMode::HorizontalTb).then(|| {
+                            specified_width.unwrap_or_else(|| {
+                                // An auto-sized horizontal child of a vertical
+                                // flow root shrink-to-fits its physical width.
+                                // Its parent's logical inline contribution is
+                                // therefore the height at that final line
+                                // measure, not the min-content wrapped height.
+                                // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-auto>
+                                let child_sizes = self.block_intrinsic_content_sizes(
+                                    child_element,
+                                    child_style,
+                                    stylesheets,
+                                    Some(child_children),
+                                    available_outer_width,
+                                );
+                                let child_axes = FlowAxes::for_style(child_style);
+                                let min_width = child_axes
+                                    .physical_width_from_logical_content_sizes(
+                                        child_sizes.min_inline,
+                                        child_sizes.min_block,
+                                    )
+                                    .content_box_length();
+                                let max_width = child_axes
+                                    .physical_width_from_logical_content_sizes(
+                                        child_sizes.max_inline,
+                                        child_sizes.block_size_at_max_inline,
+                                    )
+                                    .content_box_length();
+                                let available_width = content_box_pt(
+                                    (available_outer_width
+                                        - metrics.margin.left.points()
+                                        - metrics.margin.right.points()
+                                        - metrics.horizontal_non_content_length().points())
+                                    .max(0.0),
+                                );
+                                crate::layout::intrinsic::shrink_to_fit_width(
+                                    min_width,
+                                    max_width,
+                                    available_width,
+                                )
+                            })
+                        });
+                    let (child_min, child_max) =
+                        if let Some(line_measure) = horizontal_child_line_measure {
+                            // A horizontal child's used line measure determines
+                            // its physical height contribution. Measuring at
+                            // min-content would wrap text into extra lines and
+                            // incorrectly make the vertical parent taller.
+                            // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
+                            let items = self.intrinsic_inline_items_for_element(
+                                child_element,
+                                child_style,
+                                stylesheets,
+                                Some(child_children),
+                            );
+                            let height = if items.is_empty() {
+                                self.estimate_block_child_intrinsic_content_height(
+                                    child_element,
+                                    child_style,
+                                    stylesheets,
+                                    Some(child_children),
+                                    line_measure.points(),
+                                    available_outer_width,
+                                )
+                            } else {
+                                self.inline_items_logical_block_size(
+                                    items,
+                                    child_style,
+                                    line_measure.points(),
+                                )
+                            };
+                            (height, height)
+                        } else {
+                            let child_sizes = self.block_intrinsic_content_sizes(
+                                child_element,
+                                child_style,
+                                stylesheets,
+                                Some(child_children),
+                                available_outer_width,
+                            );
+                            let child_axes = FlowAxes::for_style(child_style);
+                            (
+                                child_axes
+                                    .physical_height_from_logical_content_sizes(
+                                        child_sizes.min_inline,
+                                        child_sizes.min_block,
+                                    )
+                                    .points(),
+                                child_axes
+                                    .physical_height_from_logical_content_sizes(
+                                        child_sizes.max_inline,
+                                        child_sizes.max_block,
+                                    )
+                                    .points(),
+                            )
+                        };
+                    let vertical_non_content = metrics.vertical_non_content_length().points();
+                    let vertical_margins =
+                        metrics.margin.top.points() + metrics.margin.bottom.points();
+                    block_child_min =
+                        block_child_min.max(child_min + vertical_non_content + vertical_margins);
+                    block_child_max =
+                        block_child_max.max(child_max + vertical_non_content + vertical_margins);
+                } else {
+                    let (child_min, child_max) = if writing_modes_are_orthogonal(
+                        style.writing_mode,
+                        child_style.writing_mode,
+                    ) {
+                        // The parent's logical inline axis is physical
+                        // horizontal here. Project an orthogonal child's two
+                        // logical contributions through its own flow axes;
+                        // using its logical inline size directly would use a
+                        // vertical child's physical height as a width.
+                        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+                        let specified_width = used_content_box_size(
+                            child_style.box_values.width.clone(),
+                            child_style.box_sizing,
+                            PercentageBasis::definite(content_box_pt(available_outer_width)),
+                            metrics.horizontal_non_content_length(),
+                        )
+                        .map(SemanticLengthExt::points);
+                        if let Some(width) = specified_width {
+                            (width, width)
+                        } else {
+                            let child_sizes = self.block_intrinsic_content_sizes(
+                                child_element,
+                                child_style,
+                                stylesheets,
+                                Some(child_children),
+                                available_outer_width,
+                            );
+                            let child_axes = FlowAxes::for_style(child_style);
+                            (
+                                child_axes
+                                    .physical_width_from_logical_content_sizes(
+                                        child_sizes.min_inline,
+                                        child_sizes.min_block,
+                                    )
+                                    .points(),
+                                child_axes
+                                    .physical_width_from_logical_content_sizes(
+                                        child_sizes.max_inline,
+                                        child_sizes.block_size_at_max_inline,
+                                    )
+                                    .points(),
+                            )
+                        }
+                    } else {
+                        self.block_intrinsic_content_widths(
+                            child_element,
+                            child_style,
+                            stylesheets,
+                            Some(child_children),
+                            available_outer_width,
+                        )
+                    };
+                    let horizontal_non_content = metrics.horizontal_non_content_length();
+                    let (child_min, child_max) = non_replaced_intrinsic_width_contributions(
+                        child_style,
+                        content_box_pt(child_min),
+                        content_box_pt(child_max),
+                        horizontal_non_content,
+                    );
+                    block_child_min = block_child_min.max(
+                        child_min.points()
+                            + horizontal_non_content.points()
+                            + metrics.margin.left.points()
+                            + metrics.margin.right.points(),
+                    );
+                    block_child_max = block_child_max.max(
+                        child_max.points()
+                            + horizontal_non_content.points()
+                            + metrics.margin.left.points()
+                            + metrics.margin.right.points(),
+                    );
+                }
             }
             if block_child_min > 0.0 || block_child_max > 0.0 {
                 return (block_child_min, block_child_max.max(block_child_min));
@@ -321,8 +665,11 @@ impl<'a> LayoutBuilder<'a> {
                     child_boxes,
                 )
             });
-        if contribution.max_content > 0.0 || contribution.min_content > 0.0 {
-            return (contribution.min_content, contribution.max_content);
+        if contribution.max_content.points() > 0.0 || contribution.min_content.points() > 0.0 {
+            return (
+                contribution.min_content.points(),
+                contribution.max_content.points(),
+            );
         }
         let shrink_to_fit = self
             .estimate_shrink_to_fit_width(
@@ -364,14 +711,24 @@ impl<'a> LayoutBuilder<'a> {
         let items =
             self.intrinsic_inline_items_for_element(element, style, stylesheets, child_boxes);
         if items.is_empty() {
-            let block_size = self.estimate_block_child_intrinsic_content_height(
-                element,
-                style,
-                stylesheets,
-                child_boxes,
-                min_inline,
-                available_outer_width,
-            );
+            let block_size = if style.writing_mode.has_vertical_lines() {
+                self.estimate_block_child_intrinsic_logical_block_size(
+                    element,
+                    style,
+                    stylesheets,
+                    child_boxes,
+                    available_outer_width,
+                )
+            } else {
+                self.estimate_block_child_intrinsic_content_height(
+                    element,
+                    style,
+                    stylesheets,
+                    child_boxes,
+                    min_inline,
+                    available_outer_width,
+                )
+            };
             return (block_size, block_size);
         }
 
@@ -381,7 +738,126 @@ impl<'a> LayoutBuilder<'a> {
             min_inline.max(style.font_size).max(1.0),
         );
         let max_block = self.inline_items_logical_block_size(items, style, f32::MAX);
-        (min_block, max_block)
+        if element.tag.eq_ignore_ascii_case("html") {
+            // The root's tree-abiding inline pseudo-elements coexist with its
+            // block-level body canvas. Inline collection intentionally omits
+            // that block child, but its intrinsic block contribution still
+            // determines the root's used principal-flow span.
+            // <https://www.w3.org/TR/css-sizing-3/#intrinsic-contribution>
+            // <https://www.w3.org/TR/css-pseudo-4/#generated-content>
+            let block_child_size = self.estimate_block_child_intrinsic_content_height(
+                element,
+                style,
+                stylesheets,
+                child_boxes,
+                min_inline,
+                available_outer_width,
+            );
+            (
+                min_block.max(block_child_size),
+                max_block.max(block_child_size),
+            )
+        } else {
+            (min_block, max_block)
+        }
+    }
+
+    /// Estimate a vertical block's logical block-size from its block children.
+    ///
+    /// The block axis of a vertical formatting context is physical horizontal.
+    /// Reusing the ordinary auto-height estimator here would instead add each
+    /// child's physical height, which is its logical inline contribution and
+    /// can double the physical width of nested orthogonal boxes.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+    /// <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
+    fn estimate_block_child_intrinsic_logical_block_size(
+        &mut self,
+        _element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
+        available_outer_width: f32,
+    ) -> f32 {
+        let Some(child_boxes) = child_boxes else {
+            return 0.0;
+        };
+        let parent_logical_inline_measure = used_content_box_size(
+            style.box_values.height.clone(),
+            style.box_sizing,
+            PercentageBasis::definite(content_box_pt(available_outer_width)),
+            intrinsic_box_metrics(style).vertical_non_content_length(),
+        );
+        let mut block_size = 0.0;
+        for child in child_boxes {
+            let Some((child_element, _, child_style, child_children)) = child.element_parts()
+            else {
+                continue;
+            };
+            if !child_style.display.is_block_level()
+                || child_style.float != Float::None
+                || matches!(child_style.position, Position::Absolute | Position::Fixed)
+            {
+                continue;
+            }
+            let metrics = intrinsic_box_metrics(child_style);
+            let physical_width_percentage_basis =
+                if writing_modes_are_orthogonal(style.writing_mode, child_style.writing_mode) {
+                    self.current_child_available_space()
+                        .orthogonal_physical_width_percentage_basis
+                        .points()
+                } else {
+                    available_outer_width
+                };
+            let wrapped_vertical_child_width = (child_style.writing_mode.has_vertical_lines()
+                && child_style.box_values.width.is_auto())
+            .then(|| {
+                parent_logical_inline_measure.and_then(|inline_measure| {
+                    let items = self.intrinsic_inline_items_for_element(
+                        child_element,
+                        child_style,
+                        stylesheets,
+                        Some(child_children),
+                    );
+                    (!items.is_empty()).then(|| {
+                        self.inline_items_logical_block_size(
+                            items,
+                            child_style,
+                            inline_measure.points(),
+                        )
+                    })
+                })
+            })
+            .flatten();
+            let specified_width = used_content_box_size(
+                child_style.box_values.width.clone(),
+                child_style.box_sizing,
+                PercentageBasis::definite(content_box_pt(physical_width_percentage_basis)),
+                metrics.horizontal_non_content_length(),
+            )
+            .map(SemanticLengthExt::points);
+            let child_width = specified_width
+                .or(wrapped_vertical_child_width)
+                .unwrap_or_else(|| {
+                    let child_sizes = self.block_intrinsic_content_sizes(
+                        child_element,
+                        child_style,
+                        stylesheets,
+                        Some(child_children),
+                        available_outer_width,
+                    );
+                    FlowAxes::for_style(child_style)
+                        .physical_width_from_logical_content_sizes(
+                            child_sizes.max_inline,
+                            child_sizes.block_size_at_max_inline,
+                        )
+                        .points()
+                });
+            block_size += child_width
+                + metrics.horizontal_non_content_length().points()
+                + metrics.margin.left.points()
+                + metrics.margin.right.points();
+        }
+        block_size
     }
 
     fn estimate_block_child_intrinsic_content_height(
@@ -418,10 +894,10 @@ impl<'a> LayoutBuilder<'a> {
         );
         (outer_height
             - used_style.margin.top
-            - box_metrics.border.top
+            - box_metrics.border.top.points()
             - used_style.padding.top
             - used_style.padding.bottom
-            - box_metrics.border.bottom
+            - box_metrics.border.bottom.points()
             - used_style.margin.bottom)
             .max(0.0)
     }
@@ -456,12 +932,19 @@ impl<'a> LayoutBuilder<'a> {
         // <https://drafts.csswg.org/css-writing-modes-4/#orthogonal-flows>
         let percentage_basis = child_available_space
             .logical_inline_percentage_basis_for(child_available_space.writing_mode);
-        let physical_width_percentage_basis = if self.active_fragmentainer_kind()
-            == FragmentainerKind::Column
+        let physical_width_percentage_basis = if crate::layout::block::writing_modes_are_orthogonal(
+            child_available_space.writing_mode,
+            style.writing_mode,
+        ) {
+            child_available_space
+                .orthogonal_physical_width_percentage_basis
+                .points()
+        } else if self.active_fragmentainer_kind() == FragmentainerKind::Column
             && crate::layout::block::writing_modes_are_orthogonal(
                 self.containing_block_writing_mode,
                 style.writing_mode,
-            ) {
+            )
+        {
             // An orthogonal flow root fragments through the multicol
             // container's block axis. Its auto physical width is therefore
             // resolved against the multicol content box exported to its
@@ -477,8 +960,10 @@ impl<'a> LayoutBuilder<'a> {
             stylesheets,
             child_boxes,
             BlockLayoutInlineConstraint {
-                containing_left: self.content_left,
-                containing_right: self.content_right,
+                containing_inline_span: PageInlineSpan::from_edges(
+                    self.content_left,
+                    self.content_right,
+                ),
                 percentage_basis,
                 physical_width_percentage_basis: PhysicalContentWidth::new(content_box_pt(
                     physical_width_percentage_basis,
@@ -496,19 +981,32 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         constraint: BlockLayoutInlineConstraint,
     ) -> BlockLayoutGeometry {
-        let containing_left = constraint.containing_left;
-        let containing_right = constraint.containing_right;
+        let containing_inline_span = constraint.containing_inline_span;
         let percentage_basis = constraint.percentage_basis.map_value(|size| {
             crate::units::IntoLayoutLength::into_layout_length(size.content_box_length())
         });
         let physical_width_percentage_basis = constraint.physical_width_percentage_basis.points();
-        let containing_inline_size = (containing_right - containing_left).max(0.0);
+        let containing_inline_size = containing_inline_span.width();
         let mut used_style = self.style_with_current_used_lengths(style);
         let box_metrics = apply_used_box_metrics(&mut used_style, percentage_basis);
         let relative_offset = self.normal_flow_relative_position_offset(&used_style);
         let available_outer_width =
             normal_flow_block_available_outer_width(&used_style, layout_pt(containing_inline_size));
-        let border_widths = box_metrics.border;
+        // Intrinsic sizing normally treats a percentage-dependent width as
+        // auto until its containing-block basis is known. At this layout
+        // boundary the physical width basis is known separately from the
+        // available inline span for an orthogonal flow, so retain that basis
+        // when resolving the specified physical width.
+        // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+        let intrinsic_width_percentage_basis = matches!(
+            used_style.box_values.width,
+            css::ComputedLengthPercentageOrAuto::LengthPercentage(ref value)
+                if value.needs_percentage_basis()
+        )
+        .then_some(layout_pt(physical_width_percentage_basis))
+        .unwrap_or(available_outer_width);
+        let border_edges = box_metrics.border;
         let horizontal_extras = box_metrics.horizontal_non_content_length();
         let vertical_extras = box_metrics.vertical_non_content_length();
         let containing_block_content_height = self
@@ -568,26 +1066,28 @@ impl<'a> LayoutBuilder<'a> {
                     available_outer_width.points(),
                 )
             });
-        let requested_content_width = if let Some(auto_border_box_width) = constraint
+        let width_resolution = if let Some(auto_border_box_width) = constraint
             .auto_border_box_width
             .filter(|_| has_auto_width(&used_style))
         {
-            PhysicalContentWidth::new(content_box_pt(
+            ResolvedBlockPhysicalContentWidth::ordinary(PhysicalContentWidth::new(content_box_pt(
                 (auto_border_box_width.points() - horizontal_extras.points()).max(0.0),
-            ))
+            )))
         } else if let Some(intrinsic_sizes) = intrinsic_sizes {
             let (min_content, max_content) =
                 intrinsic_sizes.physical_width_min_max(FlowAxes::for_style(&used_style));
-            PhysicalContentWidth::new(crate::layout::intrinsic::content_box_width_from_intrinsic(
-                &used_style,
-                available_outer_width,
-                horizontal_extras,
-                min_content,
-                max_content,
-                crate::layout::intrinsic::IntrinsicAutoWidth::FillAvailable,
+            ResolvedBlockPhysicalContentWidth::ordinary(PhysicalContentWidth::new(
+                crate::layout::intrinsic::content_box_width_from_intrinsic(
+                    &used_style,
+                    intrinsic_width_percentage_basis,
+                    horizontal_extras,
+                    min_content,
+                    max_content,
+                    crate::layout::intrinsic::IntrinsicAutoWidth::FillAvailable,
+                ),
             ))
         } else {
-            self.used_block_physical_content_width(
+            self.resolved_block_physical_content_width(
                 element,
                 &used_style,
                 stylesheets,
@@ -598,9 +1098,13 @@ impl<'a> LayoutBuilder<'a> {
                         physical_width_percentage_basis,
                     )),
                     horizontal_non_content: horizontal_extras,
+                    definite_content_height: explicit_content_height
+                        .map(|height| PhysicalContentHeight::new(content_box_pt(height))),
                 },
             )
         };
+        let selected_logical_inline_size = width_resolution.selected_logical_inline_size;
+        let requested_content_width = width_resolution.content_width;
         let requested_content_width = if let Some(intrinsic_sizes) = intrinsic_sizes {
             let (min_content, max_content) =
                 intrinsic_sizes.physical_width_min_max(FlowAxes::for_style(&used_style));
@@ -609,7 +1113,9 @@ impl<'a> LayoutBuilder<'a> {
                 requested_content_width.content_box_length(),
                 min_content,
                 max_content,
-                PercentageBasis::definite(content_box_pt(containing_inline_size)),
+                PercentageBasis::definite(content_box_pt(
+                    intrinsic_width_percentage_basis.points(),
+                )),
                 horizontal_extras,
             ))
         } else {
@@ -653,15 +1159,73 @@ impl<'a> LayoutBuilder<'a> {
                 PhysicalContentWidth::new(content_box_pt(width.max(automatic_minimum)))
             })
             .unwrap_or(requested_content_width);
-        let mut width = resolve_normal_flow_block_width(
+        let mut width = resolve_normal_flow_block_inline_geometry(
             &mut used_style,
-            containing_left,
-            containing_right,
+            containing_inline_span,
             requested_content_width,
             horizontal_extras,
             self.containing_block_direction,
             true,
         );
+        // In a parallel vertical block flow, a physical width is the logical
+        // block size. Anchor its resolved border box at logical block-start.
+        // An auto-sized orthogonal horizontal child contributes its intrinsic
+        // physical width along the vertical parent's block axis, so its
+        // static position begins at that block-start edge. A specified
+        // physical width remains an ordinary horizontal block width and uses
+        // the normal static position instead.
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+        let root_pseudo_projection = self
+            .root_pseudo_block_projection
+            .filter(|projection| projection.element == element.id);
+        if WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes()
+            && (root_pseudo_projection.is_some()
+                || !crate::layout::block::writing_modes_are_orthogonal(
+                    self.containing_block_writing_mode,
+                    style.writing_mode,
+                ))
+        {
+            let border_box_width = width.border_box_inline_span.width();
+            let block_start = root_pseudo_projection
+                .map(|projection| projection.block_start)
+                .unwrap_or_else(|| block_start_side(style.writing_mode));
+            let block_end_inset = root_pseudo_projection
+                .map(|projection| projection.block_end_inset.points())
+                .unwrap_or(0.0);
+            let start = match block_start {
+                PhysicalSide::Left => containing_inline_span.left_x() + used_style.margin.left,
+                PhysicalSide::Right => {
+                    containing_inline_span.right_x()
+                        - used_style.margin.right
+                        - block_end_inset
+                        - border_box_width
+                }
+                PhysicalSide::Top | PhysicalSide::Bottom => {
+                    unreachable!("a vertical writing mode must have a horizontal block axis")
+                }
+            };
+            width.border_box_inline_span = PageInlineSpan::new(start, border_box_width);
+        } else if !style.writing_mode.has_vertical_lines()
+            && self.containing_block_writing_mode.has_vertical_lines()
+        {
+            // The child's physical horizontal border-box span is the
+            // containing vertical flow's logical block span. Its static
+            // position therefore starts at the containing block's logical
+            // block-start edge, regardless of whether CSS `width` is `auto`
+            // or explicitly specified.
+            // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+            let border_box_width = width.border_box_inline_span.width();
+            let start = match block_start_side(self.containing_block_writing_mode) {
+                PhysicalSide::Left => containing_inline_span.left_x() + used_style.margin.left,
+                PhysicalSide::Right => {
+                    containing_inline_span.right_x() - used_style.margin.right - border_box_width
+                }
+                PhysicalSide::Top | PhysicalSide::Bottom => {
+                    unreachable!("a vertical containing block must have a horizontal block axis")
+                }
+            };
+            width.border_box_inline_span = PageInlineSpan::new(start, border_box_width);
+        }
         let mut content_width = width.content_width;
         let mut content_width_points = content_width.points();
         let mut unconstrained_aspect_height = None;
@@ -707,10 +1271,9 @@ impl<'a> LayoutBuilder<'a> {
                 vertical_extras.points(),
             )
         {
-            width = resolve_normal_flow_block_width(
+            width = resolve_normal_flow_block_inline_geometry(
                 &mut used_style,
-                containing_left,
-                containing_right,
+                containing_inline_span,
                 PhysicalContentWidth::new(content_box_pt(transferred_width)),
                 horizontal_extras,
                 self.containing_block_direction,
@@ -737,28 +1300,35 @@ impl<'a> LayoutBuilder<'a> {
         }
         let definite_content_height = definite_content_height
             .map(|height| PhysicalContentHeight::new(content_box_pt(height)));
-        let content_logical_inline_size = self.block_content_logical_inline_size(
-            element,
-            &used_style,
-            stylesheets,
-            child_boxes,
-            PhysicalContentWidth::new(content_width),
-            definite_content_height,
+        let content_logical_inline_size = selected_logical_inline_size
+            .filter(|_| definite_content_height.is_none())
+            .unwrap_or_else(|| {
+                self.block_content_logical_inline_size(
+                    element,
+                    &used_style,
+                    stylesheets,
+                    child_boxes,
+                    PhysicalContentWidth::new(content_width),
+                    definite_content_height,
+                )
+            });
+        let outer_inline_span = PageInlineSpan::new(
+            width.border_box_inline_span.left_x() + relative_offset.x(),
+            width.border_box_inline_span.width(),
         );
-        let outer_width = width.border_box_width.points();
-        let outer_x = width.border_box_x + relative_offset.x();
-        let inner_x = outer_x + border_widths.left + used_style.padding.left;
-
+        let inner_x =
+            outer_inline_span.left_x() + border_edges.left.points() + used_style.padding.left;
+        let content_inline_span = PageInlineSpan::new(inner_x, content_width.points());
         BlockLayoutGeometry {
             style: used_style,
             relative_offset,
-            border_widths,
-            vertical_extras: vertical_extras.points(),
+            border_edges,
+            vertical_non_content: vertical_extras,
             containing_block_content_height,
             definite_content_height,
             content_logical_inline_size,
-            outer_inline: BlockInlineBounds::new(outer_x, outer_width),
-            content_inline: BlockInlineBounds::new(inner_x, content_width_points),
+            outer_inline: BlockBorderBoxInlineBounds::new(outer_inline_span),
+            content_inline: BlockContentBoxInlineBounds::new(content_inline_span),
         }
     }
 
@@ -792,26 +1362,84 @@ impl<'a> LayoutBuilder<'a> {
                 // containing block's available inline size just as a
                 // horizontal block's auto width does.
                 // https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping
-                return LogicalInlineContentSize::new(content_box_pt(
-                    containing_space
-                        .logical_inline_size_for(style.writing_mode)
-                        .points()
-                        .max(1.0),
+                let available = containing_space.logical_inline_size_for(style.writing_mode);
+                let percentage_basis = containing_space
+                    .logical_inline_percentage_basis_for(style.writing_mode)
+                    .map_value(LogicalInlineContentSize::content_box_length);
+                return LogicalInlineContentSize::new(constrain_content_height(
+                    style,
+                    available.content_box_length(),
+                    percentage_basis,
                 ));
             }
-            let stretch_fit = containing_space
+            // The orthogonal available size is the containing block's
+            // available *outer* inline size.  Fit-content line layout needs
+            // this box's content inline size, so remove its physical
+            // top/bottom margin, padding, and border before choosing the
+            // line-fitting measure.  Treating the available outer measure as
+            // content-box space makes a constrained parent overflow by this
+            // amount in nested orthogonal flows.
+            // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-auto>
+            // <https://drafts.csswg.org/css-sizing-3/#fit-content-size>
+            let borders = used_border_widths(style);
+            let logical_inline_outer_non_content = style.margin.top
+                + style.padding.top
+                + borders.top
+                + style.padding.bottom
+                + borders.bottom
+                + style.margin.bottom;
+            let containing_stretch_fit = (containing_space
                 .logical_inline_size_for(style.writing_mode)
-                .points();
-            let contribution = self.intrinsic_inline_contribution_for_element(
-                element,
+                .points()
+                - logical_inline_outer_non_content)
+                .max(0.0);
+            // The box's own physical block-size constraints map to the
+            // logical inline axis in vertical writing. They therefore bound
+            // the fit-content measure before its inline contents are laid
+            // out. Constraining only the final physical height would let a
+            // vertical block first lay out against the ICB and then clip that
+            // unwrapped line, instead of reflowing it into the constrained
+            // inline measure.
+            // <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+            // <https://drafts.csswg.org/css-sizing-3/#fit-content-size>
+            let own_inline_constraint = orthogonal_fallback_physical_content_height(
                 style,
-                stylesheets,
-                child_boxes,
-            );
-            contribution
-                .max_content
-                .min(contribution.min_content.max(stretch_fit))
-                .max(1.0)
+                containing_space
+                    .physical_height_percentage_basis()
+                    .map_value(|height| height.content_box_length()),
+            )
+            .map(PhysicalContentHeight::points);
+            let stretch_fit = own_inline_constraint
+                .map(|constraint| containing_stretch_fit.min(constraint))
+                .unwrap_or(containing_stretch_fit);
+            let (min_content, max_content) =
+                if child_boxes.is_some_and(has_non_inline_formatting_box) {
+                    // Inline collection deliberately omits block children. For a
+                    // vertical flow root its logical inline measure is physical
+                    // height, so a nested horizontal block must be measured by
+                    // the block intrinsic model before fit-content negotiation.
+                    // <https://www.w3.org/TR/css-sizing-3/#intrinsic>
+                    let sizes = self.block_intrinsic_content_sizes(
+                        element,
+                        style,
+                        stylesheets,
+                        child_boxes,
+                        content_width.points(),
+                    );
+                    (sizes.min_inline.points(), sizes.max_inline.points())
+                } else {
+                    let contribution = self.intrinsic_inline_contribution_for_element(
+                        element,
+                        style,
+                        stylesheets,
+                        child_boxes,
+                    );
+                    (
+                        contribution.min_content.points(),
+                        contribution.max_content.points(),
+                    )
+                };
+            max_content.min(min_content.max(stretch_fit)).max(1.0)
         } else {
             content_width.points().max(1.0)
         };

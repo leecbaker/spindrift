@@ -1,7 +1,7 @@
 use super::*;
 use crate::css::parse_object_fit;
 use crate::css::{
-    MediaEnvironment, MediaType, parse_font_palette, parse_font_synthesis,
+    FontPaletteDefinition, MediaEnvironment, MediaType, parse_font_palette, parse_font_synthesis,
     parse_font_synthesis_subproperty,
 };
 
@@ -13,20 +13,7 @@ pub(in crate::css) fn find_ascii_case_insensitive(haystack: &str, needle: &str) 
 }
 
 pub(in crate::css) fn find_matching_brace(source: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (index, byte) in source.as_bytes().iter().enumerate().skip(open) {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(index);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    crate::css::component_values::find_matching_brace(source, open, false)
 }
 
 /// Finds a CSS block close, accepting EOF as an implicit close for recovery.
@@ -36,20 +23,7 @@ pub(in crate::css) fn find_matching_brace(source: &str, open: usize) -> Option<u
 /// is not discarded when the stylesheet reaches EOF before the last `}`:
 /// <https://www.w3.org/TR/css-syntax-3/#consume-simple-block>.
 pub(in crate::css) fn find_matching_brace_or_eof(source: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (index, byte) in source.as_bytes().iter().enumerate().skip(open) {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(index);
-                }
-            }
-            _ => {}
-        }
-    }
-    (depth > 0).then_some(source.len())
+    crate::css::component_values::find_matching_brace(source, open, true)
 }
 
 #[derive(Debug)]
@@ -60,10 +34,16 @@ pub(in crate::css) enum ParsedCssRule {
     AfterMarker(StyleRule),
     Before(StyleRule),
     After(StyleRule),
+    FootnoteCall(StyleRule),
+    FootnoteMarker(StyleRule),
     FirstLine(StyleRule),
     FirstLetter(StyleRule),
     Container(ContainerRule),
     Keyframes(KeyframesRule),
+    FontFace(CssFontFace),
+    CounterStyle(CounterStyleRule),
+    FontFeatureValues(FontFeatureValuesRule),
+    FontPaletteValues(String, FontPaletteDefinition),
     Nested(Vec<ParsedCssRule>),
     Ignored,
 }
@@ -75,6 +55,8 @@ pub(in crate::css) enum RoutedPseudoElement {
     AfterMarker,
     Before,
     After,
+    FootnoteCall,
+    FootnoteMarker,
     FirstLine,
     FirstLetter,
 }
@@ -87,6 +69,9 @@ pub(in crate::css) struct CssRuleParser {
     pub(in crate::css) current_layer: Option<String>,
     pub(in crate::css) current_scopes: Vec<ScopeRule>,
     pub(in crate::css) media_environment: MediaEnvironment,
+    /// `@namespace` is legal only in the stylesheet prelude, never in a
+    /// conditional grouping rule.
+    pub(in crate::css) namespace_prelude_open: bool,
 }
 
 pub(in crate::css) type SharedLayerRegistry = Rc<RefCell<LayerRegistry>>;
@@ -166,6 +151,7 @@ impl<'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser {
         &mut self,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::Prelude, cssparser::ParseError<'i, Self::Error>> {
+        self.namespace_prelude_open = false;
         let start = input.position();
         let parse_relative = if self.current_scopes.is_empty() {
             ParseRelative::No
@@ -235,7 +221,7 @@ impl<'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser {
         let specificity = selector
             .slice()
             .iter()
-            .map(|selector| selector.specificity())
+            .map(|branch| branch.specificity())
             .max()
             .unwrap_or(0);
         let declarations =
@@ -244,7 +230,6 @@ impl<'i> cssparser::QualifiedRuleParser<'i> for CssRuleParser {
             &selector_text,
             &self.namespaces.borrow().selector_parser(),
             &declarations,
-            specificity,
             self.current_layer.clone(),
             self.current_scopes.clone(),
         );
@@ -285,6 +270,12 @@ impl<'i> cssparser::AtRuleParser<'i> for CssRuleParser {
         } else {
             consume_remaining_input(input)
         };
+        if !name.eq_ignore_ascii_case("namespace")
+            && !name.eq_ignore_ascii_case("import")
+            && !name.eq_ignore_ascii_case("charset")
+        {
+            self.namespace_prelude_open = false;
+        }
         if name.eq_ignore_ascii_case("media") {
             Ok(AtRulePrelude::Media(media_rule_applies_in_environment(
                 &prelude,
@@ -298,7 +289,11 @@ impl<'i> cssparser::AtRuleParser<'i> for CssRuleParser {
         } else if name.eq_ignore_ascii_case("layer") {
             Ok(AtRulePrelude::Layer(prelude))
         } else if name.eq_ignore_ascii_case("namespace") {
-            Ok(AtRulePrelude::Namespace(parse_namespace_prelude(&prelude)))
+            Ok(AtRulePrelude::Namespace(
+                self.namespace_prelude_open
+                    .then(|| parse_namespace_prelude(&prelude))
+                    .flatten(),
+            ))
         } else if name.eq_ignore_ascii_case("scope") {
             let selector_parser = self.namespaces.borrow().selector_parser();
             Ok(AtRulePrelude::Scope(parse_scope_prelude(
@@ -309,6 +304,14 @@ impl<'i> cssparser::AtRuleParser<'i> for CssRuleParser {
             Ok(AtRulePrelude::Page(prelude))
         } else if name.eq_ignore_ascii_case("keyframes") {
             Ok(AtRulePrelude::Keyframes(prelude))
+        } else if name.eq_ignore_ascii_case("font-face") {
+            Ok(AtRulePrelude::FontFace)
+        } else if name.eq_ignore_ascii_case("counter-style") {
+            Ok(AtRulePrelude::CounterStyle(prelude))
+        } else if name.eq_ignore_ascii_case("font-feature-values") {
+            Ok(AtRulePrelude::FontFeatureValues(prelude))
+        } else if name.eq_ignore_ascii_case("font-palette-values") {
+            Ok(AtRulePrelude::FontPaletteValues(prelude))
         } else if name.eq_ignore_ascii_case("container") {
             Ok(AtRulePrelude::Container(prelude))
         } else {
@@ -336,6 +339,10 @@ impl<'i> cssparser::AtRuleParser<'i> for CssRuleParser {
             | AtRulePrelude::Supports(_)
             | AtRulePrelude::Page(_)
             | AtRulePrelude::Keyframes(_)
+            | AtRulePrelude::FontFace
+            | AtRulePrelude::CounterStyle(_)
+            | AtRulePrelude::FontFeatureValues(_)
+            | AtRulePrelude::FontPaletteValues(_)
             | AtRulePrelude::Container(_)
             | AtRulePrelude::Scope(_)
             | AtRulePrelude::Namespace(None)
@@ -359,6 +366,7 @@ impl<'i> cssparser::AtRuleParser<'i> for CssRuleParser {
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
                     media_environment: self.media_environment,
+                    namespace_prelude_open: false,
                 };
                 let nested = StyleSheetParser::new(input, &mut parser)
                     .flatten()
@@ -374,6 +382,7 @@ impl<'i> cssparser::AtRuleParser<'i> for CssRuleParser {
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
                     media_environment: self.media_environment,
+                    namespace_prelude_open: false,
                 };
                 let nested = StyleSheetParser::new(input, &mut parser)
                     .flatten()
@@ -403,6 +412,7 @@ impl<'i> cssparser::AtRuleParser<'i> for CssRuleParser {
                     current_layer: Some(layer_name),
                     current_scopes: self.current_scopes.clone(),
                     media_environment: self.media_environment,
+                    namespace_prelude_open: false,
                 };
                 let nested = StyleSheetParser::new(input, &mut parser)
                     .flatten()
@@ -420,6 +430,7 @@ impl<'i> cssparser::AtRuleParser<'i> for CssRuleParser {
                     current_layer: self.current_layer.clone(),
                     current_scopes,
                     media_environment: self.media_environment,
+                    namespace_prelude_open: false,
                 };
                 let nested = StyleSheetParser::new(input, &mut parser)
                     .flatten()
@@ -437,6 +448,35 @@ impl<'i> cssparser::AtRuleParser<'i> for CssRuleParser {
                     .map(ParsedCssRule::Keyframes)
                     .unwrap_or(ParsedCssRule::Ignored))
             }
+            AtRulePrelude::FontFace => {
+                let body = consume_remaining_input(input);
+                Ok(
+                    parse_font_face_rule(&body, self.base_url.as_ref(), self.root_url.as_ref())
+                        .map(ParsedCssRule::FontFace)
+                        .unwrap_or(ParsedCssRule::Ignored),
+                )
+            }
+            AtRulePrelude::CounterStyle(name) => {
+                let body = consume_remaining_input(input);
+                Ok(parse_counter_style_rule(&name, &body)
+                    .map(ParsedCssRule::CounterStyle)
+                    .unwrap_or(ParsedCssRule::Ignored))
+            }
+            AtRulePrelude::FontFeatureValues(prelude) => {
+                let block = consume_remaining_input(input);
+                Ok(ParsedCssRule::FontFeatureValues(FontFeatureValuesRule {
+                    prelude,
+                    block,
+                    layer: self.current_layer.clone(),
+                    order: 0,
+                }))
+            }
+            AtRulePrelude::FontPaletteValues(prelude) => {
+                let block = consume_remaining_input(input);
+                Ok(parse_font_palette_rule(&prelude, &block)
+                    .map(|(name, definition)| ParsedCssRule::FontPaletteValues(name, definition))
+                    .unwrap_or(ParsedCssRule::Ignored))
+            }
             AtRulePrelude::Container(prelude) => {
                 let mut parser = CssRuleParser {
                     base_url: self.base_url.clone(),
@@ -446,6 +486,7 @@ impl<'i> cssparser::AtRuleParser<'i> for CssRuleParser {
                     current_layer: self.current_layer.clone(),
                     current_scopes: self.current_scopes.clone(),
                     media_environment: self.media_environment,
+                    namespace_prelude_open: false,
                 };
                 let nested = StyleSheetParser::new(input, &mut parser)
                     .flatten()
@@ -476,6 +517,10 @@ pub(in crate::css) enum AtRulePrelude {
     Scope(Option<ScopeRule>),
     Page(String),
     Keyframes(String),
+    FontFace,
+    CounterStyle(String),
+    FontFeatureValues(String),
+    FontPaletteValues(String),
     Container(String),
     Ignored,
 }
@@ -493,10 +538,16 @@ fn collect_container_style_rules(rule: ParsedCssRule, rules: &mut Vec<StyleRule>
         | ParsedCssRule::AfterMarker(_)
         | ParsedCssRule::Before(_)
         | ParsedCssRule::After(_)
+        | ParsedCssRule::FootnoteCall(_)
+        | ParsedCssRule::FootnoteMarker(_)
         | ParsedCssRule::FirstLine(_)
         | ParsedCssRule::FirstLetter(_)
         | ParsedCssRule::Container(_)
         | ParsedCssRule::Keyframes(_)
+        | ParsedCssRule::FontFace(_)
+        | ParsedCssRule::CounterStyle(_)
+        | ParsedCssRule::FontFeatureValues(_)
+        | ParsedCssRule::FontPaletteValues(_, _)
         | ParsedCssRule::Ignored => {}
     }
 }
@@ -761,6 +812,7 @@ fn media_feature_evaluation(
     let Some((name, value)) = feature.split_once(':') else {
         return match feature.to_ascii_lowercase().as_str() {
             "color" | "height" | "width" | "scripting" => MediaQueryEvaluation::Matches,
+            "forced-colors" => matches_media_value(media_environment.forced_colors.is_active()),
             "monochrome" | "grid" => MediaQueryEvaluation::DoesNotMatch,
             _ if feature
                 .bytes()
@@ -783,6 +835,11 @@ fn media_feature_evaluation(
         "color-gamut" => match value.as_str() {
             "srgb" => MediaQueryEvaluation::Matches,
             "p3" | "rec2020" => MediaQueryEvaluation::DoesNotMatch,
+            _ => MediaQueryEvaluation::Invalid,
+        },
+        "forced-colors" => match value.as_str() {
+            "active" => matches_media_value(media_environment.forced_colors.is_active()),
+            "none" => matches_media_value(!media_environment.forced_colors.is_active()),
             _ => MediaQueryEvaluation::Invalid,
         },
         "orientation" => match value.as_str() {
@@ -1138,27 +1195,190 @@ pub(in crate::css) fn supports_condition_applies_with_selector_parser(
     prelude: &str,
     selector_parser: &QuireSelectorParser,
 ) -> bool {
-    let condition = strip_enclosing_parentheses(prelude.trim());
-    if condition.is_empty() {
-        return false;
+    parse_supports_condition(prelude, selector_parser).is_some_and(|condition| condition.applies())
+}
+
+/// A parsed CSS Conditional Rules support condition.
+///
+/// Keeping the syntax tree separate from evaluation is important here: an
+/// invalid condition is not a false declaration test which may be negated;
+/// it invalidates the containing `@supports` rule.
+/// <https://www.w3.org/TR/css-conditional-3/#at-supports>
+enum SupportsCondition {
+    Value(bool),
+    Not(Box<Self>),
+    And(Vec<Self>),
+    Or(Vec<Self>),
+}
+
+impl SupportsCondition {
+    fn applies(&self) -> bool {
+        match self {
+            Self::Value(value) => *value,
+            Self::Not(condition) => !condition.applies(),
+            Self::And(conditions) => conditions.iter().all(Self::applies),
+            Self::Or(conditions) => conditions.iter().any(Self::applies),
+        }
     }
-    if let Some(rest) = strip_ascii_word_prefix(condition, "not") {
-        return !supports_condition_applies_with_selector_parser(rest, selector_parser);
+}
+
+fn parse_supports_condition(
+    prelude: &str,
+    selector_parser: &QuireSelectorParser,
+) -> Option<SupportsCondition> {
+    parse_supports_condition_component(prelude.trim(), selector_parser, true)
+}
+
+fn parse_supports_condition_component(
+    value: &str,
+    selector_parser: &QuireSelectorParser,
+    allow_selector_function: bool,
+) -> Option<SupportsCondition> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
     }
-    let or_parts = split_top_level_keyword(condition, "or");
-    if or_parts.len() > 1 {
-        return or_parts
-            .into_iter()
-            .any(|part| supports_condition_applies_with_selector_parser(part, selector_parser));
+
+    if let Some(rest) = strip_supports_not_prefix(value) {
+        return Some(SupportsCondition::Not(Box::new(
+            parse_supports_condition_component(rest, selector_parser, false)?,
+        )));
     }
-    let and_parts = split_top_level_keyword(condition, "and");
+
+    if allow_selector_function
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+    {
+        return supports_selector_condition(value, selector_parser)
+            .then_some(SupportsCondition::Value(true));
+    }
+
+    if supports_condition_mixes_logical_keywords(value) {
+        return None;
+    }
+    if let Some(condition) = parse_supports_logical_condition(value, selector_parser) {
+        return Some(condition);
+    }
+
+    if !value.starts_with('(') {
+        return None;
+    }
+    let close = matching_parenthesis(value, 0)?;
+    if !value[close + 1..].trim().is_empty() {
+        return None;
+    }
+    parse_supports_in_parens(&value[1..close], selector_parser)
+}
+
+fn parse_supports_in_parens(
+    value: &str,
+    selector_parser: &QuireSelectorParser,
+) -> Option<SupportsCondition> {
+    let value = value.trim();
+    if supports_condition_mixes_logical_keywords(value) {
+        return None;
+    }
+    if let Some(condition) = parse_supports_logical_condition(value, selector_parser) {
+        return Some(condition);
+    }
+    if let Some(rest) = strip_supports_not_prefix(value) {
+        return Some(SupportsCondition::Not(Box::new(
+            parse_supports_condition_component(rest, selector_parser, false)?,
+        )));
+    }
+    Some(SupportsCondition::Value(supports_declaration_condition(
+        value,
+    )))
+}
+
+/// Parse one top-level CSS Conditional Rules logical sequence.
+///
+/// A feature query's outermost `and` or `or` sequence is not itself wrapped
+/// in parentheses: `(writing-mode: vertical-lr) and (direction: rtl)` is the
+/// standard spelling. Parentheses merely delimit the declaration tests, so
+/// recognizing logical keywords only after stripping an enclosing pair
+/// incorrectly rejects valid unwrapped sequences.
+/// <https://www.w3.org/TR/css-conditional-3/#at-supports>
+fn parse_supports_logical_condition(
+    value: &str,
+    selector_parser: &QuireSelectorParser,
+) -> Option<SupportsCondition> {
+    let and_parts = split_supports_logical_keyword(value, "and");
+    let or_parts = split_supports_logical_keyword(value, "or");
     if and_parts.len() > 1 {
         return and_parts
             .into_iter()
-            .all(|part| supports_condition_applies_with_selector_parser(part, selector_parser));
+            .map(|part| parse_supports_condition_component(part, selector_parser, false))
+            .collect::<Option<Vec<_>>>()
+            .map(SupportsCondition::And);
     }
-    supports_selector_condition(condition, selector_parser)
-        || supports_declaration_condition(condition)
+    if or_parts.len() > 1 {
+        return or_parts
+            .into_iter()
+            .map(|part| parse_supports_condition_component(part, selector_parser, false))
+            .collect::<Option<Vec<_>>>()
+            .map(SupportsCondition::Or);
+    }
+    None
+}
+
+fn supports_condition_mixes_logical_keywords(value: &str) -> bool {
+    split_supports_logical_keyword(value, "and").len() > 1
+        && split_supports_logical_keyword(value, "or").len() > 1
+}
+
+/// CSS Conditional's logical keywords are identifiers, not generic word
+/// boundaries.  They therefore need whitespace on both sides; `or(` is a
+/// functional notation token rather than the `or` combinator.
+fn split_supports_logical_keyword<'a>(value: &'a str, keyword: &str) -> Vec<&'a str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let bytes = value.as_bytes();
+    let keyword = keyword.as_bytes();
+    let mut index = 0;
+    while index + keyword.len() <= bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += usize::from(bytes[index] == b'\\') + 1;
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ if depth == 0
+                && bytes[index..].starts_with(keyword)
+                && index > 0
+                && bytes[index - 1].is_ascii_whitespace()
+                && bytes
+                    .get(index + keyword.len())
+                    .is_some_and(|byte| byte.is_ascii_whitespace()) =>
+            {
+                parts.push(value[start..index].trim());
+                start = index + keyword.len();
+                index = start;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    parts.push(value[start..].trim());
+    parts
+}
+
+fn strip_supports_not_prefix(value: &str) -> Option<&str> {
+    let rest = value
+        .strip_prefix("not")
+        .or_else(|| value.strip_prefix("NOT"))?;
+    let whitespace = rest.chars().next()?.is_ascii_whitespace();
+    whitespace
+        .then_some(rest.trim_start())
+        .filter(|rest| !rest.is_empty())
 }
 
 /// Evaluates CSS Conditional `@supports selector(...)` with the selector parser.
@@ -1181,22 +1401,55 @@ pub(in crate::css) fn supports_selector_condition(
     if !after_selector.trim().is_empty() {
         return false;
     }
-    parse_scope_selector(selector, selector_parser).is_some()
+    parse_scope_selector(selector, selector_parser)
+        .is_some_and(|selector| selector.slice().len() == 1)
 }
 
-pub(in crate::css) fn supports_declaration_condition(condition: &str) -> bool {
-    let declaration = strip_enclosing_parentheses(condition.trim());
-    let Some((name, value)) = declaration.split_once(':') else {
-        return false;
-    };
-    let raw_name = name.trim();
+/// A declaration accepted by Quire's specified-value-time declaration parser.
+///
+/// Keeping this operation separate from the cascade order lets normal rules
+/// and CSS Conditional feature queries share the same property grammar.
+/// CSS Conditional Rules evaluates the declaration at specified-value time,
+/// before a `var()` reference is substituted:
+/// <https://www.w3.org/TR/css-conditional-3/#at-supports>.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::css) struct DeclarationOperation {
+    pub(in crate::css) name: String,
+    pub(in crate::css) value: String,
+}
+
+/// The specified-value-time result of parsing one declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::css) enum DeclarationParseResult {
+    UnsupportedProperty,
+    InvalidValue,
+    Valid(DeclarationOperation),
+}
+
+/// Parses one normal declaration using the grammar shared by the cascade and
+/// `@supports (property: value)`.
+///
+/// This is intentionally the one property/value acceptance boundary. The
+/// cascade consumes the `Valid` operation, while a declaration feature query
+/// only observes whether it is valid.
+pub(in crate::css) fn parse_canonical_declaration(
+    raw_name: &str,
+    raw_value: &str,
+) -> DeclarationParseResult {
+    let raw_name = raw_name.trim();
+    let value = raw_value.trim();
     if raw_name.is_empty()
         || (value.is_empty() && !is_custom_property_name(raw_name))
         || !declaration_priority_is_valid(value)
     {
-        return false;
+        return DeclarationParseResult::InvalidValue;
     }
-    let name = raw_name.to_ascii_lowercase();
+    let name = match raw_name.to_ascii_lowercase().as_str() {
+        // CSSOM-compatible alias; the cascade has one canonical flex-basis
+        // slot, so feature queries must ask about that same operation.
+        "-webkit-flex-basis" => "flex-basis".to_string(),
+        _ => raw_name.to_ascii_lowercase(),
+    };
 
     // Custom properties accept any sequence of component values, except for
     // the declaration-level syntax restrictions. Their names are
@@ -1210,43 +1463,59 @@ pub(in crate::css) fn supports_declaration_condition(condition: &str) -> bool {
     // <https://www.w3.org/TR/css-variables-1/#using-variables>
     // <https://www.w3.org/TR/css-conditional-3/#at-supports>
     let Some(contains_variable_reference) = validate_component_values(value, false, true) else {
-        return false;
+        return DeclarationParseResult::InvalidValue;
     };
     if is_custom_property_name(raw_name) {
-        return true;
+        return DeclarationParseResult::Valid(DeclarationOperation {
+            name: raw_name.to_string(),
+            value: value.to_string(),
+        });
     }
     if contains_variable_reference {
-        return supported_property_name(&name);
+        return declaration_operation_for_modeled_property(&name, value);
     }
 
     let value = trim_css_value(value);
     if value.is_empty() {
-        return false;
+        return DeclarationParseResult::InvalidValue;
     }
-    match name.as_str() {
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+    ) {
+        return declaration_operation_for_modeled_property(&name, value);
+    }
+    let valid = match name.as_str() {
         "display" => supports_display_value(value),
         "direction" => matches!(value.to_ascii_lowercase().as_str(), "ltr" | "rtl"),
         "unicode-bidi" => matches!(
             value.to_ascii_lowercase().as_str(),
             "normal" | "embed" | "isolate" | "bidi-override" | "isolate-override" | "plaintext"
         ),
-        "writing-mode" => matches!(
-            value.to_ascii_lowercase().as_str(),
-            "horizontal-tb" | "vertical-rl" | "vertical-lr"
-        ),
+        "writing-mode" => parse_writing_mode(value).is_some(),
         "text-orientation" => matches!(
             value.to_ascii_lowercase().as_str(),
             "mixed" | "upright" | "sideways"
         ),
+        "text-combine-upright" => parse_text_combine_upright(value).is_some(),
         "text-align" => supports_text_align_value(value),
         "text-align-all" => supports_text_align_all_value(value),
         "text-align-last" => supports_text_align_last_value(value),
         "text-autospace" => supports_text_autospace_value(value),
+        "text-spacing-trim" => supports_text_spacing_trim_value(value),
+        "text-spacing" => supports_text_spacing_value(value),
         "word-space-transform" => supports_word_space_transform_value(value),
         "initial-letter" => parse_initial_letter(value).is_some(),
         "initial-letter-align" => parse_initial_letter_align(value).is_some(),
         "initial-letter-wrap" => parse_initial_letter_wrap(value, 12.0).is_some(),
         "text-transform" => supports_text_transform_value(value),
+        "text-wrap" => text_wrap_value_is_valid(value),
+        "text-wrap-mode" => matches!(value.to_ascii_lowercase().as_str(), "wrap" | "nowrap"),
+        "text-wrap-style" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "auto" | "balance" | "stable"
+        ),
+        "wrap-inside" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "avoid"),
         "tab-size" => parse_tab_size(value, 12.0).is_some(),
         "text-decoration" => supports_text_decoration_value(value),
         "text-decoration-line" => supports_text_decoration_line_value(value),
@@ -1289,6 +1558,7 @@ pub(in crate::css) fn supports_declaration_condition(condition: &str) -> bool {
         }
         "font" => parse_font_shorthand(value, 12.0, FontWeight::NORMAL).is_some(),
         "font-feature-settings" => parse_font_feature_settings(value).is_some(),
+        "font-variation-settings" => parse_font_variation_settings(value).is_some(),
         "font-palette" => parse_font_palette(value).is_some(),
         "font-synthesis" => parse_font_synthesis(value).is_some(),
         "font-synthesis-weight"
@@ -1296,6 +1566,9 @@ pub(in crate::css) fn supports_declaration_condition(condition: &str) -> bool {
         | "font-synthesis-small-caps"
         | "font-synthesis-position" => parse_font_synthesis_subproperty(value).is_some(),
         "font-kerning" => parse_font_kerning(value).is_some(),
+        "font-weight" => parse_font_weight(value, FontWeight::NORMAL).is_some(),
+        "font-style" => parse_font_style(value).is_some(),
+        "font-width" | "font-stretch" => parse_font_width(value).is_some(),
         "font-size-adjust" => parse_font_size_adjust(value).is_some(),
         "font-variant" => parse_font_variant(value).is_some(),
         "font-variant-ligatures" => parse_font_variant_ligatures(value).is_some(),
@@ -1321,49 +1594,58 @@ pub(in crate::css) fn supports_declaration_condition(condition: &str) -> bool {
         "baseline-shift" => parse_baseline_shift(value, 12.0).is_some(),
         "margin-block" | "margin-inline" => supports_box_edge_axis_value(value, true),
         "padding-block" | "padding-inline" => supports_box_edge_axis_value(value, false),
-        "color"
-        | "background-color"
-        | "background-origin"
-        | "background-clip"
-        | "border-color"
-        | "border-top-color"
+        "color" | "background-color" => {
+            parse_color(value).is_some()
+                || crate::css::parse_color_from_currentcolor(value, CssColor::BLACK).is_some()
+        }
+        "background-origin" => background_box_list_is_valid(value, false),
+        "background-clip" => background_box_list_is_valid(value, true),
+        "border-color" => parse_border_colors(value, CssColor::BLACK).is_some(),
+        "border-top-color"
         | "border-right-color"
         | "border-bottom-color"
         | "border-left-color"
-        | "border-block-color"
         | "border-block-start-color"
         | "border-block-end-color"
-        | "border-inline-color"
         | "border-inline-start-color"
-        | "border-inline-end-color" => parse_color(value).is_some(),
-        "font-size"
-        | "width"
-        | "height"
-        | "inline-size"
-        | "block-size"
-        | "min-width"
-        | "max-width"
-        | "min-height"
-        | "max-height"
-        | "min-inline-size"
-        | "max-inline-size"
-        | "min-block-size"
-        | "max-block-size"
-        | "left"
-        | "top"
-        | "right"
-        | "bottom"
-        | "margin"
-        | "margin-top"
+        | "border-inline-end-color" => parse_border_color(value, CssColor::BLACK).is_some(),
+        "border-block-color" | "border-inline-color" => {
+            component_list_is_valid(value, 1..=2, |part| {
+                parse_border_color(part, CssColor::BLACK).is_some()
+            })
+        }
+        "font-size" => parse_deferred_font_size(value).is_some(),
+        "width" | "height" | "inline-size" | "block-size" | "min-width" | "max-width"
+        | "min-height" | "max-height" | "min-inline-size" | "max-inline-size"
+        | "min-block-size" | "max-block-size" => {
+            value.eq_ignore_ascii_case("none")
+                || parse_computed_box_size(
+                    value,
+                    crate::css::ROOT_FONT_SIZE_PT,
+                    crate::css::ROOT_FONT_SIZE_PT,
+                )
+                .is_some()
+        }
+        "left" | "top" | "right" | "bottom" => {
+            parse_computed_length_percentage_auto(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
+        }
+        "margin" => component_list_is_valid(value, 1..=4, |part| {
+            parse_computed_length_percentage_auto(part, crate::css::ROOT_FONT_SIZE_PT).is_some()
+        }),
+        "margin-top"
         | "margin-right"
         | "margin-bottom"
         | "margin-left"
         | "margin-block-start"
         | "margin-block-end"
         | "margin-inline-start"
-        | "margin-inline-end"
-        | "padding"
-        | "padding-top"
+        | "margin-inline-end" => {
+            parse_computed_length_percentage_auto(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
+        }
+        "padding" => component_list_is_valid(value, 1..=4, |part| {
+            parse_computed_length_percentage(part, crate::css::ROOT_FONT_SIZE_PT).is_some()
+        }),
+        "padding-top"
         | "padding-right"
         | "padding-bottom"
         | "padding-left"
@@ -1373,6 +1655,21 @@ pub(in crate::css) fn supports_declaration_condition(condition: &str) -> bool {
         | "padding-inline-end" => {
             parse_computed_length_percentage(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
         }
+        "outline-offset" => parse_computed_length_percentage(value, crate::css::ROOT_FONT_SIZE_PT)
+            .is_some_and(|length| !length.contains_percentage()),
+        "border-shape" => parse_border_shape(value, crate::css::ROOT_FONT_SIZE_PT).is_some(),
+        "outline"
+        | "border"
+        | "border-top"
+        | "border-right"
+        | "border-bottom"
+        | "border-left"
+        | "border-block"
+        | "border-inline"
+        | "border-block-start"
+        | "border-block-end"
+        | "border-inline-start"
+        | "border-inline-end" => border_shorthand_is_valid(value),
         "border-width" => supports_border_width_list(value, 4),
         "border-block-width" | "border-inline-width" => supports_border_width_list(value, 2),
         "outline-width" => supports_border_width_value(value),
@@ -1388,7 +1685,8 @@ pub(in crate::css) fn supports_declaration_condition(condition: &str) -> bool {
             supports_gap_value(value)
         }
         "column-rule" | "row-rule" | "rule" => {
-            parse_gap_rule_shorthand(value, crate::css::ROOT_FONT_SIZE_PT, Color::BLACK).is_some()
+            parse_gap_rule_shorthand(value, crate::css::ROOT_FONT_SIZE_PT, CssColor::BLACK)
+                .is_some()
         }
         "column-rule-width" | "row-rule-width" | "rule-width" => {
             parse_gap_rule_width_list(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
@@ -1397,7 +1695,7 @@ pub(in crate::css) fn supports_declaration_condition(condition: &str) -> bool {
             parse_gap_rule_style_list(value).is_some()
         }
         "column-rule-color" | "row-rule-color" | "rule-color" => {
-            parse_gap_rule_color_list(value, Color::BLACK).is_some()
+            parse_gap_rule_color_list(value, CssColor::BLACK).is_some()
         }
         "column-rule-break" | "row-rule-break" | "rule-break" => {
             parse_gap_rule_break(value).is_some()
@@ -1431,10 +1729,13 @@ pub(in crate::css) fn supports_declaration_condition(condition: &str) -> bool {
         | "row-rule-inset-junction-end" => {
             parse_gap_rule_inset_value(value, crate::css::ROOT_FONT_SIZE_PT).is_some()
         }
-        "position" => matches!(
-            value.to_ascii_lowercase().as_str(),
-            "static" | "relative" | "absolute" | "fixed" | "sticky"
-        ),
+        "position" => {
+            parse_running_position(value).is_some()
+                || matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "static" | "relative" | "absolute" | "fixed" | "sticky"
+                )
+        }
         "isolation" => matches!(value.to_ascii_lowercase().as_str(), "auto" | "isolate"),
         "mix-blend-mode" => matches!(
             value.to_ascii_lowercase().as_str(),
@@ -1501,14 +1802,127 @@ pub(in crate::css) fn supports_declaration_condition(condition: &str) -> bool {
         ),
         "float" => matches!(
             value.to_ascii_lowercase().as_str(),
-            "left" | "right" | "inline-start" | "inline-end" | "none"
+            "left" | "right" | "inline-start" | "inline-end" | "footnote" | "none"
+        ),
+        "footnote-display" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "block" | "inline" | "compact"
+        ),
+        "footnote-policy" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "auto" | "line" | "block"
         ),
         "clear" => matches!(
             value.to_ascii_lowercase().as_str(),
             "left" | "right" | "both" | "inline-start" | "inline-end" | "none"
         ),
         _ => supported_property_name(&name),
+    };
+    if valid {
+        DeclarationParseResult::Valid(DeclarationOperation {
+            name,
+            value: value.to_string(),
+        })
+    } else if supported_property_name(&name) {
+        DeclarationParseResult::InvalidValue
+    } else {
+        DeclarationParseResult::UnsupportedProperty
     }
+}
+
+fn declaration_operation_for_modeled_property(name: &str, value: &str) -> DeclarationParseResult {
+    if supported_property_name(name) {
+        DeclarationParseResult::Valid(DeclarationOperation {
+            name: name.to_string(),
+            value: value.to_string(),
+        })
+    } else {
+        DeclarationParseResult::UnsupportedProperty
+    }
+}
+
+/// Validates a whitespace-separated component list without splitting CSS
+/// functions, strings, or bracketed blocks.
+fn component_list_is_valid(
+    value: &str,
+    allowed_count: std::ops::RangeInclusive<usize>,
+    mut component_is_valid: impl FnMut(&str) -> bool,
+) -> bool {
+    let components = split_css_component_values(value);
+    allowed_count.contains(&components.len()) && components.into_iter().all(&mut component_is_valid)
+}
+
+/// Validates the comma-separated box lists accepted by the background origin
+/// and clip longhands. A positioning box excludes the Level 4 `border-area`
+/// keyword, while clipping accepts it.
+fn background_box_list_is_valid(value: &str, allow_border_area: bool) -> bool {
+    let values = split_css_args(value, ',');
+    !values.is_empty()
+        && values.into_iter().all(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "border-box" | "padding-box" | "content-box"
+            ) || (allow_border_area && value.trim().eq_ignore_ascii_case("border-area"))
+        })
+}
+
+/// Validates the unordered width/style/color components shared by `border`
+/// and `outline`. The parser used by cascade application supplies omitted
+/// components from their initial values, so an empty component list is the
+/// only rejected form here.
+fn border_shorthand_is_valid(value: &str) -> bool {
+    let mut width = false;
+    let mut style = false;
+    let mut color = false;
+    let components = split_css_component_values(value);
+    !components.is_empty()
+        && components.into_iter().all(|component| {
+            if !width
+                && parse_computed_border_width(component, crate::css::ROOT_FONT_SIZE_PT).is_some()
+            {
+                width = true;
+                return true;
+            }
+            if !style && parse_border_style(component).is_some() {
+                style = true;
+                return true;
+            }
+            if !color && parse_border_color(component, CssColor::BLACK).is_some() {
+                color = true;
+                return true;
+            }
+            false
+        })
+}
+
+/// Validates `text-wrap: <text-wrap-mode> || <text-wrap-style>`.
+fn text_wrap_value_is_valid(value: &str) -> bool {
+    let mut mode = false;
+    let mut style = false;
+    component_list_is_valid(value, 1..=2, |component| {
+        match component.to_ascii_lowercase().as_str() {
+            "wrap" | "nowrap" if !mode => {
+                mode = true;
+                true
+            }
+            "auto" | "balance" | "stable" if !style => {
+                style = true;
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
+pub(in crate::css) fn supports_declaration_condition(condition: &str) -> bool {
+    let declaration = strip_enclosing_parentheses(condition.trim());
+    let Some((name, value)) = declaration.split_once(':') else {
+        return false;
+    };
+    matches!(
+        parse_canonical_declaration(name, value),
+        DeclarationParseResult::Valid(_)
+    )
 }
 
 /// Returns whether a name is a CSS custom-property name.

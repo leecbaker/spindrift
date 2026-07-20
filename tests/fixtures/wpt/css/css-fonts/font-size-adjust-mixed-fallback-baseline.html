@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset=utf-8>
+<style>
+@page { size: 160px 80px; margin: 0 }
+@font-face {
+  font-family: FirstAhem;
+  src: url("Ahem.ttf");
+  unicode-range: U+0058;
+  ascent-override: 100%;
+}
+@font-face {
+  font-family: SecondAhem;
+  src: url("../../../../../weasyprint-samples/invoice/SourceSans3-Regular.ttf");
+  unicode-range: U+0059;
+}
+body { margin: 0 }
+.sample {
+  font: 20px/1 FirstAhem, SecondAhem;
+  font-size-adjust: ex-height 0.8;
+}
+</style>
+<div class=sample>XY</div>

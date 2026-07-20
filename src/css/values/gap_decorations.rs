@@ -4,7 +4,7 @@ use super::*;
 pub(crate) struct ParsedGapRuleShorthand {
     pub(crate) widths: GapRuleList<ComputedLengthPercentage>,
     pub(crate) styles: GapRuleList<BorderStyle>,
-    pub(crate) colors: GapRuleList<Color>,
+    pub(crate) colors: GapRuleList<CssColor>,
 }
 
 /// Parses CSS Gaps Level 1 `*-rule-width` list values.
@@ -34,8 +34,8 @@ pub(crate) fn parse_gap_rule_style_list(value: &str) -> Option<GapRuleList<Borde
 /// <https://drafts.csswg.org/css-gaps-1/#column-row-rule-color>.
 pub(crate) fn parse_gap_rule_color_list(
     value: &str,
-    current_color: Color,
-) -> Option<GapRuleList<Color>> {
+    current_color: CssColor,
+) -> Option<GapRuleList<CssColor>> {
     parse_gap_rule_list(value, |token| parse_border_color(token, current_color))
 }
 
@@ -78,7 +78,7 @@ pub(crate) fn parse_gap_rule_inset_value(value: &str, font_size: f32) -> Option<
 pub(crate) fn parse_gap_rule_shorthand(
     value: &str,
     font_size: f32,
-    current_color: Color,
+    current_color: CssColor,
 ) -> Option<ParsedGapRuleShorthand> {
     let rule_components = parse_gap_rule_list(value, |token| {
         parse_single_gap_rule(token, font_size, current_color)
@@ -103,13 +103,13 @@ pub(crate) fn parse_gap_rule_shorthand(
 struct SingleGapRule {
     width: Option<ComputedLengthPercentage>,
     style: Option<BorderStyle>,
-    color: Option<Color>,
+    color: Option<CssColor>,
 }
 
 fn parse_single_gap_rule(
     value: &str,
     font_size: f32,
-    current_color: Color,
+    current_color: CssColor,
 ) -> Option<SingleGapRule> {
     let mut width = None;
     let mut style = None;
@@ -271,7 +271,7 @@ fn map_gap_rule_component<T, U>(
 }
 
 fn split_top_level_commas(value: &str) -> Vec<&str> {
-    split_top_level(value, ',')
+    crate::css::component_values::split_css_top_level_delimiter(value, ',')
         .into_iter()
         .map(trim_css_value)
         .filter(|part| !part.is_empty())
@@ -279,61 +279,5 @@ fn split_top_level_commas(value: &str) -> Vec<&str> {
 }
 
 fn split_top_level_once(value: &str, delimiter: char) -> Option<(&str, &str)> {
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in value.char_indices() {
-        if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '"' | '\'' => quote = Some(ch),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            _ if ch == delimiter && depth == 0 => {
-                return Some((&value[..index], &value[index + ch.len_utf8()..]));
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn split_top_level(value: &str, delimiter: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    let mut start = 0usize;
-    for (index, ch) in value.char_indices() {
-        if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '"' | '\'' => quote = Some(ch),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            _ if ch == delimiter && depth == 0 => {
-                parts.push(&value[start..index]);
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(&value[start..]);
-    parts
+    crate::css::component_values::split_css_top_level_once(value, delimiter)
 }

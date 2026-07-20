@@ -67,7 +67,14 @@ where block sizing interacts with margin collapse.
   `page-break-*` properties remain page-only.
 - Same-page non-positioned `overflow:hidden`/`clip` block containers clip
   descendants to the used padding box, including auto-height blocks whose
-  block-end clip edge is only known after child layout.
+  block-end clip edge is only known after child layout. Auto-height clipped
+  blocks continue their normal-flow descendants through later pages; only a
+  definite clipped block size establishes a monolithic fragmentation boundary.
+  Nonzero border radii defer this clip until final paint, preserving descendant
+  geometry for rounded, CSS Borders 4 `corner-shape`, and supported single
+  circular `border-shape` contours. A circular `border-shape` clips
+  descendants at the inner stroke edge while keeping the box's own border and
+  background outside that overflow scope.
 - Normal-flow block formatting context roots next to active floats avoid by
   border box, not margin box. Auto-width roots can narrow to the float-free
   band without horizontal margins forcing placement below the float, and

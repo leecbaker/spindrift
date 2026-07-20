@@ -67,7 +67,9 @@ pub(in crate::layout) fn inline_atom_boundary_role(
         }
         InlineAtomContent::InlineBox { .. }
         | InlineAtomContent::TextCombineUpright { .. }
-        | InlineAtomContent::InlineFragment(_) => InlineBoundaryRole::IndependentFormattingContext,
+        | InlineAtomContent::InlineFragment { .. } => {
+            InlineBoundaryRole::IndependentFormattingContext
+        }
         InlineAtomContent::Canvas
         | InlineAtomContent::Iframe(_)
         | InlineAtomContent::Image(_)

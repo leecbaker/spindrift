@@ -175,7 +175,12 @@ impl<'a> LayoutBuilder<'a> {
         });
 
         if let Some(width) = resolved_width {
-            let width = table_content_width_clamped_to_min_content(style, width, min_content);
+            let width = table_content_width_clamped_to_min_content(
+                style,
+                LogicalInlineContentSize::new(content_box_pt(width)),
+                LogicalInlineContentSize::new(content_box_pt(min_content)),
+            )
+            .points();
             (width, width)
         } else {
             (min_content, max_content)
@@ -290,8 +295,8 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             &input.columns,
-            table_width.content_width.points(),
-            !table_root_inline_size(style).is_auto(),
+            LogicalInlineContentSize::new(table_width.content_width),
+            table_root_distributes_extra_inline_space(style),
             table_cellpadding,
             table_metrics.clone(),
             collapsed_geometry.as_ref(),
@@ -346,6 +351,27 @@ impl<'a> LayoutBuilder<'a> {
         if rows.is_empty() {
             return None;
         }
+        // Normal table layout enters through `layout_table_box`, which
+        // places the table element in the selector ancestor chain before any
+        // table-part style is resolved. An inline table builds the same
+        // formatting context directly as an atomic fragment, so retain that
+        // source context explicitly for every sizing and paint pass. Without
+        // it, selector state such as `:dir(rtl)` can resolve against the
+        // outer inline container while the inherited cell direction is RTL,
+        // splitting cell background and text coordinates.
+        // <https://drafts.csswg.org/selectors-4/#the-dir-pseudo>
+        // <https://drafts.csswg.org/css-display-3/#valdef-display-inline-table>
+        let ancestor_depth = self.ancestors.len();
+        self.push_ancestor_signature(element_signature(element));
+        // Inline-table sizing may lay out table cells to obtain intrinsic
+        // column and row contributions. Those probes are speculative: they
+        // must not leave paint or other page state on the containing inline
+        // formatting context before the atom's isolated fragment is built.
+        // Take this snapshot before the first probe, rather than only around
+        // the final scratch layout below.
+        // <https://drafts.csswg.org/css-tables-3/#table-layout>
+        // <https://drafts.csswg.org/css-display-3/#valdef-display-inline-table>
+        let measurement_snapshot = self.snapshot();
         let grid = table_grid(rows);
         let available_width =
             (self.content_right - self.content_left - style.margin.left - style.margin.right)
@@ -385,14 +411,15 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             &input.columns,
-            table_width.content_width.points(),
-            !table_root_inline_size(style).is_auto(),
+            LogicalInlineContentSize::new(table_width.content_width),
+            table_root_distributes_extra_inline_space(style),
             table_cellpadding,
             table_metrics.clone(),
             collapsed_geometry.as_ref(),
         );
         let content_width = column_plan
             .total_width()
+            .points()
             .min(available_width)
             .max(style.font_size);
         let top = 10_000.0;
@@ -412,11 +439,51 @@ impl<'a> LayoutBuilder<'a> {
         let table_height_plan = self.table_height_plan(&table_context);
         let planned_row_heights = table_height_plan.final_row_heights();
         let planned_row_occupancy = table_height_plan.row_occupancy();
+        // The inline-table atom is placed in its parent's physical inline
+        // axis.  For a vertical table root, that is the root's logical block
+        // span, not its column (logical inline) span.
+        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+        // <https://www.w3.org/TR/CSS2/tables.html#table-display>
+        let physical_atom_inline_size = if style.writing_mode.has_vertical_lines() {
+            table_content_height(
+                &planned_row_heights,
+                &planned_row_occupancy,
+                table_metrics.clone(),
+            )
+            .max(style.font_size)
+        } else {
+            content_width
+        };
+        // An inline-table baseline is the first row baseline only when that
+        // row exposes one in the inline-table's physical baseline axis. An
+        // orthogonal cell's inline baseline is horizontal, so treating its
+        // painted vertical text line as a physical-Y row baseline makes two
+        // otherwise identical inline tables align at unrelated heights.
+        // <https://www.w3.org/TR/CSS2/tables.html#table-display>
+        // <https://drafts.csswg.org/css-align-3/#baseline-align-content>
+        let first_row_baseline_offset = planned_row_occupancy
+            .iter()
+            .position(|occupied| *occupied)
+            .and_then(|row_index| {
+                let row = &rows[row_index];
+                let row_style = self.style_for_table_row(row, style, stylesheets);
+                self.table_row_inline_baseline_offset(
+                    row_index,
+                    row,
+                    &grid.rows[row_index],
+                    &row_style,
+                    stylesheets,
+                    table_cellpadding,
+                    &column_plan,
+                    table_metrics.clone(),
+                    collapsed_geometry.as_ref(),
+                )
+            });
         let top_caption_height = self.estimate_table_captions_height(
             &input.captions,
             style,
             stylesheets,
-            content_width,
+            PhysicalContentWidth::new(content_box_pt(content_width)),
             CaptionSide::Top,
         );
         let first_row_baseline_range = inline_table_first_occupying_row_range(
@@ -428,21 +495,49 @@ impl<'a> LayoutBuilder<'a> {
             &planned_row_occupancy,
             table_metrics,
         );
-        let table_strut_baseline_offset = self
+        let table_rendered_baseline_adjustment = self
             .font_system
             .rendered_first_line_baseline_offset(style)
             .points();
-
+        // Discard page fragments and layout state produced by the sizing
+        // probes. The retained fragment below is the inline-table's only
+        // painting contribution to its parent line.
+        self.restore(measurement_snapshot);
         let snapshot = self.snapshot();
         let mut table_style = style.clone();
         table_style.margin = css::Edges::ZERO;
-        set_style_used_width(&mut table_style, content_width);
+        // `content_width` is the table grid's logical inline span.  CSS
+        // `width` and `height` remain physical properties, so an isolated
+        // vertical inline-table must freeze `height` here.  Freezing `width`
+        // instead turns the column total into a definite row-track span and
+        // makes orthogonal cells widen the physical table box.
+        // <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+        // <https://drafts.csswg.org/css-tables-3/#table-layout>
+        if style.writing_mode.has_vertical_lines() {
+            set_style_used_height(&mut table_style, content_width);
+        } else {
+            set_style_used_width(&mut table_style, content_width);
+        }
         table_style.break_before = PageBreak::Auto;
         table_style.break_after = PageBreak::Auto;
 
-        self.current_page = Page::new(content_width, top);
+        // The captured atom owns a zero-inset local canvas.  Table layout
+        // consults `current_page_context` for float placement and table-grid
+        // projection, so replacing only `current_page` would retain the
+        // outer document page's margins and leak that origin into the
+        // fragment before inline replay applies its destination translation.
+        // <https://www.w3.org/TR/css-display-3/#valdef-display-inline-table>
+        // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+        let atom_page_context = PageContext {
+            size: PageSize::from_points(physical_atom_inline_size, top),
+            margins: PageMargins::all_points(0.0),
+            edges: PageBoxEdges::ZERO,
+            rotation: snapshot.current_page_context.rotation,
+        };
+        self.current_page = crate::layout::builder::page_for_context(atom_page_context);
+        self.current_page_context = atom_page_context;
         self.content_left = 0.0;
-        self.content_right = content_width;
+        self.content_right = physical_atom_inline_size;
         self.cursor_y = top;
         self.truncate_page_start_margins = false;
         let _ = children;
@@ -464,25 +559,24 @@ impl<'a> LayoutBuilder<'a> {
         );
         let content_height = (top - self.cursor_y).max(style.line_height);
         let fragment_bottom = top - content_height;
-        // CSS 2.2 defines an `inline-table` baseline as the baseline of the
-        // first row. In the current paint model, align against the first
-        // rendered row line's actual shaped-font alignment coordinate.
-        // https://www.w3.org/TR/CSS22/tables.html#table-display
+        // CSS 2.2 defines an `inline-table` baseline as the first row's
+        // baseline.  Keep this in table-layout coordinates rather than
+        // recovering it from emitted PDF text positions: paint-time glyph
+        // adjustments are not part of the table-grid geometry.
+        // <https://www.w3.org/TR/CSS22/tables.html#table-display>
         let baseline_offset = if style.contain.layout {
             // Layout-contained atomic boxes expose no internal baseline and
             // therefore synthesize one from their block-end border edge.
             // <https://www.w3.org/TR/css-contain-1/#containment-layout>
             content_height
         } else {
-            first_row_baseline_range
-                .and_then(|(row_top, row_bottom)| {
-                    self.inline_table_baseline_offset_from_fragment(
-                        row_top,
-                        row_bottom,
-                        fragment_bottom,
-                        content_height,
-                        table_strut_baseline_offset,
-                    )
+            first_row_baseline_offset
+                .zip(first_row_baseline_range)
+                .map(|(row_baseline, (row_top, _))| {
+                    ((top - row_top).max(0.0) + row_baseline.offset
+                        - (row_baseline.rendered_font_adjustment
+                            - table_rendered_baseline_adjustment))
+                        .max(0.0)
                 })
                 .unwrap_or(content_height)
         };
@@ -490,7 +584,9 @@ impl<'a> LayoutBuilder<'a> {
             .current_page
             .paint_fragment()
             .translated(PaintTranslation::new(0.0, -fragment_bottom));
+        let table_cell_context = self.table_cell_content_coordinate_contexts.last().copied();
         self.restore(snapshot);
+        self.ancestors.truncate(ancestor_depth);
 
         let mut atom_style = style.clone();
         atom_style.background_color = None;
@@ -501,11 +597,14 @@ impl<'a> LayoutBuilder<'a> {
         atom_style.padding = css::Edges::ZERO;
 
         Some(InlineAtom::new(
-            InlineAtomContent::InlineFragment(Box::new(fragment)),
+            InlineAtomContent::InlineFragment {
+                fragment: Box::new(fragment),
+                table_cell_context,
+            },
             atom_style,
             None,
             InlineSize::new(
-                content_width + style.margin.left + style.margin.right,
+                physical_atom_inline_size + style.margin.left + style.margin.right,
                 content_height + style.margin.top + style.margin.bottom,
             ),
             baseline_offset,
@@ -513,33 +612,6 @@ impl<'a> LayoutBuilder<'a> {
             link_target,
             None,
         ))
-    }
-
-    /// Return the inline-table first-row baseline offset from the fragment top edge.
-    ///
-    /// CSS 2.2 defines an `inline-table` baseline as the baseline of the first
-    /// table row. `quire` stores text using PDF baseline-adjusted glyph
-    /// coordinates, so this maps the rendered line inside the first occupying
-    /// row to the atom baseline offset from the table wrapper top edge used by
-    /// the line builder.
-    /// https://www.w3.org/TR/CSS22/tables.html#table-display
-    pub(in crate::layout::table) fn inline_table_baseline_offset_from_fragment(
-        &self,
-        row_top: f32,
-        row_bottom: f32,
-        fragment_bottom: f32,
-        content_height: f32,
-        table_strut_baseline_offset: f32,
-    ) -> Option<f32> {
-        self.current_page
-            .lines
-            .iter()
-            .map(|line| self.font_system.rendered_line_alignment_y(line).points())
-            .find(|alignment_y| *alignment_y <= row_top + 0.01 && *alignment_y >= row_bottom - 0.01)
-            .map(|alignment_y| {
-                (content_height - (alignment_y - fragment_bottom) + table_strut_baseline_offset)
-                    .clamp(0.0, content_height + table_strut_baseline_offset)
-            })
     }
 
     pub(crate) fn estimate_table_height(
@@ -590,8 +662,8 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             columns,
-            table_width.content_width.points(),
-            !table_root_inline_size(style).is_auto(),
+            LogicalInlineContentSize::new(table_width.content_width),
+            table_root_distributes_extra_inline_space(style),
             table_cellpadding,
             table_metrics.clone(),
             collapsed_geometry.as_ref(),
@@ -602,7 +674,7 @@ impl<'a> LayoutBuilder<'a> {
             captions,
             style,
             stylesheets,
-            table_width.content_width.points(),
+            PhysicalContentWidth::new(table_width.content_width),
             CaptionSide::Top,
         );
         let table_used_style = self.table_used_style(style);
@@ -626,7 +698,7 @@ impl<'a> LayoutBuilder<'a> {
             captions,
             style,
             stylesheets,
-            table_width.content_width.points(),
+            PhysicalContentWidth::new(table_width.content_width),
             CaptionSide::Bottom,
         );
         total + style.margin.bottom

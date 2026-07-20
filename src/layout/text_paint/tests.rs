@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 fn glyph(unicode: &str, advance: f32) -> RenderedGlyph {
     RenderedGlyph {
-        id: 1,
+        kind: crate::document::RenderedGlyphKind::Paint(1),
         x_advance: advance,
         nominal_x_advance: advance,
         x_offset: 0.0,
@@ -24,7 +24,7 @@ fn rendered_line_with_run(
         paint_space_point(10.0, 20.0),
         10.0,
         None,
-        Color::BLACK,
+        CssColor::BLACK,
         vec![RenderedTextRun {
             text: Rc::from(text),
             actual_text: None,
@@ -61,7 +61,7 @@ fn prepared_decoration_strokes_for_style(
         style,
         decoration,
         phase,
-        color: Color::BLACK,
+        color: CssColor::BLACK,
         color_override: None,
         metrics: decoration_metrics(),
     })
@@ -234,12 +234,12 @@ fn prepared_decoration_errors_use_wavy_annotation_path() {
     assert!(
         strokes
             .iter()
-            .any(|stroke| stroke.color == Color::new(255, 0, 0))
+            .any(|stroke| stroke.color == CssColor::new(255, 0, 0))
     );
     assert!(
         strokes
             .iter()
-            .any(|stroke| stroke.color == Color::new(0, 128, 0))
+            .any(|stroke| stroke.color == CssColor::new(0, 128, 0))
     );
 }
 

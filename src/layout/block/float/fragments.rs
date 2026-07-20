@@ -9,8 +9,8 @@ impl<'a> LayoutBuilder<'a> {
         specified_side: Float,
         page_index: usize,
         side: UsedFloatSide,
-        left: f32,
-        right: f32,
+        source_order: usize,
+        placement: LogicalFloatPlacement,
         fallback_bounds: PaintClip,
         style: &ComputedStyle,
         replaced_content_is_clipped: bool,
@@ -35,7 +35,6 @@ impl<'a> LayoutBuilder<'a> {
             .map(|bounds| union_paint_bounds(child_bounds.into_iter().chain([bounds])).unwrap())
             .or(child_bounds)
             .unwrap_or(fallback_bounds);
-        let source_order = self.next_paint_source_order();
         let mut policy = StackingContextPolicy::for_atomic(style, PaintBand::Float, bounds);
         if replaced_content_is_clipped {
             // CSS overflow clips a box's contents rather than its background
@@ -50,17 +49,22 @@ impl<'a> LayoutBuilder<'a> {
             .with_source_order(source_order)
             .with_effects(policy.effects)
             .with_bounds(bounds);
+        let rect = PageTopRect::new(
+            placement.margin_box.x(),
+            bounds.y() + bounds.height(),
+            placement.margin_box.width(),
+            bounds.height(),
+        );
         Some(FloatPaintFragment {
             id,
             specified_side,
             page_index,
             side,
-            rect: PageTopRect::new(
-                left,
-                bounds.y() + bounds.height(),
-                (right - left).max(0.0),
-                bounds.height(),
-            ),
+            rect,
+            placement: placement
+                .with_margin_box(placement.containing, rect)
+                .on_page(page_index),
+            area: FloatArea::RECT,
             source_order,
             fragment_index: 0,
             starts_on_previous_page: false,
@@ -89,7 +93,7 @@ impl<'a> LayoutBuilder<'a> {
             .last_mut()
             .expect("root float context exists")
             .shapes
-            .push(shape);
+            .push(shape.clone());
         run.include_shape(shape);
     }
 

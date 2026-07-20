@@ -1,6 +1,8 @@
-use super::declarations::CascadedDeclaration;
+use super::declarations::{CascadedDeclaration, affected_longhands, expand_modeled_shorthands};
 use super::*;
 use crate::css::{custom_property_value_is_valid, is_custom_property_name};
+use cssparser::{Parser, ParserInput};
+use std::borrow::Cow;
 
 pub(super) fn apply_cascaded_custom_property_declarations(
     style: &mut ComputedStyle,
@@ -112,26 +114,9 @@ fn cyclic_custom_properties(
 }
 
 fn custom_property_dependencies(value: &str) -> Vec<String> {
-    let mut dependencies = Vec::new();
-    let mut rest = value;
-    while let Some(start) = find_css_variable_function(rest) {
-        let after_var = &rest[start + "var(".len()..];
-        let Some(end) = find_matching_paren(after_var) else {
-            break;
-        };
-        let (name, fallback) = split_var_body(&after_var[..end]);
-        let name = name.trim();
-        if is_custom_property_name(name) {
-            dependencies.push(name.to_string());
-        }
-        // A dependency in a fallback can participate in a cycle when that
-        // fallback is selected, so retain it in the graph as well.
-        if let Some(fallback) = fallback {
-            dependencies.extend(custom_property_dependencies(fallback));
-        }
-        rest = &after_var[end + 1..];
-    }
-    dependencies
+    // A fallback can participate in a cycle if it is selected, so the token
+    // walker intentionally returns references from both arguments.
+    css_variable_references(value).unwrap_or_default()
 }
 
 pub(super) fn apply_cascaded_font_size_declarations_with_parent_ch_advance(
@@ -201,7 +186,7 @@ pub(super) fn apply_cascaded_font_size_declarations_with_parent_ch_advance(
 
 /// Applies the winning `color` before dependent `currentColor` values.
 ///
-/// CSS Color defines `currentColor` as the computed value of the `color`
+/// CSS CssColor defines `currentColor` as the computed value of the `color`
 /// property, so border-color and related properties must see the final
 /// cascaded color regardless of declaration order:
 /// <https://www.w3.org/TR/css-color-4/#currentcolor-color>.
@@ -260,6 +245,77 @@ pub(super) fn apply_cascaded_color_declarations(
     }
 }
 
+/// Substitutes custom properties before parsing a shorthand's value.
+///
+/// A shorthand containing `var()` cannot be expanded during the ordinary
+/// cascade prepass, because its grammar is unknown until computed-value time.
+/// Once its token stream has been substituted it must follow the same
+/// expansion path as an authored shorthand without variables:
+/// <https://www.w3.org/TR/css-variables-1/#variables-in-shorthands>.
+pub(super) fn declarations_after_variable_substitution_and_shorthand_expansion<'a>(
+    declarations: &[CascadedDeclaration<'a>],
+    custom_properties: &std::collections::HashMap<String, String>,
+    direction: Direction,
+    writing_mode: WritingMode,
+) -> Vec<CascadedDeclaration<'a>> {
+    let mut output = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        if is_custom_property_name(&declaration.name)
+            || !contains_css_variable_reference(&declaration.value)
+        {
+            output.push(declaration.clone());
+            continue;
+        }
+        let Some(value) = resolve_css_variables(&declaration.value, custom_properties) else {
+            // A pending shorthand still wins the cascade for every longhand
+            // it addresses. Keep one unresolved declaration per affected
+            // longhand so the normal invalid-at-computed-value-time handling
+            // suppresses earlier winners instead of reviving them.
+            let targets =
+                affected_longhands(&declaration.name, direction, writing_mode).filter(|targets| {
+                    targets.len() != 1
+                        || targets
+                            .first()
+                            .is_none_or(|target| *target != declaration.name)
+                });
+            if let Some(targets) = targets {
+                output.extend(targets.into_iter().map(|target| {
+                    let mut pending = declaration.clone();
+                    pending.name = Cow::Owned(target.to_string());
+                    pending
+                }));
+            } else {
+                output.push(declaration.clone());
+            }
+            continue;
+        };
+        let mut resolved = declaration.clone();
+        resolved.value = Cow::Owned(value);
+        for expanded in
+            expand_modeled_shorthands(std::slice::from_ref(&resolved), direction, writing_mode)
+        {
+            // `expand_modeled_shorthands` is deliberately borrowing-friendly
+            // for the normal cascade path. This post-substitution path owns
+            // its value so the expanded declarations can outlive `resolved`.
+            output.push(CascadedDeclaration {
+                name: Cow::Owned(expanded.name.into_owned()),
+                value: Cow::Owned(expanded.value.into_owned()),
+                origin: declaration.origin,
+                base_url: declaration.base_url,
+                root_url: declaration.root_url,
+                important: declaration.important,
+                layer_order: declaration.layer_order,
+                specificity: declaration.specificity,
+                scope_proximity: declaration.scope_proximity,
+                stylesheet_index: declaration.stylesheet_index,
+                rule_order: declaration.rule_order,
+                declaration_order: declaration.declaration_order,
+            });
+        }
+    }
+    output
+}
+
 /// Resolves CSS custom property substitutions in a declaration value.
 ///
 /// CSS Cascade Level 5 defines custom property substitution and invalid
@@ -277,32 +333,8 @@ pub(super) fn resolve_css_variables(
 
 /// Returns whether a token stream contains a `var()` function. CSS function
 /// names are ASCII case-insensitive, unlike custom-property names.
-pub(super) fn contains_css_variable_reference(value: &str) -> bool {
-    find_css_variable_function(value).is_some()
-}
-
-fn find_css_variable_function(value: &str) -> Option<usize> {
-    let bytes = value.as_bytes();
-    for index in 0..bytes.len().saturating_sub(3) {
-        if !bytes[index..].starts_with(b"var(")
-            && !bytes[index..]
-                .get(..4)
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(b"var("))
-        {
-            continue;
-        }
-        // Do not match the trailing `var(` in another identifier such as
-        // `myvar(`. CSS tokenization makes only a standalone identifier
-        // followed directly by `(` a Function token.
-        let preceded_by_identifier_code_point = index
-            .checked_sub(1)
-            .and_then(|previous| bytes.get(previous))
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
-        if !preceded_by_identifier_code_point {
-            return Some(index);
-        }
-    }
-    None
+pub(in crate::css) fn contains_css_variable_reference(value: &str) -> bool {
+    css_variable_references(value).is_some_and(|references| !references.is_empty())
 }
 
 fn resolve_css_variables_inner(
@@ -310,110 +342,169 @@ fn resolve_css_variables_inner(
     custom_properties: &std::collections::HashMap<String, String>,
     stack: &mut Vec<String>,
 ) -> Option<String> {
-    let mut output = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(start) = find_css_variable_function(rest) {
-        append_css_component_fragment(&mut output, &rest[..start]);
-        let after_var = &rest[start + "var(".len()..];
-        let end = find_matching_paren(after_var)?;
-        let body = &after_var[..end];
-        let (name, fallback) = split_var_body(body);
-        let name = name.trim();
-        if !name.starts_with("--") {
-            return None;
-        }
-        if stack.iter().any(|item| item == name) {
-            return None;
-        }
-        if let Some(replacement) = custom_properties.get(name) {
-            stack.push(name.to_string());
-            let replacement = resolve_css_variables_inner(replacement, custom_properties, stack);
-            stack.pop();
-            if let Some(replacement) = replacement {
-                append_css_component_fragment(&mut output, &replacement);
-            } else if let Some(fallback) = fallback {
-                let fallback =
-                    resolve_css_variables_inner(fallback.trim(), custom_properties, stack)?;
-                append_css_component_fragment(&mut output, &fallback);
-            } else {
-                return None;
-            }
-        } else if let Some(fallback) = fallback {
-            let fallback = resolve_css_variables_inner(fallback.trim(), custom_properties, stack)?;
-            append_css_component_fragment(&mut output, &fallback);
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    resolve_component_values(&mut parser, custom_properties, stack).ok()
+}
+
+/// Resolves a token stream while preserving source spelling for all components
+/// other than substituted `var()` functions.
+///
+/// CSS Syntax, rather than string scanning, is responsible for recognizing
+/// functions and identifiers here. This makes escaped custom-property names,
+/// comments, nested component blocks, and EOF-closed blocks behave exactly as
+/// they do in declaration parsing:
+/// <https://www.w3.org/TR/css-syntax-3/#tokenization>.
+fn resolve_component_values(
+    parser: &mut Parser<'_, '_>,
+    custom_properties: &std::collections::HashMap<String, String>,
+    stack: &mut Vec<String>,
+) -> Result<String, ()> {
+    let source_start = parser.position();
+    let mut copied_start = source_start;
+    let mut output = String::new();
+
+    loop {
+        let token_start = parser.position();
+        let token = match parser.next_including_whitespace_and_comments() {
+            Ok(token) => token,
+            Err(_) => break,
+        };
+        let block_kind = match token {
+            cssparser::Token::Function(name) => Some(name.eq_ignore_ascii_case("var")),
+            cssparser::Token::ParenthesisBlock
+            | cssparser::Token::SquareBracketBlock
+            | cssparser::Token::CurlyBracketBlock => Some(false),
+            _ => None,
+        };
+        let Some(is_var) = block_kind else {
+            continue;
+        };
+        let block_start = parser.position();
+        output.push_str(parser.slice(copied_start..token_start));
+        let (replacement, block_end) = if is_var {
+            let replacement = parser
+                .parse_nested_block(|nested| {
+                    resolve_var_function(nested, custom_properties, stack)
+                        .ok_or_else(|| nested.new_custom_error::<(), ()>(()))
+                })
+                .map_err(|_| ())?;
+            (replacement, block_start)
         } else {
-            return None;
+            let (contents, block_end) = parser
+                .parse_nested_block(|nested| {
+                    let contents = resolve_component_values(nested, custom_properties, stack)
+                        .map_err(|_| nested.new_custom_error(()))?;
+                    Ok::<_, cssparser::ParseError<'_, ()>>((contents, nested.position()))
+                })
+                .map_err(|_| ())?;
+            output.push_str(parser.slice(token_start..block_start));
+            output.push_str(&contents);
+            (String::new(), block_end)
+        };
+        if is_var {
+            // A substituted value is a token stream, not text pasted into the
+            // surrounding source. Whitespace keeps the later property parser
+            // from merging adjacent identifier, number, or dimension tokens.
+            output.push(' ');
+            output.push_str(&replacement);
+            output.push(' ');
         }
-        rest = &after_var[end + 1..];
+        let after_block = parser.position();
+        if !is_var {
+            output.push_str(parser.slice(block_end..after_block));
+        }
+        copied_start = after_block;
     }
-    append_css_component_fragment(&mut output, rest);
-    Some(output)
+    output.push_str(parser.slice_from(copied_start));
+    Ok(output)
 }
 
-/// Appends serialized component values without accidentally retokenizing two
-/// adjacent identifiers as one identifier. `var()` substitutes a token stream,
-/// so `var(--a)var(--b)` containing `orange` and `red` must not become the
-/// single `orangered` token.
-fn append_css_component_fragment(output: &mut String, fragment: &str) {
-    let Some(first) = fragment.chars().next() else {
-        return;
+fn resolve_var_function(
+    parser: &mut Parser<'_, '_>,
+    custom_properties: &std::collections::HashMap<String, String>,
+    stack: &mut Vec<String>,
+) -> Option<String> {
+    let name = parser.expect_ident().ok()?.to_string();
+    if !is_custom_property_name(&name) {
+        return None;
+    }
+    let has_fallback = if parser.is_exhausted() {
+        false
+    } else {
+        matches!(parser.next().ok()?, cssparser::Token::Comma)
     };
-    if output
-        .chars()
-        .next_back()
-        .is_some_and(is_identifier_code_point)
-        && is_identifier_code_point(first)
-    {
-        output.push(' ');
+    let fallback = has_fallback
+        .then(|| resolve_component_values(parser, custom_properties, stack))
+        .transpose()
+        .ok()
+        .flatten();
+    if has_fallback && fallback.is_none() {
+        return None;
     }
-    output.push_str(fragment);
+    if !parser.is_exhausted() {
+        return None;
+    }
+    if stack.iter().any(|item| item == &name) {
+        return fallback;
+    }
+    if let Some(replacement) = custom_properties.get(&name) {
+        stack.push(name);
+        let replacement = resolve_css_variables_inner(replacement, custom_properties, stack);
+        stack.pop();
+        replacement.or(fallback)
+    } else {
+        fallback
+    }
 }
 
-fn is_identifier_code_point(character: char) -> bool {
-    character == '-'
-        || character == '_'
-        || character.is_ascii_alphanumeric()
-        || !character.is_ascii()
+/// Returns decoded custom-property references found in a valid CSS component
+/// value. Names are CSS token values, not source substrings.
+fn css_variable_references(value: &str) -> Option<Vec<String>> {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let mut references = Vec::new();
+    collect_css_variable_references(&mut parser, &mut references)?;
+    Some(references)
 }
 
-pub(super) fn find_matching_paren(value: &str) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut quote = None;
-    for (index, byte) in value.bytes().enumerate() {
-        if let Some(quote_byte) = quote {
-            if byte == quote_byte {
-                quote = None;
-            }
+fn collect_css_variable_references(
+    parser: &mut Parser<'_, '_>,
+    references: &mut Vec<String>,
+) -> Option<()> {
+    while let Ok(token) = parser.next_including_whitespace_and_comments() {
+        let is_var =
+            matches!(token, cssparser::Token::Function(name) if name.eq_ignore_ascii_case("var"));
+        let is_block = is_var
+            || matches!(
+                token,
+                cssparser::Token::Function(_)
+                    | cssparser::Token::ParenthesisBlock
+                    | cssparser::Token::SquareBracketBlock
+                    | cssparser::Token::CurlyBracketBlock
+            );
+        if !is_block {
             continue;
         }
-        match byte {
-            b'\'' | b'"' => quote = Some(byte),
-            b'(' => depth += 1,
-            b')' if depth == 0 => return Some(index),
-            b')' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
+        parser
+            .parse_nested_block(|nested| {
+                if is_var {
+                    let name = nested.expect_ident()?.to_string();
+                    if !is_custom_property_name(&name) {
+                        return Err(nested.new_custom_error(()));
+                    }
+                    references.push(name);
+                    if nested.is_exhausted() {
+                        return Ok::<_, cssparser::ParseError<'_, ()>>(());
+                    }
+                    if !matches!(nested.next()?, cssparser::Token::Comma) {
+                        return Err(nested.new_custom_error(()));
+                    }
+                }
+                collect_css_variable_references(nested, references)
+                    .ok_or_else(|| nested.new_custom_error(()))
+            })
+            .ok()?;
     }
-    None
-}
-
-pub(super) fn split_var_body(body: &str) -> (&str, Option<&str>) {
-    let mut depth = 0usize;
-    let mut quote = None;
-    for (index, byte) in body.bytes().enumerate() {
-        if let Some(quote_byte) = quote {
-            if byte == quote_byte {
-                quote = None;
-            }
-            continue;
-        }
-        match byte {
-            b'\'' | b'"' => quote = Some(byte),
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            b',' if depth == 0 => return (&body[..index], Some(&body[index + 1..])),
-            _ => {}
-        }
-    }
-    (body, None)
+    Some(())
 }

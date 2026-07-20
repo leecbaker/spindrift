@@ -1,7 +1,51 @@
 use super::positioning::positioned_rendered_runs_for_writing_mode;
 use super::*;
+use std::rc::Rc;
 
 impl<'a> LayoutBuilder<'a> {
+    /// Translate a CSS layout baseline into the selected font program's paint
+    /// origin. Every shaped-text paint route must use this exact conversion.
+    fn shaped_text_paint_origin(
+        &self,
+        layout_baseline: PaintPoint,
+        shaped: &ShapedInlineLine,
+    ) -> PaintPoint {
+        layout_baseline + PaintDisplacement::new(0.0, shaped.baseline_adjustment)
+    }
+
+    /// Align sideways glyph ink to the vertical line box's logical block span.
+    ///
+    /// A sideways run retains the font's horizontal alphabetic baseline and
+    /// is then rotated at the PDF boundary.  Its horizontal ascent or
+    /// descender would otherwise project past the cell's logical block-start
+    /// edge.  Move only rotated runs by the appropriate font-metric span;
+    /// upright runs already carry their OpenType vertical-origin correction
+    /// from shaping and must retain their own cross-axis position.
+    ///
+    /// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+    /// <https://drafts.csswg.org/css-inline-3/#line-box>
+    fn align_sideways_runs_to_vertical_line_box(
+        &mut self,
+        runs: &mut [RenderedTextRun],
+        shaped: &ShapedInlineLine,
+        style: &ComputedStyle,
+    ) {
+        if !style.writing_mode.has_vertical_lines() {
+            return;
+        }
+        for run in runs {
+            let descent = self
+                .font_system
+                .text_decoration_metrics(run.font_id.or_else(|| shaped.first_font_id()), style)
+                .descender_depth;
+            if run.text_matrix == RenderedTextMatrix::ROTATE_CW {
+                run.x_offset += descent;
+            } else if run.text_matrix == RenderedTextMatrix::ROTATE_CCW {
+                run.x_offset += (style.line_height - descent).max(0.0);
+            }
+        }
+    }
+
     pub(in crate::layout) fn paint_text_runs(
         &mut self,
         text: &str,
@@ -30,19 +74,33 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
     ) -> Option<RenderedLine> {
         let mut rendered_runs = positioned_rendered_runs_for_writing_mode(shaped, style);
+        self.align_sideways_runs_to_vertical_line_box(&mut rendered_runs, shaped, style);
         if rendered_runs.is_empty() {
             return None;
         }
         debug_assert!(shaped.advance_width().is_finite());
         let first_font_id = shaped.first_font_id();
-        let origin = PaintPoint::new(origin.x, origin.y + shaped.baseline_adjustment);
+        let origin = self.shaped_text_paint_origin(origin, shaped);
         let raster_glyph_images = self
             .font_system
             .take_raster_glyph_images(origin, &mut rendered_runs);
-        let palettes = vec![style.font_palette.clone(); rendered_runs.len()];
+        // Styled inline ranges can choose a different palette from the
+        // containing line. Keep the palette that travelled with each shaped
+        // run through the paint boundary.
+        // <https://www.w3.org/TR/css-fonts-4/#font-palette-prop>
+        let palettes = shaped
+            .runs
+            .iter()
+            .map(|run| run.font_palette.clone())
+            .collect::<Vec<_>>();
         let color_glyph_paths =
             self.font_system
                 .take_color_glyph_paths(origin, &mut rendered_runs, &palettes, style);
+        let full_em_rect_coverage_paths = self.font_system.full_em_rect_glyph_coverage_paths(
+            origin,
+            &rendered_runs,
+            style.text_fill_color.unwrap_or(style.color),
+        );
         let rendered_line = RenderedLine::from_paint_origin(
             shaped.text.to_string(),
             origin,
@@ -50,7 +108,8 @@ impl<'a> LayoutBuilder<'a> {
             first_font_id,
             style.text_fill_color.unwrap_or(style.color),
             rendered_runs,
-        );
+        )
+        .with_glyph_origin_adjustment(PaintDisplacement::new(0.0, shaped.baseline_adjustment));
         self.paint_text_shadows(&rendered_line, style);
         self.paint_text_decoration_lines_for_phase(
             rendered_line.x(),
@@ -67,6 +126,9 @@ impl<'a> LayoutBuilder<'a> {
             self.push_image_in_band(PaintBand::Inline, image);
         }
         self.push_line_in_band(PaintBand::Inline, rendered_line.clone());
+        for path in full_em_rect_coverage_paths {
+            self.push_path_in_band(PaintBand::Inline, path);
+        }
         self.paint_prepared_text_emphasis_marks_for_line(&rendered_line, style);
         self.paint_text_decoration_lines_for_phase(
             rendered_line.x(),
@@ -83,7 +145,9 @@ impl<'a> LayoutBuilder<'a> {
         group: &PreparedInlineTextGroup,
     ) {
         let source = match group.source {
-            InlineTextSource::Normal | InlineTextSource::Generated => RenderedLineSource::Normal,
+            InlineTextSource::Normal
+            | InlineTextSource::Generated
+            | InlineTextSource::BidiControl => RenderedLineSource::Normal,
             InlineTextSource::RunIn => RenderedLineSource::RunIn,
             InlineTextSource::Marker => RenderedLineSource::Marker,
         };
@@ -97,11 +161,16 @@ impl<'a> LayoutBuilder<'a> {
     ) {
         let mut rendered_runs =
             positioned_rendered_runs_for_writing_mode(&group.shaped, &group.style);
+        self.align_sideways_runs_to_vertical_line_box(
+            &mut rendered_runs,
+            &group.shaped,
+            &group.style,
+        );
         if rendered_runs.is_empty() {
             return;
         }
         let first_font_id = group.shaped.first_font_id();
-        let text_origin = group.bounds.text_origin();
+        let text_origin = self.shaped_text_paint_origin(group.bounds.text_origin(), &group.shaped);
         let raster_glyph_images = self
             .font_system
             .take_raster_glyph_images(text_origin, &mut rendered_runs);
@@ -116,6 +185,11 @@ impl<'a> LayoutBuilder<'a> {
                 .collect::<Vec<_>>(),
             &group.style,
         );
+        let full_em_rect_coverage_paths = self.font_system.full_em_rect_glyph_coverage_paths(
+            text_origin,
+            &rendered_runs,
+            group.style.text_fill_color.unwrap_or(group.style.color),
+        );
         let rendered_line = RenderedLine::from_paint_origin_with_source(
             group.shaped.text.to_string(),
             text_origin,
@@ -124,7 +198,12 @@ impl<'a> LayoutBuilder<'a> {
             group.style.text_fill_color.unwrap_or(group.style.color),
             rendered_runs,
             source,
-        );
+        )
+        .with_glyph_origin_adjustment(PaintDisplacement::new(
+            0.0,
+            group.shaped.baseline_adjustment,
+        ))
+        .with_source_run(Rc::clone(&group.source_run));
         let decoration_runs = rendered_line.runs.clone();
         let mut decoration_style = group.style.clone();
         let (decoration_x, decoration_baseline_y, decoration_width, decoration_style) =
@@ -171,6 +250,9 @@ impl<'a> LayoutBuilder<'a> {
             self.push_image_in_band(PaintBand::Inline, image);
         }
         self.push_line_in_band(PaintBand::Inline, rendered_line.clone());
+        for path in full_em_rect_coverage_paths {
+            self.push_path_in_band(PaintBand::Inline, path);
+        }
         self.paint_prepared_text_emphasis_marks_for_line(&rendered_line, &group.style);
         self.paint_text_decoration_lines_for_phase(
             decoration_x,

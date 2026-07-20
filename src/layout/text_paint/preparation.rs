@@ -1,42 +1,16 @@
 use super::*;
-use std::borrow::Cow;
 use std::rc::Rc;
 
 struct InlineTextPrepSpan<'a, F: InlineFragmentAccess> {
     fragment: &'a F,
-    text: Cow<'a, str>,
+    text: &'a str,
 }
 
 impl<'a, F: InlineFragmentAccess> InlineTextPrepSpan<'a, F> {
     fn new(fragment: &'a F) -> Self {
         Self {
             fragment,
-            text: Cow::Borrowed(fragment.text()),
-        }
-    }
-
-    fn prepend_text(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let mut owned = String::with_capacity(text.len() + self.text.len());
-        owned.push_str(text);
-        owned.push_str(&self.text);
-        self.text = Cow::Owned(owned);
-    }
-
-    fn append_text(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        match &mut self.text {
-            Cow::Borrowed(existing) => {
-                let mut owned = String::with_capacity(existing.len() + text.len());
-                owned.push_str(existing);
-                owned.push_str(text);
-                self.text = Cow::Owned(owned);
-            }
-            Cow::Owned(existing) => existing.push_str(text),
+            text: fragment.text(),
         }
     }
 }
@@ -82,7 +56,6 @@ fn compose_selected_source_shapes<F: InlineFragmentAccess>(
     text: &str,
 ) -> Option<ShapedInlineLine> {
     if group.is_empty()
-        || text.chars().any(character_has_joining_behavior)
         || !group
             .iter()
             .all(|span| span.fragment.preserves_source_shaping())
@@ -120,7 +93,8 @@ impl<'a> LayoutBuilder<'a> {
         fragments: &[InlineFragment],
         x: f32,
     ) -> Option<PreparedInlineTextGroup> {
-        self.prepare_inline_text_group_with_summary_policy(fragments, x, false, x)
+        let tab_metric_style = fragments.first()?.style();
+        self.prepare_inline_text_group_with_summary_policy(fragments, x, false, x, tab_metric_style)
     }
 
     pub(in crate::layout) fn prepare_inline_text_group_with_summary_policy<
@@ -131,31 +105,15 @@ impl<'a> LayoutBuilder<'a> {
         x: f32,
         preserve_leading_summary_space: bool,
         tab_origin: f32,
+        tab_metric_style: &ComputedStyle,
     ) -> Option<PreparedInlineTextGroup> {
         let first = fragments.first()?;
         let mut shaped_runs = Vec::new();
         let mut width = 0.0f32;
         let mut shaping_groups = Vec::<Vec<InlineTextPrepSpan<'_, F>>>::new();
-        let mut pending_join_controls = String::new();
 
         for fragment in fragments {
-            if inline_fragment_is_join_control_only(fragment) {
-                let join_control_span = InlineTextPrepSpan::new(fragment);
-                if let Some(group) = shaping_groups.last_mut()
-                    && let Some(last) = group.last_mut()
-                    && can_shape_inline_text_prep_spans_together(last, &join_control_span)
-                {
-                    last.append_text(fragment.text());
-                } else {
-                    pending_join_controls.push_str(fragment.text());
-                }
-                continue;
-            }
-            let mut span = InlineTextPrepSpan::new(fragment);
-            if !pending_join_controls.is_empty() {
-                span.prepend_text(&pending_join_controls);
-                pending_join_controls.clear();
-            }
+            let span = InlineTextPrepSpan::new(fragment);
             if let Some(group) = shaping_groups.last_mut()
                 && let Some(last) = group.last()
                 && can_shape_inline_text_prep_spans_together(last, &span)
@@ -165,18 +123,12 @@ impl<'a> LayoutBuilder<'a> {
             }
             shaping_groups.push(vec![span]);
         }
-        if !pending_join_controls.is_empty()
-            && let Some(group) = shaping_groups.last_mut()
-            && let Some(last) = group.last_mut()
-        {
-            last.append_text(&pending_join_controls);
-        }
 
         for group in &shaping_groups {
             let spans = group
                 .iter()
                 .map(|span| StyledTextSpan {
-                    text: span.text.as_ref(),
+                    text: span.text,
                     style: span.fragment.style(),
                 })
                 .collect::<Vec<_>>();
@@ -186,33 +138,61 @@ impl<'a> LayoutBuilder<'a> {
                 .and_then(|span| span.fragment.resolved_bidi_direction())
                 .unwrap_or(ResolvedBidiDirection::Ltr);
             // A join-control-only neighbor may have been folded into this
-            // span above. Its cached source shape predates that control and
-            // cannot be reused: U+200C/U+200D changes the OpenType joining
-            // form of otherwise identical visible text.
+            // visual span above. Only an explicitly selected source shape
+            // retains the logical joining context through that reordering;
+            // an ordinary cached shape predates the folded U+200C/U+200D.
             // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
             // <https://www.w3.org/TR/alreq/#h_joining-enforcement>
-            let reused_selected_shape =
-                if group.len() == 1 && group[0].text.as_ref() == group[0].fragment.text() {
-                    group[0].fragment.selected_shaped().cloned()
-                } else {
-                    compose_selected_source_shapes(group, &group_text)
-                };
+            // A cached source shape can have resolved a preserved tab before
+            // the selected forced break. Re-shape tab-containing selected
+            // groups from this line's content edge.
+            // <https://www.w3.org/TR/css-text-3/#tab-size-property>
+            let has_join_control = group_text
+                .chars()
+                .any(crate::text::character_is_join_control);
+            // Visual reordering reverses the order of the separate inline
+            // fragments in an RTL run, while retaining the source order
+            // inside each fragment. Keep join controls as their own spans so
+            // their logical position can be restored for cursive shaping.
+            // The resulting glyph stream remains visual, as produced by the
+            // RTL shaper, and is therefore ready for painting.
+            // <https://www.w3.org/TR/css-text-3/#boundary-shaping> and
+            // <https://www.unicode.org/reports/tr9/#Reordering_Resolved_Levels>
+            let logical_joining_spans = (has_join_control
+                && resolved_direction == ResolvedBidiDirection::Rtl)
+                .then(|| spans.iter().rev().copied().collect::<Vec<_>>());
+            let shaping_spans = logical_joining_spans.as_deref().unwrap_or(&spans);
+            let reused_selected_shape = if !group_text.contains('\t')
+                && group.len() == 1
+                && !has_join_control
+                && group[0].text == group[0].fragment.text()
+            {
+                group[0].fragment.selected_shaped().cloned()
+            } else if !group_text.contains('\t')
+                && !has_join_control
+                && group.iter().all(|span| span.text == span.fragment.text())
+            {
+                compose_selected_source_shapes(group, &group_text)
+            } else {
+                None
+            };
             let shaped = reused_selected_shape.or_else(|| {
                 self.font_system.shape_visually_ordered_inline_fragments(
-                    &spans,
+                    shaping_spans,
                     group_text,
                     0.0,
                     first.style().line_height,
                     tab_origin + width,
+                    tab_metric_style,
                     resolved_direction,
                 )
             });
             if let Some(mut shaped) = shaped {
                 let group_width = shaped.advance_width();
-                for mut run in shaped.runs.drain(..) {
+                shaped_runs.extend(shaped.runs.drain(..).map(|mut run| {
                     run.x_offset += width;
-                    shaped_runs.push(run);
-                }
+                    run
+                }));
                 width += group_width;
             }
         }
@@ -229,7 +209,7 @@ impl<'a> LayoutBuilder<'a> {
             .points();
         let baseline_adjustment = self
             .font_system
-            .font_ascent_baseline_adjustment(first_font_id, first.style(), line_height)
+            .layout_to_program_baseline_adjustment(first_font_id, first.style(), line_height)
             .points();
         let shaped = ShapedInlineLine {
             text: text_summary.into(),
@@ -251,6 +231,7 @@ impl<'a> LayoutBuilder<'a> {
             decoration_paint_rect: None,
             shaped,
             source: first.source(),
+            source_run: Rc::clone(first.source_run()),
         })
     }
 
@@ -262,12 +243,14 @@ impl<'a> LayoutBuilder<'a> {
         x: f32,
         extra_per_separator: f32,
         preserve_leading_summary_space: bool,
+        tab_metric_style: &ComputedStyle,
     ) -> Option<PreparedInlineTextGroup> {
         let mut group = self.prepare_inline_text_group_with_summary_policy(
             fragments,
             x,
             preserve_leading_summary_space,
             x,
+            tab_metric_style,
         )?;
         let separator_count = justifiable_fragment_space_count(fragments);
         let added_width = group

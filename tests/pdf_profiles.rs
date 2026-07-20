@@ -2,37 +2,16 @@
 
 use base64::Engine as _;
 use image::{ExtendedColorType, ImageEncoder};
-use lcms2::{CIExyY, CIExyYTRIPLE, Profile, ToneCurve};
+use moxcms::{ColorProfile, ToneReprCurve};
 use quire::{Html, PdfCompression, PdfOptions, PdfProfile, RenderOptions};
 
 fn wide_gamut_profile() -> Vec<u8> {
-    let white = CIExyY {
-        x: 0.3127,
-        y: 0.3290,
-        Y: 1.0,
-    };
-    let primaries = CIExyYTRIPLE {
-        Red: CIExyY {
-            x: 0.680,
-            y: 0.320,
-            Y: 1.0,
-        },
-        Green: CIExyY {
-            x: 0.265,
-            y: 0.690,
-            Y: 1.0,
-        },
-        Blue: CIExyY {
-            x: 0.150,
-            y: 0.060,
-            Y: 1.0,
-        },
-    };
-    let curve = ToneCurve::new(2.0);
-    Profile::new_rgb(&white, &primaries, &[&curve, &curve, &curve])
-        .unwrap()
-        .icc()
-        .unwrap()
+    let mut profile = ColorProfile::new_display_p3();
+    let curve = ToneReprCurve::Parametric(vec![2.0]);
+    profile.red_trc = Some(curve.clone());
+    profile.green_trc = Some(curve.clone());
+    profile.blue_trc = Some(curve);
+    profile.encode().unwrap()
 }
 
 fn tagged_png_data_url(profile: &[u8]) -> String {
@@ -59,7 +38,7 @@ async fn pdf_profiles_round_trip_and_select_expected_writer_output() {
         ("pdf/a-3u", PdfProfile::PdfA3U, "%PDF-1.7", Some(("3", "U"))),
     ];
 
-    assert_eq!(PdfProfile::default(), PdfProfile::PdfA2B);
+    assert_eq!(PdfProfile::default(), PdfProfile::Pdf);
     for (name, expected_profile, pdf_header, pdfa_identification) in profiles {
         let profile = name.parse::<PdfProfile>().unwrap();
         assert_eq!(profile, expected_profile);
@@ -105,7 +84,7 @@ async fn rendered_document_can_be_serialized_with_distinct_pdf_policies() {
     let alternate_text = String::from_utf8_lossy(&alternate_pdf);
 
     assert_eq!(document.metadata().title(), Some("Reusable"));
-    assert!(default_pdf.starts_with(b"%PDF-1.7"));
+    assert!(default_pdf.starts_with(b"%PDF-1.4"));
     assert!(alternate_pdf.starts_with(b"%PDF-1.4"));
     assert!(alternate_text.contains("/Producer (Quire integration test)"));
     assert!(!alternate_text.contains("/FlateDecode"));
@@ -173,7 +152,6 @@ async fn ordinary_pdf_gradients_use_managed_iccbased_spaces() {
     .unwrap();
     let text = String::from_utf8_lossy(&pdf);
 
-    assert!(text.contains("/CSDisplayP3"), "{text}");
     assert!(text.contains("/CSXYZD50"), "{text}");
     assert!(text.contains("/ICCBased"), "{text}");
     assert!(text.contains("/SMask"), "{text}");
@@ -198,13 +176,13 @@ async fn pdfa_raster_gradient_uses_only_tagged_srgb() {
     assert!(text.contains("/OutputIntents"), "{text}");
     assert!(text.contains("/CSsRGB"), "{text}");
     assert!(text.contains("/Subtype /Image"), "{text}");
-    assert!(text.contains("/ColorSpace [/ICCBased"), "{text}");
+    assert!(text.contains("/CssColorSpace [/ICCBased"), "{text}");
     assert!(!text.contains("/DeviceRGB"), "{text}");
     assert!(!text.contains("CSDisplayP3"), "{text}");
 }
 
 #[tokio::test]
-async fn ordinary_pdf_conic_gradient_keeps_its_display_p3_raster_tag() {
+async fn ordinary_pdf_conic_gradient_uses_its_interpolation_raster_tag() {
     let options = PdfOptions {
         profile: PdfProfile::Pdf,
         compression: PdfCompression::Uncompressed,
@@ -217,22 +195,24 @@ async fn ordinary_pdf_conic_gradient_keeps_its_display_p3_raster_tag() {
     .await
     .unwrap();
     let text = String::from_utf8_lossy(&pdf);
-    let p3_reference = text
-        .split("/CSDisplayP3 [/ICCBased ")
+    let interpolation_reference = text
+        .split("/CSXYZD50 [/ICCBased ")
         .nth(1)
         .and_then(|suffix| suffix.split_once(" R"))
         .map(|(reference, _)| format!("{reference} R"))
-        .expect("Display-P3 page resource");
+        .expect("interpolation color-space page resource");
 
     assert!(text.contains("/Subtype /Image"), "{text}");
     assert!(
-        text.contains(&format!("/ColorSpace [/ICCBased {p3_reference}]")),
-        "the conic image must refer to the Display-P3 ICC profile: {text}"
+        text.contains(&format!(
+            "/CssColorSpace [/ICCBased {interpolation_reference}]"
+        )),
+        "the conic image must refer to its interpolation ICC profile: {text}"
     );
 }
 
 #[tokio::test]
-async fn ordinary_pdf_generated_gradient_keeps_its_display_p3_raster_tag() {
+async fn ordinary_pdf_generated_gradient_uses_its_interpolation_raster_tag() {
     let options = PdfOptions {
         profile: PdfProfile::Pdf,
         compression: PdfCompression::Uncompressed,
@@ -245,17 +225,19 @@ async fn ordinary_pdf_generated_gradient_keeps_its_display_p3_raster_tag() {
     .await
     .unwrap();
     let text = String::from_utf8_lossy(&pdf);
-    let p3_reference = text
-        .split("/CSDisplayP3 [/ICCBased ")
+    let interpolation_reference = text
+        .split("/CSXYZD50 [/ICCBased ")
         .nth(1)
         .and_then(|suffix| suffix.split_once(" R"))
         .map(|(reference, _)| format!("{reference} R"))
-        .expect("Display-P3 page resource");
+        .expect("interpolation color-space page resource");
 
     assert!(text.contains("/Subtype /Image"), "{text}");
     assert!(
-        text.contains(&format!("/ColorSpace [/ICCBased {p3_reference}]")),
-        "the generated image must refer to the Display-P3 ICC profile: {text}"
+        text.contains(&format!(
+            "/CssColorSpace [/ICCBased {interpolation_reference}]"
+        )),
+        "the generated image must refer to its interpolation ICC profile: {text}"
     );
 }
 
@@ -277,7 +259,7 @@ async fn ordinary_pdf_preserves_an_embedded_raster_rgb_profile_once() {
     let text = String::from_utf8_lossy(&pdf);
 
     assert!(text.contains("/Subtype /Image"), "{text}");
-    assert!(text.contains("/ColorSpace [/ICCBased"), "{text}");
+    assert!(text.contains("/CssColorSpace [/ICCBased"), "{text}");
     assert_eq!(
         pdf.windows(profile.len())
             .filter(|window| *window == profile.as_slice())
@@ -304,7 +286,7 @@ async fn pdfa_raster_image_converts_embedded_profiles_to_srgb() {
 
     assert!(text.contains("/OutputIntents"), "{text}");
     assert!(text.contains("/Subtype /Image"), "{text}");
-    assert!(text.contains("/ColorSpace [/ICCBased"), "{text}");
+    assert!(text.contains("/CssColorSpace [/ICCBased"), "{text}");
     assert!(
         !pdf.windows(profile.len())
             .any(|window| window == profile.as_slice()),

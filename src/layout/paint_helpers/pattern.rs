@@ -6,14 +6,16 @@ pub(crate) fn paint_dashed_border_side(
     axis_start: f32,
     axis_length: f32,
     cross_start: f32,
-    cross_width: f32,
+    cross_width: PaintStrokeWidth,
     horizontal: bool,
-    border_width: f32,
-    color: Color,
+    border_width: PaintStrokeWidth,
+    color: CssColor,
 ) {
     // WeasyPrint follows CSS Backgrounds and Borders' intentionally flexible
     // dashed-border rendering by distributing same-size dashes and spaces
     // along straight edges, keeping dashes at both corners.
+    let cross_width = cross_width.points();
+    let border_width = border_width.points();
     let nominal_dash = (border_width * 3.0).max(1.0);
     let spaces = (axis_length / nominal_dash / 2.0).floor();
     let dashes = spaces + 1.0;
@@ -47,7 +49,7 @@ pub(crate) fn paint_patterned_border_side(
     horizontal: bool,
     segment_length: f32,
     gap_length: f32,
-    color: Color,
+    color: CssColor,
 ) {
     let mut offset = 0.0;
     while offset < axis_length - 0.01 {
@@ -78,16 +80,16 @@ pub(crate) fn paint_dotted_border_side(
     axis_start: f32,
     axis_length: f32,
     cross_start: f32,
-    cross_width: f32,
+    cross_width: PaintStrokeWidth,
     horizontal: bool,
-    color: Color,
+    color: CssColor,
 ) {
     paint_dotted_border_side_with_clip(
         paths,
         axis_start,
         axis_length,
         cross_start,
-        cross_width,
+        cross_width.points(),
         horizontal,
         color,
         None,
@@ -110,7 +112,7 @@ pub(crate) fn paint_dotted_border_side_with_clip(
     cross_start: f32,
     cross_width: f32,
     horizontal: bool,
-    color: Color,
+    color: CssColor,
     clip: Option<RenderedPathClip>,
 ) {
     if axis_length <= 0.0 || cross_width <= 0.0 || !color.is_visible() {
@@ -154,7 +156,7 @@ pub(crate) fn paint_dotted_border_side_with_clip(
             None,
             RenderedPathFillRule::NonZero,
             Some(color),
-            diameter,
+            PaintStrokeWidth::new(diameter),
             clip,
         )
         .with_stroke_style(RenderedPathStrokeStyle {
@@ -180,7 +182,7 @@ pub(crate) fn paint_dashed_border_side_with_clip(
     cross_width: f32,
     horizontal: bool,
     border_width: f32,
-    color: Color,
+    color: CssColor,
     clip: Option<RenderedPathClip>,
 ) {
     if axis_length <= 0.0 || cross_width <= 0.0 || !color.is_visible() {
@@ -215,7 +217,7 @@ pub(crate) fn circle_path(
     cx: f32,
     cy: f32,
     radius: f32,
-    color: Color,
+    color: CssColor,
     clip: Option<RenderedPathClip>,
 ) -> RenderedPath {
     let ratio = radius * 0.552_284_8;
@@ -247,7 +249,7 @@ pub(crate) fn circle_path(
         Some(color),
         RenderedPathFillRule::NonZero,
         None,
-        0.0,
+        PaintStrokeWidth::ZERO,
         clip,
     )
 }
@@ -259,7 +261,7 @@ pub(crate) fn circle_path(
 /// ISO 32000-1:2008, 8.5 "Path Construction and Painting".
 pub(crate) fn rect_path(
     rect: PaintRect,
-    color: Color,
+    color: CssColor,
     clip: Option<RenderedPathClip>,
 ) -> RenderedPath {
     RenderedPath::new(
@@ -267,7 +269,7 @@ pub(crate) fn rect_path(
         Some(color),
         RenderedPathFillRule::NonZero,
         None,
-        0.0,
+        PaintStrokeWidth::ZERO,
         clip,
     )
 }
@@ -279,7 +281,7 @@ pub(crate) fn push_border_rect(
     cross_start: f32,
     cross_width: f32,
     horizontal: bool,
-    color: Color,
+    color: CssColor,
 ) {
     let (x, y, width, height) = if horizontal {
         (axis_start, cross_start, axis_length, cross_width)
@@ -320,15 +322,15 @@ mod tests {
             30.0,
             2.0,
             true,
-            Color::BLACK,
+            CssColor::BLACK,
             Some(rectangular_clip()),
         );
 
         assert_eq!(paths.len(), 1);
         let path = &paths[0];
         assert_eq!(path.fill, None);
-        assert_eq!(path.stroke, Some(Color::BLACK));
-        assert_eq!(path.stroke_width, 2.0);
+        assert_eq!(path.stroke, Some(CssColor::BLACK));
+        assert_eq!(path.stroke_width, PaintStrokeWidth::new(2.0));
         assert!(path.clip.is_some());
         assert_eq!(path.stroke_style.line_cap, RenderedPathLineCap::Round);
         assert_eq!(path.stroke_style.dash_array, vec![0.0, 3.6]);
@@ -346,7 +348,15 @@ mod tests {
     #[test]
     fn dotted_vertical_side_uses_vertical_centerline() {
         let mut paths = Vec::new();
-        paint_dotted_border_side(&mut paths, 10.0, 20.0, 30.0, 2.0, false, Color::BLACK);
+        paint_dotted_border_side(
+            &mut paths,
+            10.0,
+            20.0,
+            30.0,
+            PaintStrokeWidth::new(2.0),
+            false,
+            CssColor::BLACK,
+        );
 
         assert_eq!(paths.len(), 1);
         let path = &paths[0];
@@ -363,11 +373,19 @@ mod tests {
     #[test]
     fn short_dotted_side_uses_one_filled_circle() {
         let mut paths = Vec::new();
-        paint_dotted_border_side(&mut paths, 10.0, 3.0, 30.0, 2.0, true, Color::BLACK);
+        paint_dotted_border_side(
+            &mut paths,
+            10.0,
+            3.0,
+            30.0,
+            PaintStrokeWidth::new(2.0),
+            true,
+            CssColor::BLACK,
+        );
 
         assert_eq!(paths.len(), 1);
         let path = &paths[0];
-        assert_eq!(path.fill, Some(Color::BLACK));
+        assert_eq!(path.fill, Some(CssColor::BLACK));
         assert_eq!(path.stroke, None);
         assert_eq!(path.commands.len(), 6);
     }
@@ -375,14 +393,34 @@ mod tests {
     #[test]
     fn dotted_side_skips_empty_or_invisible_paint() {
         let mut paths = Vec::new();
-        paint_dotted_border_side(&mut paths, 0.0, 0.0, 0.0, 2.0, true, Color::BLACK);
-        paint_dotted_border_side(&mut paths, 0.0, 10.0, 0.0, 2.0, true, Color::TRANSPARENT);
+        paint_dotted_border_side(
+            &mut paths,
+            0.0,
+            0.0,
+            0.0,
+            PaintStrokeWidth::new(2.0),
+            true,
+            CssColor::BLACK,
+        );
+        paint_dotted_border_side(
+            &mut paths,
+            0.0,
+            10.0,
+            0.0,
+            PaintStrokeWidth::new(2.0),
+            true,
+            CssColor::TRANSPARENT,
+        );
         assert!(paths.is_empty());
     }
 
     #[test]
     fn rect_path_preserves_a_nonzero_paint_rect() {
-        let path = rect_path(paint_space_rect(10.0, 20.0, 30.0, 40.0), Color::BLACK, None);
+        let path = rect_path(
+            paint_space_rect(10.0, 20.0, 30.0, 40.0),
+            CssColor::BLACK,
+            None,
+        );
 
         assert_eq!(
             path.commands

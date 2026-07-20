@@ -1,6 +1,6 @@
 use super::*;
 
-fn filled_rects(page: &quire::Page, fill: Color) -> Vec<&quire::RenderedRect> {
+fn filled_rects(page: &quire::Page, fill: CssColor) -> Vec<&quire::RenderedRect> {
     page.rects()
         .iter()
         .filter(|rect| rect.fill == Some(fill))
@@ -23,7 +23,7 @@ async fn zoomed_multicol_scales_fixed_columns_gaps_and_rule_widths() {
     .unwrap();
 
     let page = &document.pages[0];
-    let paints = filled_rects(page, Color::new(255, 0, 0));
+    let paints = filled_rects(page, CssColor::new(255, 0, 0));
     assert!(!paints.is_empty(), "operations={:?}", page.operations());
     assert!(
         paints
@@ -31,11 +31,11 @@ async fn zoomed_multicol_scales_fixed_columns_gaps_and_rule_widths() {
             .all(|paint| (paint.width() - 10.0).abs() < 0.01)
     );
     let has_rule = page.strokes().iter().any(|stroke| {
-        stroke.color == Color::new(0, 255, 0)
-            && (stroke.width - 4.0).abs() < 0.01
+        stroke.color == CssColor::new(0, 255, 0)
+            && (stroke.stroke_width.points() - 4.0).abs() < 0.01
             && (stroke.x1() - stroke.x2()).abs() < 0.01
     }) || page.rects().iter().any(|rect| {
-        rect.fill == Some(Color::new(0, 255, 0))
+        rect.fill == Some(CssColor::new(0, 255, 0))
             && (rect.width() - 4.0).abs() < 0.01
             && rect.height() > 0.0
     });
@@ -67,7 +67,7 @@ async fn explicitly_inherited_multicol_values_use_the_container_effective_zoom()
     .unwrap();
 
     let page = &document.pages[0];
-    let paints = filled_rects(page, Color::new(128, 0, 128));
+    let paints = filled_rects(page, CssColor::new(128, 0, 128));
     assert!(!paints.is_empty(), "paints={paints:?}");
     assert!(
         paints
@@ -76,9 +76,10 @@ async fn explicitly_inherited_multicol_values_use_the_container_effective_zoom()
     );
     assert!(
         page.strokes().iter().any(|stroke| {
-            stroke.color == Color::new(0, 255, 255) && (stroke.width - 4.0).abs() < 0.01
+            stroke.color == CssColor::new(0, 255, 255)
+                && (stroke.stroke_width.points() - 4.0).abs() < 0.01
         }) || page.rects().iter().any(|rect| {
-            rect.fill == Some(Color::new(0, 255, 255)) && (rect.width() - 4.0).abs() < 0.01
+            rect.fill == Some(CssColor::new(0, 255, 255)) && (rect.width() - 4.0).abs() < 0.01
         }),
         "strokes={:?}; rects={:?}",
         page.strokes(),
@@ -105,9 +106,9 @@ async fn zoomed_nested_multicol_spanner_and_wrapped_rows_keep_one_effective_scal
 
     let page = &document.pages[0];
     for (color, expected_width) in [
-        (Color::new(0, 0, 255), 10.0),
-        (Color::new(0, 255, 0), 40.0),
-        (Color::new(255, 128, 0), 10.0),
+        (CssColor::new(0, 0, 255), 10.0),
+        (CssColor::new(0, 255, 0), 40.0),
+        (CssColor::new(255, 128, 0), 10.0),
     ] {
         assert!(
             filled_rects(page, color)

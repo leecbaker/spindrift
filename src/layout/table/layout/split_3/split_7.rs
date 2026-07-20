@@ -13,50 +13,55 @@ impl<'a> LayoutBuilder<'a> {
         }
         match child {
             box_tree::FormattingBox::Inline(box_) => {
-                if matches!(box_.style.position, Position::Absolute | Position::Fixed) {
+                if matches!(
+                    box_.core.style.position,
+                    Position::Absolute | Position::Fixed
+                ) {
                     Some(0.0)
                 } else {
                     Some(table_cell_formatting_child_outer_height(child).points())
                 }
             }
             box_tree::FormattingBox::AtomicInline(box_)
-                if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Canvas) =>
+                if replaced_element_kind(box_.core.element)
+                    == Some(ReplacedElementKind::Canvas) =>
             {
                 let style = self.table_cell_content_sizing_style(
-                    &box_.style,
+                    &box_.core.style,
                     TableCellContentSizingPolicy::RowMinimum,
                 );
                 Some(table_cell_canvas_first_pass_outer_height(
-                    box_.element,
+                    box_.core.element,
                     &style,
                     available_width,
                 ))
             }
             box_tree::FormattingBox::Replaced(box_)
-                if replaced_element_kind(box_.element) == Some(ReplacedElementKind::Canvas) =>
+                if replaced_element_kind(box_.core.element)
+                    == Some(ReplacedElementKind::Canvas) =>
             {
                 let style = self.table_cell_content_sizing_style(
-                    &box_.style,
+                    &box_.core.style,
                     TableCellContentSizingPolicy::RowMinimum,
                 );
                 Some(table_cell_canvas_first_pass_outer_height(
-                    box_.element,
+                    box_.core.element,
                     &style,
                     available_width,
                 ))
             }
             box_tree::FormattingBox::AtomicInline(box_) => {
                 Some(self.table_cell_row_minimum_atomic_inline_outer_height(
-                    &box_.style,
-                    &box_.children,
+                    &box_.core.style,
+                    &box_.core.children,
                     stylesheets,
                     available_width,
                 ))
             }
             box_tree::FormattingBox::Replaced(box_) => {
                 Some(self.table_cell_row_minimum_atomic_inline_outer_height(
-                    &box_.style,
-                    &box_.children,
+                    &box_.core.style,
+                    &box_.core.children,
                     stylesheets,
                     available_width,
                 ))
@@ -84,8 +89,8 @@ impl<'a> LayoutBuilder<'a> {
         percentage_height_basis: BlockSizePercentageBasis,
     ) -> Option<f32> {
         let (element, style) = match child {
-            box_tree::FormattingBox::AtomicInline(box_) => (box_.element, &box_.style),
-            box_tree::FormattingBox::Replaced(box_) => (box_.element, &box_.style),
+            box_tree::FormattingBox::AtomicInline(box_) => (box_.core.element, &box_.core.style),
+            box_tree::FormattingBox::Replaced(box_) => (box_.core.element, &box_.core.style),
             _ => {
                 return self.table_cell_measured_inline_outer_height(
                     child,
@@ -400,8 +405,8 @@ impl<'a> LayoutBuilder<'a> {
                 })
             }
             box_tree::FormattingBox::Inline(box_) => self.inline_children_baseline_offset(
-                &box_.children,
-                &box_.style,
+                &box_.core.children,
+                &box_.core.style,
                 stylesheets,
                 available_width,
                 baseline_set,
@@ -416,35 +421,35 @@ impl<'a> LayoutBuilder<'a> {
                 ),
             box_tree::FormattingBox::InlineSplitBlockContext(box_) => self
                 .table_cell_children_baseline_offset(
-                    &box_.children,
-                    &box_.style,
+                    &box_.core.children,
+                    &box_.core.style,
                     stylesheets,
                     available_width,
                     baseline_set,
                 ),
             box_tree::FormattingBox::Block(box_) => self.block_child_baseline_offset(
-                &box_.style,
-                &box_.children,
+                &box_.core.style,
+                &box_.core.children,
                 stylesheets,
                 available_width,
                 baseline_set,
             ),
             box_tree::FormattingBox::Flex(box_) => self.block_child_baseline_offset(
-                &box_.style,
-                &box_.children,
+                &box_.core.style,
+                &box_.core.children,
                 stylesheets,
                 available_width,
                 baseline_set,
             ),
             box_tree::FormattingBox::Table(box_) => self
                 .table_fragment_baseline_offset(
-                    box_.element,
-                    &box_.style,
+                    box_.core.element,
+                    &box_.core.style,
                     &box_.fragment,
                     stylesheets,
                     available_width,
                 )
-                .map(|baseline| box_.style.margin.top + baseline),
+                .map(|baseline| box_.core.style.margin.top + baseline),
             box_tree::FormattingBox::AtomicInline(_) | box_tree::FormattingBox::Replaced(_) => None,
         }
     }
@@ -598,7 +603,7 @@ impl<'a> LayoutBuilder<'a> {
             style,
             stylesheets,
             &input.columns,
-            table_width.content_width.points(),
+            LogicalInlineContentSize::new(table_width.content_width),
             !style.box_values.width.is_auto(),
             table_cellpadding,
             table_metrics.clone(),
@@ -608,7 +613,7 @@ impl<'a> LayoutBuilder<'a> {
             &input.captions,
             style,
             stylesheets,
-            column_plan.total_width(),
+            PhysicalContentWidth::new(content_box_pt(column_plan.total_width().points())),
             CaptionSide::Top,
         );
         let table_used_style = self.table_used_style(style);
@@ -838,7 +843,7 @@ impl<'a> LayoutBuilder<'a> {
                 box_tree::FormattingBox::Inline(box_) => {
                     inline_line_height =
                         inline_line_height.max(self.table_cell_children_text_content_height(
-                            &box_.children,
+                            &box_.core.children,
                             available_width,
                         ));
                 }
@@ -877,11 +882,12 @@ impl<'a> LayoutBuilder<'a> {
         table_style: &ComputedStyle,
         stylesheets: &[Stylesheet],
         row_heights: &[f32],
+        source_row_heights: &[f32],
         row_occupancy: &[bool],
         table_metrics: TableMetrics,
         border_box: TableCellBorderBox,
         placement: TableGridPlacement,
-    ) -> Option<OverflowClip> {
+    ) -> Option<TableCellClipRegion> {
         if rowspan <= 1 {
             return None;
         }
@@ -897,33 +903,48 @@ impl<'a> LayoutBuilder<'a> {
             return None;
         }
 
-        let visible_row_heights = row_heights[row_index..end]
-            .iter()
-            .enumerate()
-            .filter_map(|(offset, height)| {
-                row_occupancy
-                    .get(row_index + offset)
-                    .cloned()
-                    .unwrap_or(!collapsed_rows[offset])
-                    .then_some(*height)
-            })
-            .collect::<Vec<_>>();
-        let visible_occupancy = vec![true; visible_row_heights.len()];
-        let visible_height =
-            table_grid_height(&visible_row_heights, &visible_occupancy, table_metrics);
-        let rect = TableGridRect::new(
-            border_box.rect().origin,
-            TableGridSize::new(border_box.width(), visible_height.max(0.0)),
-        );
-        Some(placement.overflow_clip_for(rect))
+        // Keep source track advances even where visibility collapse removes a
+        // row from final painting. The spanning cell's descendants are laid
+        // out in that source space; each surviving row contributes one clip
+        // rectangle and collapsed tracks become actual holes.
+        let mut source_start = 0.0;
+        let mut regions = Vec::new();
+        for (offset, collapsed) in collapsed_rows.iter().copied().enumerate() {
+            let index = row_index + offset;
+            let source_height = source_row_heights
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| row_heights.get(index).copied().unwrap_or(0.0));
+            let visible = row_occupancy.get(index).copied().unwrap_or(!collapsed);
+            if visible && source_height > 0.0 {
+                let rect = TableGridRect::new(
+                    TableGridPoint::from_lengths(
+                        TableGridLength::new(border_box.rect().origin.x),
+                        TableGridLength::new(border_box.rect().origin.y + source_start),
+                    ),
+                    TableGridSize::from_lengths(
+                        TableGridLength::new(border_box.width()),
+                        TableGridLength::new(source_height),
+                    ),
+                );
+                regions.push(placement.overflow_clip_for(rect));
+            }
+            source_start += source_height;
+            if offset + 1 < end - row_index {
+                source_start += table_metrics.spacing.vertical.length_points();
+            }
+        }
+        TableCellClipRegion::from_clips(regions)
     }
 
-    /// Return the padding-edge clip established by paint containment on a
-    /// table cell.
+    /// Return the padding-edge clip established by overflow or paint
+    /// containment on a table cell.
     ///
     /// A table cell's used height is determined by row layout rather than by
-    /// its specified height. Paint containment clips at the resulting padding
-    /// edge after the table border model resolves cell borders:
+    /// its specified height. Both CSS Overflow and paint containment clip at
+    /// the resulting padding edge after the table border model resolves cell
+    /// borders.  The CSS overflow axes stay physical at this final paint
+    /// boundary, matching ordinary block layout:
     /// <https://www.w3.org/TR/CSS22/tables.html#height-layout>
     /// <https://www.w3.org/TR/css-contain-1/#containment-paint>.
     pub(in crate::layout::table) fn table_cell_content_clip(
@@ -934,10 +955,31 @@ impl<'a> LayoutBuilder<'a> {
         cell_borders: css::Edges,
     ) -> Option<OverflowClip> {
         let padding_box = placement.containing_block_for(border_box, cell_borders);
-        cell_style
-            .contain
-            .paint
-            .then(|| OverflowClip::from_page_top_rect(padding_box.rect))
+        // CSS table cells grow their used row height for normal in-flow
+        // content. Unlike ordinary blocks, `hidden` and `clip` therefore do
+        // not establish a shorter used cell scrollport merely because an
+        // author supplied `height` or `max-height`; `auto`/`scroll` retain
+        // their table-cell scrollport behavior after row sizing.
+        // <https://drafts.csswg.org/css-tables-3/#table-height-algorithm>
+        let (overflow_x, overflow_y) = resolved_overflow_axes(cell_style);
+        let clips_scrollport_x = matches!(overflow_x, css::Overflow::Auto | css::Overflow::Scroll);
+        let clips_scrollport_y = matches!(overflow_y, css::Overflow::Auto | css::Overflow::Scroll);
+        if !(clips_scrollport_x || clips_scrollport_y || cell_style.contain.paint) {
+            return None;
+        }
+        let rect = padding_box.rect;
+        Some(
+            OverflowClip::from_page_top_rect(PageTopRect::new(
+                rect.x(),
+                rect.top_y(),
+                rect.width().max(0.0),
+                rect.height().max(0.0),
+            ))
+            .with_axes(
+                clips_scrollport_x || cell_style.contain.paint,
+                clips_scrollport_y || cell_style.contain.paint,
+            ),
+        )
     }
 
     pub(in crate::layout::table) fn layout_table_captions(
@@ -1063,7 +1105,7 @@ impl<'a> LayoutBuilder<'a> {
         let collapsed_columns =
             self.collapsed_table_columns(columns, table_style, stylesheets, column_count);
         let mut collapsed_grid =
-            CollapsedBorderGrid::new(rows.len(), column_count, TableAxes::for_style(table_style));
+            CollapsedBorderGrid::new(rows.len(), column_count, table_style.used_direction());
         collapsed_grid.add_table(table_style, rows.len(), column_count);
         for (row_index, row) in rows.iter().enumerate() {
             let row_style = self.style_for_table_row(row, table_style, stylesheets);

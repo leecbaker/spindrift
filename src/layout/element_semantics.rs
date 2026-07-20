@@ -281,6 +281,47 @@ pub(super) fn property_containment_applies_to_element(
     )
 }
 
+/// The containment effects which apply to an element's principal box.
+///
+/// `contain` is a computed-value shorthand, but size, layout, and paint
+/// containment have no effect on boxes without a containment-capable
+/// principal box.  Keep that used-value distinction at this boundary so
+/// formatting, positioning, clipping, and Grid cannot accidentally apply an
+/// authored containment bit to a non-applicable inline or table-internal box.
+/// <https://drafts.csswg.org/css-contain-1/#containment-principal>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct UsedPropertyContainment {
+    pub(super) size: bool,
+    pub(super) layout: bool,
+    pub(super) paint: bool,
+}
+
+pub(super) fn used_property_containment(
+    element: &Element,
+    style: &ComputedStyle,
+) -> UsedPropertyContainment {
+    let applies = property_containment_applies_to_element(element, style);
+    UsedPropertyContainment {
+        size: applies && style.contain.size,
+        layout: applies && style.contain.layout,
+        paint: applies && style.contain.paint,
+    }
+}
+
+pub(super) fn layout_containment_applies_to_element(
+    element: &Element,
+    style: &ComputedStyle,
+) -> bool {
+    used_property_containment(element, style).layout
+}
+
+pub(super) fn paint_containment_applies_to_element(
+    element: &Element,
+    style: &ComputedStyle,
+) -> bool {
+    used_property_containment(element, style).paint
+}
+
 pub(super) fn propagates_document_canvas_properties(
     element: &Element,
     style: &ComputedStyle,
@@ -320,7 +361,7 @@ impl<'a> LayoutBuilder<'a> {
         (self
             .used_overflow_for_element(element, style)
             .clips_overflow()
-            || (style.contain.paint && property_containment_applies_to_element(element, style)))
+            || paint_containment_applies_to_element(element, style))
             && !self
                 .document_canvas_overflow
                 .is_viewport_overflow_source(element)
@@ -385,7 +426,25 @@ pub(super) fn element_layout_kind(element: &Element, style: &ComputedStyle) -> E
     if style.display.is_grid() {
         return ElementLayoutKind::Grid;
     }
-    if style.display.is_table() || is_html_table_element(element) {
+    // Table-internal display types are consumed by their enclosing table
+    // fragment.  When one is the principal box here, no table ancestor has
+    // supplied that fragment, so its anonymous-table wrapper must retain the
+    // normal-flow static-position behavior of the principal element rather
+    // than becoming an independent table root.
+    // <https://drafts.csswg.org/css-display-3/#transformations>
+    if style.display.is_table()
+        && !matches!(
+            style.display.inner,
+            DisplayInner::TableColumnGroup
+                | DisplayInner::TableColumn
+                | DisplayInner::TableHeaderGroup
+                | DisplayInner::TableRowGroup
+                | DisplayInner::TableFooterGroup
+                | DisplayInner::TableRow
+                | DisplayInner::TableCell
+                | DisplayInner::TableCaption
+        )
+    {
         return ElementLayoutKind::Table;
     }
     if style.display.is_inline_level() && style.display.is_flow() {
@@ -445,6 +504,18 @@ pub(super) fn is_line_break_element(element: &Element) -> bool {
     has_html_rendering_semantics(element) && element.tag == "br"
 }
 
+/// Whether this element itself has a direct `<br>` child.
+///
+/// A direct break is collected by this element's raw inline fallback. A nested
+/// break is owned by its nested formatting context and must not turn an
+/// ancestor with frozen block children into an inline-content owner.
+/// <https://html.spec.whatwg.org/multipage/text-level-semantics.html#the-br-element>
+pub(super) fn element_has_direct_line_break(element: &Element) -> bool {
+    element.children.iter().any(
+        |child| matches!(&child.kind, NodeKind::Element(child) if is_line_break_element(child)),
+    )
+}
+
 pub(super) fn is_document_canvas_element(element: &Element) -> bool {
     has_html_rendering_semantics(element) && matches!(element.tag.as_str(), "html" | "body")
 }
@@ -455,8 +526,7 @@ pub(super) fn is_document_canvas_element(element: &Element) -> bool {
 /// canvas context. Context-aware principal block layout replaces this with the
 /// selected viewport overflow source's used `visible` value.
 pub(super) fn used_overflow_clips_element(element: &Element, style: &ComputedStyle) -> bool {
-    style_clips_overflow(style)
-        || (style.contain.paint && property_containment_applies_to_element(element, style))
+    style_clips_overflow(style) || paint_containment_applies_to_element(element, style)
 }
 
 pub(super) fn is_html_table_element(element: &Element) -> bool {
@@ -481,23 +551,6 @@ pub(super) fn suppresses_ordered_mixed_flow_detection(element: &Element) -> bool
         || is_html_table_element(element)
 }
 
-pub(super) fn is_html_table_caption_element(element: &Element) -> bool {
-    has_html_rendering_semantics(element) && element.tag == "caption"
-}
-
-pub(super) fn is_html_table_column_group_element(element: &Element) -> bool {
-    has_html_rendering_semantics(element) && element.tag == "colgroup"
-}
-
-pub(super) fn is_html_table_column_element(element: &Element) -> bool {
-    has_html_rendering_semantics(element) && element.tag == "col"
-}
-
-pub(super) fn is_html_table_row_group_element(element: &Element) -> bool {
-    has_html_rendering_semantics(element)
-        && matches!(element.tag.as_str(), "thead" | "tbody" | "tfoot")
-}
-
 pub(super) fn is_html_table_header_group_element(element: &Element) -> bool {
     has_html_rendering_semantics(element) && element.tag == "thead"
 }
@@ -508,10 +561,6 @@ pub(super) fn is_html_table_footer_group_element(element: &Element) -> bool {
 
 pub(super) fn is_html_table_row_element(element: &Element) -> bool {
     has_html_rendering_semantics(element) && element.tag == "tr"
-}
-
-pub(super) fn is_html_table_cell_element(element: &Element) -> bool {
-    has_html_rendering_semantics(element) && matches!(element.tag.as_str(), "td" | "th")
 }
 
 /// Return whether this element is an HTML `select` form control.

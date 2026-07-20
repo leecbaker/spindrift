@@ -22,6 +22,8 @@ cannot accidentally activate malformed syntax.
   the print capability model.
 - Output features `update: none`, `overflow-block: paged`, and the sRGB color
   gamut, including correct rejection of invalid values for known features.
+- The `forced-colors` feature, including boolean form and `none`/`active`
+  values, resolved from the caller-selected forced-colors environment.
 - General-enclosed fallback for unknown media features.
 
 The WPT `css/mediaqueries/mq-gamut-*` group passes 5/5 tests with the local

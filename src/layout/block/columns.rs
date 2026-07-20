@@ -1,8 +1,5 @@
 use super::super::*;
-use super::{
-    BlockFlowChildTraversalState, BlockFlowChildrenPhaseInput,
-    apply_pending_normal_flow_margin_before_float,
-};
+use super::{BlockFlowChildTraversalState, BlockFlowChildrenPhaseInput};
 use crate::css::Edges;
 use crate::layout::builder::page_for_context;
 use crate::layout::inline_layout::InlineLayoutOutcome;
@@ -65,6 +62,8 @@ struct EstimatedMulticolFlowUnit {
 
 #[derive(Debug, Clone, Copy)]
 struct EstimatedMulticolFloat {
+    /// Normal-flow block position at which this float is encountered.
+    block_offset: LayoutLength,
     /// Mixed content, border/padding, and margin extent used for float bands.
     outer_width: LayoutLength,
     /// Mixed content, border/padding, and margin extent used for float bands.
@@ -101,6 +100,24 @@ impl Default for MulticolDescendantPercentageBasis {
     fn default() -> Self {
         Self::INDEFINITE
     }
+}
+
+/// Whether a later temporary column page needs its complete destination
+/// rectangle retained during replay.
+///
+/// The first source page still owns normal-flow inline overflow. A later page
+/// is already a committed continuation, however, so in an orthogonal writing
+/// mode its cross-axis ink must not escape beyond the destination column after
+/// the local-to-page translation. Horizontal multicolumn replay keeps the
+/// established cross-axis overflow behavior.
+/// <https://www.w3.org/TR/css-multicol-1/#overflow-inside-multicol>
+/// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+fn continuation_column_fragment_requires_full_clip(
+    fragment_index: usize,
+    writing_mode: WritingMode,
+    direction: Direction,
+) -> bool {
+    fragment_index > 0 && WritingModeAxes::new(writing_mode, direction).swaps_physical_axes()
 }
 
 /// Independent block-axis constraints for one anonymous column set.
@@ -470,10 +487,12 @@ impl<'a> LayoutBuilder<'a> {
                 can_collapse_start_margin: false,
                 can_collapse_end_margin: false,
                 applied_start_margin: layout_pt(0.0),
+                clearance_consumed_adjoining_start_margin: false,
                 starts_at_page_top: self.cursor_is_at_page_top(),
                 laid_out_column_children: false,
                 use_box_inline_items: false,
                 use_ordered_mixed_flow: false,
+                has_preceding_inline_flow_content: false,
                 definite_content_height: content_height,
                 descendant_percentage_height_basis: content_height.map(|height| {
                     block_size_percentage_basis_from_points(
@@ -616,10 +635,12 @@ impl<'a> LayoutBuilder<'a> {
                         can_collapse_start_margin: false,
                         can_collapse_end_margin: false,
                         applied_start_margin: layout_pt(0.0),
+                        clearance_consumed_adjoining_start_margin: false,
                         starts_at_page_top: self.cursor_is_at_page_top(),
                         laid_out_column_children: false,
                         use_box_inline_items: false,
                         use_ordered_mixed_flow: false,
+                        has_preceding_inline_flow_content: false,
                         definite_content_height: content_height,
                         descendant_percentage_height_basis: content_height.map(|height| {
                             block_size_percentage_basis_from_points(
@@ -796,12 +817,12 @@ impl<'a> LayoutBuilder<'a> {
                     .swaps_physical_axes()
                     {
                         metrics.horizontal_non_content_length().points()
-                            + metrics.margin.left
-                            + metrics.margin.right
+                            + metrics.margin.left.points()
+                            + metrics.margin.right.points()
                     } else {
                         metrics.vertical_non_content_length().points()
-                            + metrics.margin.top
-                            + metrics.margin.bottom
+                            + metrics.margin.top.points()
+                            + metrics.margin.bottom.points()
                     };
                     (outer_size - block_non_content).max(0.0)
                 })
@@ -983,8 +1004,8 @@ impl<'a> LayoutBuilder<'a> {
                     )
                     .points()
                         + metrics.vertical_non_content_length().points()
-                        + metrics.margin.top
-                        + metrics.margin.bottom
+                        + metrics.margin.top.points()
+                        + metrics.margin.bottom.points()
                 })
             });
             let own_height = definite_height
@@ -1125,14 +1146,11 @@ impl<'a> LayoutBuilder<'a> {
         let balances_definite_column_set = balance_definite_column_set
             && content_height.is_some()
             && !WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes();
-        let needs_intrinsic_balance = (matches!(
+        let needs_intrinsic_balance = matches!(
             style.column_fill,
             css::ColumnFill::Balance | css::ColumnFill::BalanceAll
         ) && (content_height.is_none()
-            || balances_definite_column_set))
-            || (style.column_fill == css::ColumnFill::Auto
-                && content_height.is_none()
-                && sequential_auto_height_limit.is_none());
+            || balances_definite_column_set);
         let balanced_untrimmed_height = if needs_intrinsic_balance {
             self.converged_multicol_balance_height(MulticolBalanceSearchInput {
                 element,
@@ -1156,10 +1174,26 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             estimated_balanced_height
         };
+        // With an unconstrained auto block size, `column-fill:auto` fills
+        // sequentially rather than balancing. The content establishes one
+        // intrinsic column height; a parent fragmentainer or explicit
+        // max-height may still impose the finite continuation limit below.
+        // <https://www.w3.org/TR/css-multicol-1/#filling-columns>
+        let sequential_auto_content_height = estimated_content_height
+            .max(minimum_column_height)
+            .max(minimum_monolithic_column_height)
+            .max(minimum_forced_run_height);
+        // An auto-height `column-fill:auto` set grows only until it reaches
+        // the active parent fragmentainer. Its next anonymous column then
+        // continues in the next available fragmentainer; treating the entire
+        // intrinsic content height as one column loses those continuation
+        // rows when the multicol box itself is paginated.
+        // <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
+        let sequential_auto_column_height = column_set_content_height
+            .or(sequential_auto_height_limit)
+            .unwrap_or_else(|| sequential_auto_content_height.min(available_page_height));
         let nominal_column_height = match style.column_fill {
-            css::ColumnFill::Auto => column_set_content_height
-                .or(sequential_auto_height_limit)
-                .unwrap_or(balanced_untrimmed_height),
+            css::ColumnFill::Auto => sequential_auto_column_height,
             css::ColumnFill::Balance | css::ColumnFill::BalanceAll => {
                 if content_height.is_none() || balances_definite_column_set {
                     balanced_untrimmed_height
@@ -1190,9 +1224,7 @@ impl<'a> LayoutBuilder<'a> {
             .max(minimum_column_height)
             .min(balance_height_limit);
         let column_height = match style.column_fill {
-            css::ColumnFill::Auto => column_set_content_height
-                .or(sequential_auto_height_limit)
-                .unwrap_or(balanced_height),
+            css::ColumnFill::Auto => sequential_auto_column_height,
             css::ColumnFill::Balance | css::ColumnFill::BalanceAll => {
                 if content_height.is_none() || balances_definite_column_set {
                     balanced_height
@@ -1255,6 +1287,8 @@ impl<'a> LayoutBuilder<'a> {
                     .any(|unit| unit.block_size.points() > column_height * 1.5));
 
         let outer_snapshot = self.snapshot();
+        let deferred_positioned_children_start = self.deferred_multicol_positioned_children.len();
+        self.multicol_positioned_replay_capture_depth += 1;
         let page_size = outer_snapshot.current_page_context.size;
         let continuation_context = PageContext {
             size: page_size,
@@ -1289,7 +1323,12 @@ impl<'a> LayoutBuilder<'a> {
         self.fragmentainer_override = Some(FragmentainerOverride {
             kind: FragmentainerKind::Column,
             initial_context: first_context,
-            initial_fragmentainer_count: column_count,
+            // The first column starts in the remaining block space at this
+            // point in outer flow. Every later anonymous column starts at the
+            // nominal column height, even when it is still in the first
+            // visual column row.
+            // <https://www.w3.org/TR/css-multicol-1/#pagination-and-overflow-outside-multicol>
+            initial_fragmentainer_count: 1,
             context: continuation_context,
             relax_widows_orphans,
         });
@@ -1327,10 +1366,12 @@ impl<'a> LayoutBuilder<'a> {
             can_collapse_start_margin: false,
             can_collapse_end_margin: false,
             applied_start_margin: layout_pt(0.0),
+            clearance_consumed_adjoining_start_margin: false,
             starts_at_page_top: false,
             laid_out_column_children: false,
             use_box_inline_items: false,
             use_ordered_mixed_flow: false,
+            has_preceding_inline_flow_content: false,
             definite_content_height: Some(column_height),
             descendant_percentage_height_basis: descendant_percentage_height_basis.map(|height| {
                 block_size_percentage_basis_from_points(
@@ -1368,6 +1409,74 @@ impl<'a> LayoutBuilder<'a> {
             self.push_page();
         }
         self.apply_pending_fragments_for_current_page();
+        // Direct positioned descendants are out of normal flow. An auto inset
+        // uses its static position in the final source column, while definite
+        // insets resolve against the principal multicol containing block and
+        // must not inherit the final temporary column's translation.
+        // Capture the distinction before restoring the outer page.
+        // <https://www.w3.org/TR/css-position-3/#static-position>
+        // <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
+        let mut source_positioned_children = {
+            let sibling_tags = element_sibling_signature_list(element);
+            let mut element_index = 0usize;
+            let mut positioned = Vec::new();
+            for child in &element.children {
+                let NodeKind::Element(child_element) = &child.kind else {
+                    continue;
+                };
+                let signature = ElementSignature::with_sibling_list(
+                    child_element.tag.clone(),
+                    child_element.attrs.clone(),
+                    element_index,
+                    sibling_tags.clone(),
+                );
+                element_index += 1;
+                let child_style = self.style_for_layout_element_with_parent_font_metrics(
+                    child_element,
+                    signature.clone(),
+                    stylesheets,
+                    Some(style),
+                );
+                if !matches!(child_style.position, Position::Absolute | Position::Fixed) {
+                    continue;
+                }
+                let static_position_depends_on_final_column =
+                    (child_style.box_values.inset_left.is_auto()
+                        && child_style.box_values.inset_right.is_auto())
+                        || (child_style.box_values.inset_top.is_auto()
+                            && child_style.box_values.inset_bottom.is_auto());
+                let positioning_containing_block = PositionedContainingBlockMode::for_style(style)
+                    .zip(self.containing_blocks.last().copied());
+                let source_static_rect = if static_position_depends_on_final_column {
+                    PositionedChildStaticRect::new(
+                        self.content_left,
+                        self.content_right,
+                        self.cursor_y,
+                    )
+                } else {
+                    PositionedChildStaticRect::new(
+                        previous_left,
+                        previous_left + available_width,
+                        previous_cursor_y,
+                    )
+                };
+                let fragment = PositionedFragmentReplay::unfragmented(
+                    source_static_rect,
+                    positioning_containing_block,
+                )
+                .committed_to_fragmentainer(
+                    if static_position_depends_on_final_column {
+                        self.pages.len()
+                    } else {
+                        0
+                    },
+                    PaintTranslation::identity(),
+                    None,
+                );
+                positioned.push((child_element.clone(), signature, child_style, fragment));
+            }
+            positioned
+        };
         // Column pages are an implementation detail, so positioned descendants
         // must not be bound to whichever temporary page happened to be active
         // when their source was encountered. Direct out-of-flow children are
@@ -1405,6 +1514,7 @@ impl<'a> LayoutBuilder<'a> {
             .ceil()
             .max(1.0) as usize;
         self.restore(outer_snapshot);
+        self.multicol_positioned_replay_capture_depth -= 1;
         self.counter_set = committed_counter_set;
         self.quote_depth = committed_quote_depth;
         self.next_assignment_id = committed_next_assignment_id;
@@ -1450,6 +1560,9 @@ impl<'a> LayoutBuilder<'a> {
         let mut row_rule_paint_point = self
             .current_page
             .paint_band_insertion_point(PaintBand::InFlowBlock);
+        let multicol_axes = FlowAxes::for_style(style);
+        let multicol_block_axis = WritingModeAxes::new(style.writing_mode, style.direction)
+            .physical_axis(LogicalAxis::Block);
         for (fragment_index, fragment) in column_fragments.into_iter().enumerate() {
             // Out-of-flow descendants are positioned against the multicol
             // container, not the shortened flow extent selected for an early
@@ -1460,6 +1573,15 @@ impl<'a> LayoutBuilder<'a> {
                 .bounds()
                 .map(|bounds| (previous_cursor_y - bounds.y()).max(source_fragment_height))
                 .unwrap_or(source_fragment_height);
+            // The numerical one-CSS-pixel progress capacity of a zero-height
+            // column keeps fragmentation finite, but is not an authored
+            // clipping edge. An atomic overflow subject, including a flex
+            // line, therefore retains its committed overflow instead of
+            // becoming a one-pixel stripe during multicol projection.
+            // <https://www.w3.org/TR/css-break-3/#breaking-rules>
+            // <https://www.w3.org/TR/css-flexbox-1/#pagination>
+            let zero_capacity_column_fragment_overflows = column_height <= css::CSS_PX_TO_PT + 0.01
+                && fragment_block_extent > column_height + 0.01;
             // A block that is substantially taller than its temporary column
             // can remain in one paint fragment even though its background and
             // descendants must be replayed through later columns. Small glyph
@@ -1470,26 +1592,40 @@ impl<'a> LayoutBuilder<'a> {
             // fragments as more content slices and manufacture extra columns.
             // <https://www.w3.org/TR/css-break-3/#break-decoration>
             let slice_count = if replay_oversized_flow_slices
-                && structurally_occupied_columns == 1
+                // A zero-height column's atomic overflow is committed as one
+                // source fragment per flex item. Those records may already
+                // occupy multiple temporary pages, but each still needs its
+                // clipped synthetic tails projected through the following
+                // anonymous columns. Ordinary multi-page flow remains
+                // authoritative and is never re-sliced here.
+                && (structurally_occupied_columns == 1
+                    || zero_capacity_column_fragment_overflows)
                 && fragment_block_extent > source_fragment_height * 1.5
             {
-                (fragment_block_extent / column_height)
-                    .ceil()
-                    .clamp(1.0, estimated_occupied_columns as f32) as usize
+                (fragment_block_extent / column_height).ceil().max(1.0) as usize
             } else {
                 1
             };
             for slice_index in 0..slice_count {
-                let slice_top = previous_cursor_y
-                    - if slice_index == 0 {
-                        0.0
-                    } else {
-                        source_fragment_height + (slice_index - 1) as f32 * column_height
-                    };
                 let slice_height = if slice_index == 0 {
                     source_fragment_height
                 } else {
                     column_height
+                };
+                let lifted_block_offset = if slice_index == 0 {
+                    0.0
+                } else {
+                    source_fragment_height + (slice_index - 1) as f32 * column_height
+                };
+                let source_slice = LogicalRect {
+                    origin: LogicalPoint {
+                        inline: 0.0,
+                        block: lifted_block_offset,
+                    },
+                    size: LogicalSize {
+                        inline: column_width,
+                        block: slice_height,
+                    },
                 };
                 // A column fragments overflow in its block axis. Direct
                 // over-wide and orthogonal children preserve their authored
@@ -1498,22 +1634,6 @@ impl<'a> LayoutBuilder<'a> {
                 // slice. The height always remains the anonymous column's
                 // fragmentation-axis extent.
                 // <https://www.w3.org/TR/css-multicol-1/#overflow-inside-multicol>
-                let source_slice =
-                    PageTopRect::new(previous_left, slice_top, column_width, slice_height)
-                        .paint_clip();
-                let fragment = if single_unsplittable_column_subject {
-                    fragment.clone()
-                } else {
-                    fragment
-                        .clone()
-                        .with_primitives_clipped_to_physical_block_range_preserving_inline_overflow(
-                            source_slice,
-                            slice_count > 1,
-                        )
-                };
-                if fragment.is_empty() {
-                    continue;
-                }
                 let target_fragment = fragment_index + slice_index;
                 let target_row = if paginate_column_rows || wrap_column_rows {
                     target_fragment / column_count
@@ -1623,29 +1743,107 @@ impl<'a> LayoutBuilder<'a> {
                 } else {
                     row_fragment as isize
                 };
-                // Continuous multicol overflow creates additional columns in
-                // the inline direction. Keeping the source sequence linear
-                // also lets one-column multicol containers generate their
-                // required overflow columns instead of wrapping downward.
-                // <https://www.w3.org/TR/css-multicol-1/#overflow>
-                let offset_x =
-                    row_left - previous_left + (column_width + gap) * visual_column_offset as f32;
-                let lifted_block_offset = if slice_index == 0 {
-                    0.0
+                let destination_inline_extent = available_width
+                    .max((row_fragment + 1) as f32 * column_width + row_fragment as f32 * gap);
+                let projection = FragmentainerProjection::new(FragmentainerProjectionInput {
+                    axes: multicol_axes,
+                    source_origin: PageTopPoint::new(previous_left, previous_cursor_y),
+                    source_extent: LogicalSize {
+                        inline: column_width,
+                        block: lifted_block_offset + slice_height,
+                    },
+                    source_slice,
+                    destination_origin: PageTopPoint::new(row_left, row_top),
+                    destination_extent: LogicalSize {
+                        inline: destination_inline_extent,
+                        block: slice_height,
+                    },
+                    destination_slice: LogicalRect {
+                        origin: LogicalPoint {
+                            inline: row_fragment as f32 * (column_width + gap),
+                            block: 0.0,
+                        },
+                        size: source_slice.size,
+                    },
+                    destination_page_area: PageTopRect::new(
+                        self.page_left(),
+                        self.page_top(),
+                        self.page_area_width(),
+                        self.page_area_height(),
+                    ),
+                });
+                // A direct positioned descendant captured on this temporary
+                // page owns the same source-to-destination projection as the
+                // normal-flow paint collected from it. This matters for an
+                // auto inset: all temporary pages share a local X/Y origin,
+                // while their committed columns do not.
+                // <https://www.w3.org/TR/css-position-3/#static-position>
+                // <https://www.w3.org/TR/css-multicol-1/#the-multi-column-model>
+                if slice_index == 0 {
+                    for (_, _, _, positioned_fragment) in &mut source_positioned_children {
+                        if positioned_fragment.owns_source_fragmentainer(fragment_index) {
+                            *positioned_fragment = positioned_fragment
+                                .clone()
+                                .projected_to_destination(projection.destination_translation());
+                        }
+                    }
+                    self.project_deferred_multicol_positioned_fragments(
+                        deferred_positioned_children_start,
+                        fragment_index,
+                        projection.destination_translation(),
+                    );
+                }
+                self.retain_deferred_multicol_positioned_candidate(
+                    deferred_positioned_children_start,
+                    projection.source_clip(),
+                    layout_pt(fragment_index as f32 * column_height),
+                    layout_pt((fragment_index + 1) as f32 * column_height),
+                    projection.destination_translation(),
+                );
+                let fragment = if single_unsplittable_column_subject
+                    // Only the source fragment's first replay owns the
+                    // atomic overflow. Later synthetic slices exist to
+                    // project the remaining source ranges through the
+                    // anonymous columns, and must retain their range clip.
+                    || (zero_capacity_column_fragment_overflows && slice_index == 0)
+                {
+                    fragment.clone()
                 } else {
-                    source_fragment_height + (slice_index - 1) as f32 * column_height
+                    fragment
+                        .clone()
+                        .with_primitives_clipped_to_physical_axis_range_preserving_cross_axis_overflow(
+                            multicol_block_axis,
+                            projection.source_clip(),
+                            slice_count > 1,
+                        )
                 };
-                let offset_y = row_top - previous_cursor_y + lifted_block_offset;
-                let page_area_clip = PageTopRect::new(
-                    self.page_left() - offset_x,
-                    self.page_top() - offset_y,
-                    self.page_area_width(),
-                    self.page_area_height(),
-                )
-                .paint_clip();
+                // The first column's normal-flow inline overflow remains
+                // visible, but a continuation captured on a later temporary
+                // column page belongs to its committed column rectangle. In
+                // a vertical writing mode, preserving that continuation's
+                // physical cross-axis overflow would paint it beyond the
+                // multicol container's inline end after destination
+                // translation. Keep the entire committed source rectangle
+                // for later column pages before projecting it.
+                // <https://www.w3.org/TR/css-multicol-1/#overflow-inside-multicol>
+                let fragment = if continuation_column_fragment_requires_full_clip(
+                    fragment_index,
+                    style.writing_mode,
+                    style.direction,
+                ) {
+                    fragment.with_primitives_clipped_to_rect_preserving_structure(
+                        projection.source_clip(),
+                    )
+                } else {
+                    fragment
+                };
+                if fragment.is_empty() {
+                    continue;
+                }
                 let fragment = fragment
-                    .with_primitives_clipped_to_physical_block_range_preserving_inline_overflow(
-                        page_area_clip,
+                    .with_primitives_clipped_to_physical_axis_range_preserving_cross_axis_overflow(
+                        multicol_block_axis,
+                        projection.destination_page_clip_in_source_space(),
                         false,
                     )
                     // Column inline overflow remains visible across gaps and
@@ -1653,14 +1851,14 @@ impl<'a> LayoutBuilder<'a> {
                     // fragment is still contained by the outer page area—the
                     // initial containing block for that page fragment.
                     // <https://www.w3.org/TR/css-page-3/#page-model>
-                    .with_primitives_clipped_to_rect_preserving_structure(page_area_clip);
+                    .with_primitives_clipped_to_rect_preserving_structure(
+                        projection.destination_page_clip_in_source_space(),
+                    );
                 if fragment.is_empty() {
                     continue;
                 }
-                self.current_page.append_paint_fragment_owned(
-                    fragment,
-                    PaintTranslation::new(offset_x, offset_y),
-                );
+                self.current_page
+                    .append_paint_fragment_owned(fragment, projection.destination_translation());
                 self.mark_current_page_flow_content();
                 if visual_column_offset >= 0 {
                     painted_columns = painted_columns.max(visual_column_offset as usize + 1);
@@ -1727,42 +1925,18 @@ impl<'a> LayoutBuilder<'a> {
         if painted_columns > 0 {
             self.mark_current_page_flow_content();
         }
-        let sibling_tags = element_sibling_signature_list(element);
-        let mut element_index = 0usize;
-        for child in &element.children {
-            let NodeKind::Element(child_element) = &child.kind else {
-                continue;
-            };
-            let signature = ElementSignature::with_sibling_list(
-                child_element.tag.clone(),
-                child_element.attrs.clone(),
-                element_index,
-                sibling_tags.clone(),
+        for (child_element, signature, child_style, fragment) in source_positioned_children {
+            let owning_fragment_clip =
+                PageTopRect::new(previous_left, row_top, available_width, column_height)
+                    .paint_clip();
+            self.defer_multicol_positioned_fragment_element(
+                &child_element,
+                &signature,
+                child_style,
+                fragment.with_destination_clip(owning_fragment_clip),
             );
-            element_index += 1;
-            let child_style = self.style_for_layout_element_with_parent_font_metrics(
-                child_element,
-                signature.clone(),
-                stylesheets,
-                Some(style),
-            );
-            if !matches!(child_style.position, Position::Absolute | Position::Fixed) {
-                continue;
-            }
-            let positioned_children = self.build_frozen_child_boxes_with_current_ancestors(
-                child_element,
-                stylesheets,
-                &child_style,
-            );
-            self.push_ancestor_signature(signature);
-            self.layout_element_with_child_boxes(
-                child_element,
-                &child_style,
-                stylesheets,
-                Some(&positioned_children),
-            );
-            self.ancestors.pop();
         }
+        self.replay_deferred_multicol_positioned_children(deferred_positioned_children_start);
         self.content_left = previous_left;
         self.content_right = previous_right;
         let used_column_set_height = if content_height.is_none()
@@ -2011,10 +2185,12 @@ impl<'a> LayoutBuilder<'a> {
             can_collapse_start_margin: false,
             can_collapse_end_margin: false,
             applied_start_margin: layout_pt(0.0),
+            clearance_consumed_adjoining_start_margin: false,
             starts_at_page_top: false,
             laid_out_column_children: false,
             use_box_inline_items: false,
             use_ordered_mixed_flow: false,
+            has_preceding_inline_flow_content: false,
             definite_content_height: Some(candidate_height),
             descendant_percentage_height_basis: input.descendant_percentage_height_basis.map(
                 |height| {
@@ -2109,8 +2285,8 @@ impl<'a> LayoutBuilder<'a> {
                     )
                     .points()
                         + metrics.vertical_non_content_length().points()
-                        + metrics.margin.top
-                        + metrics.margin.bottom
+                        + metrics.margin.top.points()
+                        + metrics.margin.bottom.points()
                 })
             });
             let height = definite_height
@@ -2170,11 +2346,19 @@ impl<'a> LayoutBuilder<'a> {
         available_width: f32,
     ) -> f32 {
         let mut floats = Vec::new();
-        self.collect_estimated_multicol_floats(boxes, stylesheets, available_width, &mut floats);
+        let mut normal_flow_offset = 0.0;
+        self.collect_estimated_multicol_floats(
+            boxes,
+            stylesheets,
+            available_width,
+            &mut normal_flow_offset,
+            &mut floats,
+        );
         let mut total_height = 0.0f32;
         let mut band_width = 0.0f32;
         let mut band_height = 0.0f32;
         for float in floats {
+            total_height = total_height.max(float.block_offset.points());
             let outer_width = float.outer_width.points().min(available_width).max(0.0);
             if band_width > 0.01 && band_width + outer_width > available_width + 0.01 {
                 total_height += band_height;
@@ -2202,6 +2386,7 @@ impl<'a> LayoutBuilder<'a> {
         boxes: &[box_tree::FormattingBox<'_>],
         stylesheets: &[Stylesheet],
         available_width: f32,
+        normal_flow_offset: &mut f32,
         floats: &mut Vec<EstimatedMulticolFloat>,
     ) {
         for box_ in boxes {
@@ -2211,14 +2396,16 @@ impl<'a> LayoutBuilder<'a> {
                         &box_.children,
                         stylesheets,
                         available_width,
+                        normal_flow_offset,
                         floats,
                     );
                 }
                 box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
                     self.collect_estimated_multicol_floats(
-                        &box_.children,
+                        &box_.core.children,
                         stylesheets,
                         available_width,
+                        normal_flow_offset,
                         floats,
                     );
                 }
@@ -2243,11 +2430,12 @@ impl<'a> LayoutBuilder<'a> {
                             )
                             .points();
                         floats.push(EstimatedMulticolFloat {
+                            block_offset: layout_pt(*normal_flow_offset),
                             outer_width: layout_pt(
                                 content_width
                                     + metrics.horizontal_non_content_length().points()
-                                    + metrics.margin.left
-                                    + metrics.margin.right,
+                                    + metrics.margin.left.points()
+                                    + metrics.margin.right.points(),
                             ),
                             outer_height: layout_pt(
                                 self.estimate_element_height(
@@ -2272,16 +2460,31 @@ impl<'a> LayoutBuilder<'a> {
                             || block_align_content_establishes_independent_formatting_context(
                                 style.align_content,
                             );
-                    if !style_is_in_normal_flow(style) || establishes_independent_formatting_context
-                    {
+                    if !style_is_in_normal_flow(style) {
                         continue;
+                    }
+                    let start_offset = *normal_flow_offset;
+                    let estimated_height = self
+                        .estimate_element_height(
+                            element,
+                            style,
+                            stylesheets,
+                            available_width,
+                            Some(children),
+                        )
+                        .unwrap_or(style.line_height)
+                        .max(0.0);
+                    if establishes_independent_formatting_context {
+                        *normal_flow_offset += estimated_height;
                     } else {
                         self.collect_estimated_multicol_floats(
                             children,
                             stylesheets,
                             available_width,
+                            normal_flow_offset,
                             floats,
                         );
+                        *normal_flow_offset = start_offset + estimated_height;
                     }
                 }
             }
@@ -2324,7 +2527,7 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 box_tree::FormattingBox::InlineSplitBlockContext(context) => {
                     units.extend(self.estimated_multicol_flow_units(
-                        &context.children,
+                        &context.core.children,
                         stylesheets,
                         available_width,
                         descendant_percentage_height_basis,
@@ -2356,8 +2559,8 @@ impl<'a> LayoutBuilder<'a> {
                             )
                             .points()
                                 + metrics.vertical_non_content_length().points()
-                                + metrics.margin.top
-                                + metrics.margin.bottom
+                                + metrics.margin.top.points()
+                                + metrics.margin.bottom.points()
                         })
                     });
                     let estimated = if is_self_collapsing_block_box(
@@ -2482,7 +2685,7 @@ impl<'a> LayoutBuilder<'a> {
                 }
                 box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
                     self.accumulate_estimated_multicol_monolithic_block_size(
-                        &box_.children,
+                        &box_.core.children,
                         stylesheets,
                         available_width,
                         largest,
@@ -2493,6 +2696,14 @@ impl<'a> LayoutBuilder<'a> {
                     let Some((element, _, style, children)) = box_.element_parts() else {
                         continue;
                     };
+                    // A table owns row-level fragmentation and can therefore
+                    // expose compatible breaks to an orthogonal multicol
+                    // parent. Other vertical flow roots remain monolithic
+                    // until they provide the same fragmentainer contract.
+                    // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+                    // <https://www.w3.org/TR/css-break-3/#fragmentation-model>
+                    let owns_compatible_fragmentation =
+                        box_.supports_fragmentainer_fragmentation(FragmentainerKind::Column);
                     // An orthogonal flow root is atomic in the containing
                     // horizontal column's block axis unless its own nested
                     // fragmentation context supplies a compatible break. Its
@@ -2502,7 +2713,8 @@ impl<'a> LayoutBuilder<'a> {
                     // <https://www.w3.org/TR/css-break-3/#monolithic>
                     let own_is_monolithic = style.contain.size
                         || style.display.is_atomic_inline()
-                        || style.writing_mode != WritingMode::HorizontalTb
+                        || (style.writing_mode != WritingMode::HorizontalTb
+                            && !owns_compatible_fragmentation)
                         || FragmentainerKind::Column.avoids_break_inside(style);
                     let own = own_is_monolithic
                         .then(|| {
@@ -2526,11 +2738,11 @@ impl<'a> LayoutBuilder<'a> {
                                     &text,
                                     style,
                                     available_width,
-                                    metrics.padding.left + metrics.border.left,
-                                    metrics.padding.right + metrics.border.right,
+                                    (metrics.padding.left + metrics.border.left).points(),
+                                    (metrics.padding.right + metrics.border.right).points(),
                                 ) + metrics.vertical_non_content_length().points()
-                                    + metrics.margin.top
-                                    + metrics.margin.bottom;
+                                    + metrics.margin.top.points()
+                                    + metrics.margin.bottom.points();
                             Some(estimated.unwrap_or(0.0).max(orthogonal_physical_height))
                         })
                         .flatten()
@@ -2745,10 +2957,6 @@ impl<'a> LayoutBuilder<'a> {
                 if traversal_state.is_exhausted() {
                     break;
                 }
-                apply_pending_normal_flow_margin_before_float(
-                    &mut child_style,
-                    previous_flow_bottom_margin,
-                );
                 if self.layout_floating_child(
                     child_element,
                     child_signature.clone(),
@@ -2762,6 +2970,53 @@ impl<'a> LayoutBuilder<'a> {
                     previous_flow_bottom_margin = None;
                     continue;
                 }
+            }
+            // The document canvas is treated as a flow owner for its
+            // block-level children, but an HTML `<br>` remains inline content
+            // even directly under `body`. Keeping it in the pending inline
+            // run preserves its forced-break and `clear` semantics.
+            // <https://html.spec.whatwg.org/multipage/text-level-semantics.html#the-br-element>
+            if is_line_break_element(child_element) {
+                inline_nodes.push(child.clone());
+                continue;
+            }
+            if matches!(child_style.position, Position::Absolute | Position::Fixed) {
+                // Positioned descendants are out of flow, but their static
+                // position is selected at this source-order boundary. Flush
+                // the preceding inline run before dispatching the box rather
+                // than treating the descendant as inline content (where a
+                // blockified source can be dropped by the anonymous-inline
+                // collector).
+                // <https://www.w3.org/TR/css-position-3/#static-position>
+                let inline_outcome = self.layout_ordered_mixed_inline_fragment_block(
+                    &inline_nodes,
+                    traversal_state
+                        .style_with_remaining(style)
+                        .as_ref()
+                        .unwrap_or(style),
+                    stylesheets,
+                    &mut inline_run_index,
+                    &text_box_trim_targets,
+                    text_box_line_trim,
+                    first_formatted_line.applies_to_next_inline_run(),
+                );
+                if inline_outcome.has_flow_effects {
+                    first_formatted_line.consume_next_formatted_line();
+                    seen_flow_child = true;
+                    previous_flow_bottom_margin = None;
+                    self.flush_float_run(&mut float_run);
+                }
+                traversal_state.debit(inline_outcome.clamp_line_slots);
+                inline_nodes.clear();
+                if traversal_state.is_exhausted() {
+                    break;
+                }
+                self.push_ancestor_signature(child_signature);
+                self.with_text_box_line_trim_scope(TextBoxLineTrim::default(), |layout| {
+                    layout.layout_element(child_element, &child_style, stylesheets);
+                });
+                self.ancestors.pop();
+                continue;
             }
             let is_flow_child = is_normal_block_flow_child(child_element, &child_style)
                 || is_document_canvas_element(element)
@@ -2905,6 +3160,15 @@ impl<'a> LayoutBuilder<'a> {
         text_box_line_trim: TextBoxLineTrim,
         allow_typographic_first_line: bool,
     ) -> InlineLayoutOutcome {
+        // Normal white-space-only DOM runs do not create a line box. In
+        // particular, an indentation text node before a block child must not
+        // consume a fragmentainer row before that child is placed.
+        // <https://www.w3.org/TR/css-text-3/#white-space-phase-1>
+        if inline_nodes.iter().all(|node| {
+            matches!(&node.kind, NodeKind::Text(text) if normalize_inline_text(text).is_empty())
+        }) {
+            return InlineLayoutOutcome::default();
+        }
         let is_text_box_trim_candidate =
             ordered_mixed_inline_nodes_accept_text_box_trim(inline_nodes, style);
         let run_text_box_line_trim = if is_text_box_trim_candidate {
@@ -3281,8 +3545,8 @@ fn formatting_box_is_eligible_multicol_spanner(box_: &box_tree::FormattingBox<'_
 
 fn formatting_box_allows_descendant_spanner_promotion(box_: &box_tree::FormattingBox<'_>) -> bool {
     let style = match box_ {
-        box_tree::FormattingBox::Block(box_) => box_.style.as_ref(),
-        box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_.style.as_ref(),
+        box_tree::FormattingBox::Block(box_) => box_.core.style.as_ref(),
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_.core.style.as_ref(),
         box_tree::FormattingBox::AnonymousBlock(box_) => box_.style.as_ref(),
         _ => return false,
     };
@@ -3319,16 +3583,22 @@ fn clone_multicol_wrapper_with_children<'a>(
     match box_ {
         box_tree::FormattingBox::Block(box_) => {
             let mut fragment = box_.clone();
-            fragment.children = children;
-            fragment.style =
-                multicol_wrapper_fragment_style(&fragment.style, owns_block_start, owns_block_end);
+            fragment.core.children = children;
+            fragment.core.style = multicol_wrapper_fragment_style(
+                &fragment.core.style,
+                owns_block_start,
+                owns_block_end,
+            );
             Some(box_tree::FormattingBox::Block(fragment))
         }
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
             let mut fragment = box_.clone();
-            fragment.children = children;
-            fragment.style =
-                multicol_wrapper_fragment_style(&fragment.style, owns_block_start, owns_block_end);
+            fragment.core.children = children;
+            fragment.core.style = multicol_wrapper_fragment_style(
+                &fragment.core.style,
+                owns_block_start,
+                owns_block_end,
+            );
             Some(box_tree::FormattingBox::InlineSplitBlockContext(fragment))
         }
         box_tree::FormattingBox::AnonymousBlock(box_) => {
@@ -3356,10 +3626,10 @@ fn empty_multicol_wrapper_fragment_is_zero_sized(box_: &box_tree::FormattingBox<
     let box_tree::FormattingBox::Block(box_) = box_ else {
         return false;
     };
-    let style = box_.style.as_ref();
+    let style = box_.core.style.as_ref();
     style.margin == css::Edges::ZERO
         && is_self_collapsing_block_box(
-            box_.element,
+            box_.core.element,
             style,
             &[],
             DocumentCanvasOverflowContext::default(),
@@ -3437,19 +3707,7 @@ fn multicol_spanner_boxes_with_container_inline_size<'a>(
         .iter()
         .cloned()
         .map(|mut box_| {
-            let style_slot = match &mut box_ {
-                box_tree::FormattingBox::Block(box_) => Some(&mut box_.style),
-                box_tree::FormattingBox::Inline(box_) => Some(&mut box_.style),
-                box_tree::FormattingBox::InlineSplitBlockContext(box_) => Some(&mut box_.style),
-                box_tree::FormattingBox::AtomicInline(box_) => Some(&mut box_.style),
-                box_tree::FormattingBox::Table(box_) => Some(&mut box_.style),
-                box_tree::FormattingBox::Flex(box_) => Some(&mut box_.style),
-                box_tree::FormattingBox::Replaced(box_) => Some(&mut box_.style),
-                box_tree::FormattingBox::AnonymousBlock(_) | box_tree::FormattingBox::Text(_) => {
-                    None
-                }
-            };
-            let Some(style_slot) = style_slot else {
+            let Some(style_slot) = box_.element_core_mut().map(|core| &mut core.style) else {
                 return box_;
             };
             if !matches!(
@@ -3467,8 +3725,8 @@ fn multicol_spanner_boxes_with_container_inline_size<'a>(
                 )),
             );
             let non_content = metrics.vertical_non_content_length().points()
-                + metrics.margin.top
-                + metrics.margin.bottom;
+                + metrics.margin.top.points()
+                + metrics.margin.bottom.points();
             set_style_used_height(
                 &mut used_style,
                 (container_inline_size.points() - non_content).max(0.0),
@@ -3568,8 +3826,8 @@ fn suppress_multicol_wrapper_fragment_physical_edge(style: &mut ComputedStyle, s
 
 fn multicol_wrapper_key(box_: &box_tree::FormattingBox<'_>) -> Option<usize> {
     let signature = match box_ {
-        box_tree::FormattingBox::Block(box_) => &box_.signature,
-        box_tree::FormattingBox::InlineSplitBlockContext(box_) => &box_.signature,
+        box_tree::FormattingBox::Block(box_) => &box_.core.signature,
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => &box_.core.signature,
         _ => return None,
     };
     Some(std::rc::Rc::as_ptr(&signature.opaque_id) as usize)
@@ -3608,14 +3866,22 @@ fn multicol_wrapper_fragments<'a, 'b>(
                 if multicol_wrapper_key(&box_tree::FormattingBox::Block(box_.clone()))
                     == Some(key) =>
             {
-                fragments.push((box_.element, box_.style.as_ref(), box_.children.as_slice()));
+                fragments.push((
+                    box_.core.element,
+                    box_.core.style.as_ref(),
+                    box_.core.children.as_slice(),
+                ));
             }
             box_tree::FormattingBox::InlineSplitBlockContext(box_)
                 if multicol_wrapper_key(&box_tree::FormattingBox::InlineSplitBlockContext(
                     box_.clone(),
                 )) == Some(key) =>
             {
-                fragments.push((box_.element, box_.style.as_ref(), box_.children.as_slice()));
+                fragments.push((
+                    box_.core.element,
+                    box_.core.style.as_ref(),
+                    box_.core.children.as_slice(),
+                ));
             }
             _ => {}
         }
@@ -3648,8 +3914,10 @@ fn set_multicol_wrapper_block_sizes_in_boxes(
         let is_target = multicol_wrapper_key(box_) == Some(key);
         if is_target && let Some(size) = sizes.get(*occurrence).cloned() {
             let style = match box_ {
-                box_tree::FormattingBox::Block(box_) => Some(&mut box_.style),
-                box_tree::FormattingBox::InlineSplitBlockContext(box_) => Some(&mut box_.style),
+                box_tree::FormattingBox::Block(box_) => Some(&mut box_.core.style),
+                box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+                    Some(&mut box_.core.style)
+                }
                 _ => None,
             };
             if let Some(style) = style {
@@ -3659,28 +3927,7 @@ fn set_multicol_wrapper_block_sizes_in_boxes(
             }
             *occurrence += 1;
         }
-        set_multicol_wrapper_block_sizes_in_boxes(
-            multicol_formatting_box_children_mut(box_),
-            key,
-            sizes,
-            occurrence,
-        );
-    }
-}
-
-fn multicol_formatting_box_children_mut<'a, 'b>(
-    box_: &'b mut box_tree::FormattingBox<'a>,
-) -> &'b mut [box_tree::FormattingBox<'a>] {
-    match box_ {
-        box_tree::FormattingBox::Block(box_) => &mut box_.children,
-        box_tree::FormattingBox::Inline(box_) => &mut box_.children,
-        box_tree::FormattingBox::InlineSplitBlockContext(box_) => &mut box_.children,
-        box_tree::FormattingBox::AnonymousBlock(box_) => &mut box_.children,
-        box_tree::FormattingBox::AtomicInline(box_) => &mut box_.children,
-        box_tree::FormattingBox::Text(_) => &mut [],
-        box_tree::FormattingBox::Table(box_) => &mut box_.children,
-        box_tree::FormattingBox::Flex(box_) => &mut box_.children,
-        box_tree::FormattingBox::Replaced(box_) => &mut box_.children,
+        set_multicol_wrapper_block_sizes_in_boxes(box_.children_mut(), key, sizes, occurrence);
     }
 }
 
@@ -3934,5 +4181,34 @@ fn definition_list_item_physical_edge_value(edges: Edges, side: PhysicalSide) ->
         PhysicalSide::Right => edges.right,
         PhysicalSide::Bottom => edges.bottom,
         PhysicalSide::Left => edges.left,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_later_orthogonal_column_pages_receive_a_full_destination_clip() {
+        assert!(!continuation_column_fragment_requires_full_clip(
+            0,
+            WritingMode::VerticalLr,
+            Direction::Ltr,
+        ));
+        assert!(!continuation_column_fragment_requires_full_clip(
+            1,
+            WritingMode::HorizontalTb,
+            Direction::Ltr,
+        ));
+        assert!(continuation_column_fragment_requires_full_clip(
+            1,
+            WritingMode::VerticalLr,
+            Direction::Ltr,
+        ));
+        assert!(continuation_column_fragment_requires_full_clip(
+            1,
+            WritingMode::VerticalRl,
+            Direction::Rtl,
+        ));
     }
 }

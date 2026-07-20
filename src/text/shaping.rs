@@ -43,38 +43,51 @@ pub(super) fn shape_text_with_document_font(
         .chars()
         .filter(|character| !character_is_bidi_format_control(*character))
         .collect::<Vec<_>>();
-    let mut glyphs = Vec::with_capacity(characters.len());
-    for (index, character) in characters.iter().cloned().enumerate() {
-        let glyph_id = if character == '\t' {
-            face.glyph_index(' ')?
-        } else {
-            css_space_separator_blank_glyph(&face, character)
-                .or_else(|| face.glyph_index(character))?
-        };
-        let mut x_advance = css_space_separator_advance(&face, character, font_size, scale)
-            .or_else(|| {
-                face.glyph_hor_advance(glyph_id)
+    let glyphs = characters
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, character)| {
+            let glyph_id = if character == '\t' {
+                face.glyph_index(' ')?
+            } else {
+                css_space_separator_blank_glyph(&face, character)
+                    .or_else(|| face.glyph_index(character))?
+            };
+            let mut x_advance = css_space_separator_advance(&face, character, font_size, scale)
+                .or_else(|| {
+                    face.glyph_hor_advance(glyph_id)
+                        .map(|advance| advance as f32 * scale)
+                })
+                .unwrap_or(0.0);
+            if used_letter_spacing != 0.0 && index + 1 < characters.len() {
+                x_advance += used_letter_spacing;
+            }
+            if word_spacing != 0.0 && character_is_css_word_separator(character) {
+                x_advance += word_spacing;
+            }
+            Some(RenderedGlyph {
+                // Preserved tabs use a font's provisional advance only to
+                // keep later shaping runs positioned until CSS tab-stop
+                // resolution replaces it. They are never paintable glyphs,
+                // including when this direct document-font path is used for
+                // a fallback run.
+                kind: if character == '\t' {
+                    RenderedGlyphKind::AdvanceOnly
+                } else {
+                    RenderedGlyphKind::Paint(glyph_id.0)
+                },
+                x_advance,
+                nominal_x_advance: face
+                    .glyph_hor_advance(glyph_id)
                     .map(|advance| advance as f32 * scale)
+                    .unwrap_or(x_advance),
+                x_offset: 0.0,
+                y_offset: 0.0,
+                unicode: character.to_string(),
             })
-            .unwrap_or(0.0);
-        if used_letter_spacing != 0.0 && index + 1 < characters.len() {
-            x_advance += used_letter_spacing;
-        }
-        if word_spacing != 0.0 && character_is_css_word_separator(character) {
-            x_advance += word_spacing;
-        }
-        glyphs.push(RenderedGlyph {
-            id: glyph_id.0,
-            x_advance,
-            nominal_x_advance: face
-                .glyph_hor_advance(glyph_id)
-                .map(|advance| advance as f32 * scale)
-                .unwrap_or(x_advance),
-            x_offset: 0.0,
-            y_offset: 0.0,
-            unicode: character.to_string(),
-        });
-    }
+        })
+        .collect::<Option<Vec<_>>>()?;
     Some(glyphs)
 }
 

@@ -76,6 +76,15 @@ impl Node {
         }
     }
 
+    /// Returns this node's element data when it is an element node.
+    #[cfg(test)]
+    pub(crate) fn as_element(&self) -> Option<&Element> {
+        match &self.kind {
+            NodeKind::Element(element) => Some(element),
+            NodeKind::Text(_) => None,
+        }
+    }
+
     fn as_element_mut(&mut self) -> Option<&mut Element> {
         match &mut self.kind {
             NodeKind::Element(element) => Some(element),

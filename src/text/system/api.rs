@@ -1,9 +1,11 @@
 use super::font_registry::FontSupportKind;
 use super::*;
+#[cfg(test)]
+use crate::RenderedLine;
 use crate::css::{BaselineShift, FontSizeAdjust, FontSizeAdjustMetric, FontSizeAdjustValue};
 use crate::document::{PaintSize, PaintTransform};
 use crate::{
-    Color, PaintPoint, PaintRect, RenderedImage, RenderedLine, RenderedPath, RenderedPathCommand,
+    CssColor, PaintPoint, PaintRect, RenderedImage, RenderedPath, RenderedPathCommand,
     RenderedPathFillRule, RenderedTextRun,
 };
 

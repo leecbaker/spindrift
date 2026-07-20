@@ -1,7 +1,15 @@
 use super::*;
 use crate::LayoutSize;
 use crate::layout::assets::rasterize_generated_css_image;
+use crate::units::{IntoLayoutLength, LayoutLength, layout_px};
 use std::rc::Rc;
+
+/// High-precision displacement of a background tile in page-local paint space.
+///
+/// Background positioning keeps this separate from generic primitive
+/// translations because percentages may be resolved against extremely large
+/// free space before the tile is clipped to a page.
+pub(in crate::layout) type PaintBackgroundOffset = euclid::Vector2D<f64, PaintSpace>;
 
 /// A URL-backed image that remains raster or vector through layout.
 #[derive(Debug, Clone)]
@@ -69,7 +77,7 @@ pub(super) fn load_resolved_image_source_with_request(
                 image_id: Some(image_id),
                 pixel_width: metadata.pixel_width,
                 pixel_height: metadata.pixel_height,
-                rgb: resource_cache.image_placeholder_rgb(),
+                rgb: EncodedRasterRgbSamples::from_shared(resource_cache.image_placeholder_rgb()),
                 alpha: None,
                 color_space: crate::color::RasterColorSpace::SRGB,
             })
@@ -133,6 +141,68 @@ pub(super) struct UsedImage {
     pub(super) border_box_size: BorderBoxSize,
 }
 
+/// Source-local coordinate space for a resolved CSS `object-view-box`.
+///
+/// The rectangle is normalized to the image's natural width and height, but
+/// deliberately permits origins outside the source image. CSS Images allows a
+/// view box to pan beyond the source; only a non-positive used width or height
+/// makes the view box ineffective.
+/// <https://drafts.csswg.org/css-images-5/#the-object-view-box-property>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum ObjectViewBoxSourceSpace {}
+
+pub(in crate::layout) type NormalizedObjectSourcePoint =
+    euclid::Point2D<f32, ObjectViewBoxSourceSpace>;
+pub(in crate::layout) type NormalizedObjectSourceSize =
+    euclid::Size2D<f32, ObjectViewBoxSourceSpace>;
+pub(in crate::layout) type NormalizedObjectSourceRect = euclid::Rect<f32, ObjectViewBoxSourceSpace>;
+
+/// The effective CSS Images source selection after resolving `object-view-box`.
+///
+/// `NoEffect` covers `none`, source images without both natural axes, and
+/// basic rectangles with a non-positive or non-finite used extent. In each
+/// case the image retains its full source and receives no view-box-specific
+/// clip.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::layout) enum ResolvedObjectViewBox {
+    NoEffect,
+    Source {
+        rect: NormalizedObjectSourceRect,
+        radii: Option<css::BorderRadius>,
+    },
+}
+
+impl ResolvedObjectViewBox {
+    pub(in crate::layout) fn source_rect(&self) -> NormalizedObjectSourceRect {
+        match self {
+            Self::NoEffect => NormalizedObjectSourceRect::new(
+                NormalizedObjectSourcePoint::new(0.0, 0.0),
+                NormalizedObjectSourceSize::new(1.0, 1.0),
+            ),
+            Self::Source { rect, .. } => *rect,
+        }
+    }
+
+    pub(in crate::layout) fn effective_natural_size(&self, natural_size: LayoutSize) -> LayoutSize {
+        let source = self.source_rect();
+        LayoutSize::new(
+            natural_size.width * source.size.width,
+            natural_size.height * source.size.height,
+        )
+    }
+
+    pub(in crate::layout) fn radii(&self) -> Option<&css::BorderRadius> {
+        match self {
+            Self::NoEffect => None,
+            Self::Source { radii, .. } => radii.as_ref(),
+        }
+    }
+
+    pub(in crate::layout) fn applies(&self) -> bool {
+        matches!(self, Self::Source { .. })
+    }
+}
+
 /// Used CSS box geometry shared by replaced elements without a painted image
 /// resource, such as HTML `<canvas>`.
 ///
@@ -174,16 +244,16 @@ impl UsedReplacedBox {
 /// <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>
 #[derive(Debug, Clone, Copy)]
 pub(super) struct IntrinsicReplacedSize {
-    pub(super) width: f32,
-    pub(super) height: f32,
+    pub(super) width: ContentBoxLength,
+    pub(super) height: ContentBoxLength,
     /// The source's preferred aspect ratio, when it has one. Default iframe
     /// dimensions deliberately do not establish this relationship.
     pub(super) preferred_aspect_ratio: Option<f32>,
     /// Whether the resource supplies either intrinsic dimension rather than
     /// only a preferred aspect ratio and CSS's default object size.
     pub(super) has_intrinsic_size: bool,
-    pub(super) attr_width: Option<f32>,
-    pub(super) attr_height: Option<f32>,
+    pub(super) attr_width: Option<ContentBoxLength>,
+    pub(super) attr_height: Option<ContentBoxLength>,
 }
 
 impl IntrinsicReplacedSize {
@@ -204,8 +274,8 @@ impl IntrinsicReplacedSize {
     pub(super) fn attribute_aspect_ratio(self) -> Option<f32> {
         self.attr_width
             .zip(self.attr_height)
-            .filter(|(width, height)| *width > 0.0 && *height > 0.0)
-            .map(|(width, height)| width / height)
+            .filter(|(width, height)| *width > content_box_pt(0.0) && *height > content_box_pt(0.0))
+            .map(|(width, height)| width.points() / height.points())
     }
 }
 
@@ -254,10 +324,10 @@ impl UsedImage {
 pub(super) struct IntrinsicImageSize {
     pub(super) decoded: DecodedPngImage,
     pub(super) svg: Option<SharedSvgAsset>,
-    pub(super) width: f32,
-    pub(super) height: f32,
-    pub(super) attr_width: Option<f32>,
-    pub(super) attr_height: Option<f32>,
+    pub(super) width: ContentBoxLength,
+    pub(super) height: ContentBoxLength,
+    pub(super) attr_width: Option<ContentBoxLength>,
+    pub(super) attr_height: Option<ContentBoxLength>,
 }
 
 impl IntrinsicImageSize {
@@ -265,8 +335,18 @@ impl IntrinsicImageSize {
         IntrinsicReplacedSize {
             width: self.width,
             height: self.height,
-            preferred_aspect_ratio: (self.width > 0.0 && self.height > 0.0)
-                .then_some(self.width / self.height),
+            // An SVG's concrete 300 by 150 viewport is the CSS default
+            // object size, not a preferred aspect ratio.  Keep the SVG
+            // document's ratio separate so an omitted `viewBox` does not
+            // accidentally turn the fallback size into a 2:1 constraint.
+            // <https://www.w3.org/TR/css-images-3/#default-sizing>
+            preferred_aspect_ratio: self.svg.as_ref().map_or_else(
+                || {
+                    (self.width > content_box_pt(0.0) && self.height > content_box_pt(0.0))
+                        .then_some(self.width.points() / self.height.points())
+                },
+                |asset| asset.intrinsic_dimensions().aspect_ratio,
+            ),
             has_intrinsic_size: self.svg.as_ref().is_none_or(|asset| {
                 let dimensions = asset.intrinsic_dimensions();
                 dimensions.width.is_some() || dimensions.height.is_some()
@@ -297,15 +377,15 @@ pub(super) fn intrinsic_default_replaced_size(element: &Element) -> IntrinsicRep
         .and_then(|value| parse_html_length(value))
         .filter(|value| *value > 0.0);
     IntrinsicReplacedSize {
-        width: attr_width.unwrap_or(300.0 * css::CSS_PX_TO_PT),
-        height: attr_height.unwrap_or(150.0 * css::CSS_PX_TO_PT),
+        width: content_box_pt(attr_width.unwrap_or(300.0 * css::CSS_PX_TO_PT)),
+        height: content_box_pt(attr_height.unwrap_or(150.0 * css::CSS_PX_TO_PT)),
         preferred_aspect_ratio: Some(
             attr_width.unwrap_or(300.0 * css::CSS_PX_TO_PT)
                 / attr_height.unwrap_or(150.0 * css::CSS_PX_TO_PT),
         ),
         has_intrinsic_size: true,
-        attr_width,
-        attr_height,
+        attr_width: attr_width.map(content_box_pt),
+        attr_height: attr_height.map(content_box_pt),
     }
 }
 
@@ -334,8 +414,8 @@ pub(super) fn intrinsic_svg_size(element: &Element) -> Option<IntrinsicReplacedS
     let width = size.width;
     let height = size.height;
     Some(IntrinsicReplacedSize {
-        width,
-        height,
+        width: content_box_pt(width),
+        height: content_box_pt(height),
         preferred_aspect_ratio: (width > 0.0 && height > 0.0).then_some(width / height),
         has_intrinsic_size: dimensions.width.is_some() || dimensions.height.is_some(),
         // Root SVG width/height attributes are presentation attributes for
@@ -344,10 +424,14 @@ pub(super) fn intrinsic_svg_size(element: &Element) -> Option<IntrinsicReplacedS
         // suppress the latter without discarding an explicit axis.
         // <https://www.w3.org/TR/SVG2/embedded.html#placement>
         attr_width: element.attrs.get("width").and_then(|value| {
-            parse_html_length(value).filter(|width| *width > 0.0 && !value.contains('%'))
+            parse_html_length(value)
+                .filter(|width| *width > 0.0 && !value.contains('%'))
+                .map(content_box_pt)
         }),
         attr_height: element.attrs.get("height").and_then(|value| {
-            parse_html_length(value).filter(|height| *height > 0.0 && !value.contains('%'))
+            parse_html_length(value)
+                .filter(|height| *height > 0.0 && !value.contains('%'))
+                .map(content_box_pt)
         }),
     })
 }
@@ -389,8 +473,8 @@ pub(super) fn intrinsic_image_size(
         ResolvedImageAsset::Raster(image) => image.natural_layout_size(),
         ResolvedImageAsset::Svg(asset) => asset.replaced_intrinsic_size(),
     };
-    let intrinsic_size =
-        object_view_box_intrinsic_size(style.object_view_box.clone(), intrinsic_size)?;
+    let view_box = resolved_object_view_box_for_asset(style.object_view_box.clone(), &asset);
+    let intrinsic_size = view_box.effective_natural_size(intrinsic_size);
     let width = intrinsic_size.width / intrinsic_resolution;
     let height = intrinsic_size.height / intrinsic_resolution;
     if width <= 0.0 || height <= 0.0 {
@@ -412,10 +496,10 @@ pub(super) fn intrinsic_image_size(
     Some(IntrinsicImageSize {
         decoded,
         svg,
-        width,
-        height,
-        attr_width,
-        attr_height,
+        width: content_box_pt(width),
+        height: content_box_pt(height),
+        attr_width: attr_width.map(content_box_pt),
+        attr_height: attr_height.map(content_box_pt),
     })
 }
 
@@ -462,14 +546,19 @@ pub(super) fn used_image(
         // has no media-frame decoder, so represent its unavailable frame with
         // one transparent pixel while retaining its CSS object geometry.
         // <https://html.spec.whatwg.org/multipage/media.html#the-video-element>
-        None if matches!(element.tag.as_str(), "img" | "video") => (
+        None if unavailable_image_establishes_replaced_box(element) => (
             transparent_replaced_fallback_pixel(),
             None,
             intrinsic_default_replaced_size(element),
         ),
         None => return None,
     };
-    let geometry = used_replaced_box(intrinsic, style, available_width, height_basis);
+    let geometry = used_replaced_box(
+        intrinsic,
+        style,
+        content_box_pt(available_width),
+        height_basis,
+    );
     Some(UsedImage::from_geometry(decoded, geometry).with_svg(svg))
 }
 
@@ -480,7 +569,7 @@ pub(super) fn used_image(
 /// cyclic.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct IntrinsicInlineImageSizingContext {
-    pub(super) available_width: f32,
+    pub(super) available_width: ContentBoxLength,
     pub(super) inline_percentage_basis: IntrinsicInlinePercentageBasis,
     pub(super) height_basis: BlockSizePercentageBasis,
 }
@@ -503,7 +592,7 @@ pub(super) fn used_image_with_inline_percentage_basis(
             let replaced_size = intrinsic.replaced_size();
             (intrinsic.decoded, intrinsic.svg, replaced_size)
         }
-        None if matches!(element.tag.as_str(), "img" | "video") => (
+        None if unavailable_image_establishes_replaced_box(element) => (
             transparent_replaced_fallback_pixel(),
             None,
             intrinsic_default_replaced_size(element),
@@ -530,6 +619,29 @@ fn transparent_replaced_fallback_pixel() -> DecodedPngImage {
     DecodedPngImage::new(1, 1, vec![0, 0, 0], Some(vec![0]))
 }
 
+/// Return whether an unavailable HTML image-like element still establishes a
+/// replaced box.
+///
+/// A media element has an HTML default object size without decoded media, and
+/// an `<img>` with a source or explicit dimensions retains a broken-image box.
+/// A bare `<img>` without either has no image request or intrinsic geometry;
+/// treating it as the 300×150 default object would incorrectly contribute to
+/// intrinsic sizing.
+/// <https://html.spec.whatwg.org/multipage/images.html#the-img-element>
+/// <https://www.w3.org/TR/css-images-3/#default-sizing>
+fn unavailable_image_establishes_replaced_box(element: &Element) -> bool {
+    if element.tag == "video" {
+        return true;
+    }
+    element.tag == "img"
+        && (element
+            .attrs
+            .get("src")
+            .is_some_and(|source| !source.trim().is_empty())
+            || element.attrs.contains_key("width")
+            || element.attrs.contains_key("height"))
+}
+
 /// Resolve a replaced element's intrinsic dimensions into CSS content and
 /// border boxes.
 ///
@@ -542,7 +654,7 @@ fn transparent_replaced_fallback_pixel() -> DecodedPngImage {
 pub(super) fn used_replaced_box(
     intrinsic: IntrinsicReplacedSize,
     style: &ComputedStyle,
-    available_width: f32,
+    available_width: ContentBoxLength,
     height_basis: BlockSizePercentageBasis,
 ) -> UsedReplacedBox {
     used_replaced_box_with_inline_percentage_basis(
@@ -550,7 +662,7 @@ pub(super) fn used_replaced_box(
         style,
         available_width,
         PercentageBasis::definite_from(
-            content_box_pt(available_width.max(0.0)),
+            ContentBoxLength::new(available_width.points().max(0.0)),
             IntrinsicInlinePercentageBasisSource::MeasurementAvailableWidth,
         ),
         height_basis,
@@ -568,7 +680,7 @@ pub(super) fn used_replaced_box(
 pub(super) fn used_replaced_box_with_inline_percentage_basis(
     intrinsic: IntrinsicReplacedSize,
     style: &ComputedStyle,
-    available_width: f32,
+    available_width: ContentBoxLength,
     inline_percentage_basis: IntrinsicInlinePercentageBasis,
     height_basis: BlockSizePercentageBasis,
 ) -> UsedReplacedBox {
@@ -588,7 +700,7 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
             style.contain_intrinsic_size.width.clone().map(|width| {
                 used_length_percentage(
                     width,
-                    PercentageBasis::definite(layout_pt(available_width.max(0.0))),
+                    PercentageBasis::definite(available_width.into_layout_length()),
                 )
                 .points()
             })
@@ -602,7 +714,7 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
             style.contain_intrinsic_size.height.clone().map(|height| {
                 used_length_percentage(
                     height,
-                    PercentageBasis::definite(layout_pt(available_width.max(0.0))),
+                    PercentageBasis::definite(available_width.into_layout_length()),
                 )
                 .points()
             })
@@ -626,7 +738,7 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
         borders.left + borders.right + style.padding.left + style.padding.right;
     let vertical_non_content =
         borders.top + borders.bottom + style.padding.top + style.padding.bottom;
-    let available_content_width = (available_width - horizontal_non_content).max(0.0);
+    let available_content_width = (available_width.points() - horizontal_non_content).max(0.0);
     let css_width = used_content_box_width_or_auto_with_basis(
         style,
         inline_percentage_basis,
@@ -651,7 +763,10 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
         // aspect ratio rather than reviving the overridden attribute length.
         (css_width, css_height)
     } else {
-        (intrinsic.attr_width, intrinsic.attr_height)
+        (
+            intrinsic.attr_width.map(SemanticLengthExt::points),
+            intrinsic.attr_height.map(SemanticLengthExt::points),
+        )
     };
     // HTML dimension attributes contribute intrinsic dimensions, not definite
     // CSS preferred sizes. Constraints may therefore transfer through their
@@ -674,12 +789,18 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
         (None, Some(height_value), None) if style.contain.size => {
             (contained_intrinsic_width, height_value)
         }
-        (Some(width_value), None, None) => (width_value, 0.0),
-        (None, Some(height_value), None) => (0.0, height_value),
+        // With one CSS axis specified but no preferred ratio, the automatic
+        // axis retains its independent intrinsic dimension. This is distinct
+        // from transferring a size through an aspect ratio: an SVG can supply
+        // an intrinsic width or height without supplying a ratio at all.
+        // <https://www.w3.org/TR/CSS22/visudet.html#inline-replaced-width>
+        // <https://www.w3.org/TR/CSS22/visudet.html#inline-replaced-height>
+        (Some(width_value), None, None) => (width_value, intrinsic.height.points()),
+        (None, Some(height_value), None) => (intrinsic.width.points(), height_value),
         (None, None, _) if style.contain.size => {
             (contained_intrinsic_width, contained_intrinsic_height)
         }
-        (None, None, _) => (intrinsic.width, intrinsic.height),
+        (None, None, _) => (intrinsic.width.points(), intrinsic.height.points()),
         (Some(width_value), Some(height_value), _) => (width_value, height_value),
     };
     if let Some(aspect_ratio) = aspect_ratio {
@@ -694,14 +815,14 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
             ReplacedSizeConstraints {
                 min_width: used_min_width(
                     style,
-                    PercentageBasis::definite(layout_pt(available_width)),
+                    PercentageBasis::definite(available_width.into_layout_length()),
                 )
                 .map(SemanticLengthExt::points),
                 max_width: used_max_width(
                     style,
-                    PercentageBasis::definite(layout_pt(available_width)),
+                    PercentageBasis::definite(available_width.into_layout_length()),
                 )
-                .map(|width| width.points().min(available_content_width)),
+                .map(SemanticLengthExt::points),
                 // CSS block-axis constraints resolve percentage values from
                 // the containing block's block-size basis. An indefinite
                 // basis leaves a percentage min/max-height unresolved rather
@@ -724,30 +845,27 @@ pub(super) fn used_replaced_box_with_inline_percentage_basis(
         content_width = constrain_content_width(
             style,
             content_box_pt(content_width),
-            PercentageBasis::definite(layout_pt(available_width)),
+            PercentageBasis::definite(available_width.into_layout_length()),
         )
         .points();
         content_height = constrain_content_height(
             style,
             content_box_pt(content_height),
-            PercentageBasis::definite(layout_pt(available_width)),
+            PercentageBasis::definite(available_width.into_layout_length()),
         )
         .points();
     }
-    // A specified inline size on a replaced element is not shrink-to-fit.
-    // In particular, an inline canvas with `width: 100px` in a narrower
-    // multicolumn column keeps its used width and overflows the column just
-    // like any other in-flow box.  The available measure only constrains the
-    // automatic sizing path used while resolving an intrinsic contribution.
+    // A ratio-only image has no intrinsic width or height. CSS Images uses the
+    // available object-size width to choose its otherwise automatic concrete
+    // size. Images with at least one intrinsic axis keep that axis and may
+    // overflow an inline formatting context instead of becoming shrink-to-fit.
     // <https://www.w3.org/TR/CSS22/visudet.html#inline-replaced-width>
-    if width_is_auto {
+    // <https://www.w3.org/TR/css-images-3/#default-sizing>
+    let ratio_only_automatic_size =
+        width_is_auto && height_is_auto && !intrinsic.has_intrinsic_size && aspect_ratio.is_some();
+    if ratio_only_automatic_size {
         content_width = content_width.min(available_content_width);
-    }
-    if width_is_auto
-        && !height_is_auto
-        && let Some(aspect_ratio) = aspect_ratio
-    {
-        content_height = content_width / aspect_ratio;
+        content_height = content_width / aspect_ratio.expect("ratio-only size has a ratio");
     }
     UsedReplacedBox::new(
         content_box_size_pt(content_width, content_height),
@@ -765,7 +883,13 @@ pub(super) fn used_generated_image(
     root_url: Option<&url::Url>,
     resource_cache: &ResourceCache,
 ) -> Option<UsedImage> {
-    let asset = load_resolved_image_source(src, base_url, root_url, resource_cache, true)?;
+    let asset = load_resolved_image_source(
+        src,
+        base_url,
+        root_url,
+        resource_cache,
+        style.image_orientation == css::ImageOrientation::FromImage,
+    )?;
     let intrinsic_resolution = intrinsic_resolution.max(f32::MIN_POSITIVE);
     let raw_intrinsic_size = match &asset {
         ResolvedImageAsset::Raster(image) => image.natural_layout_size(),
@@ -774,8 +898,8 @@ pub(super) fn used_generated_image(
         // size, not the parser's concrete root viewport fallback.
         ResolvedImageAsset::Svg(asset) => asset.replaced_intrinsic_size(),
     };
-    let raw_intrinsic_size =
-        object_view_box_intrinsic_size(style.object_view_box.clone(), raw_intrinsic_size)?;
+    let view_box = resolved_object_view_box_for_asset(style.object_view_box.clone(), &asset);
+    let raw_intrinsic_size = view_box.effective_natural_size(raw_intrinsic_size);
     let intrinsic_width = raw_intrinsic_size.width / intrinsic_resolution;
     let intrinsic_height = raw_intrinsic_size.height / intrinsic_resolution;
     if intrinsic_width <= 0.0 || intrinsic_height <= 0.0 {
@@ -857,13 +981,55 @@ pub(super) fn used_generated_image(
 /// `object-view-box`. The source crop is resolved before CSS replaced sizing;
 /// paint later maps the same source rectangle into that effective object.
 /// <https://drafts.csswg.org/css-images-5/#the-object-view-box-property>
-fn object_view_box_intrinsic_size(
+/// Resolve a view box for an image asset before its CSS replaced sizing.
+///
+/// SVG's 300 by 150 parser viewport fallback is not a natural image size, so
+/// an SVG only participates when it supplies both natural axes. Raster images
+/// always expose both axes through their decoded dimensions.
+pub(in crate::layout) fn resolved_object_view_box_for_asset(
     view_box: css::ObjectViewBox,
-    natural_size: LayoutSize,
-) -> Option<LayoutSize> {
-    if natural_size.width <= 0.0 || natural_size.height <= 0.0 {
-        return None;
-    }
+    asset: &ResolvedImageAsset,
+) -> ResolvedObjectViewBox {
+    let natural_size = match asset {
+        ResolvedImageAsset::Raster(image) => Some(image.natural_layout_size()),
+        ResolvedImageAsset::Svg(asset) => asset
+            .intrinsic_dimensions()
+            .width
+            .zip(asset.intrinsic_dimensions().height)
+            .map(|(width, height)| LayoutSize::new(width.points(), height.points())),
+    };
+    resolved_object_view_box(view_box, natural_size)
+}
+
+/// Resolve an SVG view box without promoting its parser viewport fallback to
+/// CSS natural dimensions.
+pub(in crate::layout) fn resolved_object_view_box_for_svg(
+    view_box: css::ObjectViewBox,
+    asset: &SharedSvgAsset,
+) -> ResolvedObjectViewBox {
+    let dimensions = asset.intrinsic_dimensions();
+    let natural_size = dimensions
+        .width
+        .zip(dimensions.height)
+        .map(|(width, height)| LayoutSize::new(width.points(), height.points()));
+    resolved_object_view_box(view_box, natural_size)
+}
+
+/// Resolve CSS `object-view-box` into an effective normalized source rectangle.
+///
+/// A missing natural axis or a non-positive used rectangle makes the property
+/// ineffective. This follows the WPT-defined behavior for empty and negative
+/// basic shapes while retaining valid out-of-bounds source origins.
+/// <https://drafts.csswg.org/css-images-5/#the-object-view-box-property>
+pub(in crate::layout) fn resolved_object_view_box(
+    view_box: css::ObjectViewBox,
+    natural_size: Option<LayoutSize>,
+) -> ResolvedObjectViewBox {
+    let Some(natural_size) = natural_size.filter(|size| {
+        size.width.is_finite() && size.height.is_finite() && size.width > 0.0 && size.height > 0.0
+    }) else {
+        return ResolvedObjectViewBox::NoEffect;
+    };
     let resolve_x = |value| {
         used_length_percentage(
             value,
@@ -878,33 +1044,76 @@ fn object_view_box_intrinsic_size(
         )
         .points()
     };
-    let size = match view_box {
-        css::ObjectViewBox::None => natural_size,
+    let (rect, radii) = match view_box {
+        css::ObjectViewBox::None => return ResolvedObjectViewBox::NoEffect,
         css::ObjectViewBox::Inset {
             top,
             right,
             bottom,
             left,
-            ..
-        } => LayoutSize::new(
-            natural_size.width - resolve_x(left) - resolve_x(right),
-            natural_size.height - resolve_y(top) - resolve_y(bottom),
-        ),
-        css::ObjectViewBox::Xywh { width, height, .. } => {
-            LayoutSize::new(resolve_x(width), resolve_y(height))
+            radii,
+        } => {
+            let left = resolve_x(left) / natural_size.width;
+            let right = resolve_x(right) / natural_size.width;
+            let top = resolve_y(top) / natural_size.height;
+            let bottom = resolve_y(bottom) / natural_size.height;
+            (
+                NormalizedObjectSourceRect::new(
+                    NormalizedObjectSourcePoint::new(left, top),
+                    NormalizedObjectSourceSize::new(1.0 - left - right, 1.0 - top - bottom),
+                ),
+                radii,
+            )
         }
+        css::ObjectViewBox::Xywh {
+            x,
+            y,
+            width,
+            height,
+            radii,
+        } => (
+            NormalizedObjectSourceRect::new(
+                NormalizedObjectSourcePoint::new(
+                    resolve_x(x) / natural_size.width,
+                    resolve_y(y) / natural_size.height,
+                ),
+                NormalizedObjectSourceSize::new(
+                    resolve_x(width) / natural_size.width,
+                    resolve_y(height) / natural_size.height,
+                ),
+            ),
+            radii,
+        ),
         css::ObjectViewBox::Rect {
             top,
             right,
             bottom,
             left,
-        } => LayoutSize::new(
-            resolve_x(right) - resolve_x(left),
-            resolve_y(bottom) - resolve_y(top),
-        ),
+        } => {
+            let left = resolve_x(left) / natural_size.width;
+            let right = resolve_x(right) / natural_size.width;
+            let top = resolve_y(top) / natural_size.height;
+            let bottom = resolve_y(bottom) / natural_size.height;
+            (
+                NormalizedObjectSourceRect::new(
+                    NormalizedObjectSourcePoint::new(left, top),
+                    NormalizedObjectSourceSize::new(right - left, bottom - top),
+                ),
+                None,
+            )
+        }
     };
-    (size.width.is_finite() && size.height.is_finite() && size.width > 0.0 && size.height > 0.0)
-        .then_some(size)
+    if rect.origin.x.is_finite()
+        && rect.origin.y.is_finite()
+        && rect.size.width.is_finite()
+        && rect.size.height.is_finite()
+        && rect.size.width > 0.0
+        && rect.size.height > 0.0
+    {
+        ResolvedObjectViewBox::Source { rect, radii }
+    } else {
+        ResolvedObjectViewBox::NoEffect
+    }
 }
 
 pub(super) fn used_generated_image_value(
@@ -1153,7 +1362,7 @@ pub(super) fn used_canvas(
     used_replaced_box(
         intrinsic_canvas_size(element),
         style,
-        available_width,
+        content_box_pt(available_width),
         height_basis,
     )
 }
@@ -1168,7 +1377,7 @@ pub(super) fn used_canvas_with_inline_percentage_basis(
     used_replaced_box_with_inline_percentage_basis(
         intrinsic_canvas_size(element),
         style,
-        available_width,
+        content_box_pt(available_width),
         inline_percentage_basis,
         height_basis,
     )
@@ -1182,40 +1391,32 @@ pub(super) fn used_svg(
     available_width: f32,
     height_basis: BlockSizePercentageBasis,
 ) -> Option<UsedReplacedBox> {
-    intrinsic_svg_size(element)
-        .map(|intrinsic| used_replaced_box(intrinsic, style, available_width, height_basis))
+    intrinsic_svg_size(element).map(|intrinsic| {
+        used_replaced_box(
+            intrinsic,
+            style,
+            content_box_pt(available_width),
+            height_basis,
+        )
+    })
 }
 
 pub(super) fn used_background_size(
     image: &DecodedPngImage,
-    area_width: f32,
-    area_height: f32,
+    positioning_area: PaintSize,
     value: css::BackgroundSize,
     intrinsic_resolution: f32,
 ) -> PaintSize {
     let natural_size = image.natural_layout_size();
     let intrinsic_resolution = intrinsic_resolution.max(f32::MIN_POSITIVE);
-    let intrinsic_width = natural_size.width / intrinsic_resolution;
-    let intrinsic_height = natural_size.height / intrinsic_resolution;
     used_background_size_from_intrinsic_dimensions(
-        area_width,
-        area_height,
+        positioning_area,
         value,
-        BackgroundIntrinsicDimensions {
-            width: intrinsic_width
-                .is_finite()
-                .then_some(intrinsic_width.max(0.0)),
-            height: intrinsic_height
-                .is_finite()
-                .then_some(intrinsic_height.max(0.0)),
-            aspect_ratio: (intrinsic_width > 0.0 && intrinsic_height > 0.0)
-                .then_some(intrinsic_width / intrinsic_height),
-        },
+        CssImageNaturalDimensions::from_raster_layout_size(natural_size, intrinsic_resolution),
     )
 }
 
-/// CSS-facing intrinsic dimensions used by the background image sizing
-/// algorithm.
+/// CSS-facing natural dimensions used by image sizing algorithms.
 ///
 /// Concrete image decoders may need fallback dimensions to render source
 /// content, but `background-size` must distinguish those from actual
@@ -1223,10 +1424,166 @@ pub(super) fn used_background_size(
 /// omitted or percentage root dimensions.
 /// <https://www.w3.org/TR/css-images-3/#default-sizing>
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct BackgroundIntrinsicDimensions {
-    pub(super) width: Option<f32>,
-    pub(super) height: Option<f32>,
+pub(in crate::layout) struct CssImageNaturalDimensions {
+    axes: ImageNaturalAxes,
     pub(super) aspect_ratio: Option<f32>,
+}
+
+/// The intrinsic axes that CSS Backgrounds can learn from an image source.
+///
+/// A source may provide neither axis, exactly one axis, or a complete size.
+/// These cases have different `background-size: auto` behavior, so retain the
+/// state rather than reducing it to optional untyped scalar fields.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ImageNaturalAxes {
+    None,
+    Width(euclid::Length<f32, PaintSpace>),
+    Height(euclid::Length<f32, PaintSpace>),
+    Size(PaintSize),
+}
+
+impl CssImageNaturalDimensions {
+    #[cfg(test)]
+    pub(super) fn without_size(aspect_ratio: Option<f32>) -> Self {
+        Self {
+            axes: ImageNaturalAxes::None,
+            aspect_ratio,
+        }
+    }
+
+    pub(in crate::layout) fn from_layout_axes(
+        width: Option<LayoutLength>,
+        height: Option<LayoutLength>,
+        aspect_ratio: Option<f32>,
+    ) -> Self {
+        let width = width.and_then(Self::paint_axis);
+        let height = height.and_then(Self::paint_axis);
+        let axes = match (width, height) {
+            (Some(width), Some(height)) => {
+                ImageNaturalAxes::Size(PaintSize::new(width.get(), height.get()))
+            }
+            (Some(width), None) => ImageNaturalAxes::Width(width),
+            (None, Some(height)) => ImageNaturalAxes::Height(height),
+            (None, None) => ImageNaturalAxes::None,
+        };
+        Self { axes, aspect_ratio }
+    }
+
+    /// Build fully definite natural dimensions from a raster source or a
+    /// source rectangle already resolved into CSS layout space.
+    pub(in crate::layout) fn from_layout_size(size: LayoutSize) -> Self {
+        let width = layout_pt(size.width);
+        let height = layout_pt(size.height);
+        Self::from_layout_axes(
+            Some(width),
+            Some(height),
+            (width > layout_pt(0.0) && height > layout_pt(0.0))
+                .then_some(width.points() / height.points()),
+        )
+    }
+
+    fn from_raster_layout_size(size: LayoutSize, intrinsic_resolution: f32) -> Self {
+        let width = layout_pt(size.width / intrinsic_resolution);
+        let height = layout_pt(size.height / intrinsic_resolution);
+        Self::from_layout_axes(
+            Some(width),
+            Some(height),
+            (width.get() > 0.0 && height.get() > 0.0).then_some(width.get() / height.get()),
+        )
+    }
+
+    fn paint_axis(value: LayoutLength) -> Option<euclid::Length<f32, PaintSpace>> {
+        let value = value.max(layout_pt(0.0));
+        value.get().is_finite().then_some(value.cast_unit())
+    }
+
+    fn width(self) -> Option<euclid::Length<f32, PaintSpace>> {
+        match self.axes {
+            ImageNaturalAxes::Width(width) => Some(width),
+            ImageNaturalAxes::Size(size) => Some(euclid::Length::new(size.width)),
+            ImageNaturalAxes::None | ImageNaturalAxes::Height(_) => None,
+        }
+    }
+
+    fn height(self) -> Option<euclid::Length<f32, PaintSpace>> {
+        match self.axes {
+            ImageNaturalAxes::Height(height) => Some(height),
+            ImageNaturalAxes::Size(size) => Some(euclid::Length::new(size.height)),
+            ImageNaturalAxes::None | ImageNaturalAxes::Width(_) => None,
+        }
+    }
+
+    /// Restrict natural dimensions to a normalized source rectangle.
+    ///
+    /// `object-view-box` selects this source before CSS resolves the concrete
+    /// object size, so any present natural axes and preferred ratio must be
+    /// scaled together rather than reconstructed from a fallback size.
+    pub(in crate::layout) fn scaled(self, width_scale: f32, height_scale: f32) -> Self {
+        debug_assert!(width_scale.is_finite() && width_scale > 0.0);
+        debug_assert!(height_scale.is_finite() && height_scale > 0.0);
+        let scale_axis =
+            |axis: euclid::Length<f32, PaintSpace>, scale| euclid::Length::new(axis.get() * scale);
+        let axes = match self.axes {
+            ImageNaturalAxes::None => ImageNaturalAxes::None,
+            ImageNaturalAxes::Width(width) => {
+                ImageNaturalAxes::Width(scale_axis(width, width_scale))
+            }
+            ImageNaturalAxes::Height(height) => {
+                ImageNaturalAxes::Height(scale_axis(height, height_scale))
+            }
+            ImageNaturalAxes::Size(size) => ImageNaturalAxes::Size(PaintSize::new(
+                size.width * width_scale,
+                size.height * height_scale,
+            )),
+        };
+        let aspect_ratio = self
+            .aspect_ratio
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+            .and_then(|ratio| {
+                let scaled = ratio * width_scale / height_scale;
+                (scaled.is_finite() && scaled > 0.0).then_some(scaled)
+            });
+        Self { axes, aspect_ratio }
+    }
+
+    /// Resolve default object sizing with no specified dimensions.
+    ///
+    /// This is shared by `background-size: auto auto` and `object-fit: none`.
+    /// <https://www.w3.org/TR/css-images-3/#default-sizing>
+    pub(in crate::layout) fn default_size(self, default_object_size: PaintSize) -> PaintSize {
+        let default_object_size = PaintSize::new(
+            default_object_size.width.max(0.0),
+            default_object_size.height.max(0.0),
+        );
+        let ratio = self
+            .aspect_ratio
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+        match (self.width(), self.height(), ratio) {
+            (Some(width), Some(height), _) => PaintSize::new(width.get(), height.get()),
+            (Some(width), None, Some(ratio)) => PaintSize::new(width.get(), width.get() / ratio),
+            (None, Some(height), Some(ratio)) => PaintSize::new(height.get() * ratio, height.get()),
+            (Some(width), None, None) => PaintSize::new(width.get(), default_object_size.height),
+            (None, Some(height), None) => PaintSize::new(default_object_size.width, height.get()),
+            (None, None, Some(ratio)) => background_size_contain(default_object_size, ratio),
+            (None, None, None) => default_object_size,
+        }
+    }
+
+    /// Resolve a contain constraint against the image's preferred ratio.
+    pub(in crate::layout) fn contain_size(self, constraint: PaintSize) -> PaintSize {
+        self.aspect_ratio
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+            .map(|ratio| background_size_contain(constraint, ratio))
+            .unwrap_or(constraint)
+    }
+
+    /// Resolve a cover constraint against the image's preferred ratio.
+    pub(in crate::layout) fn cover_size(self, constraint: PaintSize) -> PaintSize {
+        self.aspect_ratio
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+            .map(|ratio| background_size_cover(constraint, ratio))
+            .unwrap_or(constraint)
+    }
 }
 
 /// Resolve a background image's used size from its intrinsic dimensions.
@@ -1237,63 +1594,66 @@ pub(super) struct BackgroundIntrinsicDimensions {
 /// <https://www.w3.org/TR/css-backgrounds-3/#the-background-size>
 /// <https://www.w3.org/TR/css-images-3/#default-sizing>
 pub(super) fn used_background_size_from_intrinsic_dimensions(
-    area_width: f32,
-    area_height: f32,
+    positioning_area: PaintSize,
     value: css::BackgroundSize,
-    intrinsic: BackgroundIntrinsicDimensions,
+    intrinsic: CssImageNaturalDimensions,
 ) -> PaintSize {
-    let area_width = area_width.max(0.0);
-    let area_height = area_height.max(0.0);
+    let positioning_area = PaintSize::new(
+        positioning_area.width.max(0.0),
+        positioning_area.height.max(0.0),
+    );
     let ratio = intrinsic
         .aspect_ratio
         .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
-    let auto_size = || match (intrinsic.width, intrinsic.height, ratio) {
-        (Some(width), Some(height), _) => PaintSize::new(width, height),
-        (Some(width), None, Some(ratio)) => PaintSize::new(width, width / ratio),
-        (None, Some(height), Some(ratio)) => PaintSize::new(height * ratio, height),
-        (Some(width), None, None) => PaintSize::new(width, area_height),
-        (None, Some(height), None) => PaintSize::new(area_width, height),
-        (None, None, Some(ratio)) => background_size_contain(area_width, area_height, ratio),
-        (None, None, None) => PaintSize::new(area_width, area_height),
-    };
+    let auto_size = || intrinsic.default_size(positioning_area);
 
     match value {
         css::BackgroundSize::Auto => auto_size(),
-        css::BackgroundSize::Cover => ratio
-            .map(|ratio| background_size_cover(area_width, area_height, ratio))
-            .unwrap_or_else(|| PaintSize::new(area_width, area_height)),
-        css::BackgroundSize::Contain => ratio
-            .map(|ratio| background_size_contain(area_width, area_height, ratio))
-            .unwrap_or_else(|| PaintSize::new(area_width, area_height)),
+        css::BackgroundSize::Cover => intrinsic.cover_size(positioning_area),
+        css::BackgroundSize::Contain => intrinsic.contain_size(positioning_area),
         css::BackgroundSize::Explicit { width, height } => match (
-            used_background_size_axis(width, area_width),
-            used_background_size_axis(height, area_height),
+            used_background_size_axis(width, positioning_area.width),
+            used_background_size_axis(height, positioning_area.height),
         ) {
             (Some(width), Some(height)) => PaintSize::new(width, height),
             (Some(width), None) => ratio
                 .map(|ratio| PaintSize::new(width, width / ratio))
-                .unwrap_or_else(|| PaintSize::new(width, intrinsic.height.unwrap_or(area_height))),
+                .unwrap_or_else(|| {
+                    PaintSize::new(
+                        width,
+                        intrinsic
+                            .height()
+                            .map_or(positioning_area.height, |height| height.get()),
+                    )
+                }),
             (None, Some(height)) => ratio
                 .map(|ratio| PaintSize::new(height * ratio, height))
-                .unwrap_or_else(|| PaintSize::new(intrinsic.width.unwrap_or(area_width), height)),
+                .unwrap_or_else(|| {
+                    PaintSize::new(
+                        intrinsic
+                            .width()
+                            .map_or(positioning_area.width, |width| width.get()),
+                        height,
+                    )
+                }),
             (None, None) => auto_size(),
         },
     }
 }
 
-fn background_size_cover(area_width: f32, area_height: f32, ratio: f32) -> PaintSize {
-    if area_width <= 0.0 && area_height <= 0.0 {
+fn background_size_cover(positioning_area: PaintSize, ratio: f32) -> PaintSize {
+    if positioning_area.width <= 0.0 && positioning_area.height <= 0.0 {
         return PaintSize::new(0.0, 0.0);
     }
-    let scale = (area_width / ratio).max(area_height);
+    let scale = (positioning_area.width / ratio).max(positioning_area.height);
     PaintSize::new(scale * ratio, scale)
 }
 
-fn background_size_contain(area_width: f32, area_height: f32, ratio: f32) -> PaintSize {
-    if area_width <= 0.0 || area_height <= 0.0 {
+fn background_size_contain(positioning_area: PaintSize, ratio: f32) -> PaintSize {
+    if positioning_area.width <= 0.0 || positioning_area.height <= 0.0 {
         return PaintSize::new(0.0, 0.0);
     }
-    let scale = (area_width / ratio).min(area_height);
+    let scale = (positioning_area.width / ratio).min(positioning_area.height);
     PaintSize::new(scale * ratio, scale)
 }
 
@@ -1320,18 +1680,16 @@ pub(super) fn used_background_size_axis(
 
 pub(super) fn background_position(
     value: css::BackgroundPosition,
-    area_width: f32,
-    area_height: f32,
-    image_width: f32,
-    image_height: f32,
-) -> (f64, f64) {
+    positioning_area: PaintSize,
+    image_size: PaintSize,
+) -> PaintBackgroundOffset {
     // Keep the free space and its position calculation in f64. A valid SVG
     // `cover` size can be far larger than its background positioning area;
     // doing `area - image` in f32 would discard the area entirely and make a
     // tile that should cover the box appear not to intersect it.
-    let free_x = f64::from(area_width) - f64::from(image_width);
-    let free_y = f64::from(area_height) - f64::from(image_height);
-    (
+    let free_x = f64::from(positioning_area.width) - f64::from(image_size.width);
+    let free_y = f64::from(positioning_area.height) - f64::from(image_size.height);
+    PaintBackgroundOffset::new(
         used_background_position_axis_precise(value.x, free_x, false),
         used_background_position_axis_precise(value.y, free_y, true),
     )
@@ -1445,44 +1803,48 @@ fn reduce_opposing_slices(first: &mut u32, second: &mut u32, reference: u32) {
 pub(super) fn used_border_image_widths(
     style: &ComputedStyle,
     border_widths: css::Edges,
-    border_box_width: f32,
-    border_box_height: f32,
+    border_box_width: BorderBoxLength,
+    border_box_height: BorderBoxLength,
     slices: UsedBorderImageSlices,
 ) -> css::Edges {
     css::Edges {
         top: used_border_image_width_value(
             style.border_image.width.top.clone(),
-            border_widths.top,
+            layout_pt(border_widths.top),
             border_box_height,
             slices.top,
-        ),
+        )
+        .points(),
         right: used_border_image_width_value(
             style.border_image.width.right.clone(),
-            border_widths.right,
+            layout_pt(border_widths.right),
             border_box_width,
             slices.right,
-        ),
+        )
+        .points(),
         bottom: used_border_image_width_value(
             style.border_image.width.bottom.clone(),
-            border_widths.bottom,
+            layout_pt(border_widths.bottom),
             border_box_height,
             slices.bottom,
-        ),
+        )
+        .points(),
         left: used_border_image_width_value(
             style.border_image.width.left.clone(),
-            border_widths.left,
+            layout_pt(border_widths.left),
             border_box_width,
             slices.left,
-        ),
+        )
+        .points(),
     }
 }
 
 fn used_border_image_width_value(
     value: css::BorderImageWidthValue,
-    border_width: f32,
-    reference: f32,
+    border_width: LayoutLength,
+    reference: BorderBoxLength,
     slice_width: u32,
-) -> f32 {
+) -> LayoutLength {
     match value {
         css::BorderImageWidthValue::Auto => {
             if slice_width > 0 {
@@ -1490,17 +1852,18 @@ fn used_border_image_width_value(
                 // the intrinsic slice extent into Quire's PDF-point layout
                 // space before using it as an `auto` border-image width.
                 // <https://www.w3.org/TR/css-backgrounds-3/#border-image-width>
-                slice_width as f32 * css::CSS_PX_TO_PT
+                layout_px(slice_width as f32)
             } else {
                 border_width
             }
         }
         css::BorderImageWidthValue::Number(value) => border_width * value,
-        css::BorderImageWidthValue::LengthPercentage(value) => {
-            used_length_percentage(value, PercentageBasis::definite(layout_pt(reference))).points()
-        }
+        css::BorderImageWidthValue::LengthPercentage(value) => used_length_percentage(
+            value,
+            PercentageBasis::definite(reference.into_layout_length()),
+        ),
     }
-    .max(0.0)
+    .max(layout_pt(0.0))
 }
 
 /// Proportionally fit border-image widths inside the border-image area.
@@ -1598,16 +1961,9 @@ pub(super) fn used_background_position_axis(
     }
 }
 
-pub(super) fn inline_replaced_descent(style: &ComputedStyle) -> LayoutLength {
-    // CSS inline replaced elements align to the text baseline by default.
-    // Reserve a conservative descender area below the image until line layout
-    // has real font ascent/descent metrics.
-    layout_pt((style.line_height * 0.25).max(0.0))
-}
-
-pub(super) fn svg_rect(element: &Element) -> Option<(f32, f32, Color)> {
+pub(super) fn svg_rect(element: &Element) -> Option<(f32, f32, CssColor)> {
     crate::svg::svg_intrinsic_size(element)
-        .map(|size| (size.width, size.height, Color::TRANSPARENT))
+        .map(|size| (size.width, size.height, CssColor::TRANSPARENT))
 }
 
 pub(super) fn estimate_svg_height(
@@ -1723,7 +2079,7 @@ mod tests {
         let first = load_image_source(source, None, None, &cache, true).unwrap();
         let second = load_image_source(source, None, None, &cache, true).unwrap();
 
-        assert!(Rc::ptr_eq(&first.rgb, &second.rgb));
+        assert!(Rc::ptr_eq(&first.rgb.shared(), &second.rgb.shared()));
         assert!(match (&first.alpha, &second.alpha) {
             (Some(first), Some(second)) => Rc::ptr_eq(first, second),
             (None, None) => true,
@@ -1763,15 +2119,15 @@ mod tests {
     #[test]
     fn intrinsic_canvas_size_uses_html_defaults_and_attributes() {
         let default_canvas = intrinsic_canvas_size(&canvas_element(&[]));
-        assert_eq!(default_canvas.width, 225.0);
-        assert_eq!(default_canvas.height, 112.5);
+        assert_eq!(default_canvas.width, content_box_pt(225.0));
+        assert_eq!(default_canvas.height, content_box_pt(112.5));
         assert_eq!(default_canvas.attr_width, None);
         assert_eq!(default_canvas.attr_height, None);
 
         let attributed_canvas =
             intrinsic_canvas_size(&canvas_element(&[("width", "96"), ("height", "48px")]));
-        assert_eq!(attributed_canvas.width, 72.0);
-        assert_eq!(attributed_canvas.height, 36.0);
+        assert_eq!(attributed_canvas.width, content_box_pt(72.0));
+        assert_eq!(attributed_canvas.height, content_box_pt(36.0));
         assert_eq!(attributed_canvas.attribute_aspect_ratio(), Some(2.0));
     }
 
@@ -1793,15 +2149,15 @@ mod tests {
         );
         let image = used_replaced_box(
             IntrinsicReplacedSize {
-                width: 150.0,
-                height: 75.0,
+                width: content_box_pt(150.0),
+                height: content_box_pt(75.0),
                 preferred_aspect_ratio: Some(2.0),
                 has_intrinsic_size: true,
-                attr_width: Some(150.0),
-                attr_height: Some(75.0),
+                attr_width: Some(content_box_pt(150.0)),
+                attr_height: Some(content_box_pt(75.0)),
             },
             &style,
-            500.0,
+            content_box_pt(500.0),
             BlockSizePercentageBasis::indefinite(),
         );
         let svg = used_svg(
@@ -1829,15 +2185,15 @@ mod tests {
 
         let geometry = used_replaced_box(
             IntrinsicReplacedSize {
-                width: 150.0,
-                height: 75.0,
+                width: content_box_pt(150.0),
+                height: content_box_pt(75.0),
                 preferred_aspect_ratio: Some(2.0),
                 has_intrinsic_size: true,
                 attr_width: None,
                 attr_height: None,
             },
             &style,
-            500.0,
+            content_box_pt(500.0),
             BlockSizePercentageBasis::indefinite(),
         );
 
@@ -1846,21 +2202,64 @@ mod tests {
     }
 
     #[test]
+    fn no_ratio_replaced_element_keeps_the_independent_intrinsic_auto_axis() {
+        let intrinsic = IntrinsicReplacedSize {
+            width: content_box_pt(225.0),
+            height: content_box_pt(112.5),
+            preferred_aspect_ratio: None,
+            has_intrinsic_size: false,
+            attr_width: None,
+            attr_height: None,
+        };
+
+        let mut explicit_width = ComputedStyle::initial();
+        explicit_width.box_values.width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(30.0),
+        );
+        let width_geometry = used_replaced_box(
+            intrinsic,
+            &explicit_width,
+            content_box_pt(500.0),
+            BlockSizePercentageBasis::indefinite(),
+        );
+
+        let mut explicit_height = ComputedStyle::initial();
+        explicit_height.box_values.height = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_points(15.0),
+        );
+        let height_geometry = used_replaced_box(
+            intrinsic,
+            &explicit_height,
+            content_box_pt(500.0),
+            BlockSizePercentageBasis::indefinite(),
+        );
+
+        assert_eq!(
+            width_geometry.content_size,
+            content_box_size_pt(30.0, 112.5)
+        );
+        assert_eq!(
+            height_geometry.content_size,
+            content_box_size_pt(225.0, 15.0)
+        );
+    }
+
+    #[test]
     fn effective_zoom_scales_replaced_dimensions_but_not_aspect_ratio() {
         let intrinsic = IntrinsicReplacedSize {
-            width: 100.0,
-            height: 50.0,
+            width: content_box_pt(100.0),
+            height: content_box_pt(50.0),
             preferred_aspect_ratio: Some(2.0),
             has_intrinsic_size: true,
-            attr_width: Some(100.0),
-            attr_height: Some(50.0),
+            attr_width: Some(content_box_pt(100.0)),
+            attr_height: Some(content_box_pt(50.0)),
         }
         .scaled_by_effective_zoom(2.0);
 
-        assert_eq!(intrinsic.width, 200.0);
-        assert_eq!(intrinsic.height, 100.0);
-        assert_eq!(intrinsic.attr_width, Some(200.0));
-        assert_eq!(intrinsic.attr_height, Some(100.0));
+        assert_eq!(intrinsic.width, content_box_pt(200.0));
+        assert_eq!(intrinsic.height, content_box_pt(100.0));
+        assert_eq!(intrinsic.attr_width, Some(content_box_pt(200.0)));
+        assert_eq!(intrinsic.attr_height, Some(content_box_pt(100.0)));
         assert_eq!(intrinsic.natural_aspect_ratio(), Some(2.0));
     }
 
@@ -1871,8 +2270,8 @@ mod tests {
             css::ComputedLengthPercentage::from_percent(1.0),
         );
         let intrinsic = IntrinsicReplacedSize {
-            width: 200.0,
-            height: 200.0,
+            width: content_box_pt(200.0),
+            height: content_box_pt(200.0),
             preferred_aspect_ratio: Some(1.0),
             has_intrinsic_size: true,
             attr_width: None,
@@ -1882,13 +2281,18 @@ mod tests {
         let definite = used_replaced_box(
             intrinsic,
             &style,
-            500.0,
+            content_box_pt(500.0),
             PercentageBasis::definite_from(
                 content_box_pt(100.0),
                 BlockSizeBasisSource::ContainingBlock,
             ),
         );
-        let indefinite = used_replaced_box(intrinsic, &style, 500.0, PercentageBasis::indefinite());
+        let indefinite = used_replaced_box(
+            intrinsic,
+            &style,
+            content_box_pt(500.0),
+            PercentageBasis::indefinite(),
+        );
 
         assert_eq!(definite.content_size.width, 100.0);
         assert_eq!(definite.content_size.height, 100.0);
@@ -1926,14 +2330,9 @@ mod tests {
     #[test]
     fn background_size_uses_contain_for_ratio_only_images() {
         let size = used_background_size_from_intrinsic_dimensions(
-            300.0,
-            150.0,
+            PaintSize::new(300.0, 150.0),
             css::BackgroundSize::Auto,
-            BackgroundIntrinsicDimensions {
-                width: None,
-                height: None,
-                aspect_ratio: Some(1.0 / 4.0),
-            },
+            CssImageNaturalDimensions::without_size(Some(1.0 / 4.0)),
         );
 
         assert_eq!(size, PaintSize::new(37.5, 150.0));
@@ -1941,16 +2340,11 @@ mod tests {
 
     #[test]
     fn background_size_fills_area_for_images_without_intrinsic_geometry() {
-        let intrinsic = BackgroundIntrinsicDimensions {
-            width: None,
-            height: None,
-            aspect_ratio: None,
-        };
+        let intrinsic = CssImageNaturalDimensions::without_size(None);
 
         assert_eq!(
             used_background_size_from_intrinsic_dimensions(
-                300.0,
-                150.0,
+                PaintSize::new(300.0, 150.0),
                 css::BackgroundSize::Auto,
                 intrinsic,
             ),
@@ -1958,8 +2352,7 @@ mod tests {
         );
         assert_eq!(
             used_background_size_from_intrinsic_dimensions(
-                300.0,
-                150.0,
+                PaintSize::new(300.0, 150.0),
                 css::BackgroundSize::Contain,
                 intrinsic,
             ),
@@ -1970,19 +2363,14 @@ mod tests {
     #[test]
     fn background_size_uses_positioning_area_for_auto_axis_without_ratio() {
         let size = used_background_size_from_intrinsic_dimensions(
-            300.0,
-            150.0,
+            PaintSize::new(300.0, 150.0),
             css::BackgroundSize::Explicit {
                 width: css::BackgroundSizeAxis::LengthPercentage(
                     css::ComputedLengthPercentage::from_points(50.0),
                 ),
                 height: css::BackgroundSizeAxis::Auto,
             },
-            BackgroundIntrinsicDimensions {
-                width: None,
-                height: None,
-                aspect_ratio: None,
-            },
+            CssImageNaturalDimensions::without_size(None),
         );
 
         assert_eq!(size, PaintSize::new(50.0, 150.0));
@@ -1991,16 +2379,102 @@ mod tests {
     #[test]
     fn background_size_cover_uses_the_nonzero_positioning_axis() {
         assert_eq!(
-            background_size_cover(100.0, 0.0, 2.0),
+            background_size_cover(PaintSize::new(100.0, 0.0), 2.0),
             PaintSize::new(100.0, 50.0)
         );
         assert_eq!(
-            background_size_cover(0.0, 100.0, 2.0),
+            background_size_cover(PaintSize::new(0.0, 100.0), 2.0),
             PaintSize::new(200.0, 100.0)
         );
         assert_eq!(
-            background_size_cover(0.0, 0.0, 2.0),
+            background_size_cover(PaintSize::new(0.0, 0.0), 2.0),
             PaintSize::new(0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn background_position_returns_a_typed_high_precision_offset() {
+        let offset: PaintBackgroundOffset = background_position(
+            css::BackgroundPosition::INITIAL,
+            PaintSize::new(100.0, 80.0),
+            PaintSize::new(30.0, 20.0),
+        );
+
+        assert_eq!(offset, PaintBackgroundOffset::new(0.0, 60.0));
+    }
+
+    #[test]
+    fn object_view_box_resolution_preserves_valid_source_geometry() {
+        let view_box = css::ObjectViewBox::Xywh {
+            x: css::ComputedLengthPercentage::from_points(25.0),
+            y: css::ComputedLengthPercentage::from_points(50.0),
+            width: css::ComputedLengthPercentage::from_points(25.0),
+            height: css::ComputedLengthPercentage::from_points(50.0),
+            radii: None,
+        };
+
+        let resolved = resolved_object_view_box(view_box, Some(LayoutSize::new(50.0, 100.0)));
+
+        assert!(resolved.applies());
+        assert_eq!(
+            resolved.source_rect(),
+            NormalizedObjectSourceRect::new(
+                NormalizedObjectSourcePoint::new(0.5, 0.5),
+                NormalizedObjectSourceSize::new(0.5, 0.5),
+            )
+        );
+        assert_eq!(
+            resolved.effective_natural_size(LayoutSize::new(50.0, 100.0)),
+            LayoutSize::new(25.0, 50.0)
+        );
+    }
+
+    #[test]
+    fn empty_or_inapplicable_object_view_box_has_no_effect() {
+        let empty = css::ObjectViewBox::Inset {
+            top: css::ComputedLengthPercentage::from_points(50.0),
+            right: css::ComputedLengthPercentage::ZERO,
+            bottom: css::ComputedLengthPercentage::from_points(50.0),
+            left: css::ComputedLengthPercentage::ZERO,
+            radii: None,
+        };
+        let natural = LayoutSize::new(100.0, 100.0);
+
+        for resolved in [
+            resolved_object_view_box(empty.clone(), Some(natural)),
+            resolved_object_view_box(empty, None),
+        ] {
+            assert!(!resolved.applies());
+            assert_eq!(
+                resolved.source_rect().size,
+                NormalizedObjectSourceSize::new(1.0, 1.0)
+            );
+            assert_eq!(resolved.effective_natural_size(natural), natural);
+        }
+    }
+
+    #[test]
+    fn svg_without_both_natural_axes_ignores_object_view_box() {
+        let asset = Rc::new(
+            crate::svg::parse_svg_bytes(
+                br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%"/></svg>"#,
+            )
+            .expect("dimensionless SVG parses"),
+        );
+        let view_box = css::ObjectViewBox::Inset {
+            top: css::ComputedLengthPercentage::from_points(50.0),
+            right: css::ComputedLengthPercentage::ZERO,
+            bottom: css::ComputedLengthPercentage::ZERO,
+            left: css::ComputedLengthPercentage::ZERO,
+            radii: None,
+        };
+
+        let resolved = resolved_object_view_box_for_svg(view_box, &asset);
+
+        assert!(!resolved.applies());
+        assert_eq!(
+            resolved.source_rect().size,
+            NormalizedObjectSourceSize::new(1.0, 1.0)
         );
     }
 }

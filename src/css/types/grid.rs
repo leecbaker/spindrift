@@ -9,16 +9,96 @@ use super::*;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GridTrackList {
     None,
-    /// A subgridded axis. Its inherited tracks are intentionally not resolved
-    /// yet, but containment can resolve this used value to `none`.
-    /// <https://drafts.csswg.org/css-grid-2/#subgrids>
+    /// A subgridded axis and its locally assigned line names.
+    ///
+    /// The track sizes and the final number of lines are supplied by the
+    /// parent grid at layout time.  Keeping the authored name-repeat list
+    /// intact here is important: `repeat(auto-fill, ...)` on a subgrid fills
+    /// its *used parent span*, rather than a container size.
+    /// <https://drafts.csswg.org/css-grid-2/#subgrid-listing>
     Subgrid {
-        line_names: GridLineNames,
+        line_names: SubgridLineNameList,
     },
     Tracks {
         components: Vec<GridTrackListComponent>,
         trailing_names: GridLineNames,
     },
+}
+
+/// The `<line-name-list>` following the `subgrid` keyword.
+///
+/// Unlike a standalone track list, every entry names one inherited grid line;
+/// it never defines a track.  The list is expanded only after the subgrid's
+/// used parent span is known.
+/// <https://drafts.csswg.org/css-grid-2/#typedef-line-name-list>
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SubgridLineNameList {
+    pub(crate) components: Vec<SubgridLineNameComponent>,
+}
+
+impl SubgridLineNameList {
+    /// Expand local names to the used number of inherited lines.
+    ///
+    /// Fixed repeats and overlong lists are truncated.  The sole allowed
+    /// `auto-fill` name repeat is expanded just far enough to fill the span,
+    /// then the result is truncated at the final inherited line.  This avoids
+    /// materializing an authored `repeat(100, ...)` beyond the subgrid span.
+    /// <https://drafts.csswg.org/css-grid-2/#auto-repeat>
+    pub(crate) fn expand_to_line_count(&self, line_count: usize) -> Vec<GridLineNames> {
+        let fixed_slot_count = self
+            .components
+            .iter()
+            .filter_map(|component| match component {
+                SubgridLineNameComponent::LineNames(_) => Some(1_usize),
+                SubgridLineNameComponent::Repeat {
+                    count: SubgridLineNameRepeatCount::Number(count),
+                    line_names,
+                } => Some(usize::from(*count).saturating_mul(line_names.len())),
+                SubgridLineNameComponent::Repeat {
+                    count: SubgridLineNameRepeatCount::AutoFill,
+                    ..
+                } => None,
+            })
+            .sum::<usize>();
+        let mut result = Vec::with_capacity(line_count);
+        for component in &self.components {
+            match component {
+                SubgridLineNameComponent::LineNames(names) => result.push(names.clone()),
+                SubgridLineNameComponent::Repeat { count, line_names } => {
+                    let repetitions = match count {
+                        SubgridLineNameRepeatCount::Number(count) => usize::from(*count),
+                        SubgridLineNameRepeatCount::AutoFill => {
+                            let remaining = line_count.saturating_sub(fixed_slot_count);
+                            remaining.div_ceil(line_names.len().max(1))
+                        }
+                    };
+                    for _ in 0..repetitions {
+                        result.extend(line_names.iter().cloned());
+                    }
+                }
+            }
+        }
+        result.truncate(line_count);
+        result.resize_with(line_count, Vec::new);
+        result
+    }
+}
+
+/// One line-name slot or a repetition of adjacent line-name slots in a
+/// subgrid declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubgridLineNameComponent {
+    LineNames(GridLineNames),
+    Repeat {
+        count: SubgridLineNameRepeatCount,
+        line_names: Vec<GridLineNames>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubgridLineNameRepeatCount {
+    Number(u16),
+    AutoFill,
 }
 
 impl GridTrackList {

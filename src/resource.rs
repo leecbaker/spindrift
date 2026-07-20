@@ -1,8 +1,12 @@
 use crate::dom::{Element, ElementId};
 use crate::image_store::{DocumentImageStore, ImageId, ImageMetadata};
-use crate::svg::{SharedSvgAsset, parse_inline_svg_with_transform_overrides, parse_svg_bytes};
+use crate::svg::{
+    SharedSvgAsset, SvgPresentationOverrides, parse_inline_svg_with_presentation_overrides,
+    parse_svg_bytes,
+};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -65,6 +69,7 @@ impl Default for ResourcePolicy {
 #[derive(Debug, Clone)]
 pub(crate) struct ResourceFetcher {
     policy: ResourcePolicy,
+    #[cfg(not(target_arch = "wasm32"))]
     http_client: reqwest::Client,
 }
 
@@ -78,23 +83,30 @@ pub(crate) struct FetchedResource {
 
 impl ResourceFetcher {
     pub(crate) fn new(policy: ResourcePolicy) -> crate::Result<Self> {
-        let redirect = if policy.follow_http_redirects {
-            reqwest::redirect::Policy::limited(10)
-        } else {
-            reqwest::redirect::Policy::none()
-        };
-        let http_client = reqwest::Client::builder()
-            .redirect(redirect)
-            .build()
-            .map_err(|error| {
-                crate::Error::InvalidInput(format!(
-                    "failed to create HTTP resource client: {error}"
-                ))
-            })?;
-        Ok(Self {
-            policy,
-            http_client,
-        })
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let redirect = if policy.follow_http_redirects {
+                reqwest::redirect::Policy::limited(10)
+            } else {
+                reqwest::redirect::Policy::none()
+            };
+            let http_client = reqwest::Client::builder()
+                .redirect(redirect)
+                .build()
+                .map_err(|error| {
+                    crate::Error::InvalidInput(format!(
+                        "failed to create HTTP resource client: {error}"
+                    ))
+                })?;
+            Ok(Self {
+                policy,
+                http_client,
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(Self { policy })
+        }
     }
 
     pub(crate) fn allows_fetch_errors(&self) -> bool {
@@ -106,6 +118,17 @@ impl ResourceFetcher {
     }
 
     pub(crate) async fn fetch(&self, location: &Url) -> crate::Result<FetchedResource> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Data URLs are decoded directly by their callers and therefore
+            // do not reach this platform resource backend.
+            return Err(crate::Error::InvalidInput(format!(
+                "resource URL scheme {:?} is unavailable when targeting wasm32; use in-memory or data URL resources",
+                location.scheme()
+            )));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
         match location.scheme() {
             "http" | "https" => {
                 log::trace!("fetching HTTP resource {location}");
@@ -198,13 +221,13 @@ pub(crate) struct ResourceCache {
     cors_response_metadata: HashMap<Url, CorsResponseMetadata>,
     image_store: RefCell<DocumentImageStore>,
     svg_assets: RefCell<HashMap<ElementId, Option<SharedSvgAsset>>>,
-    /// CSS transforms cascaded onto descendants of inline SVG roots.
+    /// CSS presentation values cascaded onto descendants of inline SVG roots.
     ///
     /// Inline SVG is an atomic HTML layout box, but its descendants still
     /// participate in the document's CSS cascade.  The SVG adapter consumes
     /// these overrides while constructing its own SVG scene, without mutating
     /// the source DOM used by HTML selector matching.
-    svg_transform_overrides: RefCell<HashMap<ElementId, String>>,
+    svg_presentation_overrides: RefCell<SvgPresentationOverrides>,
     /// Used iframe content-box viewport dimensions recorded during the parent
     /// measurement layout. They let nested browsing contexts lay out against
     /// their actual embedding viewport on the final pass.
@@ -229,7 +252,7 @@ impl Default for ResourceCache {
             cors_response_metadata: HashMap::new(),
             image_store: RefCell::new(DocumentImageStore::default()),
             svg_assets: RefCell::new(HashMap::new()),
-            svg_transform_overrides: RefCell::new(HashMap::new()),
+            svg_presentation_overrides: RefCell::new(SvgPresentationOverrides::new()),
             iframe_viewports: RefCell::new(HashMap::new()),
             image_assets: RefCell::new(HashMap::new()),
             oriented_image_assets: RefCell::new(HashMap::new()),
@@ -264,14 +287,17 @@ impl ResourceCache {
         std::mem::take(&mut *self.iframe_viewports.borrow_mut())
     }
 
-    /// Installs the document-cascaded CSS transforms for inline SVG descendants.
+    /// Installs document-cascaded CSS presentation values for inline SVG descendants.
     ///
     /// This is called once before layout starts, before any inline SVG asset
     /// can be cached. See CSS Transforms Level 1, §7.3, for CSS `transform` on
     /// SVG elements and SVG 2, §6.6, for presentation-attribute precedence.
-    pub(crate) fn set_inline_svg_transform_overrides(&self, overrides: HashMap<ElementId, String>) {
+    pub(crate) fn set_inline_svg_presentation_overrides(
+        &self,
+        overrides: SvgPresentationOverrides,
+    ) {
         debug_assert!(self.svg_assets.borrow().is_empty());
-        *self.svg_transform_overrides.borrow_mut() = overrides;
+        *self.svg_presentation_overrides.borrow_mut() = overrides;
     }
 
     pub(crate) async fn preload(
@@ -478,8 +504,8 @@ impl ResourceCache {
         if let Some(asset) = self.svg_assets.borrow().get(&element.id) {
             return asset.clone();
         }
-        let overrides = self.svg_transform_overrides.borrow();
-        let asset = match parse_inline_svg_with_transform_overrides(element, &overrides) {
+        let overrides = self.svg_presentation_overrides.borrow();
+        let asset = match parse_inline_svg_with_presentation_overrides(element, &overrides) {
             Ok(asset) => Some(Rc::new(asset)),
             Err(error) => {
                 log::debug!("failed to parse inline SVG: {error}");
@@ -501,6 +527,17 @@ impl ResourceCache {
         image: crate::image_store::GeneratedRasterImage,
     ) -> ImageId {
         self.image_store.borrow_mut().register_generated(image)
+    }
+
+    /// Borrow one decoded document image for layout-time consumers such as CSS
+    /// Shapes alpha contours. The raster remains owned by the image store and
+    /// is released immediately after `consume` returns.
+    pub(crate) fn with_rasterized_image<T>(
+        &self,
+        image: ImageId,
+        consume: impl FnOnce(crate::image_store::RasterImage) -> T,
+    ) -> Option<T> {
+        self.image_store.borrow().with_rasterized(image, consume)
     }
 }
 
@@ -529,6 +566,7 @@ fn same_svg_resource_origin(parent: &Url, child: &Url) -> bool {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn read_to_string(location: &Url) -> crate::Result<String> {
     let fetcher = ResourceFetcher::new(ResourcePolicy::default())?;
     fetcher
@@ -537,6 +575,7 @@ pub(crate) async fn read_to_string(location: &Url) -> crate::Result<String> {
         .map(|(source, _)| source)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn file_url_from_path(path: &Path) -> crate::Result<Url> {
     let path = absolute_path(path)?;
     Url::from_file_path(&path).map_err(|_| {
@@ -547,6 +586,7 @@ pub(crate) fn file_url_from_path(path: &Path) -> crate::Result<Url> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn directory_url_from_path(path: &Path) -> crate::Result<Url> {
     let path = absolute_path(path)?;
     Url::from_directory_path(&path).map_err(|_| {
@@ -646,6 +686,7 @@ pub(crate) fn origin_url(url: &Url) -> Option<Url> {
     Url::parse(&origin.ascii_serialization()).ok()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn absolute_path(path: &Path) -> crate::Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())

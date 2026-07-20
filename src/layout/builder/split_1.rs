@@ -1,8 +1,9 @@
 use super::*;
 
 #[derive(Debug, Clone)]
-pub(in crate::layout) struct PageNameScope {
-    pub(in crate::layout) end_page_name: Option<String>,
+pub(in crate::layout) enum PageNameScope {
+    Element,
+    Inline { previous_page_name: Option<String> },
 }
 
 #[derive(Debug, Clone)]

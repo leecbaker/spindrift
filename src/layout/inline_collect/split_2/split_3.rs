@@ -15,12 +15,21 @@ impl<'a> LayoutBuilder<'a> {
         visual_offset: InlineVisualOffset,
         link_target: Option<String>,
     ) -> Option<InlineAtom> {
+        // Atomic inline dimensions participate directly in their containing
+        // line's intrinsic contribution. Resolve viewport and font-relative
+        // components before that contribution is captured; otherwise a
+        // vertical `height: 20vh` is reduced to its line strut and cannot
+        // negotiate against the orthogonal flow's available inline size.
+        // <https://www.w3.org/TR/css-values-4/#viewport-relative-lengths>
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flow>
+        let used_style = self.style_with_current_used_lengths(style);
+        let style = &used_style;
         let intrinsic_metrics = intrinsic_box_metrics(style);
         let available_width = (self.content_right
             - self.content_left
-            - intrinsic_metrics.margin.left
-            - intrinsic_metrics.margin.right)
-            .max(0.0);
+            - intrinsic_metrics.margin.left.points()
+            - intrinsic_metrics.margin.right.points())
+        .max(0.0);
         let inline_percentage_basis = self
             .intrinsic_inline_percentage_basis_stack
             .last()
@@ -37,7 +46,7 @@ impl<'a> LayoutBuilder<'a> {
         } = &style.content
         {
             let image = used_generated_image_value(
-                image,
+                image.as_image()?,
                 style,
                 available_width,
                 self.base_url,
@@ -57,11 +66,11 @@ impl<'a> LayoutBuilder<'a> {
                     None,
                     InlineSize::new(
                         border_box_width
-                            + intrinsic_metrics.margin.left
-                            + intrinsic_metrics.margin.right,
+                            + intrinsic_metrics.margin.left.points()
+                            + intrinsic_metrics.margin.right.points(),
                         border_box_height
-                            + intrinsic_metrics.margin.top
-                            + intrinsic_metrics.margin.bottom,
+                            + intrinsic_metrics.margin.top.points()
+                            + intrinsic_metrics.margin.bottom.points(),
                     ),
                     border_box_height,
                     baseline_shift,
@@ -89,11 +98,11 @@ impl<'a> LayoutBuilder<'a> {
                 let border_box_height = canvas.border_box_size.height;
                 (
                     border_box_width
-                        + intrinsic_metrics.margin.left
-                        + intrinsic_metrics.margin.right,
+                        + intrinsic_metrics.margin.left.points()
+                        + intrinsic_metrics.margin.right.points(),
                     border_box_height
-                        + intrinsic_metrics.margin.top
-                        + intrinsic_metrics.margin.bottom,
+                        + intrinsic_metrics.margin.top.points()
+                        + intrinsic_metrics.margin.bottom.points(),
                     border_box_height,
                 )
             }
@@ -101,7 +110,7 @@ impl<'a> LayoutBuilder<'a> {
                 element,
                 style,
                 IntrinsicInlineImageSizingContext {
-                    available_width,
+                    available_width: content_box_pt(available_width),
                     inline_percentage_basis,
                     height_basis: self
                         .definite_block_size_stack
@@ -118,11 +127,11 @@ impl<'a> LayoutBuilder<'a> {
                 let border_box_height = image.border_box_size.height;
                 (
                     border_box_width
-                        + intrinsic_metrics.margin.left
-                        + intrinsic_metrics.margin.right,
+                        + intrinsic_metrics.margin.left.points()
+                        + intrinsic_metrics.margin.right.points(),
                     border_box_height
-                        + intrinsic_metrics.margin.top
-                        + intrinsic_metrics.margin.bottom,
+                        + intrinsic_metrics.margin.top.points()
+                        + intrinsic_metrics.margin.bottom.points(),
                     border_box_height,
                 )
             })?,
@@ -139,8 +148,12 @@ impl<'a> LayoutBuilder<'a> {
                 let width = svg.border_box_size.width;
                 let height = svg.border_box_size.height;
                 (
-                    width + intrinsic_metrics.margin.left + intrinsic_metrics.margin.right,
-                    height + intrinsic_metrics.margin.top + intrinsic_metrics.margin.bottom,
+                    width
+                        + intrinsic_metrics.margin.left.points()
+                        + intrinsic_metrics.margin.right.points(),
+                    height
+                        + intrinsic_metrics.margin.top.points()
+                        + intrinsic_metrics.margin.bottom.points(),
                     height,
                 )
             }
@@ -169,8 +182,8 @@ impl<'a> LayoutBuilder<'a> {
                     )
                     .points()
                         + horizontal_extras
-                        + box_metrics.margin.left
-                        + box_metrics.margin.right,
+                        + box_metrics.margin.left.points()
+                        + box_metrics.margin.right.points(),
                     style.line_height,
                     style.line_height,
                 )
@@ -178,19 +191,19 @@ impl<'a> LayoutBuilder<'a> {
             None if style.display.is_flex() && style.display.is_inline_level() => {
                 let box_metrics = intrinsic_box_metrics(style);
                 let horizontal_extras = box_metrics.horizontal_non_content_length().points();
-                let (min_width, width) = self.estimate_flex_intrinsic_widths(
+                let contributions = self.estimate_flex_intrinsic_widths(
                     element,
                     style,
                     stylesheets,
-                    available_width,
+                    PhysicalContentWidth::new(content_box_pt(available_width)),
                     Some(children),
                 );
                 let content_width = intrinsic::content_box_width_from_intrinsic(
                     style,
                     layout_pt(available_width),
                     non_content_pt(horizontal_extras),
-                    content_box_pt(min_width),
-                    content_box_pt(width),
+                    contributions.min_content.content_box_length(),
+                    contributions.max_content.content_box_length(),
                     intrinsic::IntrinsicAutoWidth::ShrinkToFit,
                 )
                 .points();
@@ -202,8 +215,8 @@ impl<'a> LayoutBuilder<'a> {
                     )
                     .points()
                         + horizontal_extras
-                        + box_metrics.margin.left
-                        + box_metrics.margin.right,
+                        + box_metrics.margin.left.points()
+                        + box_metrics.margin.right.points(),
                     style.line_height,
                     style.line_height,
                 )
@@ -247,13 +260,8 @@ impl<'a> LayoutBuilder<'a> {
                     ));
                 let contribution = if children.is_empty() {
                     let text = inline_text_for_style(element, style);
-                    let contribution = self
-                        .intrinsic_inline_measurement_for_text(&text, style, available_width)
-                        .contribution;
-                    inline_layout::InlineIntrinsicContribution {
-                        min_content: contribution.min_content,
-                        max_content: contribution.max_content,
-                    }
+                    self.intrinsic_inline_measurement_for_text(&text, style, available_width)
+                        .contribution
                 } else {
                     self.intrinsic_inline_contribution_for_element(
                         element,
@@ -267,48 +275,72 @@ impl<'a> LayoutBuilder<'a> {
                     style,
                     layout_pt(available_width),
                     non_content_pt(horizontal_extras),
-                    content_box_pt(contribution.min_content),
-                    content_box_pt(contribution.max_content),
+                    contribution.min_content.content_box_length(),
+                    contribution.max_content.content_box_length(),
                     intrinsic::IntrinsicAutoWidth::ShrinkToFit,
                 )
                 .points();
-                let content_width = if style.box_values.width.is_auto() {
+                let mut content_width = if style.box_values.width.is_auto() {
                     content_width.max(style.font_size)
                 } else {
                     content_width
                 };
-                let measured_content_height = if children.is_empty() {
+                let (measured_content_height, measured_physical_height) = if children.is_empty() {
                     let text = inline_text_for_style(element, style);
-                    self.intrinsic_inline_measurement_for_text(&text, style, content_width)
-                        .height()
-                        .max(style.line_height)
+                    let measurement =
+                        self.intrinsic_inline_measurement_for_text(&text, style, content_width);
+                    (
+                        measurement.height().max(style.line_height),
+                        measurement.physical_height(style),
+                    )
                 } else {
                     self.definite_block_size_stack
                         .push(block_size_percentage_basis_from_points(
                             definite_content_height,
                             BlockSizeBasisSource::InlineBlock,
                         ));
-                    self.intrinsic_inline_measurement_for_element(
+                    let measurement = self.intrinsic_inline_measurement_for_element(
                         element,
                         style,
                         stylesheets,
                         Some(children),
                         content_width,
+                    );
+                    (
+                        measurement.height().max(style.line_height),
+                        measurement.physical_height(style),
                     )
-                    .height()
-                    .max(style.line_height)
                 };
                 if !children.is_empty() {
                     self.definite_block_size_stack.pop();
                 }
-                let content_height = definite_content_height.unwrap_or_else(|| {
-                    constrain_content_height(
-                        style,
-                        content_box_pt(measured_content_height),
-                        PercentageBasis::definite(layout_pt(available_width)),
-                    )
-                    .points()
-                });
+                let vertical_writing_mode = style.writing_mode.has_vertical_lines();
+                let has_intrinsic_inline_content =
+                    !children.is_empty() || !inline_text_for_style(element, style).is_empty();
+                if vertical_writing_mode
+                    && style.box_values.width.is_auto()
+                    && has_intrinsic_inline_content
+                {
+                    // A vertical inline-block's physical width is its logical
+                    // block contribution, i.e. the stacked line-box extent.
+                    // Its physical height is instead the used logical inline
+                    // extent below. Keeping those projections distinct makes
+                    // intrinsic atom sizing agree with final inline paint.
+                    // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+                    content_width = measured_content_height;
+                }
+                let content_height = if vertical_writing_mode {
+                    definite_content_height.unwrap_or(measured_physical_height)
+                } else {
+                    definite_content_height.unwrap_or_else(|| {
+                        constrain_content_height(
+                            style,
+                            content_box_pt(measured_content_height),
+                            PercentageBasis::definite(layout_pt(available_width)),
+                        )
+                        .points()
+                    })
+                };
                 let border_box_height = content_height + vertical_extras;
                 (
                     constrain_content_width(
@@ -318,9 +350,11 @@ impl<'a> LayoutBuilder<'a> {
                     )
                     .points()
                         + horizontal_extras
-                        + box_metrics.margin.left
-                        + box_metrics.margin.right,
-                    border_box_height + box_metrics.margin.top + box_metrics.margin.bottom,
+                        + box_metrics.margin.left.points()
+                        + box_metrics.margin.right.points(),
+                    border_box_height
+                        + box_metrics.margin.top.points()
+                        + box_metrics.margin.bottom.points(),
                     border_box_height,
                 )
             }
@@ -388,10 +422,15 @@ impl<'a> LayoutBuilder<'a> {
             InlineItem::Atom(atom) => {
                 !atom.content().is_inline_edge() || atom.size.width > 0.0 || atom.size.height > 0.0
             }
-            InlineItem::Float(_)
-            | InlineItem::Break(_)
-            | InlineItem::PageScopeStart(_)
-            | InlineItem::PageScopeEnd => false,
+            InlineItem::Float(_) | InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd => {
+                false
+            }
+            // A forced line break has no inline advance, but it does create
+            // a line box. Its hypothetical block position is therefore part
+            // of the static-position rectangle for a following block-level
+            // positioned descendant.
+            // <https://www.w3.org/TR/css-position-3/#staticpos-rect>
+            InlineItem::Break(_) => true,
         });
         if !has_buffered_content {
             return 0.0;
@@ -456,11 +495,22 @@ impl<'a> LayoutBuilder<'a> {
         &mut self,
         block_style: &ComputedStyle,
     ) -> InlineAtom {
+        self.block_static_position_placeholder_atom_with_inline_size(block_style, 0.0)
+    }
+
+    /// Builds a non-painting static-position atom with an explicit inline
+    /// footprint. Split inline floats use this to participate in the line
+    /// selection that determines their source block position.
+    pub(in crate::layout) fn block_static_position_placeholder_atom_with_inline_size(
+        &mut self,
+        block_style: &ComputedStyle,
+        inline_size: f32,
+    ) -> InlineAtom {
         InlineAtom::new(
             InlineAtomContent::StaticPositionPlaceholder,
             block_style.clone(),
             None,
-            InlineSize::new(0.0, block_style.line_height),
+            InlineSize::new(inline_size.max(0.0), block_style.line_height),
             self.font_system
                 .rendered_first_line_baseline_offset(block_style)
                 .points(),
@@ -644,14 +694,16 @@ impl<'a> LayoutBuilder<'a> {
                 )));
             }
             GeneratedContentPart::Image { image } => {
-                if let Some(atom) = self.generated_image_atom_for_image(
-                    image,
-                    style,
-                    baseline_shift,
-                    visual_offset,
-                    link_target,
-                    alt_text,
-                ) {
+                if let Some(atom) = image.as_image().and_then(|image| {
+                    self.generated_image_atom_for_image(
+                        image,
+                        style,
+                        baseline_shift,
+                        visual_offset,
+                        link_target,
+                        alt_text,
+                    )
+                }) {
                     output.push(InlineItem::Atom(Box::new(atom)));
                 }
             }
@@ -849,7 +901,7 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         link_target: Option<String>,
         placement: InlinePlacement,
-        source: InlineTextSource,
+        _source: InlineTextSource,
         output: &mut Vec<InlineItem>,
     ) {
         if !text.is_empty() {
@@ -860,7 +912,10 @@ impl<'a> LayoutBuilder<'a> {
                 visual_offset: placement.visual_offset,
                 link_target: link_target.map(Rc::from),
                 mergeable: true,
-                source,
+                // This is CSS-generated UAX #9 input, rather than authored
+                // text. Retaining that provenance lets later line selection
+                // balance only these controls across a soft wrap.
+                source: InlineTextSource::BidiControl,
                 hanging_edges: InlineHangingEdges::default(),
                 ancestor_inline_decorations: Vec::new().into(),
             })));
@@ -905,14 +960,16 @@ impl<'a> LayoutBuilder<'a> {
         } = &style.content
         {
             let alt_text = self.generated_alt_text(element, style);
-            return self.generated_image_atom_for_image(
-                image,
-                style,
-                baseline_shift,
-                visual_offset,
-                link_target,
-                alt_text,
-            );
+            return image.as_image().and_then(|image| {
+                self.generated_image_atom_for_image(
+                    image,
+                    style,
+                    baseline_shift,
+                    visual_offset,
+                    link_target,
+                    alt_text,
+                )
+            });
         }
         match replaced_element_kind(element) {
             Some(ReplacedElementKind::Canvas) => {
@@ -940,7 +997,8 @@ impl<'a> LayoutBuilder<'a> {
                 };
                 let border_box_width = canvas.border_box_size.width;
                 let border_box_height = canvas.border_box_size.height;
-                let atom_width = border_box_width + metrics.margin.left + metrics.margin.right;
+                let atom_width =
+                    border_box_width + metrics.margin.left.points() + metrics.margin.right.points();
                 Some(
                     InlineAtom::new(
                         content,
@@ -948,7 +1006,9 @@ impl<'a> LayoutBuilder<'a> {
                         None,
                         InlineSize::new(
                             atom_width,
-                            border_box_height + metrics.margin.top + metrics.margin.bottom,
+                            border_box_height
+                                + metrics.margin.top.points()
+                                + metrics.margin.bottom.points(),
                         ),
                         border_box_height,
                         baseline_shift,
@@ -1026,8 +1086,8 @@ impl<'a> LayoutBuilder<'a> {
                         style,
                         None,
                         InlineSize::new(
-                            width + metrics.margin.left + metrics.margin.right,
-                            height + metrics.margin.top + metrics.margin.bottom,
+                            width + metrics.margin.left.points() + metrics.margin.right.points(),
+                            height + metrics.margin.top.points() + metrics.margin.bottom.points(),
                         ),
                         height,
                         baseline_shift,
@@ -1094,13 +1154,13 @@ impl<'a> LayoutBuilder<'a> {
                     - style.margin.left
                     - style.margin.right)
                     .max(0.0);
-                let mut used_style = self.style_with_current_viewport_lengths(style);
+                let mut used_style = self.style_with_current_used_lengths(style);
                 let box_metrics = apply_used_box_metrics(
                     &mut used_style,
                     PercentageBasis::definite(layout_pt(available_width)),
                 );
                 let style = &used_style;
-                let border_widths = box_metrics.border;
+                let border_widths = box_metrics.border.to_css_edges();
                 let horizontal_extras = box_metrics.horizontal_non_content_length().points();
                 let vertical_extras = box_metrics.vertical_non_content_length().points();
                 let containing_block_height = self
@@ -1147,12 +1207,12 @@ impl<'a> LayoutBuilder<'a> {
                         style,
                         layout_pt(available_width),
                         non_content_pt(horizontal_extras),
-                        content_box_pt(intrinsic.contribution.min_content),
-                        content_box_pt(intrinsic.contribution.max_content),
+                        intrinsic.contribution.min_content.content_box_length(),
+                        intrinsic.contribution.max_content.content_box_length(),
                         intrinsic::IntrinsicAutoWidth::ShrinkToFit,
                     )
                 });
-                let content_width = constrain_content_width(
+                let mut content_width = constrain_content_width(
                     style,
                     requested_content_width,
                     PercentageBasis::definite(layout_pt(available_width.max(0.0))),
@@ -1222,30 +1282,73 @@ impl<'a> LayoutBuilder<'a> {
                     &mut sequence_items,
                 );
                 self.definite_block_size_stack.pop();
+                let vertical_writing_mode = style.writing_mode.has_vertical_lines();
+                // A physical `width` is the logical block size in vertical
+                // writing. Select the line's logical inline measure from
+                // `height` (or its shrink-to-fit intrinsic contribution),
+                // then derive the physical width from the resulting wrapped
+                // logical block contribution.
+                // <https://www.w3.org/TR/css-writing-modes-4/#dimension-mapping>
+                let logical_inline_measure = if vertical_writing_mode {
+                    definite_content_height.unwrap_or_else(|| {
+                        intrinsic::content_box_width_from_intrinsic(
+                            style,
+                            layout_pt(available_width),
+                            non_content_pt(horizontal_extras),
+                            intrinsic.contribution.min_content.content_box_length(),
+                            intrinsic.contribution.max_content.content_box_length(),
+                            intrinsic::IntrinsicAutoWidth::ShrinkToFit,
+                        )
+                        .points()
+                    })
+                } else {
+                    content_width
+                };
                 let sequence = self.collect_inline_line_sequence_with_text_box_trim(
                     sequence_items,
                     style,
-                    content_width,
+                    logical_inline_measure,
                     0.0,
                     0.0,
                 );
-                let measured_content_height = sequence.total_height().max(0.0);
+                let measured_logical_block_size = if vertical_writing_mode {
+                    sequence
+                        .records
+                        .iter()
+                        .map(|record| record.block_before + record.height().max(style.line_height))
+                        .sum::<f32>()
+                        .max(0.0)
+                } else {
+                    sequence.total_height().max(0.0)
+                };
+                if vertical_writing_mode && style.box_values.width.is_auto() {
+                    content_width = constrain_content_width(
+                        style,
+                        content_box_pt(measured_logical_block_size),
+                        PercentageBasis::definite(layout_pt(available_width.max(0.0))),
+                    )
+                    .points();
+                }
                 // CSS Sizing applies `height` to the content box; line-height
                 // can overflow explicit-height inline-blocks but must not
                 // increase their used height:
                 // <https://www.w3.org/TR/CSS22/visudet.html#the-height-property>.
-                let content_height = definite_content_height.unwrap_or_else(|| {
-                    constrain_content_height(
-                        style,
-                        content_box_pt(if style.contain.size {
-                            0.0
-                        } else {
-                            measured_content_height
-                        }),
-                        PercentageBasis::definite(layout_pt(available_width)),
-                    )
-                    .points()
-                });
+                let content_height = if vertical_writing_mode {
+                    definite_content_height.unwrap_or(logical_inline_measure)
+                } else {
+                    definite_content_height.unwrap_or_else(|| {
+                        constrain_content_height(
+                            style,
+                            content_box_pt(if style.contain.size {
+                                0.0
+                            } else {
+                                measured_logical_block_size
+                            }),
+                            PercentageBasis::definite(layout_pt(available_width)),
+                        )
+                        .points()
+                    })
+                };
                 let border_box_height = content_height + vertical_extras;
                 let line_baseline_offset =
                     self.inline_box_sequence_baseline_offset(&sequence, style, border_widths);

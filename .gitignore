@@ -6,5 +6,6 @@ WeasyPrint
 
 output/
 wpt-results/
+results/
 
 *.pdf

@@ -9,8 +9,8 @@ pub(in crate::layout) use graph::{
     build_inline_opportunity_graph,
 };
 pub(in crate::layout) use items::{
-    InlineLayoutOutcome, InlineLineRecord, InlineLineSequence, MulticolumnInlinePaintGeometry,
-    inline_line_fragment_is_phantom,
+    InlineLayoutOutcome, InlineLineRecord, InlineLineSequence, InlineLineStackCursor,
+    MulticolumnInlinePaintGeometry, inline_line_fragment_is_phantom,
 };
 
 #[cfg(test)]

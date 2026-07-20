@@ -159,6 +159,15 @@ fn element_dir_attribute_direction(element: &Element) -> Option<Direction> {
 }
 
 fn html_auto_directionality(element: &Element) -> Option<Direction> {
+    if let Some(value) = css::auto_directionality_input_value(&element.tag, &element.attrs) {
+        // HTML's form-control branch returns RTL when the first strong
+        // directional character is AL/R, LTR when it is L, and otherwise LTR
+        // for a non-empty value. `plaintext_direction_for_text` is precisely
+        // that first-strong-character step.
+        // <https://html.spec.whatwg.org/multipage/dom.html#auto-directionality>
+        return plaintext_direction_for_text(value)
+            .or_else(|| (!value.is_empty()).then_some(Direction::Ltr));
+    }
     contained_text_auto_directionality(element, false)
 }
 
@@ -250,5 +259,29 @@ mod tests {
         apply_html_directionality(&element, &mut style);
 
         assert_eq!(style.direction, Direction::Rtl);
+    }
+
+    #[test]
+    fn dir_auto_input_uses_its_static_value_for_auto_directionality() {
+        let rtl = first_element_by_tag(r#"<input dir="auto" value=".-=123 אבגABC.">"#, "input");
+        let ltr = first_element_by_tag(r#"<input dir="auto" value="123ABCאבג.">"#, "input");
+        let empty = first_element_by_tag(r#"<input dir="auto" value="">"#, "input");
+        let excluded =
+            first_element_by_tag(r#"<input type="number" dir="auto" value="אבג">"#, "input");
+
+        assert_eq!(html_auto_directionality(&rtl), Some(Direction::Rtl));
+        assert_eq!(html_auto_directionality(&ltr), Some(Direction::Ltr));
+        assert_eq!(html_auto_directionality(&empty), None);
+        assert_eq!(html_auto_directionality(&excluded), None);
+    }
+
+    #[test]
+    fn dir_auto_unknown_input_type_uses_the_text_state() {
+        let element = first_element_by_tag(
+            r#"<input type="not-a-real-state" dir="auto" value="אבג">"#,
+            "input",
+        );
+
+        assert_eq!(html_auto_directionality(&element), Some(Direction::Rtl));
     }
 }

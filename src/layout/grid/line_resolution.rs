@@ -275,19 +275,22 @@ fn grid_static_line_offsets(
 
     let mut track_sizes =
         Vec::with_capacity(before_track_count + explicit_track_sizes.len() + after_track_count);
-    for auto_index in (0..before_track_count).rev() {
-        track_sizes.push(cycled_definite_auto_track_size_before(
-            auto_tracks,
-            auto_index,
-            container_size,
-        )?);
-    }
+    track_sizes.extend(
+        (0..before_track_count)
+            .rev()
+            .map(|auto_index| {
+                cycled_definite_auto_track_size_before(auto_tracks, auto_index, container_size)
+            })
+            .collect::<Option<Vec<_>>>()?,
+    );
     track_sizes.extend_from_slice(explicit_track_sizes);
-    for auto_index in 0..after_track_count {
-        let auto_size =
-            cycled_definite_auto_track_size_after(auto_tracks, auto_index, container_size)?;
-        track_sizes.push(auto_size);
-    }
+    track_sizes.extend(
+        (0..after_track_count)
+            .map(|auto_index| {
+                cycled_definite_auto_track_size_after(auto_tracks, auto_index, container_size)
+            })
+            .collect::<Option<Vec<_>>>()?,
+    );
     Some(GridStaticLineOffsets {
         first_line_index: 1 - i32::try_from(before_track_count).ok()?,
         offsets: line_offsets_from_sizes_and_gap(&track_sizes, gap),

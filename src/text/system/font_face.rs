@@ -35,8 +35,11 @@ impl FontSystem {
                 self.family_cache.insert(cache_key, id);
                 return Some(id);
             }
+            if is_private_standard_ui_family_name(name) {
+                continue;
+            }
             if let Some(id) = self.load_document_font_for_families(
-                &[FontiqueQueryFamily::Named(name)],
+                &[FontiqueQueryFamily::Named(fontique_family_name(name))],
                 weight,
                 style,
                 width,
@@ -75,41 +78,12 @@ impl FontSystem {
     /// <https://www.w3.org/TR/CSS22/visudet.html#line-height> and
     /// <https://www.w3.org/TR/css-fonts-4/#unicode-range-desc>.
     pub(crate) fn resolve_metric_font_for_style(&mut self, style: &ComputedStyle) -> Option<usize> {
-        if let FontFamily::List(families) = &style.font_family {
-            return families.iter().find_map(|family| {
-                self.resolve_font_family(
-                    family,
-                    style.font_weight,
-                    style.font_style,
-                    style.font_width,
-                )
-            });
-        }
-        if let FontFamily::Names(names) = &style.font_family {
-            for name in names {
-                if let Some(id) = self.resolve_single_family(
-                    name,
-                    style.font_weight,
-                    style.font_style,
-                    style.font_width,
-                ) {
-                    return Some(id);
-                }
-            }
-        } else if let Some(id) = self.resolve_generic_family(
-            &style.font_family,
-            style.font_weight,
-            style.font_style,
-            style.font_width,
-        ) {
-            return Some(id);
-        }
-
-        self.resolve_system_fallback_for_character(
-            'M',
-            style.font_weight,
-            style.font_style,
-            style.font_width,
-        )
+        // The element's first available font is the first face in its font
+        // list that can render U+0020.  A `unicode-range` descriptor can make
+        // an otherwise loadable face unavailable for that purpose, so this
+        // must share the character-selection path used for shaping instead of
+        // merely returning the first resolvable family.
+        // <https://www.w3.org/TR/css-fonts-4/#first-available-font>
+        self.resolve_family_fallback_for_character(style, ' ')
     }
 }

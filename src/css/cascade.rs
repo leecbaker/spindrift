@@ -10,10 +10,12 @@ mod columns;
 mod declarations;
 mod properties;
 mod style;
-mod variables;
+pub(in crate::css) mod variables;
 
 use background::*;
-pub(crate) use background::{parse_background_image, parse_background_position};
+pub(crate) use background::{
+    ParsedImage, parse_background_image, parse_background_position, parse_css_image,
+};
 use columns::*;
 pub(crate) use declarations::{
     CascadedDeclaration, apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance,
@@ -24,8 +26,11 @@ pub(crate) use declarations::{
     parse_transform_origin, sort_cascaded_declarations,
 };
 pub(in crate::css) use declarations::{
-    parse_initial_letter, parse_initial_letter_align, parse_initial_letter_wrap,
+    parse_border_shape, parse_initial_letter, parse_initial_letter_align,
+    parse_initial_letter_wrap, parse_running_position, parse_text_combine_upright,
+    parse_writing_mode,
 };
+pub(in crate::css) use properties::is_modeled_property_name;
 use properties::*;
 pub(crate) use style::{
     anonymous_block_style, apply_pseudo_rules_with_parent_ch_advance, default_style_for_tag,

@@ -48,6 +48,12 @@ pub(crate) fn typographic_unit_count(text: &str) -> usize {
     typographic_unit_ranges(text).len()
 }
 
+/// Return whether source text consists entirely of formatting characters that
+/// cannot own an inter-character tracking boundary.
+pub(crate) fn text_is_inter_character_control_only(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(character_is_inter_character_control)
+}
+
 /// Return whether an inter-character justification gap is valid between two
 /// already materialized text units.
 ///
@@ -62,13 +68,14 @@ pub(crate) fn inter_character_gap_allowed_between_text(left: &str, right: &str) 
 
 pub(crate) fn text_allows_inter_character_gap_after(text: &str) -> bool {
     text.chars()
-        .next_back()
+        .rev()
+        .find(|character| !character_is_inter_character_control(*character))
         .is_some_and(|character| !character_blocks_inter_character_gap(character))
 }
 
 pub(crate) fn text_allows_inter_character_gap_before(text: &str) -> bool {
     text.chars()
-        .next()
+        .find(|character| !character_is_inter_character_control(*character))
         .is_some_and(|character| !character_blocks_inter_character_gap(character))
 }
 
@@ -150,7 +157,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(units, vec!["e\u{301}", "x"]);
     }
-
     #[test]
     fn typographic_units_group_joining_sequences() {
         let text = "سلام";
@@ -160,6 +166,52 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(units, vec!["سلام"]);
         assert!(!inter_character_gap_allowed_between_text("س", "ل"));
+    }
+
+    #[test]
+    fn typographic_units_keep_bengali_yaphala_indivisible() {
+        let text = "ক্য";
+        let units = typographic_unit_ranges(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect::<Vec<_>>();
+
+        assert_eq!(units, vec!["ক্য"]);
+    }
+
+    #[test]
+    fn controls_are_transparent_to_tracking_boundaries() {
+        for control in ['\u{200c}', '\u{200d}', '\u{200e}'] {
+            let control = control.to_string();
+            assert!(!inter_character_gap_allowed_between_text(&control, "a"));
+            assert!(!inter_character_gap_allowed_between_text("a", &control));
+            assert!(inter_character_gap_allowed_between_text(
+                "a",
+                &format!("{control}b")
+            ));
+            assert!(inter_character_gap_allowed_between_text(
+                &format!("a{control}"),
+                "b"
+            ));
+        }
+    }
+
+    #[test]
+    fn zero_width_space_is_attached_to_the_preceding_typographic_unit() {
+        let text = "12\u{200b}三";
+        let units = typographic_unit_ranges(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect::<Vec<_>>();
+
+        assert_eq!(units, vec!["1", "2\u{200b}", "三"]);
+    }
+
+    #[test]
+    fn arabic_word_can_track_after_an_intervening_space() {
+        assert!(!inter_character_gap_allowed_between_text("س", " "));
+        assert!(inter_character_gap_allowed_between_text(" ", "a"));
+        assert!(!inter_character_gap_allowed_between_text(" ", "ل"));
     }
 
     #[test]

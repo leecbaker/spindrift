@@ -189,7 +189,7 @@ pub(crate) fn edge_all(value: f32) -> Edges {
     }
 }
 
-pub(crate) fn border_colors_all(color: Color) -> BorderColors {
+pub(crate) fn border_colors_all(color: CssColor) -> BorderColors {
     BorderColors {
         top: color,
         right: color,

@@ -54,11 +54,13 @@ pub(in crate::css) fn expand_corner_shorthand(value: &str) -> Option<Vec<(&'stat
         ("border-bottom-right-radius", "corner-bottom-right-shape"),
         ("border-bottom-left-radius", "corner-bottom-left-shape"),
     ];
-    let mut declarations = Vec::with_capacity(8);
-    for ((radius_name, shape_name), (radius, shape)) in corner_names.into_iter().zip(expanded) {
-        declarations.push((radius_name, radius.clone()));
-        declarations.push((shape_name, shape.clone()));
-    }
+    let declarations = corner_names
+        .into_iter()
+        .zip(expanded)
+        .flat_map(|((radius_name, shape_name), (radius, shape))| {
+            [(radius_name, radius.clone()), (shape_name, shape.clone())]
+        })
+        .collect::<Vec<_>>();
     Some(declarations)
 }
 
@@ -102,12 +104,12 @@ pub(in crate::css) fn expand_gap_rule_shorthand(
     if !matches!(axis_prefix, "column-rule" | "row-rule") {
         return None;
     }
-    parse_gap_rule_shorthand(value, ROOT_FONT_SIZE_PT, Color::BLACK)?;
+    parse_gap_rule_shorthand(value, ROOT_FONT_SIZE_PT, CssColor::BLACK)?;
     Some(vec![(axis_prefix, trim_css_value(value).to_string())])
 }
 
 pub(in crate::css) fn expand_rule_shorthand(value: &str) -> Option<Vec<(&'static str, String)>> {
-    parse_gap_rule_shorthand(value, ROOT_FONT_SIZE_PT, Color::BLACK)?;
+    parse_gap_rule_shorthand(value, ROOT_FONT_SIZE_PT, CssColor::BLACK)?;
     Some(vec![("rule", trim_css_value(value).to_string())])
 }
 
@@ -462,10 +464,7 @@ pub(in crate::css) fn parse_grid_track_list(value: &str, font_size: f32) -> Opti
         .first()
         .is_some_and(|token| token.eq_ignore_ascii_case("subgrid"))
     {
-        let mut line_names = Vec::new();
-        for token in &tokens[1..] {
-            line_names.extend(parse_grid_line_names(token)?);
-        }
+        let line_names = parse_subgrid_line_name_list(&tokens[1..])?;
         return Some(GridTrackList::Subgrid { line_names });
     }
     let (components, trailing_names) = parse_grid_track_list_components(value, font_size)?;
@@ -473,6 +472,68 @@ pub(in crate::css) fn parse_grid_track_list(value: &str, font_size: f32) -> Opti
         components,
         trailing_names,
     })
+}
+
+/// Parse the `<line-name-list>` permitted after `subgrid`.
+///
+/// Name repeats differ from standalone grid repeats: they contain only line
+/// name slots and `auto-fill` resolves against the subgrid's used span.
+/// <https://drafts.csswg.org/css-grid-2/#typedef-line-name-list>
+fn parse_subgrid_line_name_list(tokens: &[&str]) -> Option<SubgridLineNameList> {
+    let mut components = Vec::with_capacity(tokens.len());
+    let mut has_auto_fill = false;
+    for token in tokens {
+        if let Some(names) = parse_subgrid_line_names(token) {
+            components.push(SubgridLineNameComponent::LineNames(names));
+            continue;
+        }
+        let repeat = parse_subgrid_name_repeat(token)?;
+        if matches!(
+            repeat,
+            SubgridLineNameComponent::Repeat {
+                count: SubgridLineNameRepeatCount::AutoFill,
+                ..
+            }
+        ) {
+            if has_auto_fill {
+                return None;
+            }
+            has_auto_fill = true;
+        }
+        components.push(repeat);
+    }
+    Some(SubgridLineNameList { components })
+}
+
+fn parse_subgrid_name_repeat(token: &str) -> Option<SubgridLineNameComponent> {
+    let inner = grid_function_body(trim_css_value(token), "repeat")?;
+    let (count, slots) = split_top_level_once(inner, ',')?;
+    let count = match trim_css_value(count).to_ascii_lowercase().as_str() {
+        "auto-fill" => SubgridLineNameRepeatCount::AutoFill,
+        value => SubgridLineNameRepeatCount::Number(
+            value.parse::<u16>().ok().filter(|count| *count > 0)?,
+        ),
+    };
+    let line_names = split_css_component_values(slots)
+        .into_iter()
+        .map(parse_subgrid_line_names)
+        .collect::<Option<Vec<_>>>()?;
+    (!line_names.is_empty()).then_some(SubgridLineNameComponent::Repeat { count, line_names })
+}
+
+/// Subgrid line-name lists preserve empty `[]` slots, which are significant:
+/// they advance the local line assignment without contributing a name.
+fn parse_subgrid_line_names(token: &str) -> Option<Vec<String>> {
+    let token = trim_css_value(token);
+    let inner = token.strip_prefix('[')?.strip_suffix(']')?;
+    let mut input = cssparser::ParserInput::new(inner);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let mut names = Vec::new();
+    while !parser.is_exhausted() {
+        let name = parser.expect_ident_cloned().ok()?.to_string();
+        names.push(parse_grid_custom_ident_value(name)?);
+    }
+    Some(names)
 }
 
 pub(in crate::css) fn expand_grid_template_shorthand(
@@ -935,18 +996,18 @@ pub(in crate::css) fn parse_grid_template_areas(value: &str) -> Option<GridTempl
     if value.eq_ignore_ascii_case("none") {
         return Some(GridTemplateAreas::None);
     }
-    let mut rows = Vec::new();
-    for token in split_css_component_values(value) {
-        let (row, tail) = parse_css_string_token(trim_css_value(token))?;
-        if !tail.trim().is_empty() {
-            return None;
-        }
-        let cells = parse_grid_template_area_row(&row)?;
-        if cells.is_empty() {
-            return None;
-        }
-        rows.push(GridTemplateAreaRow { cells });
-    }
+    let rows = split_css_component_values(value)
+        .into_iter()
+        .map(|token| {
+            let (row, tail) = parse_css_string_token(trim_css_value(token))?;
+            if !tail.trim().is_empty() {
+                None
+            } else {
+                let cells = parse_grid_template_area_row(&row)?;
+                (!cells.is_empty()).then_some(GridTemplateAreaRow { cells })
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
     let width = rows.first()?.cells.len();
     (rows.iter().all(|row| row.cells.len() == width) && grid_template_areas_are_rectangular(&rows))
         .then_some(GridTemplateAreas::Areas(rows))

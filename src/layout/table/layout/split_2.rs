@@ -28,6 +28,10 @@ impl TableHeightPlan {
     pub(in crate::layout::table) fn row_occupancy(&self) -> Vec<bool> {
         self.rows.iter().map(|row| !row.collapsed).collect()
     }
+
+    pub(in crate::layout::table) fn source_row_heights(&self) -> Vec<f32> {
+        self.rows.iter().map(|row| row.source_height).collect()
+    }
 }
 
 pub(in crate::layout::table) fn table_content_height_from_plan(

@@ -27,6 +27,7 @@ impl<'a> LayoutBuilder<'a> {
             && !style.display.is_none()
             && !style.display.is_inline_level()
             && !matches!(style.position, Position::Absolute | Position::Fixed)
+            && self.current_page_has_content()
             && !self.cursor_is_at_page_top()
     }
 
@@ -74,17 +75,14 @@ impl<'a> LayoutBuilder<'a> {
         else {
             return false;
         };
-        let current_fragmentainer = Fragmentainer::from_cursor_bounds(
-            self.page_area_height(),
-            self.cursor_y,
-            self.page_bottom(),
-        );
+        let current_fragmentainer =
+            self.fragmentainer_from_page_cursor(PageTopBlockPosition::new(self.cursor_y));
         let should_break = FragmentPrebreakDecision::choose(FragmentPrebreakInput {
             can_advance: true,
             current_fragmentainer,
-            required_block_size: estimated_height,
+            required_block_size: layout_pt(estimated_height),
             empty_fragmentainer: current_fragmentainer,
-            empty_fit_block_size: estimated_height,
+            empty_fit_block_size: layout_pt(estimated_height),
         })
         .should_break;
         if should_break {
@@ -92,7 +90,7 @@ impl<'a> LayoutBuilder<'a> {
                 "moving break-inside: avoid <{}> to next page: estimated height {:.2}, remaining {:.2}",
                 element.tag,
                 estimated_height,
-                current_fragmentainer.available_block_size()
+                current_fragmentainer.available_block_size().points()
             );
         }
         should_break
@@ -127,8 +125,6 @@ impl<'a> LayoutBuilder<'a> {
         if self.pages.len() <= pages_before {
             return;
         }
-        let split_layout = self.snapshot();
-        let split_page_count = split_layout.pages.len();
         let available_width =
             (self.content_right - self.content_left - style.margin.left - style.margin.right)
                 .max(style.font_size);
@@ -136,16 +132,25 @@ impl<'a> LayoutBuilder<'a> {
             .estimate_element_height(element, style, stylesheets, available_width, child_boxes)
             .is_some_and(|height| {
                 let inner_height = (height - style.margin.top - style.margin.bottom).max(0.0);
-                Fragmentainer::from_cursor_bounds(
-                    self.page_area_height(),
-                    self.cursor_y,
-                    self.page_bottom(),
-                )
-                .block_size_fits_empty(inner_height)
+                // The speculative pass may have ended partway through a
+                // destination page. Test the retry against that page's
+                // actual fragmentainer start, not the post-fragmentation
+                // cursor, so an otherwise keepable nested box does not lose
+                // its avoid constraint.
+                self.fragmentainer_from_page_cursor(PageTopBlockPosition::new(self.page_top()))
+                    .block_size_fits_empty(layout_pt(inner_height))
             });
 
         self.restore(snapshot);
+        let continuation = self.block_page_break_continuation_context();
         self.push_page_if_nonempty();
+        if !self.current_page_has_content()
+            && self.active_fragmentainer_kind() == FragmentainerKind::Page
+        {
+            let page_number = self.pages.len() + 1;
+            let context = self.resolved_page_context(page_number, false);
+            self.replay_fragment_continuation_on_page(&continuation, context);
+        }
         let mut retry_style = style.clone();
         retry_style.break_inside_avoid = false;
         retry_style.break_inside_avoid_column = false;
@@ -168,10 +173,11 @@ impl<'a> LayoutBuilder<'a> {
         if avoid_box_fits_empty_page {
             self.avoid_inside_retry_depth -= 1;
         }
-        let retry_uses_larger_destination = self.current_page_context.area_height()
-            > split_layout.current_page_context.area_height() + 0.01;
-        if self.pages.len() > split_page_count && !retry_uses_larger_destination {
-            self.restore(split_layout);
-        }
+        // Retain the retry even when it spans more fragmentainers. A higher
+        // ancestor's `break-inside: avoid` may move before its first
+        // descendant while a nested avoid group moves again at the next
+        // class-A opportunity; restoring the shorter split layout would
+        // discard both avoidance constraints merely to save a page.
+        // <https://www.w3.org/TR/css-break-3/#breaking-rules>
     }
 }

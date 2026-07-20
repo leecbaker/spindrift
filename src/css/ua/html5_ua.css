@@ -36,7 +36,9 @@ td, th, td[hidden], th[hidden] { display: table-cell }
 
 /* Margins and padding */
 
-blockquote, dir, dl, figure, listing, menu, ol, p, plaintext, pre, ul, xmp { margin-top: 1em; margin-bottom: 1em }
+/* These are block-flow margins: use logical properties so their physical
+   sides follow an element's writing mode. */
+blockquote, dir, dl, figure, listing, menu, ol, p, plaintext, pre, ul, xmp { margin-block: 1em }
 :is(dir, dl, menu, ol, ul) :is(dir, dl, menu, ol, ul) { margin-top: 0; margin-bottom: 0 }
 
 body { margin: 8px }
@@ -103,7 +105,10 @@ sub, sup { line-height: normal }
 :link { color: blue }
 mark { background: yellow; color: black }
 
-table, td, th { border-color: gray }
+/* The initial border color is `currentColor`; state it here so this scalar
+   computed-style representation resolves it after the element's final color
+   cascade, rather than freezing the initial black value. */
+table, td, th { border-color: currentColor }
 thead, tbody, tfoot, tr { border-color: inherit }
 table:is([rules], [frame]):is([frame=above i], [frame=below i], [frame=border i], [frame=box i], [frame=hsides i], [frame=lhs i], [frame=rhs i], [frame=void i], [frame=vsides i], [rules=all i], [rules=cols i], [rules=groups i], [rules=none i], [rules=rows i]), table[rules]:is([rules=all i], [rules=cols i], [rules=groups i], [rules=none i], [rules=rows i]) > tr > :is(td, th), table[rules]:is([rules=all i], [rules=cols i], [rules=groups i], [rules=none i], [rules=rows i]) > :is(thead, tbody, tfoot) > tr > :is(td, th) { border-color: black }
 table[rules=groups i] { border-style: hidden; border-collapse: collapse }
@@ -124,7 +129,7 @@ table[rules=groups i] > :is(thead, tbody, tfoot) { border-top-width: 1px; border
 [lang]:lang("*-Latn", "*-Cyrl") { initial-letter-align: alphabetic }
 [lang]:lang("*-Hani", "*-Hant", "*-Hans") { initial-letter-align: ideographic }
 blink { text-decoration-line: blink }
-:link, :visited, ins, u { text-decoration: underline }
+:link, ins, u { text-decoration: underline }
 abbr[title], acronym[title] { text-decoration: dotted underline }
 del, s, strike { text-decoration: line-through }
 rt { text-emphasis: none }
@@ -163,6 +168,11 @@ table, input, select, option, optgroup, button, textarea, keygen { text-indent: 
 center { text-align: center }
 iframe:not([seamless]) { border: 2px inset }
 img, svg { overflow: clip }
+
+/* CSS Color Adjustment recommends this UA behavior so inline SVG preserves
+   illustration colors while inheriting an adjusted outer text color. */
+svg { forced-color-adjust: preserve-parent-color }
+foreignObject { forced-color-adjust: auto }
 video { object-fit: contain }
 table { box-sizing: border-box }
 
@@ -189,7 +199,7 @@ ol, ul { break-before: avoid }
 
 /* Form fields */
 
-button, input, select, textarea { border: 1px solid black; font-size: .85em; padding: .2em; white-space: pre }
+button, input, select, textarea { border: 1px solid black; box-sizing: border-box; font-size: .85em; padding: .2em; white-space: pre }
 input, select, textarea { height: 1.2em; width: 20em }
 input:is([type=button i], [type=reset i], [type=submit i]), button { background: lightgrey; border-radius: .25em; text-align: center }
 input:is([type=button i], [type=reset i], [type=submit i])[value], button[value] { max-width: 100%; width: auto }

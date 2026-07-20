@@ -53,31 +53,43 @@ pub(super) fn image_pattern_source(pattern: &RenderedImagePattern) -> ImageResou
 pub(super) fn materialize_image_resource(
     image_store: &crate::image_store::DocumentImageStore,
     source: &ImageResourceSource,
+    color_mode: super::colors::PdfColorMode,
 ) -> ImageResource {
     match source {
         ImageResourceSource::Stored {
             image_id,
             source_rect,
             interpolate,
-        } => image_store
-            .with_rasterized(*image_id, |raster| {
-                let data = crop_image_resource_data(
-                    raster.metadata.pixel_width,
-                    raster.metadata.pixel_height,
-                    raster.rgb,
-                    raster.alpha,
-                    *source_rect,
-                );
-                ImageResource {
-                    pixel_width: data.pixel_width,
-                    pixel_height: data.pixel_height,
-                    interpolate: *interpolate,
-                    color_space: raster.color_space,
-                    rgb: data.rgb,
-                    alpha: data.alpha,
-                }
-            })
-            .unwrap_or_else(|| transparent_fallback(*interpolate)),
+        } => direct_jpeg_resource(
+            image_store,
+            *image_id,
+            *source_rect,
+            *interpolate,
+            color_mode,
+        )
+        .unwrap_or_else(|| {
+            image_store
+                .with_rasterized(*image_id, |raster| {
+                    let data = crop_image_resource_data(
+                        raster.metadata.pixel_width,
+                        raster.metadata.pixel_height,
+                        raster.rgb,
+                        raster.alpha,
+                        *source_rect,
+                    );
+                    ImageResource {
+                        pixel_width: data.pixel_width,
+                        pixel_height: data.pixel_height,
+                        interpolate: *interpolate,
+                        color_space: raster.color_space,
+                        payload: ImagePayload::Samples {
+                            rgb: data.rgb,
+                            alpha: data.alpha,
+                        },
+                    }
+                })
+                .unwrap_or_else(|| transparent_fallback(*interpolate))
+        }),
         ImageResourceSource::Inline {
             pixel_width,
             pixel_height,
@@ -90,10 +102,132 @@ pub(super) fn materialize_image_resource(
             pixel_height: *pixel_height,
             interpolate: *interpolate,
             color_space: color_space.clone(),
-            rgb: rgb.to_vec(),
-            alpha: alpha.as_deref().map(ToOwned::to_owned),
+            payload: ImagePayload::Samples {
+                rgb: rgb.to_vec(),
+                alpha: alpha.as_deref().map(ToOwned::to_owned),
+            },
         },
     }
+}
+
+/// Resolve one image source into its final PDF paint representation.
+///
+/// The solid-fill classification happens only after source cropping and the
+/// selected PDF output conversion. Consequently a promoted fill selects the
+/// same calibrated components an image XObject would have carried.
+/// ISO 32000-2:2020, 8.6.5 and 8.9.5.
+pub(super) fn prepare_image_resource(
+    image_store: &crate::image_store::DocumentImageStore,
+    source: &ImageResourceSource,
+    color_mode: super::colors::PdfColorMode,
+    solid_fill_eligible: bool,
+) -> PreparedImageResource {
+    let mut image = materialize_image_resource(image_store, source, color_mode);
+    convert_image_resource_to_output_color(&mut image, color_mode);
+    if super::PROMOTE_SOLID_RASTER_IMAGES_TO_VECTOR_FILLS
+        && solid_fill_eligible
+        && let Some(fill) = solid_fill_from_image_resource(&image)
+    {
+        PreparedImageResource::SolidFill(fill)
+    } else {
+        PreparedImageResource::Raster(image)
+    }
+}
+
+/// Convert decoded image samples to the output image color space selected by
+/// the document profile. JPEG passthrough intentionally retains its source
+/// profile and therefore cannot become a direct graphics fill.
+fn convert_image_resource_to_output_color(
+    image: &mut ImageResource,
+    color_mode: super::colors::PdfColorMode,
+) {
+    let target_space = match (color_mode, &image.color_space) {
+        (super::colors::PdfColorMode::SrgbOutputIntent, _) => Some(crate::css::CssColorSpace::Srgb),
+        (
+            super::colors::PdfColorMode::PreserveCssSpace,
+            crate::color::RasterColorSpace::BuiltIn(crate::css::CssColorSpace::XyzD50),
+        ) => Some(crate::css::CssColorSpace::DisplayP3),
+        (super::colors::PdfColorMode::PreserveCssSpace, _) => None,
+    };
+    if let (Some(target_space), ImagePayload::Samples { rgb, .. }) =
+        (target_space, &mut image.payload)
+    {
+        let converted = match &image.color_space {
+            crate::color::RasterColorSpace::BuiltIn(space) => {
+                crate::color::convert_samples(rgb, *space, target_space)
+            }
+            crate::color::RasterColorSpace::EmbeddedRgb(profile) => {
+                crate::color::convert_embedded_rgb_samples(rgb, profile, target_space)
+            }
+        };
+        if let Some(converted) = converted {
+            *rgb = converted;
+            image.color_space = crate::color::RasterColorSpace::BuiltIn(target_space);
+        }
+    }
+}
+
+/// Return the exact direct-fill representation for an opaque uniform decoded
+/// image. Embedded image profiles are deliberately excluded because page
+/// graphics resources only expose Quire's built-in calibrated CSS spaces.
+fn solid_fill_from_image_resource(image: &ImageResource) -> Option<SolidImageFill> {
+    let ImageResource {
+        pixel_width,
+        pixel_height,
+        color_space: crate::color::RasterColorSpace::BuiltIn(color_space),
+        payload: ImagePayload::Samples { rgb, alpha },
+        ..
+    } = image
+    else {
+        return None;
+    };
+    let pixel_count = (*pixel_width as usize).checked_mul(*pixel_height as usize)?;
+    if pixel_count == 0 || rgb.len() != pixel_count.checked_mul(3)? {
+        return None;
+    }
+    if alpha
+        .as_ref()
+        .is_some_and(|alpha| alpha.len() != pixel_count || alpha.iter().any(|alpha| *alpha != 255))
+    {
+        return None;
+    }
+    let first = [rgb[0], rgb[1], rgb[2]];
+    rgb.chunks_exact(3)
+        .all(|sample| sample == first)
+        .then_some(SolidImageFill {
+            color_space: *color_space,
+            components: first.map(|sample| sample as f32 / 255.0),
+        })
+}
+
+/// Use a JPEG's original DCT stream only when no source-pixel operation is
+/// required. PDF/A output uses a tagged sRGB output condition, so a JPEG with
+/// another embedded RGB profile must retain the decoded conversion path.
+fn direct_jpeg_resource(
+    image_store: &crate::image_store::DocumentImageStore,
+    image_id: crate::image_store::ImageId,
+    source_rect: RenderedImageSourceRect,
+    interpolate: bool,
+    color_mode: super::colors::PdfColorMode,
+) -> Option<ImageResource> {
+    let jpeg = image_store.direct_jpeg(image_id)?;
+    let full_source = source_rect.x == 0
+        && source_rect.y == 0
+        && source_rect.width == jpeg.metadata.pixel_width
+        && source_rect.height == jpeg.metadata.pixel_height;
+    if !full_source
+        || (color_mode == super::colors::PdfColorMode::SrgbOutputIntent
+            && jpeg.color_space != crate::color::RasterColorSpace::SRGB)
+    {
+        return None;
+    }
+    Some(ImageResource {
+        pixel_width: jpeg.metadata.pixel_width,
+        pixel_height: jpeg.metadata.pixel_height,
+        interpolate,
+        color_space: jpeg.color_space,
+        payload: ImagePayload::Jpeg(jpeg.bytes),
+    })
 }
 
 #[cfg(test)]
@@ -202,8 +336,10 @@ fn transparent_fallback(interpolate: bool) -> ImageResource {
         pixel_height: 1,
         interpolate,
         color_space: crate::color::RasterColorSpace::SRGB,
-        rgb: vec![0, 0, 0],
-        alpha: Some(vec![0]),
+        payload: ImagePayload::Samples {
+            rgb: vec![0, 0, 0],
+            alpha: Some(vec![0]),
+        },
     }
 }
 
@@ -219,7 +355,7 @@ pub(super) struct ImageResourceData {
 /// PDF 1.4 transparency uses ExtGState dictionaries with stroking (`CA`) and
 /// nonstroking (`ca`) alpha constants:
 /// ISO 32000-1:2008, 11.7.4.3 "Constant Shape and Opacity".
-pub(super) fn paint_alpha_resource_name(color: Color) -> Option<String> {
+pub(super) fn paint_alpha_resource_name(color: CssColor) -> Option<String> {
     alpha_key(color).map(|key| format!("GSalpha{key:03}"))
 }
 
@@ -320,14 +456,14 @@ pub(super) fn page_ext_gstate_resources(page: &Page) -> Vec<ExtGStateResource> {
     entries
 }
 
-fn collect_alpha_key(alpha_keys: &mut BTreeMap<u16, ()>, color: Color) {
+fn collect_alpha_key(alpha_keys: &mut BTreeMap<u16, ()>, color: CssColor) {
     if let Some(key) = alpha_key(color) {
         alpha_keys.insert(key, ());
     }
 }
 
 fn collect_opacity_key(alpha_keys: &mut BTreeMap<u16, ()>, opacity: f32) {
-    collect_alpha_key(alpha_keys, Color::TRANSPARENT.with_alpha(opacity));
+    collect_alpha_key(alpha_keys, CssColor::TRANSPARENT.with_alpha(opacity));
 }
 
 fn collect_paint_tree_ext_gstates(
@@ -380,9 +516,9 @@ fn collect_effect_scope_ext_gstates(
     }
 }
 
-fn alpha_key(color: Color) -> Option<u16> {
+fn alpha_key(color: CssColor) -> Option<u16> {
     if color.is_visible() && !color.is_opaque() {
-        Some((color.a * 1000.0).round().clamp(1.0, 999.0) as u16)
+        Some((color.alpha() * 1000.0).round().clamp(1.0, 999.0) as u16)
     } else {
         None
     }
@@ -391,7 +527,21 @@ fn alpha_key(color: Color) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::ImageEncoder;
     use std::rc::Rc;
+
+    fn opaque_rgb_jpeg() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95)
+            .write_image(
+                &[240, 32, 16, 16, 192, 64, 32, 64, 240, 224, 224, 32],
+                2,
+                2,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        bytes
+    }
 
     fn test_image(
         pixel_width: u32,
@@ -459,6 +609,129 @@ mod tests {
         assert_eq!(data.pixel_height, 2);
         assert_eq!(data.rgb.as_slice(), &[4, 5, 6, 10, 11, 12]);
         assert_eq!(data.alpha.as_deref(), Some([20, 40].as_slice()));
+    }
+
+    #[test]
+    fn cropped_opaque_uniform_samples_promote_to_their_final_fill_color() {
+        let image = test_image(
+            2,
+            2,
+            Rc::from(vec![0, 128, 0, 0, 128, 0, 0, 128, 0, 0, 128, 0].into_boxed_slice()),
+            Some(Rc::from(vec![255, 255, 255, 255].into_boxed_slice())),
+            Some(RenderedImageSourceRect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 2,
+            }),
+        );
+        let prepared = prepare_image_resource(
+            &crate::image_store::DocumentImageStore::default(),
+            &image_source(&image),
+            super::super::colors::PdfColorMode::SrgbOutputIntent,
+            true,
+        );
+
+        assert_eq!(
+            prepared,
+            PreparedImageResource::SolidFill(SolidImageFill {
+                color_space: crate::css::CssColorSpace::Srgb,
+                components: [0.0, 128.0 / 255.0, 0.0],
+            })
+        );
+    }
+
+    #[test]
+    fn non_uniform_or_transparent_samples_remain_raster_images() {
+        let non_uniform = ImageResource {
+            pixel_width: 2,
+            pixel_height: 1,
+            interpolate: false,
+            color_space: crate::color::RasterColorSpace::SRGB,
+            payload: ImagePayload::Samples {
+                rgb: vec![0, 128, 0, 0, 129, 0],
+                alpha: None,
+            },
+        };
+        let transparent = ImageResource {
+            pixel_width: 1,
+            pixel_height: 1,
+            interpolate: false,
+            color_space: crate::color::RasterColorSpace::SRGB,
+            payload: ImagePayload::Samples {
+                rgb: vec![0, 128, 0],
+                alpha: Some(vec![254]),
+            },
+        };
+
+        assert_eq!(solid_fill_from_image_resource(&non_uniform), None);
+        assert_eq!(solid_fill_from_image_resource(&transparent), None);
+    }
+
+    #[test]
+    fn cropped_jpeg_source_uses_decoded_samples() {
+        let mut store = crate::image_store::DocumentImageStore::default();
+        let (image_id, _) = store
+            .resolve_data_url_with_orientation(
+                "data:image/jpeg;base64,fixture",
+                Rc::from(opaque_rgb_jpeg().into_boxed_slice()),
+                false,
+            )
+            .unwrap();
+        let source = ImageResourceSource::Stored {
+            image_id,
+            source_rect: RenderedImageSourceRect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 2,
+            },
+            interpolate: false,
+        };
+
+        let image = materialize_image_resource(
+            &store,
+            &source,
+            super::super::colors::PdfColorMode::SrgbOutputIntent,
+        );
+
+        assert_eq!((image.pixel_width, image.pixel_height), (1, 2));
+        assert!(matches!(image.payload, ImagePayload::Samples { .. }));
+    }
+
+    #[test]
+    fn direct_jpeg_sources_remain_raster_images() {
+        let mut store = crate::image_store::DocumentImageStore::default();
+        let (image_id, _) = store
+            .resolve_data_url_with_orientation(
+                "data:image/jpeg;base64,fixture",
+                Rc::from(opaque_rgb_jpeg().into_boxed_slice()),
+                false,
+            )
+            .unwrap();
+        let source = ImageResourceSource::Stored {
+            image_id,
+            source_rect: RenderedImageSourceRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            interpolate: false,
+        };
+
+        assert!(matches!(
+            prepare_image_resource(
+                &store,
+                &source,
+                super::super::colors::PdfColorMode::PreserveCssSpace,
+                true,
+            ),
+            PreparedImageResource::Raster(ImageResource {
+                payload: ImagePayload::Jpeg(_),
+                ..
+            })
+        ));
     }
 
     #[test]

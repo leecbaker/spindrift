@@ -43,12 +43,7 @@ impl FontSystem {
             return Some(font_id);
         }
 
-        self.resolve_system_fallback_for_character(
-            character,
-            style.font_weight,
-            style.font_style,
-            style.font_width,
-        )
+        self.resolve_system_fallback_for_style_character(style, character)
     }
 
     pub(super) fn resolve_generic_family(
@@ -112,7 +107,20 @@ impl FontSystem {
                 })
                 .collect::<Vec<_>>()
                 .join(", "),
-            FontFamily::Names(_) => parley_font_family_source(family),
+            FontFamily::Names(names) => {
+                let public_names = names
+                    .iter()
+                    .filter(|name| !is_private_standard_ui_family_name(name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if public_names.is_empty() {
+                    // A missing named family falls through to the UA's sans-serif
+                    // default, rather than exposing a private platform face.
+                    parley_font_family_source(&FontFamily::SansSerif)
+                } else {
+                    parley_font_family_source(&FontFamily::Names(public_names))
+                }
+            }
             _ => self
                 .resolve_generic_family(family, weight, style, width)
                 .and_then(|font_id| self.document_fonts.get(font_id))
@@ -141,9 +149,12 @@ impl FontSystem {
         if let Some(family) = standard_ui_family_alias(name) {
             return self.resolve_generic_family(&family, weight, style, width);
         }
+        if is_private_standard_ui_family_name(name) {
+            return None;
+        }
 
         if let Some(id) = self.load_document_font_for_families(
-            &[FontiqueQueryFamily::Named(name)],
+            &[FontiqueQueryFamily::Named(fontique_family_name(name))],
             weight,
             style,
             width,
@@ -178,7 +189,7 @@ impl FontSystem {
         }
 
         let request = FontRequest::single_name("<platform fallback>", weight, style, width);
-        for font in self.query_platform_fallback_fonts(character, weight, style, width) {
+        for font in self.query_platform_fallback_fonts(character, weight, style, width, None) {
             if !DocumentFontRegistry::font_query_has_character(&font, character) {
                 continue;
             }
@@ -196,6 +207,37 @@ impl FontSystem {
         }
 
         self.fallback_cache.insert(cache_key, None);
+        None
+    }
+
+    fn resolve_system_fallback_for_style_character(
+        &mut self,
+        style: &ComputedStyle,
+        character: char,
+    ) -> Option<usize> {
+        let locale = style
+            .language
+            .as_deref()
+            .and_then(|language| language.parse::<fontique::Language>().ok());
+        let request = FontRequest::single_name(
+            "<platform fallback>",
+            style.font_weight,
+            style.font_style,
+            style.font_width,
+        );
+        for font in self.query_platform_fallback_fonts(
+            character,
+            style.font_weight,
+            style.font_style,
+            style.font_width,
+            locale.as_ref(),
+        ) {
+            if DocumentFontRegistry::font_query_has_character(&font, character)
+                && let Some(font_id) = self.document_font_from_query_font(font, None, &request)
+            {
+                return Some(font_id);
+            }
+        }
         None
     }
 }

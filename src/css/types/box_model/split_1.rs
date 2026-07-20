@@ -73,18 +73,18 @@ impl BackgroundRepeat {
 /// <https://www.w3.org/TR/css-backgrounds-3/#border-color>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct BorderColors {
-    pub top: Color,
-    pub right: Color,
-    pub bottom: Color,
-    pub left: Color,
+    pub top: CssColor,
+    pub right: CssColor,
+    pub bottom: CssColor,
+    pub left: CssColor,
 }
 
 impl BorderColors {
     pub const BLACK: Self = Self {
-        top: Color::BLACK,
-        right: Color::BLACK,
-        bottom: Color::BLACK,
-        left: Color::BLACK,
+        top: CssColor::BLACK,
+        right: CssColor::BLACK,
+        bottom: CssColor::BLACK,
+        left: CssColor::BLACK,
     };
 }
 
@@ -918,6 +918,34 @@ pub(crate) struct TextAutospace {
     pub(crate) ideograph_alpha: bool,
     pub(crate) ideograph_numeric: bool,
     pub(crate) punctuation: bool,
+}
+
+/// Computed CSS `text-spacing-trim`.
+///
+/// The property selects the CJK punctuation-spacing policy used after a line
+/// candidate has established its physical inline edges:
+/// <https://drafts.csswg.org/css-text-4/#text-spacing-trim-property>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextSpacingTrim {
+    SpaceAll,
+    Normal,
+    SpaceFirst,
+    TrimStart,
+    TrimBoth,
+    TrimAll,
+    Auto,
+}
+
+impl TextSpacingTrim {
+    /// Quire's deterministic user-agent policy for the spec-defined `auto`
+    /// value. `normal` is conservative and preserves the initial-value
+    /// behavior while avoiding platform-dependent PDF output.
+    pub(crate) const fn resolved(self) -> Self {
+        match self {
+            Self::Auto => Self::Normal,
+            value => value,
+        }
+    }
 }
 
 impl TextAutospace {

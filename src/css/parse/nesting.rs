@@ -1,4 +1,5 @@
 use super::*;
+use crate::css::FontPaletteDefinition;
 
 pub(super) fn expand_nested_rules(source: &str) -> String {
     let mut output = String::with_capacity(source.len());
@@ -183,39 +184,7 @@ pub(super) fn split_selector_list(selectors: &str) -> Vec<&str> {
 }
 
 pub(super) fn find_next_top_level_open_brace(source: &str, start: usize) -> Option<usize> {
-    let bytes = source.as_bytes();
-    let mut index = start;
-    let mut string_quote = None;
-    let mut paren_depth = 0usize;
-    while index < bytes.len() {
-        if let Some(quote) = string_quote {
-            if bytes[index] == b'\\' {
-                index += 2;
-                continue;
-            }
-            if bytes[index] == quote {
-                string_quote = None;
-            }
-            index += 1;
-            continue;
-        }
-        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
-            if let Some(end) = source[index + 2..].find("*/") {
-                index += end + 4;
-                continue;
-            }
-            return None;
-        }
-        match bytes[index] {
-            b'\'' | b'"' => string_quote = Some(bytes[index]),
-            b'(' => paren_depth += 1,
-            b')' => paren_depth = paren_depth.saturating_sub(1),
-            b'{' if paren_depth == 0 => return Some(index),
-            _ => {}
-        }
-        index += 1;
-    }
-    None
+    crate::css::component_values::find_next_top_level_open_brace(source, start)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -228,9 +197,15 @@ pub(super) fn flatten_rule(
     after_marker_rules: &mut Vec<StyleRule>,
     before_rules: &mut Vec<StyleRule>,
     after_rules: &mut Vec<StyleRule>,
+    footnote_call_rules: &mut Vec<StyleRule>,
+    footnote_marker_rules: &mut Vec<StyleRule>,
     first_line_rules: &mut Vec<StyleRule>,
     first_letter_rules: &mut Vec<StyleRule>,
     keyframes: &mut Vec<KeyframesRule>,
+    font_faces: &mut Vec<CssFontFace>,
+    counter_styles: &mut Vec<CounterStyleRule>,
+    font_feature_values: &mut Vec<FontFeatureValuesRule>,
+    font_palette_values: &mut Vec<(String, FontPaletteDefinition)>,
 ) {
     match rule {
         ParsedCssRule::Style(rule) => rules.push(rule),
@@ -240,9 +215,17 @@ pub(super) fn flatten_rule(
         ParsedCssRule::AfterMarker(rule) => after_marker_rules.push(rule),
         ParsedCssRule::Before(rule) => before_rules.push(rule),
         ParsedCssRule::After(rule) => after_rules.push(rule),
+        ParsedCssRule::FootnoteCall(rule) => footnote_call_rules.push(rule),
+        ParsedCssRule::FootnoteMarker(rule) => footnote_marker_rules.push(rule),
         ParsedCssRule::FirstLine(rule) => first_line_rules.push(rule),
         ParsedCssRule::FirstLetter(rule) => first_letter_rules.push(rule),
         ParsedCssRule::Keyframes(rule) => keyframes.push(rule),
+        ParsedCssRule::FontFace(rule) => font_faces.push(rule),
+        ParsedCssRule::CounterStyle(rule) => counter_styles.push(rule),
+        ParsedCssRule::FontFeatureValues(rule) => font_feature_values.push(rule),
+        ParsedCssRule::FontPaletteValues(name, definition) => {
+            font_palette_values.push((name, definition));
+        }
         ParsedCssRule::Nested(nested) => {
             for rule in nested {
                 flatten_rule(
@@ -254,9 +237,15 @@ pub(super) fn flatten_rule(
                     after_marker_rules,
                     before_rules,
                     after_rules,
+                    footnote_call_rules,
+                    footnote_marker_rules,
                     first_line_rules,
                     first_letter_rules,
                     keyframes,
+                    font_faces,
+                    counter_styles,
+                    font_feature_values,
+                    font_palette_values,
                 );
             }
         }

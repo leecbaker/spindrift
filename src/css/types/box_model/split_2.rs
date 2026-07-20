@@ -359,6 +359,19 @@ pub(crate) enum TextWrapStyle {
     Stable,
 }
 
+/// Controls the preference for soft line breaks within an inline box.
+///
+/// CSS Text Level 4 makes this a non-inherited property of inline boxes. An
+/// `avoid` box retains its ordinary break opportunities, but line selection
+/// must prefer an equally fitting opportunity outside that box:
+/// <https://drafts.csswg.org/css-text-4/#wrap-inside-property>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum WrapInside {
+    #[default]
+    Auto,
+    Avoid,
+}
+
 impl WhiteSpace {
     pub(crate) fn collapses_spaces(self) -> bool {
         matches!(self, Self::Normal | Self::NoWrap | Self::PreLine)
@@ -529,10 +542,24 @@ pub(crate) enum HyphenateCharacter {
 }
 
 impl HyphenateCharacter {
-    /// Quire's current UA `auto` glyph, pending language-specific defaults.
-    pub(crate) fn used_text(&self) -> &str {
+    /// Resolve the language-sensitive used string for `hyphenate-character`.
+    ///
+    /// CSS Text leaves the `auto` glyph to the UA, including its choice for a
+    /// particular writing system.  Keep that choice at the line-edge
+    /// materialization boundary: only a selected discretionary break inserts
+    /// this text, whereas an unselected soft hyphen has no used glyph.
+    /// <https://drafts.csswg.org/css-text-4/#hyphenate-character>
+    pub(crate) fn used_text_for_language(&self, language: Option<&str>) -> &str {
         match self {
-            Self::Auto => "-",
+            Self::Auto => match language.map(str::to_ascii_lowercase).as_deref() {
+                // Uyghur uses kashida as its conventional discretionary
+                // marker. The graph materializer supplies the ZWJ context at
+                // a joining-script source boundary.
+                Some(language) if language == "ug" || language.starts_with("ug-") => "\u{0640}",
+                // Canadian Aboriginal Syllabics uses U+1400 HYPHEN.
+                Some(language) if language == "cr" || language.starts_with("cr-") => "\u{1400}",
+                _ => "-",
+            },
             Self::String(value) => value,
         }
     }

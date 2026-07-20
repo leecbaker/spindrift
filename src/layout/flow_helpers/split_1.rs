@@ -272,22 +272,24 @@ pub(in crate::layout) fn has_table_or_replaced_descendant_box(
     child_boxes.iter().any(|child| match child {
         box_tree::FormattingBox::Table(_) | box_tree::FormattingBox::Replaced(_) => true,
         box_tree::FormattingBox::AtomicInline(box_) => {
-            is_table_or_replaced_element(box_.element)
-                || has_table_or_replaced_descendant_box(&box_.children)
+            is_table_or_replaced_element(box_.core.element)
+                || has_table_or_replaced_descendant_box(&box_.core.children)
         }
         box_tree::FormattingBox::Block(box_) => {
-            has_table_or_replaced_descendant_box(&box_.children)
+            has_table_or_replaced_descendant_box(&box_.core.children)
         }
         box_tree::FormattingBox::Inline(box_) => {
-            has_table_or_replaced_descendant_box(&box_.children)
+            has_table_or_replaced_descendant_box(&box_.core.children)
         }
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-            has_table_or_replaced_descendant_box(&box_.children)
+            has_table_or_replaced_descendant_box(&box_.core.children)
         }
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             has_table_or_replaced_descendant_box(&box_.children)
         }
-        box_tree::FormattingBox::Flex(box_) => has_table_or_replaced_descendant_box(&box_.children),
+        box_tree::FormattingBox::Flex(box_) => {
+            has_table_or_replaced_descendant_box(&box_.core.children)
+        }
         box_tree::FormattingBox::Text(_) => false,
     })
 }
@@ -300,7 +302,97 @@ pub(in crate::layout) fn inline_text_from_formatting_boxes(
     text
 }
 
-/// Returns first/last CSS `page` values with whether the value was specified.
+/// The page value associated with one side of a structural class-A boundary.
+///
+/// `Inherited` is deliberately distinct from `Auto`: a box with an omitted
+/// `page` declaration still participates in the boundary, but its used value
+/// has to be resolved from the active lexical page-value scope. An explicit
+/// `page: auto` resolves to the nearest non-auto ancestor while retaining its
+/// structural identity. `Inapplicable` is used for a box that
+/// cannot establish a page boundary at all (for example text before it is
+/// wrapped in its anonymous block).
+///
+/// CSS Paged Media's page-group algorithm uses the used value for the
+/// boundary comparison while preserving this lexical distinction:
+/// <https://www.w3.org/TR/css-page-3/#using-named-pages>.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::layout) enum PageBoundaryValue {
+    Inapplicable,
+    Inherited,
+    Auto,
+    Named(String),
+}
+
+impl PageBoundaryValue {
+    pub(in crate::layout) fn from_style(style: &ComputedStyle) -> Self {
+        if !style.page_name_specified {
+            return Self::Inherited;
+        }
+        style
+            .page_name
+            .clone()
+            .map(Self::Named)
+            .unwrap_or(Self::Auto)
+    }
+
+    /// Whether this child value replaces its parent's structural start/end
+    /// summary. An inherited child has no authored value to propagate.
+    pub(in crate::layout) fn overrides_parent_summary(&self) -> bool {
+        matches!(self, Self::Auto | Self::Named(_))
+    }
+}
+
+/// First and last page-boundary values propagated from one formatting box.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::layout) struct PageBoundaryValues {
+    pub(in crate::layout) start: PageBoundaryValue,
+    pub(in crate::layout) end: PageBoundaryValue,
+}
+
+/// The used page types at the two propagated sides of a formatting box.
+///
+/// Unlike [`PageBoundaryValues`], this record contains no authored-value
+/// placeholders. `auto` has already been resolved against the nearest
+/// non-auto ancestor in the *formatting tree*, before layout starts moving the
+/// page cursor. This is the value class-A break selection compares.
+/// <https://www.w3.org/TR/css-page-3/#using-named-pages>
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::layout) struct ResolvedPageBoundaryValues {
+    pub(in crate::layout) start: Option<String>,
+    pub(in crate::layout) end: Option<String>,
+}
+
+impl ResolvedPageBoundaryValues {
+    fn uniform(page_name: Option<String>) -> Self {
+        Self {
+            start: page_name.clone(),
+            end: page_name,
+        }
+    }
+
+    fn inapplicable() -> Self {
+        Self::uniform(None)
+    }
+}
+
+impl PageBoundaryValues {
+    pub(in crate::layout) fn inapplicable() -> Self {
+        Self {
+            start: PageBoundaryValue::Inapplicable,
+            end: PageBoundaryValue::Inapplicable,
+        }
+    }
+
+    pub(in crate::layout) fn from_style(style: &ComputedStyle) -> Self {
+        let own = PageBoundaryValue::from_style(style);
+        Self {
+            start: own.clone(),
+            end: own,
+        }
+    }
+}
+
+/// Returns first/last CSS `page` boundary values.
 ///
 /// CSS Paged Media's `auto` page value can explicitly end an ancestor named
 /// page group, while an omitted `page` declaration inherits the surrounding
@@ -310,30 +402,26 @@ pub(in crate::layout) fn inline_text_from_formatting_boxes(
 pub(in crate::layout) fn page_value_sources_from_style_and_children(
     style: &ComputedStyle,
     child_boxes: &[box_tree::FormattingBox<'_>],
-) -> ((Option<String>, bool), (Option<String>, bool)) {
-    let own = style.page_name_specified.then(|| style.page_name.clone());
-    let mut start = own
-        .clone()
-        .map(|name| (name, true))
-        .unwrap_or((None, false));
-    let mut end = own.map(|name| (name, true)).unwrap_or((None, false));
+) -> PageBoundaryValues {
+    let PageBoundaryValues { mut start, mut end } = PageBoundaryValues::from_style(style);
     if style.display.is_flex() {
-        return (start, end);
+        return PageBoundaryValues { start, end };
     }
-    // Only child boxes to which `page` applies can propagate start/end page
-    // values. Formatting whitespace can generate a normal-flow anonymous
-    // box, but it does not create a class-A break point and must not mask the
-    // first block-level child's page value.
-    // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+    // Ignore transparent wrappers rooted in boxes to which `page` cannot
+    // apply (such as an absolutely positioned descendant), but retain an
+    // inline atomic box as an inapplicable first/last participant. The latter
+    // makes its parent fall back to its own used value rather than allowing a
+    // later named sibling to select the document's first page.
+    // <https://drafts.csswg.org/css-page-3/#using-named-pages>
     let mut normal_flow_children = child_boxes
         .iter()
         .filter(|child| formatting_box_is_page_value_participant(child));
     let Some(first) = normal_flow_children.next() else {
-        return (start, end);
+        return PageBoundaryValues { start, end };
     };
     let first_sources = formatting_box_page_value_sources(first);
-    if first_sources.0.1 {
-        start = first_sources.0.clone();
+    if first_sources.start.overrides_parent_summary() {
+        start = first_sources.start.clone();
     }
     // A single normal-flow child supplies both boundaries. Compute its paired
     // summary once: recursively querying it separately for start and end
@@ -342,56 +430,252 @@ pub(in crate::layout) fn page_value_sources_from_style_and_children(
         .next_back()
         .map(formatting_box_page_value_sources)
         .unwrap_or(first_sources);
-    if last_sources.1.1 {
-        end = last_sources.1;
+    if last_sources.end.overrides_parent_summary() {
+        end = last_sources.end;
     }
-    (start, end)
+    PageBoundaryValues { start, end }
+}
+
+/// Returns page-value sources for an element's box, retaining leading direct
+/// inline content as the element's first page-group participant.
+///
+/// Formatting-tree normalization stores direct text separately from the
+/// element's block-level child boxes. A later descendant with `page: <name>`
+/// must not make the document root select that named page before direct text
+/// which precedes it in tree order. That text belongs to the initial `auto`
+/// page group and establishes the class-A boundary before the named child.
+/// <https://www.w3.org/TR/css-page-3/#using-named-pages>
+pub(in crate::layout) fn page_value_sources_from_element_style_and_children(
+    element: &Element,
+    style: &ComputedStyle,
+    child_boxes: &[box_tree::FormattingBox<'_>],
+) -> PageBoundaryValues {
+    let mut sources = page_value_sources_from_style_and_children(style, child_boxes);
+    if !style.page_name_specified && element_has_leading_direct_inline_content(element, style) {
+        sources.start = PageBoundaryValue::Inherited;
+    }
+    sources
+}
+
+/// Whether direct inline content precedes the first element child.
+///
+/// Inline element children remain represented in the formatting tree and are
+/// therefore covered by `page_value_sources_from_style_and_children`. This
+/// helper accounts only for direct text and `<br>` nodes, which normalization
+/// otherwise keeps outside that child-box sequence.
+fn element_has_leading_direct_inline_content(element: &Element, style: &ComputedStyle) -> bool {
+    if element_suppresses_direct_text_children(element) {
+        return false;
+    }
+    let mut text = String::new();
+    for child in &element.children {
+        match &child.kind {
+            NodeKind::Text(value) => text.push_str(value),
+            NodeKind::Element(child) if is_line_break_element(child) => text.push(INLINE_BREAK),
+            NodeKind::Element(_) => break,
+        }
+    }
+    !normalized_text_for_style(&text, style).is_empty()
 }
 
 pub(in crate::layout) fn formatting_box_page_value_sources(
     box_: &box_tree::FormattingBox<'_>,
-) -> ((Option<String>, bool), (Option<String>, bool)) {
+) -> PageBoundaryValues {
     match box_ {
-        box_tree::FormattingBox::Block(box_) => {
-            page_value_sources_from_style_and_children(&box_.style, &box_.children)
-        }
+        box_tree::FormattingBox::Block(box_) => page_value_sources_from_element_style_and_children(
+            box_.core.element,
+            &box_.core.style,
+            &box_.core.children,
+        ),
         box_tree::FormattingBox::Inline(box_) => {
-            page_value_sources_from_style_and_children(&box_.style, &box_.children)
+            page_value_sources_from_element_style_and_children(
+                box_.core.element,
+                &box_.core.style,
+                &box_.core.children,
+            )
         }
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-            page_value_sources_from_style_and_children(&box_.style, &box_.children)
+            page_value_sources_from_element_style_and_children(
+                box_.core.element,
+                &box_.core.style,
+                &box_.core.children,
+            )
         }
+        // `page` does not apply to an atomic inline box itself, but a nested
+        // normal-flow descendant can still carry the first/last class-A
+        // boundary values for the atomic formatting context. Suppress only
+        // the atomic box's own value; discarding its children loses named
+        // page transitions inside inline blocks and tables.
+        // In particular, an inline `<canvas style="page:b">` must not
+        // select the document's first page, while an inline-block containing
+        // `page:a` then `page:b` descendants propagates `(a, b)`.
+        // <https://drafts.csswg.org/css-page-3/#using-named-pages>
         box_tree::FormattingBox::AtomicInline(box_) => {
-            if box_.style.display.is_replaced() {
-                return ((None, false), (None, false));
-            }
-            page_value_sources_from_style_and_children(&box_.style, &box_.children)
+            let mut descendant_style = box_.core.style.as_ref().clone();
+            descendant_style.page_name_specified = false;
+            descendant_style.page_name = None;
+            page_value_sources_from_style_and_children(&descendant_style, &box_.core.children)
         }
-        box_tree::FormattingBox::Flex(box_) => {
-            let own = box_
-                .style
-                .page_name_specified
-                .then(|| box_.style.page_name.clone())
-                .map(|name| (name, true))
-                .unwrap_or((None, false));
-            (own.clone(), own)
-        }
-        box_tree::FormattingBox::Table(box_) => {
-            page_value_sources_from_style_and_children(&box_.style, &box_.children)
-        }
-        box_tree::FormattingBox::Replaced(box_) => {
-            let own = box_
-                .style
-                .page_name_specified
-                .then(|| box_.style.page_name.clone())
-                .map(|name| (name, true))
-                .unwrap_or((None, false));
-            (own.clone(), own)
-        }
+        box_tree::FormattingBox::Flex(box_) => PageBoundaryValues::from_style(&box_.core.style),
+        box_tree::FormattingBox::Table(box_) => page_value_sources_from_element_style_and_children(
+            box_.core.element,
+            &box_.core.style,
+            &box_.core.children,
+        ),
+        box_tree::FormattingBox::Replaced(box_) => PageBoundaryValues::from_style(&box_.core.style),
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             page_value_sources_from_style_and_children(&box_.style, &box_.children)
         }
-        box_tree::FormattingBox::Text(_) => ((None, false), (None, false)),
+        box_tree::FormattingBox::Text(_) => PageBoundaryValues::inapplicable(),
+    }
+}
+
+/// Resolves the used `page` value for one style without consulting the output
+/// page cursor. CSS Paged Media resolves `auto` to the nearest ancestor whose
+/// used page value is not `auto`; this lexical operation must happen before
+/// start/end values are propagated through a formatting tree.
+/// <https://www.w3.org/TR/css-page-3/#using-named-pages>
+fn resolved_page_name_for_style(
+    style: &ComputedStyle,
+    inherited_page_name: Option<&str>,
+) -> Option<String> {
+    if style.page_name_specified {
+        style
+            .page_name
+            .clone()
+            .or_else(|| inherited_page_name.map(str::to_string))
+    } else {
+        inherited_page_name.map(str::to_string)
+    }
+}
+
+/// Resolves start/end page types for a style and its formatting-tree children.
+///
+/// The structural source helper retains whether a descendant's `auto` or
+/// named value replaces its parent summary. This helper supplies the missing
+/// lexical half: every recursive call receives the parent's already-used page
+/// type, so a deep `page:auto` cannot accidentally bind to the mutable page
+/// selected by an unrelated preceding sibling.
+pub(in crate::layout) fn resolved_page_boundary_values_from_style_and_children(
+    style: &ComputedStyle,
+    child_boxes: &[box_tree::FormattingBox<'_>],
+    inherited_page_name: Option<&str>,
+) -> ResolvedPageBoundaryValues {
+    let own_page_name = resolved_page_name_for_style(style, inherited_page_name);
+    let mut values = ResolvedPageBoundaryValues::uniform(own_page_name.clone());
+    if style.display.is_flex() {
+        return values;
+    }
+    let mut normal_flow_children = child_boxes
+        .iter()
+        .filter(|child| formatting_box_is_page_value_participant(child));
+    let Some(first) = normal_flow_children.next() else {
+        return values;
+    };
+    let first_sources = formatting_box_page_value_sources(first);
+    let first_values =
+        resolved_formatting_box_page_boundary_values(first, own_page_name.as_deref());
+    if first_sources.start.overrides_parent_summary() {
+        values.start = first_values.start;
+    }
+    let last = normal_flow_children.next_back().unwrap_or(first);
+    let last_sources = formatting_box_page_value_sources(last);
+    if last_sources.end.overrides_parent_summary() {
+        values.end =
+            resolved_formatting_box_page_boundary_values(last, own_page_name.as_deref()).end;
+    }
+    values
+}
+
+/// Resolves propagated class-A start/end page types for one formatting box.
+///
+/// This deliberately follows formatting boxes rather than DOM children so
+/// display-none, floated, positioned, and otherwise non-participating boxes
+/// never take part in named-page propagation.
+/// <https://www.w3.org/TR/css-page-3/#using-named-pages>
+pub(in crate::layout) fn resolved_formatting_box_page_boundary_values(
+    box_: &box_tree::FormattingBox<'_>,
+    inherited_page_name: Option<&str>,
+) -> ResolvedPageBoundaryValues {
+    match box_ {
+        box_tree::FormattingBox::Block(box_) => {
+            let mut values = resolved_page_boundary_values_from_style_and_children(
+                &box_.core.style,
+                &box_.core.children,
+                inherited_page_name,
+            );
+            if !box_.core.style.page_name_specified
+                && element_has_leading_direct_inline_content(box_.core.element, &box_.core.style)
+            {
+                values.start = resolved_page_name_for_style(&box_.core.style, inherited_page_name);
+            }
+            values
+        }
+        box_tree::FormattingBox::Inline(box_) => {
+            let mut values = resolved_page_boundary_values_from_style_and_children(
+                &box_.core.style,
+                &box_.core.children,
+                inherited_page_name,
+            );
+            if !box_.core.style.page_name_specified
+                && element_has_leading_direct_inline_content(box_.core.element, &box_.core.style)
+            {
+                values.start = resolved_page_name_for_style(&box_.core.style, inherited_page_name);
+            }
+            values
+        }
+        box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
+            let mut values = resolved_page_boundary_values_from_style_and_children(
+                &box_.core.style,
+                &box_.core.children,
+                inherited_page_name,
+            );
+            if !box_.core.style.page_name_specified
+                && element_has_leading_direct_inline_content(box_.core.element, &box_.core.style)
+            {
+                values.start = resolved_page_name_for_style(&box_.core.style, inherited_page_name);
+            }
+            values
+        }
+        // Atomic inline boxes do not supply their own `page` value. Their
+        // descendants nevertheless retain the surrounding lexical scope.
+        box_tree::FormattingBox::AtomicInline(box_) => {
+            let mut style = box_.core.style.as_ref().clone();
+            style.page_name_specified = false;
+            style.page_name = None;
+            resolved_page_boundary_values_from_style_and_children(
+                &style,
+                &box_.core.children,
+                inherited_page_name,
+            )
+        }
+        box_tree::FormattingBox::Flex(box_) => ResolvedPageBoundaryValues::uniform(
+            resolved_page_name_for_style(&box_.core.style, inherited_page_name),
+        ),
+        box_tree::FormattingBox::Table(box_) => {
+            let mut values = resolved_page_boundary_values_from_style_and_children(
+                &box_.core.style,
+                &box_.core.children,
+                inherited_page_name,
+            );
+            if !box_.core.style.page_name_specified
+                && element_has_leading_direct_inline_content(box_.core.element, &box_.core.style)
+            {
+                values.start = resolved_page_name_for_style(&box_.core.style, inherited_page_name);
+            }
+            values
+        }
+        box_tree::FormattingBox::Replaced(box_) => ResolvedPageBoundaryValues::uniform(
+            resolved_page_name_for_style(&box_.core.style, inherited_page_name),
+        ),
+        box_tree::FormattingBox::AnonymousBlock(box_) => {
+            resolved_page_boundary_values_from_style_and_children(
+                &box_.style,
+                &box_.children,
+                inherited_page_name,
+            )
+        }
+        box_tree::FormattingBox::Text(_) => ResolvedPageBoundaryValues::inapplicable(),
     }
 }
 
@@ -406,47 +690,31 @@ pub(in crate::layout) fn formatting_box_page_value_sources(
 pub(in crate::layout) fn formatting_box_is_page_value_participant(
     box_: &box_tree::FormattingBox<'_>,
 ) -> bool {
+    // Anonymous inline runs participate in the class-A boundary surrounding
+    // their containing block even though a text formatting box is not a
+    // normal-flow *box* for the generic flow helper.  Otherwise a named
+    // block followed by direct text has no succeeding page value, and the
+    // return to the parent's used page type is never forced.
+    // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+    if let box_tree::FormattingBox::Text(box_) = box_ {
+        return !(box_.text.is_empty()
+            || (box_.style.white_space.collapses_spaces()
+                && box_.text.chars().all(is_css_collapsible_whitespace)));
+    }
     if !formatting_box_is_in_normal_flow(box_) {
         return false;
     }
     match box_ {
-        box_tree::FormattingBox::Text(box_) => {
-            !(box_.text.is_empty()
-                || (box_.style.white_space.collapses_spaces()
-                    && box_.text.chars().all(is_css_collapsible_whitespace)))
-        }
         box_tree::FormattingBox::AnonymousBlock(box_) => box_
             .children
             .iter()
             .any(formatting_box_is_page_value_participant),
         box_tree::FormattingBox::InlineSplitBlockContext(box_) => box_
+            .core
             .children
             .iter()
             .any(formatting_box_is_page_value_participant),
         _ => !formatting_box_can_only_create_phantom_line_boxes(box_),
-    }
-}
-
-/// Resolves a child boundary page value in its parent page scope.
-///
-/// At CSS Paged Media class-A sibling boundaries, an explicitly specified
-/// child `page` value wins. An explicit `page:auto` resolves to the nearest
-/// non-auto ancestor, which is the immediate parent when it has a named page;
-/// an omitted value follows that same parent page group:
-/// <https://www.w3.org/TR/css-page-3/#using-named-pages>.
-pub(in crate::layout) fn page_boundary_name_in_parent_scope(
-    source: (Option<String>, bool),
-    parent_style: &ComputedStyle,
-) -> Option<String> {
-    if source.1 {
-        // Preserve explicit `page:auto`: it clears the parent group instead
-        // of falling back to the parent's named page value.
-        // <https://www.w3.org/TR/css-page-3/#using-named-pages>
-        source.0
-    } else if parent_style.page_name_specified {
-        parent_style.page_name.clone()
-    } else {
-        None
     }
 }
 
@@ -456,29 +724,24 @@ pub(in crate::layout) fn page_boundary_name_in_parent_scope(
 /// boxes are not in normal flow and therefore do not create class A sibling
 /// page-name boundaries:
 /// <https://www.w3.org/TR/css-break-3/#possible-breaks>.
+#[cfg(test)]
 pub(in crate::layout) fn formatting_box_page_values(
     box_: &box_tree::FormattingBox<'_>,
 ) -> (Option<String>, Option<String>) {
-    let ((start, _), (end, _)) = formatting_box_page_value_sources(box_);
-    (start, end)
+    let sources = formatting_box_page_value_sources(box_);
+    let name = |source: PageBoundaryValue| match source {
+        PageBoundaryValue::Named(name) => Some(name),
+        PageBoundaryValue::Inapplicable
+        | PageBoundaryValue::Inherited
+        | PageBoundaryValue::Auto => None,
+    };
+    (name(sources.start), name(sources.end))
 }
 
 pub(in crate::layout) fn formatting_box_is_in_normal_flow(
     box_: &box_tree::FormattingBox<'_>,
 ) -> bool {
-    match box_ {
-        box_tree::FormattingBox::Block(box_) => style_is_in_normal_flow(&box_.style),
-        box_tree::FormattingBox::Inline(box_) => style_is_in_normal_flow(&box_.style),
-        box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-            style_is_in_normal_flow(&box_.style)
-        }
-        box_tree::FormattingBox::AtomicInline(box_) => style_is_in_normal_flow(&box_.style),
-        box_tree::FormattingBox::Flex(box_) => style_is_in_normal_flow(&box_.style),
-        box_tree::FormattingBox::Table(box_) => style_is_in_normal_flow(&box_.style),
-        box_tree::FormattingBox::Replaced(box_) => style_is_in_normal_flow(&box_.style),
-        box_tree::FormattingBox::AnonymousBlock(box_) => style_is_in_normal_flow(&box_.style),
-        box_tree::FormattingBox::Text(_) => true,
-    }
+    !matches!(box_, box_tree::FormattingBox::Text(_)) && style_is_in_normal_flow(box_.style())
 }
 
 /// Returns true for an explicit zero-height page-owning block boundary.
@@ -513,14 +776,21 @@ pub(in crate::layout) fn formatting_box_is_zero_height_page_boundary(
 pub(in crate::layout) fn coalesced_zero_height_page_start(
     child_boxes: &[box_tree::FormattingBox<'_>],
     current_index: usize,
+    inherited_page_name: Option<&str>,
 ) -> Option<String> {
     child_boxes
         .iter()
         .skip(current_index + 1)
         .filter(|child| formatting_box_is_in_normal_flow(child))
         .find(|child| !formatting_box_is_zero_height_page_boundary(child))
-        .and_then(|child| formatting_box_page_values(child).0)
-        .or_else(|| formatting_box_page_values(&child_boxes[current_index]).0)
+        .map(|child| resolved_formatting_box_page_boundary_values(child, inherited_page_name).start)
+        .unwrap_or_else(|| {
+            resolved_formatting_box_page_boundary_values(
+                &child_boxes[current_index],
+                inherited_page_name,
+            )
+            .start
+        })
 }
 
 pub(in crate::layout) fn style_is_in_normal_flow(style: &ComputedStyle) -> bool {
@@ -546,19 +816,21 @@ pub(in crate::layout) fn formatting_box_has_inline_content(
             // with owned inline-axis margin, border, or padding still generate
             // inline boxes whose decorations and advance must be preserved:
             // <https://www.w3.org/TR/CSS22/box.html#inline-boxes>.
-            box_.style
+            box_.core
+                .style
                 .before_style
                 .as_deref()
                 .is_some_and(|style| style.content.is_generated())
                 || box_
+                    .core
                     .style
                     .after_style
                     .as_deref()
                     .is_some_and(|style| style.content.is_generated())
-                || box_.style.content.is_generated()
-                || box_.style.float != Float::None
-                || inline_box_fragment_has_owned_inline_edge(&box_.style, box_.fragment_edges)
-                || formatting_box_has_inline_content(&box_.children)
+                || box_.core.style.content.is_generated()
+                || box_.core.style.float != Float::None
+                || inline_box_fragment_has_owned_inline_edge(&box_.core.style, box_.fragment_edges)
+                || formatting_box_has_inline_content(&box_.core.children)
         }
         box_tree::FormattingBox::AnonymousBlock(box_) => {
             formatting_box_has_inline_content(&box_.children)
@@ -600,9 +872,9 @@ fn inline_box_fragment_has_owned_inline_edge(
 
 fn inline_box_logical_edge_has_nonzero_component(style: &ComputedStyle, is_start: bool) -> bool {
     let side = if is_start {
-        inline_start_side(style.writing_mode, style.direction)
+        inline_start_side(style.writing_mode, style.used_direction())
     } else {
-        inline_end_side(style.writing_mode, style.direction)
+        inline_end_side(style.writing_mode, style.used_direction())
     };
     let borders = used_border_widths(style);
     let (margin, border, padding) = match side {
@@ -622,16 +894,16 @@ pub(in crate::layout) fn collect_inline_text_from_formatting_boxes(
         match child {
             box_tree::FormattingBox::Text(box_) => output.push_str(&box_.text),
             box_tree::FormattingBox::Inline(box_) => {
-                collect_inline_text_from_formatting_boxes(&box_.children, output);
+                collect_inline_text_from_formatting_boxes(&box_.core.children, output);
             }
             box_tree::FormattingBox::InlineSplitBlockContext(box_) => {
-                collect_inline_text_from_formatting_boxes(&box_.children, output);
+                collect_inline_text_from_formatting_boxes(&box_.core.children, output);
             }
             box_tree::FormattingBox::AnonymousBlock(box_) => {
                 collect_inline_text_from_formatting_boxes(&box_.children, output);
             }
             box_tree::FormattingBox::AtomicInline(box_) => {
-                collect_inline_text_from_formatting_boxes(&box_.children, output);
+                collect_inline_text_from_formatting_boxes(&box_.core.children, output);
             }
             box_tree::FormattingBox::Block(_)
             | box_tree::FormattingBox::Table(_)
@@ -685,7 +957,16 @@ pub(in crate::layout) fn has_styled_inline_descendant_with_resolver(
             Some(parent_style),
             ancestors,
         );
-        if child_style.display.is_none() || child_style.display.is_block_level() {
+        // A suppressed descendant still changes the rendered text stream:
+        // flattening the parent's DOM text would otherwise resurrect fallback
+        // text from `display: none` / unboxed HTML elements. Route this
+        // through the item collector, which observes the descendant's used
+        // display value before adding its content.
+        // <https://www.w3.org/TR/css-display-3/#box-generation>
+        if child_style.display.is_none() {
+            return true;
+        }
+        if child_style.display.is_block_level() {
             return false;
         }
         inline_style_affects_line(parent_style, &child_style) || {
@@ -715,6 +996,7 @@ pub(in crate::layout) fn inline_style_affects_line(
         || child.font_style != parent.font_style
         || child.font_weight != parent.font_weight
         || child.font_width != parent.font_width
+        || child.font_palette != parent.font_palette
         || child.line_height != parent.line_height
         || child.text_decoration != parent.text_decoration
         || child.text_transform != parent.text_transform
@@ -826,8 +1108,18 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
                     Some(parent_style),
                     ancestors,
                 );
-                let is_flow_child = is_normal_block_flow_child(child_element, &child_style)
-                    || is_replaced_element(child_element);
+                // A float or out-of-flow positioned child does not contribute
+                // a normal-flow block, but it still selects placement at its
+                // source position amongst adjacent inline content. It
+                // therefore needs the same ordered traversal boundary as a
+                // flow child: collecting the entire inline run before DOM
+                // traversal would place it after text that follows it in
+                // source order (and can replay the float twice).
+                // <https://www.w3.org/TR/css-position-3/#static-position>
+                let is_flow_child = child_style.float != Float::None
+                    || is_normal_block_flow_child(child_element, &child_style)
+                    || is_replaced_element(child_element)
+                    || matches!(child_style.position, Position::Absolute | Position::Fixed);
                 if is_flow_child {
                     has_flow = true;
                 } else if is_line_break_element(child_element)
@@ -862,7 +1154,7 @@ pub(in crate::layout) fn has_ordered_mixed_flow_content_with_resolver(
 /// <https://www.w3.org/TR/css-contain-1/#containment-layout>
 pub(in crate::layout) fn can_collapse_block_start_margin(
     style: &ComputedStyle,
-    border_widths: css::Edges,
+    border_edges: UsedEdges,
     has_direct_inline_content: bool,
     used_overflow: css::Overflow,
 ) -> bool {
@@ -875,7 +1167,7 @@ pub(in crate::layout) fn can_collapse_block_start_margin(
         && !has_direct_inline_content
         && used_overflow == css::Overflow::Visible
         && style.padding.top == 0.0
-        && border_widths.top == 0.0
+        && border_edges.top == layout_pt(0.0)
 }
 
 /// Returns whether a block container's end edge can adjoin child margins.
@@ -890,7 +1182,7 @@ pub(in crate::layout) fn can_collapse_block_start_margin(
 /// <https://www.w3.org/TR/css-contain-1/#containment-layout>
 pub(in crate::layout) fn can_collapse_block_end_margin(
     style: &ComputedStyle,
-    border_widths: css::Edges,
+    border_edges: UsedEdges,
     has_direct_inline_content: bool,
     used_overflow: css::Overflow,
 ) -> bool {
@@ -903,7 +1195,7 @@ pub(in crate::layout) fn can_collapse_block_end_margin(
         && !has_direct_inline_content
         && used_overflow == css::Overflow::Visible
         && style.padding.bottom == 0.0
-        && border_widths.bottom == 0.0
+        && border_edges.bottom == layout_pt(0.0)
         && has_auto_height(style)
 }
 
@@ -983,6 +1275,14 @@ impl RelativeOffset {
     pub(in crate::layout) fn y(self) -> f32 {
         self.vector.y
     }
+
+    /// Whether a relative-position translation has no observable visual
+    /// effect. This keeps the decision at the relative-positioning boundary,
+    /// rather than comparing generic coordinates at each paint caller.
+    /// <https://drafts.csswg.org/css-position-3/#relative-positioning>
+    pub(in crate::layout) fn is_zero(self) -> bool {
+        self.x().abs() <= 0.01 && self.y().abs() <= 0.01
+    }
 }
 
 pub(in crate::layout) fn relative_position_offset(
@@ -996,6 +1296,47 @@ pub(in crate::layout) fn relative_position_offset(
     let right = used_inset_right(style, containing_block);
     let top = used_inset_top(style, containing_block);
     let bottom = used_inset_bottom(style, containing_block);
+    RelativeOffset {
+        vector: ContainerVector::new(
+            left.unwrap_or_else(|| -right.unwrap_or(0.0)),
+            bottom.unwrap_or_else(|| -top.unwrap_or(0.0)),
+        ),
+    }
+}
+
+/// Resolve a relative-position translation from explicit percentage bases.
+///
+/// Table tracks have a final used block size even where their parent table
+/// part's `height` remains indefinite. Keeping the percentage basis explicit
+/// prevents that used geometry from accidentally resolving a percentage inset:
+/// <https://drafts.csswg.org/css-position-3/#relative-positioning> and
+/// <https://drafts.csswg.org/css-sizing-3/#definite>.
+pub(in crate::layout) fn relative_position_offset_with_bases(
+    style: &ComputedStyle,
+    inline_basis: PercentageBasis<ContentBoxLength>,
+    block_basis: PercentageBasis<ContentBoxLength>,
+) -> RelativeOffset {
+    if !matches!(style.position, Position::Relative | Position::Sticky) {
+        return RelativeOffset::zero();
+    }
+    let left = used_length_percentage_or_auto_with_basis(
+        style.box_values.inset_left.clone(),
+        inline_basis,
+    )
+    .map(|length| length.points());
+    let right = used_length_percentage_or_auto_with_basis(
+        style.box_values.inset_right.clone(),
+        inline_basis,
+    )
+    .map(|length| length.points());
+    let top =
+        used_length_percentage_or_auto_with_basis(style.box_values.inset_top.clone(), block_basis)
+            .map(|length| length.points());
+    let bottom = used_length_percentage_or_auto_with_basis(
+        style.box_values.inset_bottom.clone(),
+        block_basis,
+    )
+    .map(|length| length.points());
     // CSS 2.1 9.4.3/9.3.2: relative positioning offsets the visual box while
     // preserving its normal-flow space. Opposing insets over-constrain the axis;
     // for left-to-right content, `left` wins horizontally, and `top` wins

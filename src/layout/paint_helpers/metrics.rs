@@ -1,4 +1,5 @@
 use super::*;
+use crate::units::layout_px;
 
 /// A used border side for layout and painting.
 ///
@@ -9,10 +10,10 @@ use super::*;
 /// <https://www.w3.org/TR/css-backgrounds-3/#the-border-width>.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct UsedBorderSide {
-    pub(crate) specified_width: f32,
-    pub(crate) used_width: f32,
+    pub(crate) specified_width: LayoutLength,
+    pub(crate) used_width: LayoutLength,
     pub(crate) style: BorderStyle,
-    pub(crate) color: Color,
+    pub(crate) color: CssColor,
 }
 
 impl UsedBorderSide {
@@ -21,9 +22,9 @@ impl UsedBorderSide {
     /// CSS Backgrounds and Borders resolves the used width from the computed
     /// width and style:
     /// <https://www.w3.org/TR/css-backgrounds-3/#border-width>.
-    pub(crate) fn new(specified_width: f32, style: BorderStyle, color: Color) -> Self {
+    pub(crate) fn new(specified_width: LayoutLength, style: BorderStyle, color: CssColor) -> Self {
         Self {
-            specified_width: specified_width.max(0.0),
+            specified_width: layout_pt(specified_width.get().max(0.0)),
             used_width: used_border_side_width(specified_width, style),
             style,
             color,
@@ -32,12 +33,14 @@ impl UsedBorderSide {
 
     /// Return whether this side produces visible border paint.
     ///
-    /// CSS Color defines `transparent` as transparent black, so a transparent
+    /// CSS CssColor defines `transparent` as transparent black, so a transparent
     /// border still contributes its used width to layout but emits no visible
     /// paint:
     /// <https://www.w3.org/TR/css-color-4/#transparent-color>.
     pub(crate) fn is_visible(self) -> bool {
-        self.used_width > 0.0 && !self.style.suppresses_used_width() && self.color.is_visible()
+        self.used_width > layout_pt(0.0)
+            && !self.style.suppresses_used_width()
+            && self.color.is_visible()
     }
 }
 
@@ -59,10 +62,10 @@ pub(crate) struct UsedBorder {
 impl UsedBorder {
     pub(crate) fn widths(self) -> css::Edges {
         css::Edges {
-            top: self.top.used_width,
-            right: self.right.used_width,
-            bottom: self.bottom.used_width,
-            left: self.left.used_width,
+            top: self.top.used_width.get(),
+            right: self.right.used_width.get(),
+            bottom: self.bottom.used_width.get(),
+            left: self.left.used_width.get(),
         }
     }
 }
@@ -76,22 +79,22 @@ impl UsedBorder {
 pub(crate) fn used_border(style: &ComputedStyle) -> UsedBorder {
     UsedBorder {
         top: UsedBorderSide::new(
-            style.border_widths.top,
+            layout_pt(style.border_widths.top),
             style.border_styles.top,
             style.border_colors.top,
         ),
         right: UsedBorderSide::new(
-            style.border_widths.right,
+            layout_pt(style.border_widths.right),
             style.border_styles.right,
             style.border_colors.right,
         ),
         bottom: UsedBorderSide::new(
-            style.border_widths.bottom,
+            layout_pt(style.border_widths.bottom),
             style.border_styles.bottom,
             style.border_colors.bottom,
         ),
         left: UsedBorderSide::new(
-            style.border_widths.left,
+            layout_pt(style.border_widths.left),
             style.border_styles.left,
             style.border_colors.left,
         ),
@@ -102,11 +105,31 @@ pub(crate) fn used_border_widths(style: &ComputedStyle) -> css::Edges {
     used_border(style).widths()
 }
 
-pub(crate) fn used_border_side_width(width: f32, style: BorderStyle) -> f32 {
+pub(crate) fn used_border_side_width(width: LayoutLength, style: BorderStyle) -> LayoutLength {
     if style.suppresses_used_width() {
-        0.0
+        layout_pt(0.0)
     } else {
-        width.max(0.0)
+        layout_pt(width.get().max(0.0))
+    }
+}
+
+/// Typed paint metrics for a `double` border.
+///
+/// A double border is painted as two solid lines separated by an equal-width
+/// gap. The rendering fallback below three CSS pixels is retained for
+/// compatibility, but the cutoff is expressed as a CSS length before the
+/// layout-to-paint boundary.
+/// <https://www.w3.org/TR/css-backgrounds-3/#border-style>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DoubleBorderBands {
+    pub(crate) stripe: LayoutLength,
+}
+
+impl DoubleBorderBands {
+    pub(crate) fn for_used_width(used_width: LayoutLength) -> Option<Self> {
+        (used_width >= layout_px(3.0)).then(|| Self {
+            stripe: layout_pt(used_width.get() / 3.0),
+        })
     }
 }
 
@@ -148,5 +171,14 @@ mod tests {
         let width: LayoutLength = used_border_width(&style);
 
         assert_eq!(width, layout_pt(3.0));
+    }
+
+    #[test]
+    fn double_border_bands_use_css_pixel_cutoff_and_equal_layout_bands() {
+        assert_eq!(DoubleBorderBands::for_used_width(layout_px(2.0)), None);
+
+        let bands = DoubleBorderBands::for_used_width(layout_px(3.0)).unwrap();
+        assert_eq!(bands.stripe, layout_px(1.0));
+        assert_eq!(bands.stripe.get() * 3.0, layout_px(3.0).get());
     }
 }

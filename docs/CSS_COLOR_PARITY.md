@@ -7,27 +7,62 @@
   color functions.
 - Predefined `color()` spaces: `srgb`, `srgb-linear`, `display-p3`,
   `display-p3-linear`, `a98-rgb`, `prophoto-rgb`, `rec2020`, `xyz`,
-  `xyz-d50`, and `xyz-d65`. Direct vector paints retain their CSS RGB space;
-  XYZ, Lab/LCH, and Oklab/Oklch normalize to unbounded D50 XYZ coordinates.
-- Ordinary PDFs emit direct vector paints and CSS gradients in generated
-  ICCBased color spaces. A same-space gradient stays in its authored CSS
-  space; mixed-space gradients resolve through D50 XYZ. PDF/A converts vector
-  paint and generated gradients to tagged sRGB, supplies an sRGB OutputIntent,
-  and retains only the required sRGB ICC resource.
+  `xyz-d50`, and `xyz-d65`. Quire owns CSS coordinates and alpha, using
+  tagged RGB and D50-PCS coordinate variants. Each RGB variant carries a
+  distinct private space marker, and raw coordinates are private. XYZ,
+  Lab/LCH, and Oklab/Oklch normalize to unbounded D50 XYZ coordinates.
+- Ordinary PDFs emit vector paints and CSS gradients in generated ICCBased
+  color spaces. A direct paint that is representable in sRGB is canonically
+  emitted as tagged 8-bit sRGB; every other direct paint is converted to the
+  fixed Display-P3 ordinary-PDF output condition. A same-space gradient stays
+  in its authored CSS space; mixed-space gradients resolve through D50 XYZ.
+  PCS-derived direct paint takes sRGB when it fits and otherwise Display-P3,
+  without intermediate sRGB clipping. PDF/A converts vector paint and
+  generated gradients to tagged sRGB, supplies an sRGB OutputIntent, and
+  retains only the required sRGB ICC resource.
 - Embedded RGB ICC profiles in PNG and JPEG images are retained as ICCBased
   image spaces in ordinary PDFs. PDF/A transforms those decoded samples to its
   tagged sRGB output condition; missing, invalid, and non-RGB source profiles
   use the explicit sRGB input boundary.
-- CSS Color 5 two-color `color-mix()` in sRGB and LCH, including percentage
-  normalization and premultiplied alpha in sRGB.
+- moxcms is used at ICC boundaries: embedded-profile parsing and validation,
+  embedded-raster transforms, and generated ICC bytes. CSS predefined-space
+  conversion uses the CSS Color 4 matrices and transfer functions directly,
+  preserving extended-range components until the selected PDF output boundary.
+  PDF serialization consumes final `PdfPaintColor` samples, and generated
+  raster images use encoded RGB samples rather than CSS coordinates.
+
+## Conversion ownership
+
+- Palette owns the standard, typed D50 XYZ ↔ Lab and D65 XYZ ↔ OKLab
+  transforms. Palette's D50 white point uses CSS Color's exact
+  `0.96422 / 1 / 0.82521` reference values, and its unchecked conversions
+  preserve CSS extended-range coordinates. Quire adapts only at the explicit
+  D50/D65 boundary.
+- Quire owns CSS-specific conversion behavior: the CSS D50/D65 Bradford
+  matrices, LCH/OKLCH polar syntax, predefined RGB matrices and signed
+  transfer curves, HSL/HWB grammar, missing-component replacement, polar hue
+  interpolation, alpha premultiplication, and output gamut policy. Palette's
+  generic spaces do not encode those CSS parsing and output rules.
+- moxcms remains limited to ICC work: parsing/validating profiles,
+  embedded-profile raster transforms, and ICC byte generation. It is not used
+  for CSS predefined-space conversion, where ICC rendering intents and
+  profile precision would change CSS-defined extended-range results.
+- CSS Color 5 `color-mix()` across Quire's supported gradient interpolation
+  spaces and polar hue routes. The computed result retains its selected CSS
+  space; percentage normalization and premultiplied alpha do not force an
+  sRGB conversion.
 - CSS Color 5 single-argument `contrast-color()`, selecting black or white by
   WCAG relative-luminance contrast.
 - `currentcolor` background values retain their deferred resolution through
   inheritance. The covered CSS Color 5 relative-color forms with a
-  `currentcolor` origin resolve against each element's own computed `color`.
+  `currentcolor` origin resolve against each element's own computed `color`;
+  relative RGB and HSL preserve extended-range target-space components.
 - `light-dark()` selects its light branch in Quire's fixed light print scheme.
 - Deterministic print-palette values for CSS system colors and their deprecated
   aliases, so aliases compare consistently within a generated PDF.
+- CSS Color Adjustment forced-colors used values, including configurable light
+  and dark palettes, preserved authored system-color references, and
+  `forced-color-adjust` inheritance for HTML and inline SVG presentation.
 
 ## Remaining work
 
@@ -42,3 +77,6 @@
   system colors.
 - Add CSS Color 4 interpolation spaces and hue interpolation to gradients and
   animation.
+- Implement the remaining forced-colors backplate and script-driven behavior,
+  plus the unimplemented Color Adjustment properties beyond
+  `forced-color-adjust`.

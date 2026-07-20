@@ -1,6 +1,6 @@
 # CSS Positioning Parity
 
-Last updated: 2026-07-18
+Last updated: 2026-07-19
 
 This document tracks current CSS positioning and stacking behavior in Quire.
 Known unresolved divergences belong in `SPEC_DIVERGENCES.md`; this file is a
@@ -13,6 +13,10 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 - Auto-width absolutely positioned non-replaced blocks use CSS 2.2
   shrink-to-fit sizing, including zero-width results for empty content when no
   inset pair or explicit width fills the containing block.
+- Absolutely positioned table boxes with both insets set retain their
+  intrinsic auto size before the absolute-axis solver distributes remaining
+  space to authored auto margins, including the corresponding block-axis
+  table-height case.
 - Auto-sized absolutely positioned replaced images use their intrinsic
   dimensions and aspect ratio before resolving absolute insets.
 - Positioned layout prepares a zoom-normalized used style exactly once for
@@ -30,8 +34,8 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   paint contexts before PDF emission.
 - Transform translations and transform origins keep typed length components
   until used-value preparation, including `ch` resolved through the selected
-  font metric and viewport units resolved against the immutable initial page
-  viewport rather than a later named page's used area.
+  font metric and viewport units resolved against the active page
+  fragmentainer's used area.
 - CSS Transforms Level 2's independent 2D `translate`, `rotate`, and `scale`
   properties compose before the legacy `transform` list, establish the same
   stacking-context and containing-block effects, and preserve typed
@@ -71,6 +75,17 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
 - Block-level absolutely positioned descendants with auto horizontal insets
   honor the static-position containing block's direction, including RTL cases
   that seed `right` from the hypothetical normal-flow static position.
+- Positioned inline ancestors retain typed start/end edge markers through
+  inline collection. Block-level, and inline-level with explicit insets,
+  absolute descendants can replay those markers through line preparation to
+  form a physical `ContainingBlock`, covering ordinary horizontal
+  static-position cases without reducing the geometry to the block-flow
+  cursor.
+- When an explicit-inset descendant occurs before its positioned inline
+  ancestor closes, collection defers materialization until that final edge is
+  present. A typed pending segment-break placement keeps collapsed boundary
+  whitespace outside the inline box when it began before the start edge; this
+  covers the fragmented horizontal inline-containing-block case.
 - Block-level absolutely positioned descendants with orthogonal writing modes,
   auto physical vertical insets, and both physical horizontal insets set
   preserve their resolved physical static top edge instead of translating by
@@ -113,6 +128,18 @@ working parity snapshot for implemented behavior and nearby follow-up areas.
   insets remain page-resolved when the inline-block is not a containing block,
   and remain atom-local when the inline-block itself is positioned or
   transformed and establishes the containing block.
+- Positioned descendants produced while an atomic inline is measured, including
+  relatively positioned table captions, likewise escape the atom's inline
+  paint unit and retain their parent stacking level and source order.
+- An absolutely positioned flex child whose hypothetical sole-item rectangle
+  is centered on the physical horizontal axis retains that typed rectangle
+  through automatic sizing and final static-position resolution.
+- Intrinsic inline-block measurement suppresses positioned-descendant
+  materialization, so committed atom layout—not an off-page intrinsic probe—
+  creates escaped positioned layers.
+- Positioned `html` roots, including flex roots, resolve absolute and fixed
+  insets against the initial containing block and retain their own border
+  decoration while the root background continues to propagate to the canvas.
 - Same-page non-positioned overflow clips apply to descendant paint without
   creating an atomic stacking context, so later normal-flow block backgrounds
   do not cover earlier clipped inline foregrounds.

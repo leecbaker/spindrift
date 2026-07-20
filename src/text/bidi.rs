@@ -14,7 +14,18 @@ use super::*;
 pub(crate) fn bidi_control_scope_for_style(
     style: &ComputedStyle,
 ) -> Option<(&'static str, &'static str)> {
-    match (style.unicode_bidi, style.direction) {
+    match (style.unicode_bidi, style.used_direction()) {
+        // In a vertical typographic mode, `text-orientation: upright` makes
+        // every typographic character unit a strong LTR unit for bidi. Model
+        // that inline boundary with an LRO/PDF pair: an LTR embedding would
+        // still retain Hebrew and Arabic characters' intrinsic RTL classes,
+        // whereas the specified strong-LTR treatment overrides each unit.
+        // This is independent of the computed `direction`, which remains
+        // available for inheritance into descendants outside this override.
+        // <https://drafts.csswg.org/css-writing-modes-4/#text-orientation>
+        (UnicodeBidi::Normal, Direction::Ltr) if style.direction != style.used_direction() => {
+            Some(("\u{202d}", "\u{202c}"))
+        }
         (UnicodeBidi::Normal, _) => None,
         (UnicodeBidi::Isolate, _) if style.display.is_block_level() => None,
         (UnicodeBidi::Embed, Direction::Ltr) => Some(("\u{202a}", "\u{202c}")),
@@ -24,10 +35,10 @@ pub(crate) fn bidi_control_scope_for_style(
         (UnicodeBidi::BidiOverride, Direction::Ltr) => Some(("\u{202d}", "\u{202c}")),
         (UnicodeBidi::BidiOverride, Direction::Rtl) => Some(("\u{202e}", "\u{202c}")),
         (UnicodeBidi::IsolateOverride, Direction::Ltr) => {
-            Some(("\u{2066}\u{202d}", "\u{202c}\u{2069}"))
+            Some(("\u{2068}\u{202d}", "\u{202c}\u{2069}"))
         }
         (UnicodeBidi::IsolateOverride, Direction::Rtl) => {
-            Some(("\u{2067}\u{202e}", "\u{202c}\u{2069}"))
+            Some(("\u{2068}\u{202e}", "\u{202c}\u{2069}"))
         }
         (UnicodeBidi::Plaintext, _) => Some(("\u{2068}", "\u{2069}")),
     }
@@ -85,7 +96,7 @@ pub(crate) fn text_with_css_bidi_controls<'a>(
     text: &'a str,
     style: &ComputedStyle,
 ) -> CssBidiText<'a> {
-    let base_direction = match (style.unicode_bidi, style.direction) {
+    let base_direction = match (style.unicode_bidi, style.used_direction()) {
         (UnicodeBidi::Plaintext, _) => "",
         (_, Direction::Ltr) => "\u{200e}",
         (_, Direction::Rtl) => "\u{200f}",

@@ -4,8 +4,9 @@ use clap::{ArgGroup, CommandFactory, Parser, ValueEnum, ValueHint};
 use clap_complete::{Shell, generate};
 use log::LevelFilter;
 use quire::{
-    Css, FetchErrorPolicy, FontEmbeddingMode, Html, InputSyntax, MediaType, PageMargins, PageSize,
-    PdfCompression, PdfOptions, PdfProfile, RenderOptions, ResourcePolicy, Url,
+    Css, FetchErrorPolicy, FontEmbeddingMode, ForcedColorPalette, ForcedColorsMode, Html,
+    InputSyntax, MediaType, PageMargins, PageSize, PdfCompression, PdfOptions, PdfProfile,
+    RenderOptions, ResourcePolicy, Url,
 };
 use std::io;
 use std::path::{Path, PathBuf};
@@ -102,6 +103,10 @@ struct Cli {
     #[arg(long = "media-type", value_enum, default_value_t = CliMediaType::Print)]
     media_type: CliMediaType,
 
+    /// Forced-colors palette used for CSS CssColor Adjustment.
+    #[arg(long = "forced-colors", value_enum, default_value_t = CliForcedColors::None)]
+    forced_colors: CliForcedColors,
+
     /// Initial page-box width and height, as CSS absolute lengths.
     ///
     /// This is the initial page box used by `@page size: auto` and viewport
@@ -176,6 +181,23 @@ enum CliMediaType {
     Screen,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliForcedColors {
+    None,
+    Light,
+    Dark,
+}
+
+impl From<CliForcedColors> for ForcedColorsMode {
+    fn from(value: CliForcedColors) -> Self {
+        match value {
+            CliForcedColors::None => Self::Inactive,
+            CliForcedColors::Light => Self::Active(ForcedColorPalette::LIGHT),
+            CliForcedColors::Dark => Self::Active(ForcedColorPalette::DARK),
+        }
+    }
+}
+
 impl From<CliMediaType> for MediaType {
     fn from(value: CliMediaType) -> Self {
         match value {
@@ -222,6 +244,9 @@ fn initialize_logger(args: &Cli) {
     } else {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
     };
+    // ICU4X's CJK fallback is expected with the data embedded by its line
+    // segmenter. Do not flood the CLI with one dependency warning per run.
+    logger.filter_module("icu_provider", LevelFilter::Off);
     logger.init();
 }
 
@@ -247,7 +272,7 @@ async fn run(args: Cli) -> quire::Result<()> {
         log::debug!("loading stylesheet from {location}");
         stylesheets.push(
             if let Some(url) = parse_resource_url(location) {
-                Css::from_url_async_with_resource_policy(url, resource_policy).await?
+                Css::from_url_with_resource_policy(url, resource_policy).await?
             } else {
                 Css::from_file(location).await?
             }
@@ -288,6 +313,7 @@ async fn run(args: Cli) -> quire::Result<()> {
     let started = Instant::now();
     let mut options = RenderOptions::default();
     options.media_type = args.media_type.into();
+    options.forced_colors = args.forced_colors.into();
     options.presentational_hints = args.presentational_hints;
     options.target_fragment = args.target_fragment;
     let pdf_options = PdfOptions {
@@ -426,10 +452,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_defaults_to_pdfa_2b() {
+    fn cli_defaults_to_regular_pdf() {
         let cli = Cli::try_parse_from(["quire", "input.html", "output.pdf"]).unwrap();
 
-        assert_eq!(cli.pdf_profile, PdfProfile::PdfA2B);
+        assert_eq!(cli.pdf_profile, PdfProfile::Pdf);
         assert!(!cli.verbose);
         assert!(!cli.debug);
         assert!(!cli.quiet);

@@ -3,9 +3,10 @@ use std::rc::Rc;
 
 /// Return whether an inline fragment needs glyph or decoration paint.
 ///
-/// CSS Color defines alpha as part of the used color. Fully transparent text
-/// still participates in layout and can have backgrounds, but emits no visible
-/// glyph paint unless an explicit visible text-decoration color is present:
+/// CSS CssColor defines alpha as part of the used color. Fully transparent text
+/// still participates in layout and can have backgrounds, but an explicit
+/// visible text decoration or text shadow still needs the glyph outline as a
+/// paint source:
 /// <https://www.w3.org/TR/css-color-4/#alpha-value> and
 /// <https://www.w3.org/TR/css-text-decor-4/#painting>.
 pub(in crate::layout) fn inline_fragment_has_visible_text_paint(
@@ -19,6 +20,9 @@ pub(in crate::layout) fn inline_fragment_has_visible_text_paint(
                 .color
                 .unwrap_or(fragment.style().color)
                 .is_visible())
+        || fragment.style().text_shadow.iter().any(|shadow| {
+            !shadow.inset && shadow.color.resolve(fragment.style().color).is_visible()
+        })
 }
 
 pub(in crate::layout) fn justifiable_fragment_space_count<F: InlineFragmentAccess>(
@@ -343,11 +347,11 @@ pub(in crate::layout) fn inline_atom_is_inter_character_unit(atom: &InlineAtom) 
             | InlineAtomContent::Svg { .. }
             | InlineAtomContent::InlineBox { .. }
             | InlineAtomContent::TextCombineUpright { .. }
-            | InlineAtomContent::InlineFragment(_)
+            | InlineAtomContent::InlineFragment { .. }
     )
 }
 
-fn inline_atom_is_inter_character_transparent(atom: &InlineAtom) -> bool {
+pub(in crate::layout) fn inline_atom_is_inter_character_transparent(atom: &InlineAtom) -> bool {
     matches!(
         atom.content(),
         InlineAtomContent::InlineEdge(_) | InlineAtomContent::StaticPositionPlaceholder
@@ -389,7 +393,14 @@ fn apply_first_line_style_delta(
     first_line_style: &ComputedStyle,
 ) -> bool {
     let mut background_changed = false;
-    if first_line_style.color != originating_style.color {
+    if first_line_style.color != originating_style.color
+        && fragment_style.color == originating_style.color
+    {
+        // `::first-line` supplies an inherited color to its descendant
+        // fragments. A nested inline's specified color, including one whose
+        // principal box was suppressed by `display: contents`, wins over that
+        // inherited pseudo value.
+        // <https://drafts.csswg.org/css-pseudo-4/#first-line-pseudo>
         fragment_style.color = first_line_style.color;
     }
     if first_line_style.text_fill_color != originating_style.text_fill_color {

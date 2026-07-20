@@ -20,6 +20,192 @@ pub enum MediaType {
     Screen,
 }
 
+/// CSS system colors supplied by the rendering environment.
+///
+/// CSS CssColor Adjustment requires an active forced-colors environment to make
+/// its limited palette available through CSS system color keywords:
+/// <https://www.w3.org/TR/css-color-adjust-1/#forced-colors-mode>.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForcedColorPalette {
+    /// `Canvas`.
+    pub canvas: CssColor,
+    /// `CanvasText`.
+    pub canvas_text: CssColor,
+    /// `LinkText`.
+    pub link_text: CssColor,
+    /// `VisitedText`.
+    pub visited_text: CssColor,
+    /// `ActiveText`.
+    pub active_text: CssColor,
+    /// `ButtonFace`.
+    pub button_face: CssColor,
+    /// `ButtonText`.
+    pub button_text: CssColor,
+    /// `ButtonBorder`.
+    pub button_border: CssColor,
+    /// `Field`.
+    pub field: CssColor,
+    /// `FieldText`.
+    pub field_text: CssColor,
+    /// `Highlight`.
+    pub highlight: CssColor,
+    /// `HighlightText`.
+    pub highlight_text: CssColor,
+    /// `Mark`.
+    pub mark: CssColor,
+    /// `MarkText`.
+    pub mark_text: CssColor,
+    /// `GrayText`.
+    pub gray_text: CssColor,
+    /// `AccentColor`.
+    pub accent_color: CssColor,
+    /// `AccentColorText`.
+    pub accent_color_text: CssColor,
+    /// `SelectedItem`.
+    pub selected_item: CssColor,
+    /// `SelectedItemText`.
+    pub selected_item_text: CssColor,
+}
+
+impl ForcedColorPalette {
+    /// Deterministic light high-contrast palette used by the command line and
+    /// the WPT runner.
+    pub const LIGHT: Self = Self {
+        canvas: CssColor::WHITE,
+        canvas_text: CssColor::BLACK,
+        link_text: CssColor::BLACK,
+        visited_text: CssColor::BLACK,
+        active_text: CssColor::BLACK,
+        button_face: CssColor::WHITE,
+        button_text: CssColor::BLACK,
+        button_border: CssColor::srgb_const(0.5, 0.5, 0.5, 1.0),
+        field: CssColor::WHITE,
+        field_text: CssColor::BLACK,
+        highlight: CssColor::WHITE,
+        highlight_text: CssColor::BLACK,
+        mark: CssColor::WHITE,
+        mark_text: CssColor::BLACK,
+        gray_text: CssColor::BLACK,
+        accent_color: CssColor::WHITE,
+        accent_color_text: CssColor::BLACK,
+        selected_item: CssColor::WHITE,
+        selected_item_text: CssColor::BLACK,
+    };
+
+    /// Deterministic dark high-contrast palette.
+    pub const DARK: Self = Self {
+        canvas: CssColor::BLACK,
+        canvas_text: CssColor::WHITE,
+        link_text: CssColor::WHITE,
+        visited_text: CssColor::WHITE,
+        active_text: CssColor::WHITE,
+        button_face: CssColor::BLACK,
+        button_text: CssColor::WHITE,
+        button_border: CssColor::srgb_const(0.5, 0.5, 0.5, 1.0),
+        field: CssColor::BLACK,
+        field_text: CssColor::WHITE,
+        highlight: CssColor::BLACK,
+        highlight_text: CssColor::WHITE,
+        mark: CssColor::BLACK,
+        mark_text: CssColor::WHITE,
+        gray_text: CssColor::WHITE,
+        accent_color: CssColor::BLACK,
+        accent_color_text: CssColor::WHITE,
+        selected_item: CssColor::BLACK,
+        selected_item_text: CssColor::WHITE,
+    };
+}
+
+/// Whether CSS forced-colors mode is active for this render.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Public Copy render option avoids per-style indirection.
+pub enum ForcedColorsMode {
+    /// Preserve authors' colors.
+    #[default]
+    Inactive,
+    /// Force used colors through the supplied system-color palette.
+    Active(ForcedColorPalette),
+}
+
+/// Canonical CSS system-color keyword.
+///
+/// Legacy CSS CssColor aliases are normalized by the parser to one of these
+/// values before the forced-colors used-value stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemColor {
+    Canvas,
+    CanvasText,
+    LinkText,
+    VisitedText,
+    ActiveText,
+    ButtonFace,
+    ButtonText,
+    ButtonBorder,
+    Field,
+    FieldText,
+    Highlight,
+    HighlightText,
+    Mark,
+    MarkText,
+    GrayText,
+    AccentColor,
+    AccentColorText,
+    SelectedItem,
+    SelectedItemText,
+}
+
+impl ForcedColorPalette {
+    pub(crate) const fn color(self, system: SystemColor) -> CssColor {
+        match system {
+            SystemColor::Canvas => self.canvas,
+            SystemColor::CanvasText => self.canvas_text,
+            SystemColor::LinkText => self.link_text,
+            SystemColor::VisitedText => self.visited_text,
+            SystemColor::ActiveText => self.active_text,
+            SystemColor::ButtonFace => self.button_face,
+            SystemColor::ButtonText => self.button_text,
+            SystemColor::ButtonBorder => self.button_border,
+            SystemColor::Field => self.field,
+            SystemColor::FieldText => self.field_text,
+            SystemColor::Highlight => self.highlight,
+            SystemColor::HighlightText => self.highlight_text,
+            SystemColor::Mark => self.mark,
+            SystemColor::MarkText => self.mark_text,
+            SystemColor::GrayText => self.gray_text,
+            SystemColor::AccentColor => self.accent_color,
+            SystemColor::AccentColorText => self.accent_color_text,
+            SystemColor::SelectedItem => self.selected_item,
+            SystemColor::SelectedItemText => self.selected_item_text,
+        }
+    }
+}
+
+impl ForcedColorsMode {
+    /// Whether forced colors are enabled.
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Active(_))
+    }
+
+    /// Return the active palette, if any.
+    pub const fn palette(self) -> Option<ForcedColorPalette> {
+        match self {
+            Self::Inactive => None,
+            Self::Active(palette) => Some(palette),
+        }
+    }
+}
+
+/// Author control over forced-color used-value substitution.
+///
+/// <https://www.w3.org/TR/css-color-adjust-1/#forced-color-adjust-prop>
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ForcedColorAdjust {
+    #[default]
+    Auto,
+    None,
+    PreserveParentColor,
+}
+
 /// CSS-pixel viewport coordinates used only by media-query evaluation.
 /// They are deliberately distinct from PDF-point layout viewport lengths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +378,7 @@ pub struct MediaEnvironment {
     pub media_type: MediaType,
     pub viewport: CssViewportSize,
     pub resolution_dppx: f32,
+    pub forced_colors: ForcedColorsMode,
 }
 
 impl MediaEnvironment {
@@ -200,7 +387,13 @@ impl MediaEnvironment {
             media_type,
             viewport,
             resolution_dppx: 1.0,
+            forced_colors: ForcedColorsMode::Inactive,
         }
+    }
+
+    pub const fn with_forced_colors(mut self, forced_colors: ForcedColorsMode) -> Self {
+        self.forced_colors = forced_colors;
+        self
     }
 }
 
@@ -235,25 +428,105 @@ mod tests {
     }
 }
 
-/// The CSS color space in which a [`Color`] stores its three coordinates.
+/// A predefined CSS RGB component space.
 ///
-/// CSS Color 4 keeps colors in their specified space until they are used by a
+/// CSS CssColor 4 keeps colors in their specified space until they are used by a
 /// physical output device.  In particular, an out-of-sRGB Display-P3 color
 /// must not be clipped merely because Quire's layout engine is not itself a
 /// display device.  See <https://www.w3.org/TR/css-color-4/#color-conversion>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
-pub(crate) enum ColorSpace {
+pub(crate) enum RgbColorSpace {
     Srgb,
     DisplayP3,
     A98Rgb,
     ProphotoRgb,
     Rec2020,
-    /// Device-independent CIE XYZ, chromatically adapted to D50.
+}
+
+/// The component model carried by a CSS color.
+///
+/// A D50 XYZ profile-connection-space value must not be mistaken for RGB
+/// channels merely because both have three scalar components. CSS CssColor 4
+/// conversion preserves this distinction until a concrete output boundary.
+/// <https://www.w3.org/TR/css-color-4/#color-conversion>
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CssColorCoordinates {
+    Srgb(EncodedRgb<Srgb>),
+    DisplayP3(EncodedRgb<DisplayP3>),
+    A98Rgb(EncodedRgb<A98Rgb>),
+    ProphotoRgb(EncodedRgb<ProphotoRgb>),
+    Rec2020(EncodedRgb<Rec2020>),
+    XyzD50(D50Xyz),
+}
+
+/// Encoded coordinates in one predefined CSS RGB space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CssRgbCoordinates {
+    pub(crate) red: f32,
+    pub(crate) green: f32,
+    pub(crate) blue: f32,
+}
+
+const fn rgb_components(coordinates: CssRgbCoordinates) -> [f32; 3] {
+    [coordinates.red, coordinates.green, coordinates.blue]
+}
+
+/// Encoded components tagged with their CSS predefined RGB space.
+///
+/// The marker is zero-sized but prevents `DisplayP3` coordinates from being
+/// constructed as an `EncodedRgb<Srgb>` by accident.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EncodedRgb<Space> {
+    coordinates: CssRgbCoordinates,
+    marker: std::marker::PhantomData<Space>,
+}
+
+impl<Space> EncodedRgb<Space> {
+    const fn new(red: f32, green: f32, blue: f32) -> Self {
+        Self {
+            coordinates: CssRgbCoordinates { red, green, blue },
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    const fn coordinates(self) -> CssRgbCoordinates {
+        self.coordinates
+    }
+}
+
+// Private markers for CSS's distinct encoded RGB component spaces.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Srgb;
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DisplayP3;
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct A98Rgb;
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ProphotoRgb;
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Rec2020;
+
+/// Device-independent CIE XYZ coordinates chromatically adapted to D50.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct D50Xyz {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) z: f32,
+}
+
+/// The CSS component space in which a [`CssColor`] stores its coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CssColorSpace {
+    Srgb,
+    DisplayP3,
+    A98Rgb,
+    ProphotoRgb,
+    Rec2020,
     XyzD50,
 }
 
-impl ColorSpace {
+impl CssColorSpace {
     /// Stable discriminant for document-local cache keys.
     pub(crate) const fn cache_key(self) -> u8 {
         self as u8
@@ -262,42 +535,64 @@ impl ColorSpace {
 
 /// A CSS color with independent alpha and color-space-tagged coordinates.
 ///
-/// `r`, `g`, and `b` are historic field names retained while the renderer is
-/// migrated; they are generic three-component coordinates, not necessarily
-/// sRGB channels. Alpha is always clamped as required by CSS Color 4.
+/// Coordinates retain their semantic model until an output boundary. Alpha is
+/// always clamped as required by CSS CssColor 4.
 ///
 /// <https://www.w3.org/TR/css-color-4/#alpha-value>
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Color {
-    pub r: f32,
-    pub g: f32,
-    pub b: f32,
-    pub a: f32,
-    pub(crate) space: ColorSpace,
+#[derive(Debug, Clone, Copy)]
+pub struct CssColor {
+    coordinates: CssColorCoordinates,
+    alpha: CssAlpha,
+    pub(crate) system: Option<SystemColor>,
 }
 
-impl Color {
+/// CSS alpha is independent of the coordinate system and always normalized.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CssAlpha(f32);
+
+impl CssAlpha {
+    const fn new(value: f32) -> Self {
+        Self(value.clamp(0.0, 1.0))
+    }
+
+    pub(crate) const fn value(self) -> f32 {
+        self.0
+    }
+}
+
+// The system-color marker is cascade metadata, not part of a color's paint
+// value. In particular, collapsed-border conflict resolution must consider a
+// resolved `CanvasText` equal to the same concrete palette color.
+impl PartialEq for CssColor {
+    fn eq(&self, other: &Self) -> bool {
+        self.coordinates == other.coordinates && self.alpha == other.alpha
+    }
+}
+
+impl CssColor {
     pub const BLACK: Self = Self {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: 1.0,
-        space: ColorSpace::Srgb,
+        coordinates: CssColorCoordinates::Srgb(EncodedRgb::new(0.0, 0.0, 0.0)),
+        alpha: CssAlpha::new(1.0),
+        system: None,
     };
     pub const WHITE: Self = Self {
-        r: 1.0,
-        g: 1.0,
-        b: 1.0,
-        a: 1.0,
-        space: ColorSpace::Srgb,
+        coordinates: CssColorCoordinates::Srgb(EncodedRgb::new(1.0, 1.0, 1.0)),
+        alpha: CssAlpha::new(1.0),
+        system: None,
     };
     pub const TRANSPARENT: Self = Self {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: 0.0,
-        space: ColorSpace::Srgb,
+        coordinates: CssColorCoordinates::Srgb(EncodedRgb::new(0.0, 0.0, 0.0)),
+        alpha: CssAlpha::new(0.0),
+        system: None,
     };
+
+    const fn srgb_const(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self {
+            coordinates: CssColorCoordinates::Srgb(EncodedRgb::new(r, g, b)),
+            alpha: CssAlpha::new(a),
+            system: None,
+        }
+    }
 
     pub fn new(r: u8, g: u8, b: u8) -> Self {
         Self::rgba(r, g, b, 1.0)
@@ -305,69 +600,229 @@ impl Color {
 
     /// Create an sRGB color with alpha.
     ///
-    /// CSS Color Level 4 defines alpha as a number in `[0, 1]` after
+    /// CSS CssColor Level 4 defines alpha as a number in `[0, 1]` after
     /// clamping:
     /// <https://www.w3.org/TR/css-color-4/#alpha-value>.
     pub fn rgba(r: u8, g: u8, b: u8, a: f32) -> Self {
         Self {
-            r: r as f32 / 255.0,
-            g: g as f32 / 255.0,
-            b: b as f32 / 255.0,
-            a: a.clamp(0.0, 1.0),
-            space: ColorSpace::Srgb,
+            coordinates: CssColorCoordinates::Srgb(EncodedRgb::new(
+                r as f32 / 255.0,
+                g as f32 / 255.0,
+                b as f32 / 255.0,
+            )),
+            alpha: CssAlpha::new(a),
+            system: None,
         }
     }
 
     /// Create an sRGB color from normalized CSS color components.
     ///
-    /// CSS Color Level 4 defines `color(srgb ...)` components as numbers or
+    /// CSS CssColor Level 4 defines `color(srgb ...)` components as numbers or
     /// percentages in the sRGB color space, with alpha clamped to `[0, 1]`:
     /// <https://www.w3.org/TR/css-color-4/#predefined-sRGB>.
     pub(crate) fn srgb(r: f32, g: f32, b: f32, a: f32) -> Self {
         Self {
-            r: r.clamp(0.0, 1.0),
-            g: g.clamp(0.0, 1.0),
-            b: b.clamp(0.0, 1.0),
-            a: a.clamp(0.0, 1.0),
-            space: ColorSpace::Srgb,
+            coordinates: CssColorCoordinates::Srgb(EncodedRgb::new(
+                r.clamp(0.0, 1.0),
+                g.clamp(0.0, 1.0),
+                b.clamp(0.0, 1.0),
+            )),
+            alpha: CssAlpha::new(a),
+            system: None,
         }
     }
 
-    /// Create a color in a CSS Color 4 predefined RGB space, retaining
+    /// Create a color in a CSS CssColor 4 predefined RGB space, retaining
     /// out-of-gamut coordinates for the eventual output conversion.
-    pub(crate) fn in_space(space: ColorSpace, r: f32, g: f32, b: f32, a: f32) -> Self {
+    pub(crate) fn rgb(space: RgbColorSpace, red: f32, green: f32, blue: f32, a: f32) -> Self {
         Self {
-            r,
-            g,
-            b,
-            a: a.clamp(0.0, 1.0),
-            space,
+            coordinates: match space {
+                RgbColorSpace::Srgb => CssColorCoordinates::Srgb(EncodedRgb::new(red, green, blue)),
+                RgbColorSpace::DisplayP3 => {
+                    CssColorCoordinates::DisplayP3(EncodedRgb::new(red, green, blue))
+                }
+                RgbColorSpace::A98Rgb => {
+                    CssColorCoordinates::A98Rgb(EncodedRgb::new(red, green, blue))
+                }
+                RgbColorSpace::ProphotoRgb => {
+                    CssColorCoordinates::ProphotoRgb(EncodedRgb::new(red, green, blue))
+                }
+                RgbColorSpace::Rec2020 => {
+                    CssColorCoordinates::Rec2020(EncodedRgb::new(red, green, blue))
+                }
+            },
+            alpha: CssAlpha::new(a),
+            system: None,
         }
     }
 
-    pub(crate) const fn space(self) -> ColorSpace {
-        self.space
+    /// Create a D50 XYZ profile-connection-space color.
+    pub(crate) fn xyz_d50(x: f32, y: f32, z: f32, a: f32) -> Self {
+        Self {
+            coordinates: CssColorCoordinates::XyzD50(D50Xyz { x, y, z }),
+            alpha: CssAlpha::new(a),
+            system: None,
+        }
+    }
+
+    /// Construct a color from legacy three-component callers while retaining
+    /// the coordinate model selected by CSS CssColor.
+    ///
+    /// This compatibility boundary is deliberately centralized during the
+    /// renderer-wide typed-coordinate migration: RGB spaces use the typed RGB
+    /// constructor and the profile-connection space uses the distinct XYZ
+    /// constructor, so callers cannot accidentally label XYZ coordinates as
+    /// RGB channels.
+    pub(crate) fn in_space(
+        space: CssColorSpace,
+        first: f32,
+        second: f32,
+        third: f32,
+        a: f32,
+    ) -> Self {
+        match space {
+            CssColorSpace::Srgb => Self::rgb(RgbColorSpace::Srgb, first, second, third, a),
+            CssColorSpace::DisplayP3 => {
+                Self::rgb(RgbColorSpace::DisplayP3, first, second, third, a)
+            }
+            CssColorSpace::A98Rgb => Self::rgb(RgbColorSpace::A98Rgb, first, second, third, a),
+            CssColorSpace::ProphotoRgb => {
+                Self::rgb(RgbColorSpace::ProphotoRgb, first, second, third, a)
+            }
+            CssColorSpace::Rec2020 => Self::rgb(RgbColorSpace::Rec2020, first, second, third, a),
+            CssColorSpace::XyzD50 => Self::xyz_d50(first, second, third, a),
+        }
+    }
+
+    pub(crate) const fn space(self) -> CssColorSpace {
+        match self.coordinates {
+            CssColorCoordinates::Srgb(_) => CssColorSpace::Srgb,
+            CssColorCoordinates::DisplayP3(_) => CssColorSpace::DisplayP3,
+            CssColorCoordinates::A98Rgb(_) => CssColorSpace::A98Rgb,
+            CssColorCoordinates::ProphotoRgb(_) => CssColorSpace::ProphotoRgb,
+            CssColorCoordinates::Rec2020(_) => CssColorSpace::Rec2020,
+            CssColorCoordinates::XyzD50(_) => CssColorSpace::XyzD50,
+        }
+    }
+
+    /// Return the three coordinates in this color's declared CSS space.
+    ///
+    /// Callers that need RGB semantics must first use `rgb_coordinates`; this
+    /// view exists for generic interpolation and backend adapters only.
+    pub(crate) const fn components(self) -> [f32; 3] {
+        match self.coordinates {
+            CssColorCoordinates::Srgb(c) => rgb_components(c.coordinates()),
+            CssColorCoordinates::DisplayP3(c) => rgb_components(c.coordinates()),
+            CssColorCoordinates::A98Rgb(c) => rgb_components(c.coordinates()),
+            CssColorCoordinates::ProphotoRgb(c) => rgb_components(c.coordinates()),
+            CssColorCoordinates::Rec2020(c) => rgb_components(c.coordinates()),
+            CssColorCoordinates::XyzD50(c) => [c.x, c.y, c.z],
+        }
+    }
+
+    pub(crate) const fn alpha(self) -> f32 {
+        self.alpha.value()
+    }
+
+    /// Return RGB coordinates only when this color is in an RGB space.
+    pub(crate) const fn rgb_coordinates(self) -> Option<(RgbColorSpace, CssRgbCoordinates)> {
+        match self.coordinates {
+            CssColorCoordinates::Srgb(coordinates) => {
+                Some((RgbColorSpace::Srgb, coordinates.coordinates()))
+            }
+            CssColorCoordinates::DisplayP3(coordinates) => {
+                Some((RgbColorSpace::DisplayP3, coordinates.coordinates()))
+            }
+            CssColorCoordinates::A98Rgb(coordinates) => {
+                Some((RgbColorSpace::A98Rgb, coordinates.coordinates()))
+            }
+            CssColorCoordinates::ProphotoRgb(coordinates) => {
+                Some((RgbColorSpace::ProphotoRgb, coordinates.coordinates()))
+            }
+            CssColorCoordinates::Rec2020(coordinates) => {
+                Some((RgbColorSpace::Rec2020, coordinates.coordinates()))
+            }
+            CssColorCoordinates::XyzD50(_) => None,
+        }
+    }
+
+    /// Return D50 XYZ coordinates only when this color is in the PCS.
+    pub(crate) const fn xyz_d50_coordinates(self) -> Option<D50Xyz> {
+        match self.coordinates {
+            CssColorCoordinates::Srgb(_)
+            | CssColorCoordinates::DisplayP3(_)
+            | CssColorCoordinates::A98Rgb(_)
+            | CssColorCoordinates::ProphotoRgb(_)
+            | CssColorCoordinates::Rec2020(_) => None,
+            CssColorCoordinates::XyzD50(coordinates) => Some(coordinates),
+        }
+    }
+
+    /// Convert this computed CSS color to its D50 profile-connection-space
+    /// coordinates without clipping or output encoding.
+    pub(crate) fn to_xyz_d50(self) -> D50Xyz {
+        self.xyz_d50_coordinates().unwrap_or_else(|| {
+            crate::css::color_to_xyz_d50(self)
+                .xyz_d50_coordinates()
+                .expect("CSS D50 conversion must produce PCS coordinates")
+        })
+    }
+
+    /// Convert this computed CSS color to a requested predefined RGB space
+    /// without clipping or quantization. The result remains a CSS color.
+    pub(crate) fn to_rgb_space(self, space: RgbColorSpace) -> Self {
+        let target = match space {
+            RgbColorSpace::Srgb => CssColorSpace::Srgb,
+            RgbColorSpace::DisplayP3 => CssColorSpace::DisplayP3,
+            RgbColorSpace::A98Rgb => CssColorSpace::A98Rgb,
+            RgbColorSpace::ProphotoRgb => CssColorSpace::ProphotoRgb,
+            RgbColorSpace::Rec2020 => CssColorSpace::Rec2020,
+        };
+        crate::css::color_to_predefined_rgb(self, target)
+            .expect("a predefined CSS RGB target must be convertible")
+    }
+
+    pub(crate) const fn system(system: SystemColor, color: Self) -> Self {
+        Self {
+            system: Some(system),
+            ..color
+        }
+    }
+
+    pub(crate) const fn system_color(self) -> Option<SystemColor> {
+        self.system
     }
 
     pub(crate) fn with_alpha(self, alpha: f32) -> Self {
         Self {
-            a: alpha.clamp(0.0, 1.0),
+            alpha: CssAlpha::new(alpha),
             ..self
         }
     }
 
     pub(crate) fn is_visible(self) -> bool {
-        self.a > 0.0
+        self.alpha.value() > 0.0
     }
 
     pub(crate) fn is_opaque(self) -> bool {
-        (self.a - 1.0).abs() < 0.001
+        (self.alpha.value() - 1.0).abs() < 0.001
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Stylesheet {
     pub origin: StylesheetOrigin,
+    /// URL context inherited by declarations synthesized from this stylesheet.
+    ///
+    /// HTML presentational hints are generated during cascade, after parsing,
+    /// but URL-valued hints such as a legacy table `background` attribute must
+    /// resolve exactly like declarations in the owning document stylesheet.
+    pub base_url: Option<url::Url>,
+    pub root_url: Option<url::Url>,
+    /// The renderer color-adjustment environment used while parsing this
+    /// stylesheet. Cascade-time used-value adjustment reads the same immutable
+    /// input as its nested `@media` rules.
+    pub forced_colors: ForcedColorsMode,
     /// Whether this is Quire's built-in HTML presentational-hints sheet.
     ///
     /// Static selector-expressible hints live in the stylesheet itself, while
@@ -412,6 +867,8 @@ pub(crate) struct Stylesheet {
     pub after_marker_rules: Vec<StyleRule>,
     pub before_rules: Vec<StyleRule>,
     pub after_rules: Vec<StyleRule>,
+    pub footnote_call_rules: Vec<StyleRule>,
+    pub footnote_marker_rules: Vec<StyleRule>,
     pub first_line_rules: Vec<StyleRule>,
     pub first_letter_rules: Vec<StyleRule>,
     pub page_rules: Vec<PageRule>,
@@ -436,6 +893,10 @@ pub(crate) struct PageRule {
     pub selectors: Vec<PageSelector>,
     pub declarations: Declarations,
     pub margin_boxes: HashMap<String, Declarations>,
+    /// Cascaded declarations for GCPM's page-footnote area, if this page rule
+    /// defines one:
+    /// <https://www.w3.org/TR/css-gcpm-3/#footnote-area>.
+    pub footnote_area: Option<Declarations>,
     pub order: usize,
     /// Resolved cascade layer order for this page rule, if declared in `@layer`.
     ///
@@ -622,6 +1083,11 @@ pub(crate) struct CssFontFace {
     /// CSS Fonts Level 5 `size-adjust` is distinct from the element-level
     /// `font-size-adjust` property and therefore remains face metadata.
     pub size_adjust: Option<u32>,
+    /// CSS Fonts metric override descriptors, stored as percentage factors of
+    /// the selected face's em square.
+    pub ascent_override: Option<u32>,
+    pub descent_override: Option<u32>,
+    pub line_gap_override: Option<u32>,
     pub weight: FontWeight,
     /// `font-weight: auto` (the descriptor initial value) or a variable range.
     /// In both cases the registered face keeps its intrinsic `wght` axis.
@@ -631,6 +1097,9 @@ pub(crate) struct CssFontFace {
     /// `font-stretch: auto` (the descriptor initial value) or a variable range.
     /// In both cases the registered face keeps its intrinsic `wdth` axis.
     pub width_is_variable: bool,
+    /// Default OpenType axis coordinates supplied by the @font-face
+    /// `font-variation-settings` descriptor.
+    pub font_variation_settings: FontVariationSettings,
     pub font_feature_settings: FontFeatureSettings,
     pub font_variant_ligatures: FontVariantLigatures,
     pub font_variant_position: FontVariantPosition,
@@ -677,6 +1146,9 @@ pub(crate) struct StyleRule {
     pub selector_text: String,
     pub selector: SelectorList<QuireSelectorImpl>,
     pub declarations: Declarations,
+    /// Maximum selector-list specificity, retained for parser diagnostics and
+    /// tests. The cascade uses the specificity of the branch that matched.
+    #[allow(dead_code)]
     pub specificity: u32,
     pub order: usize,
     pub layer_name: Option<String>,

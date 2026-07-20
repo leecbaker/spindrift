@@ -1,5 +1,59 @@
 use super::*;
 
+/// Parse CSS Text Level 4's `text-spacing-trim` keyword.
+///
+/// <https://drafts.csswg.org/css-text-4/#text-spacing-trim-property>.
+pub(in crate::css) fn parse_text_spacing_trim(value: &str) -> Option<TextSpacingTrim> {
+    match trim_css_value(value).to_ascii_lowercase().as_str() {
+        "space-all" => Some(TextSpacingTrim::SpaceAll),
+        "normal" => Some(TextSpacingTrim::Normal),
+        "space-first" => Some(TextSpacingTrim::SpaceFirst),
+        "trim-start" => Some(TextSpacingTrim::TrimStart),
+        "trim-both" => Some(TextSpacingTrim::TrimBoth),
+        "trim-all" => Some(TextSpacingTrim::TrimAll),
+        "auto" => Some(TextSpacingTrim::Auto),
+        _ => None,
+    }
+}
+
+/// Parse CSS Text Level 4's `text-spacing` shorthand.
+///
+/// The shorthand owns both text-spacing longhands, so an omitted component
+/// resets to that longhand's initial value:
+/// <https://drafts.csswg.org/css-text-4/#text-spacing-property>.
+pub(in crate::css) fn parse_text_spacing(value: &str) -> Option<(TextSpacingTrim, TextAutospace)> {
+    let tokens = split_css_component_values(value);
+    if tokens.len() == 1 {
+        return match tokens[0].to_ascii_lowercase().as_str() {
+            "none" => Some((TextSpacingTrim::SpaceAll, TextAutospace::NONE)),
+            "normal" => Some((TextSpacingTrim::Normal, TextAutospace::NORMAL)),
+            "auto" => Some((TextSpacingTrim::Auto, TextAutospace::NORMAL)),
+            _ => parse_text_spacing_trim(tokens[0])
+                .map(|trim| (trim, TextAutospace::NORMAL))
+                .or_else(|| {
+                    parse_text_autospace(tokens[0])
+                        .map(|autospace| (TextSpacingTrim::Normal, autospace))
+                }),
+        };
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut trim = None;
+    let mut autospace_tokens = Vec::new();
+    for token in tokens {
+        if let Some(value) = parse_text_spacing_trim(token) {
+            if trim.replace(value).is_some() {
+                return None;
+            }
+        } else {
+            autospace_tokens.push(token);
+        }
+    }
+    let autospace = parse_text_autospace(&autospace_tokens.join(" "))?;
+    Some((trim.unwrap_or(TextSpacingTrim::Normal), autospace))
+}
+
 /// Parse CSS Text Level 4's `text-autospace` keyword set.
 ///
 /// The grammar accepts `normal`, `auto`, `no-autospace`, or an unordered set
@@ -526,7 +580,7 @@ pub(in crate::css) fn parse_text_emphasis_style(value: &str) -> Option<TextEmpha
 
 pub(in crate::css) fn parse_text_emphasis(
     value: &str,
-) -> Option<(TextEmphasisStyle, Option<Color>)> {
+) -> Option<(TextEmphasisStyle, Option<CssColor>)> {
     let parts = split_css_component_values(value);
     if parts.is_empty() {
         return None;
@@ -608,10 +662,10 @@ pub(in crate::css) fn parse_text_shadow(value: &str, font_size: f32) -> Option<V
     if value.eq_ignore_ascii_case("none") {
         return Some(Vec::new());
     }
-    let mut shadows = Vec::new();
-    for layer in split_css_args(value, ',') {
-        shadows.push(parse_text_shadow_layer(layer, font_size)?);
-    }
+    let shadows = split_css_args(value, ',')
+        .into_iter()
+        .map(|layer| parse_text_shadow_layer(layer, font_size))
+        .collect::<Option<Vec<_>>>()?;
     (!shadows.is_empty()).then_some(shadows)
 }
 
@@ -631,7 +685,7 @@ pub(in crate::css) fn parse_text_shadow_layer(value: &str, font_size: f32) -> Op
         if color.is_none()
             && let Some(parsed_color) = parse_color(part)
         {
-            color = Some(TextShadowColor::Color(parsed_color));
+            color = Some(TextShadowColor::CssColor(parsed_color));
             continue;
         }
         if let Some(length) = parse_shadow_length(part, font_size) {
@@ -669,10 +723,10 @@ pub(in crate::css) fn parse_box_shadow(value: &str, font_size: f32) -> Option<Ve
     if value.eq_ignore_ascii_case("none") {
         return Some(Vec::new());
     }
-    let mut shadows = Vec::new();
-    for layer in split_css_args(value, ',') {
-        shadows.push(parse_box_shadow_layer(layer, font_size)?);
-    }
+    let shadows = split_css_args(value, ',')
+        .into_iter()
+        .map(|layer| parse_box_shadow_layer(layer, font_size))
+        .collect::<Option<Vec<_>>>()?;
     (!shadows.is_empty()).then_some(shadows)
 }
 
@@ -692,7 +746,7 @@ pub(in crate::css) fn parse_box_shadow_layer(value: &str, font_size: f32) -> Opt
         if color.is_none()
             && let Some(parsed_color) = parse_color(part)
         {
-            color = Some(BoxShadowColor::Color(parsed_color));
+            color = Some(BoxShadowColor::CssColor(parsed_color));
             continue;
         }
         if let Some(length) = parse_shadow_length(part, font_size) {

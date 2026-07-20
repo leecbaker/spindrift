@@ -9,7 +9,7 @@ use selectors::context::{
     MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags, QuirksMode,
     SelectorCaches,
 };
-use selectors::matching::{ElementSelectorFlags, matches_selector_list};
+use selectors::matching::{ElementSelectorFlags, matches_selector, matches_selector_list};
 use selectors::parser::{
     NonTSPseudoClass, Parser as SelectorParser, PseudoElement, SelectorImpl, SelectorList,
     SelectorParseErrorKind,

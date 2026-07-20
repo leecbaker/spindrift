@@ -61,6 +61,18 @@ enum PageContentPart {
 pub(super) enum PageMarginContentItem {
     Inline(GeneratedContentPart),
     EmbeddedRunningElement(Box<RunningElementCapture>),
+    /// A page-associated counter captured by `string-set`.
+    ///
+    /// Unlike ordinary counters, `page` and `pages` are only known after
+    /// pagination. Keep their authored syntax until the named string is
+    /// resolved, then evaluate it in the page context of its source
+    /// assignment rather than the page margin box consuming `string()`.
+    /// <https://www.w3.org/TR/css-gcpm-3/#setting-named-strings>
+    NamedStringPageCounter {
+        name: String,
+        separator: Option<String>,
+        style: Option<ListStyleType>,
+    },
     TargetCounter {
         target: String,
         name: String,
@@ -94,6 +106,7 @@ impl ResolvedPageContent {
                 | GeneratedContentPart::TargetText { .. } => false,
             },
             PageMarginContentItem::EmbeddedRunningElement(_) => false,
+            PageMarginContentItem::NamedStringPageCounter { .. } => false,
             PageMarginContentItem::TargetCounter { .. }
             | PageMarginContentItem::TargetText { .. } => false,
         })
@@ -127,6 +140,7 @@ pub(super) struct PageContentResolveContext<'a> {
     pub page_anchor_text: &'a HashMap<String, AnchorText>,
     pub counter_styles: &'a HashMap<String, CounterStyleRule>,
     pub page_counters: &'a HashMap<String, i32>,
+    pub page_counters_by_page: &'a [HashMap<String, i32>],
 }
 
 /// Resolves a page-margin `content` value to paintable generated-content parts.
@@ -163,11 +177,11 @@ pub(super) fn resolve_page_content_parts(
             }
             PageContentPart::Image { image } => {
                 output.push(PageMarginContentItem::Inline(GeneratedContentPart::Image {
-                    image: page_content_image_with_context_urls(
+                    image: css::ComputedImage::image(page_content_image_with_context_urls(
                         image,
                         context.base_url,
                         context.root_url,
-                    ),
+                    )),
                 }))
             }
             PageContentPart::Quote(quote) => output.push(PageMarginContentItem::Inline(
@@ -288,7 +302,7 @@ fn append_assignment_generated_content(
 ) {
     match &assignment.value {
         PageAssignmentValue::GeneratedContent(parts) => {
-            append_resolved_items(output, parts, context);
+            append_resolved_items(output, parts, assignment.placement.page_index, context);
         }
         PageAssignmentValue::RunningElement(capture) => {
             output.push(PageMarginContentItem::EmbeddedRunningElement(
@@ -301,6 +315,7 @@ fn append_assignment_generated_content(
 fn append_resolved_items(
     output: &mut Vec<PageMarginContentItem>,
     items: &[PageMarginContentItem],
+    source_page_index: usize,
     context: &PageContentResolveContext<'_>,
 ) {
     for item in items {
@@ -356,6 +371,31 @@ fn append_resolved_items(
                     context.page_anchor_text,
                 ) {
                     push_resolved_text(output, &value);
+                }
+            }
+            PageMarginContentItem::NamedStringPageCounter {
+                name,
+                separator,
+                style,
+            } => {
+                let value = if name.eq_ignore_ascii_case("pages") {
+                    context.total_pages as i32
+                } else {
+                    context
+                        .page_counters_by_page
+                        .get(source_page_index)
+                        .and_then(|counters| counters.get(name))
+                        .cloned()
+                        .unwrap_or(source_page_index.saturating_add(1) as i32)
+                };
+                let counter = format_page_counter_i32(value, style.clone(), context.counter_styles);
+                if let Some(separator) = separator {
+                    push_resolved_text(output, &counter);
+                    if counter.is_empty() {
+                        push_resolved_text(output, separator);
+                    }
+                } else {
+                    push_resolved_text(output, &counter);
                 }
             }
             _ => output.push(item.clone()),
@@ -1024,11 +1064,11 @@ mod tests {
             .unwrap(),
             vec![
                 PageContentPart::PageCounter {
-                    style: Some(ListStyleType::UpperRoman),
+                    style: Some(ListStyleType::Named("upper-roman".to_string())),
                 },
                 PageContentPart::Text("/".to_string()),
                 PageContentPart::PagesCounter {
-                    style: Some(ListStyleType::DecimalLeadingZero),
+                    style: Some(ListStyleType::Named("decimal-leading-zero".to_string())),
                 }
             ]
         );
@@ -1036,7 +1076,7 @@ mod tests {
             parse_page_content(r#"counter(foo, lower-alpha)"#).unwrap(),
             vec![PageContentPart::Counter {
                 name: "foo".to_string(),
-                style: Some(ListStyleType::LowerAlpha),
+                style: Some(ListStyleType::Named("lower-alpha".to_string())),
             }]
         );
         assert_eq!(
@@ -1044,7 +1084,7 @@ mod tests {
             vec![PageContentPart::Counters {
                 name: "foo".to_string(),
                 separator: ".".to_string(),
-                style: Some(ListStyleType::LowerRoman),
+                style: Some(ListStyleType::Named("lower-roman".to_string())),
             }]
         );
         assert_eq!(
@@ -1052,7 +1092,7 @@ mod tests {
             vec![PageContentPart::TargetCounter {
                 target: "#chapter".to_string(),
                 name: "page".to_string(),
-                style: Some(ListStyleType::LowerRoman),
+                style: Some(ListStyleType::Named("lower-roman".to_string())),
             }]
         );
         assert_eq!(

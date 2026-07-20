@@ -5,6 +5,20 @@ current behavior rather than treating harness thresholds as renderer support.
 
 ## Current baseline
 
+On 2026-07-24, the local `quire-wpt` raw run of `css/CSS2/pagination/`
+rendered 43 reftests:
+
+- 42 passed;
+- 1 failed.
+
+The remaining raw mismatch, `row-page-break-inside-avoid-2-print.html`, is a
+legacy reference incompatibility rather than a renderer target. Its source
+table has no header row, but its assigned reference introduces a `<thead>`
+whose `page-break-after: always` creates different page content. The same
+case fails in all four configured engines. Quire deliberately preserves the
+source table's CSS Fragmentation behavior instead of adding a test-specific
+header/repetition exception; see `SPEC_DIVERGENCES.md`.
+
 On 2026-07-18, the local `quire-wpt` raw run of `css/css-page/` rendered 226
 reftests with the development binary and `--page-margin=0px`:
 
@@ -22,9 +36,22 @@ margin-box alignment work.
 
 ## Implemented foundations
 
+- On 2026-07-28, a fresh local run of all 53
+  `css/css-page/page-name-*-print.html` reftests rendered 53 matches and no
+  mismatches. Named-page selection now resolves used start/end values before
+  comparing class-A boundaries and re-enters destination page contexts with
+  normalized continuation offsets.
 - Page-name scopes retain their lexical specified value independently from the
   currently selected page, so nested and flex-item page groups do not leak
   into their parent scope.
+- Formatting-tree propagation resolves each descendant's `page:auto` against
+  its nearest non-auto ancestor before its start/end values are compared at a
+  class-A boundary. The same immutable used-value model is used for ordinary
+  block flow and table rows; output-page selection is no longer used as that
+  ancestor lookup.
+- Leading direct inline content remains in the initial `page:auto` group when
+  a later block descendant selects a named page, preserving the class-A page
+  break between those two groups.
 - Page-local canvas insets are tracked while root/body fragments are laid out,
   preventing a page transition from carrying the first page's canvas offset
   into later named pages.
@@ -33,6 +60,14 @@ margin-box alignment work.
   now takes its fallback block basis from that logical page extent.
 - Deferred float paint materializes every destination page and marks a page
   containing deferred paint as a real fragmentainer.
+- A cleared, `break-inside: avoid` float now freezes its definite percentage
+  block size before isolated replay and defers its destination-page paint.
+  Its following in-flow siblings consequently remain in their source
+  fragmentainer while the new page receives the float's page-local exclusion.
+- Oversized table rows select shared in-flow child boundaries before committing
+  a row piece. A child that fits on a fresh fragmentainer is therefore moved
+  intact rather than replayed as a zero-height source slice; table captions
+  remain table-wrapper edge content across those continuations.
 - Absolutely positioned replay retains every captured painted fragment. A
   background-only slice must not be discarded merely because it contains no
   text baseline.

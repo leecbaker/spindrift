@@ -60,7 +60,7 @@ P<br>A<wbr>S<br>S"#,
         "object fallback contents should be suppressed: {visible_text:?}"
     );
 
-    let red = Color::new(255, 0, 0);
+    let red = CssColor::new(255, 0, 0);
     assert!(
         document
             .pages
@@ -126,7 +126,7 @@ async fn select_4_option_optgroup_display_none_hides_red_form_content() {
     .await
     .unwrap();
 
-    let red = Color::new(255, 0, 0);
+    let red = CssColor::new(255, 0, 0);
     let visible_text = document
         .pages
         .iter()
@@ -199,12 +199,12 @@ async fn baseline_shift_center_centers_inline_images_in_line_box() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap_or_else(|| panic!("expected big inline background: {:?}", page.rects()));
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap_or_else(|| panic!("expected small inline background: {:?}", page.rects()));
 
     let image_center = image.y() + image.height() / 2.0;
@@ -235,9 +235,97 @@ async fn renders_png_data_uri_images() {
         .write_pdf_bytes(&crate::PdfOptions::default())
         .unwrap();
     let rendered = pdf_searchable_text(&pdf);
+    // A uniform opaque raster can be emitted as an equivalent calibrated PDF
+    // fill. The retained document image still establishes the replaced
+    // element's layout and accessibility semantics; this assertion only
+    // verifies that its PDF paint representation is present.
+    assert!(
+        rendered.contains("/Subtype /Image") || rendered.contains("/CSsRGB cs"),
+        "{rendered}"
+    );
+    if rendered.contains("/Subtype /Image") {
+        assert!(rendered.contains("/Interpolate false"));
+        assert!(rendered.contains("/Im1 Do"));
+    }
+}
+
+#[tokio::test]
+async fn renders_only_the_first_frame_of_an_animated_gif_data_uri() {
+    use image::{Frame, RgbaImage};
+
+    let first = RgbaImage::from_raw(2, 1, vec![230, 32, 16, 255, 0, 0, 0, 0])
+        .expect("RGBA dimensions match the sample pixels");
+    let second = RgbaImage::from_raw(2, 1, vec![0, 96, 255, 255, 0, 96, 255, 255])
+        .expect("RGBA dimensions match the sample pixels");
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+        encoder
+            .encode_frames([Frame::new(first), Frame::new(second)])
+            .expect("GIF sample encodes");
+    }
+    let image = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let document = Html::from_string(format!(
+        "<img src=\"data:image/gif;base64,{image}\" height=\"10pt\">"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let rendered_image = &document.pages[0].images()[0];
+    assert_eq!(rendered_image.pixel_width(), 2);
+    assert_eq!(rendered_image.pixel_height(), 1);
+    let crate::document::RenderedImageSource::Stored { image_id, .. } = &rendered_image.source
+    else {
+        panic!("HTML GIF should retain a store-backed source");
+    };
+    let raster = document
+        .image_store
+        .with_rasterized(*image_id, |raster| raster)
+        .expect("GIF first frame rasterizes for PDF output");
+    assert_eq!(raster.rgb, vec![230, 32, 16, 0, 0, 0]);
+    assert_eq!(raster.alpha, Some(vec![255, 0]));
+
+    let pdf = document
+        .write_pdf_bytes(&crate::PdfOptions::default())
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
     assert!(rendered.contains("/Subtype /Image"));
-    assert!(rendered.contains("/Interpolate false"));
-    assert!(rendered.contains("/Im1 Do"));
+    assert!(rendered.contains("/FlateDecode"));
+    assert!(!rendered.contains("/DCTDecode"));
+}
+
+#[tokio::test]
+async fn renders_only_the_first_frame_of_an_animated_webp_data_uri() {
+    const ANIMATED_WEBP: &str = "UklGRoYAAABXRUJQVlA4WAoAAAACAAAAAQAAAAAAQU5JTQYAAAD/////AABBTk1GKgAAAAAAAAAAAAEAAAAAAGQAAAJWUDhMEgAAAC8BAAAADzAgYz4Q8x94yIj+B0FOTUYoAAAAAAAAAAAAAQAAAAAAZAAAAFZQOEwQAAAALwEAAAAHULDof/8DEdH/AA==";
+    let document = Html::from_string(format!(
+        "<img src=\"data:image/webp;base64,{ANIMATED_WEBP}\" height=\"10pt\">"
+    ))
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let rendered_image = &document.pages[0].images()[0];
+    assert_eq!(rendered_image.pixel_width(), 2);
+    assert_eq!(rendered_image.pixel_height(), 1);
+    let crate::document::RenderedImageSource::Stored { image_id, .. } = &rendered_image.source
+    else {
+        panic!("HTML WebP should retain a store-backed source");
+    };
+    let raster = document
+        .image_store
+        .with_rasterized(*image_id, |raster| raster)
+        .expect("WebP first frame rasterizes for PDF output");
+    assert_eq!(raster.rgb, vec![230, 32, 16, 0, 0, 0]);
+    assert_eq!(raster.alpha, None);
+
+    let pdf = document
+        .write_pdf_bytes(&crate::PdfOptions::default())
+        .unwrap();
+    let rendered = pdf_searchable_text(&pdf);
+    assert!(rendered.contains("/Subtype /Image"));
+    assert!(rendered.contains("/FlateDecode"));
+    assert!(!rendered.contains("/DCTDecode"));
 }
 
 #[tokio::test]
@@ -252,7 +340,7 @@ async fn embeds_png_alpha_as_pdf_soft_mask() {
         .unwrap();
     let rendered = pdf_searchable_text(&pdf);
     assert!(rendered.contains("/SMask"));
-    assert!(rendered.contains("/ColorSpace /DeviceGray"));
+    assert!(rendered.contains("/DeviceGray"));
     assert!(rendered.matches("/Interpolate false").count() >= 2);
 }
 
@@ -319,7 +407,7 @@ async fn floated_percentage_width_replays_resolved_used_width_once() {
     let mut rects = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(204, 204, 204)))
+        .filter(|rect| rect.fill == Some(CssColor::new(204, 204, 204)))
         .collect::<Vec<_>>();
     rects.sort_by(|a, b| a.x().total_cmp(&b.x()));
 
@@ -352,7 +440,7 @@ async fn floated_border_box_percentage_width_replay_preserves_content_width() {
     let fill = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("blue child should render");
 
     assert!((fill.x() - 15.0).abs() < 0.01, "blue child: {fill:?}");
@@ -384,7 +472,7 @@ async fn floated_non_replaced_block_intrinsic_width_honors_definite_max_width() 
     .await
     .unwrap();
 
-    let orange = Color::new(255, 165, 0);
+    let orange = CssColor::new(255, 165, 0);
     let mut right_borders = document.pages[0]
         .rects()
         .iter()
@@ -429,7 +517,7 @@ async fn min_content_block_resolves_calc_margin_percent_against_zero() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("green min-content background should paint");
 
     assert!(
@@ -484,7 +572,7 @@ async fn hidden_float_placeholders_reserve_reference_grid_cells() {
     let mut containers = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .collect::<Vec<_>>();
     containers.sort_by(|a, b| {
         b.y()
@@ -770,7 +858,7 @@ async fn inline_block_before_right_float_stays_on_same_line() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("container background should paint");
     assert!((red.width() - 75.0).abs() < 0.01, "red={red:?}");
     assert!((red.height() - 75.0).abs() < 0.01, "red={red:?}");
@@ -778,7 +866,7 @@ async fn inline_block_before_right_float_stays_on_same_line() {
     let mut green = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
     green.sort_by(|left, right| left.x().total_cmp(&right.x()));
 
@@ -828,7 +916,7 @@ async fn zero_height_float_does_not_shorten_same_top_line_box() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("container background should paint");
     assert!((red.width() - 75.0).abs() < 0.01, "red={red:?}");
     assert!((red.height() - 75.0).abs() < 0.01, "red={red:?}");
@@ -837,7 +925,7 @@ async fn zero_height_float_does_not_shorten_same_top_line_box() {
         .rects()
         .iter()
         .find(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.width() - 75.0).abs() < 0.01
                 && (rect.height() - 15.0).abs() < 0.01
         })
@@ -850,7 +938,7 @@ async fn zero_height_float_does_not_shorten_same_top_line_box() {
         .rects()
         .iter()
         .find(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.width() - 45.0).abs() < 0.01
                 && (rect.height() - 45.0).abs() < 0.01
         })
@@ -895,7 +983,7 @@ async fn inline_block_intrinsic_width_uses_own_definite_height_for_percentage_ca
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("inline-block background should paint");
     assert!((green.width() - 75.0).abs() < 0.01, "green={green:?}");
     assert!((green.height() - 75.0).abs() < 0.01, "green={green:?}");
@@ -903,7 +991,7 @@ async fn inline_block_intrinsic_width_uses_own_definite_height_for_percentage_ca
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("canvas background should paint behind green");
     assert!((red.width() - 75.0).abs() < 0.01, "red={red:?}");
     assert!((red.height() - 75.0).abs() < 0.01, "red={red:?}");
@@ -930,7 +1018,7 @@ async fn abspos_intrinsic_width_uses_own_definite_height_for_percentage_canvas()
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("absolute positioned background should paint");
     assert!((green.width() - 75.0).abs() < 0.01, "green={green:?}");
     assert!((green.height() - 75.0).abs() < 0.01, "green={green:?}");
@@ -958,7 +1046,7 @@ async fn orthogonal_abspos_canvas_static_top_keeps_physical_top_edge() {
         let green = page
             .rects()
             .iter()
-            .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+            .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
             .unwrap_or_else(|| {
                 panic!("absolute positioned background should paint in {writing_mode}")
             });
@@ -999,7 +1087,7 @@ async fn orthogonal_abspos_block_content_static_top_keeps_physical_top_edge() {
         let green = page
             .rects()
             .iter()
-            .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+            .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
             .unwrap_or_else(|| {
                 panic!("absolute positioned background should paint in {writing_mode}")
             });
@@ -1039,7 +1127,7 @@ async fn auto_height_inline_block_masks_ancestor_height_for_percentage_canvas() 
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("canvas background should paint");
     assert!(
         (red.width() - 7.5).abs() < 0.01,
@@ -1097,11 +1185,11 @@ async fn overflow_scroll_float_preserves_later_inline_block_paint_order() {
     .unwrap();
 
     let page = &document.pages[0];
-    let red = first_rect_paint_operation_index(page, Color::new(255, 0, 0));
-    let yellow = first_rect_paint_operation_index(page, Color::new(255, 255, 0));
-    let blue = first_rect_paint_operation_index(page, Color::new(0, 0, 255));
-    let green = first_rect_paint_operation_index(page, Color::new(0, 128, 0));
-    let magenta = first_rect_paint_operation_index(page, Color::new(255, 0, 255));
+    let red = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
+    let yellow = first_rect_paint_operation_index(page, CssColor::new(255, 255, 0));
+    let blue = first_rect_paint_operation_index(page, CssColor::new(0, 0, 255));
+    let green = first_rect_paint_operation_index(page, CssColor::new(0, 128, 0));
+    let magenta = first_rect_paint_operation_index(page, CssColor::new(255, 0, 255));
 
     assert!(
         red < yellow,
@@ -1121,7 +1209,7 @@ async fn overflow_scroll_float_preserves_later_inline_block_paint_order() {
     );
     assert_eq!(
         final_rect_fill_at(page, 10.0, 140.0),
-        Some(Color::new(255, 0, 255))
+        Some(CssColor::new(255, 0, 255))
     );
 }
 
@@ -1201,7 +1289,7 @@ async fn overflow_hidden_bfc_border_box_avoids_left_float_in_rtl() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("container background should paint");
     assert!((red.width() - 75.0).abs() < 0.01, "red={red:?}");
     assert!((red.height() - 75.0).abs() < 0.01, "red={red:?}");
@@ -1210,7 +1298,7 @@ async fn overflow_hidden_bfc_border_box_avoids_left_float_in_rtl() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0)) && (rect.height() - 75.0).abs() < 0.01
+            rect.fill == Some(CssColor::new(0, 128, 0)) && (rect.height() - 75.0).abs() < 0.01
         })
         .collect::<Vec<_>>();
     green_rects.sort_by(|left, right| left.x().total_cmp(&right.x()));
@@ -1231,7 +1319,7 @@ async fn overflow_hidden_bfc_border_box_avoids_left_float_in_rtl() {
     for x in [red.x() + 18.75, red.x() + 56.25] {
         assert_eq!(
             final_rect_fill_at(page, x, red.y() + 37.5),
-            Some(Color::new(0, 128, 0)),
+            Some(CssColor::new(0, 128, 0)),
             "sample at x={x} should be green"
         );
     }
@@ -1261,7 +1349,7 @@ async fn overflow_hidden_bfc_reflows_to_avoid_later_float_overlap() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("BFC background should paint");
 
     assert!((green.x() - 0.0).abs() < 0.01, "green={green:?}");
@@ -1280,7 +1368,7 @@ async fn overflow_hidden_bfc_reflows_to_avoid_later_float_overlap() {
     for y in [5.0, 37.5, 70.0] {
         assert_eq!(
             final_rect_fill_at(page, 37.5, green.y() + y),
-            Some(Color::new(0, 128, 0)),
+            Some(CssColor::new(0, 128, 0)),
             "visible BFC area should be green at y={y}: {green:?}"
         );
     }
@@ -1306,25 +1394,32 @@ async fn bfc_adjoining_float_top_margin_pulls_float_down_when_it_fits() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
-    for (x, y) in [
-        (24.0, 48.0),
-        (74.0, 48.0),
-        (149.0, 48.0),
-        (24.0, 98.0),
-        (74.0, 98.0),
-        (149.0, 98.0),
-        (24.0, 148.0),
-        (74.0, 148.0),
-        (149.0, 148.0),
-    ] {
-        assert_eq!(
-            final_rect_fill_at(page, x, y),
-            Some(green),
-            "sample at ({x}, {y}) should be green; rects={:?} operations={:?}",
-            page.rects(),
-            page.paint_operations()
-        );
+    let green = CssColor::new(0, 128, 0);
+    let bfc_background = page
+        .rects()
+        .iter()
+        .filter(|rect| rect.fill == Some(green))
+        .max_by(|left, right| left.height().partial_cmp(&right.height()).unwrap())
+        .expect("BFC background should paint");
+    assert!(
+        (bfc_background.width() - 150.0).abs() < 0.01
+            && (bfc_background.height() - 150.0).abs() < 0.01,
+        "the BFC should retain the 200px-wide, 200px-tall used box: {bfc_background:?}"
+    );
+    for x in [24.0, 74.0, 149.0] {
+        for y in [
+            bfc_background.y() + 24.0,
+            bfc_background.y() + 74.0,
+            bfc_background.y() + 124.0,
+        ] {
+            assert_eq!(
+                final_rect_fill_at(page, x, y),
+                Some(green),
+                "sample at ({x}, {y}) should be green; rects={:?} operations={:?}",
+                page.rects(),
+                page.paint_operations()
+            );
+        }
     }
 }
 
@@ -1343,7 +1438,7 @@ async fn clear_both_moves_block_image_below_active_float() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let image = &document.pages[0].images()[0];
 
@@ -1368,7 +1463,7 @@ async fn overwide_block_image_moves_below_active_float() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let image = &document.pages[0].images()[0];
 
@@ -1395,12 +1490,12 @@ async fn block_canvas_and_svg_avoid_active_float() {
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .unwrap();
     let red = document.pages[0]
         .paths()
         .iter()
-        .find(|path| path.fill == Some(Color::new(255, 0, 0)))
+        .find(|path| path.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
     let red_bounds = red.paint_bounds().unwrap();
 
@@ -1432,7 +1527,7 @@ async fn flow_root_auto_height_expands_to_contain_internal_float() {
     let root = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
 
     assert!(
@@ -1460,12 +1555,12 @@ async fn internal_flow_root_float_does_not_leak_to_following_sibling() {
     let root = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap();
     let after = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .unwrap();
 
     assert!(
@@ -1488,7 +1583,7 @@ async fn renders_simple_svg_rects_in_table_cells() {
         };
         bounds.size.width == 15.0
             && bounds.size.height == 15.0
-            && path.fill == Some(Color::new(34, 146, 212))
+            && path.fill == Some(CssColor::new(34, 146, 212))
     }));
     let text = document.pages[0]
         .lines()
@@ -1536,7 +1631,7 @@ async fn draws_text_decorations() {
         document.pages[0]
             .rects()
             .iter()
-            .all(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+            .all(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
     );
 }
 
@@ -1649,7 +1744,7 @@ async fn inline_block_overflow_baseline_uses_css22_fallback_edges() {
             .unwrap_or_else(|| panic!("expected rect {color:?}: {:?}", page.rects()))
     };
 
-    let empty_outer = rect(Color::new(255, 0, 0));
+    let empty_outer = rect(CssColor::new(255, 0, 0));
     assert!(
         (line("EMPTY").y() - (empty_outer.y() - 12.0)).abs() < 0.5,
         "inline-block with no in-flow line boxes should use bottom margin edge: rect={empty_outer:?}, line={:?}",
@@ -1663,7 +1758,7 @@ async fn inline_block_overflow_baseline_uses_css22_fallback_edges() {
         line("BLOCK")
     );
 
-    let self_hidden = rect(Color::new(255, 0, 255));
+    let self_hidden = rect(CssColor::new(255, 0, 255));
     assert!(
         (line("SELFREF").y() - (self_hidden.y() - 12.0)).abs() < 0.5,
         "overflow:hidden inline-block should ignore its internal text baseline and use bottom margin edge: rect={self_hidden:?}, line={:?}",

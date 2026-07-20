@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>CSS Fonts metric override baseline regression reference</title>
+<style>
+.target {
+  position: absolute;
+  font-size: 20px;
+  top: 10px;
+  left: 10px;
+  width: 60px;
+  height: 30px;
+}
+
+.top-aligned {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1em;
+  height: 1em;
+  background-color: green;
+}
+
+.character {
+  position: absolute;
+  top: 0.2em;
+  left: 1em;
+  width: 1em;
+  height: 1em;
+  background-color: green;
+}
+
+.bottom-aligned {
+  position: absolute;
+  top: 1em;
+  left: 2em;
+  width: 1em;
+  height: 0.5em;
+  background-color: green;
+}
+</style>
+<div class="target"><span class="top-aligned"></span><span class="character"></span><span class="bottom-aligned"></span></div>

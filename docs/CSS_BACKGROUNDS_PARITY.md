@@ -36,6 +36,13 @@ This makes `background-origin-006.html` and both root-canvas
 generated images likewise cover the full clip area rather than stopping at a
 smaller positioning area.
 
+Background paint now distinguishes the document canvas from an ordinary
+element paint subtree. A transformed non-root fixed background resolves as
+scroll-attached, while propagated canvas paint remains outside an ordinary
+root transform. SVG tiling-pattern resources retain the active CSS transform,
+so repeated vector backgrounds rotate, scale, and inherit ancestor transforms
+with their element rather than staying page-aligned.
+
 `border-image-repeat: repeat` now centers the complete sequence of edge tiles
 before clipping its equal overhang at each end. This preserves the correct
 source pixels when an edge is not a whole number of tiles wide, including an

@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::block::child_available_space_for_formatting_context;
 
 impl<'a> LayoutBuilder<'a> {
     pub(in crate::layout) fn inline_fragment_atom_for_children(
@@ -19,7 +20,7 @@ impl<'a> LayoutBuilder<'a> {
             PercentageBasis::definite(layout_pt(available_width)),
         );
         let style = &used_style;
-        let borders = box_metrics.border;
+        let borders = box_metrics.border.to_css_edges();
         let horizontal_extras = box_metrics.horizontal_non_content_length().points();
         let vertical_extras = box_metrics.vertical_non_content_length().points();
         let containing_block_height = self
@@ -45,6 +46,14 @@ impl<'a> LayoutBuilder<'a> {
                 definite_content_height,
                 BlockSizeBasisSource::InlineBlock,
             ));
+        // Intrinsic sizing may recursively collect this inline formatting
+        // context in an off-page scratch coordinate space. Out-of-flow
+        // descendants contribute no intrinsic inline size, and materializing
+        // them here would retain a positioned layer at that scratch origin
+        // instead of during the committed inline-block layout below.
+        // <https://www.w3.org/TR/css-sizing-3/#intrinsic> and
+        // <https://www.w3.org/TR/css-position-3/#absolute-positioning>
+        self.positioned_inline_layout_suppression_depth += 1;
         let contribution =
             self.intrinsic_inline_contribution_for_boxes(children, style, stylesheets);
         let block_flow_root_contribution = element
@@ -66,6 +75,7 @@ impl<'a> LayoutBuilder<'a> {
                 stylesheets,
                 available_width,
             );
+        self.positioned_inline_layout_suppression_depth -= 1;
         // Size containment makes the principal box's intrinsic content sizes
         // zero, but descendants are still laid out (and may visibly overflow)
         // inside the resulting zero-sized content box.
@@ -75,6 +85,7 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             let preferred_min = contribution
                 .min_content
+                .points()
                 .max(block_flow_root_contribution.0)
                 .max(inline_float_preferred_min);
             // The collected inline graph is the authoritative source for
@@ -87,6 +98,7 @@ impl<'a> LayoutBuilder<'a> {
             // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
             let preferred = contribution
                 .max_content
+                .points()
                 .max(block_flow_root_contribution.1)
                 .max(inline_float_preferred)
                 .max(preferred_min);
@@ -162,12 +174,16 @@ impl<'a> LayoutBuilder<'a> {
         self.push_page_name_scope_suppression();
         self.push_float_context();
         self.content_logical_inline_size_stack.push(content_width);
+        let inherited_orthogonal_available_height = self
+            .current_child_available_space()
+            .orthogonal_available_height;
         self.child_available_space_stack
-            .push(ChildAvailableSpace::new(
-                style.writing_mode,
+            .push(child_available_space_for_formatting_context(
+                style,
                 PhysicalContentWidth::new(content_box_pt(content_width)),
                 definite_content_height
                     .map(|height| PhysicalContentHeight::new(content_box_pt(height))),
+                inherited_orthogonal_available_height,
                 PhysicalContentHeight::new(content_box_pt(self.page_area_height())),
             ));
         self.definite_block_size_stack
@@ -227,13 +243,13 @@ impl<'a> LayoutBuilder<'a> {
                 // <https://www.w3.org/TR/CSS22/visuren.html#inline-formatting>.
                 let _ = layout.layout_anonymous_block(style, children, stylesheets, None);
             } else {
-                layout.layout_flow_root_child_boxes(children, stylesheets);
+                layout.layout_flow_root_child_boxes(style, children, stylesheets);
             }
         });
         if has_auto_height(style)
             && let Some(float_bottom) = self.current_float_context_lowest_bottom()
         {
-            self.cursor_y = self.cursor_y.min(float_bottom);
+            self.cursor_y = self.cursor_y.min(float_bottom.points());
         }
         self.escaped_atom_positioning_depth -= 1;
         self.block_static_position_y_offset = previous_block_static_position_y_offset;
@@ -251,7 +267,20 @@ impl<'a> LayoutBuilder<'a> {
         // a line box. Any real inline line or block child has already advanced
         // the temporary formatting-context cursor by its used block size.
         // <https://www.w3.org/TR/CSS22/visudet.html#inlineblock-width>
-        let measured_content_height = (content_top - self.cursor_y).max(0.0);
+        // A later orthogonal block advances its own physical block axis and
+        // may leave this temporary formatting context's top-to-bottom cursor
+        // unchanged. The atomic inline's physical height must still retain a
+        // preceding compatible line box; otherwise normal inline paint is
+        // translated above the zero-height atom during replay.
+        // <https://drafts.csswg.org/css-align-3/#baseline-export>
+        let compatible_line_height = self.last_in_flow_line_baseline_y.map(|baseline| {
+            let baseline_from_content_top = (content_top - baseline).max(0.0);
+            let baseline_offset = self.inline_box_text_line_layout_baseline_offset(style);
+            baseline_from_content_top + (style.line_height - baseline_offset).max(0.0)
+        });
+        let measured_content_height = (content_top - self.cursor_y)
+            .max(0.0)
+            .max(compatible_line_height.unwrap_or(0.0));
         // CSS Sizing applies explicit `height` to the content box of the
         // atomic inline-block fragment; internal line/block contents may
         // overflow but do not increase the used height:
@@ -319,6 +348,7 @@ impl<'a> LayoutBuilder<'a> {
             };
         self.flush_positioned_layers_since(positioned_layer_start);
         let mut fragment = self.current_page.paint_fragment();
+        let escaped_normal_flow_contexts = fragment.take_positioned_stacking_contexts();
         if static_scroll_offset.x != 0.0 || static_scroll_offset.y != 0.0 {
             fragment = fragment.translated(crate::layout::scroll_snap::static_scroll_translation(
                 static_scroll_offset,
@@ -345,6 +375,19 @@ impl<'a> LayoutBuilder<'a> {
         }
         let escaped_positioned_layers = escaped_positioned_layers
             .into_iter()
+            .chain(
+                escaped_normal_flow_contexts
+                    .into_iter()
+                    .map(|context| PositionedPaintLayer {
+                        page_index: self.pages.len(),
+                        source_style: style.clone(),
+                        source_is_target: false,
+                        stack_level: context.stack_level,
+                        context,
+                        links: Vec::new(),
+                        escaped_atom_translation: EscapedAtomTranslation::normal_flow_fragment(),
+                    }),
+            )
             .map(|layer| {
                 let escape_offset = layer.escaped_atom_translation.escape_offset(-border_bottom);
                 layer.translated(escape_offset)
@@ -360,7 +403,10 @@ impl<'a> LayoutBuilder<'a> {
         self.restore(snapshot);
 
         InlineAtom::new(
-            InlineAtomContent::InlineFragment(Box::new(fragment)),
+            InlineAtomContent::InlineFragment {
+                fragment: Box::new(fragment),
+                table_cell_context: None,
+            },
             style.clone(),
             escaped_positioned_layers,
             InlineSize::new(
@@ -415,6 +461,7 @@ impl<'a> LayoutBuilder<'a> {
     /// <https://www.w3.org/TR/CSS22/visuren.html#floats>.
     pub(in crate::layout) fn layout_flow_root_child_boxes(
         &mut self,
+        containing_style: &ComputedStyle,
         children: &[box_tree::FormattingBox<'_>],
         stylesheets: &[Stylesheet],
     ) {
@@ -437,17 +484,25 @@ impl<'a> LayoutBuilder<'a> {
             self.flush_float_run(&mut float_run);
             let prior_line_baseline = self.last_in_flow_line_baseline_y;
             self.layout_formatting_box(child, stylesheets);
-            if child.element_parts().is_some_and(|(_, _, style, _)| {
-                style.contain.layout
-                    && !matches!(style.position, Position::Absolute | Position::Fixed)
-                    && style.float == Float::None
-            }) {
-                // A layout-contained block cannot replace the surrounding
-                // atomic flow root's last eligible line baseline with one
-                // from its descendants. Preserve the baseline established by
-                // the preceding in-flow line instead.
-                // <https://www.w3.org/TR/css-contain-1/#containment-layout>
-                self.last_in_flow_line_baseline_y = prior_line_baseline;
+            if let Some((child_element, _, child_style, _)) = child.element_parts() {
+                let child_cannot_export_compatible_baseline =
+                    layout_containment_applies_to_element(child_element, child_style)
+                        || crate::layout::block::writing_modes_are_orthogonal(
+                            containing_style.writing_mode,
+                            child_style.writing_mode,
+                        );
+                if child_cannot_export_compatible_baseline
+                    && !matches!(child_style.position, Position::Absolute | Position::Fixed)
+                    && child_style.float == Float::None
+                {
+                    // A layout-contained or orthogonal block cannot replace
+                    // the surrounding atomic flow root's last compatible line
+                    // baseline. CSS Align exports baseline sets only across
+                    // matching writing-mode axes.
+                    // <https://www.w3.org/TR/css-contain-1/#containment-layout>
+                    // <https://drafts.csswg.org/css-align-3/#baseline-export>
+                    self.last_in_flow_line_baseline_y = prior_line_baseline;
+                }
             }
         }
         self.flush_float_run(&mut float_run);

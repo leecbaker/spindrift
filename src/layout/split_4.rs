@@ -56,11 +56,37 @@ mod tests {
         }))
     }
 
+    #[test]
+    fn vertical_inline_box_edges_use_their_logical_advance() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalRl;
+        style.line_height = 20.0;
+        let edge = InlineBoxEdgeFragment {
+            logical_edge: InlineLogicalEdge::Start,
+            physical_side: PhysicalSide::Top,
+            positioning_containing_block_id: None,
+            advance: 0.0,
+            paint_extent: 0.0,
+        };
+        let atom = InlineAtom::new(
+            InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge)),
+            style.clone(),
+            None,
+            InlineSize::new(edge.advance, style.line_height),
+            style.font_size,
+            0.0,
+            None,
+            None,
+        );
+
+        assert_eq!(inline_atom_logical_inline_size(&atom, &style), 0.0);
+    }
+
     fn inline_box_edge(width: f32, style: &ComputedStyle) -> InlineItem {
         InlineItem::Atom(Box::new(InlineAtom::new(
             InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(InlineBoxEdgeFragment {
                 logical_edge: InlineLogicalEdge::End,
-                physical_side: inline_end_side(style.writing_mode, style.direction),
+                physical_side: inline_end_side(style.writing_mode, style.used_direction()),
                 positioning_containing_block_id: None,
                 advance: width,
                 paint_extent: width.max(0.0),
@@ -998,6 +1024,28 @@ mod tests {
     }
 
     #[test]
+    fn production_sequence_breaks_after_other_space_separator_in_break_spaces() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.4;
+        style.white_space = WhiteSpace::BreakSpaces;
+        let available_width = builder.font_system.measure_text("xx", &style) + 0.1;
+        assert!(
+            builder.font_system.measure_text("xx\u{1680}", &style) > available_width,
+            "the test separator must make the selected line overflow"
+        );
+
+        let sequence = raw_text_sequence(&mut builder, "xx\u{1680}あ", &style, available_width);
+
+        assert_eq!(sequence_fragment_texts(&sequence), vec!["xx\u{1680}", "あ"]);
+    }
+
+    #[test]
     fn production_sequence_keeps_keep_all_hyphen_breaks() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
@@ -1293,7 +1341,8 @@ mod tests {
         let contribution = graph.intrinsic_contribution(&mut builder.font_system, &style);
 
         assert!(
-            contribution.min_content <= builder.font_system.measure_text("123 ", &style) + 0.01,
+            contribution.min_content.points()
+                <= builder.font_system.measure_text("123 ", &style) + 0.01,
             "break-spaces min-content should break after each preserved space: {contribution:?}"
         );
     }
@@ -1341,6 +1390,31 @@ mod tests {
             "\u{3000}\u{3000}XX"
         );
         assert_eq!(normalize_inline_text("  XX  "), "XX");
+    }
+
+    #[test]
+    fn explicit_breaks_preserve_consecutive_empty_line_boxes() {
+        let style = ComputedStyle::initial();
+        let text = format!("6{INLINE_BREAK}{INLINE_BREAK}{INLINE_BREAK}7");
+        assert_eq!(normalize_inline_text(&text), "6\n\n\n7");
+
+        let mut items = Vec::new();
+        push_inline_words_for_style(
+            &text,
+            &style,
+            None,
+            0.0,
+            InlineVisualOffset::zero(),
+            &mut items,
+        );
+        inline_collect::normalize_inline_whitespace_items(&mut items);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, InlineItem::Break(_)))
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -1869,10 +1943,87 @@ mod tests {
         let sequence = builder.collect_inline_line_sequence(items, &style, 100.0, 0.0, 0.0);
 
         assert_eq!(sequence.records.len(), 5);
-        assert_eq!(sequence.fitting_line_count(0, 25.0, false, 2, 2), 2);
-        assert_eq!(sequence.fitting_line_count(0, 35.0, false, 2, 3), 2);
-        assert_eq!(sequence.fitting_line_count(0, 5.0, false, 2, 2), 0);
-        assert_eq!(sequence.fitting_line_count(0, 5.0, true, 2, 2), 1);
+        assert_eq!(
+            sequence
+                .fragment_break_selection(0, 25.0, false, 2, 2)
+                .line_count(),
+            Some(2)
+        );
+        assert_eq!(
+            sequence
+                .fragment_break_selection(0, 35.0, false, 2, 3)
+                .line_count(),
+            Some(2)
+        );
+        assert_eq!(
+            sequence
+                .fragment_break_selection(0, 5.0, false, 2, 2)
+                .line_count(),
+            None
+        );
+        assert_eq!(
+            sequence
+                .fragment_break_selection(0, 5.0, true, 2, 2)
+                .line_count(),
+            Some(1)
+        );
+        assert_eq!(
+            sequence
+                .fragment_break_selection(0, 45.0, false, 3, 3)
+                .line_count(),
+            Some(3),
+            "when both controls cannot be met, retain the orphan minimum and leave the largest widow suffix"
+        );
+
+        let short_sequence = builder.collect_inline_line_sequence(
+            vec![
+                inline_word("A", &style),
+                InlineItem::Break(InlineBreak::default()),
+                inline_word("B", &style),
+            ],
+            &style,
+            100.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            short_sequence
+                .fragment_break_selection(0, 15.0, false, 1, 2)
+                .line_count(),
+            None,
+            "a block shorter than widows is kept together during balancing"
+        );
+        assert_eq!(
+            short_sequence
+                .fragment_break_selection(0, 15.0, true, 1, 2)
+                .line_count(),
+            Some(1),
+            "an undersized real fragmentainer still makes progress"
+        );
+
+        let float_after_lines = builder.collect_inline_line_sequence(
+            vec![
+                inline_word("A", &style),
+                InlineItem::Break(InlineBreak::default()),
+                inline_word("B", &style),
+                InlineItem::Break(InlineBreak::default()),
+                inline_word("C", &style),
+                InlineItem::Break(InlineBreak::default()),
+                inline_word("D", &style),
+                inline_test_float(&style),
+            ],
+            &style,
+            100.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            float_after_lines
+                .fragment_break_selection(0, 25.0, false, 1, 3)
+                .line_count(),
+            Some(1),
+            "a float-only record does not count toward the trailing widow minimum"
+        );
     }
 
     #[test]
@@ -2201,7 +2352,8 @@ mod tests {
             .find(|glyph| glyph.source_text() == "\u{0628}")
             .expect("isolated beh glyph")
             .rendered
-            .id;
+            .painted_id()
+            .expect("the selected BEH glyph is paintable");
         let beh_fragment = inline_fragment("\u{0628}", arabic.clone());
         let tatweel_fragment = inline_fragment("\u{0640}", tatweel.clone());
         let beh_width = builder.font_system.measure_text("\u{0628}", &arabic);
@@ -2227,6 +2379,7 @@ mod tests {
             HangingPunctuationWidths::default(),
             0.0,
             200.0,
+            0,
             false,
             "\u{0628}\u{0640}",
         );
@@ -2242,6 +2395,7 @@ mod tests {
                     line_indent: 0.0,
                     text_align: TextAlign::Left,
                     is_first_line: true,
+                    line_block_size: arabic.line_height,
                 },
             )
             .expect("prepared line");
@@ -2256,7 +2410,11 @@ mod tests {
             .flat_map(|run| &run.glyphs)
             .find(|glyph| glyph.source_text() == "\u{0628}")
             .expect("joined beh glyph");
-        assert_ne!(beh_glyph.rendered.id, isolated_beh, "{prepared:?}");
+        assert_ne!(
+            beh_glyph.rendered.painted_id(),
+            Some(isolated_beh),
+            "{prepared:?}"
+        );
         assert!(
             group
                 .shaped
@@ -2328,6 +2486,7 @@ mod tests {
             HangingPunctuationWidths::default(),
             0.0,
             200.0,
+            0,
             false,
             "AB",
         );
@@ -2342,6 +2501,7 @@ mod tests {
                     line_indent: 0.0,
                     text_align: TextAlign::Left,
                     is_first_line: true,
+                    line_block_size: style.line_height,
                 },
             )
             .expect("mixed line should prepare");
@@ -2383,7 +2543,7 @@ mod tests {
         style.line_height = 150.0;
         style.border_widths.right = 150.0;
         style.border_styles.right = BorderStyle::Solid;
-        style.border_colors.right = Color::new(0, 128, 0);
+        style.border_colors.right = CssColor::new(0, 128, 0);
         style.margin.right = -150.0;
         builder.cursor_y = 180.0;
 
@@ -2417,6 +2577,7 @@ mod tests {
             HangingPunctuationWidths::default(),
             0.0,
             300.0,
+            0,
             false,
             String::new(),
         );
@@ -2432,6 +2593,7 @@ mod tests {
                     line_indent: 0.0,
                     text_align: TextAlign::Left,
                     is_first_line: true,
+                    line_block_size: style.line_height,
                 },
             )
             .expect("edge-only split inline line should prepare");
@@ -2612,7 +2774,7 @@ mod tests {
         let parent_style = ComputedStyle {
             font_size: 12.0,
             line_height: 14.4,
-            color: Color::BLACK,
+            color: CssColor::BLACK,
             ..ComputedStyle::initial()
         };
         let page =
@@ -2705,6 +2867,7 @@ mod tests {
             HangingPunctuationWidths::default(),
             0.0,
             available_width,
+            0,
             false,
             text,
         );
@@ -2720,6 +2883,7 @@ mod tests {
             is_forced_empty: false,
             starts_after_preserved_segment_break: false,
             clear_after: Clear::None,
+            block_before: 0.0,
             block_start_trim: 0.0,
             block_end_trim: 0.0,
             paragraph_last_hanging_width: 0.0,
@@ -2736,6 +2900,7 @@ mod tests {
         InlineParagraphContext {
             block_style: style,
             stylesheets: &[],
+            initial_first_formatted_line: true,
             available_width,
             padding_left: 0.0,
             hanging_indent: 0.0,
@@ -2749,7 +2914,9 @@ mod tests {
         style.direction = Direction::Ltr;
         let ltr = InlineLineGeometry::new(
             20.0,
+            140.0,
             100.0,
+            20.0,
             InlinePaintContext {
                 block_style: &style,
                 direction: style.direction,
@@ -2758,6 +2925,7 @@ mod tests {
                 line_indent: 10.0,
                 text_align: TextAlign::Left,
                 is_first_line: true,
+                line_block_size: 20.0,
             },
         );
         let ltr_origin = ltr.visual_line_origin(0.0, 12.0);
@@ -2770,7 +2938,9 @@ mod tests {
         style.direction = Direction::Rtl;
         let rtl = InlineLineGeometry::new(
             20.0,
+            140.0,
             100.0,
+            20.0,
             InlinePaintContext {
                 block_style: &style,
                 direction: style.direction,
@@ -2779,6 +2949,7 @@ mod tests {
                 line_indent: 10.0,
                 text_align: TextAlign::Right,
                 is_first_line: true,
+                line_block_size: 20.0,
             },
         );
         let rtl_origin = rtl.visual_line_origin(0.0, 12.0);
@@ -2796,7 +2967,9 @@ mod tests {
         style.direction = Direction::Ltr;
         let geometry = InlineLineGeometry::new(
             20.0,
+            80.0,
             100.0,
+            20.0,
             InlinePaintContext {
                 block_style: &style,
                 direction: style.direction,
@@ -2805,11 +2978,12 @@ mod tests {
                 line_indent: 10.0,
                 text_align: TextAlign::Left,
                 is_first_line: true,
+                line_block_size: 20.0,
             },
         );
         let origin = geometry.visual_line_origin(5.0, 12.0);
         let rect = geometry.visual_line_item_rect(5.0, origin, 0.0, 12.0, 80.0, 20.0);
-        assert!((rect.x() - 22.0).abs() < 0.01);
+        assert!((rect.x() - 60.0).abs() < 0.01);
         assert!((rect.y() - 73.0).abs() < 0.01);
         assert!((rect.width() - 20.0).abs() < 0.01);
         assert!((rect.height() - 12.0).abs() < 0.01);
@@ -2821,6 +2995,8 @@ mod tests {
         let ltr = InlineLineGeometry::new(
             0.0,
             100.0,
+            100.0,
+            20.0,
             InlinePaintContext {
                 block_style: &style,
                 direction: style.direction,
@@ -2829,6 +3005,7 @@ mod tests {
                 line_indent: 0.0,
                 text_align: TextAlign::Left,
                 is_first_line: true,
+                line_block_size: 20.0,
             },
         );
         assert!((ltr.alignment_offset(30.0, TextAlign::Left) - 0.0).abs() < 0.01);
@@ -2847,6 +3024,8 @@ mod tests {
         let rtl = InlineLineGeometry::new(
             0.0,
             100.0,
+            100.0,
+            20.0,
             InlinePaintContext {
                 block_style: &style,
                 direction: style.direction,
@@ -2855,6 +3034,7 @@ mod tests {
                 line_indent: 0.0,
                 text_align: TextAlign::Right,
                 is_first_line: true,
+                line_block_size: 20.0,
             },
         );
         assert!(
@@ -2865,6 +3045,62 @@ mod tests {
                 .abs()
                 < 0.01
         );
+    }
+
+    #[test]
+    fn inline_line_geometry_maps_left_and_right_through_vertical_line_sides() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalRl;
+        for (direction, left_offset, right_offset) in
+            [(Direction::Ltr, 0.0, 70.0), (Direction::Rtl, 70.0, 0.0)]
+        {
+            style.direction = direction;
+            let geometry = InlineLineGeometry::new(
+                0.0,
+                100.0,
+                100.0,
+                20.0,
+                InlinePaintContext {
+                    block_style: &style,
+                    direction,
+                    available_width: 100.0,
+                    padding_left: 0.0,
+                    line_indent: 0.0,
+                    text_align: TextAlign::Left,
+                    is_first_line: true,
+                    line_block_size: 20.0,
+                },
+            );
+            assert_eq!(
+                geometry.alignment_offset(30.0, TextAlign::Left),
+                left_offset
+            );
+            assert_eq!(
+                geometry.alignment_offset(30.0, TextAlign::Right),
+                right_offset
+            );
+        }
+
+        style.writing_mode = WritingMode::SidewaysLr;
+        style.direction = Direction::Ltr;
+        let sideways = InlineLineGeometry::new(
+            0.0,
+            100.0,
+            100.0,
+            20.0,
+            InlinePaintContext {
+                block_style: &style,
+                direction: style.direction,
+                available_width: 100.0,
+                padding_left: 0.0,
+                line_indent: 0.0,
+                text_align: TextAlign::Left,
+                is_first_line: true,
+                line_block_size: 20.0,
+            },
+        );
+        assert_eq!(sideways.alignment_offset(30.0, TextAlign::Left), 0.0);
+        assert_eq!(sideways.alignment_offset(30.0, TextAlign::Right), 70.0);
     }
 
     #[test]
@@ -3085,7 +3321,7 @@ mod tests {
             .current_page
             .rects
             .iter()
-            .filter(|rect| rect.fill == Some(Color::BLACK))
+            .filter(|rect| rect.fill == Some(CssColor::BLACK))
             .collect::<Vec<_>>();
         assert_eq!(purple_rects.len(), 4, "{purple_rects:?}");
         let top = purple_rects
@@ -3238,8 +3474,8 @@ mod tests {
         .expect("RTL nested inline document should render");
 
         let page = &document.pages[0];
-        let purple = Color::new(128, 0, 128);
-        let orange = Color::new(255, 165, 0);
+        let purple = CssColor::new(128, 0, 128);
+        let orange = CssColor::new(255, 165, 0);
         let orange_background = page
             .rects()
             .iter()
@@ -3355,6 +3591,21 @@ mod tests {
         let stylesheets = vec![css::html5_user_agent_stylesheet(), author];
         let parent_style = ComputedStyle::initial();
         let root_style = document_root_style(&root, &stylesheets, &parent_style);
+        let document = root
+            .as_element()
+            .expect("parsed document root should be an element");
+        let html = document
+            .children
+            .iter()
+            .filter_map(Node::as_element)
+            .find(|element| element.tag == "html")
+            .expect("parsed document should contain an HTML element");
+        let body = html
+            .children
+            .iter()
+            .filter_map(Node::as_element)
+            .find(|element| element.tag == "body")
+            .expect("HTML element should contain a body");
 
         assert_eq!(root_style.writing_mode, WritingMode::HorizontalTb);
         assert_eq!(
@@ -3367,8 +3618,47 @@ mod tests {
             super::super::split_1::DocumentPrincipalFlow {
                 writing_mode: WritingMode::VerticalRl,
                 direction: Direction::Rtl,
+                source: PrincipalFlowSource::Body(body.id),
+                propagates_axes: true,
             }
         );
+    }
+
+    #[test]
+    fn principal_flow_tracks_the_first_eligible_body_canvas() {
+        let root =
+            dom::parse("<html><body id=first>first</body><body id=second>second</body></html>");
+        let author = css::parse_stylesheet(&crate::css::Css::from_string(
+            "#first { writing-mode: vertical-lr } #second { writing-mode: sideways-rl }",
+        ));
+        let stylesheets = vec![css::html5_user_agent_stylesheet(), author];
+        let parent_style = ComputedStyle::initial();
+        let root_style = document_root_style(&root, &stylesheets, &parent_style);
+        let document = root
+            .as_element()
+            .expect("parsed document root should be an element");
+        let html = document
+            .children
+            .iter()
+            .filter_map(Node::as_element)
+            .find(|element| element.tag == "html")
+            .expect("parsed document should contain an HTML element");
+        let first_body = html
+            .children
+            .iter()
+            .filter_map(Node::as_element)
+            .find(|element| element.tag == "body")
+            .expect("HTML element should contain a body");
+
+        let flow = super::super::split_1::document_principal_flow(
+            &root,
+            &stylesheets,
+            &parent_style,
+            &root_style,
+        );
+
+        assert_eq!(flow.writing_mode, WritingMode::VerticalLr);
+        assert_eq!(flow.source, PrincipalFlowSource::Body(first_body.id));
     }
 
     #[test]
@@ -3386,18 +3676,91 @@ mod tests {
             &parent_style,
             &root_style,
         );
-        let page = box_tree::build_page_box_with_principal_flow(
-            &root,
-            &stylesheets,
-            &parent_style,
-            principal_flow,
-        );
+        let page = box_tree::build_page_box(&root, &stylesheets, &parent_style);
         let (_, _, html_style, _) = page.children[0]
             .element_parts()
             .expect("HTML root should generate a principal box");
 
-        assert_eq!(html_style.writing_mode, WritingMode::VerticalLr);
-        assert_eq!(html_style.direction, Direction::Rtl);
+        assert_eq!(html_style.writing_mode, WritingMode::HorizontalTb);
+        assert_eq!(html_style.direction, Direction::Ltr);
+        assert_eq!(principal_flow.writing_mode, WritingMode::VerticalLr);
+        assert_eq!(principal_flow.direction, Direction::Rtl);
+    }
+
+    #[test]
+    fn upright_principal_flow_uses_its_ltr_direction() {
+        let mut style = ComputedStyle::initial();
+        style.writing_mode = WritingMode::VerticalRl;
+        style.direction = Direction::Rtl;
+        style.text_orientation = TextOrientation::Upright;
+
+        let principal = super::super::split_1::DocumentPrincipalFlow::from_style(&style);
+
+        assert_eq!(principal.direction, Direction::Ltr);
+    }
+
+    #[test]
+    fn principal_flow_projects_both_root_generated_pseudos() {
+        let mut root_style = ComputedStyle::initial();
+        root_style.before_style = Some(Box::new(ComputedStyle::initial()));
+        root_style.after_style = Some(Box::new(ComputedStyle::initial()));
+        let principal = super::super::split_1::DocumentPrincipalFlow {
+            writing_mode: WritingMode::SidewaysRl,
+            direction: Direction::Rtl,
+            source: PrincipalFlowSource::Root,
+            propagates_axes: false,
+        };
+
+        let used = principal.root_layout_style(&root_style);
+
+        assert_eq!(root_style.writing_mode, WritingMode::HorizontalTb);
+        assert_eq!(
+            used.before_style
+                .as_deref()
+                .expect("the root before pseudo remains present")
+                .writing_mode,
+            WritingMode::SidewaysRl
+        );
+        assert_eq!(
+            used.after_style
+                .as_deref()
+                .expect("the root after pseudo remains present")
+                .writing_mode,
+            WritingMode::SidewaysRl
+        );
+        assert_eq!(
+            used.after_style
+                .as_deref()
+                .expect("the root after pseudo inherits used direction")
+                .direction,
+            Direction::Rtl
+        );
+    }
+
+    #[test]
+    fn principal_flow_keeps_a_block_root_pseudo_in_its_own_writing_mode() {
+        let mut root_style = ComputedStyle::initial();
+        let mut after = ComputedStyle::initial();
+        after.display = Display::BLOCK;
+        after.writing_mode = WritingMode::VerticalRl;
+        root_style.after_style = Some(Box::new(after));
+        let principal = super::super::split_1::DocumentPrincipalFlow {
+            writing_mode: WritingMode::HorizontalTb,
+            direction: Direction::Ltr,
+            source: PrincipalFlowSource::Root,
+            propagates_axes: false,
+        };
+
+        let used = principal.root_layout_style(&root_style);
+
+        assert_eq!(
+            used.after_style
+                .as_deref()
+                .expect("the root after pseudo remains present")
+                .writing_mode,
+            WritingMode::VerticalRl,
+            "the pseudo's computed writing mode is retained when it establishes a block context"
+        );
     }
 
     #[test]
@@ -3927,8 +4290,13 @@ mod tests {
             "gamma"
         );
         assert!((measurement.height() - 40.0).abs() < 0.01);
-        assert!((measurement.contribution.min_content - alpha.max(beta).max(gamma)).abs() < 0.01);
-        assert!((measurement.contribution.max_content - first_line.max(gamma)).abs() < 0.01);
+        assert!(
+            (measurement.contribution.min_content.points() - alpha.max(beta).max(gamma)).abs()
+                < 0.01
+        );
+        assert!(
+            (measurement.contribution.max_content.points() - first_line.max(gamma)).abs() < 0.01
+        );
     }
 
     #[test]
@@ -4245,6 +4613,11 @@ mod tests {
         style.line_height_multiplier = None;
         style.line_height_is_normal = false;
         let mut first_letter = style.clone();
+        // CSS Inline derives an initial letter's used font size from the
+        // surrounding line geometry, rather than clamping it to the authored
+        // `::first-letter` size.
+        let authored_first_letter_font_size = 120.0;
+        first_letter.font_size = authored_first_letter_font_size;
         first_letter.initial_letter = css::InitialLetter::Specified { size: 3.0, sink: 3 };
         style.first_letter_style = Some(Box::new(first_letter));
 
@@ -4262,7 +4635,8 @@ mod tests {
         assert_eq!(first_fragment.text(), "H");
         assert_eq!(second_fragment.text(), "ello");
         assert!(first_fragment.style().font_size > style.font_size * 2.0);
-        assert!(first_fragment.baseline_shift < -style.line_height);
+        assert!(first_fragment.style().font_size < authored_first_letter_font_size);
+        assert_eq!(first_fragment.baseline_shift, 0.0);
 
         let items = vec![
             inline_layout::MeasuredInlineItem {
@@ -4427,10 +4801,11 @@ mod tests {
         let graph = builder.build_inline_opportunity_graph(&items, &style);
         let contribution = graph.intrinsic_contribution(&mut builder.font_system, &style);
 
-        assert!(contribution.max_content > contribution.min_content);
-        assert!(contribution.min_content >= 28.0);
+        assert!(contribution.max_content.points() > contribution.min_content.points());
+        assert!(contribution.min_content.points() >= 28.0);
         assert!(
-            contribution.max_content > 28.0 + builder.font_system.measure_text("gamma", &style)
+            contribution.max_content.points()
+                > 28.0 + builder.font_system.measure_text("gamma", &style)
         );
     }
 
@@ -4498,7 +4873,7 @@ mod tests {
                 && opportunity.position.run_index == 0
                 && opportunity.position.byte_offset > 0
         }));
-        assert!(contribution.max_content > contribution.min_content);
+        assert!(contribution.max_content.points() > contribution.min_content.points());
     }
 
     #[test]
@@ -4544,6 +4919,64 @@ mod tests {
     }
 
     #[test]
+    fn manual_hyphenation_keeps_following_space_wraps_available() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::Monospace;
+        style.font_size = 32.0;
+        style.line_height = 32.0;
+
+        let available_width = builder.font_system.measure_text("Deoxyribo-", &style) + 0.1;
+        assert!(
+            builder.font_system.measure_text("nucleic acid", &style) > available_width,
+            "the second source line must overflow the available width"
+        );
+        let graph = builder.build_inline_opportunity_graph(
+            &[inline_word("Deoxy\u{00ad}ribo\u{00ad}nucleic acid", &style)],
+            &style,
+        );
+        assert!(graph.opportunities.iter().any(|opportunity| {
+            opportunity.position.byte_offset == "Deoxy\u{00ad}ribo\u{00ad}nucleic ".len()
+        }));
+        let second_soft_hyphen = graph
+            .opportunities
+            .iter()
+            .copied()
+            .filter(|opportunity| opportunity.soft_hyphen)
+            .nth(1)
+            .expect("the second soft hyphen is an opportunity");
+        let unbroken_second_line = graph.materialize_line(
+            inline_layout::InlineGraphRange {
+                start: second_soft_hyphen.position,
+                end: graph.end_position(),
+            },
+            None,
+            &mut builder.font_system,
+            &style,
+        );
+        assert!(
+            unbroken_second_line.fitting_width > available_width,
+            "the graph's source slice must retain its measured overflow: {} <= {}",
+            unbroken_second_line.fitting_width,
+            available_width
+        );
+        let sequence = raw_text_sequence(
+            &mut builder,
+            "Deoxy\u{00ad}ribo\u{00ad}nucleic acid",
+            &style,
+            available_width,
+        );
+
+        assert_eq!(
+            sequence_fragment_texts(&sequence),
+            vec!["Deoxyribo-", "nucleic", "acid"]
+        );
+    }
+
+    #[test]
     fn inline_opportunity_graph_materialization_strips_zero_width_space() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
@@ -4569,6 +5002,99 @@ mod tests {
         assert_eq!(materialized.text, "abcdef");
         assert!(!materialized.text.contains('\u{200b}'));
         assert!(materialized.content_width > 0.0);
+    }
+
+    #[test]
+    fn tracked_zero_width_space_does_not_add_an_inline_advance() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut tracked = ComputedStyle::initial();
+        tracked.font_family = css::FontFamily::Monospace;
+        tracked.font_size = 12.0;
+        tracked.line_height = 14.0;
+        tracked.letter_spacing = css::ComputedLengthPercentage::from_points(10.0);
+        let mut untracked = tracked.clone();
+        untracked.letter_spacing = css::ComputedLengthPercentage::ZERO;
+
+        let tracked_items = vec![inline_word("12\u{200b}三", &tracked)];
+        let tracked_graph = builder.build_inline_opportunity_graph(&tracked_items, &tracked);
+        let tracked_line = tracked_graph.materialize_line(
+            inline_layout::InlineGraphRange {
+                start: tracked_graph.start_position(),
+                end: tracked_graph.end_position(),
+            },
+            None,
+            &mut builder.font_system,
+            &tracked,
+        );
+
+        let untracked_items = vec![inline_word("12三", &untracked)];
+        let untracked_graph = builder.build_inline_opportunity_graph(&untracked_items, &untracked);
+        let untracked_line = untracked_graph.materialize_line(
+            inline_layout::InlineGraphRange {
+                start: untracked_graph.start_position(),
+                end: untracked_graph.end_position(),
+            },
+            None,
+            &mut builder.font_system,
+            &untracked,
+        );
+
+        assert_eq!(tracked_line.text, "12三");
+        assert!(
+            (tracked_line.content_width - (untracked_line.content_width + 20.0)).abs() < 0.01,
+            "a zero-width space must not contribute a glyph or tracking advance"
+        );
+    }
+
+    #[test]
+    fn tracked_control_wrapped_latin_tracks_between_visible_characters() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut tracked = ComputedStyle::initial();
+        tracked.font_family = css::FontFamily::Monospace;
+        tracked.font_size = 12.0;
+        tracked.line_height = 14.0;
+        tracked.letter_spacing = css::ComputedLengthPercentage::from_points(10.0);
+        let mut untracked = tracked.clone();
+        untracked.letter_spacing = css::ComputedLengthPercentage::ZERO;
+        let controls = "\u{200b}\u{200c}\u{200d}\u{feff}\u{200e}\u{2066}";
+        let text = format!("{controls}xx{controls}");
+
+        let tracked_items = vec![inline_word(&text, &tracked)];
+        let tracked_graph = builder.build_inline_opportunity_graph(&tracked_items, &tracked);
+        let tracked_line = tracked_graph.materialize_line(
+            inline_layout::InlineGraphRange {
+                start: tracked_graph.start_position(),
+                end: tracked_graph.end_position(),
+            },
+            None,
+            &mut builder.font_system,
+            &tracked,
+        );
+
+        let untracked_items = vec![inline_word("xx", &untracked)];
+        let untracked_graph = builder.build_inline_opportunity_graph(&untracked_items, &untracked);
+        let untracked_line = untracked_graph.materialize_line(
+            inline_layout::InlineGraphRange {
+                start: untracked_graph.start_position(),
+                end: untracked_graph.end_position(),
+            },
+            None,
+            &mut builder.font_system,
+            &untracked,
+        );
+
+        assert!(
+            (tracked_line.content_width - (untracked_line.content_width + 10.0)).abs() < 0.01,
+            "controls must not own tracking, but visible neighbors still do: tracked={}, untracked={}",
+            tracked_line.content_width,
+            untracked_line.content_width,
+        );
     }
 
     #[test]
@@ -4830,7 +5356,7 @@ mod tests {
             .min_content;
         let contribution =
             with_trailing_spaces.intrinsic_contribution(&mut builder.font_system, &style);
-        assert!((contribution.min_content - x_width).abs() < 0.01);
+        assert!((contribution.min_content.points() - x_width.points()).abs() < 0.01);
     }
 
     #[test]
@@ -4858,6 +5384,7 @@ mod tests {
                 terminal_range,
                 None,
                 &mut builder.font_system,
+                &style,
             )
             .expect("whole preserved run should have a borrowed measurement");
         let materialized =
@@ -4946,6 +5473,29 @@ mod tests {
         style.white_space = WhiteSpace::BreakSpaces;
         style.overflow_wrap = css::OverflowWrap::Anywhere;
         let items = vec![inline_word("X", &style), inline_word(" ", &style)];
+        let graph = builder.build_inline_opportunity_graph(&items, &style);
+
+        assert!(graph.opportunities.iter().any(|opportunity| {
+            opportunity.kind == inline_layout::InlineBreakKind::Emergency
+                && opportunity.emergency
+                && opportunity.position.run_index == 1
+                && opportunity.position.byte_offset == 0
+        }));
+    }
+
+    #[test]
+    fn break_spaces_anywhere_adds_emergency_boundary_before_other_space_separator() {
+        let options = RenderOptions::default();
+        let stylesheets = Vec::new();
+        let resource_cache = ResourceCache::default();
+        let mut builder = test_layout_builder(&options, &stylesheets, &resource_cache);
+        let mut style = ComputedStyle::initial();
+        style.font_family = css::FontFamily::SansSerif;
+        style.font_size = 12.0;
+        style.line_height = 14.0;
+        style.white_space = WhiteSpace::BreakSpaces;
+        style.overflow_wrap = css::OverflowWrap::Anywhere;
+        let items = vec![inline_word("X", &style), inline_word("\u{1680}", &style)];
         let graph = builder.build_inline_opportunity_graph(&items, &style);
 
         assert!(graph.opportunities.iter().any(|opportunity| {
@@ -5071,7 +5621,9 @@ mod tests {
                 && opportunity.position.byte_offset > 0
                 && opportunity.min_content
         }));
-        assert!(anywhere_contribution.max_content > anywhere_contribution.min_content);
+        assert!(
+            anywhere_contribution.max_content.points() > anywhere_contribution.min_content.points()
+        );
 
         let mut break_word = anywhere.clone();
         break_word.overflow_wrap = css::OverflowWrap::BreakWord;
@@ -5099,7 +5651,9 @@ mod tests {
                 && !opportunity.min_content
         }));
         assert!(
-            (break_word_contribution.max_content - break_word_contribution.min_content).abs()
+            (break_word_contribution.max_content.points()
+                - break_word_contribution.min_content.points())
+            .abs()
                 < 0.01
         );
 
@@ -5134,7 +5688,8 @@ mod tests {
                 })
         );
         assert!(
-            legacy_word_break_contribution.max_content > legacy_word_break_contribution.min_content
+            legacy_word_break_contribution.max_content.points()
+                > legacy_word_break_contribution.min_content.points()
         );
     }
 
@@ -5279,7 +5834,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_opportunity_graph_tracks_across_transparent_box_edges() {
+    fn inline_opportunity_graph_does_not_create_breaks_at_transparent_box_edges() {
         let options = RenderOptions::default();
         let stylesheets = Vec::new();
         let resource_cache = ResourceCache::default();
@@ -5297,7 +5852,7 @@ mod tests {
 
         let graph = builder.build_inline_opportunity_graph(&items, &style);
 
-        assert!(graph.opportunities.iter().any(|opportunity| {
+        assert!(!graph.opportunities.iter().any(|opportunity| {
             opportunity.kind == inline_layout::InlineBreakKind::SoftWrap
                 && opportunity.position.run_index == 1
         }));
@@ -5386,6 +5941,7 @@ mod tests {
         let context = InlineParagraphContext {
             block_style: &style,
             stylesheets: &[],
+            initial_first_formatted_line: true,
             available_width: 200.0,
             padding_left: 0.0,
             hanging_indent: 0.0,
@@ -5422,6 +5978,7 @@ mod tests {
         let context = InlineParagraphContext {
             block_style: &style,
             stylesheets: &[],
+            initial_first_formatted_line: true,
             available_width: graph.runs.iter().take(2).map(|run| run.width).sum::<f32>() + 0.5,
             padding_left: 0.0,
             hanging_indent: 0.0,
@@ -5451,17 +6008,17 @@ mod tests {
         style.border_styles.top = BorderStyle::Hidden;
         style.border_styles.right = BorderStyle::Solid;
         style.border_styles.bottom = BorderStyle::Solid;
-        style.border_colors.top = Color::new(255, 0, 0);
-        style.border_colors.bottom = Color::TRANSPARENT;
+        style.border_colors.top = CssColor::new(255, 0, 0);
+        style.border_colors.bottom = CssColor::TRANSPARENT;
 
         let border = used_border(&style);
 
-        assert_eq!(border.top.specified_width, 4.0);
-        assert_eq!(border.top.used_width, 0.0);
+        assert_eq!(border.top.specified_width, layout_pt(4.0));
+        assert_eq!(border.top.used_width, layout_pt(0.0));
         assert!(!border.top.is_visible());
-        assert_eq!(border.right.used_width, 3.0);
+        assert_eq!(border.right.used_width, layout_pt(3.0));
         assert!(border.right.is_visible());
-        assert_eq!(border.bottom.used_width, 5.0);
+        assert_eq!(border.bottom.used_width, layout_pt(5.0));
         assert!(!border.bottom.is_visible());
     }
 
@@ -5472,11 +6029,11 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(10.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(255, 0, 0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
         style.row_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(30.0));
         style.row_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.row_rule.colors = css::GapRuleList::single(Color::new(0, 0, 255));
+        style.row_rule.colors = css::GapRuleList::single(CssColor::new(0, 0, 255));
         let items = [
             GapDecorationItem::new(0.0, 0.0, 70.0, 50.0),
             GapDecorationItem::new(80.0, 0.0, 70.0, 50.0),
@@ -5502,19 +6059,21 @@ mod tests {
         let strokes = solid_gap_rule_centerlines(&primitives);
 
         assert_eq!(strokes.len(), 3);
-        assert!(
-            strokes.iter().any(|stroke| {
-                stroke.x1() == 75.0 && stroke.x2() == 75.0 && stroke.width == 10.0
-            })
-        );
         assert!(strokes.iter().any(|stroke| {
-            stroke.x1() == 155.0 && stroke.x2() == 155.0 && stroke.width == 10.0
+            stroke.x1() == 75.0
+                && stroke.x2() == 75.0
+                && stroke.stroke_width == PaintStrokeWidth::new(10.0)
         }));
-        assert!(
-            strokes.iter().any(|stroke| {
-                stroke.y1() == 65.0 && stroke.y2() == 65.0 && stroke.width == 30.0
-            })
-        );
+        assert!(strokes.iter().any(|stroke| {
+            stroke.x1() == 155.0
+                && stroke.x2() == 155.0
+                && stroke.stroke_width == PaintStrokeWidth::new(10.0)
+        }));
+        assert!(strokes.iter().any(|stroke| {
+            stroke.y1() == 65.0
+                && stroke.y2() == 65.0
+                && stroke.stroke_width == PaintStrokeWidth::new(30.0)
+        }));
     }
 
     #[test]
@@ -5524,7 +6083,7 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(10.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(255, 0, 0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
         style.column_rule.rule_break = css::GapRuleBreak::Intersection;
         style.column_rule.inset_junction_start = css::GapRuleInsetValue::OverlapJoin;
         style.column_rule.inset_junction_end = css::GapRuleInsetValue::OverlapJoin;
@@ -5565,7 +6124,7 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(4.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(255, 0, 0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
         let gutters = grid_gap_decoration_gutters_from_tracks(
             &[50.0, 50.0, 50.0],
             &[0.0, 10.0, 10.0, 0.0],
@@ -5585,16 +6144,16 @@ mod tests {
         let strokes = solid_gap_rule_centerlines(&primitives);
 
         assert_eq!(strokes.len(), 2);
-        assert!(
-            strokes.iter().any(|stroke| {
-                stroke.x1() == 55.0 && stroke.x2() == 55.0 && stroke.width == 4.0
-            })
-        );
-        assert!(
-            strokes.iter().any(|stroke| {
-                stroke.x1() == 115.0 && stroke.x2() == 115.0 && stroke.width == 4.0
-            })
-        );
+        assert!(strokes.iter().any(|stroke| {
+            stroke.x1() == 55.0
+                && stroke.x2() == 55.0
+                && stroke.stroke_width == PaintStrokeWidth::new(4.0)
+        }));
+        assert!(strokes.iter().any(|stroke| {
+            stroke.x1() == 115.0
+                && stroke.x2() == 115.0
+                && stroke.stroke_width == PaintStrokeWidth::new(4.0)
+        }));
     }
 
     #[test]
@@ -5604,7 +6163,7 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(10.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(255, 0, 0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
         style.column_rule.rule_break = css::GapRuleBreak::Intersection;
         style.row_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(6.0));
@@ -5663,7 +6222,7 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(10.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(255, 0, 0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
         style.column_rule.rule_break = css::GapRuleBreak::Intersection;
         style.row_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(6.0));
@@ -5715,7 +6274,7 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(4.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(255, 0, 0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
         style.column_rule.rule_break = css::GapRuleBreak::Intersection;
         style.column_rule.inset_junction_end =
             css::GapRuleInsetValue::LengthPercentage(ComputedLengthPercentage::from_points(10.0));
@@ -5777,7 +6336,7 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(4.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(255, 0, 0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
         style.column_rule.rule_break = css::GapRuleBreak::Intersection;
         style.column_rule.inset_junction_end =
             css::GapRuleInsetValue::LengthPercentage(ComputedLengthPercentage::from_points(10.0));
@@ -5862,7 +6421,7 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(4.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(255, 0, 0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
         style.column_rule.visibility_items = css::GapRuleVisibilityItems::Between;
         let gutters = GapDecorationGutters {
             columns: vec![GapDecorationGutter::with_grid_line(50.0, 60.0, Some(2))],
@@ -5909,7 +6468,7 @@ mod tests {
                 stroke.x1() == 55.0
                     && stroke.y1() == 50.0
                     && stroke.y2() == 0.0
-                    && stroke.width == 4.0
+                    && stroke.stroke_width == PaintStrokeWidth::new(4.0)
             }),
             "grid area adjacency should make the between segment visible: {strokes:?}"
         );
@@ -5922,11 +6481,11 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(4.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(255, 0, 0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
         style.row_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(4.0));
         style.row_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.row_rule.colors = css::GapRuleList::single(Color::new(0, 0, 255));
+        style.row_rule.colors = css::GapRuleList::single(CssColor::new(0, 0, 255));
         let gutters = GapDecorationGutters {
             columns: vec![GapDecorationGutter::with_grid_line(50.0, 60.0, Some(2))],
             rows: vec![GapDecorationGutter::with_grid_line(50.0, 60.0, Some(2))],
@@ -5992,7 +6551,7 @@ mod tests {
         let column_strokes = strokes
             .iter()
             .cloned()
-            .filter(|stroke| stroke.color == Color::new(255, 0, 0))
+            .filter(|stroke| stroke.color == CssColor::new(255, 0, 0))
             .collect::<Vec<_>>();
 
         assert_eq!(column_strokes.len(), 1);
@@ -6011,7 +6570,7 @@ mod tests {
         style.column_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(4.0));
         style.column_rule.styles = css::GapRuleList::single(BorderStyle::Solid);
-        style.column_rule.colors = css::GapRuleList::single(Color::new(255, 0, 0));
+        style.column_rule.colors = css::GapRuleList::single(CssColor::new(255, 0, 0));
         style.row_rule.widths =
             css::GapRuleList::single(ComputedLengthPercentage::from_points(4.0));
         style.row_rule.styles = css::GapRuleList::single(BorderStyle::None);

@@ -95,7 +95,8 @@ cargo run -- --full-fonts input.html /tmp/full-fonts.pdf
 ```
 
 Use `--pdf-profile` to select Quire's PDF writer policy. The default is
-`pdf/a-2b`; supported values are `pdf`, `pdf/a-1b`, `pdf/a-2b`, `pdf/a-3b`,
+`pdf`; pass `--pdf-profile pdf/a-2b` to opt into the current PDF/A-oriented
+writer behavior. Supported values are `pdf`, `pdf/a-1b`, `pdf/a-2b`, `pdf/a-3b`,
 `pdf/a-2u`, and `pdf/a-3u`. These profiles select the implemented header,
 metadata, and font-planning behavior, but do not yet guarantee PDF/A
 conformance. `--pdf-variant` and `--pdf-type` remain aliases.

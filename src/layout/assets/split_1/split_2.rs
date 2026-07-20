@@ -219,8 +219,11 @@ impl<'a> LayoutBuilder<'a> {
             self.intrinsic_inline_contribution_for_boxes(run, block_style, stylesheets);
         let float_widths = self.inline_float_widths_in_run_boxes(run, stylesheets, available_width);
         output.include(InlineFloatRunIntrinsicWidths {
-            preferred_min: contribution.min_content.max(float_widths.preferred_min),
-            preferred: contribution.max_content + float_widths.preferred,
+            preferred_min: contribution
+                .min_content
+                .points()
+                .max(float_widths.preferred_min),
+            preferred: contribution.max_content.points() + float_widths.preferred,
         });
     }
 
@@ -261,7 +264,7 @@ impl<'a> LayoutBuilder<'a> {
                             child_style.clear,
                             child_style.writing_mode,
                             child_style.direction,
-                            child_width,
+                            child_width.points(),
                         );
                     }
                     continue;
@@ -269,7 +272,7 @@ impl<'a> LayoutBuilder<'a> {
             }
             if let box_tree::FormattingBox::Inline(box_) = child {
                 widths.include(self.inline_float_widths_in_run_boxes(
-                    &box_.children,
+                    &box_.core.children,
                     stylesheets,
                     available_width,
                 ));
@@ -288,6 +291,13 @@ impl<'a> LayoutBuilder<'a> {
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
     ) -> (f32, f32) {
+        // Intrinsic sizing consumes computed CSS lengths. In particular,
+        // font-relative values such as `width: 2em` are definite even when
+        // the enclosing intrinsic percentage basis is indefinite.
+        // <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+        // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
+        let used_style = self.style_with_current_used_lengths(style);
+        let style = &used_style;
         let built_multicol_child_boxes;
         let child_boxes = if child_boxes.is_none()
             && (style.column_count.is_some()
@@ -318,6 +328,51 @@ impl<'a> LayoutBuilder<'a> {
             }
             return size_contained_multicol_intrinsic_inline_sizes(style).unwrap_or((0.0, 0.0));
         }
+        // A replaced element's used content dimensions are its intrinsic
+        // contributions. Floats use this same physical-width query for their
+        // shrink-to-fit width before the isolated replay paints the object.
+        // Do not fall through to the empty-child inline contribution: canvas
+        // and SVG elements have no ordinary descendants, but their intrinsic
+        // dimensions are still part of their preferred widths.
+        // <https://www.w3.org/TR/css-sizing-3/#intrinsic-sizes>
+        let containing_block_height = self
+            .definite_block_size_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(PercentageBasis::indefinite);
+        let replaced_width = match replaced_element_kind(element) {
+            Some(ReplacedElementKind::Canvas) => Some(
+                used_canvas(
+                    element,
+                    style,
+                    available_width.max(0.0),
+                    containing_block_height,
+                )
+                .content_size
+                .width,
+            ),
+            Some(ReplacedElementKind::Image) => used_image(
+                element,
+                style,
+                available_width.max(0.0),
+                containing_block_height,
+                self.base_url,
+                self.root_url,
+                self.resource_cache,
+            )
+            .map(|image| image.content_size.width),
+            Some(ReplacedElementKind::Svg) => used_svg(
+                element,
+                style,
+                available_width.max(0.0),
+                containing_block_height,
+            )
+            .map(|svg| svg.content_size.width),
+            None => None,
+        };
+        if let Some(width) = replaced_width {
+            return (width, width);
+        }
         // This API supplies a physical width to shrink-to-fit callers such
         // as floats. In a vertical writing mode, the logical inline
         // contribution is physical height; physical width instead projects
@@ -345,16 +400,16 @@ impl<'a> LayoutBuilder<'a> {
             );
         }
         if style.display.is_flex() {
-            let (preferred_min, preferred) = self.estimate_flex_intrinsic_widths(
+            let contributions = self.estimate_flex_intrinsic_widths(
                 element,
                 style,
                 stylesheets,
-                available_width,
+                PhysicalContentWidth::new(content_box_pt(available_width)),
                 child_boxes,
             );
             return (
-                preferred_min.max(0.0),
-                preferred.max(preferred_min).max(0.0),
+                contributions.min_content.points(),
+                contributions.max_content.points(),
             );
         }
         if style.display.is_table() {
@@ -435,13 +490,13 @@ impl<'a> LayoutBuilder<'a> {
         } else {
             self.intrinsic_inline_contribution_for_element(element, style, stylesheets, child_boxes)
         };
-        let mut preferred = contribution.max_content;
-        let mut preferred_min = contribution.min_content;
+        let mut preferred = contribution.max_content.points();
+        let mut preferred_min = contribution.min_content.points();
         let establishes_multicol = style.column_count.is_some()
             || matches!(style.column_width, css::ComputedColumnWidth::Length(_))
             || matches!(style.column_height, css::ComputedColumnHeight::Length(_));
-        let mut multicol_column_preferred = contribution.max_content;
-        let mut multicol_column_preferred_min = contribution.min_content;
+        let mut multicol_column_preferred = contribution.max_content.points();
+        let mut multicol_column_preferred_min = contribution.min_content.points();
         let mut multicol_spanner_preferred = 0.0f32;
         let mut multicol_spanner_preferred_min = 0.0f32;
 
@@ -483,7 +538,7 @@ impl<'a> LayoutBuilder<'a> {
                 if let box_tree::FormattingBox::Table(table_box) = child_box {
                     let (child_preferred_min, child_preferred) = self
                         .table_outer_intrinsic_widths_from_fragment(
-                            table_box.element,
+                            table_box.core.element,
                             child_style,
                             stylesheets,
                             &table_box.fragment,
@@ -499,17 +554,21 @@ impl<'a> LayoutBuilder<'a> {
                     continue;
                 }
                 let child_metrics = intrinsic_box_metrics(child_style);
-                let child_extras = child_metrics.margin.left
-                    + child_metrics.margin.right
+                let child_extras = child_metrics.margin.left.points()
+                    + child_metrics.margin.right.points()
                     + child_metrics.horizontal_non_content_length().points();
                 let (intrinsic_preferred_min, intrinsic_preferred) =
                     if child_style.display.is_flex() {
-                        self.estimate_flex_intrinsic_widths(
+                        let contributions = self.estimate_flex_intrinsic_widths(
                             child_element,
                             child_style,
                             stylesheets,
-                            available_width,
+                            PhysicalContentWidth::new(content_box_pt(available_width)),
                             Some(child_children),
+                        );
+                        (
+                            contributions.min_content.points(),
+                            contributions.max_content.points(),
                         )
                     } else {
                         // A block container's intrinsic physical width is
@@ -588,9 +647,9 @@ impl<'a> LayoutBuilder<'a> {
                         None,
                         None,
                     );
-                    float_run_width += child_width;
+                    float_run_width += child_width.points();
                     max_float_run_width = max_float_run_width.max(float_run_width);
-                    max_float_width = max_float_width.max(child_width);
+                    max_float_width = max_float_width.max(child_width.points());
                     continue;
                 }
                 float_run_width = 0.0;
@@ -598,17 +657,21 @@ impl<'a> LayoutBuilder<'a> {
                     continue;
                 }
                 let child_metrics = intrinsic_box_metrics(&child_style);
-                let child_extras = child_metrics.margin.left
-                    + child_metrics.margin.right
+                let child_extras = child_metrics.margin.left.points()
+                    + child_metrics.margin.right.points()
                     + child_metrics.horizontal_non_content_length().points();
                 let (intrinsic_preferred_min, intrinsic_preferred) =
                     if child_style.display.is_flex() {
-                        self.estimate_flex_intrinsic_widths(
+                        let contributions = self.estimate_flex_intrinsic_widths(
                             child_element,
                             &child_style,
                             stylesheets,
-                            available_width,
+                            PhysicalContentWidth::new(content_box_pt(available_width)),
                             None,
+                        );
+                        (
+                            contributions.min_content.points(),
+                            contributions.max_content.points(),
                         )
                     } else {
                         self.formatting_context_intrinsic_widths(
@@ -718,7 +781,7 @@ impl<'a> LayoutBuilder<'a> {
         element: &Element,
         style: &ComputedStyle,
         stylesheets: &[Stylesheet],
-        width: f32,
+        measurement_space: PositionedAutoBlockMeasurementSpace,
         child_boxes: Option<&[box_tree::FormattingBox<'_>]>,
         table_fragment: Option<&box_tree::TableFragment<'_>>,
     ) -> f32 {
@@ -726,16 +789,36 @@ impl<'a> LayoutBuilder<'a> {
             self.positioned_vertical_border_width(element, style, stylesheets, table_fragment);
         let snapshot = self.snapshot();
         self.content_left = 0.0;
-        self.content_right = width.max(style.font_size);
+        self.content_right = measurement_space
+            .content_width
+            .points()
+            .max(style.font_size);
         let start_page_index = self.pages.len();
         let start_page_context = self.current_page_context;
         self.cursor_y = self.page_top();
+        // A horizontal auto-height measurement may traverse arbitrary page
+        // fragments, so its synthetic block-axis extent remains effectively
+        // unbounded. In a vertical writing mode, however, physical height is
+        // the logical inline axis. It is the definite inline containing size
+        // used to fit the positioned box's lines; replacing it with the
+        // measurement sentinel would make a one-glyph abspos box stretch to
+        // that sentinel instead of shrink-wrapping to its containing block.
+        // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+        // <https://www.w3.org/TR/css-position-3/#abspos-layout>
+        let measurement_height = if style.writing_mode.has_vertical_lines() {
+            measurement_space
+                .available_physical_height
+                .points()
+                .max(0.0)
+        } else {
+            10_000.0
+        };
         self.containing_blocks
             .push(ContainingBlock::from_page_top_rect(PageTopRect::new(
                 self.content_left,
                 self.cursor_y,
                 self.content_right - self.content_left,
-                10_000.0,
+                measurement_height,
             )));
         // Match final absolute-positioned replay: the box is an independent
         // block formatting context, so ambient source-float exclusions cannot

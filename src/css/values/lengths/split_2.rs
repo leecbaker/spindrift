@@ -223,6 +223,27 @@ pub(in crate::css) fn push_css_string_escape(
     }
 }
 
+/// Decode CSS escapes in an identifier-like token.
+///
+/// CSS Syntax uses the same escaped-code-point algorithm for identifiers and
+/// strings.  Keeping the decoding at the token boundary lets callers retain
+/// their own identifier comparison rules (for example, CSS font family names
+/// are ASCII-case-insensitive while `@font-feature-values` aliases are
+/// case-sensitive):
+/// <https://www.w3.org/TR/css-syntax-3/#consume-escaped-code-point>.
+pub(crate) fn decode_css_escapes(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut characters = value.char_indices();
+    while let Some((_, character)) = characters.next() {
+        if character == '\\' {
+            push_css_string_escape(&mut output, &mut characters);
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
 pub(crate) fn strip_ascii_function<'a>(value: &'a str, name: &str) -> Option<&'a str> {
     let prefix_len = name.len();
     let prefix = value.get(..prefix_len)?;

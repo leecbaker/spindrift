@@ -1,18 +1,23 @@
 use super::*;
 
 mod children;
+mod contributions;
 mod fragmentation;
 mod intrinsic;
 mod lanes;
 mod line_resolution;
 mod replay;
+mod resolved;
 mod static_position;
 mod taffy_adapter;
 
 use children::*;
+use contributions::*;
 use fragmentation::*;
 use intrinsic::*;
 use line_resolution::*;
+pub(in crate::layout) use resolved::ResolvedSubgridContext;
+use resolved::{ResolvedSubgridAxis, ResolvedSubgridPlacement};
 use static_position::*;
 pub(in crate::layout) use static_position::{
     GridPositioningScope, grid_abspos_late_horizontal_static_position,
@@ -38,12 +43,12 @@ pub(in crate::layout) enum GridAvailableSizeSource {
 pub(in crate::layout) type GridPercentageBasis =
     PercentageBasis<ContentBoxLength, GridAvailableSizeSource>;
 
-pub(in crate::layout) fn grid_percentage_basis_from_points(
-    value: Option<f32>,
+pub(in crate::layout) fn grid_percentage_basis(
+    value: Option<ContentBoxLength>,
     source: GridAvailableSizeSource,
 ) -> GridPercentageBasis {
     value
-        .map(|value| PercentageBasis::definite_from(content_box_pt(value), source))
+        .map(|value| PercentageBasis::definite_from(value, source))
         .unwrap_or_else(PercentageBasis::indefinite)
 }
 

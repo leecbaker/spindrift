@@ -14,9 +14,24 @@ impl<'a> LayoutBuilder<'a> {
         can_collapse_start_margin: bool,
         can_collapse_end_margin: bool,
         applied_start_margin: LayoutLength,
+        clearance_consumed_adjoining_start_margin: bool,
         starts_at_page_top: bool,
+        has_preceding_inline_flow_content: bool,
         traversal_state: &mut BlockFlowChildTraversalState,
     ) -> ChildFlowTraversalOutcome {
+        if element.tag.eq_ignore_ascii_case("html") {
+            self.root_principal_flow_context.has_inline_root_pseudo = style
+                .before_style
+                .iter()
+                .chain(style.after_style.iter())
+                .any(|pseudo| !pseudo.display.is_block_level())
+                || child_boxes.iter().any(|child| match child {
+                    box_tree::FormattingBox::AnonymousBlock(anonymous) => {
+                        anonymous_block_wraps_root_principal_pseudo(&anonymous.children)
+                    }
+                    _ => false,
+                });
+        }
         let mut collapsed_end_margin = false;
         let mut pending_end_margin_collapse = None;
         let mut collapsed_start_margin_offset = layout_pt(0.0);
@@ -24,7 +39,14 @@ impl<'a> LayoutBuilder<'a> {
         let mut seen_flow_child = false;
         let mut trim_block_start_adjoining_margins = style.margin_trim.block_start;
         let mut float_run = self.float_run_state();
-        let mut previous_child_page_end: Option<Option<String>> = None;
+        // Direct inline content is laid out before this child traversal and
+        // is not represented by a formatting-box sibling. It still occupies
+        // the source side of the first class-A break: a following named block
+        // must start its own page group rather than retroactively selecting
+        // the page that contains that text.
+        // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+        let mut previous_child_page_end = has_preceding_inline_flow_content
+            .then(|| self.page_boundary_name_in_active_scope(PageBoundaryValue::Inherited, style));
         let mut avoid_run_candidate: Option<AvoidBreakRunCandidate> = None;
         let mut previous_break_after = PageBreak::Auto;
         let mut adjoining_float_replay: Option<AdjoiningFloatReplayCandidate> = None;
@@ -54,12 +76,12 @@ impl<'a> LayoutBuilder<'a> {
             .flatten();
         let mut child_box_index = 0usize;
         while child_box_index < child_boxes.len() {
-            let replayed_adjoining_origin_y = if replaying_adjoining_until == Some(child_box_index)
-            {
+            let replaying_adjoining_target = if replaying_adjoining_until == Some(child_box_index) {
                 replaying_adjoining_until = None;
-                self.adjoining_float_origin_y.take()
+                self.adjoining_float_origin_y.take();
+                true
             } else {
-                None
+                false
             };
             let raw_child_box = &child_boxes[child_box_index];
             if traversal_state.is_exhausted() {
@@ -71,9 +93,9 @@ impl<'a> LayoutBuilder<'a> {
             }
             let (split_block_context, child_box) = match raw_child_box {
                 box_tree::FormattingBox::InlineSplitBlockContext(context)
-                    if context.children.len() == 1 =>
+                    if context.core.children.len() == 1 =>
                 {
-                    (Some(context), &context.children[0])
+                    (Some(context), &context.core.children[0])
                 }
                 _ => (None, raw_child_box),
             };
@@ -113,18 +135,24 @@ impl<'a> LayoutBuilder<'a> {
                 },
             };
             let child_parts = child_box.element_parts();
+            let (child_break_before, child_break_after) =
+                formatting_box_fragment_boundary_breaks(child_box, fragmentainer_kind);
             let child_avoid_break_flow =
                 child_parts.is_some_and(|(child_element, _, child_style, _)| {
                     block_avoid_break_flow_child(element, child_element, child_style)
                 });
-            let next_flow_child_break_before =
-                next_formatting_box_flow_child_break_before(element, child_boxes, child_box_index);
+            let next_flow_child_break_before = next_formatting_box_flow_child_break_before(
+                element,
+                child_boxes,
+                child_box_index,
+                fragmentainer_kind,
+            );
             let child_break_context = child_parts
-                .map(|(_, _, child_style, _)| {
+                .map(|_| {
                     FragmentBreakContext::new(
                         PageBreak::Auto,
-                        child_style.break_before,
-                        child_style.break_after,
+                        child_break_before,
+                        child_break_after,
                         next_flow_child_break_before.unwrap_or(PageBreak::Auto),
                     )
                 })
@@ -172,30 +200,76 @@ impl<'a> LayoutBuilder<'a> {
             // participant keeps that wrapper from restoring its
             // parent page group after a preceding named child.
             // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+            let inherited_page_name = self.active_page_value_scope(style);
             let child_page_value_sources = formatting_box_is_page_value_participant(child_box)
-                .then(|| formatting_box_page_value_sources(child_box));
+                .then(|| {
+                    resolved_formatting_box_page_boundary_values(
+                        child_box,
+                        inherited_page_name.as_deref(),
+                    )
+                });
             let effective_child_page_start = if zero_height_page_boundary {
                 Some(coalesced_zero_height_page_start(
                     child_boxes,
                     child_box_index,
+                    inherited_page_name.as_deref(),
                 ))
             } else {
                 child_page_value_sources
                     .as_ref()
-                    .map(|(child_page_start, _)| {
-                        self.page_boundary_name_in_active_scope(child_page_start.clone(), style)
-                    })
+                    .map(|sources| sources.start.clone())
             };
-            if let Some(child_page_start) = &effective_child_page_start
-                && let Some(previous_page_end) = &previous_child_page_end
-                && previous_page_end != child_page_start
+            let child_page_boundary_selected = if let Some(child_page_start) =
+                &effective_child_page_start
+                && previous_child_page_end
+                    .as_ref()
+                    .is_none_or(|previous_page_end| previous_page_end != child_page_start)
+                && (!self.current_page_has_content() || previous_child_page_end.is_some())
             {
+                // Match DOM traversal: the first normal-flow child selects an
+                // explicit named page even without a preceding class-A
+                // sibling boundary.
+                // <https://www.w3.org/TR/css-page-3/#using-named-pages>
                 self.switch_page_name_at_class_a_boundary(child_page_start.as_deref());
-            }
+                true
+            } else {
+                false
+            };
             if let box_tree::FormattingBox::AnonymousBlock(box_) = child_box {
                 self.flush_float_run(&mut float_run);
+                let root_principal_inline_pseudo = element.tag.eq_ignore_ascii_case("html")
+                    && self.principal_flow.is_body_sourced()
+                    && WritingModeAxes::new(style.writing_mode, style.used_direction())
+                        .swaps_physical_axes()
+                    && anonymous_block_wraps_root_principal_pseudo(&box_.children);
+                let root_canvas_block_cursor = root_principal_inline_pseudo
+                    .then_some(self.root_principal_flow_context.completed_body)
+                    .flatten();
+                let root_canvas_page_index = self.pages.len();
+                let root_canvas_paint_checkpoint =
+                    root_canvas_block_cursor.map(|_| self.current_page.paint_checkpoint());
+                // An anonymous inline wrapper following a propagated
+                // sideways-lr body (notably a root ::after) shares the
+                // bottom-origin inline axis. The legacy pagination cursor is
+                // top-origin, so use a scratch line and project its paint
+                // back to the canvas edge just as for block children.
+                // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+                let bottom_inline_start =
+                    WritingModeAxes::new(style.writing_mode, style.used_direction())
+                        .swaps_physical_axes()
+                        && self.active_fragmentainer_kind() == FragmentainerKind::Page
+                        && inline_start_side(style.writing_mode, style.used_direction())
+                            == PhysicalSide::Bottom;
+                let inline_cursor = self.cursor_y;
+                let page_index = self.pages.len();
+                let paint_checkpoint =
+                    bottom_inline_start.then(|| self.current_page.paint_checkpoint());
+                if bottom_inline_start {
+                    self.cursor_y = self.page_top();
+                }
                 let allow_typographic_first_line =
                     first_formatted_line.applies_to_next_inline_run();
+                let initial_first_formatted_line = first_formatted_line.is_pending();
                 let originating_pseudo_style = allow_typographic_first_line
                     .then(|| style_with_originating_typographic_pseudos(&box_.style, style))
                     .flatten();
@@ -210,8 +284,47 @@ impl<'a> LayoutBuilder<'a> {
                             stylesheets,
                             None,
                             allow_typographic_first_line,
+                            initial_first_formatted_line,
                         )
                     });
+                if let (Some(contribution), Some(checkpoint)) =
+                    (root_canvas_block_cursor, root_canvas_paint_checkpoint)
+                    && self.pages.len() == root_canvas_page_index
+                {
+                    // Keep inline line construction in the complete initial
+                    // canvas. The body contribution changes only the root
+                    // logical block coordinate, so project the completed
+                    // anonymous fragment through the writing-mode axes rather
+                    // than narrowing its inline measure and accidentally
+                    // changing wrapping.
+                    // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+                    let fragment = self.current_page.take_paint_fragment_since(checkpoint);
+                    let x = match block_start_side(style.writing_mode) {
+                        PhysicalSide::Left => contribution.logical_block_advance.points(),
+                        PhysicalSide::Right => -contribution.logical_block_advance.points(),
+                        PhysicalSide::Top | PhysicalSide::Bottom => unreachable!(
+                            "a vertical writing mode must have a horizontal block axis"
+                        ),
+                    };
+                    self.current_page
+                        .append_paint_fragment_owned(fragment, PaintTranslation::new(x, 0.0));
+                }
+                if let Some(checkpoint) = paint_checkpoint
+                    && self.pages.len() == page_index
+                {
+                    let fragment = self.current_page.take_paint_fragment_since(checkpoint);
+                    let translation = fragment
+                        .bounds()
+                        .map(|bounds| {
+                            self.page_bottom() + self.principal_inline_end_inset - bounds.y()
+                        })
+                        .unwrap_or(0.0);
+                    self.current_page.append_paint_fragment_owned(
+                        fragment,
+                        PaintTranslation::new(0.0, translation),
+                    );
+                    self.cursor_y = inline_cursor;
+                }
                 if inline_outcome.has_flow_effects {
                     seen_flow_child = true;
                 }
@@ -230,15 +343,14 @@ impl<'a> LayoutBuilder<'a> {
                     if let Some(child_page_start) = effective_child_page_start {
                         previous_child_page_end = Some(child_page_start);
                     }
-                } else if let Some((_, child_page_end)) = child_page_value_sources {
+                } else if let Some(sources) = child_page_value_sources {
                     // The next class-A sibling compares against this
                     // child's propagated *end* value. Its start can
                     // remain `auto` while a later descendant selects
                     // a named page, in which case using the start here
                     // would lose the required destination transition.
                     // <https://www.w3.org/TR/css-page-3/#using-named-pages>
-                    previous_child_page_end =
-                        Some(self.page_boundary_name_in_active_scope(child_page_end, style));
+                    previous_child_page_end = Some(sources.end);
                 }
                 child_box_index += 1;
                 continue;
@@ -250,17 +362,46 @@ impl<'a> LayoutBuilder<'a> {
             };
             let mut child_style = Box::new(child_style.clone());
             traversal_state.apply_to(&mut child_style);
+            if block_avoid_break_flow_child(element, child_element, &child_style)
+                && let Some(line_clamp) = &mut child_style.line_clamp
+            {
+                line_clamp.continues_after_clamp_point = has_later_normal_block_flow_box_child(
+                    child_boxes,
+                    child_box_index + 1,
+                    element,
+                );
+            }
             child_style.apply_effective_zoom();
+            // Margin-collapse and sibling placement consume the physical
+            // margin cache before the child's own block-layout geometry runs.
+            // Resolve percentage edges here against the parent's logical
+            // inline basis, rather than leaving (for example) a vertical
+            // child's `margin-top: 10%` as the stale zero-length cache value.
+            // CSS percentages on every margin edge use the containing block's
+            // inline size, independent of the child's writing mode.
+            // <https://www.w3.org/TR/CSS22/box.html#margin-properties>
+            // <https://www.w3.org/TR/css-writing-modes-4/#orthogonal-flows>
+            let parent_inline_percentage_basis = self
+                .current_child_available_space()
+                .logical_inline_percentage_basis_for(style.writing_mode)
+                .map_value(|size| {
+                    crate::units::IntoLayoutLength::into_layout_length(size.content_box_length())
+                });
+            apply_used_box_metrics(&mut child_style, parent_inline_percentage_basis);
             let child_table_fragment = if let box_tree::FormattingBox::Table(table_box) = child_box
             {
                 Some(&table_box.fragment)
             } else {
                 None
             };
-            apply_pending_normal_flow_margin_before_float(
-                &mut child_style,
-                previous_flow_bottom_margin,
-            );
+            let split_inline_float_block_offset = split_block_context.and_then(|_| {
+                self.split_inline_static_position_y_offset_before_child(
+                    child_boxes,
+                    child_box_index,
+                    style,
+                    stylesheets,
+                )
+            });
             let laid_out_float = if let Some(split_block_context) = split_block_context {
                 self.layout_floating_child_in_inline_split_block_context(
                     split_block_context,
@@ -271,6 +412,7 @@ impl<'a> LayoutBuilder<'a> {
                     child_table_fragment,
                     stylesheets,
                     &mut float_run,
+                    split_inline_float_block_offset,
                 )
             } else {
                 self.layout_floating_child(
@@ -301,7 +443,7 @@ impl<'a> LayoutBuilder<'a> {
             let descendant_start_margin = (is_flow_child
                 && can_collapse_block_start_margin(
                     &child_style,
-                    used_border_widths(&child_style),
+                    UsedEdges::from_css_edges(used_border_widths(&child_style)),
                     has_direct_inline_content_box(child_children),
                     self.used_overflow_for_element(child_element, &child_style),
                 ))
@@ -314,10 +456,19 @@ impl<'a> LayoutBuilder<'a> {
                 )
             })
             .flatten();
+            let mut margin_collapse_style = None;
+            if self.definite_block_size_stack.last().is_some_and(|basis| {
+                percentage_height_is_auto_for_margin_collapse(&child_style, *basis)
+            }) {
+                let mut used_style = (*child_style).clone();
+                used_style.box_values.height = css::ComputedLengthPercentageOrAuto::Auto;
+                margin_collapse_style = Some(used_style);
+            }
+            let margin_collapse_style = margin_collapse_style.as_ref().unwrap_or(&child_style);
             let self_collapsing_child = is_flow_child
                 && is_self_collapsing_block_box(
                     child_element,
-                    &child_style,
+                    margin_collapse_style,
                     child_children,
                     self.document_canvas_overflow,
                 );
@@ -354,24 +505,38 @@ impl<'a> LayoutBuilder<'a> {
             }
 
             let mut collapses_with_parent_end = false;
+            let mut adjoining_start_margin_paint_offset = None;
             if is_flow_child {
                 let collapses_with_parent = is_collapsible_block_child(child_element, &child_style);
                 let collapses_with_sibling =
                     is_sibling_margin_collapsible_block_child(child_element, &child_style);
-                if !trimmed_block_start_margin
+                // This traversal's start-margin machinery is expressed in
+                // physical top/bottom coordinates. In a vertical principal
+                // flow, those coordinates are the inline axis, not the
+                // logical block axis whose margins may adjoin. In particular,
+                // a root body's UA `margin-top` must not disappear merely
+                // because its first in-flow descendant happens to be
+                // collapsible.
+                // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+                // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+                let physical_top_is_inline_axis =
+                    WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes();
+                let adjoins_parent_start = !trimmed_block_start_margin
                     && !seen_flow_child
                     && can_collapse_start_margin
                     && collapses_with_parent
-                {
+                    && !physical_top_is_inline_axis;
+                if adjoins_parent_start {
                     if let Some(previous_margin) = previous_flow_bottom_margin {
                         // An earlier self-collapsing sibling has
                         // already contributed its adjoining margin at
-                        // the parent start. Its following sibling
-                        // supplies only the delta of the merged
-                        // margin set, not the entire start margin a
-                        // second time.
+                        // the parent start. Merge that contribution with the
+                        // parent's already-applied start margin before
+                        // calculating the next delta: a zero-margin float
+                        // wrapper must not discard the ancestor margin in
+                        // this same collapsed set.
                         child_style.margin.top = collapsed_margin_delta(
-                            layout_pt(previous_margin),
+                            collapse_margins(applied_start_margin, layout_pt(previous_margin)),
                             layout_pt(effective_start_margin),
                         )
                         .points()
@@ -384,6 +549,9 @@ impl<'a> LayoutBuilder<'a> {
                         )
                         .points()
                             - descendant_margin_adjustment;
+                    }
+                    if clearance_consumed_adjoining_start_margin {
+                        child_style.margin.top = 0.0;
                     }
                 } else if !trimmed_block_start_margin
                     && collapses_with_sibling
@@ -399,6 +567,15 @@ impl<'a> LayoutBuilder<'a> {
                     .points()
                         - descendant_margin_adjustment;
                 }
+                // A first child's adjoining positive margin lies outside the
+                // parent's border box, unless actual clearance separates the
+                // margins while laying out that child. Keep the candidate at
+                // this collapse boundary and commit it after child layout.
+                // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+                if adjoins_parent_start {
+                    adjoining_start_margin_paint_offset =
+                        Some(layout_pt(child_style.margin.top.max(0.0)));
+                }
 
                 collapses_with_parent_end = collapses_with_parent
                     && can_collapse_end_margin
@@ -407,14 +584,6 @@ impl<'a> LayoutBuilder<'a> {
                         child_box_index + 1,
                         element,
                     );
-            }
-            if let Some(origin_y) = replayed_adjoining_origin_y {
-                let start_offset = (self.cursor_y - origin_y).max(0.0);
-                if start_offset > child_style.margin.top {
-                    child_style.margin.top = start_offset;
-                }
-                collapsed_start_margin_offset =
-                    collapsed_start_margin_offset.max(layout_pt(start_offset));
             }
             preserve_adjusted_block_margins(&mut child_style);
 
@@ -457,11 +626,7 @@ impl<'a> LayoutBuilder<'a> {
                         child_style.margin.top
                             + child_style.line_height * child_style.orphans.max(1) as f32,
                     ),
-                    Fragmentainer::from_cursor_bounds(
-                        self.page_area_height(),
-                        self.cursor_y,
-                        self.page_bottom(),
-                    ),
+                    self.fragmentainer_from_page_cursor(PageTopBlockPosition::new(self.cursor_y)),
                     self.cursor_is_at_page_top(),
                 )
             {
@@ -512,10 +677,10 @@ impl<'a> LayoutBuilder<'a> {
             let closes_adjoining_float_replay = is_flow_child
                 && !self_collapsing_child
                 && previous_flow_bottom_margin.is_some()
-                && replayed_adjoining_origin_y.is_none();
+                && !replaying_adjoining_target;
             if closes_adjoining_float_replay && let Some(replay) = adjoining_float_replay.take() {
                 let replay_origin_y = self.cursor_y - child_style.margin.top;
-                let replay_separates = self.adjoining_float_replay_separated_by_bfc_root(
+                let replay_separation = self.adjoining_float_replay_separated_by_following_child(
                     &replay,
                     child_element,
                     &child_style,
@@ -523,7 +688,15 @@ impl<'a> LayoutBuilder<'a> {
                     Some(child_children),
                     replay_origin_y,
                 );
-                if !replay_separates
+                if let AdjoiningFloatReplaySeparation::Clearance { border_top }
+                | AdjoiningFloatReplaySeparation::MarginSeparation { border_top } =
+                    replay_separation
+                {
+                    child_style.margin.top =
+                        layout_pt((self.cursor_y - border_top.points()).max(0.0)).points();
+                    preserve_adjusted_block_margins(&mut child_style);
+                }
+                if replay_separation == AdjoiningFloatReplaySeparation::None
                     && (replay_origin_y - replay.snapshot_cursor_y()).abs() > FLOAT_EPSILON
                 {
                     let replay_until = child_box_index;
@@ -611,6 +784,55 @@ impl<'a> LayoutBuilder<'a> {
                         )
                     })
                     .flatten();
+            let clearance_count_before_child = self.applied_clearance_count;
+            // Block traversal's legacy cursor is physical top-to-bottom.
+            // The principal vertical flow instead advances through the page's
+            // horizontal span; preserve the inline cursor while consuming the
+            // completed child fragment from logical block-start.
+            let principal_vertical_flow = is_flow_child
+                && WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes()
+                && self.active_fragmentainer_kind() == FragmentainerKind::Page;
+            let principal_flow_page_index = self.pages.len();
+            let principal_flow_paint_checkpoint =
+                principal_vertical_flow.then(|| self.current_page.paint_checkpoint());
+            let principal_flow_inline_cursor = self.cursor_y;
+            // CSS Writing Modes makes the selected HTML body the source of
+            // the document canvas and initial containing block. Its automatic
+            // canvas-sized block span is not an ordinary sibling advance in
+            // the root principal flow: otherwise a following anonymous root
+            // inline box (such as `html::after`) starts after the whole
+            // viewport instead of after the body's actual document flow.
+            // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+            let source_body_canvas =
+                principal_vertical_flow && self.principal_flow.is_source_body(child_element);
+            if source_body_canvas {
+                self.root_principal_flow_context.active_body = Some(child_element.id);
+                self.root_principal_flow_context
+                    .active_body_inline_end_inset = layout_pt(
+                    match inline_start_side(child_style.writing_mode, child_style.used_direction())
+                    {
+                        PhysicalSide::Top => child_style.margin.bottom,
+                        PhysicalSide::Bottom => child_style.margin.top,
+                        PhysicalSide::Left | PhysicalSide::Right => {
+                            unreachable!("a vertical writing mode must have a vertical inline axis")
+                        }
+                    },
+                );
+            }
+            // The legacy page-fragment cursor follows the physical top edge,
+            // whereas a sideways-lr body begins its inline progression at the
+            // physical bottom. Lay out each of its block children against an
+            // empty top-origin scratch line, then project the resulting
+            // fragment back to that bottom inline edge below. Otherwise the
+            // generic page-break check mistakes the bottom-origin cursor for
+            // an exhausted fragmentainer and creates a second page.
+            // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+            let body_bottom_inline_start = source_body_canvas
+                && inline_start_side(style.writing_mode, style.used_direction())
+                    == PhysicalSide::Bottom;
+            if body_bottom_inline_start {
+                self.cursor_y = self.page_top();
+            }
             self.last_block_layout_outcome = BlockLayoutOutcome::default();
             if child_style.display.is_block_level()
                 || is_document_canvas_element(element)
@@ -629,15 +851,18 @@ impl<'a> LayoutBuilder<'a> {
                         None
                     };
                 self.push_ancestor_signature(child_signature.clone());
-                // The parent has already selected this normal-flow
-                // child's page group at the class-A sibling boundary
-                // above. Re-entering a descendant-derived page value
-                // here can manufacture a second boundary even when
-                // this is the first in-flow child of its own block.
+                // Suppress entry only when the parent has actually selected
+                // this normal-flow child's page group at the class-A sibling
+                // boundary above. A first named child after direct inline
+                // content has no preceding formatting-box sibling, so it
+                // must retain its own entry scope to form that boundary.
+                // Re-entering a page value already selected by the parent
+                // would manufacture a second break instead.
                 // Nested sibling boundaries remain active while this
                 // element-entry scope is suppressed.
                 // <https://www.w3.org/TR/css-page-3/#using-named-pages>
-                let boundary_selected_page_scope = is_flow_child && !zero_height_page_boundary;
+                let boundary_selected_page_scope =
+                    is_flow_child && !zero_height_page_boundary && child_page_boundary_selected;
                 if boundary_selected_page_scope {
                     self.push_page_name_element_scope_suppression();
                 }
@@ -647,63 +872,113 @@ impl<'a> LayoutBuilder<'a> {
                 if let box_tree::FormattingBox::Table(table_box) = child_box {
                     let split_scope =
                         split_block_context.map(|_| self.begin_inline_split_block_paint_scope());
-                    self.with_text_box_line_trim_scope(child_text_box_line_trim, |layout| {
-                        layout.layout_element_with_child_boxes_and_table_fragment(
-                            table_box.element,
-                            child_style,
-                            stylesheets,
-                            Some(&table_box.children),
-                            Some(&table_box.fragment),
-                        );
-                    });
+                    self.with_inline_split_block_relative_layout_scope(
+                        split_block_context,
+                        |layout| {
+                            layout.with_text_box_line_trim_scope(
+                                child_text_box_line_trim,
+                                |layout| {
+                                    layout.layout_element_with_child_boxes_and_table_fragment(
+                                        table_box.core.element,
+                                        child_style,
+                                        stylesheets,
+                                        Some(&table_box.core.children),
+                                        Some(&table_box.fragment),
+                                    );
+                                },
+                            );
+                        },
+                    );
                     if let (Some(context), Some(scope)) = (split_block_context, split_scope) {
                         self.finish_inline_split_block_paint_scope(context, scope);
                     }
                 } else if let box_tree::FormattingBox::Block(block_box) = child_box {
                     let split_scope =
                         split_block_context.map(|_| self.begin_inline_split_block_paint_scope());
-                    self.with_text_box_line_trim_scope(child_text_box_line_trim, |layout| {
-                        if let box_tree::BoxSource::GeneratedPseudo(pseudo) = &block_box.source {
-                            layout.layout_generated_pseudo_box(
-                                child_element,
-                                child_style,
-                                match pseudo.kind {
-                                    box_tree::GeneratedPseudoKind::Before => {
-                                        box_tree::CounterEventSource::Before
-                                    }
-                                    box_tree::GeneratedPseudoKind::After => {
-                                        box_tree::CounterEventSource::After
+                    self.with_inline_split_block_relative_layout_scope(
+                        split_block_context,
+                        |layout| {
+                            layout.with_text_box_line_trim_scope(
+                                child_text_box_line_trim,
+                                |layout| {
+                                    if let box_tree::BoxSource::GeneratedPseudo(pseudo) =
+                                        &block_box.core.source
+                                    {
+                                        layout.layout_generated_pseudo_box(
+                                            child_element,
+                                            child_style,
+                                            pseudo.kind.counter_event_source(),
+                                            stylesheets,
+                                            &block_box.run_in_children,
+                                            Some(child_children),
+                                            None,
+                                        );
+                                    } else {
+                                        let principal_root_layout_style = child_element
+                                            .tag
+                                            .eq_ignore_ascii_case("html")
+                                            .then(|| {
+                                                layout.principal_flow.root_layout_style(child_style)
+                                            });
+                                        layout.layout_element_with_child_boxes_and_run_ins(
+                                            child_element,
+                                            principal_root_layout_style
+                                                .as_ref()
+                                                .unwrap_or(child_style),
+                                            stylesheets,
+                                            &block_box.run_in_children,
+                                            Some(child_children),
+                                        );
                                     }
                                 },
-                                stylesheets,
-                                &block_box.run_in_children,
-                                Some(child_children),
-                                None,
                             );
-                        } else {
-                            layout.layout_element_with_child_boxes_and_run_ins(
-                                child_element,
-                                child_style,
-                                stylesheets,
-                                &block_box.run_in_children,
-                                Some(child_children),
-                            );
-                        }
-                    });
+                        },
+                    );
                     if let (Some(context), Some(scope)) = (split_block_context, split_scope) {
                         self.finish_inline_split_block_paint_scope(context, scope);
                     }
                 } else {
                     let split_scope =
                         split_block_context.map(|_| self.begin_inline_split_block_paint_scope());
-                    self.with_text_box_line_trim_scope(child_text_box_line_trim, |layout| {
-                        layout.layout_element_with_child_boxes(
-                            child_element,
-                            child_style,
-                            stylesheets,
-                            Some(child_children),
-                        );
-                    });
+                    self.with_inline_split_block_relative_layout_scope(
+                        split_block_context,
+                        |layout| {
+                            layout.with_text_box_line_trim_scope(
+                                child_text_box_line_trim,
+                                |layout| {
+                                    if let Some(core) = child_box.element_core()
+                                        && let box_tree::BoxSource::GeneratedPseudo(pseudo) =
+                                            &core.source
+                                    {
+                                        layout.layout_generated_pseudo_box(
+                                            child_element,
+                                            child_style,
+                                            pseudo.kind.counter_event_source(),
+                                            stylesheets,
+                                            &[],
+                                            Some(child_children),
+                                            None,
+                                        );
+                                    } else {
+                                        let principal_root_layout_style = child_element
+                                            .tag
+                                            .eq_ignore_ascii_case("html")
+                                            .then(|| {
+                                                layout.principal_flow.root_layout_style(child_style)
+                                            });
+                                        layout.layout_element_with_child_boxes(
+                                            child_element,
+                                            principal_root_layout_style
+                                                .as_ref()
+                                                .unwrap_or(child_style),
+                                            stylesheets,
+                                            Some(child_children),
+                                        );
+                                    }
+                                },
+                            );
+                        },
+                    );
                     if let (Some(context), Some(scope)) = (split_block_context, split_scope) {
                         self.finish_inline_split_block_paint_scope(context, scope);
                     }
@@ -719,6 +994,132 @@ impl<'a> LayoutBuilder<'a> {
                     self.block_static_position_y_offset = previous;
                 }
                 self.flush_float_run(&mut float_run);
+            }
+            if let Some(checkpoint) = principal_flow_paint_checkpoint
+                && self.pages.len() == principal_flow_page_index
+            {
+                let fragment = self.current_page.take_paint_fragment_since(checkpoint);
+                // A logical block sibling consumes the preceding child's used
+                // border-box span, regardless of whether that child is the
+                // document canvas. Paint bounds include glyph overhang and
+                // omit empty boxes, so using them here changes normal-flow
+                // placement according to incidental ink.
+                // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+                let block_advance = self
+                    .last_block_layout_outcome
+                    .physical_border_box_inline_span
+                    .points()
+                    + match block_start_side(style.writing_mode) {
+                        PhysicalSide::Left => child_style.margin.right,
+                        PhysicalSide::Right => child_style.margin.left,
+                        PhysicalSide::Top | PhysicalSide::Bottom => {
+                            unreachable!(
+                                "a vertical writing mode must have a horizontal block axis"
+                            )
+                        }
+                    };
+                if is_flow_child && self.principal_flow.is_source_body(element) {
+                    // The body's ordinary child cursor is local to the
+                    // document canvas. Retain only its trailing logical
+                    // margin for a later root-inline continuation; its box
+                    // span is never a root sibling advance.
+                    // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+                    let trailing_child_margin = match block_start_side(style.writing_mode) {
+                        PhysicalSide::Left => child_style.margin.right,
+                        PhysicalSide::Right => child_style.margin.left,
+                        PhysicalSide::Top | PhysicalSide::Bottom => unreachable!(
+                            "a vertical writing mode must have a horizontal block axis"
+                        ),
+                    };
+                    self.root_principal_flow_context.completed_body =
+                        Some(PrincipalFlowContribution {
+                            logical_block_advance: layout_pt(trailing_child_margin),
+                        });
+                }
+                let inline_translation = if body_bottom_inline_start {
+                    fragment
+                        .bounds()
+                        .map(|bounds| {
+                            self.page_bottom() + self.principal_inline_end_inset - bounds.y()
+                        })
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let canvas_child_block_start_translation =
+                    if self.principal_flow.is_source_body(element)
+                        && style.writing_mode == WritingMode::VerticalRl
+                        && child_style.margin.right > 0.0
+                    {
+                        // The body's physical block-start canvas inset and
+                        // the child's own block-start margin both offset a
+                        // non-initial canvas child. They are layout
+                        // coordinates, not ink bounds, so preserve them when
+                        // projecting the vertical-rl canvas child.
+                        // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+                        style.margin.right + child_style.margin.right
+                    } else {
+                        0.0
+                    };
+                self.current_page.append_paint_fragment_owned(
+                    fragment,
+                    PaintTranslation::new(canvas_child_block_start_translation, inline_translation),
+                );
+                self.cursor_y = principal_flow_inline_cursor;
+                if !source_body_canvas && !self.principal_flow.is_source_body(element) {
+                    match block_start_side(style.writing_mode) {
+                        PhysicalSide::Left => {
+                            self.content_left =
+                                (self.content_left + block_advance).min(self.content_right)
+                        }
+                        PhysicalSide::Right => {
+                            self.content_right =
+                                (self.content_right - block_advance).max(self.content_left)
+                        }
+                        PhysicalSide::Top | PhysicalSide::Bottom => {
+                            unreachable!(
+                                "a vertical writing mode must have a horizontal block axis"
+                            )
+                        }
+                    }
+                }
+                if source_body_canvas {
+                    // The selected body supplies the document canvas, not a
+                    // viewport-sized block sibling. Its used block-end canvas
+                    // inset remains visible to later root inline content,
+                    // while the automatic canvas span itself does not advance
+                    // the root's logical cursor.
+                    // <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+                    let block_end_inset = match block_start_side(style.writing_mode) {
+                        PhysicalSide::Left => child_style.margin.right,
+                        PhysicalSide::Right => child_style.margin.left,
+                        PhysicalSide::Top | PhysicalSide::Bottom => unreachable!(
+                            "a vertical writing mode must have a horizontal block axis"
+                        ),
+                    };
+                    let trailing_body_child_margin = self
+                        .root_principal_flow_context
+                        .completed_body
+                        .map(|contribution| contribution.logical_block_advance.points())
+                        .unwrap_or(0.0);
+                    let logical_block_advance = root_inline_body_canvas_completion(
+                        style.writing_mode,
+                        block_end_inset,
+                        trailing_body_child_margin,
+                    );
+                    self.root_principal_flow_context.completed_body =
+                        Some(PrincipalFlowContribution {
+                            logical_block_advance: layout_pt(logical_block_advance),
+                        });
+                    self.root_principal_flow_context.active_body = None;
+                    self.root_principal_flow_context
+                        .active_body_inline_end_inset = layout_pt(0.0);
+                }
+            }
+            if self.applied_clearance_count == clearance_count_before_child
+                && let Some(offset) = adjoining_start_margin_paint_offset
+            {
+                collapsed_start_margin_offset = collapsed_start_margin_offset.max(offset);
             }
             let emitted_float = self
                 .float_contexts
@@ -744,7 +1145,17 @@ impl<'a> LayoutBuilder<'a> {
                         ),
                     });
                 }
-                previous_flow_bottom_margin = if self_collapsing_child {
+                previous_flow_bottom_margin = if principal_vertical_flow {
+                    // This traversal cursor is physical top-to-bottom, but
+                    // a principal vertical flow advances along the physical
+                    // horizontal block axis. The child's physical bottom
+                    // margin is consequently an inline-axis margin and must
+                    // not collapse into the next sibling's physical top
+                    // margin.
+                    // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+                    // <https://www.w3.org/TR/css-writing-modes-4/#logical-to-physical>
+                    None
+                } else if self_collapsing_child {
                     Some(if trimmed_block_start_margin {
                         0.0
                     } else {
@@ -775,9 +1186,8 @@ impl<'a> LayoutBuilder<'a> {
                 if let Some(child_page_start) = effective_child_page_start {
                     previous_child_page_end = Some(child_page_start);
                 }
-            } else if let Some((_, child_page_end)) = child_page_value_sources {
-                previous_child_page_end =
-                    Some(self.page_boundary_name_in_active_scope(child_page_end, style));
+            } else if let Some(sources) = child_page_value_sources {
+                previous_child_page_end = Some(sources.end);
             }
             avoid_run_candidate = if avoid_run_start_decision.seeds_later_avoid_boundary {
                 child_estimated_height.and_then(|child_height| {
@@ -801,6 +1211,60 @@ impl<'a> LayoutBuilder<'a> {
         ChildFlowTraversalOutcome {
             pending_end_margin_collapse,
             collapsed_start_margin_offset,
+        }
+    }
+}
+
+/// Whether an anonymous block exists solely because an inline generated
+/// pseudo-element belongs to the HTML root. Such a wrapper shares the
+/// document principal flow; block-level root pseudos remain independent
+/// formatting contexts.
+///
+/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+fn anonymous_block_wraps_root_principal_pseudo(children: &[box_tree::FormattingBox<'_>]) -> bool {
+    children.iter().any(|child| {
+        child.element_core().is_some_and(|core| {
+            core.element.document_syntax == crate::dom::DocumentSyntax::Html
+                && core.element.tag.eq_ignore_ascii_case("html")
+                && !core.style.display.is_block_level()
+                && matches!(
+                    &core.source,
+                    box_tree::BoxSource::GeneratedPseudo(pseudo)
+                        if matches!(
+                            pseudo.kind,
+                            box_tree::GeneratedPseudoKind::Before
+                                | box_tree::GeneratedPseudoKind::After
+                        )
+                )
+        })
+    })
+}
+
+/// Returns the root-flow continuation left by a propagated body canvas.
+///
+/// The selected body supplies the initial canvas rather than an ordinary
+/// root block. Its automatic span is therefore discarded, but its used
+/// block-end canvas inset and its final child margin remain observable at the
+/// root inline continuation. The physical combination follows the principal
+/// writing-mode axes: sideways modes retain both edges, while the two
+/// vertical directions retain the edge that is traversed by their respective
+/// root inline continuation.
+///
+/// <https://www.w3.org/TR/css-writing-modes-4/#principal-flow>
+fn root_inline_body_canvas_completion(
+    writing_mode: WritingMode,
+    block_end_canvas_inset: f32,
+    trailing_child_block_margin: f32,
+) -> f32 {
+    match writing_mode {
+        WritingMode::SidewaysRl | WritingMode::SidewaysLr => {
+            block_end_canvas_inset + trailing_child_block_margin
+        }
+        WritingMode::VerticalRl => trailing_child_block_margin,
+        WritingMode::VerticalLr => block_end_canvas_inset,
+        WritingMode::HorizontalTb => {
+            let _ = (block_end_canvas_inset, trailing_child_block_margin);
+            0.0
         }
     }
 }

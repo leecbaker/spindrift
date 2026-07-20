@@ -11,6 +11,15 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
     let (direction, writing_mode) =
         logical_mapping_context(style, declarations, inheritance_source);
     let declarations = declarations_after_css_wide_rollbacks(declarations, direction, writing_mode);
+    // A declaration is ignored when its specified value does not match the
+    // property's grammar.  Keep this boundary before the font-size/color
+    // prepasses: CSS Conditional declaration queries and ordinary cascade
+    // application must agree about the same specified-value operation.
+    // <https://www.w3.org/TR/css-cascade-5/#filtering>
+    let declarations = declarations
+        .into_iter()
+        .filter_map(canonical_cascaded_declaration)
+        .collect::<Vec<_>>();
     apply_cascaded_custom_property_declarations(style, &declarations);
     apply_cascaded_font_size_declarations_with_parent_ch_advance(
         style,
@@ -19,6 +28,12 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
         parent_ch_advance,
     );
     apply_cascaded_color_declarations(style, &declarations, inheritance_source);
+    let declarations = declarations_after_variable_substitution_and_shorthand_expansion(
+        &declarations,
+        &style.custom_properties,
+        direction,
+        writing_mode,
+    );
 
     for (index, declaration) in declarations.iter().enumerate() {
         let name = declaration.name.as_ref();
@@ -119,6 +134,20 @@ pub(crate) fn apply_cascaded_declarations_with_inheritance_source_and_parent_ch_
     // <https://drafts.csswg.org/css-viewport/#zoom-property>
     style.effective_zoom =
         EffectiveZoom::from_parent_and_local(inheritance_source.effective_zoom, style.zoom);
+}
+
+pub(in crate::css) fn canonical_cascaded_declaration<'a>(
+    declaration: CascadedDeclaration<'a>,
+) -> Option<CascadedDeclaration<'a>> {
+    let (name, value) = crate::css::parse::declaration_operation(
+        declaration.name.as_ref(),
+        declaration.value.as_ref(),
+    )?;
+    Some(CascadedDeclaration {
+        name: Cow::Owned(name),
+        value: Cow::Owned(value),
+        ..declaration
+    })
 }
 
 /// Apply Overflow's cross-axis computed-value adjustment.

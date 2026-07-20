@@ -4,7 +4,43 @@ use std::rc::Rc;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PageBoxWith<'a, S = MutableStyle> {
     pub children: Vec<FormattingBoxWith<'a, S>>,
+    /// GCPM footnote bodies, separated from their source position before the
+    /// normal formatting tree is fragmented into pages.
+    pub footnotes: Vec<FootnoteBoxWith<'a, S>>,
     pub counter_events: Vec<CounterEventNode<'a>>,
+    /// `string-set` sources with `display: none` do not generate formatting
+    /// boxes, but GCPM still assigns their named strings at their source
+    /// position. This sidecar carries those non-painting source events through
+    /// box-tree construction without making them layout children.
+    pub suppressed_named_string_events: Vec<SuppressedNamedStringEvent>,
+}
+
+/// A `float: footnote` body detached from the principal flow.
+///
+/// The call remains in the ordinary formatting tree, while this body is
+/// assigned to a page footnote area by paged layout. Keeping the two together
+/// in the unfragmented box tree preserves document order and counter identity
+/// independently of page-break retry.
+/// <https://www.w3.org/TR/css-gcpm-3/#footnotes>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FootnoteBoxWith<'a, S = MutableStyle> {
+    pub element: &'a Element,
+    pub body: FormattingBoxWith<'a, S>,
+    pub display: css::FootnoteDisplay,
+    pub policy: css::FootnotePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SuppressedNamedStringEvent {
+    pub element: Element,
+    pub style: ComputedStyle,
+    pub target: SuppressedNamedStringEventTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuppressedNamedStringEventTarget {
+    BeforeElement(ElementId),
+    AfterElement(ElementId),
 }
 
 /// A box-generating element or tree-abiding pseudo-element in CSS tree order.
@@ -15,8 +51,52 @@ pub(crate) struct PageBoxWith<'a, S = MutableStyle> {
 pub(crate) struct CounterEventNode<'a> {
     pub element: &'a Element,
     pub source: CounterEventSource,
-    pub style: ComputedStyle,
+    /// The counter-relevant portion of the element's computed style.
+    ///
+    /// Counter planning is intentionally a sidecar to the formatting tree,
+    /// but retaining a complete `ComputedStyle` here would duplicate every
+    /// inline box's full CSS state. Keep only the declarations and flags that
+    /// affect counter scopes and values.
+    pub counter_style: CounterEventStyle,
     pub children: Vec<CounterEventNode<'a>>,
+}
+
+/// The computed CSS state consumed by counter planning.
+///
+/// CSS Lists and CSS Containment make counter behavior depend on counter
+/// resets, increments, sets, list-item display, and style containment. Other
+/// computed values belong exclusively to the formatting tree.
+/// <https://www.w3.org/TR/css-lists-3/#automatic-counters> and
+/// <https://www.w3.org/TR/css-contain-1/#containment-style>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CounterEventStyle {
+    pub counter_resets: Vec<css::CounterReset>,
+    pub counter_increments: Vec<css::CounterChange>,
+    pub counter_sets: Vec<css::CounterChange>,
+    pub is_list_item: bool,
+    pub style_containment: bool,
+}
+
+impl CounterEventStyle {
+    pub(crate) fn from_computed(style: &ComputedStyle) -> Self {
+        Self {
+            counter_resets: style.counter_resets.clone(),
+            counter_increments: style.counter_increments.clone(),
+            counter_sets: style.counter_sets.clone(),
+            is_list_item: style.display.is_list_item(),
+            style_containment: style.contain.style,
+        }
+    }
+
+    pub(crate) fn suppressed_display_none() -> Self {
+        Self {
+            counter_resets: Vec::new(),
+            counter_increments: Vec::new(),
+            counter_sets: Vec::new(),
+            is_list_item: false,
+            style_containment: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,6 +105,8 @@ pub(crate) enum CounterEventSource {
     Marker,
     Before,
     After,
+    FootnoteCall,
+    FootnoteMarker,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +126,7 @@ pub(crate) type MutableStyle = Box<ComputedStyle>;
 pub(crate) type SharedStyle = Rc<ComputedStyle>;
 pub(crate) type MutablePageBox<'a> = PageBoxWith<'a, MutableStyle>;
 pub(crate) type MutableFormattingBox<'a> = FormattingBoxWith<'a, MutableStyle>;
+pub(crate) type MutableFootnoteBox<'a> = FootnoteBoxWith<'a, MutableStyle>;
 pub(crate) type MutableTableFragment<'a> = TableFragmentWith<'a, MutableStyle>;
 pub(crate) type MutableBlockBox<'a> = BlockBoxWith<'a, MutableStyle>;
 pub(crate) type MutableInlineBox<'a> = InlineBoxWith<'a, MutableStyle>;
@@ -65,6 +148,7 @@ pub(crate) type MutableTableFragmentColumnGroup<'a> =
     TableFragmentColumnGroupWith<'a, MutableStyle>;
 pub(crate) type FrozenPageBox<'a> = PageBoxWith<'a, SharedStyle>;
 pub(crate) type FrozenFormattingBox<'a> = FormattingBoxWith<'a, SharedStyle>;
+pub(crate) type FootnoteBox<'a> = FootnoteBoxWith<'a, SharedStyle>;
 pub(crate) type FrozenTableFragment<'a> = TableFragmentWith<'a, SharedStyle>;
 pub(crate) type FrozenBlockBox<'a> = BlockBoxWith<'a, SharedStyle>;
 pub(crate) type FrozenInlineBox<'a> = InlineBoxWith<'a, SharedStyle>;
@@ -93,7 +177,18 @@ pub(crate) fn freeze_page_box<'a>(page_box: MutablePageBox<'a>) -> FrozenPageBox
     let mut freezer = StyleFreezer::default();
     FrozenPageBox {
         children: freezer.freeze_child_boxes(page_box.children),
+        footnotes: page_box
+            .footnotes
+            .into_iter()
+            .map(|footnote| FootnoteBoxWith {
+                element: footnote.element,
+                body: freezer.freeze_box(footnote.body),
+                display: footnote.display,
+                policy: footnote.policy,
+            })
+            .collect(),
         counter_events: page_box.counter_events,
+        suppressed_named_string_events: page_box.suppressed_named_string_events,
     }
 }
 
@@ -141,33 +236,34 @@ impl StyleFreezer {
         style.map(|style| self.freeze_style(style))
     }
 
+    fn freeze_element_box_core<'a>(
+        &mut self,
+        core: ElementBoxCoreWith<'a, MutableStyle>,
+    ) -> ElementBoxCoreWith<'a, SharedStyle> {
+        ElementBoxCoreWith {
+            element: core.element,
+            signature: core.signature,
+            source: core.source,
+            style: self.freeze_style(core.style),
+            children: self.freeze_child_boxes(core.children),
+        }
+    }
+
     fn freeze_box<'a>(&mut self, box_: MutableFormattingBox<'a>) -> FrozenFormattingBox<'a> {
         match box_ {
             MutableFormattingBox::Block(box_) => FrozenFormattingBox::Block(FrozenBlockBox {
-                element: box_.element,
-                signature: box_.signature,
-                source: box_.source,
-                style: self.freeze_style(box_.style),
+                core: self.freeze_element_box_core(box_.core),
                 marker: box_.marker.map(|marker| self.freeze_marker(marker)),
                 run_in_children: self.freeze_child_boxes(box_.run_in_children),
-                children: self.freeze_child_boxes(box_.children),
             }),
             MutableFormattingBox::Inline(box_) => FrozenFormattingBox::Inline(FrozenInlineBox {
-                element: box_.element,
-                signature: box_.signature,
-                source: box_.source,
-                style: self.freeze_style(box_.style),
+                core: self.freeze_element_box_core(box_.core),
                 marker: box_.marker.map(|marker| self.freeze_marker(marker)),
                 fragment_edges: box_.fragment_edges,
-                children: self.freeze_child_boxes(box_.children),
             }),
             MutableFormattingBox::InlineSplitBlockContext(box_) => {
                 FrozenFormattingBox::InlineSplitBlockContext(FrozenInlineSplitBlockContextBox {
-                    element: box_.element,
-                    signature: box_.signature,
-                    source: box_.source,
-                    style: self.freeze_style(box_.style),
-                    children: self.freeze_child_boxes(box_.children),
+                    core: self.freeze_element_box_core(box_.core),
                 })
             }
             MutableFormattingBox::AnonymousBlock(box_) => {
@@ -178,12 +274,8 @@ impl StyleFreezer {
             }
             MutableFormattingBox::AtomicInline(box_) => {
                 FrozenFormattingBox::AtomicInline(FrozenAtomicInlineBox {
-                    element: box_.element,
-                    signature: box_.signature,
-                    source: box_.source,
-                    style: self.freeze_style(box_.style),
+                    core: self.freeze_element_box_core(box_.core),
                     marker: box_.marker.map(|marker| self.freeze_marker(marker)),
-                    children: self.freeze_child_boxes(box_.children),
                     table_fragment: box_
                         .table_fragment
                         .map(|fragment| self.freeze_table_fragment(fragment)),
@@ -193,30 +285,18 @@ impl StyleFreezer {
                 FrozenFormattingBox::Text(self.freeze_text_box(box_))
             }
             MutableFormattingBox::Table(box_) => FrozenFormattingBox::Table(FrozenTableBox {
-                element: box_.element,
-                signature: box_.signature,
-                source: box_.source,
-                style: self.freeze_style(box_.style),
+                core: self.freeze_element_box_core(box_.core),
                 marker: box_.marker.map(|marker| self.freeze_marker(marker)),
-                children: self.freeze_child_boxes(box_.children),
                 fragment: self.freeze_table_fragment(box_.fragment),
             }),
             MutableFormattingBox::Flex(box_) => FrozenFormattingBox::Flex(FrozenFlexBox {
-                element: box_.element,
-                signature: box_.signature,
-                source: box_.source,
-                style: self.freeze_style(box_.style),
+                core: self.freeze_element_box_core(box_.core),
                 marker: box_.marker.map(|marker| self.freeze_marker(marker)),
-                children: self.freeze_child_boxes(box_.children),
             }),
             MutableFormattingBox::Replaced(box_) => {
                 FrozenFormattingBox::Replaced(FrozenReplacedBox {
-                    element: box_.element,
-                    signature: box_.signature,
-                    source: box_.source,
-                    style: self.freeze_style(box_.style),
+                    core: self.freeze_element_box_core(box_.core),
                     marker: box_.marker.map(|marker| self.freeze_marker(marker)),
-                    children: self.freeze_child_boxes(box_.children),
                 })
             }
         }
@@ -286,33 +366,33 @@ fn thaw_optional_style(style: &Option<SharedStyle>) -> Option<MutableStyle> {
     style.as_ref().map(thaw_style)
 }
 
+fn thaw_element_box_core<'a>(
+    core: &ElementBoxCoreWith<'a, SharedStyle>,
+) -> ElementBoxCoreWith<'a, MutableStyle> {
+    ElementBoxCoreWith {
+        element: core.element,
+        signature: core.signature.clone(),
+        source: core.source.clone(),
+        style: thaw_style(&core.style),
+        children: thaw_child_boxes(&core.children),
+    }
+}
+
 fn thaw_box<'a>(box_: &FrozenFormattingBox<'a>) -> MutableFormattingBox<'a> {
     match box_ {
         FrozenFormattingBox::Block(box_) => MutableFormattingBox::Block(MutableBlockBox {
-            element: box_.element,
-            signature: box_.signature.clone(),
-            source: box_.source.clone(),
-            style: thaw_style(&box_.style),
+            core: thaw_element_box_core(&box_.core),
             marker: box_.marker.as_ref().map(thaw_marker),
             run_in_children: thaw_child_boxes(&box_.run_in_children),
-            children: thaw_child_boxes(&box_.children),
         }),
         FrozenFormattingBox::Inline(box_) => MutableFormattingBox::Inline(MutableInlineBox {
-            element: box_.element,
-            signature: box_.signature.clone(),
-            source: box_.source.clone(),
-            style: thaw_style(&box_.style),
+            core: thaw_element_box_core(&box_.core),
             marker: box_.marker.as_ref().map(thaw_marker),
             fragment_edges: box_.fragment_edges,
-            children: thaw_child_boxes(&box_.children),
         }),
         FrozenFormattingBox::InlineSplitBlockContext(box_) => {
             MutableFormattingBox::InlineSplitBlockContext(MutableInlineSplitBlockContextBox {
-                element: box_.element,
-                signature: box_.signature.clone(),
-                source: box_.source.clone(),
-                style: thaw_style(&box_.style),
-                children: thaw_child_boxes(&box_.children),
+                core: thaw_element_box_core(&box_.core),
             })
         }
         FrozenFormattingBox::AnonymousBlock(box_) => {
@@ -323,40 +403,24 @@ fn thaw_box<'a>(box_: &FrozenFormattingBox<'a>) -> MutableFormattingBox<'a> {
         }
         FrozenFormattingBox::AtomicInline(box_) => {
             MutableFormattingBox::AtomicInline(MutableAtomicInlineBox {
-                element: box_.element,
-                signature: box_.signature.clone(),
-                source: box_.source.clone(),
-                style: thaw_style(&box_.style),
+                core: thaw_element_box_core(&box_.core),
                 marker: box_.marker.as_ref().map(thaw_marker),
-                children: thaw_child_boxes(&box_.children),
                 table_fragment: box_.table_fragment.as_ref().map(thaw_table_fragment),
             })
         }
         FrozenFormattingBox::Text(box_) => MutableFormattingBox::Text(thaw_text_box(box_)),
         FrozenFormattingBox::Table(box_) => MutableFormattingBox::Table(MutableTableBox {
-            element: box_.element,
-            signature: box_.signature.clone(),
-            source: box_.source.clone(),
-            style: thaw_style(&box_.style),
+            core: thaw_element_box_core(&box_.core),
             marker: box_.marker.as_ref().map(thaw_marker),
-            children: thaw_child_boxes(&box_.children),
             fragment: thaw_table_fragment(&box_.fragment),
         }),
         FrozenFormattingBox::Flex(box_) => MutableFormattingBox::Flex(MutableFlexBox {
-            element: box_.element,
-            signature: box_.signature.clone(),
-            source: box_.source.clone(),
-            style: thaw_style(&box_.style),
+            core: thaw_element_box_core(&box_.core),
             marker: box_.marker.as_ref().map(thaw_marker),
-            children: thaw_child_boxes(&box_.children),
         }),
         FrozenFormattingBox::Replaced(box_) => MutableFormattingBox::Replaced(MutableReplacedBox {
-            element: box_.element,
-            signature: box_.signature.clone(),
-            source: box_.source.clone(),
-            style: thaw_style(&box_.style),
+            core: thaw_element_box_core(&box_.core),
             marker: box_.marker.as_ref().map(thaw_marker),
-            children: thaw_child_boxes(&box_.children),
         }),
     }
 }
@@ -537,6 +601,21 @@ impl<'a, S> FormattingBoxWith<'a, S>
 where
     S: AsRef<ComputedStyle>,
 {
+    /// Whether this formatting root can honor breaks from `fragmentainer_kind`
+    /// when it is orthogonal to an enclosing fragmentation context.
+    ///
+    /// Tables own a row-fragment plan and commit their continuation state
+    /// before paint replay. Other formatting roots remain monolithic until
+    /// they expose the same contract; treating every vertical descendant as
+    /// fragmentable would discard source-range ownership at the boundary.
+    /// <https://www.w3.org/TR/css-break-3/#fragmentation-model>.
+    pub(crate) fn supports_fragmentainer_fragmentation(
+        &self,
+        fragmentainer_kind: FragmentainerKind,
+    ) -> bool {
+        matches!(self, Self::Table(_)) && fragmentainer_kind == FragmentainerKind::Column
+    }
+
     pub fn element_parts(
         &self,
     ) -> Option<(
@@ -545,44 +624,53 @@ where
         &ComputedStyle,
         &[FormattingBoxWith<'a, S>],
     )> {
+        if matches!(self, Self::InlineSplitBlockContext(_)) {
+            return None;
+        }
+        self.element_core().map(|core| {
+            (
+                core.element,
+                &core.signature,
+                core.style.as_ref(),
+                core.children.as_slice(),
+            )
+        })
+    }
+
+    /// Returns the structural state shared by element-backed formatting boxes.
+    ///
+    /// Inline-split block contexts retain their originating element's core,
+    /// even though [`element_parts`](Self::element_parts) excludes them from
+    /// ordinary element layout dispatch. Markers, block run-in children, inline
+    /// fragment edges, and table fragments remain variant-specific state.
+    pub(crate) fn element_core(&self) -> Option<&ElementBoxCoreWith<'a, S>> {
         match self {
-            Self::Block(box_) => Some((
-                box_.element,
-                &box_.signature,
-                box_.style.as_ref(),
-                &box_.children,
-            )),
-            Self::Inline(box_) => Some((
-                box_.element,
-                &box_.signature,
-                box_.style.as_ref(),
-                &box_.children,
-            )),
-            Self::InlineSplitBlockContext(_) => None,
-            Self::AtomicInline(box_) => Some((
-                box_.element,
-                &box_.signature,
-                box_.style.as_ref(),
-                &box_.children,
-            )),
-            Self::Table(box_) => Some((
-                box_.element,
-                &box_.signature,
-                box_.style.as_ref(),
-                &box_.children,
-            )),
-            Self::Flex(box_) => Some((
-                box_.element,
-                &box_.signature,
-                box_.style.as_ref(),
-                &box_.children,
-            )),
-            Self::Replaced(box_) => Some((
-                box_.element,
-                &box_.signature,
-                box_.style.as_ref(),
-                &box_.children,
-            )),
+            Self::Block(box_) => Some(&box_.core),
+            Self::Inline(box_) => Some(&box_.core),
+            Self::InlineSplitBlockContext(box_) => Some(&box_.core),
+            Self::AtomicInline(box_) => Some(&box_.core),
+            Self::Table(box_) => Some(&box_.core),
+            Self::Flex(box_) => Some(&box_.core),
+            Self::Replaced(box_) => Some(&box_.core),
+            Self::AnonymousBlock(_) | Self::Text(_) => None,
+        }
+    }
+
+    /// Returns mutable structural state shared by element-backed formatting boxes.
+    ///
+    /// This permits replacing owned core fields, including a frozen box's
+    /// [`SharedStyle`] handle, but never mutates the computed style behind a
+    /// shared handle. Markers, block run-in children, inline fragment edges,
+    /// and table fragments remain variant-specific state.
+    pub(crate) fn element_core_mut(&mut self) -> Option<&mut ElementBoxCoreWith<'a, S>> {
+        match self {
+            Self::Block(box_) => Some(&mut box_.core),
+            Self::Inline(box_) => Some(&mut box_.core),
+            Self::InlineSplitBlockContext(box_) => Some(&mut box_.core),
+            Self::AtomicInline(box_) => Some(&mut box_.core),
+            Self::Table(box_) => Some(&mut box_.core),
+            Self::Flex(box_) => Some(&mut box_.core),
+            Self::Replaced(box_) => Some(&mut box_.core),
             Self::AnonymousBlock(_) | Self::Text(_) => None,
         }
     }
@@ -602,32 +690,77 @@ where
         }
     }
 
-    #[cfg(test)]
-    pub fn style(&self) -> &ComputedStyle {
+    /// Returns this formatting box's stored computed style.
+    ///
+    /// This is the box-tree value before any formatting-context-specific
+    /// used-value adjustments. Callers that need used values must obtain them
+    /// at the relevant layout boundary.
+    pub(crate) fn style(&self) -> &ComputedStyle {
         match self {
-            Self::Block(box_) => box_.style.as_ref(),
-            Self::Inline(box_) => box_.style.as_ref(),
-            Self::InlineSplitBlockContext(box_) => box_.style.as_ref(),
+            Self::Block(box_) => box_.core.style.as_ref(),
+            Self::Inline(box_) => box_.core.style.as_ref(),
+            Self::InlineSplitBlockContext(box_) => box_.core.style.as_ref(),
             Self::AnonymousBlock(box_) => box_.style.as_ref(),
-            Self::AtomicInline(box_) => box_.style.as_ref(),
+            Self::AtomicInline(box_) => box_.core.style.as_ref(),
             Self::Text(box_) => box_.style.as_ref(),
-            Self::Table(box_) => box_.style.as_ref(),
-            Self::Flex(box_) => box_.style.as_ref(),
-            Self::Replaced(box_) => box_.style.as_ref(),
+            Self::Table(box_) => box_.core.style.as_ref(),
+            Self::Flex(box_) => box_.core.style.as_ref(),
+            Self::Replaced(box_) => box_.core.style.as_ref(),
         }
     }
 
     pub(crate) fn children(&self) -> &[FormattingBoxWith<'a, S>] {
         match self {
-            Self::Block(box_) => &box_.children,
-            Self::Inline(box_) => &box_.children,
-            Self::InlineSplitBlockContext(box_) => &box_.children,
+            Self::Block(box_) => &box_.core.children,
+            Self::Inline(box_) => &box_.core.children,
+            Self::InlineSplitBlockContext(box_) => &box_.core.children,
             Self::AnonymousBlock(box_) => &box_.children,
-            Self::AtomicInline(box_) => &box_.children,
-            Self::Table(box_) => &box_.children,
-            Self::Flex(box_) => &box_.children,
-            Self::Replaced(box_) => &box_.children,
+            Self::AtomicInline(box_) => &box_.core.children,
+            Self::Table(box_) => &box_.core.children,
+            Self::Flex(box_) => &box_.core.children,
+            Self::Replaced(box_) => &box_.core.children,
             Self::Text(_) => &[],
+        }
+    }
+
+    /// Returns this formatting box's ordinary child formatting boxes.
+    ///
+    /// This mirrors [`children`](Self::children): block run-in children,
+    /// markers, and table fragments remain variant-specific structures rather
+    /// than ordinary formatting-tree descendants.
+    pub(crate) fn children_mut(&mut self) -> &mut [FormattingBoxWith<'a, S>] {
+        match self {
+            Self::Block(box_) => &mut box_.core.children,
+            Self::Inline(box_) => &mut box_.core.children,
+            Self::InlineSplitBlockContext(box_) => &mut box_.core.children,
+            Self::AnonymousBlock(box_) => &mut box_.children,
+            Self::AtomicInline(box_) => &mut box_.core.children,
+            Self::Table(box_) => &mut box_.core.children,
+            Self::Flex(box_) => &mut box_.core.children,
+            Self::Replaced(box_) => &mut box_.core.children,
+            Self::Text(_) => &mut [],
+        }
+    }
+}
+
+impl<'a> FormattingBoxWith<'a, MutableStyle> {
+    /// Returns this mutable formatting box's stored computed style.
+    ///
+    /// This accessor is intentionally unavailable for frozen formatting trees:
+    /// layout-time mutations must not alter shared [`SharedStyle`] values. As
+    /// with [`style`](Self::style), the returned value is the stored computed
+    /// style before formatting-context-specific used-value adjustments.
+    pub(crate) fn style_mut(&mut self) -> &mut ComputedStyle {
+        match self {
+            Self::Block(box_) => box_.core.style.as_mut(),
+            Self::Inline(box_) => box_.core.style.as_mut(),
+            Self::InlineSplitBlockContext(box_) => box_.core.style.as_mut(),
+            Self::AnonymousBlock(box_) => box_.style.as_mut(),
+            Self::AtomicInline(box_) => box_.core.style.as_mut(),
+            Self::Text(box_) => box_.style.as_mut(),
+            Self::Table(box_) => box_.core.style.as_mut(),
+            Self::Flex(box_) => box_.core.style.as_mut(),
+            Self::Replaced(box_) => box_.core.style.as_mut(),
         }
     }
 }
@@ -661,6 +794,17 @@ pub(crate) struct GeneratedPseudoBox<'a> {
 pub(crate) enum GeneratedPseudoKind {
     Before,
     After,
+    FootnoteCall,
+}
+
+impl GeneratedPseudoKind {
+    pub(crate) fn counter_event_source(self) -> CounterEventSource {
+        match self {
+            Self::Before => CounterEventSource::Before,
+            Self::After => CounterEventSource::After,
+            Self::FootnoteCall => CounterEventSource::FootnoteCall,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -677,26 +821,35 @@ pub(crate) enum FormattingBoxKind {
     Replaced,
 }
 
+/// Tree-owned data shared by every formatting box backed by one DOM element.
+///
+/// CSS Display transformations may change the formatting role of an element,
+/// but its identity, generated-box source, computed style, and descendants
+/// remain one coherent unit. Variant-specific fields stay on the concrete box
+/// type so that table, inline, and block formatting invariants remain
+/// explicit:
+/// <https://www.w3.org/TR/css-display-3/#box-generation>.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ElementBoxCoreWith<'a, S = MutableStyle> {
+    pub(crate) element: &'a Element,
+    pub(crate) signature: ElementSignature,
+    pub(crate) source: BoxSource<'a>,
+    pub(crate) style: S,
+    pub(crate) children: Vec<FormattingBoxWith<'a, S>>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BlockBoxWith<'a, S = MutableStyle> {
-    pub element: &'a Element,
-    pub signature: ElementSignature,
-    pub source: BoxSource<'a>,
-    pub style: S,
+    pub(crate) core: ElementBoxCoreWith<'a, S>,
     pub marker: Option<MarkerBoxWith<S>>,
     pub run_in_children: Vec<FormattingBoxWith<'a, S>>,
-    pub children: Vec<FormattingBoxWith<'a, S>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InlineBoxWith<'a, S = MutableStyle> {
-    pub element: &'a Element,
-    pub signature: ElementSignature,
-    pub source: BoxSource<'a>,
-    pub style: S,
+    pub(crate) core: ElementBoxCoreWith<'a, S>,
     pub marker: Option<MarkerBoxWith<S>>,
     pub fragment_edges: InlineBoxFragmentEdges,
-    pub children: Vec<FormattingBoxWith<'a, S>>,
 }
 
 /// Block-level segment generated by splitting an inline around an in-flow block.
@@ -710,11 +863,7 @@ pub(crate) struct InlineBoxWith<'a, S = MutableStyle> {
 /// <https://www.w3.org/TR/CSS22/zindex.html>.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InlineSplitBlockContextBoxWith<'a, S = MutableStyle> {
-    pub element: &'a Element,
-    pub signature: ElementSignature,
-    pub source: BoxSource<'a>,
-    pub style: S,
-    pub children: Vec<FormattingBoxWith<'a, S>>,
+    pub(crate) core: ElementBoxCoreWith<'a, S>,
 }
 
 /// Inline-start and inline-end decorations owned by one inline box fragment.
@@ -747,12 +896,8 @@ pub(crate) struct AnonymousBlockBoxWith<'a, S = MutableStyle> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AtomicInlineBoxWith<'a, S = MutableStyle> {
-    pub element: &'a Element,
-    pub signature: ElementSignature,
-    pub source: BoxSource<'a>,
-    pub style: S,
+    pub(crate) core: ElementBoxCoreWith<'a, S>,
     pub marker: Option<MarkerBoxWith<S>>,
-    pub children: Vec<FormattingBoxWith<'a, S>>,
     pub table_fragment: Option<TableFragmentWith<'a, S>>,
 }
 
@@ -769,12 +914,8 @@ pub(crate) struct TextBoxWith<S = MutableStyle> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TableBoxWith<'a, S = MutableStyle> {
-    pub element: &'a Element,
-    pub signature: ElementSignature,
-    pub source: BoxSource<'a>,
-    pub style: S,
+    pub(crate) core: ElementBoxCoreWith<'a, S>,
     pub marker: Option<MarkerBoxWith<S>>,
-    pub children: Vec<FormattingBoxWith<'a, S>>,
     pub fragment: TableFragmentWith<'a, S>,
 }
 
@@ -866,20 +1007,12 @@ pub(crate) struct TableFragmentCellPlacement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FlexBoxWith<'a, S = MutableStyle> {
-    pub element: &'a Element,
-    pub signature: ElementSignature,
-    pub source: BoxSource<'a>,
-    pub style: S,
+    pub(crate) core: ElementBoxCoreWith<'a, S>,
     pub marker: Option<MarkerBoxWith<S>>,
-    pub children: Vec<FormattingBoxWith<'a, S>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReplacedBoxWith<'a, S = MutableStyle> {
-    pub element: &'a Element,
-    pub signature: ElementSignature,
-    pub source: BoxSource<'a>,
-    pub style: S,
+    pub(crate) core: ElementBoxCoreWith<'a, S>,
     pub marker: Option<MarkerBoxWith<S>>,
-    pub children: Vec<FormattingBoxWith<'a, S>>,
 }

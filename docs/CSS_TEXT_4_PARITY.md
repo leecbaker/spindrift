@@ -29,6 +29,25 @@ approximation. Remaining work includes punctuation and replacement semantics,
 vertical edge cases, and complete selected-line line-break ownership for
 autospace edges: <https://drafts.csswg.org/css-text-4/#text-autospace-property>.
 
+## `text-spacing-trim` and `text-spacing`
+
+Quire represents `text-spacing-trim` as an inherited computed value and
+parses the `text-spacing` shorthand atomically with `text-autospace`. `auto`
+uses Quire's deterministic `normal` policy. Candidate lines are materialized
+before fitting: eligible CJK opening, closing, middle-dot, colon/dot, and
+ideographic-space adjacency effects select `halt` in horizontal text or
+`vhal` in vertical text. The same selected materialization supplies the
+committed line, paint, and intrinsic measurements, so a narrowed opening
+punctuation mark can change where a line wraps.
+
+The selector preserves source text and uses only copied fragments with changed
+used glyph advances. It implements start and forced-break-start treatment,
+closing-edge trimming, unconditional `trim-both` ends, `trim-all`, and the
+adjacent punctuation-pair rules. CJK
+colon and dot behavior is selected from the inherited language, including the
+Japanese/simplified/traditional Chinese distinctions:
+<https://drafts.csswg.org/css-text-4/#text-spacing-trim-property>.
+
 ## `text-wrap`
 
 Quire parses inherited `text-wrap`, `text-wrap-mode`, and `text-wrap-style`
@@ -61,6 +80,23 @@ pseudo-element boundaries, and fragmentation ordering. These are required by
 CSS Text 4's
 clamp-before-balance ordering:
 <https://drafts.csswg.org/css-text-4/#text-wrap-style>.
+
+## `wrap-inside`
+
+Quire supports the non-inherited `wrap-inside: auto | avoid` property on
+inline boxes. The shared inline opportunity graph retains lexical inline-box
+edges, so a marked box contains text, nested inline descendants, generated
+inline content, and atomic inline children without incorrectly inheriting the
+property. Line selection retains all otherwise legal candidates and chooses
+the latest fitting candidate in the least avoided scope: an external break
+first, then a break in an outer avoided box before one in a nested box. If an
+avoided unit cannot fit on an otherwise empty line, the normal candidate is
+used rather than overflowing it.
+
+`wrap-before` and `wrap-after` remain unimplemented. There is currently no
+upstream Web Platform Test coverage for `wrap-inside`; Quire's local parser,
+graph, and Ahem-backed layout regressions cover the supported behavior:
+<https://www.w3.org/TR/css-text-4/#wrap-inside-property>.
 
 ## `word-space-transform`
 

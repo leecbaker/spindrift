@@ -45,7 +45,9 @@ impl PhysicalInlineTextBounds {
 impl InlineLineGeometry {
     pub(in crate::layout) fn new(
         content_left: f32,
+        content_right: f32,
         cursor_y: f32,
+        line_block_size: f32,
         context: InlinePaintContext<'_>,
     ) -> Self {
         let style = context.block_style;
@@ -61,11 +63,18 @@ impl InlineLineGeometry {
         };
         let block_start = match axes.physical_side(LogicalSide::BlockStart) {
             PhysicalSide::Top | PhysicalSide::Bottom => cursor_y,
-            PhysicalSide::Left | PhysicalSide::Right => content_inline_start,
+            PhysicalSide::Left => content_inline_start,
+            // A vertical right-to-left line's logical block-start is the
+            // physical right edge of its containing block.  Place the line's
+            // own block extent immediately before that edge; subsequent lines
+            // advance left through the physical line stack.
+            // <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>
+            PhysicalSide::Right => content_right - line_block_size.max(0.0),
         };
         Self {
             writing_mode: style.writing_mode,
             direction,
+            inline_start_offset: context.line_indent,
             inline_start,
             inline_size,
             block_start,
@@ -79,8 +88,8 @@ impl InlineLineGeometry {
     ) -> f32 {
         let free_space = (self.inline_size - content_inline_size).max(0.0);
         match align {
-            TextAlign::Left if self.physical_left_is_inline_end() => free_space,
-            TextAlign::Right if self.physical_right_is_inline_end() => free_space,
+            TextAlign::Left if self.line_left_is_inline_end() => free_space,
+            TextAlign::Right if self.line_right_is_inline_end() => free_space,
             TextAlign::Center => free_space / 2.0,
             TextAlign::End => free_space,
             TextAlign::Left
@@ -179,8 +188,34 @@ impl InlineLineGeometry {
         logical_inline_start: f32,
         inline_size: f32,
     ) -> f32 {
-        let origin = self.physical_inline_origin(logical_inline_start, inline_size);
-        if WritingModeAxes::new(self.writing_mode, self.direction)
+        // `sideways-lr` fixes the line's physical orientation bottom-to-top.
+        // `direction` still selects bidi ordering and logical alignment, but
+        // must not reverse the PDF run origin a second time after the
+        // sideways-left text matrix has established that physical line.
+        // <https://drafts.csswg.org/css-writing-modes-4/#valdef-writing-mode-sideways-lr>
+        let (placement, placement_logical_inline_start) =
+            if self.writing_mode == WritingMode::SidewaysLr && self.direction == Direction::Rtl {
+                // The line geometry was collected with RTL's physical top edge
+                // as its inline start. `sideways-lr` instead has a fixed
+                // bottom-to-top physical line, so changing only `direction`
+                // would reinterpret that top coordinate as a bottom coordinate
+                // and replay the atom outside its cell. Reproject the retained
+                // logical line span to the writing-mode-defined bottom edge at
+                // the same boundary.
+                // <https://www.w3.org/TR/css-writing-modes-4/#valdef-writing-mode-sideways-lr>
+                (
+                    Self {
+                        direction: Direction::Ltr,
+                        inline_start: self.inline_start - self.inline_size,
+                        ..self
+                    },
+                    self.inline_size - logical_inline_start - inline_size,
+                )
+            } else {
+                (self, logical_inline_start)
+            };
+        let origin = placement.physical_inline_origin(placement_logical_inline_start, inline_size);
+        if WritingModeAxes::new(self.writing_mode, placement.direction)
             .physical_side(LogicalSide::InlineStart)
             == PhysicalSide::Top
         {
@@ -190,16 +225,40 @@ impl InlineLineGeometry {
         }
     }
 
-    pub(in crate::layout) fn physical_left_is_inline_end(self) -> bool {
-        WritingModeAxes::new(self.writing_mode, self.direction)
-            .physical_side(LogicalSide::InlineEnd)
-            == PhysicalSide::Left
+    /// CSS Writing Modes maps `text-align: left` and `right` through the
+    /// line-left and line-right sides, which are not always physical left and
+    /// right.  In vertical writing, the two sides are physical top/bottom;
+    /// `sideways-lr` reverses their order.
+    /// <https://www.w3.org/TR/css-writing-modes-4/#line-directions>
+    fn line_left_side(self) -> PhysicalSide {
+        match self.writing_mode {
+            WritingMode::HorizontalTb => PhysicalSide::Left,
+            WritingMode::VerticalRl | WritingMode::VerticalLr | WritingMode::SidewaysRl => {
+                PhysicalSide::Top
+            }
+            WritingMode::SidewaysLr => PhysicalSide::Bottom,
+        }
     }
 
-    pub(in crate::layout) fn physical_right_is_inline_end(self) -> bool {
+    fn line_right_side(self) -> PhysicalSide {
+        match self.line_left_side() {
+            PhysicalSide::Left => PhysicalSide::Right,
+            PhysicalSide::Right => PhysicalSide::Left,
+            PhysicalSide::Top => PhysicalSide::Bottom,
+            PhysicalSide::Bottom => PhysicalSide::Top,
+        }
+    }
+
+    fn line_left_is_inline_end(self) -> bool {
         WritingModeAxes::new(self.writing_mode, self.direction)
             .physical_side(LogicalSide::InlineEnd)
-            == PhysicalSide::Right
+            == self.line_left_side()
+    }
+
+    fn line_right_is_inline_end(self) -> bool {
+        WritingModeAxes::new(self.writing_mode, self.direction)
+            .physical_side(LogicalSide::InlineEnd)
+            == self.line_right_side()
     }
 }
 
@@ -213,6 +272,13 @@ impl InlineLineGeometry {
 pub(in crate::layout) struct InlineParagraphContext<'a> {
     pub(in crate::layout) block_style: &'a ComputedStyle,
     pub(in crate::layout) stylesheets: &'a [Stylesheet],
+    /// Whether the first formatted line of the originating block container
+    /// is still available to this anonymous inline run.
+    ///
+    /// Anonymous blocks produced by mixed inline/block content do not restart
+    /// their parent's first formatted line for `text-indent`, even though a
+    /// real descendant block establishes its own formatting context.
+    pub(in crate::layout) initial_first_formatted_line: bool,
     pub(in crate::layout) available_width: f32,
     pub(in crate::layout) padding_left: f32,
     pub(in crate::layout) hanging_indent: f32,
@@ -228,6 +294,9 @@ pub(in crate::layout) struct InlinePaintContext<'a> {
     pub(in crate::layout) line_indent: f32,
     pub(in crate::layout) text_align: TextAlign,
     pub(in crate::layout) is_first_line: bool,
+    /// Used logical block advance selected for this line record. This can
+    /// differ from the glyph/baseline metrics used for vertical alignment.
+    pub(in crate::layout) line_block_size: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +309,11 @@ pub(in crate::layout) struct InlineAtomData {
     pub(in crate::layout) escaped_positioned_layers: Option<Rc<[PositionedPaintLayer]>>,
     pub(in crate::layout) link_target: Option<Rc<str>>,
     pub(in crate::layout) alt_text: Option<Rc<str>>,
+    /// The containing inline scope. Atomic boxes use their parent scope so an
+    /// atom's own style cannot own tracking on its outside boundaries.
+    pub(in crate::layout) tracking_scope: Option<Rc<InlineTrackingScope>>,
+    /// Paintless advance inserted before this item after visual ordering.
+    pub(in crate::layout) leading_tracking: LayoutLength,
 }
 
 #[derive(Debug, Clone)]
@@ -275,10 +349,9 @@ impl InlineAtom {
         // participant.
         // <https://www.w3.org/TR/css-inline-3/#inline-block-baseline>
         // <https://www.w3.org/TR/css-contain-1/#containment-layout>
-        let exports_internal_baseline = !style.contain.layout
-            || (matches!(&content, InlineAtomContent::InlineBox { sequence } if sequence.records.is_empty())
-                && !style.box_values.width.is_auto()
-                && !style.box_values.height.is_auto());
+        let uses_empty_fallback_baseline =
+            (baseline_offset + style.margin.top + style.margin.bottom - size.height).abs() <= 0.01;
+        let exports_internal_baseline = !style.contain.layout || uses_empty_fallback_baseline;
         Self {
             data: Rc::new(InlineAtomData {
                 content,
@@ -289,6 +362,8 @@ impl InlineAtom {
                 escaped_positioned_layers: escaped_positioned_layers.map(Rc::from),
                 link_target: link_target.map(Rc::from),
                 alt_text: alt_text.map(Rc::from),
+                tracking_scope: None,
+                leading_tracking: layout_pt(0.0),
             }),
             size,
             baseline_offset,
@@ -304,6 +379,23 @@ impl InlineAtom {
     ) -> Self {
         self.visual_offset = visual_offset;
         self
+    }
+
+    pub(in crate::layout) fn with_tracking_scope(mut self, scope: Rc<InlineTrackingScope>) -> Self {
+        Rc::make_mut(&mut self.data).tracking_scope = Some(scope);
+        self
+    }
+
+    pub(in crate::layout) fn tracking_scope(&self) -> Option<&Rc<InlineTrackingScope>> {
+        self.data.tracking_scope.as_ref()
+    }
+
+    pub(in crate::layout) fn leading_tracking(&self) -> LayoutLength {
+        self.data.leading_tracking
+    }
+
+    pub(in crate::layout) fn set_leading_tracking(&mut self, advance: LayoutLength) {
+        Rc::make_mut(&mut self.data).leading_tracking = advance;
     }
 
     pub(in crate::layout) fn with_outside_marker(mut self, marker: Option<ListMarker>) -> Self {
@@ -473,7 +565,13 @@ pub(in crate::layout) enum InlineAtomContent {
         horizontal_style: Box<ComputedStyle>,
         inline_scale: f32,
     },
-    InlineFragment(Box<PaintFragment>),
+    /// Paint captured from an independent formatting context. Table-cell
+    /// fragments retain their final content-coordinate context so replay does
+    /// not infer writing mode from the enclosing inline line.
+    InlineFragment {
+        fragment: Box<PaintFragment>,
+        table_cell_context: Option<table::TableCellContentCoordinateContext>,
+    },
     InlineEdge(InlineEdgeRole),
     Leader(String),
 }
@@ -585,6 +683,10 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) page_value_scope_stack: Vec<Option<String>>,
     pub(in crate::layout) page_named_strings: Vec<HashMap<String, Vec<NamedStringAssignment>>>,
     pub(in crate::layout) page_running_elements: Vec<HashMap<String, Vec<NamedStringAssignment>>>,
+    pub(in crate::layout) suppressed_named_strings_before:
+        HashMap<ElementId, Vec<box_tree::SuppressedNamedStringEvent>>,
+    pub(in crate::layout) suppressed_named_strings_after:
+        HashMap<ElementId, Vec<box_tree::SuppressedNamedStringEvent>>,
     pub(in crate::layout) page_anchors: HashMap<String, usize>,
     pub(in crate::layout) page_anchor_text: HashMap<String, AnchorText>,
     pub(in crate::layout) document_canvas_background: Option<DocumentCanvasBackground>,
@@ -606,6 +708,12 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) cursor_y: f32,
     pub(in crate::layout) content_left: f32,
     pub(in crate::layout) content_right: f32,
+    pub(in crate::layout) table_cell_content_coordinate_contexts:
+        Vec<table::TableCellContentCoordinateContext>,
+    pub(in crate::layout) principal_body_block_end_inset: LayoutLength,
+    pub(in crate::layout) root_principal_flow_context: RootPrincipalFlowContext,
+    pub(in crate::layout) root_pseudo_block_projection: Option<RootPseudoBlockProjection>,
+    pub(in crate::layout) inline_split_float_exclusion_query_offset: RelativeOffset,
     pub(in crate::layout) content_logical_inline_size_stack: Vec<f32>,
     pub(in crate::layout) multicol_column_containing_blocks: Vec<MulticolColumnContainingBlock>,
     pub(in crate::layout) intrinsic_inline_percentage_basis_stack:
@@ -619,6 +727,7 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) block_static_position_y_offset: Option<f32>,
     pub(in crate::layout) absolute_static_position: Option<AbsoluteStaticPosition>,
     pub(in crate::layout) grid_positioning_scopes: Vec<grid::GridPositioningScope>,
+    pub(in crate::layout) pending_subgrid_contexts: Vec<Option<grid::ResolvedSubgridContext>>,
     pub(in crate::layout) escaped_atom_positioning_depth: usize,
     pub(in crate::layout) escaped_atom_containing_block: Option<ContainingBlock>,
     pub(in crate::layout) containing_block_writing_mode: WritingMode,
@@ -626,6 +735,7 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) child_available_space_stack: Vec<ChildAvailableSpace>,
     pub(in crate::layout) normal_flow_relative_containing_blocks:
         Vec<NormalFlowRelativeContainingBlock>,
+    pub(in crate::layout) block_static_position_contexts: Vec<BlockStaticPositionContext>,
     pub(in crate::layout) definite_block_size_stack: Vec<BlockSizePercentageBasis>,
     pub(in crate::layout) replayed_flex_item_percentage_height_bases:
         Vec<Option<BlockSizePercentageBasis>>,
@@ -656,12 +766,16 @@ pub(in crate::layout) struct LayoutSnapshot {
     pub(in crate::layout) active_scroll_snap_scopes: Vec<scroll_snap::ActiveScrollSnapScope>,
     pub(in crate::layout) next_float_id: usize,
     pub(in crate::layout) float_contexts: Vec<FloatContext>,
+    pub(in crate::layout) float_fragment_parent_inline_spans: Vec<PageInlineSpan>,
     pub(in crate::layout) adjoining_float_origin_y: Option<f32>,
     pub(in crate::layout) pending_paint_fragments: Vec<PendingPaintFragment>,
     pub(in crate::layout) pending_page_side_effects: Vec<PendingPageSideEffects>,
     pub(in crate::layout) applied_clearance_count: usize,
+    pub(in crate::layout) float_paint_capture_depth: usize,
     pub(in crate::layout) preserve_scoped_paint_public_order: bool,
     pub(in crate::layout) defer_next_block_decoration_promotion: bool,
+    pub(in crate::layout) suppress_next_principal_box_decoration: bool,
+    pub(in crate::layout) pending_page_footnotes: Vec<ElementId>,
 }
 
 /// A temporary fragmentainer materialized through Quire's page cursor.

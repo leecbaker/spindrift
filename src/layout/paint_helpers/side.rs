@@ -76,12 +76,15 @@ pub(crate) fn paint_border_side(
     if !border.is_visible() {
         return;
     }
-    if border.style == BorderStyle::Double && border.used_width >= 3.0 {
+    if border.style == BorderStyle::Double
+        && DoubleBorderBands::for_used_width(border.used_width).is_some()
+    {
         paint_double_border_side(rects, paths, edge, rect, border);
         return;
     }
 
-    let geometry = border_side_geometry(edge, rect, border.used_width);
+    let used_width = border.used_width.get();
+    let geometry = border_side_geometry(edge, rect, used_width);
     let axis_start = geometry.axis_start();
     let axis_length = geometry.axis_length();
     let cross_start = geometry.cross_start();
@@ -93,9 +96,9 @@ pub(crate) fn paint_border_side(
             axis_start,
             axis_length,
             cross_start,
-            cross_width,
+            PaintStrokeWidth::new(cross_width),
             horizontal,
-            border.used_width,
+            PaintStrokeWidth::new(used_width),
             border.color,
         ),
         BorderStyle::Dotted => paint_dotted_border_side(
@@ -103,7 +106,7 @@ pub(crate) fn paint_border_side(
             axis_start,
             axis_length,
             cross_start,
-            cross_width,
+            PaintStrokeWidth::new(cross_width),
             horizontal,
             border.color,
         ),
@@ -149,8 +152,8 @@ pub(crate) fn paint_border_side(
 pub(crate) fn inset_outset_border_color(
     style: BorderStyle,
     edge: BorderEdge,
-    color: Color,
-) -> Color {
+    color: CssColor,
+) -> CssColor {
     let top_or_left = matches!(edge, BorderEdge::Top | BorderEdge::Left);
     let lighten_side = top_or_left ^ (style == BorderStyle::Inset);
     if lighten_side {
@@ -163,8 +166,8 @@ pub(crate) fn inset_outset_border_color(
 pub(crate) fn groove_ridge_border_colors(
     style: BorderStyle,
     edge: BorderEdge,
-    color: Color,
-) -> (Color, Color) {
+    color: CssColor,
+) -> (CssColor, CssColor) {
     let top_or_left = matches!(edge, BorderEdge::Top | BorderEdge::Left);
     let outer_light = top_or_left ^ (style == BorderStyle::Ridge);
     if outer_light {
@@ -184,7 +187,7 @@ pub(crate) fn paint_groove_ridge_border_side(
     cross_width: f32,
     horizontal: bool,
     style: BorderStyle,
-    color: Color,
+    color: CssColor,
 ) {
     let (outer_color, inner_color) = groove_ridge_border_colors(style, edge, color);
     let half = cross_width / 2.0;
@@ -217,25 +220,35 @@ fn outer_inner_cross_positions(edge: BorderEdge, cross_start: f32, cross_width: 
     }
 }
 
-fn lighten_border_color(color: Color) -> Color {
+fn lighten_border_color(color: CssColor) -> CssColor {
     // CSS2's inset/outset border shading is an sRGB-era operation. Keep it
-    // at the explicit legacy paint boundary until it gains defined CSS Color
+    // at the explicit legacy paint boundary until it gains defined CSS CssColor
     // interpolation semantics.
-    let color = crate::css::color_to_srgb(color);
-    let (hue, mut saturation, mut value) = rgb_to_hsv(color.r, color.g, color.b);
+    let color = crate::css::color_to_predefined_rgb(color, crate::css::CssColorSpace::Srgb)
+        .expect("sRGB is a predefined CSS RGB space");
+    let (hue, mut saturation, mut value) = rgb_to_hsv(
+        color.components()[0],
+        color.components()[1],
+        color.components()[2],
+    );
     value = 1.0 - (1.0 - value) / 1.5;
     if saturation > 0.0 {
         saturation = 1.0 - (1.0 - saturation) / 1.25;
     }
     let (r, g, b) = hsv_to_rgb(hue, saturation, value);
-    Color::srgb(r, g, b, color.a)
+    CssColor::srgb(r, g, b, color.alpha())
 }
 
-fn darken_border_color(color: Color) -> Color {
-    let color = crate::css::color_to_srgb(color);
-    let (hue, saturation, value) = rgb_to_hsv(color.r, color.g, color.b);
+fn darken_border_color(color: CssColor) -> CssColor {
+    let color = crate::css::color_to_predefined_rgb(color, crate::css::CssColorSpace::Srgb)
+        .expect("sRGB is a predefined CSS RGB space");
+    let (hue, saturation, value) = rgb_to_hsv(
+        color.components()[0],
+        color.components()[1],
+        color.components()[2],
+    );
     let (r, g, b) = hsv_to_rgb(hue, saturation / 1.25, value / 1.5);
-    Color::srgb(r, g, b, color.a)
+    CssColor::srgb(r, g, b, color.alpha())
 }
 
 fn rgb_to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
@@ -281,10 +294,13 @@ pub(crate) fn paint_double_border_side(
     rect: PageTopRect,
     border: UsedBorderSide,
 ) {
-    let stripe = (border.used_width / 3.0).max(1.0);
+    let bands = DoubleBorderBands::for_used_width(border.used_width)
+        .expect("double border paint requires a double-band width");
+    let stripe = bands.stripe.get();
+    let used_width = border.used_width.get();
     let stripe_border = UsedBorderSide {
-        specified_width: stripe,
-        used_width: stripe,
+        specified_width: bands.stripe,
+        used_width: bands.stripe,
         style: BorderStyle::Solid,
         color: border.color,
     };
@@ -297,7 +313,7 @@ pub(crate) fn paint_double_border_side(
                 edge,
                 PageTopRect::new(
                     rect.x(),
-                    rect.top_y() - border.used_width + stripe,
+                    rect.top_y() - used_width + stripe,
                     rect.width(),
                     rect.height(),
                 ),
@@ -312,7 +328,7 @@ pub(crate) fn paint_double_border_side(
                 edge,
                 PageTopRect::new(
                     rect.x(),
-                    rect.top_y() + border.used_width - stripe,
+                    rect.top_y() + used_width - stripe,
                     rect.width(),
                     rect.height(),
                 ),
@@ -326,7 +342,7 @@ pub(crate) fn paint_double_border_side(
                 paths,
                 edge,
                 PageTopRect::new(
-                    rect.x() - border.used_width + stripe,
+                    rect.x() - used_width + stripe,
                     rect.top_y(),
                     rect.width(),
                     rect.height(),
@@ -341,7 +357,7 @@ pub(crate) fn paint_double_border_side(
                 paths,
                 edge,
                 PageTopRect::new(
-                    rect.x() + border.used_width - stripe,
+                    rect.x() + used_width - stripe,
                     rect.top_y(),
                     rect.width(),
                     rect.height(),
@@ -411,7 +427,8 @@ mod tests {
 
     #[test]
     fn double_top_border_keeps_inner_stripe_on_the_same_page_top_rect_edge() {
-        let border = UsedBorderSide::new(6.0, BorderStyle::Double, Color::new(0, 0, 0));
+        let border =
+            UsedBorderSide::new(layout_pt(6.0), BorderStyle::Double, CssColor::new(0, 0, 0));
         let mut rects = Vec::new();
         let mut paths = Vec::new();
         paint_double_border_side(
@@ -431,6 +448,36 @@ mod tests {
             vec![
                 paint_space_rect(10.0, 98.0, 50.0, 2.0),
                 paint_space_rect(10.0, 94.0, 50.0, 2.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn medium_double_border_paints_two_css_pixel_stripes() {
+        let border = UsedBorderSide::new(
+            layout_pt(3.0 * css::CSS_PX_TO_PT),
+            BorderStyle::Double,
+            CssColor::BLACK,
+        );
+        let mut rects = Vec::new();
+        let mut paths = Vec::new();
+        paint_border_side(
+            &mut rects,
+            &mut paths,
+            BorderEdge::Top,
+            PageTopRect::new(10.0, 100.0, 50.0, 30.0),
+            border,
+        );
+
+        assert!(paths.is_empty());
+        assert_eq!(
+            rects
+                .into_iter()
+                .map(|rect| rect.paint_rect())
+                .collect::<Vec<_>>(),
+            vec![
+                paint_space_rect(10.0, 99.25, 50.0, 0.75),
+                paint_space_rect(10.0, 97.75, 50.0, 0.75),
             ]
         );
     }

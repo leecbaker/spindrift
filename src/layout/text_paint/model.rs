@@ -41,7 +41,7 @@ pub(in crate::layout) struct PreparedTextDecorationStroke {
     pub(in crate::layout) inline_span: TextInlineSpan,
     pub(in crate::layout) block_position: f32,
     pub(in crate::layout) thickness: f32,
-    pub(in crate::layout) color: Color,
+    pub(in crate::layout) color: CssColor,
     pub(in crate::layout) style: TextDecorationStyle,
     pub(in crate::layout) skip_ink: TextDecorationSkipInk,
     pub(in crate::layout) skip_spaces: TextDecorationSkipSpaces,
@@ -101,8 +101,8 @@ pub(in crate::layout) struct TextDecorationPreparationInput<'a> {
     pub(in crate::layout) style: &'a ComputedStyle,
     pub(in crate::layout) decoration: TextDecoration,
     pub(in crate::layout) phase: TextDecorationPaintPhase,
-    pub(in crate::layout) color: Color,
-    pub(in crate::layout) color_override: Option<Color>,
+    pub(in crate::layout) color: CssColor,
+    pub(in crate::layout) color_override: Option<CssColor>,
     pub(in crate::layout) metrics: TextDecorationFontMetrics,
 }
 

@@ -41,7 +41,7 @@ pub(in crate::layout::flex) fn apply_subject_axis_self_alignment_offsets(
             }
             let outer_size = item_outer_cross_size(&items[index], child_style, physical_direction);
             let target_side = if alignment.safety == AlignmentSafety::Safe
-                && line.cross_size().points() - outer_size < 0.0
+                && (line.cross_size() - outer_size).is_negative()
             {
                 flex_cross_start_side(container_style)
             } else {
@@ -64,20 +64,20 @@ pub(in crate::layout::flex) fn flex_lines_from_items(
     estimates: &[FlexItemEstimate],
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
-    container_cross_size: f32,
+    container_cross_size: FlexCrossSize,
 ) -> Vec<FlexLineLayout> {
     if container_style.flex_wrap == FlexWrap::NoWrap {
-        let (main_start, main_end) =
-            flex_items_main_extent(items, children, physical_direction).unwrap_or((0.0, 0.0));
+        let (main_start, main_end) = flex_items_main_extent(items, children, physical_direction)
+            .unwrap_or((FlexMainOffset::new(0.0), FlexMainOffset::new(0.0)));
         let item_indices = (0..items.len()).collect::<Vec<_>>();
         return vec![FlexLineLayout {
             item_indices: item_indices.clone(),
             source_start: 0,
             source_end: items.len(),
-            main_start: FlexMainOffset::new(main_start),
-            main_end: FlexMainOffset::new(main_end),
+            main_start,
+            main_end,
             cross_start: FlexCrossOffset::new(0.0),
-            cross_end: FlexCrossOffset::new(container_cross_size.max(0.0)),
+            cross_end: FlexCrossOffset::new(0.0) + container_cross_size,
             first_baseline: flex_line_baseline(
                 &item_indices,
                 items,
@@ -86,8 +86,7 @@ pub(in crate::layout::flex) fn flex_lines_from_items(
                 container_style,
                 FlexBaselineSet::First,
                 physical_direction,
-            )
-            .map(FlexCrossOffset::new),
+            ),
             last_baseline: flex_line_baseline(
                 &item_indices,
                 items,
@@ -96,26 +95,45 @@ pub(in crate::layout::flex) fn flex_lines_from_items(
                 container_style,
                 FlexBaselineSet::Last,
                 physical_direction,
-            )
-            .map(FlexCrossOffset::new),
+            ),
             collapsed_struts: Vec::new(),
         }];
     }
 
     let mut lines: Vec<FlexLineLayout> = Vec::new();
+    let overlap_tolerance = FlexCrossLength::new(0.01);
     for index in 0..items.len() {
         let (cross_start, cross_end) =
             item_outer_cross_bounds(&items[index], &children[index].style, physical_direction);
         let (main_start, main_end) =
             item_outer_main_bounds(&items[index], &children[index].style, physical_direction);
         if let Some(line) = lines.iter_mut().find(|line| {
-            cross_start < line.cross_end.points() - 0.01
-                && cross_end > line.cross_start.points() + 0.01
+            let cross_ranges_overlap = cross_start < line.cross_end - overlap_tolerance
+                && cross_end > line.cross_start + overlap_tolerance;
+            // A stretched item's hypothetical cross size may be zero before
+            // CSS Flexbox's cross-size step. It still belongs to the source
+            // line that precedes it in the main axis; grouping exclusively
+            // by non-zero cross-range overlap would split that line and give
+            // only its later siblings the stretched width.
+            // <https://www.w3.org/TR/css-flexbox-1/#algo-line-break>
+            // <https://www.w3.org/TR/css-flexbox-1/#algo-cross-item>
+            let shares_collapsed_cross_start = (cross_start - line.cross_start).abs() <= 0.01
+                && ((cross_end - cross_start).abs() <= 0.01
+                    || (line.cross_end - line.cross_start).abs() <= 0.01);
+            let follows_line_in_main_axis = match physical_direction {
+                FlexDirection::Row | FlexDirection::Column => {
+                    main_start >= line.main_end - FlexMainLength::new(0.01)
+                }
+                FlexDirection::RowReverse | FlexDirection::ColumnReverse => {
+                    main_end <= line.main_start + FlexMainLength::new(0.01)
+                }
+            };
+            cross_ranges_overlap || (shares_collapsed_cross_start && follows_line_in_main_axis)
         }) {
-            line.cross_start = line.cross_start.min(FlexCrossOffset::new(cross_start));
-            line.cross_end = line.cross_end.max(FlexCrossOffset::new(cross_end));
-            line.main_start = line.main_start.min(FlexMainOffset::new(main_start));
-            line.main_end = line.main_end.max(FlexMainOffset::new(main_end));
+            line.cross_start = line.cross_start.min(cross_start);
+            line.cross_end = line.cross_end.max(cross_end);
+            line.main_start = line.main_start.min(main_start);
+            line.main_end = line.main_end.max(main_end);
             line.source_start = line.source_start.min(index);
             line.source_end = line.source_end.max(index + 1);
             line.item_indices.push(index);
@@ -124,10 +142,10 @@ pub(in crate::layout::flex) fn flex_lines_from_items(
                 item_indices: vec![index],
                 source_start: index,
                 source_end: index + 1,
-                main_start: FlexMainOffset::new(main_start),
-                main_end: FlexMainOffset::new(main_end),
-                cross_start: FlexCrossOffset::new(cross_start),
-                cross_end: FlexCrossOffset::new(cross_end),
+                main_start,
+                main_end,
+                cross_start,
+                cross_end,
                 first_baseline: None,
                 last_baseline: None,
                 collapsed_struts: Vec::new(),
@@ -152,7 +170,7 @@ pub(in crate::layout::flex) fn refresh_flex_line_cross_bounds(
     children: &[StyledChild<'_>],
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
-    container_cross_size: f32,
+    container_cross_size: FlexCrossSize,
 ) {
     let stretch_wrapped_lines = !lines.is_empty()
         && container_style.flex_wrap != FlexWrap::NoWrap
@@ -163,10 +181,10 @@ pub(in crate::layout::flex) fn refresh_flex_line_cross_bounds(
     for line in &mut *lines {
         if container_style.flex_wrap == FlexWrap::NoWrap {
             line.cross_start = FlexCrossOffset::new(0.0);
-            line.cross_end = FlexCrossOffset::new(container_cross_size.max(0.0));
+            line.cross_end = FlexCrossOffset::new(0.0) + container_cross_size;
             if let Some(main_extent) = flex_items_main_extent(items, children, physical_direction) {
-                line.main_start = FlexMainOffset::new(main_extent.0);
-                line.main_end = FlexMainOffset::new(main_extent.1);
+                line.main_start = main_extent.0;
+                line.main_end = main_extent.1;
             }
             line.cross_end = line
                 .cross_end
@@ -179,26 +197,33 @@ pub(in crate::layout::flex) fn refresh_flex_line_cross_bounds(
                 .max(line.cross_start + line.largest_collapsed_strut());
             continue;
         }
-        let mut cross_start = f32::INFINITY;
-        let mut cross_end = f32::NEG_INFINITY;
-        let mut main_start = f32::INFINITY;
-        let mut main_end = f32::NEG_INFINITY;
+        let mut cross_bounds: Option<(FlexCrossOffset, FlexCrossOffset)> = None;
+        let mut main_bounds: Option<(FlexMainOffset, FlexMainOffset)> = None;
         for &index in &line.item_indices {
             let (item_cross_start, item_cross_end) =
                 item_outer_cross_bounds(&items[index], &children[index].style, physical_direction);
             let (item_main_start, item_main_end) =
                 item_outer_main_bounds(&items[index], &children[index].style, physical_direction);
-            cross_start = cross_start.min(item_cross_start);
-            cross_end = cross_end.max(item_cross_end);
-            main_start = main_start.min(item_main_start);
-            main_end = main_end.max(item_main_end);
+            cross_bounds = Some(match cross_bounds {
+                Some((cross_start, cross_end)) => (
+                    cross_start.min(item_cross_start),
+                    cross_end.max(item_cross_end),
+                ),
+                None => (item_cross_start, item_cross_end),
+            });
+            main_bounds = Some(match main_bounds {
+                Some((main_start, main_end)) => {
+                    (main_start.min(item_main_start), main_end.max(item_main_end))
+                }
+                None => (item_main_start, item_main_end),
+            });
         }
-        line.cross_start = FlexCrossOffset::new(cross_start);
-        line.cross_end = FlexCrossOffset::new(
-            cross_end.max(cross_start + line.largest_collapsed_strut().points()),
-        );
-        line.main_start = FlexMainOffset::new(main_start);
-        line.main_end = FlexMainOffset::new(main_end);
+        let (cross_start, cross_end) = cross_bounds.expect("non-empty flex line has item bounds");
+        line.cross_start = cross_start;
+        line.cross_end = cross_end.max(cross_start + line.largest_collapsed_strut());
+        let (main_start, main_end) = main_bounds.expect("non-empty flex line has item bounds");
+        line.main_start = main_start;
+        line.main_end = main_end;
     }
     if stretch_wrapped_lines {
         let PhysicalFlexGaps {
@@ -211,9 +236,13 @@ pub(in crate::layout::flex) fn refresh_flex_line_cross_bounds(
             } else {
                 physical_gap_width
             },
-            PercentageBasis::definite(content_box_pt(container_cross_size)),
+            PercentageBasis::definite(flex_cross_content_box_length(container_cross_size)),
         );
-        preserve_stretched_flex_line_cross_bounds(lines, container_cross_size, cross_gap.points());
+        preserve_stretched_flex_line_cross_bounds(
+            lines,
+            container_cross_size,
+            flex_cross_gap_size(cross_gap),
+        );
     }
 }
 
@@ -227,8 +256,8 @@ pub(in crate::layout::flex) fn refresh_flex_line_cross_bounds(
 /// <https://www.w3.org/TR/css-align-3/#align-content-property>.
 pub(in crate::layout::flex) fn preserve_stretched_flex_line_cross_bounds(
     lines: &mut [FlexLineLayout],
-    container_cross_size: f32,
-    cross_gap: f32,
+    container_cross_size: FlexCrossSize,
+    cross_gap: FlexCrossSize,
 ) {
     let mut line_order = (0..lines.len()).collect::<Vec<_>>();
     line_order.sort_by(|&a, &b| {
@@ -241,24 +270,27 @@ pub(in crate::layout::flex) fn preserve_stretched_flex_line_cross_bounds(
     if line_order.len() == 1 {
         let line = &mut lines[line_order[0]];
         line.cross_start = FlexCrossOffset::new(0.0);
-        line.cross_end = FlexCrossOffset::new(container_cross_size.max(0.0))
+        let cross_origin = FlexCrossOffset::new(0.0);
+        line.cross_end = (cross_origin + container_cross_size)
             .max(line.cross_end)
             .max(line.cross_start + line.largest_collapsed_strut());
         return;
     }
 
-    let container_cross_size = container_cross_size.max(0.0);
+    let cross_origin = FlexCrossOffset::new(0.0);
     for position in 0..line_order.len() {
         let line_index = line_order[position];
-        if position == 0 && lines[line_index].cross_start.points() > 0.0 {
-            lines[line_index].cross_start = FlexCrossOffset::new(0.0);
+        if position == 0 && lines[line_index].cross_start > cross_origin {
+            lines[line_index].cross_start = cross_origin;
         }
         let next_cross_start = line_order
             .get(position + 1)
             .map(|&next_index| {
-                FlexCrossOffset::new((lines[next_index].cross_start.points() - cross_gap).max(0.0))
+                cross_origin
+                    + ((lines[next_index].cross_start - cross_origin) - cross_gap)
+                        .non_negative_size()
             })
-            .unwrap_or_else(|| FlexCrossOffset::new(container_cross_size));
+            .unwrap_or(cross_origin + container_cross_size);
         lines[line_index].cross_end = lines[line_index]
             .cross_end
             .max(next_cross_start)
@@ -273,7 +305,7 @@ pub(in crate::layout::flex) fn refresh_flex_line_metadata(
     children: &[StyledChild<'_>],
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
-    container_cross_size: f32,
+    container_cross_size: FlexCrossSize,
 ) {
     refresh_flex_line_cross_bounds(
         lines,
@@ -292,8 +324,7 @@ pub(in crate::layout::flex) fn refresh_flex_line_metadata(
             container_style,
             FlexBaselineSet::First,
             physical_direction,
-        )
-        .map(FlexCrossOffset::new);
+        );
         line.last_baseline = flex_line_baseline(
             &line.item_indices,
             items,
@@ -302,8 +333,7 @@ pub(in crate::layout::flex) fn refresh_flex_line_metadata(
             container_style,
             FlexBaselineSet::Last,
             physical_direction,
-        )
-        .map(FlexCrossOffset::new);
+        );
     }
 }
 
@@ -311,20 +341,21 @@ pub(in crate::layout::flex) fn item_outer_cross_bounds(
     item: &FlexItemLayout,
     style: &ComputedStyle,
     physical_direction: FlexDirection,
-) -> (f32, f32) {
-    item.outer_cross_bounds(
+) -> (FlexCrossOffset, FlexCrossOffset) {
+    let (start, end) = item.outer_cross_bounds(
         FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction)),
         style,
-    )
+    );
+    (start, end)
 }
 
 pub(in crate::layout::flex) fn item_outer_cross_size(
     item: &FlexItemLayout,
     style: &ComputedStyle,
     physical_direction: FlexDirection,
-) -> f32 {
+) -> FlexCrossSize {
     let (cross_start, cross_end) = item_outer_cross_bounds(item, style, physical_direction);
-    (cross_end - cross_start).max(0.0)
+    (cross_end - cross_start).non_negative_size()
 }
 
 pub(in crate::layout::flex) fn estimated_outer_cross_size(
@@ -373,11 +404,7 @@ pub(in crate::layout::flex) fn collapsed_struts_from_visible_layout(
                 .find(|line| line.item_indices.contains(&item_index));
             FlexCollapsedStrut {
                 item_index,
-                cross_size: FlexCrossSize::new(item_outer_cross_size(
-                    item,
-                    &child.style,
-                    physical_direction,
-                )),
+                cross_size: item_outer_cross_size(item, &child.style, physical_direction),
                 source_start: line.map(|line| line.source_start).unwrap_or(item_index),
                 source_end: line.map(|line| line.source_end).unwrap_or(item_index + 1),
             }
@@ -419,7 +446,7 @@ pub(in crate::layout::flex) fn attach_collapsed_struts_to_active_lines(
                 main_start: FlexMainOffset::new(0.0),
                 main_end: FlexMainOffset::new(0.0),
                 cross_start: FlexCrossOffset::new(0.0),
-                cross_end: FlexCrossOffset::new(strut.cross_size.points()),
+                cross_end: FlexCrossOffset::new(0.0) + strut.cross_size,
                 first_baseline: None,
                 last_baseline: None,
                 collapsed_struts: vec![strut.clone()],
@@ -469,12 +496,10 @@ pub(in crate::layout::flex) fn repack_lines_after_collapsed_struts(
 
     let mut next_cross_start = lines[line_order[0]].cross_start;
     for line_index in line_order {
-        let delta = next_cross_start.points() - lines[line_index].cross_start.points();
+        let delta = next_cross_start - lines[line_index].cross_start;
         if delta.abs() > 0.01 {
-            lines[line_index].cross_start =
-                FlexCrossOffset::new(lines[line_index].cross_start.points() + delta);
-            lines[line_index].cross_end =
-                FlexCrossOffset::new(lines[line_index].cross_end.points() + delta);
+            lines[line_index].cross_start = lines[line_index].cross_start + delta;
+            lines[line_index].cross_end = lines[line_index].cross_end + delta;
             for &item_index in &lines[line_index].item_indices {
                 items[item_index].translate_cross(axes, delta);
             }
@@ -496,10 +521,10 @@ pub(in crate::layout::flex) fn repack_lines_after_collapsed_struts(
 pub(in crate::layout::flex) struct FlexBalanceContext<'a> {
     pub(in crate::layout::flex) physical_direction: FlexDirection,
     pub(in crate::layout::flex) requested_line_count: Option<usize>,
-    pub(in crate::layout::flex) hypothetical_main_sizes: Option<&'a [f32]>,
-    pub(in crate::layout::flex) main_gap: f32,
-    pub(in crate::layout::flex) cross_gap: f32,
-    pub(in crate::layout::flex) available_main_size: f32,
+    pub(in crate::layout::flex) hypothetical_main_sizes: Option<&'a [FlexMainSize]>,
+    pub(in crate::layout::flex) main_gap: FlexMainSize,
+    pub(in crate::layout::flex) cross_gap: FlexCrossSize,
+    pub(in crate::layout::flex) available_main_size: FlexMainSize,
 }
 
 pub(in crate::layout::flex) fn rebalance_flex_line_membership(
@@ -523,18 +548,20 @@ pub(in crate::layout::flex) fn rebalance_flex_line_membership(
     let outer_main_sizes = ordered_items
         .iter()
         .map(|&index| {
-            context
+            let item_main_size = context
                 .hypothetical_main_sizes
                 .and_then(|sizes| sizes.get(index))
                 .cloned()
-                .unwrap_or_else(|| item_main_size(&items[index], context.physical_direction))
+                .unwrap_or_else(|| item_main_size(&items[index], context.physical_direction));
+            (item_main_size
                 + fixed_main_before_margin(&children[index].style, context.physical_direction)
-                + fixed_main_after_margin(&children[index].style, context.physical_direction)
+                + fixed_main_after_margin(&children[index].style, context.physical_direction))
+            .non_negative_size()
         })
         .collect::<Vec<_>>();
     let inferred_line_count = balanced_flex_line_count(
         &outer_main_sizes,
-        context.main_gap.max(0.0),
+        context.main_gap,
         context.available_main_size,
     );
     // `flex-line-count` is an explicit request for the number of balanced
@@ -555,7 +582,7 @@ pub(in crate::layout::flex) fn rebalance_flex_line_membership(
             return false;
         };
         let cross_size = last_line.cross_size();
-        let cross_start = last_line.cross_end + FlexCrossSize::new(context.cross_gap.max(0.0));
+        let cross_start = last_line.cross_end + context.cross_gap;
         lines.push(FlexLineLayout {
             item_indices: Vec::new(),
             source_start: last_line.source_end,
@@ -575,7 +602,7 @@ pub(in crate::layout::flex) fn rebalance_flex_line_membership(
         &ordered_items,
         &outer_main_sizes,
         line_count,
-        context.main_gap.max(0.0),
+        context.main_gap,
         context.available_main_size,
     ) else {
         return false;
@@ -594,7 +621,7 @@ pub(in crate::layout::flex) fn rebalance_flex_line_membership(
         changed |= line.item_indices != item_indices;
         for (position, &item_index) in item_indices.iter().enumerate() {
             let item = &mut items[item_index];
-            let delta = cross_start.points() - item.cross_start(axes);
+            let delta = cross_start - item.cross_start(axes);
             item.translate_cross(axes, delta);
             // Main-axis repacking sorts by physical position. A member moved
             // from a later normal-wrap line may retain a stale position, so
@@ -607,7 +634,11 @@ pub(in crate::layout::flex) fn rebalance_flex_line_membership(
             } else {
                 position as f32
             };
-            set_item_main_start(item, context.physical_direction, provisional_main_start);
+            set_item_main_start(
+                item,
+                context.physical_direction,
+                FlexMainOffset::new(provisional_main_start),
+            );
         }
         line.source_start = item_indices
             .iter()
@@ -635,27 +666,28 @@ pub(in crate::layout::flex) fn rebalance_flex_line_membership(
 /// assigned to the next sequence as required by the balance algorithm:
 /// <https://drafts.csswg.org/css-flexbox-2/#algo-balance>.
 fn balanced_flex_line_count(
-    outer_main_sizes: &[f32],
-    main_gap: f32,
-    available_main_size: f32,
+    outer_main_sizes: &[FlexMainSize],
+    main_gap: FlexMainSize,
+    available_main_size: FlexMainSize,
 ) -> usize {
     if outer_main_sizes.is_empty() {
         return 0;
     }
     let mut line_count = 1usize;
-    let mut line_extent = outer_main_sizes[0].max(0.0);
-    let mut line_overflows = line_extent > available_main_size + 0.01;
-    for &size in &outer_main_sizes[1..] {
-        let size = size.max(0.0);
-        let candidate = line_extent + main_gap + size;
-        let must_break = candidate > available_main_size + 0.01 || (line_overflows && size == 0.0);
+    let tolerance = FlexMainSize::new(0.01);
+    let mut line_extent = outer_main_sizes[0];
+    let mut line_overflows = line_extent > available_main_size + tolerance;
+    for size in &outer_main_sizes[1..] {
+        let candidate = line_extent + main_gap + *size;
+        let must_break = candidate > available_main_size + tolerance
+            || (line_overflows && *size == FlexMainSize::new(0.0));
         if must_break {
             line_count += 1;
-            line_extent = size;
-            line_overflows = line_extent > available_main_size + 0.01;
+            line_extent = *size;
+            line_overflows = line_extent > available_main_size + tolerance;
         } else {
             line_extent = candidate;
-            line_overflows = line_extent > available_main_size + 0.01;
+            line_overflows = line_extent > available_main_size + tolerance;
         }
     }
     line_count
@@ -671,10 +703,10 @@ fn balanced_flex_line_count(
 /// <https://drafts.csswg.org/css-flexbox-2/#algo-balance>.
 fn balanced_flex_line_partitions(
     item_indices: &[usize],
-    outer_main_sizes: &[f32],
+    outer_main_sizes: &[FlexMainSize],
     line_count: usize,
-    main_gap: f32,
-    available_main_size: f32,
+    main_gap: FlexMainSize,
+    available_main_size: FlexMainSize,
 ) -> Option<Vec<Vec<usize>>> {
     let item_count = item_indices.len();
     if line_count == 0 || line_count > item_count || item_count != outer_main_sizes.len() {
@@ -682,12 +714,13 @@ fn balanced_flex_line_partitions(
     }
 
     let mut prefix = Vec::with_capacity(item_count + 1);
-    prefix.push(0.0);
+    prefix.push(FlexMainSize::new(0.0));
     for size in outer_main_sizes {
-        prefix.push(prefix.last().cloned().unwrap_or(0.0) + size.max(0.0));
+        prefix.push(*prefix.last().expect("prefix starts with zero") + *size);
     }
     let line_extent = |start: usize, end: usize| {
-        prefix[end] - prefix[start] + main_gap * end.saturating_sub(start + 1) as f32
+        (prefix[end] - prefix[start]).non_negative_size()
+            + main_gap.scale(end.saturating_sub(start + 1) as f32)
     };
 
     let mut costs = vec![vec![f32::INFINITY; item_count + 1]; line_count + 1];
@@ -700,13 +733,16 @@ fn balanced_flex_line_partitions(
                 // A sequence may overflow only when it contains one item.
                 // This keeps a following zero-sized item out of an already
                 // overflowing sequence.
-                if (end - start > 1 && extent > available_main_size + 0.01)
+                if (end - start > 1 && extent > available_main_size + FlexMainSize::new(0.01))
                     || !costs[line - 1][start].is_finite()
                 {
                     continue;
                 }
                 let error = extent - available_main_size;
-                let candidate = costs[line - 1][start] + error * error;
+                // Dynamic-programming costs are dimensionless ordering
+                // scores. The conversion happens only at this algorithmic
+                // boundary; all line geometry remains typed above.
+                let candidate = costs[line - 1][start] + error.points().powi(2);
                 // Prefer the later break for equal errors. During reverse
                 // reconstruction, this gives the draft algorithm's start bias:
                 // assign as many items as possible to earlier lines.
@@ -746,7 +782,8 @@ pub(in crate::layout::flex) fn repack_lines_after_main_size_adjustment(
     children: &[StyledChild<'_>],
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
-    container_main_size: f32,
+    container_main_size: FlexMainSize,
+    container_main_percentage_basis: FlexAvailablePercentageBasis,
 ) {
     if !container_main_size.is_finite() {
         return;
@@ -756,16 +793,14 @@ pub(in crate::layout::flex) fn repack_lines_after_main_size_adjustment(
         horizontal: physical_gap_width,
         vertical: physical_gap_height,
     } = physical_flex_gaps(container_style);
-    let main_gap = used_flex_gap(
+    let main_gap = flex_main_gap_size(used_flex_gap_with_basis(
         if physical_direction.is_row_axis() {
             physical_gap_width
         } else {
             physical_gap_height
         },
-        PercentageBasis::definite(content_box_pt(container_main_size)),
-    )
-    .points()
-    .max(0.0);
+        container_main_percentage_basis,
+    ));
 
     for line in lines {
         if line.item_indices.is_empty() {
@@ -778,31 +813,40 @@ pub(in crate::layout::flex) fn repack_lines_after_main_size_adjustment(
                 item_outer_main_bounds(&items[left], &children[left].style, physical_direction).0;
             let right_start =
                 item_outer_main_bounds(&items[right], &children[right].style, physical_direction).0;
-            left_start.total_cmp(&right_start)
+            left_start
+                .partial_cmp(&right_start)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let item_count = physical_order.len();
-        let fixed_outer_size = physical_order
-            .iter()
-            .map(|&index| {
-                item_main_size(&items[index], physical_direction)
-                    + fixed_main_before_margin(&children[index].style, physical_direction)
-                    + fixed_main_after_margin(&children[index].style, physical_direction)
-            })
-            .sum::<f32>();
-        let total_gap = main_gap * item_count.saturating_sub(1) as f32;
+        let fixed_outer_size =
+            physical_order
+                .iter()
+                .fold(FlexMainLength::new(0.0), |total, &index| {
+                    total
+                        + (item_main_size(&items[index], physical_direction)
+                            + fixed_main_before_margin(&children[index].style, physical_direction)
+                            + fixed_main_after_margin(&children[index].style, physical_direction))
+                });
+        let total_gap = main_gap.scale(item_count.saturating_sub(1) as f32);
         let free_space = container_main_size - fixed_outer_size - total_gap;
         let auto_margin_count = physical_order
             .iter()
             .map(|&index| main_auto_margin_count(&children[index].style, physical_direction))
             .sum::<usize>();
-        let auto_margin = if free_space > 0.0 && auto_margin_count > 0 {
-            free_space / auto_margin_count as f32
+        let auto_margin = if free_space.is_positive() && auto_margin_count > 0 {
+            free_space.divide(
+                std::num::NonZeroUsize::new(auto_margin_count)
+                    .expect("positive auto-margin count is non-zero"),
+            )
         } else {
-            0.0
+            FlexMainLength::new(0.0)
         };
-        let (initial_offset, extra_gap) = if auto_margin_count > 0 && free_space > 0.0 {
-            (0.0, 0.0)
+        let justification = if auto_margin_count > 0 && free_space.is_positive() {
+            FlexMainJustificationOffsets {
+                initial: FlexMainLength::new(0.0),
+                between: FlexMainLength::new(0.0),
+            }
         } else {
             justify_content_offsets(
                 container_style.justify_content,
@@ -812,24 +856,24 @@ pub(in crate::layout::flex) fn repack_lines_after_main_size_adjustment(
             )
         };
 
-        let mut cursor = initial_offset;
+        let mut cursor = FlexMainOffset::new(0.0) + justification.initial;
         for (position, &item_index) in physical_order.iter().enumerate() {
-            cursor +=
-                main_before_margin(&children[item_index].style, physical_direction, auto_margin);
+            cursor = cursor
+                + main_before_margin(&children[item_index].style, physical_direction, auto_margin);
             set_item_main_start(&mut items[item_index], physical_direction, cursor);
-            cursor += item_main_size(&items[item_index], physical_direction);
-            cursor +=
-                main_after_margin(&children[item_index].style, physical_direction, auto_margin);
+            cursor = cursor + item_main_size(&items[item_index], physical_direction);
+            cursor = cursor
+                + main_after_margin(&children[item_index].style, physical_direction, auto_margin);
             if position + 1 < item_count {
-                cursor += main_gap + extra_gap;
+                cursor = cursor + main_gap + justification.between;
             }
         }
 
         if let Some((main_start, main_end)) =
             flex_line_items_main_extent(line, items, children, physical_direction)
         {
-            line.main_start = FlexMainOffset::new(main_start);
-            line.main_end = FlexMainOffset::new(main_end);
+            line.main_start = main_start;
+            line.main_end = main_end;
         }
     }
 }
@@ -837,17 +881,16 @@ pub(in crate::layout::flex) fn repack_lines_after_main_size_adjustment(
 pub(in crate::layout::flex) fn item_main_size(
     item: &FlexItemLayout,
     physical_direction: FlexDirection,
-) -> f32 {
+) -> FlexMainSize {
     item.main_size(FlexAxes::from_physical_direction(
         PhysicalFlexDirection::new(physical_direction),
     ))
-    .max(0.0)
 }
 
 pub(in crate::layout::flex) fn set_item_main_start(
     item: &mut FlexItemLayout,
     physical_direction: FlexDirection,
-    main_start: f32,
+    main_start: FlexMainOffset,
 ) {
     item.set_main_start(
         FlexAxes::from_physical_direction(PhysicalFlexDirection::new(physical_direction)),
@@ -858,70 +901,70 @@ pub(in crate::layout::flex) fn set_item_main_start(
 pub(in crate::layout::flex) fn fixed_main_before_margin(
     style: &ComputedStyle,
     physical_direction: FlexDirection,
-) -> f32 {
+) -> FlexMainLength {
     if physical_direction.is_row_axis() {
         if style.box_values.margin.left.is_auto() {
-            0.0
+            FlexMainLength::new(0.0)
         } else {
-            style.margin.left
+            FlexMainLength::new(style.margin.left)
         }
     } else if style.box_values.margin.top.is_auto() {
-        0.0
+        FlexMainLength::new(0.0)
     } else {
-        style.margin.top
+        FlexMainLength::new(style.margin.top)
     }
 }
 
 pub(in crate::layout::flex) fn fixed_main_after_margin(
     style: &ComputedStyle,
     physical_direction: FlexDirection,
-) -> f32 {
+) -> FlexMainLength {
     if physical_direction.is_row_axis() {
         if style.box_values.margin.right.is_auto() {
-            0.0
+            FlexMainLength::new(0.0)
         } else {
-            style.margin.right
+            FlexMainLength::new(style.margin.right)
         }
     } else if style.box_values.margin.bottom.is_auto() {
-        0.0
+        FlexMainLength::new(0.0)
     } else {
-        style.margin.bottom
+        FlexMainLength::new(style.margin.bottom)
     }
 }
 
 pub(in crate::layout::flex) fn main_before_margin(
     style: &ComputedStyle,
     physical_direction: FlexDirection,
-    auto_margin: f32,
-) -> f32 {
+    auto_margin: FlexMainLength,
+) -> FlexMainLength {
     if physical_direction.is_row_axis() {
         if style.box_values.margin.left.is_auto() {
             auto_margin
         } else {
-            style.margin.left
+            FlexMainLength::new(style.margin.left)
         }
     } else if style.box_values.margin.top.is_auto() {
         auto_margin
     } else {
-        style.margin.top
+        FlexMainLength::new(style.margin.top)
     }
 }
 
 pub(in crate::layout::flex) fn main_after_margin(
     style: &ComputedStyle,
     physical_direction: FlexDirection,
-    auto_margin: f32,
-) -> f32 {
+    auto_margin: FlexMainLength,
+) -> FlexMainLength {
     if physical_direction.is_row_axis() {
         if style.box_values.margin.right.is_auto() {
             auto_margin
         } else {
-            style.margin.right
+            FlexMainLength::new(style.margin.right)
         }
     } else if style.box_values.margin.bottom.is_auto() {
         auto_margin
     } else {
-        style.margin.bottom
+        FlexMainLength::new(style.margin.bottom)
     }
 }
 
@@ -941,9 +984,9 @@ pub(in crate::layout::flex) fn main_auto_margin_count(
 pub(in crate::layout::flex) fn justify_content_offsets(
     justify_content: JustifyContent,
     physical_direction: FlexDirection,
-    free_space: f32,
+    free_space: FlexMainLength,
     item_count: usize,
-) -> (f32, f32) {
+) -> FlexMainJustificationOffsets {
     let keyword = justify_content_fallback_keyword(justify_content, free_space, item_count);
     let reversed = matches!(
         physical_direction,
@@ -952,64 +995,83 @@ pub(in crate::layout::flex) fn justify_content_offsets(
     let first = match keyword {
         ContentAlignmentKeyword::Normal
         | ContentAlignmentKeyword::Stretch
-        | ContentAlignmentKeyword::Start => 0.0,
+        | ContentAlignmentKeyword::Start => FlexMainLength::new(0.0),
         ContentAlignmentKeyword::FlexStart => {
             if reversed {
                 free_space
             } else {
-                0.0
+                FlexMainLength::new(0.0)
             }
         }
         ContentAlignmentKeyword::End => free_space,
         ContentAlignmentKeyword::FlexEnd => {
             if reversed {
-                0.0
+                FlexMainLength::new(0.0)
             } else {
                 free_space
             }
         }
-        ContentAlignmentKeyword::Left => 0.0,
+        ContentAlignmentKeyword::Left => FlexMainLength::new(0.0),
         ContentAlignmentKeyword::Right => free_space,
-        ContentAlignmentKeyword::Center => free_space / 2.0,
-        ContentAlignmentKeyword::SpaceBetween => 0.0,
+        ContentAlignmentKeyword::Center => free_space.half(),
+        ContentAlignmentKeyword::SpaceBetween => FlexMainLength::new(0.0),
         ContentAlignmentKeyword::SpaceAround => {
-            if free_space >= 0.0 {
-                (free_space / item_count as f32) / 2.0
+            if !free_space.is_negative() {
+                free_space
+                    .divide(std::num::NonZeroUsize::new(item_count).expect("non-zero item count"))
+                    .half()
             } else {
-                free_space / 2.0
+                free_space.half()
             }
         }
         ContentAlignmentKeyword::SpaceEvenly => {
-            if free_space >= 0.0 {
-                free_space / (item_count + 1) as f32
+            if !free_space.is_negative() {
+                free_space.divide(
+                    std::num::NonZeroUsize::new(item_count + 1)
+                        .expect("item count plus one is non-zero"),
+                )
             } else {
-                free_space / 2.0
+                free_space.half()
             }
         }
-        ContentAlignmentKeyword::Baseline | ContentAlignmentKeyword::LastBaseline => 0.0,
+        ContentAlignmentKeyword::Baseline | ContentAlignmentKeyword::LastBaseline => {
+            FlexMainLength::new(0.0)
+        }
     };
-    let positive_free_space = free_space.max(0.0);
+    let positive_free_space = free_space.max(FlexMainLength::new(0.0));
     let between = match keyword {
-        ContentAlignmentKeyword::SpaceBetween if item_count > 1 => {
-            positive_free_space / (item_count - 1) as f32
-        }
-        ContentAlignmentKeyword::SpaceAround if item_count > 0 => {
-            positive_free_space / item_count as f32
-        }
-        ContentAlignmentKeyword::SpaceEvenly => positive_free_space / (item_count + 1) as f32,
-        _ => 0.0,
+        ContentAlignmentKeyword::SpaceBetween if item_count > 1 => positive_free_space.divide(
+            std::num::NonZeroUsize::new(item_count - 1)
+                .expect("more than one item leaves a non-zero divisor"),
+        ),
+        ContentAlignmentKeyword::SpaceAround if item_count > 0 => positive_free_space
+            .divide(std::num::NonZeroUsize::new(item_count).expect("non-zero item count")),
+        ContentAlignmentKeyword::SpaceEvenly => positive_free_space.divide(
+            std::num::NonZeroUsize::new(item_count + 1).expect("item count plus one is non-zero"),
+        ),
+        _ => FlexMainLength::new(0.0),
     };
-    (first, between)
+    FlexMainJustificationOffsets {
+        initial: first,
+        between,
+    }
+}
+
+/// Main-axis offsets selected by CSS `justify-content` for one flex line.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::layout::flex) struct FlexMainJustificationOffsets {
+    pub(in crate::layout::flex) initial: FlexMainLength,
+    pub(in crate::layout::flex) between: FlexMainLength,
 }
 
 pub(in crate::layout::flex) fn justify_content_fallback_keyword(
     justify_content: JustifyContent,
-    free_space: f32,
+    free_space: FlexMainLength,
     item_count: usize,
 ) -> ContentAlignmentKeyword {
     let mut keyword = justify_content.keyword;
     let mut safe = justify_content.safety == AlignmentSafety::Safe;
-    if item_count <= 1 || free_space <= 0.0 {
+    if item_count <= 1 || free_space.is_non_positive() {
         (keyword, safe) = match keyword {
             ContentAlignmentKeyword::Stretch | ContentAlignmentKeyword::SpaceBetween => {
                 (ContentAlignmentKeyword::FlexStart, true)
@@ -1020,18 +1082,21 @@ pub(in crate::layout::flex) fn justify_content_fallback_keyword(
             other => (other, safe),
         };
     }
-    if free_space <= 0.0 && safe {
+    if free_space.is_non_positive() && safe {
         ContentAlignmentKeyword::Start
     } else {
         keyword
     }
 }
 
-/// Apply CSS Box Alignment baseline content-alignment to wrapped row flex lines.
+/// Apply CSS Box Alignment baseline content-alignment to wrapped flex lines.
 ///
-/// Taffy 0.11 maps `align-content: baseline` to start packing. CSS Align
-/// instead treats flex lines as the alignment subjects and aligns their
-/// compatible baseline sets when those sets are available:
+/// Taffy's `AlignContentKeyword` has no baseline keywords, so the adapter maps
+/// `align-content: baseline` to start packing. CSS Align instead treats flex
+/// lines as the alignment subjects and aligns their compatible baseline sets
+/// when those sets are available. `FlexCrossOffset` is projected by the
+/// physical flex direction, so this also covers a logical row in vertical
+/// writing, whose cross axis is physically horizontal:
 /// <https://www.w3.org/TR/css-align-3/#baseline-align-content>.
 pub(in crate::layout::flex) fn apply_baseline_align_content_offsets(
     items: &mut [FlexItemLayout],
@@ -1040,7 +1105,7 @@ pub(in crate::layout::flex) fn apply_baseline_align_content_offsets(
     children: &[StyledChild<'_>],
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
-    container_cross_size: f32,
+    container_cross_size: FlexCrossSize,
 ) {
     if lines.is_empty() || container_style.flex_wrap == FlexWrap::NoWrap {
         return;
@@ -1083,6 +1148,9 @@ pub(in crate::layout::flex) fn apply_baseline_align_content_offsets(
         return;
     }
 
+    // CSS Flexbox defines line baseline sets for a row main axis. A logical
+    // row can project to a physical column in vertical writing, so this must
+    // use the authored logical flex direction rather than `physical_direction`.
     if !container_style.flex_direction.is_row_axis() {
         apply_baseline_align_content_fallback_offset(
             items,
@@ -1098,11 +1166,9 @@ pub(in crate::layout::flex) fn apply_baseline_align_content_offsets(
     let target_baseline = line_baselines
         .iter()
         .flatten()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
-    if !target_baseline.is_finite() {
-        return;
-    }
+        .copied()
+        .reduce(FlexCrossOffset::max)
+        .expect("more than one baseline participant has a baseline");
 
     for (line_index, baseline) in line_baselines.into_iter().enumerate() {
         let Some(baseline) = baseline else {
@@ -1128,14 +1194,14 @@ pub(in crate::layout::flex) fn apply_baseline_align_content_fallback_offset(
     lines: &mut [FlexLineLayout],
     container_style: &ComputedStyle,
     physical_direction: FlexDirection,
-    container_cross_size: f32,
+    container_cross_size: FlexCrossSize,
     baseline_set: FlexBaselineSet,
 ) {
     let Some((group_start, group_end)) = flex_line_group_cross_bounds(lines) else {
         return;
     };
-    let group_size = (group_end - group_start).max(0.0);
-    let target_side = if group_size > container_cross_size.max(0.0) {
+    let group_size = (group_end - group_start).non_negative_size();
+    let target_side = if group_size > container_cross_size {
         flex_cross_start_side(container_style)
     } else {
         match baseline_set {
@@ -1154,14 +1220,124 @@ pub(in crate::layout::flex) fn apply_baseline_align_content_fallback_offset(
 
 pub(in crate::layout::flex) fn flex_line_group_cross_bounds(
     lines: &[FlexLineLayout],
-) -> Option<(f32, f32)> {
+) -> Option<(FlexCrossOffset, FlexCrossOffset)> {
     lines
         .iter()
-        .map(|line| (line.cross_start.points(), line.cross_end.points()))
+        .map(|line| (line.cross_start, line.cross_end))
         .fold(None, |bounds, line_bounds| {
             Some(match bounds {
                 Some((start, end)) => (start.min(line_bounds.0), end.max(line_bounds.1)),
                 None => line_bounds,
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_line(
+        item_indices: Vec<usize>,
+        cross_start: FlexCrossOffset,
+        cross_end: FlexCrossOffset,
+    ) -> FlexLineLayout {
+        FlexLineLayout {
+            source_start: item_indices.iter().cloned().min().unwrap_or(0),
+            source_end: item_indices
+                .iter()
+                .cloned()
+                .max()
+                .map(|index| index + 1)
+                .unwrap_or(0),
+            item_indices,
+            main_start: FlexMainOffset::new(0.0),
+            main_end: FlexMainOffset::new(0.0),
+            cross_start,
+            cross_end,
+            first_baseline: None,
+            last_baseline: None,
+            collapsed_struts: Vec::new(),
+        }
+    }
+
+    fn test_child() -> StyledChild<'static> {
+        StyledChild {
+            kind: FormattingContextChildKind::AnonymousContent { children: vec![] },
+            style: ComputedStyle::initial(),
+        }
+    }
+
+    #[test]
+    fn balance_context_uses_cross_gap_when_adding_requested_lines() {
+        let mut lines = vec![test_line(
+            vec![0, 1],
+            FlexCrossOffset::new(0.0),
+            FlexCrossOffset::new(10.0),
+        )];
+        let mut items = vec![
+            FlexItemLayout::new(ContainerRect::new(
+                ContainerPoint::new(0.0, 0.0),
+                ContainerSize::new(20.0, 10.0),
+            )),
+            FlexItemLayout::new(ContainerRect::new(
+                ContainerPoint::new(20.0, 0.0),
+                ContainerSize::new(20.0, 10.0),
+            )),
+        ];
+        let children = vec![test_child(), test_child()];
+
+        assert!(rebalance_flex_line_membership(
+            &mut lines,
+            &mut items,
+            &children,
+            FlexBalanceContext {
+                physical_direction: FlexDirection::Row,
+                requested_line_count: Some(2),
+                hypothetical_main_sizes: None,
+                main_gap: FlexMainSize::new(0.0),
+                cross_gap: FlexCrossSize::new(15.0),
+                available_main_size: FlexMainSize::new(100.0),
+            },
+        ));
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].cross_start, FlexCrossOffset::new(25.0));
+        assert_eq!(lines[1].cross_end, FlexCrossOffset::new(35.0));
+    }
+
+    #[test]
+    fn balance_outer_main_sizes_keep_negative_margin_clamp() {
+        let outer_main_sizes = [FlexMainSize::new(20.0 - 30.0), FlexMainSize::new(30.0)];
+
+        assert_eq!(outer_main_sizes[0], FlexMainSize::new(0.0));
+        assert_eq!(
+            balanced_flex_line_count(
+                &outer_main_sizes,
+                FlexMainSize::new(0.0),
+                FlexMainSize::new(30.0),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn balance_partitions_overflowing_main_sizes_at_available_boundary() {
+        let item_indices = [0, 1, 2];
+        let outer_main_sizes = [
+            FlexMainSize::new(60.0),
+            FlexMainSize::new(60.0),
+            FlexMainSize::new(40.0),
+        ];
+
+        assert_eq!(
+            balanced_flex_line_partitions(
+                &item_indices,
+                &outer_main_sizes,
+                2,
+                FlexMainSize::new(0.0),
+                FlexMainSize::new(100.0),
+            ),
+            Some(vec![vec![0], vec![1, 2]])
+        );
+    }
 }

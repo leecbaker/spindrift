@@ -42,6 +42,12 @@ caption[align=bottom i] { caption-side: bottom }
 
 table:is([rules=none i], [rules=groups i], [rules=rows i], [rules=cols i]) { border-style: hidden; border-collapse: collapse }
 table[border]:not([border="0" i]) { border-style: outset }
+table[border]:not([border="0" i]) { border-width: 1px }
+/* Parse-error recovery treats a leading signed zero as no border. The dynamic
+   hint path covers general values; these selectors also override the static
+   cell rule for the legacy token forms that need no numeric declaration. */
+table:is([border^="0" i], [border^="+0" i], [border^="-0" i]) { border-style: none }
+table:is([border^="0" i], [border^="+0" i], [border^="-0" i]) > tr > :is(td, th), table:is([border^="0" i], [border^="+0" i], [border^="-0" i]) > :is(thead, tbody, tfoot) > tr > :is(td, th) { border-style: none }
 table[frame=void i] { border-style: hidden }
 table[frame=above i] { border-style: outset hidden hidden hidden }
 table[frame=below i] { border-style: hidden hidden outset hidden }

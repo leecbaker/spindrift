@@ -1,13 +1,22 @@
 use crate::document::RenderedImagePattern;
-use crate::document::{FontProgramKind, RenderedImageSourceRect};
+use crate::document::{FontProgramKind, PdfSize, RenderedImageSourceRect};
 use crate::{
-    Bookmark, BookmarkState, Color, Document, DocumentFont, DocumentMetadata, Page, RenderedGlyph,
-    RenderedImage, RenderedPath, RenderedPathCommand, RenderedPathFillRule, RenderedRoundedRect,
-    RenderedTextMatrix,
+    Bookmark, BookmarkState, CssColor, Document, DocumentFont, DocumentMetadata, Page,
+    RenderedGlyph, RenderedImage, RenderedPath, RenderedPathCommand, RenderedPathFillRule,
+    RenderedRoundedRect, RenderedTextMatrix,
 };
 use pdf_writer::types::BlendMode;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
+
+/// Whether fully opaque uniform decoded raster images may serialize as direct
+/// PDF vector fills instead of `/Image` XObjects.
+///
+/// This is a deliberately compile-time rollout switch: set it to `false` to
+/// retain the conventional raster-image representation while investigating a
+/// PDF consumer or rasterizer. It affects only PDF serialization after image
+/// materialization and color conversion; CSS image layout is unchanged.
+pub(super) const PROMOTE_SOLID_RASTER_IMAGES_TO_VECTOR_FILLS: bool = true;
 
 /// Bytes prepared for one generated PDF stream.
 ///
@@ -83,8 +92,44 @@ struct ImageResource {
     pixel_height: u32,
     interpolate: bool,
     color_space: crate::color::RasterColorSpace,
-    rgb: Vec<u8>,
-    alpha: Option<Vec<u8>>,
+    payload: ImagePayload,
+}
+
+/// One resolved PDF paint representation for a raster source.
+///
+/// A uniform, fully opaque decoded image can be painted as an ICC-tagged
+/// vector fill without changing its resolved CSS destination geometry. All
+/// other sources retain their PDF image XObject representation.
+/// ISO 32000-2:2020, 8.9.5 defines image XObjects and 8.6.5 defines
+/// calibrated color spaces for direct graphics paint.
+#[derive(Debug, Clone, PartialEq)]
+enum PreparedImageResource {
+    Raster(ImageResource),
+    SolidFill(SolidImageFill),
+}
+
+/// The final calibrated samples for an opaque uniform raster image.
+///
+/// `color_space` and `components` are retained after image color conversion,
+/// so a vector replacement selects the same ICC resource and component values
+/// that the ordinary image XObject would have used.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SolidImageFill {
+    color_space: crate::css::CssColorSpace,
+    components: [f32; 3],
+}
+
+/// The PDF encoding selected for one resolved raster-image resource.
+///
+/// Decoded samples need a PDF stream filter, while an eligible JPEG is already
+/// a complete DCT-coded stream and must be passed through unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImagePayload {
+    Samples {
+        rgb: Vec<u8>,
+        alpha: Option<Vec<u8>>,
+    },
+    Jpeg(Rc<[u8]>),
 }
 
 /// A PDF image resource before its source has been expanded into samples.
@@ -146,6 +191,23 @@ struct ImageResourcePlan {
 }
 
 impl ImageResourcePlan {
+    fn built_in_color_spaces(
+        &self,
+        image_store: &crate::image_store::DocumentImageStore,
+    ) -> Vec<crate::css::CssColorSpace> {
+        let mut spaces = Vec::new();
+        for source in &self.unique_images {
+            let color_space = source.raster_color_space(image_store);
+            let crate::color::RasterColorSpace::BuiltIn(space) = color_space else {
+                continue;
+            };
+            if !spaces.contains(&space) {
+                spaces.push(space);
+            }
+        }
+        spaces
+    }
+
     fn embedded_rgb_profiles(
         &self,
         image_store: &crate::image_store::DocumentImageStore,
@@ -165,6 +227,29 @@ impl ImageResourcePlan {
             }
         }
         profiles
+    }
+
+    /// Returns source indexes which cannot be emitted as a direct solid fill.
+    ///
+    /// Image patterns retain an image XObject by construction, and local
+    /// image transforms use a source-space image matrix rather than a
+    /// page-space rectangle. Keeping those sources raster also means one
+    /// deduplicated resource has one stable paint representation everywhere.
+    fn solid_fill_eligibility(&self, document: &Document) -> Vec<bool> {
+        let mut eligible = vec![true; self.unique_images.len()];
+        for indexes in &self.page_pattern_tile_unique_indexes {
+            for index in indexes {
+                eligible[index.0] = false;
+            }
+        }
+        for (page, indexes) in document.pages.iter().zip(&self.page_image_unique_indexes) {
+            for (image, index) in page.images.iter().zip(indexes) {
+                if image.transform.is_some() {
+                    eligible[index.0] = false;
+                }
+            }
+        }
+        eligible
     }
 }
 
@@ -199,6 +284,7 @@ struct SvgTilingPatternPlan {
     form_id: usize,
     form_name: String,
     pattern: crate::document::RenderedSvgPattern,
+    transform: crate::document::PaintTransform,
 }
 
 /// A Type 1 tiling pattern used as the fill or stroke paint of one SVG path.
@@ -246,8 +332,7 @@ struct GradientAlphaPlan {
     form_id: usize,
     ext_gstate_id: usize,
     ext_gstate_name: String,
-    page_width: f32,
-    page_height: f32,
+    page_size: PdfSize,
 }
 
 #[derive(Debug, Clone, PartialEq)]

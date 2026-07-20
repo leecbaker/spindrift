@@ -1,5 +1,5 @@
 use super::super::*;
-use super::float::freeze_float_replay_width;
+use super::float::{freeze_float_replay_height, freeze_float_replay_width};
 use crate::LayoutSize;
 
 impl<'a> LayoutBuilder<'a> {
@@ -43,7 +43,7 @@ impl<'a> LayoutBuilder<'a> {
                 Some(ReplacedElementKind::Svg) => {
                     Some(estimate_svg_height(element, style, available_outer_width))
                 }
-                None if style.display.is_table() || is_html_table_element(element) => {
+                None if style.display.is_table() => {
                     let built_child_boxes;
                     let table_children = if let Some(children) = child_boxes {
                         children
@@ -129,6 +129,7 @@ impl<'a> LayoutBuilder<'a> {
                     available_outer_width: layout_pt(available_outer_width),
                     percentage_basis: PercentageBasis::definite(layout_pt(available_outer_width)),
                     horizontal_non_content: horizontal_extras,
+                    definite_content_height: None,
                 },
             )
         };
@@ -549,6 +550,13 @@ impl<'a> LayoutBuilder<'a> {
             &mut placed_style,
             PercentageBasis::definite(layout_pt(containing_width)),
         );
+        let _ = freeze_float_replay_height(
+            &mut placed_style,
+            self.definite_block_size_stack
+                .last()
+                .cloned()
+                .unwrap_or_else(PercentageBasis::indefinite),
+        );
         let inline_size = self.resolved_float_inline_size(
             element,
             &placed_style,
@@ -558,28 +566,29 @@ impl<'a> LayoutBuilder<'a> {
             None,
         );
         freeze_float_replay_width(&mut placed_style, inline_size);
-        let width = inline_size.margin_box_width;
-        let height = self.float_margin_box_height(
-            element,
-            &placed_style,
-            stylesheets,
-            inline_size,
-            child_boxes,
-            None,
-        );
+        let width = inline_size.margin_box_width.points();
+        let height = self
+            .float_margin_box_height(
+                element,
+                &placed_style,
+                stylesheets,
+                inline_size,
+                child_boxes,
+                None,
+            )
+            .points();
         let placement = float_context.avoiding_position(
             0,
-            0.0,
-            PageTopSize::new(width, height),
+            PageTopBlockPosition::new(0.0),
+            margin_box_size_pt(width, height),
             placed_style.clear,
             placed_style.writing_mode,
             placed_style.direction,
-            0.0,
-            containing_width,
+            PageInlineSpan::from_edges(0.0, containing_width),
         );
-        let band_left = placement.left();
-        let top = placement.top();
-        let available_width = placement.available_width();
+        let band_left = placement.available_span.left_x();
+        let top = PageTopBlockPosition::new(placement.origin.top_y());
+        let available_width = placement.available_span.width();
         let margin_box_left = match float_side {
             UsedFloatSide::Left => band_left,
             UsedFloatSide::Right => band_left + (available_width - width).max(0.0),
@@ -591,10 +600,10 @@ impl<'a> LayoutBuilder<'a> {
             float_side,
             0,
             0,
-            PageTopRect::new(margin_box_left, top, width, height),
+            PageTopRect::new(margin_box_left, top.points(), width, height),
         );
         float_context.shapes.push(shape);
-        Some(top - height)
+        Some(top.toward_block_end(layout_pt(height)).points())
     }
 
     pub(in crate::layout) fn estimate_image_height(
@@ -623,7 +632,7 @@ impl<'a> LayoutBuilder<'a> {
                     self.base_url,
                     self.root_url,
                     self.resource_cache,
-                    true,
+                    style.image_orientation == css::ImageOrientation::FromImage,
                 )
             })
             .map(|asset| asset.intrinsic_size());

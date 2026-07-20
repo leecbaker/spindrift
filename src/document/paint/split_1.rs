@@ -189,6 +189,11 @@ impl Page {
             .root
             .bands
             .push_context_in_band(band, context);
+        // Captured atomic fragments can be committed after later source
+        // siblings (notably an overhanging nested float). Restore the
+        // per-band stacking-context order at the commit boundary rather than
+        // relying on capture completion order.
+        self.paint_tree.sort_stacking_contexts();
         self.links = self.paint_tree.transformed_links();
     }
 
@@ -294,18 +299,19 @@ impl Page {
     }
 
     fn record_svg_group(&mut self, group: crate::svg::SvgPaintGroup) -> PaintEffectScope {
-        let mut items = Vec::new();
-        for item in group.items {
-            match item {
+        let items = group
+            .items
+            .into_iter()
+            .map(|item| match item {
                 crate::svg::SvgPaintItem::Path(path) => {
                     let operation = self.record_path(*path).1;
-                    items.push(PaintDisplayItem::Operation(operation));
+                    PaintDisplayItem::Operation(operation)
                 }
                 crate::svg::SvgPaintItem::Group(group) => {
-                    items.push(PaintDisplayItem::EffectScope(self.record_svg_group(*group)));
+                    PaintDisplayItem::EffectScope(self.record_svg_group(*group))
                 }
-            }
-        }
+            })
+            .collect();
         PaintEffectScope::new(
             PaintEffects {
                 opacity: group.opacity,
@@ -387,6 +393,10 @@ impl Page {
         };
         let previous = self.lines.get_mut(*index)?;
         if rendered_lines_can_merge_as_inline_continuation(previous, line) {
+            previous.append_same_line_continuation(line);
+            return Some(*index);
+        }
+        if rendered_lines_can_merge_as_tracking_continuation(previous, line) {
             previous.append_same_line_continuation(line);
             return Some(*index);
         }
@@ -1020,7 +1030,15 @@ mod paint_tree_validation_tests {
     use super::*;
 
     fn black_rect(x: f32) -> RenderedRect {
-        RenderedRect::new(x, 0.0, 10.0, 10.0, Some(Color::BLACK), None, 0.0)
+        RenderedRect::new(
+            x,
+            0.0,
+            10.0,
+            10.0,
+            Some(CssColor::BLACK),
+            None,
+            PaintStrokeWidth::ZERO,
+        )
     }
 
     #[test]

@@ -477,7 +477,8 @@ pub(in crate::layout) fn page_margin_intrinsic_inline_items(
                 resource_cache,
             ),
             PageMarginContentItem::TargetCounter { .. }
-            | PageMarginContentItem::TargetText { .. } => {}
+            | PageMarginContentItem::TargetText { .. }
+            | PageMarginContentItem::NamedStringPageCounter { .. } => {}
         }
     }
     flush_page_margin_intrinsic_text_buffer(&mut items, &mut text_buffer, style);
@@ -520,14 +521,16 @@ pub(in crate::layout) fn append_page_margin_intrinsic_part(
         }
         GeneratedContentPart::Image { image } => {
             flush_page_margin_intrinsic_text_buffer(items, text_buffer, inline_style);
-            if let Some(image) = used_generated_image_value(
-                image,
-                box_style,
-                available_width,
-                base_url,
-                root_url,
-                resource_cache,
-            ) {
+            if let Some(image) = image.as_image().and_then(|image| {
+                used_generated_image_value(
+                    image,
+                    box_style,
+                    available_width,
+                    base_url,
+                    root_url,
+                    resource_cache,
+                )
+            }) {
                 let border_box_width = image.border_box_size.width;
                 let border_box_height = image.border_box_size.height;
                 let content = image
@@ -580,8 +583,8 @@ pub(in crate::layout) fn accumulate_page_margin_intrinsic_paragraph(
     }
     let graph = inline_layout::build_inline_opportunity_graph(font_system, paragraph.iter(), style);
     let contribution = graph.intrinsic_contribution(font_system, style);
-    *min_content = (*min_content).max(contribution.min_content);
-    *max_content = (*max_content).max(contribution.max_content);
+    *min_content = (*min_content).max(contribution.min_content.points());
+    *max_content = (*max_content).max(contribution.max_content.points());
     paragraph.clear();
 }
 
@@ -631,7 +634,7 @@ pub(in crate::layout) fn page_margin_inline_content_style(style: &ComputedStyle)
     inline_style.outline_style = css::BorderStyle::None;
     inline_style.outline_offset = css::ComputedLengthPercentage::ZERO;
     inline_style.background_color = None;
-    inline_style.background_image = None;
+    inline_style.background_image = css::ComputedImage::None;
     inline_style.background_layers.clear();
     inline_style
 }
@@ -683,14 +686,16 @@ pub(in crate::layout) fn append_page_margin_inline_part(
             );
         }
         GeneratedContentPart::Image { image } => {
-            if let Some(image) = used_generated_image_value(
-                image,
-                box_style,
-                available_width,
-                base_url,
-                root_url,
-                resource_cache,
-            ) {
+            if let Some(image) = image.as_image().and_then(|image| {
+                used_generated_image_value(
+                    image,
+                    box_style,
+                    available_width,
+                    base_url,
+                    root_url,
+                    resource_cache,
+                )
+            }) {
                 let border_box_width = image.border_box_size.width;
                 let border_box_height = image.border_box_size.height;
                 let content = image

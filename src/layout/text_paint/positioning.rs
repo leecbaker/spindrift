@@ -30,14 +30,6 @@ pub(in crate::layout) fn position_rendered_runs_for_writing_mode(
         return runs;
     }
     let text_layout_policy = style.text_layout_policy();
-    let placement_direction = if matches!(
-        text_layout_policy,
-        css::TextLayoutPolicy::Vertical(TextOrientation::Upright)
-    ) {
-        Direction::Ltr
-    } else {
-        style.direction
-    };
     let advance_sign = vertical_text_advance_sign(style);
     let sideways_matrix = match text_layout_policy {
         css::TextLayoutPolicy::Sideways(css::SidewaysOrientation::Right) => {
@@ -46,7 +38,7 @@ pub(in crate::layout) fn position_rendered_runs_for_writing_mode(
         css::TextLayoutPolicy::Sideways(css::SidewaysOrientation::Left) => {
             RenderedTextMatrix::ROTATE_CCW
         }
-        _ => match placement_direction {
+        _ => match style.direction {
             Direction::Ltr => RenderedTextMatrix::ROTATE_CW,
             Direction::Rtl => RenderedTextMatrix::ROTATE_CCW,
         },
@@ -194,7 +186,17 @@ fn flush_vertical_cluster(
         // positioned runs so the vertical-origin correction recorded during
         // shaping reaches the PDF text matrix. This also preserves the
         // cross-axis offsets of marks in a vertical typographic unit.
+        // One typographic unit can contain several paintable glyphs, and
+        // some of those glyphs deliberately have no standalone Unicode
+        // summary (for example a vertical-form alternate that shares the
+        // cluster's ToUnicode value). Each glyph still owns one used advance.
+        // Keep their individual vertical origins in the same coordinate
+        // system as the cluster start instead of stacking them all at the
+        // first glyph's origin.
+        let mut glyph_cursor = cluster_start;
         output.extend(glyphs.into_iter().map(|glyph| {
+            let y_offset = advance_sign * glyph_cursor;
+            glyph_cursor += glyph.x_advance;
             RenderedTextRun {
                 text: glyph.unicode.clone().into(),
                 actual_text: glyph
@@ -203,8 +205,8 @@ fn flush_vertical_cluster(
                     .then(|| source.actual_text.clone())
                     .flatten(),
                 x_offset: glyph.x_offset,
-                y_offset: advance_sign * cluster_start + glyph.y_offset,
-                text_matrix: RenderedTextMatrix::IDENTITY,
+                y_offset,
+                text_matrix: source.text_matrix,
                 font_size: source.font_size,
                 font_id: source.font_id,
                 glyphs: Some(vec![glyph].into()),
@@ -242,5 +244,96 @@ pub(in crate::layout) fn vertical_text_cluster_is_upright(
         TextOrientation::Sideways => false,
         TextOrientation::Upright => !text.is_empty(),
         TextOrientation::Mixed => typographic_unit_is_upright_in_mixed_orientation(text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::RenderedGlyphKind;
+
+    fn upright_glyph(text: &str, advance: f32, vertical_origin: f32) -> RenderedGlyph {
+        RenderedGlyph {
+            kind: RenderedGlyphKind::Paint(1),
+            x_advance: advance,
+            nominal_x_advance: advance,
+            x_offset: 0.0,
+            y_offset: vertical_origin,
+            unicode: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn upright_vertical_runs_apply_vertical_origin_once() {
+        let source = RenderedTextRun {
+            text: Rc::from("AB"),
+            actual_text: None,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            text_matrix: RenderedTextMatrix::IDENTITY,
+            font_size: 12.0,
+            font_id: None,
+            glyphs: Some(
+                vec![
+                    upright_glyph("A", 12.0, -10.0),
+                    upright_glyph("B", 12.0, -10.0),
+                ]
+                .into(),
+            ),
+        };
+
+        let runs = vertical_positioned_text_runs(
+            source,
+            TextOrientation::Upright,
+            -1.0,
+            RenderedTextMatrix::ROTATE_CW,
+        );
+
+        assert_eq!(runs.len(), 2);
+        for (index, run) in runs.iter().enumerate() {
+            let glyph = run.glyphs.as_ref().unwrap().first().unwrap();
+            assert!(
+                (run.y_offset + glyph.y_offset - (-10.0 - index as f32 * 12.0)).abs() < 0.01,
+                "upright glyph {index} should receive its OpenType vertical origin exactly once: {run:?}"
+            );
+            assert!(
+                (run.y_offset - -(index as f32 * 12.0)).abs() < 0.01,
+                "run origin contains only normal-flow vertical advance: {run:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn upright_vertical_runs_advance_glyphs_without_individual_unicode() {
+        let source = RenderedTextRun {
+            text: Rc::from("\u{3000}\u{3001}\u{3002}"),
+            actual_text: Some(Rc::from("\u{3000}\u{3001}")),
+            x_offset: 0.0,
+            y_offset: 0.0,
+            text_matrix: RenderedTextMatrix::IDENTITY,
+            font_size: 12.0,
+            font_id: None,
+            glyphs: Some(
+                vec![
+                    upright_glyph("", 3.75, -10.0),
+                    upright_glyph("", 3.75, -10.0),
+                    upright_glyph("\u{3002}", 3.75, -10.0),
+                ]
+                .into(),
+            ),
+        };
+
+        let runs = vertical_positioned_text_runs(
+            source,
+            TextOrientation::Upright,
+            -1.0,
+            RenderedTextMatrix::ROTATE_CW,
+        );
+
+        assert_eq!(runs.len(), 3);
+        assert_eq!(
+            runs.iter().map(|run| run.y_offset).collect::<Vec<_>>(),
+            vec![0.0, -3.75, -7.5]
+        );
     }
 }

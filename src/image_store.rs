@@ -6,11 +6,94 @@
 //! every image use.
 
 use image::metadata::Orientation;
-use image::{ImageDecoder, ImageReader};
+use image::{AnimationDecoder, ColorType, ImageDecoder, ImageReader};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::rc::Rc;
 use url::Url;
+
+/// Whether a MIME type named by CSS `image-set()` is backed by a decoder in
+/// this build.
+///
+/// The descriptor participates only in candidate negotiation: it does not
+/// constrain the bytes eventually fetched for a selected URL.
+/// <https://drafts.csswg.org/css-images-4/#image-set-notation>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MimeSupport {
+    Supported,
+    Unsupported,
+}
+
+/// Classify a CSS `type()` descriptor against Quire's actual image decoders.
+pub(crate) fn image_mime_support(mime_type: &str) -> MimeSupport {
+    let Some(mime_type) = declared_mime_essence(mime_type) else {
+        return MimeSupport::Unsupported;
+    };
+    let supported = matches!(mime_type.as_str(), "image/svg+xml" | "image/jxl")
+        || image::ImageFormat::from_mime_type(&mime_type).is_some_and(|format| {
+            matches!(
+                format,
+                image::ImageFormat::Png
+                    | image::ImageFormat::Jpeg
+                    | image::ImageFormat::Gif
+                    | image::ImageFormat::WebP
+            )
+        });
+    if supported {
+        MimeSupport::Supported
+    } else {
+        MimeSupport::Unsupported
+    }
+}
+
+/// Return the normalized media-type essence from a `type()` descriptor.
+///
+/// Parameters do not affect decoder selection, but the essence must retain
+/// the RFC media-type token shape so malformed descriptors never accidentally
+/// match a decoder. CSS Images treats an unknown type as an unsupported
+/// candidate rather than making the surrounding `image-set()` syntactically
+/// invalid.
+fn declared_mime_essence(value: &str) -> Option<String> {
+    let essence = value
+        .trim()
+        .split_once(';')
+        .map_or(value.trim(), |(head, _)| head.trim());
+    let (type_, subtype) = essence.split_once('/')?;
+    if type_.is_empty()
+        || subtype.is_empty()
+        || subtype.contains('/')
+        || !type_.bytes().all(is_mime_token_character)
+        || !subtype.bytes().all(is_mime_token_character)
+    {
+        return None;
+    }
+    Some(essence.to_ascii_lowercase())
+}
+
+fn is_mime_token_character(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+pub(crate) fn supports_declared_image_mime_type(mime_type: &str) -> bool {
+    image_mime_support(mime_type) == MimeSupport::Supported
+}
 
 /// Stable, document-local reference to an image source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,10 +114,37 @@ pub(crate) struct ImageMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EncodedImage {
     bytes: Rc<[u8]>,
-    format: image::ImageFormat,
+    format: EncodedImageFormat,
     metadata: ImageMetadata,
     apply_orientation: bool,
+    source_orientation: Orientation,
+    direct_jpeg: bool,
     color_space: crate::color::RasterColorSpace,
+}
+
+/// Raster-image encodings supported by the document image store.
+///
+/// JPEG XL is intentionally represented outside [`image::ImageFormat`]: the
+/// `image` crate can dispatch third-party decoders but does not have a JPEG XL
+/// enum variant. Keeping that distinction here lets this store retain the
+/// original source and use `jxl-oxide` only at decode time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodedImageFormat {
+    Image(image::ImageFormat),
+    JpegXl,
+}
+
+/// A JPEG source that can be represented directly by a PDF `/DCTDecode`
+/// image XObject without changing any pixel samples.
+///
+/// PDF's DCT filter consumes the JPEG interchange stream directly (ISO
+/// 32000-2:2020, 7.4.8). Keeping the source bytes shared avoids decoding a
+/// photographic image just to recompress its samples less efficiently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectJpegImage {
+    pub(crate) bytes: Rc<[u8]>,
+    pub(crate) metadata: ImageMetadata,
+    pub(crate) color_space: crate::color::RasterColorSpace,
 }
 
 /// Expanded samples used only while writing one PDF image object.
@@ -91,14 +201,15 @@ impl GeneratedRasterImage {
 
     /// Resolve the component space that gradient rasterization will use
     /// without materializing its pixels. This keeps PDF resource planning
-    /// bounded while matching the common-space rule used at rasterization.
+    /// bounded while matching the interpolation-space conversion used at
+    /// rasterization.
     fn color_space(&self) -> crate::color::RasterColorSpace {
         let space = match self {
             Self::Linear { gradient, .. } => {
-                crate::color::common_color_space(gradient.stops.iter().map(|stop| stop.color))
+                generated_gradient_interpolation_output_space(gradient.interpolation)
             }
             Self::Radial { gradient, .. } => {
-                crate::color::common_color_space(gradient.stops.iter().map(|stop| stop.color))
+                generated_gradient_interpolation_output_space(gradient.interpolation)
             }
         };
         crate::color::RasterColorSpace::BuiltIn(space)
@@ -136,6 +247,36 @@ impl GeneratedRasterImage {
     }
 }
 
+/// Match generated-gradient rasterization's resolved component space without
+/// expanding its pixels. CSS gradients interpolate in their selected space;
+/// perceptual and Lab-family methods use the D50 XYZ connection space.
+/// <https://drafts.csswg.org/css-color-4/#interpolation-space>
+fn generated_gradient_interpolation_output_space(
+    method: crate::css::GradientInterpolationMethod,
+) -> crate::css::CssColorSpace {
+    match method.space {
+        crate::css::GradientInterpolationSpace::Srgb
+        | crate::css::GradientInterpolationSpace::SrgbLinear
+        | crate::css::GradientInterpolationSpace::Hsl
+        | crate::css::GradientInterpolationSpace::Hwb => crate::css::CssColorSpace::Srgb,
+        crate::css::GradientInterpolationSpace::DisplayP3
+        | crate::css::GradientInterpolationSpace::DisplayP3Linear => {
+            crate::css::CssColorSpace::DisplayP3
+        }
+        crate::css::GradientInterpolationSpace::A98Rgb => crate::css::CssColorSpace::A98Rgb,
+        crate::css::GradientInterpolationSpace::ProphotoRgb => {
+            crate::css::CssColorSpace::ProphotoRgb
+        }
+        crate::css::GradientInterpolationSpace::Rec2020 => crate::css::CssColorSpace::Rec2020,
+        crate::css::GradientInterpolationSpace::XyzD50
+        | crate::css::GradientInterpolationSpace::XyzD65
+        | crate::css::GradientInterpolationSpace::Lab
+        | crate::css::GradientInterpolationSpace::Oklab
+        | crate::css::GradientInterpolationSpace::Lch
+        | crate::css::GradientInterpolationSpace::Oklch => crate::css::CssColorSpace::XyzD50,
+    }
+}
+
 #[derive(Default)]
 struct GeneratedImageKeyBuilder {
     output: String,
@@ -165,12 +306,12 @@ impl GeneratedImageKeyBuilder {
         self.u32(value.to_bits());
     }
 
-    fn color(&mut self, color: crate::Color) {
+    fn color(&mut self, color: crate::CssColor) {
         self.u32(u32::from(color.space().cache_key()));
-        self.f32(color.r);
-        self.f32(color.g);
-        self.f32(color.b);
-        self.f32(color.a);
+        self.f32(color.components()[0]);
+        self.f32(color.components()[1]);
+        self.f32(color.components()[2]);
+        self.f32(color.alpha());
     }
 
     fn length_percentage(&mut self, value: crate::css::ComputedLengthPercentage) {
@@ -186,7 +327,7 @@ impl GeneratedImageKeyBuilder {
     ) {
         self.usize(stops.len());
         for stop in stops {
-            self.color(stop.color);
+            self.gradient_color(stop.color);
             match &stop.position {
                 Some(position) => {
                     self.bool(true);
@@ -199,6 +340,35 @@ impl GeneratedImageKeyBuilder {
         for hint in hints {
             self.usize(hint.after_stop);
             self.length_percentage(hint.position.clone());
+        }
+    }
+
+    fn gradient_color(&mut self, color: crate::css::GradientColor) {
+        match color {
+            crate::css::GradientColor::CssColor(color) => {
+                self.tag("color");
+                self.color(color);
+            }
+            crate::css::GradientColor::ColorWithMissing {
+                color,
+                missing,
+                source,
+            } => {
+                self.tag("color-with-missing");
+                self.color(color);
+                self.u32(u32::from(missing.bits()));
+                self.tag(match source {
+                    crate::css::GradientMissingComponentSpace::Rgb => "rgb",
+                    crate::css::GradientMissingComponentSpace::Xyz => "xyz",
+                    crate::css::GradientMissingComponentSpace::Lab => "lab",
+                    crate::css::GradientMissingComponentSpace::Oklab => "oklab",
+                    crate::css::GradientMissingComponentSpace::Hsl => "hsl",
+                    crate::css::GradientMissingComponentSpace::Hwb => "hwb",
+                    crate::css::GradientMissingComponentSpace::Lch => "lch",
+                    crate::css::GradientMissingComponentSpace::Oklch => "oklch",
+                });
+            }
+            crate::css::GradientColor::CurrentColor => self.tag("currentcolor"),
         }
     }
 
@@ -223,6 +393,7 @@ impl GeneratedImageKeyBuilder {
                 });
             }
         }
+        self.gradient_interpolation(gradient.interpolation);
         self.bool(gradient.repeating);
         self.stops_and_hints(&gradient.stops, &gradient.hints);
     }
@@ -251,8 +422,35 @@ impl GeneratedImageKeyBuilder {
         }
         self.position_axis(gradient.position.x.clone());
         self.position_axis(gradient.position.y.clone());
+        self.gradient_interpolation(gradient.interpolation);
         self.bool(gradient.repeating);
         self.stops_and_hints(&gradient.stops, &gradient.hints);
+    }
+
+    fn gradient_interpolation(&mut self, method: crate::css::GradientInterpolationMethod) {
+        self.tag(match method.space {
+            crate::css::GradientInterpolationSpace::Srgb => "srgb",
+            crate::css::GradientInterpolationSpace::SrgbLinear => "srgb-linear",
+            crate::css::GradientInterpolationSpace::DisplayP3 => "display-p3",
+            crate::css::GradientInterpolationSpace::DisplayP3Linear => "display-p3-linear",
+            crate::css::GradientInterpolationSpace::A98Rgb => "a98-rgb",
+            crate::css::GradientInterpolationSpace::ProphotoRgb => "prophoto-rgb",
+            crate::css::GradientInterpolationSpace::Rec2020 => "rec2020",
+            crate::css::GradientInterpolationSpace::XyzD50 => "xyz-d50",
+            crate::css::GradientInterpolationSpace::XyzD65 => "xyz-d65",
+            crate::css::GradientInterpolationSpace::Lab => "lab",
+            crate::css::GradientInterpolationSpace::Oklab => "oklab",
+            crate::css::GradientInterpolationSpace::Hsl => "hsl",
+            crate::css::GradientInterpolationSpace::Hwb => "hwb",
+            crate::css::GradientInterpolationSpace::Lch => "lch",
+            crate::css::GradientInterpolationSpace::Oklch => "oklch",
+        });
+        self.tag(match method.hue {
+            crate::css::HueInterpolationMethod::Shorter => "shorter",
+            crate::css::HueInterpolationMethod::Longer => "longer",
+            crate::css::HueInterpolationMethod::Increasing => "increasing",
+            crate::css::HueInterpolationMethod::Decreasing => "decreasing",
+        });
     }
 
     fn position_axis(&mut self, axis: crate::css::BackgroundPositionAxis) {
@@ -327,13 +525,16 @@ impl DocumentImageStore {
         bytes: Rc<[u8]>,
         apply_orientation: bool,
     ) -> Option<(ImageId, ImageMetadata)> {
-        let (metadata, format, color_space) = image_metadata(&bytes, apply_orientation)?;
+        let (metadata, format, color_space, source_orientation, direct_jpeg) =
+            image_metadata(&bytes, apply_orientation)?;
         let id = ImageId(u32::try_from(self.images.len()).ok()?);
         self.images.push(ImageAsset::Encoded(EncodedImage {
             bytes,
             format,
             metadata,
             apply_orientation,
+            source_orientation,
+            direct_jpeg,
             color_space,
         }));
         Some((id, metadata))
@@ -352,6 +553,21 @@ impl DocumentImageStore {
             ImageAsset::Encoded(image) => image.color_space.clone(),
             ImageAsset::Generated(image) => image.color_space(),
         })
+    }
+
+    /// Return an original JPEG stream when PDF emission can use it without
+    /// bypassing a required EXIF-orientation transform.
+    pub(crate) fn direct_jpeg(&self, id: ImageId) -> Option<DirectJpegImage> {
+        let ImageAsset::Encoded(image) = self.images.get(id.index())? else {
+            return None;
+        };
+        (image.direct_jpeg
+            && !(image.apply_orientation && image.source_orientation != Orientation::NoTransforms))
+            .then(|| DirectJpegImage {
+                bytes: Rc::clone(&image.bytes),
+                metadata: image.metadata,
+                color_space: image.color_space.clone(),
+            })
     }
 
     #[cfg(test)]
@@ -388,11 +604,37 @@ impl DocumentImageStore {
     }
 
     fn rasterize_encoded(&self, image: &EncodedImage) -> Option<RasterImage> {
-        let mut decoder = ImageReader::with_format(Cursor::new(image.bytes.as_ref()), image.format)
-            .into_decoder()
-            .ok()?;
-        let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-        let mut decoded = image::DynamicImage::from_decoder(decoder).ok()?;
+        // GIF and animated WebP expose their logical screen dimensions and
+        // contribute only their first image frame. This deliberately gives
+        // animated images a stable PDF representation: frame timing, looping,
+        // disposal, and later-frame compositing are not part of a static PDF
+        // image.
+        // https://www.w3.org/TR/css-images-3/#image-notation
+        let (mut decoded, orientation) = if image.format
+            == EncodedImageFormat::Image(image::ImageFormat::WebP)
+        {
+            decode_webp_first_frame(&image.bytes)?
+        } else if image.format == EncodedImageFormat::JpegXl {
+            let mut decoder =
+                jxl_oxide::integration::JxlDecoder::new(Cursor::new(image.bytes.as_ref())).ok()?;
+            let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+            (
+                image::DynamicImage::from_decoder(decoder).ok()?,
+                orientation,
+            )
+        } else {
+            let EncodedImageFormat::Image(format) = image.format else {
+                unreachable!("JPEG XL is handled by jxl-oxide above");
+            };
+            let mut decoder = ImageReader::with_format(Cursor::new(image.bytes.as_ref()), format)
+                .into_decoder()
+                .ok()?;
+            let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+            (
+                image::DynamicImage::from_decoder(decoder).ok()?,
+                orientation,
+            )
+        };
         if image.apply_orientation {
             decoded.apply_orientation(orientation);
         }
@@ -443,14 +685,36 @@ impl DocumentImageStore {
     }
 }
 
+/// Decode a WebP image as one static CSS image.
+///
+/// Animated WebP uses the first composited frame, which covers the decoder's
+/// logical canvas. Static WebP retains the ordinary decoder path so its native
+/// RGB/RGBA representation remains unchanged.
+/// <https://www.w3.org/TR/css-images-3/#image-notation>
+fn decode_webp_first_frame(bytes: &[u8]) -> Option<(image::DynamicImage, Orientation)> {
+    let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)).ok()?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let decoded = if decoder.has_animation() {
+        image::DynamicImage::ImageRgba8(decoder.into_frames().next()?.ok()?.into_buffer())
+    } else {
+        image::DynamicImage::from_decoder(decoder).ok()?
+    };
+    Some((decoded, orientation))
+}
+
 fn image_metadata(
     bytes: &[u8],
     apply_orientation: bool,
 ) -> Option<(
     ImageMetadata,
-    image::ImageFormat,
+    EncodedImageFormat,
     crate::color::RasterColorSpace,
+    Orientation,
+    bool,
 )> {
+    if is_jpeg_xl(bytes) {
+        return jpeg_xl_metadata(bytes, apply_orientation);
+    }
     let reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -461,13 +725,150 @@ fn image_metadata(
             log::debug!("ignoring an invalid or non-RGB embedded image ICC profile");
             crate::color::RasterColorSpace::SRGB
         }),
-        Ok(None) => {
-            log::debug!("using the sRGB fallback for an image without an embedded ICC profile");
+        Ok(None) => png_color_space(bytes, format).unwrap_or_else(|| {
+            log::debug!("using the sRGB fallback for an image without color metadata");
             crate::color::RasterColorSpace::SRGB
-        }
+        }),
         Err(error) => {
             log::debug!(
                 "using the sRGB fallback after reading an image ICC profile failed: {error}"
+            );
+            crate::color::RasterColorSpace::SRGB
+        }
+    };
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let direct_jpeg = format == image::ImageFormat::Jpeg && decoder.color_type() == ColorType::Rgb8;
+    let (mut pixel_width, mut pixel_height) = decoder.dimensions();
+    if apply_orientation
+        && matches!(
+            orientation,
+            Orientation::Rotate90
+                | Orientation::Rotate270
+                | Orientation::Rotate90FlipH
+                | Orientation::Rotate270FlipH
+        )
+    {
+        std::mem::swap(&mut pixel_width, &mut pixel_height);
+    }
+    Some((
+        ImageMetadata {
+            pixel_width,
+            pixel_height,
+        },
+        EncodedImageFormat::Image(format),
+        color_space,
+        orientation,
+        direct_jpeg,
+    ))
+}
+
+/// Read PNG color chunks that the generic image decoder does not expose.
+///
+/// An embedded `iCCP` profile is handled by `ImageDecoder::icc_profile` and
+/// takes precedence. This parser only reads singleton pre-IDAT color chunks;
+/// the image decoder remains responsible for validating and decoding PNG data.
+/// <https://www.w3.org/TR/png-3/#11iCCP>
+/// <https://www.w3.org/TR/png-3/#11gAMA>
+/// <https://www.w3.org/TR/png-3/#11cHRM>
+fn png_color_space(
+    bytes: &[u8],
+    format: image::ImageFormat,
+) -> Option<crate::color::RasterColorSpace> {
+    if format != image::ImageFormat::Png || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+
+    let mut gamma = None;
+    let mut chromaticities = None;
+    let mut offset: usize = 8;
+    while let Some(header) = bytes.get(offset..offset.checked_add(8)?) {
+        let length = u32::from_be_bytes(header[..4].try_into().ok()?) as usize;
+        let chunk_start = offset.checked_add(8)?;
+        let data_end = chunk_start.checked_add(length)?;
+        let chunk_end = data_end.checked_add(4)?;
+        let chunk = bytes.get(chunk_start..data_end)?;
+        match &header[4..] {
+            b"sRGB" if chunk.len() == 1 => return Some(crate::color::RasterColorSpace::SRGB),
+            b"gAMA" if chunk.len() == 4 && gamma.is_none() => {
+                gamma = Some(u32::from_be_bytes(chunk.try_into().ok()?));
+            }
+            b"cHRM" if chunk.len() == 32 && chromaticities.is_none() => {
+                chromaticities = png_chromaticities(chunk);
+            }
+            b"IDAT" => break,
+            _ => {}
+        }
+        offset = chunk_end;
+    }
+
+    crate::color::png_gamma_chromaticities_profile(f64::from(gamma?) / 100_000.0, chromaticities?)
+}
+
+fn png_chromaticities(bytes: &[u8]) -> Option<crate::color::PngChromaticities> {
+    let mut values = bytes.chunks_exact(4).map(|value| {
+        u32::from_be_bytes(value.try_into().expect("chunks_exact yields four bytes")) as f64
+            / 100_000.0
+    });
+    Some(crate::color::PngChromaticities {
+        white_x: values.next()?,
+        white_y: values.next()?,
+        red_x: values.next()?,
+        red_y: values.next()?,
+        green_x: values.next()?,
+        green_y: values.next()?,
+        blue_x: values.next()?,
+        blue_y: values.next()?,
+    })
+}
+
+/// Return whether bytes begin with either JPEG XL file signature from
+/// ISO/IEC 18181-2:2024, 11.2.2 (codestream) or 11.2.3 (container).
+const fn is_jpeg_xl(bytes: &[u8]) -> bool {
+    matches!(bytes, [0xff, 0x0a, ..])
+        || matches!(
+            bytes,
+            [
+                0,
+                0,
+                0,
+                0x0c,
+                b'J',
+                b'X',
+                b'L',
+                b' ',
+                0x0d,
+                0x0a,
+                0x87,
+                0x0a,
+                ..
+            ]
+        )
+}
+
+/// Read JPEG XL metadata through `jxl-oxide`'s `image` integration.
+///
+/// The decoder's ICC profile describes the rendered samples, so retaining it
+/// preserves the same source-color-space contract as the built-in decoders.
+fn jpeg_xl_metadata(
+    bytes: &[u8],
+    apply_orientation: bool,
+) -> Option<(
+    ImageMetadata,
+    EncodedImageFormat,
+    crate::color::RasterColorSpace,
+    Orientation,
+    bool,
+)> {
+    let mut decoder = jxl_oxide::integration::JxlDecoder::new(Cursor::new(bytes)).ok()?;
+    let color_space = match decoder.icc_profile() {
+        Ok(Some(profile)) => crate::color::embedded_rgb_profile(profile).unwrap_or_else(|| {
+            log::debug!("ignoring an invalid or non-RGB JPEG XL ICC profile");
+            crate::color::RasterColorSpace::SRGB
+        }),
+        Ok(None) => crate::color::RasterColorSpace::SRGB,
+        Err(error) => {
+            log::debug!(
+                "using the sRGB fallback after reading a JPEG XL ICC profile failed: {error}"
             );
             crate::color::RasterColorSpace::SRGB
         }
@@ -490,15 +891,18 @@ fn image_metadata(
             pixel_width,
             pixel_height,
         },
-        format,
+        EncodedImageFormat::JpegXl,
         color_space,
+        orientation,
+        false,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{ExtendedColorType, ImageEncoder};
+    use base64::Engine as _;
+    use image::{ExtendedColorType, Frame, ImageEncoder, RgbaImage};
 
     fn tagged_png(profile: Vec<u8>) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -520,11 +924,113 @@ mod tests {
         bytes
     }
 
+    fn two_frame_gif() -> Vec<u8> {
+        let first = RgbaImage::from_raw(
+            2,
+            2,
+            vec![
+                230, 32, 16, 255, // opaque red
+                0, 0, 0, 0, // transparent
+                10, 20, 30, 255, // opaque dark blue
+                0, 0, 0, 0, // transparent
+            ],
+        )
+        .expect("RGBA dimensions match the sample pixels");
+        let second = RgbaImage::from_raw(
+            2,
+            2,
+            vec![
+                0, 96, 255, 255, 0, 96, 255, 255, 0, 96, 255, 255, 0, 96, 255, 255,
+            ],
+        )
+        .expect("RGBA dimensions match the sample pixels");
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+        encoder
+            .encode_frames([Frame::new(first), Frame::new(second)])
+            .expect("GIF sample encodes");
+        drop(encoder);
+        bytes
+    }
+
+    fn tagged_lossless_webp(profile: Vec<u8>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+        encoder.set_icc_profile(profile).unwrap();
+        encoder
+            .write_image(
+                &[230, 32, 16, 255, 0, 0, 0, 0],
+                2,
+                1,
+                ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        bytes
+    }
+
+    fn exif_oriented_lossless_webp() -> Vec<u8> {
+        // Little-endian TIFF with one IFD0 Orientation (0x0112) entry set to
+        // 6, Rotate90.
+        const EXIF_ORIENTATION_ROTATE_90: &[u8] = &[
+            b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0,
+            0,
+        ];
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+        encoder
+            .set_exif_metadata(EXIF_ORIENTATION_ROTATE_90.to_vec())
+            .unwrap();
+        encoder
+            .write_image(
+                &[230, 32, 16, 255, 10, 20, 30, 255],
+                2,
+                1,
+                ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        bytes
+    }
+
+    /// A 2x2 lossy VP8 WebP generated with ImageMagick.
+    const LOSSY_WEBP: &[u8] = &[
+        0x52, 0x49, 0x46, 0x46, 0x3c, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38,
+        0x20, 0x30, 0x00, 0x00, 0x00, 0xd0, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x02, 0x00, 0x02, 0x00,
+        0x02, 0x00, 0x34, 0x25, 0xa0, 0x02, 0x74, 0xba, 0x01, 0xf8, 0x00, 0x03, 0xb0, 0x00, 0xfe,
+        0xf0, 0xc4, 0x0b, 0xff, 0x20, 0xb9, 0x61, 0x75, 0xc8, 0xd7, 0xff, 0x20, 0x3f, 0xe4, 0x07,
+        0xfc, 0x80, 0xff, 0xf8, 0xf2, 0x00, 0x00, 0x00,
+    ];
+
+    /// A two-frame lossless WebP: red/black first frame, blue second frame.
+    fn animated_webp() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode("UklGRoYAAABXRUJQVlA4WAoAAAACAAAAAQAAAAAAQU5JTQYAAAD/////AABBTk1GKgAAAAAAAAAAAAEAAAAAAGQAAAJWUDhMEgAAAC8BAAAADzAgYz4Q8x94yIj+B0FOTUYoAAAAAAAAAAAAAQAAAAAAZAAAAFZQOEwQAAAALwEAAAAHULDof/8DEdH/AA==")
+            .expect("animated WebP fixture is valid base64")
+    }
+
+    #[test]
+    fn jpeg_passthrough_requires_rgb_samples_and_no_applied_orientation() {
+        let bytes =
+            tagged_jpeg(crate::color::icc_profile_bytes(crate::css::CssColorSpace::Srgb).unwrap());
+        let mut store = DocumentImageStore::default();
+        let (image_id, _) = store
+            .insert(Rc::from(bytes.into_boxed_slice()), false)
+            .unwrap();
+        assert!(store.direct_jpeg(image_id).is_some());
+
+        let ImageAsset::Encoded(image) = &mut store.images[image_id.index()] else {
+            panic!("inserted image must be encoded");
+        };
+        image.apply_orientation = true;
+        image.source_orientation = Orientation::Rotate90;
+        assert!(store.direct_jpeg(image_id).is_none());
+    }
+
     #[test]
     fn png_and_jpeg_retain_valid_embedded_rgb_profiles() {
-        let profile = crate::color::icc_profile_bytes(crate::css::ColorSpace::DisplayP3).unwrap();
+        let profile =
+            crate::color::icc_profile_bytes(crate::css::CssColorSpace::DisplayP3).unwrap();
         for bytes in [tagged_png(profile.clone()), tagged_jpeg(profile.clone())] {
-            let (_, _, color_space) = image_metadata(&bytes, false).unwrap();
+            let (_, _, color_space, _, _) = image_metadata(&bytes, false).unwrap();
             assert_eq!(
                 color_space,
                 crate::color::RasterColorSpace::EmbeddedRgb(Rc::from(profile.clone()))
@@ -533,10 +1039,226 @@ mod tests {
     }
 
     #[test]
+    fn lossless_webp_retains_alpha_and_embedded_rgb_profile() {
+        let profile =
+            crate::color::icc_profile_bytes(crate::css::CssColorSpace::DisplayP3).unwrap();
+        let bytes = tagged_lossless_webp(profile.clone());
+        let (metadata, format, color_space, _, _) = image_metadata(&bytes, false).unwrap();
+        assert_eq!(format, EncodedImageFormat::Image(image::ImageFormat::WebP));
+        assert_eq!(
+            color_space,
+            crate::color::RasterColorSpace::EmbeddedRgb(Rc::from(profile))
+        );
+
+        let mut store = DocumentImageStore::default();
+        let (image_id, stored_metadata) = store
+            .insert(Rc::from(bytes.into_boxed_slice()), false)
+            .expect("lossless WebP image is recognized");
+        assert_eq!(stored_metadata, metadata);
+        assert!(store.direct_jpeg(image_id).is_none());
+        let raster = store
+            .with_rasterized(image_id, |raster| raster)
+            .expect("lossless WebP rasterizes");
+        assert_eq!(raster.rgb, vec![230, 32, 16, 0, 0, 0]);
+        assert_eq!(raster.alpha, Some(vec![255, 0]));
+    }
+
+    #[test]
+    fn lossy_webp_rasterizes_as_an_opaque_static_image() {
+        let mut store = DocumentImageStore::default();
+        let (image_id, metadata) = store
+            .insert(Rc::from(LOSSY_WEBP), false)
+            .expect("lossy WebP image is recognized");
+        assert_eq!(
+            metadata,
+            ImageMetadata {
+                pixel_width: 2,
+                pixel_height: 2,
+            }
+        );
+        assert!(store.direct_jpeg(image_id).is_none());
+        let raster = store
+            .with_rasterized(image_id, |raster| raster)
+            .expect("lossy WebP rasterizes");
+        assert_eq!(raster.alpha, None);
+        assert_eq!(raster.rgb.len(), 2 * 2 * 3);
+        assert!(
+            raster
+                .rgb
+                .chunks_exact(3)
+                .all(|pixel| pixel == &raster.rgb[0..3])
+        );
+    }
+
+    #[test]
+    fn jpeg_xl_is_recognized_and_rasterized() {
+        // 3×3 lossless RGBA JPEG XL image from WPT's JPEG XL resources. Keep
+        // the fixture inline so this crate's test suite is self-contained.
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode("/woQELCgcm8VRQgQEADIAEsYixUKJYLsdkD5lm3pAEP51y/mVkAqNRs+7Y8+vyhKKU5gn/q/jPolL15LnJgIAAAA")
+            .unwrap();
+        let mut store = DocumentImageStore::default();
+        let (image_id, metadata) = store.insert(bytes.into(), false).unwrap();
+        assert_eq!(
+            metadata,
+            ImageMetadata {
+                pixel_width: 3,
+                pixel_height: 3
+            }
+        );
+        assert!(store.direct_jpeg(image_id).is_none());
+        let raster = store.with_rasterized(image_id, |raster| raster).unwrap();
+        assert_eq!(raster.metadata, metadata);
+        assert_eq!(raster.rgb.len(), 3 * 3 * 3);
+        assert_eq!(raster.alpha.as_ref().map(Vec::len), Some(3 * 3));
+    }
+
+    #[test]
+    fn png_gamma_and_chromaticities_preserve_the_declared_rgb_encoding() {
+        // Self-contained 3×3 PNG from WPT's JPEG XL 8-bit reference. It has
+        // no iCCP profile, but its gAMA=45455 and cHRM declarations describe
+        // sRGB primaries with a 2.2 decoding exponent.
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAMAAAADCAIAAADZSiLoAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6QAAdTAAAOpgAAA6mAAAF3AbHJp/AAAAI0lEQVQImQXBAREAMAgEIHYrYhSjWdUkLwiC/Ndtq6wkM4MDjYQKASYFwFoAAAAASUVORK5CYII=")
+            .unwrap();
+        let (metadata, format, color_space, _, _) = image_metadata(&bytes, false).unwrap();
+        assert_eq!(
+            metadata,
+            ImageMetadata {
+                pixel_width: 3,
+                pixel_height: 3,
+            }
+        );
+        assert_eq!(format, EncodedImageFormat::Image(image::ImageFormat::Png));
+        assert!(matches!(
+            color_space,
+            crate::color::RasterColorSpace::EmbeddedRgb(_)
+        ));
+
+        let mut store = DocumentImageStore::default();
+        let (image_id, _) = store.insert(bytes.into(), false).unwrap();
+        let raster = store.with_rasterized(image_id, |raster| raster).unwrap();
+        assert_eq!(raster.alpha, None);
+        assert_eq!(
+            raster.rgb,
+            vec![
+                255, 0, 0, 0, 255, 0, 0, 0, 255, 128, 64, 64, 64, 128, 64, 64, 64, 128, 255, 255,
+                255, 128, 128, 128, 0, 0, 0,
+            ]
+        );
+    }
+
+    #[test]
+    fn webp_applies_embedded_exif_orientation() {
+        let bytes = exif_oriented_lossless_webp();
+        let mut store = DocumentImageStore::default();
+        let (_, raw_metadata) = store
+            .insert(Rc::from(bytes.clone().into_boxed_slice()), false)
+            .expect("raw WebP image is recognized");
+        let (image_id, oriented_metadata) = store
+            .insert(Rc::from(bytes.into_boxed_slice()), true)
+            .expect("oriented WebP image is recognized");
+        assert_eq!(
+            raw_metadata,
+            ImageMetadata {
+                pixel_width: 2,
+                pixel_height: 1,
+            }
+        );
+        assert_eq!(
+            oriented_metadata,
+            ImageMetadata {
+                pixel_width: 1,
+                pixel_height: 2,
+            }
+        );
+        let raster = store
+            .with_rasterized(image_id, |raster| raster)
+            .expect("oriented WebP rasterizes");
+        assert_eq!(raster.metadata, oriented_metadata);
+        assert_eq!(raster.rgb, vec![230, 32, 16, 10, 20, 30]);
+        assert_eq!(raster.alpha, None);
+    }
+
+    #[test]
+    fn animated_webp_uses_its_first_composited_frame() {
+        let bytes = animated_webp();
+        let decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(&bytes)).unwrap();
+        assert!(decoder.has_animation());
+        let first_frame = decoder
+            .into_frames()
+            .next()
+            .expect("animated WebP has a first frame")
+            .expect("animated WebP first frame decodes");
+        assert_eq!(first_frame.buffer().dimensions(), (2, 1));
+        assert_eq!(
+            first_frame.buffer().as_raw(),
+            &[230, 32, 16, 255, 0, 0, 0, 255]
+        );
+        let mut store = DocumentImageStore::default();
+        let (image_id, metadata) = store
+            .insert(Rc::from(bytes.into_boxed_slice()), true)
+            .expect("animated WebP image is recognized");
+        assert_eq!(
+            metadata,
+            ImageMetadata {
+                pixel_width: 2,
+                pixel_height: 1,
+            }
+        );
+        assert!(store.direct_jpeg(image_id).is_none());
+
+        let raster = store
+            .with_rasterized(image_id, |raster| raster)
+            .expect("animated WebP first frame rasterizes");
+        assert_eq!(raster.rgb, vec![230, 32, 16, 0, 0, 0]);
+        assert_eq!(raster.alpha, None);
+        assert!(
+            !raster
+                .rgb
+                .chunks_exact(3)
+                .any(|pixel| pixel == [0, 96, 255]),
+            "later WebP frames must not contribute samples: {raster:?}"
+        );
+    }
+
+    #[test]
+    fn animated_gif_uses_its_first_frame_on_the_logical_screen() {
+        let mut store = DocumentImageStore::default();
+        let (image_id, metadata) = store
+            .insert(Rc::from(two_frame_gif().into_boxed_slice()), true)
+            .expect("GIF image is recognized");
+
+        assert_eq!(
+            metadata,
+            ImageMetadata {
+                pixel_width: 2,
+                pixel_height: 2,
+            }
+        );
+        assert!(store.direct_jpeg(image_id).is_none());
+
+        let raster = store
+            .with_rasterized(image_id, |raster| raster)
+            .expect("GIF first frame rasterizes");
+        assert_eq!(raster.metadata, metadata);
+        assert_eq!(raster.alpha, Some(vec![255, 0, 255, 0]));
+        assert_eq!(&raster.rgb[0..3], &[230, 32, 16]);
+        assert_eq!(&raster.rgb[6..9], &[10, 20, 30]);
+        assert!(
+            !raster
+                .rgb
+                .chunks_exact(3)
+                .any(|pixel| pixel == [0, 96, 255]),
+            "later GIF frames must not contribute samples: {raster:?}"
+        );
+    }
+
+    #[test]
     fn malformed_and_non_rgb_embedded_profiles_fall_back_to_srgb() {
-        let non_rgb = lcms2::Profile::new_xyz().icc().unwrap();
+        let non_rgb = moxcms::ColorProfile::new_lab().encode().unwrap();
         for profile in [vec![1, 2, 3], non_rgb] {
-            let (_, _, color_space) = image_metadata(&tagged_png(profile), false).unwrap();
+            let (_, _, color_space, _, _) = image_metadata(&tagged_png(profile), false).unwrap();
             assert_eq!(color_space, crate::color::RasterColorSpace::SRGB);
         }
     }

@@ -304,16 +304,19 @@ impl Display {
     }
 
     pub fn blockified(self) -> Self {
-        if self.is_none() || self.is_contents() || self.is_block_level() {
+        if self.is_none() || self.is_contents() {
+            self
+        } else if self.is_layout_internal() {
+            // CSS Display 4 blockification converts layout-internal boxes into
+            // block flow containers even when their computed outer display is
+            // already `block`.
+            // https://www.w3.org/TR/css-display-4/#transformations
+            Self::BLOCK.with_list_item(self.list_item)
+        } else if self.is_block_level() {
             self
         } else if self.inner == DisplayInner::FlowRoot {
             // CSS Display 4 preserves legacy behavior: `inline flow-root` and
             // `run-in flow-root` blockify to `block flow`, not `block flow-root`.
-            // https://www.w3.org/TR/css-display-4/#transformations
-            Self::BLOCK.with_list_item(self.list_item)
-        } else if self.is_layout_internal() {
-            // CSS Display 4 blockification converts layout-internal boxes into
-            // block flow containers.
             // https://www.w3.org/TR/css-display-4/#transformations
             Self::BLOCK.with_list_item(self.list_item)
         } else {
@@ -349,5 +352,27 @@ impl Display {
                 | DisplayInner::TableRow
                 | DisplayInner::TableCell
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blockification_converts_block_outer_table_internal_boxes_to_flow() {
+        let table_row = Display {
+            outer: DisplayOuter::Block,
+            inner: DisplayInner::TableRow,
+            list_item: false,
+        };
+        let table_cell = Display {
+            outer: DisplayOuter::Block,
+            inner: DisplayInner::TableCell,
+            list_item: true,
+        };
+
+        assert_eq!(table_row.blockified(), Display::BLOCK);
+        assert_eq!(table_cell.blockified(), Display::BLOCK.with_list_item(true));
     }
 }

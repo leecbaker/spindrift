@@ -13,6 +13,7 @@ impl<'a> LayoutBuilder<'a> {
         can_collapse_start_margin: bool,
         can_collapse_end_margin: bool,
         applied_start_margin: LayoutLength,
+        clearance_consumed_adjoining_start_margin: bool,
         starts_at_page_top: bool,
         traversal_state: &mut BlockFlowChildTraversalState,
     ) -> ChildFlowTraversalOutcome {
@@ -54,16 +55,18 @@ impl<'a> LayoutBuilder<'a> {
         let mut float_run = self.float_run_state();
         let mut avoid_run_candidate: Option<AvoidBreakRunCandidate> = None;
         let mut previous_break_after = PageBreak::Auto;
+        let mut previous_child_page_end: Option<Option<String>> = None;
         let mut adjoining_float_replay: Option<AdjoiningFloatReplayCandidate> = None;
         let mut replaying_adjoining_until: Option<usize> = None;
         let mut child_node_index = 0usize;
         while child_node_index < element.children.len() {
-            let replayed_adjoining_origin_y = if replaying_adjoining_until == Some(child_node_index)
+            let replaying_adjoining_target = if replaying_adjoining_until == Some(child_node_index)
             {
                 replaying_adjoining_until = None;
-                self.adjoining_float_origin_y.take()
+                self.adjoining_float_origin_y.take();
+                true
             } else {
-                None
+                false
             };
             let child = &element.children[child_node_index];
             let NodeKind::Element(child_element) = &child.kind else {
@@ -109,6 +112,20 @@ impl<'a> LayoutBuilder<'a> {
             ));
             child_style.apply_effective_zoom();
             traversal_state.apply_to(&mut child_style);
+            if block_avoid_break_flow_child(element, child_element, &child_style)
+                && let Some(line_clamp) = &mut child_style.line_clamp
+            {
+                line_clamp.continues_after_clamp_point =
+                    has_later_normal_block_flow_child_with_font_metrics(
+                        element,
+                        element_index.saturating_sub(1),
+                        &sibling_tags,
+                        style,
+                        stylesheets,
+                        &self.ancestors,
+                        &mut self.font_system,
+                    );
+            }
             let child_text_box_line_trim = TextBoxLineTrim {
                 trims_block_start: text_box_trim_start_child == Some(child_node_index),
                 trims_block_end: text_box_trim_end_child == Some(child_node_index),
@@ -125,6 +142,33 @@ impl<'a> LayoutBuilder<'a> {
             };
             let child_is_flow_candidate =
                 block_avoid_break_flow_child(element, child_element, &child_style);
+            let child_page_values = style_is_in_normal_flow(&child_style).then(|| {
+                let inherited_page_name = self.active_page_value_scope(style);
+                self.dom_page_boundary_values(
+                    child_element,
+                    &child_style,
+                    stylesheets,
+                    inherited_page_name.as_deref(),
+                )
+            });
+            let child_page_start = child_page_values
+                .as_ref()
+                .map(|values| values.start.clone());
+            if let Some(start) = child_page_start.as_ref()
+                && previous_child_page_end
+                    .as_ref()
+                    .is_none_or(|previous| previous != start)
+                && (!self.current_page_has_content() || previous_child_page_end.is_some())
+            {
+                // The initial in-flow child has no preceding sibling to
+                // supply a class-A end value, but an explicit `page`
+                // value still selects its first fragmentainer. Without
+                // that selection a first `page: named` box is laid out
+                // against the default page size until a later sibling
+                // happens to create a named-page boundary.
+                // <https://www.w3.org/TR/css-page-3/#using-named-pages>
+                self.switch_page_name_at_class_a_boundary(start.as_deref());
+            }
             let next_flow_child_break_before = self.next_dom_flow_child_break_before(
                 element,
                 child_node_index,
@@ -161,10 +205,6 @@ impl<'a> LayoutBuilder<'a> {
             let child_start_candidate = avoid_run_start_decision
                 .should_arm_start_candidate
                 .then(|| pending_child_start_candidate.arm(self));
-            apply_pending_normal_flow_margin_before_float(
-                &mut child_style,
-                previous_flow_bottom_margin,
-            );
             if self.layout_floating_child(
                 child_element,
                 child_signature.clone(),
@@ -192,7 +232,7 @@ impl<'a> LayoutBuilder<'a> {
             let descendant_start_margin = (is_flow_child
                 && can_collapse_block_start_margin(
                     &child_style,
-                    used_border_widths(&child_style),
+                    UsedEdges::from_css_edges(used_border_widths(&child_style)),
                     has_direct_inline_content_dom_with_font_metrics(
                         child_element,
                         &child_style,
@@ -213,10 +253,19 @@ impl<'a> LayoutBuilder<'a> {
                 )
             })
             .flatten();
+            let mut margin_collapse_style = None;
+            if self.definite_block_size_stack.last().is_some_and(|basis| {
+                percentage_height_is_auto_for_margin_collapse(&child_style, *basis)
+            }) {
+                let mut used_style = (*child_style).clone();
+                used_style.box_values.height = css::ComputedLengthPercentageOrAuto::Auto;
+                margin_collapse_style = Some(used_style);
+            }
+            let margin_collapse_style = margin_collapse_style.as_ref().unwrap_or(&child_style);
             let self_collapsing_child = is_flow_child
                 && is_self_collapsing_block_dom_with_font_metrics(
                     child_element,
-                    &child_style,
+                    margin_collapse_style,
                     stylesheets,
                     &child_ancestors,
                     &mut self.font_system,
@@ -255,21 +304,22 @@ impl<'a> LayoutBuilder<'a> {
             }
 
             let mut collapses_with_parent_end = false;
+            let mut adjoining_start_margin_paint_offset = None;
             if is_flow_child {
                 let collapses_with_parent = is_collapsible_block_child(child_element, &child_style);
                 let collapses_with_sibling =
                     is_sibling_margin_collapsible_block_child(child_element, &child_style);
-                if !trimmed_block_start_margin
+                let adjoins_parent_start = !trimmed_block_start_margin
                     && !seen_flow_child
                     && can_collapse_start_margin
-                    && collapses_with_parent
-                {
+                    && collapses_with_parent;
+                if adjoins_parent_start {
                     if let Some(previous_margin) = previous_flow_bottom_margin {
-                        // See the formatting-box traversal above:
-                        // consecutive self-collapsing DOM children
-                        // share one parent-start margin set.
+                        // Keep the parent's applied start margin in the
+                        // collapsed set when a self-collapsing sibling has
+                        // zero margin. This mirrors the formatting-box path.
                         child_style.margin.top = collapsed_margin_delta(
-                            layout_pt(previous_margin),
+                            collapse_margins(applied_start_margin, layout_pt(previous_margin)),
                             layout_pt(effective_start_margin),
                         )
                         .points()
@@ -282,6 +332,9 @@ impl<'a> LayoutBuilder<'a> {
                         )
                         .points()
                             - descendant_margin_adjustment;
+                    }
+                    if clearance_consumed_adjoining_start_margin {
+                        child_style.margin.top = 0.0;
                     }
                 } else if !trimmed_block_start_margin
                     && collapses_with_sibling
@@ -297,6 +350,15 @@ impl<'a> LayoutBuilder<'a> {
                     .points()
                         - descendant_margin_adjustment;
                 }
+                // A first child's adjoining positive margin lies outside the
+                // parent's border box, unless actual clearance separates the
+                // margins while laying out that child. Keep the candidate at
+                // this collapse boundary and commit it after child layout.
+                // <https://www.w3.org/TR/CSS22/box.html#collapsing-margins>
+                if adjoins_parent_start {
+                    adjoining_start_margin_paint_offset =
+                        Some(layout_pt(child_style.margin.top.max(0.0)));
+                }
 
                 collapses_with_parent_end = collapses_with_parent
                     && can_collapse_end_margin
@@ -309,14 +371,6 @@ impl<'a> LayoutBuilder<'a> {
                         &self.ancestors,
                         &mut self.font_system,
                     );
-            }
-            if let Some(origin_y) = replayed_adjoining_origin_y {
-                let start_offset = (self.cursor_y - origin_y).max(0.0);
-                if start_offset > child_style.margin.top {
-                    child_style.margin.top = start_offset;
-                }
-                collapsed_start_margin_offset =
-                    collapsed_start_margin_offset.max(layout_pt(start_offset));
             }
             preserve_adjusted_block_margins(&mut child_style);
 
@@ -359,11 +413,7 @@ impl<'a> LayoutBuilder<'a> {
                         child_style.margin.top
                             + child_style.line_height * child_style.orphans.max(1) as f32,
                     ),
-                    Fragmentainer::from_cursor_bounds(
-                        self.page_area_height(),
-                        self.cursor_y,
-                        self.page_bottom(),
-                    ),
+                    self.fragmentainer_from_page_cursor(PageTopBlockPosition::new(self.cursor_y)),
                     self.cursor_is_at_page_top(),
                 )
             {
@@ -399,10 +449,10 @@ impl<'a> LayoutBuilder<'a> {
             let closes_adjoining_float_replay = is_flow_child
                 && !self_collapsing_child
                 && previous_flow_bottom_margin.is_some()
-                && replayed_adjoining_origin_y.is_none();
+                && !replaying_adjoining_target;
             if closes_adjoining_float_replay && let Some(replay) = adjoining_float_replay.take() {
                 let replay_origin_y = self.cursor_y - child_style.margin.top;
-                let replay_separates = self.adjoining_float_replay_separated_by_bfc_root(
+                let replay_separation = self.adjoining_float_replay_separated_by_following_child(
                     &replay,
                     child_element,
                     &child_style,
@@ -410,7 +460,15 @@ impl<'a> LayoutBuilder<'a> {
                     None,
                     replay_origin_y,
                 );
-                if !replay_separates
+                if let AdjoiningFloatReplaySeparation::Clearance { border_top }
+                | AdjoiningFloatReplaySeparation::MarginSeparation { border_top } =
+                    replay_separation
+                {
+                    child_style.margin.top =
+                        layout_pt((self.cursor_y - border_top.points()).max(0.0)).points();
+                    preserve_adjusted_block_margins(&mut child_style);
+                }
+                if replay_separation == AdjoiningFloatReplaySeparation::None
                     && (replay_origin_y - replay.snapshot_cursor_y()).abs() > FLOAT_EPSILON
                 {
                     let replay_until = child_node_index;
@@ -476,6 +534,7 @@ impl<'a> LayoutBuilder<'a> {
                 element_layout_kind(child_element, &child_style),
                 ElementLayoutKind::BlockFlow
             );
+            let clearance_count_before_child = self.applied_clearance_count;
             self.last_block_layout_outcome = BlockLayoutOutcome::default();
             if child_style.display.is_block_level()
                 || is_document_canvas_element(element)
@@ -498,6 +557,11 @@ impl<'a> LayoutBuilder<'a> {
                     self.block_static_position_y_offset = previous;
                 }
                 self.flush_float_run(&mut float_run);
+            }
+            if self.applied_clearance_count == clearance_count_before_child
+                && let Some(offset) = adjoining_start_margin_paint_offset
+            {
+                collapsed_start_margin_offset = collapsed_start_margin_offset.max(offset);
             }
             let emitted_float = self
                 .float_contexts
@@ -541,6 +605,9 @@ impl<'a> LayoutBuilder<'a> {
                     is_sibling_margin_collapsible_block_child(child_element, &child_style)
                         .then_some(child_consumed_bottom_margin)
                 };
+                if let Some(values) = child_page_values {
+                    previous_child_page_end = Some(values.end);
+                }
                 if child_uses_block_layout {
                     traversal_state.record_descendant_clamp_line_slots(
                         self.last_block_layout_outcome.clamp_line_slots,
@@ -571,5 +638,150 @@ impl<'a> LayoutBuilder<'a> {
             pending_end_margin_collapse,
             collapsed_start_margin_offset,
         }
+    }
+
+    /// Derives the CSS Paged Media start/end page values for a DOM fallback
+    /// subtree. This mirrors the frozen formatting-tree path so dynamically
+    /// laid-out block flow cannot bypass class-A named-page transitions.
+    fn dom_page_boundary_values(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+        inherited_page_name: Option<&str>,
+    ) -> ResolvedPageBoundaryValues {
+        let own_page_name = if style.page_name_specified {
+            style
+                .page_name
+                .clone()
+                .or_else(|| inherited_page_name.map(str::to_string))
+        } else {
+            inherited_page_name.map(str::to_string)
+        };
+        let mut values = ResolvedPageBoundaryValues {
+            start: own_page_name.clone(),
+            end: own_page_name.clone(),
+        };
+        if style.display.is_flex() {
+            return values;
+        }
+        let siblings = element_sibling_signature_list(element);
+        let mut element_index = 0;
+        let mut first = None;
+        let mut last = None;
+        for child in &element.children {
+            let NodeKind::Element(child) = &child.kind else {
+                continue;
+            };
+            let signature = ElementSignature::with_sibling_list(
+                child.tag.clone(),
+                child.attrs.clone(),
+                element_index,
+                siblings.clone(),
+            );
+            element_index += 1;
+            let child_style = self.style_for_layout_element_with_parent_font_metrics(
+                child,
+                signature,
+                stylesheets,
+                Some(style),
+            );
+            if !style_is_in_normal_flow(&child_style) {
+                continue;
+            }
+            let applies = child_style.display.is_block_level() || is_replaced_element(child);
+            let (child_values, child_sources) = if applies {
+                (
+                    self.dom_page_boundary_values(
+                        child,
+                        &child_style,
+                        stylesheets,
+                        own_page_name.as_deref(),
+                    ),
+                    self.dom_page_boundary_value_sources(child, &child_style, stylesheets),
+                )
+            } else {
+                (
+                    ResolvedPageBoundaryValues {
+                        start: None,
+                        end: None,
+                    },
+                    PageBoundaryValues::inapplicable(),
+                )
+            };
+            first.get_or_insert_with(|| (child_values.clone(), child_sources.clone()));
+            last = Some((child_values, child_sources));
+        }
+        if let Some((first, sources)) = first
+            && sources.start.overrides_parent_summary()
+        {
+            values.start = first.start;
+        }
+        if let Some((last, sources)) = last
+            && sources.end.overrides_parent_summary()
+        {
+            values.end = last.end;
+        }
+        values
+    }
+
+    /// Structural companion to [`Self::dom_page_boundary_values`]. The DOM
+    /// fallback needs this only to determine which recursively resolved child
+    /// boundary replaces its parent; it never uses the source value itself as
+    /// an output page selection.
+    fn dom_page_boundary_value_sources(
+        &mut self,
+        element: &Element,
+        style: &ComputedStyle,
+        stylesheets: &[Stylesheet],
+    ) -> PageBoundaryValues {
+        let mut values = PageBoundaryValues::from_style(style);
+        if style.display.is_flex() {
+            return values;
+        }
+        let siblings = element_sibling_signature_list(element);
+        let mut element_index = 0;
+        let mut first = None;
+        let mut last = None;
+        for child in &element.children {
+            let NodeKind::Element(child) = &child.kind else {
+                continue;
+            };
+            let signature = ElementSignature::with_sibling_list(
+                child.tag.clone(),
+                child.attrs.clone(),
+                element_index,
+                siblings.clone(),
+            );
+            element_index += 1;
+            let child_style = self.style_for_layout_element_with_parent_font_metrics(
+                child,
+                signature,
+                stylesheets,
+                Some(style),
+            );
+            if !style_is_in_normal_flow(&child_style) {
+                continue;
+            }
+            let applies = child_style.display.is_block_level() || is_replaced_element(child);
+            let child_values = if applies {
+                self.dom_page_boundary_value_sources(child, &child_style, stylesheets)
+            } else {
+                PageBoundaryValues::inapplicable()
+            };
+            first.get_or_insert_with(|| child_values.clone());
+            last = Some(child_values);
+        }
+        if let Some(first) = first
+            && first.start.overrides_parent_summary()
+        {
+            values.start = first.start;
+        }
+        if let Some(last) = last
+            && last.end.overrides_parent_summary()
+        {
+            values.end = last.end;
+        }
+        values
     }
 }

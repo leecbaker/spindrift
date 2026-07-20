@@ -26,6 +26,10 @@ pub(crate) struct LineClamp {
     pub(crate) max_lines: usize,
     pub(crate) ellipsis: BlockEllipsis,
     pub(crate) legacy_webkit: bool,
+    /// A layout-time propagation flag for a descendant that consumes the
+    /// remaining lines of an ancestor clamp before later in-flow siblings.
+    /// It is never authored CSS state.
+    pub(crate) continues_after_clamp_point: bool,
 }
 
 /// Reference box and non-negative expansion for an `overflow:clip` edge.
@@ -60,6 +64,7 @@ impl LineClamp {
             max_lines,
             ellipsis: BlockEllipsis::Auto,
             legacy_webkit,
+            continues_after_clamp_point: false,
         }
     }
 }
@@ -236,6 +241,12 @@ pub(crate) struct ComputedStyle {
     pub column_rule: GapRuleAxis,
     pub rule_overlap: GapRuleOverlap,
     pub box_values: ComputedBoxValues,
+    /// Whether the winning physical `height` retains a selected-font metric.
+    ///
+    /// The used-value phase replaces a `ch` component with a numeric length,
+    /// but table row sizing still needs to know that the height must be
+    /// resolved in the table-track context.
+    pub(crate) physical_height_has_font_metric: bool,
     pub aspect_ratio: AspectRatio,
     pub contain_intrinsic_size: ContainIntrinsicSize,
     pub margin_trim: MarginTrim,
@@ -245,15 +256,25 @@ pub(crate) struct ComputedStyle {
     pub border_width: f32,
     pub border_widths: Edges,
     pub border_width_values: CssEdges<ComputedLengthPercentage>,
-    pub border_color: Color,
+    pub border_color: CssColor,
     pub border_colors: BorderColors,
     pub border_styles: BorderStyles,
     pub border_radius: BorderRadius,
     pub corner_shapes: CornerShapes,
+    pub border_shape: BorderShape,
+    pub shape_outside: ShapeOutside,
+    /// CSS Shapes Level 1 offset applied to the resolved `shape-outside`
+    /// contour. Percentages resolve against the float containing block's
+    /// inline size at used-value time.
+    /// <https://drafts.csswg.org/css-shapes-1/#shape-margin-property>
+    pub shape_margin: ComputedLengthPercentage,
+    /// CSS Shapes alpha cutoff for image-backed float contours.
+    /// <https://drafts.csswg.org/css-shapes-1/#shape-image-threshold-property>
+    pub shape_image_threshold: f32,
     pub border_image: BorderImage,
     pub outline_width: f32,
     pub outline_width_value: ComputedLengthPercentage,
-    pub outline_color: Color,
+    pub outline_color: CssColor,
     pub outline_style: BorderStyle,
     pub outline_offset: ComputedLengthPercentage,
     pub border_collapse: BorderCollapse,
@@ -262,16 +283,16 @@ pub(crate) struct ComputedStyle {
     pub empty_cells: EmptyCells,
     pub border_spacing: BorderSpacing,
     pub border_spacing_explicit: bool,
-    pub background_color: Option<Color>,
+    pub background_color: Option<CssColor>,
     /// Whether `background-color` is specified as `currentcolor` and must be
     /// resolved against this element's own computed `color` after inheritance.
-    /// CSS Color 4 resolves `currentcolor` at used-value time:
+    /// CSS CssColor 4 resolves `currentcolor` at used-value time:
     /// <https://www.w3.org/TR/css-color-4/#resolving-other-colors>.
     pub background_color_is_current_color: bool,
     /// The uncomputed relative-color expression when its origin is
     /// `currentcolor`, retained so inheritance resolves it on each element.
     pub background_color_current_color_expression: Option<String>,
-    pub background_image: Option<BackgroundImage>,
+    pub background_image: ComputedImage,
     pub background_size: BackgroundSize,
     pub background_position: BackgroundPosition,
     pub background_repeat: BackgroundRepeat,
@@ -295,9 +316,33 @@ pub(crate) struct ComputedStyle {
     pub object_position: BackgroundPosition,
     pub box_decoration_break: BoxDecorationBreak,
     pub box_shadow: Vec<BoxShadow>,
-    pub color: Color,
+    /// CSS CssColor Adjustment opt-out state inherited by this element.
+    pub forced_color_adjust: ForcedColorAdjust,
+    pub color: CssColor,
+    /// Cascaded SVG `fill` presentation paint. `None` represents CSS `none`.
+    ///
+    /// This stays in the computed style so host-document CSS can cross the
+    /// inline SVG scene boundary without reparsing selectors in the SVG
+    /// adapter: <https://www.w3.org/TR/SVG2/painting.html#SpecifyingPaint>.
+    pub svg_fill: Option<CssColor>,
+    /// Whether SVG `fill` was specified as `currentColor`.
+    pub svg_fill_is_current_color: bool,
+    /// Whether `svg_fill` originates from a host-document CSS declaration
+    /// (including inherited SVG paint), rather than its computed initial value.
+    pub svg_fill_overridden: bool,
+    /// Cascaded SVG `stroke` presentation paint. `None` represents CSS `none`.
+    pub svg_stroke: Option<CssColor>,
+    /// Whether SVG `stroke` was specified as `currentColor`.
+    pub svg_stroke_is_current_color: bool,
+    /// Whether `svg_stroke` originates from host-document CSS.
+    pub svg_stroke_overridden: bool,
+    /// Cascaded SVG `stroke-width`, retained as a typed CSS length until the
+    /// inline SVG serializer resolves it in the element's used font context.
+    pub svg_stroke_width: ComputedLengthPercentage,
+    /// Whether `svg_stroke_width` originates from host-document CSS.
+    pub svg_stroke_width_overridden: bool,
     /// WebKit-compatible glyph fill color; `None` represents `currentColor`.
-    pub text_fill_color: Option<Color>,
+    pub text_fill_color: Option<CssColor>,
     pub font_size: f32,
     /// Used font size of the document root, the computed-value basis for `rem`.
     /// <https://www.w3.org/TR/css-values-4/#rem>
@@ -324,6 +369,7 @@ pub(crate) struct ComputedStyle {
     pub text_align_last: TextAlignLast,
     pub text_justify: TextJustify,
     pub text_autospace: TextAutospace,
+    pub text_spacing_trim: TextSpacingTrim,
     pub word_space_transform: WordSpaceTransform,
     pub line_fit_edge: LineFitEdge,
     pub text_box_trim: TextBoxTrim,
@@ -340,6 +386,7 @@ pub(crate) struct ComputedStyle {
     pub font_family: FontFamily,
     pub font_synthesis: FontSynthesis,
     pub font_feature_settings: FontFeatureSettings,
+    pub font_variation_settings: FontVariationSettings,
     pub font_kerning: FontKerning,
     pub font_variant_ligatures: FontVariantLigatures,
     pub font_variant_position: FontVariantPosition,
@@ -354,6 +401,7 @@ pub(crate) struct ComputedStyle {
     pub white_space: WhiteSpace,
     pub text_wrap_mode: TextWrapMode,
     pub text_wrap_style: TextWrapStyle,
+    pub wrap_inside: WrapInside,
     /// Maximum number of visible inline line boxes before truncation.
     ///
     /// CSS Overflow defines line clamping; CSS Text 4 requires clamp selection
@@ -378,15 +426,25 @@ pub(crate) struct ComputedStyle {
     pub visibility: Visibility,
     pub list_style_type: ListStyleType,
     pub list_style_position: ListStylePosition,
-    pub list_style_image: Option<String>,
-    pub list_style_image_base_url: Option<url::Url>,
-    pub list_style_image_root_url: Option<url::Url>,
+    /// The selected CSS image for an automatic list marker.
+    ///
+    /// Keeping the full image value preserves `image-set()`'s selected
+    /// candidate resolution until marker intrinsic sizing.
+    /// <https://drafts.csswg.org/css-lists-3/#list-style-image-property>
+    /// <https://drafts.csswg.org/css-images-4/#image-set-notation>
+    pub list_style_image: ComputedImage,
     pub marker_side: MarkerSide,
     pub marker_content: MarkerContent,
     pub marker_style: Option<Box<ComputedStyle>>,
     pub content: Content,
     pub before_style: Option<Box<ComputedStyle>>,
     pub after_style: Option<Box<ComputedStyle>>,
+    /// Author-cascaded GCPM `::footnote-call` style. Its default generated
+    /// counter content is created only when the element is a footnote.
+    pub footnote_call_style: Option<Box<ComputedStyle>>,
+    /// Author-cascaded GCPM `::footnote-marker` style. Its default generated
+    /// counter content is created only when the element is a footnote.
+    pub footnote_marker_style: Option<Box<ComputedStyle>>,
     pub first_line_style: Option<Box<ComputedStyle>>,
     pub first_letter_style: Option<Box<ComputedStyle>>,
     pub quotes: Quotes,
@@ -418,11 +476,17 @@ pub(crate) struct ComputedStyle {
     pub text_decoration: TextDecoration,
     pub text_shadow: Vec<TextShadow>,
     pub text_emphasis_style: TextEmphasisStyle,
-    pub text_emphasis_color: Option<Color>,
+    pub text_emphasis_color: Option<CssColor>,
     pub text_emphasis_position: TextEmphasisPosition,
     pub text_emphasis_skip: TextEmphasisSkip,
     pub position: Position,
     pub float: Float,
+    /// GCPM presentation mode for this element after `float: footnote`
+    /// extracts it from normal flow.
+    pub footnote_display: FootnoteDisplay,
+    /// GCPM page-break policy for the call/body pair created by
+    /// `float: footnote`.
+    pub footnote_policy: FootnotePolicy,
     pub clear: Clear,
     pub running_element_name: Option<String>,
     pub abspos_static_source_was_inline_level: bool,
@@ -454,6 +518,34 @@ pub(crate) struct ComputedStyle {
 }
 
 impl ComputedStyle {
+    /// Resolves the specified border-width values to the used physical edge
+    /// widths consumed by layout.
+    ///
+    /// `none` and `hidden` force a zero used width even though the specified
+    /// width remains available for a later cascade declaration.
+    /// <https://www.w3.org/TR/css-backgrounds-3/#border-width>
+    fn resolve_used_border_widths(&mut self) {
+        let used_width = |value: &ComputedLengthPercentage, border_style: BorderStyle| {
+            if border_style.suppresses_used_width() {
+                0.0
+            } else {
+                used_css_border_width(value.clone().length_max_zero().points())
+            }
+        };
+        self.border_widths = Edges {
+            top: used_width(&self.border_width_values.top, self.border_styles.top),
+            right: used_width(&self.border_width_values.right, self.border_styles.right),
+            bottom: used_width(&self.border_width_values.bottom, self.border_styles.bottom),
+            left: used_width(&self.border_width_values.left, self.border_styles.left),
+        };
+        self.border_width = self
+            .border_widths
+            .top
+            .max(self.border_widths.right)
+            .max(self.border_widths.bottom)
+            .max(self.border_widths.left);
+    }
+
     /// Return the used `direction` after writing-mode text-orientation rules.
     ///
     /// In vertical typographic modes, `text-orientation: upright` makes the
@@ -615,6 +707,7 @@ impl ComputedStyle {
             column_rule: GapRuleAxis::initial(),
             rule_overlap: GapRuleOverlap::RowOverColumn,
             box_values: ComputedBoxValues::initial(),
+            physical_height_has_font_metric: false,
             aspect_ratio: AspectRatio::AUTO,
             contain_intrinsic_size: ContainIntrinsicSize::NONE,
             margin_trim: MarginTrim::NONE,
@@ -623,16 +716,26 @@ impl ComputedStyle {
             padding: Edges::ZERO,
             border_width: 0.0,
             border_widths: Edges::ZERO,
-            border_width_values: CssEdges::all(ComputedLengthPercentage::ZERO),
-            border_color: Color::BLACK,
+            // `medium` is the initial *specified* border width.  The
+            // corresponding resolved edge widths remain zero until a
+            // non-suppressing line style makes them usable by layout.
+            // <https://www.w3.org/TR/css-backgrounds-3/#border-width>
+            border_width_values: CssEdges::all(ComputedLengthPercentage::from_points(
+                3.0 * CSS_PX_TO_PT,
+            )),
+            border_color: CssColor::BLACK,
             border_colors: BorderColors::BLACK,
             border_styles: BorderStyles::NONE,
             border_radius: BorderRadius::ZERO,
             corner_shapes: CornerShapes::ROUND,
+            border_shape: BorderShape::None,
+            shape_outside: ShapeOutside::NONE,
+            shape_margin: ComputedLengthPercentage::ZERO,
+            shape_image_threshold: 0.0,
             border_image: BorderImage::initial(),
             outline_width: 3.0 * CSS_PX_TO_PT,
             outline_width_value: ComputedLengthPercentage::from_points(3.0 * CSS_PX_TO_PT),
-            outline_color: Color::BLACK,
+            outline_color: CssColor::BLACK,
             outline_style: BorderStyle::None,
             outline_offset: ComputedLengthPercentage::ZERO,
             border_collapse: BorderCollapse::Separate,
@@ -644,7 +747,7 @@ impl ComputedStyle {
             background_color: None,
             background_color_is_current_color: false,
             background_color_current_color_expression: None,
-            background_image: None,
+            background_image: ComputedImage::None,
             background_size: BackgroundSize::AUTO,
             background_position: BackgroundPosition::INITIAL,
             background_repeat: BackgroundRepeat::Repeat,
@@ -669,7 +772,16 @@ impl ComputedStyle {
             },
             box_decoration_break: BoxDecorationBreak::Slice,
             box_shadow: Vec::new(),
-            color: Color::BLACK,
+            forced_color_adjust: ForcedColorAdjust::Auto,
+            color: CssColor::BLACK,
+            svg_fill: Some(CssColor::BLACK),
+            svg_fill_is_current_color: false,
+            svg_fill_overridden: false,
+            svg_stroke: None,
+            svg_stroke_is_current_color: false,
+            svg_stroke_overridden: false,
+            svg_stroke_width: ComputedLengthPercentage::from_points(CSS_PX_TO_PT),
+            svg_stroke_width_overridden: false,
             text_fill_color: None,
             font_size,
             root_font_size: font_size,
@@ -691,6 +803,7 @@ impl ComputedStyle {
             text_align_last: TextAlignLast::Auto,
             text_justify: TextJustify::Auto,
             text_autospace: TextAutospace::NORMAL,
+            text_spacing_trim: TextSpacingTrim::Normal,
             word_space_transform: WordSpaceTransform::NONE,
             line_fit_edge: LineFitEdge::Leading,
             text_box_trim: TextBoxTrim::None,
@@ -707,6 +820,7 @@ impl ComputedStyle {
             font_family: FontFamily::SansSerif,
             font_synthesis: FontSynthesis::ALL,
             font_feature_settings: FontFeatureSettings::NORMAL,
+            font_variation_settings: FontVariationSettings::NORMAL,
             font_kerning: FontKerning::Auto,
             font_variant_ligatures: FontVariantLigatures::Normal,
             font_variant_position: FontVariantPosition::Normal,
@@ -721,6 +835,7 @@ impl ComputedStyle {
             white_space: WhiteSpace::Normal,
             text_wrap_mode: TextWrapMode::Legacy,
             text_wrap_style: TextWrapStyle::Auto,
+            wrap_inside: WrapInside::Auto,
             line_clamp: None,
             tab_size: TabSize::INITIAL,
             word_break: WordBreak::Normal,
@@ -741,15 +856,15 @@ impl ComputedStyle {
             visibility: Visibility::Visible,
             list_style_type: ListStyleType::Disc,
             list_style_position: ListStylePosition::Outside,
-            list_style_image: None,
-            list_style_image_base_url: None,
-            list_style_image_root_url: None,
+            list_style_image: ComputedImage::None,
             marker_side: MarkerSide::MatchSelf,
             marker_content: MarkerContent::Auto,
             marker_style: None,
             content: Content::Normal,
             before_style: None,
             after_style: None,
+            footnote_call_style: None,
+            footnote_marker_style: None,
             first_line_style: None,
             first_letter_style: None,
             quotes: Quotes::auto(),
@@ -791,6 +906,8 @@ impl ComputedStyle {
             text_emphasis_skip: TextEmphasisSkip::default(),
             position: Position::Static,
             float: Float::None,
+            footnote_display: FootnoteDisplay::Block,
+            footnote_policy: FootnotePolicy::Auto,
             clear: Clear::None,
             running_element_name: None,
             abspos_static_source_was_inline_level: false,
@@ -843,10 +960,19 @@ impl ComputedStyle {
         parent: FontRelativeLengthBasis,
         viewport: LayoutSize,
     ) {
+        self.resolve_deferred_font_size_with_viewport_and_root_metrics(parent, viewport, None);
+    }
+
+    pub(crate) fn resolve_deferred_font_size_with_viewport_and_root_metrics(
+        &mut self,
+        parent: FontRelativeLengthBasis,
+        viewport: LayoutSize,
+        root_metrics: Option<RootFontMetricLengthBasis>,
+    ) {
         let basis = ViewportLengthBasis::for_writing_mode(viewport, self.writing_mode);
         self.font_size = clamp_used_layout_length(
             self.deferred_font_size
-                .resolve_with_viewport(parent, Some(basis)),
+                .resolve_with_viewport_and_root_metrics(parent, Some(basis), root_metrics),
         )
         .points();
         let (line_height, multiplier, is_normal) =
@@ -892,7 +1018,7 @@ impl ComputedStyle {
             || self.tab_size.requires_ch_advance()
             || self
                 .background_image
-                .as_ref()
+                .as_image()
                 .is_some_and(BackgroundImage::requires_ch_advance)
             || self.background_size.requires_ch_advance()
             || self.background_position.requires_ch_advance()
@@ -943,6 +1069,8 @@ impl ComputedStyle {
             self.marker_style.as_deref(),
             self.before_style.as_deref(),
             self.after_style.as_deref(),
+            self.footnote_call_style.as_deref(),
+            self.footnote_marker_style.as_deref(),
             self.first_line_style.as_deref(),
             self.first_letter_style.as_deref(),
         ]
@@ -966,7 +1094,7 @@ impl ComputedStyle {
             .resolve_em_relative_lengths(layout_pt(self.font_size));
         self.box_values
             .resolve_root_font_relative_lengths(self.root_font_size);
-        if let Some(image) = &mut self.background_image {
+        if let Some(image) = self.background_image.as_image_mut() {
             image.resolve_em_relative_lengths(layout_pt(self.font_size));
             image.resolve_root_font_relative_lengths(self.root_font_size);
         }
@@ -1044,18 +1172,7 @@ impl ComputedStyle {
         self.border_width_values
             .left
             .resolve_font_metric_lengths(ch_advance);
-        self.border_widths = Edges {
-            top: self.border_width_values.top.length_max_zero().points(),
-            right: self.border_width_values.right.length_max_zero().points(),
-            bottom: self.border_width_values.bottom.length_max_zero().points(),
-            left: self.border_width_values.left.length_max_zero().points(),
-        };
-        self.border_width = self
-            .border_widths
-            .top
-            .max(self.border_widths.right)
-            .max(self.border_widths.bottom)
-            .max(self.border_widths.left);
+        self.resolve_used_border_widths();
         self.outline_width_value
             .resolve_font_metric_lengths(ch_advance);
         self.outline_width = self.outline_width_value.length_max_zero().points();
@@ -1066,7 +1183,7 @@ impl ComputedStyle {
             .resolve_font_metric_lengths(ch_advance);
         self.vertical_align.resolve_font_metric_lengths(ch_advance);
         self.tab_size.resolve_font_metric_lengths(ch_advance);
-        if let Some(image) = &mut self.background_image {
+        if let Some(image) = self.background_image.as_image_mut() {
             image.resolve_font_metric_lengths(ch_advance);
         }
         self.background_size.resolve_font_metric_lengths(ch_advance);
@@ -1246,6 +1363,22 @@ impl ComputedStyle {
     }
 }
 
+/// Resolve a visible CSS border width to the layout used value.
+///
+/// A used border width remains the specified non-negative CSS length.
+///
+/// Device-pixel snapping belongs to rasterization, not CSS layout. Rounding
+/// here changes box geometry (for example, `border: 1pt` becomes 0.75pt) and
+/// quantizes the visible edge at the renderer's CSS-pixel boundary while
+/// retaining the specified value separately for subsequent cascade work.
+/// <https://www.w3.org/TR/css-backgrounds-3/#border-width>
+fn used_css_border_width(points: f32) -> f32 {
+    if !points.is_finite() || points <= 0.0 {
+        return 0.0;
+    }
+    points
+}
+
 fn scaled_edges(edges: Edges, factor: f32) -> Edges {
     Edges {
         top: edges.top * factor,
@@ -1283,18 +1416,7 @@ impl ResolveViewportLengths for ComputedStyle {
         self.border_width_values
             .left
             .resolve_viewport_lengths(basis);
-        self.border_widths = Edges {
-            top: self.border_width_values.top.length_max_zero().points(),
-            right: self.border_width_values.right.length_max_zero().points(),
-            bottom: self.border_width_values.bottom.length_max_zero().points(),
-            left: self.border_width_values.left.length_max_zero().points(),
-        };
-        self.border_width = self
-            .border_widths
-            .top
-            .max(self.border_widths.right)
-            .max(self.border_widths.bottom)
-            .max(self.border_widths.left);
+        self.resolve_used_border_widths();
         self.outline_width_value.resolve_viewport_lengths(basis);
         self.outline_width = self.outline_width_value.length_max_zero().points();
         self.outline_offset.resolve_viewport_lengths(basis);
@@ -1320,7 +1442,7 @@ impl ResolveViewportLengths for ComputedStyle {
         self.text_indent.amount.resolve_viewport_lengths(basis);
         self.vertical_align.resolve_viewport_lengths(basis);
         self.tab_size.resolve_viewport_lengths(basis);
-        if let Some(image) = &mut self.background_image {
+        if let Some(image) = self.background_image.as_image_mut() {
             image.resolve_viewport_lengths(basis);
         }
         self.background_size.resolve_viewport_lengths(basis);
@@ -1664,5 +1786,26 @@ mod tests {
         assert_eq!(first.box_values.width.length_if_no_percent(), Some(30.0));
         assert_eq!(second.box_values.width.length_if_no_percent(), Some(70.0));
         assert_eq!(original.box_values.width.length_if_no_percent(), None);
+    }
+
+    #[test]
+    fn visible_border_widths_preserve_used_css_lengths() {
+        assert_eq!(used_css_border_width(0.0), 0.0);
+        assert_eq!(
+            used_css_border_width(0.3 * CSS_PX_TO_PT),
+            0.3 * CSS_PX_TO_PT
+        );
+        assert_eq!(
+            used_css_border_width(0.9 * CSS_PX_TO_PT),
+            0.9 * CSS_PX_TO_PT
+        );
+        assert_eq!(
+            used_css_border_width(1.9 * CSS_PX_TO_PT),
+            1.9 * CSS_PX_TO_PT
+        );
+        assert_eq!(
+            used_css_border_width(3.9 * CSS_PX_TO_PT),
+            3.9 * CSS_PX_TO_PT
+        );
     }
 }

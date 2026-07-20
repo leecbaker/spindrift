@@ -8,7 +8,7 @@ use super::*;
 /// <https://www.w3.org/TR/css-break-3/#possible-breaks>.
 pub(in crate::layout) struct DefiniteBlockBreakContext<'a> {
     pub(in crate::layout) definite_content_height: Option<f32>,
-    pub(in crate::layout) vertical_extras: f32,
+    pub(in crate::layout) vertical_non_content: NonContentLength,
     pub(in crate::layout) style: &'a ComputedStyle,
     pub(in crate::layout) current_fragmentainer: Fragmentainer,
     /// The empty destination fragmentainer selected for a prebreak.
@@ -135,9 +135,9 @@ pub(in crate::layout) fn should_move_avoid_break_run_to_next_fragmentainer(
     FragmentPrebreakDecision::choose(FragmentPrebreakInput {
         can_advance: !at_page_top,
         current_fragmentainer,
-        required_block_size: next_height,
+        required_block_size: layout_pt(next_height),
         empty_fragmentainer: current_fragmentainer,
-        empty_fit_block_size: run_height + next_height,
+        empty_fit_block_size: layout_pt(run_height + next_height),
     })
     .should_break
 }
@@ -158,7 +158,7 @@ pub(in crate::layout) fn should_prebreak_definite_block(
         return false;
     };
     let block_height = context.style.margin.top
-        + context.vertical_extras
+        + context.vertical_non_content.points()
         + content_height.max(0.0)
         + context.style.margin.bottom;
     // A box at the start of a short fragmentainer normally stays there even
@@ -171,10 +171,15 @@ pub(in crate::layout) fn should_prebreak_definite_block(
     let improves_empty_destination = context
         .empty_destination_fragmentainer
         .fragmentainer_block_size()
-        > context.current_fragmentainer.fragmentainer_block_size() + 0.01
+        .points()
+        > context
+            .current_fragmentainer
+            .fragmentainer_block_size()
+            .points()
+            + 0.01
         && context
             .empty_destination_fragmentainer
-            .block_size_fits_empty(block_height);
+            .block_size_fits_empty(layout_pt(block_height));
     if (!context.fragmentainer_has_occupied_flow || context.at_page_top)
         && !improves_empty_destination
     {
@@ -183,16 +188,16 @@ pub(in crate::layout) fn should_prebreak_definite_block(
     if context.suppress_for_avoid_retry
         && context
             .current_fragmentainer
-            .block_size_fits_empty(block_height)
+            .block_size_fits_empty(layout_pt(block_height))
     {
         return false;
     }
     FragmentPrebreakDecision::choose(FragmentPrebreakInput {
         can_advance: true,
         current_fragmentainer: context.current_fragmentainer,
-        required_block_size: block_height,
+        required_block_size: layout_pt(block_height),
         empty_fragmentainer: context.empty_destination_fragmentainer,
-        empty_fit_block_size: block_height,
+        empty_fit_block_size: layout_pt(block_height),
     })
     .should_break
 }

@@ -554,6 +554,9 @@ pub(in crate::layout) struct InlineWhitespaceProcessor {
     pub(in crate::layout) merge_next_run_after_removed_segment_break: bool,
     pub(in crate::layout) last_text_character: Option<char>,
     pub(in crate::layout) pending_segment_break: Option<InlineTextRunMeta>,
+    /// Where the current collapsible segment-break sequence owns its eventual
+    /// space, if it materializes one.
+    pending_segment_break_placement: PendingSegmentBreakPlacement,
     pub(in crate::layout) pending_forced_segment_break: Option<PendingForcedSegmentBreak>,
     /// An explicit U+200B whose `word-space-transform` replacement depends on
     /// the following CSS Text boundary.
@@ -570,6 +573,26 @@ pub(in crate::layout) struct InlineTextRunMeta {
     pub(in crate::layout) source: InlineTextSource,
     pub(in crate::layout) hanging_edges: InlineHangingEdges,
     pub(in crate::layout) ancestor_inline_decorations: Rc<[InlineAncestorDecoration]>,
+}
+
+/// A source-stream insertion point, deliberately distinct from a character
+/// offset or a line-item index.
+#[derive(Clone, Copy)]
+struct InlineStreamItemIndex(usize);
+
+/// Ownership of a collapsed segment-break sequence crossing inline edges.
+///
+/// CSS Text collapses source whitespace across an inline boundary, but the
+/// resulting advance is outside the following inline when the sequence began
+/// before its start edge. Keeping this as state rather than inferring it from
+/// adjacent zero-width atoms prevents containing-block geometry from silently
+/// adopting the wrong side of the collapsed space.
+/// <https://drafts.csswg.org/css-text-3/#white-space-phase-1>
+#[derive(Clone, Copy, Default)]
+enum PendingSegmentBreakPlacement {
+    #[default]
+    WithinCurrentInline,
+    BeforeInlineStart(InlineStreamItemIndex),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -687,6 +710,26 @@ impl InlineWhitespaceProcessor {
                     self.emit_forced_break();
                 }
                 self.flush_run();
+                if self.pending_segment_break.is_some()
+                    && matches!(
+                        &item,
+                        InlineItem::Atom(atom)
+                            if matches!(
+                                atom.content(),
+                                InlineAtomContent::InlineEdge(InlineEdgeRole::BoxEdge(edge))
+                                    if edge.logical_edge == InlineLogicalEdge::Start
+                            )
+                    )
+                    && matches!(
+                        self.pending_segment_break_placement,
+                        PendingSegmentBreakPlacement::WithinCurrentInline
+                    )
+                {
+                    self.pending_segment_break_placement =
+                        PendingSegmentBreakPlacement::BeforeInlineStart(InlineStreamItemIndex(
+                            self.output.len(),
+                        ));
+                }
                 self.output.push(item);
             }
             InlineBoundaryRole::Float => {
@@ -856,6 +899,9 @@ impl InlineWhitespaceProcessor {
             });
         } else if meta.style.white_space.collapses_spaces() {
             self.flush_run();
+            if self.pending_segment_break.is_none() {
+                self.pending_segment_break_placement = PendingSegmentBreakPlacement::default();
+            }
             self.pending_segment_break = Some(meta.clone());
         } else {
             self.push_text_character('\n', meta);
@@ -975,6 +1021,7 @@ impl InlineWhitespaceProcessor {
         let Some(meta) = self.pending_segment_break.take() else {
             return;
         };
+        let placement = std::mem::take(&mut self.pending_segment_break_placement);
         let previous = self
             .last_text_character
             .filter(|character| !is_css_collapsible_whitespace(*character))
@@ -992,7 +1039,17 @@ impl InlineWhitespaceProcessor {
             self.last_text_character = previous;
             return;
         }
+        let output_len = self.output.len();
         self.push_collapsible_space(&meta);
+        if let PendingSegmentBreakPlacement::BeforeInlineStart(InlineStreamItemIndex(
+            start_edge_index,
+        )) = placement
+            && self.output.len() > output_len
+            && matches!(self.output.last(), Some(InlineItem::Word(word)) if word.text == " ")
+        {
+            let space = self.output.pop().expect("checked trailing space");
+            self.output.insert(start_edge_index, space);
+        }
     }
 
     /// Remove the Phase I collapsible-space prefix of a segment-break
@@ -1197,6 +1254,7 @@ impl InlineWhitespaceProcessor {
 
     pub(in crate::layout) fn discard_pending_segment_breaks(&mut self) {
         self.pending_segment_break = None;
+        self.pending_segment_break_placement = PendingSegmentBreakPlacement::default();
         self.pending_forced_segment_break = None;
     }
 

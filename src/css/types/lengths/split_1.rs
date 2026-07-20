@@ -148,6 +148,22 @@ impl DeferredFontSize {
         parent: FontRelativeLengthBasis,
         viewport: Option<ViewportLengthBasis>,
     ) -> LayoutLength {
+        self.resolve_with_viewport_and_root_metrics(parent, viewport, None)
+    }
+
+    /// Resolve a deferred `font-size`, using the document root's selected
+    /// metrics when root-relative metric units occur on a descendant.
+    ///
+    /// Root-relative font units are not fixed ratios of the root font size:
+    /// their basis is the used root font. The root snapshot is only available
+    /// once structural font-metric resolution has selected that face.
+    /// <https://www.w3.org/TR/css-values-4/#font-relative-lengths>
+    pub(crate) fn resolve_with_viewport_and_root_metrics(
+        &self,
+        parent: FontRelativeLengthBasis,
+        viewport: Option<ViewportLengthBasis>,
+        root_metrics: Option<RootFontMetricLengthBasis>,
+    ) -> LayoutLength {
         let parent_font_size = parent.font_size().points();
         let parent_ch_advance = parent.ch_advance();
         layout_pt(match self {
@@ -167,7 +183,15 @@ impl DeferredFontSize {
                     parent_ch_advance,
                 ));
                 value.resolve_font_metric_lengths(parent_ch_advance);
-                value.resolve_root_font_relative_lengths(ROOT_FONT_SIZE_PT);
+                if let Some(root_metrics) = root_metrics {
+                    value.resolve_root_font_relative_lengths(root_metrics.font_size.points());
+                    value.resolve_root_font_metric_lengths(root_metrics);
+                } else {
+                    // Resolving the root style itself cannot use a root
+                    // snapshot yet. Preserve the CSS initial-metric fallback
+                    // for that bootstrap case.
+                    value.resolve_root_font_relative_lengths(ROOT_FONT_SIZE_PT);
+                }
                 // `font-size` resolves its font-relative units against the
                 // parent font. `ex` has a 0.5em fallback while the selected
                 // font's x-height is unavailable to the computed-value

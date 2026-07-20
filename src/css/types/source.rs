@@ -1,6 +1,7 @@
 use super::*;
 use cssparser::{Parser, ParserInput, Token};
 use std::future::Future;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::pin::Pin;
 use url::Url;
@@ -54,6 +55,7 @@ impl Css {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn from_file<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
         let path = path.as_ref();
         log::debug!("reading CSS file {}", path.display());
@@ -75,13 +77,13 @@ impl Css {
     /// ```no_run
     /// # async fn load() -> Result<(), Box<dyn std::error::Error>> {
     /// let url = "https://example.test/styles.css".parse()?;
-    /// let stylesheet = quire::Css::from_url_async(url).await?;
+    /// let stylesheet = quire::Css::from_url(url).await?;
     /// # let _ = stylesheet;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn from_url_async(url: Url) -> crate::Result<Self> {
-        Self::from_url_async_with_resource_policy(url, crate::ResourcePolicy::default()).await
+    pub async fn from_url(url: Url) -> crate::Result<Self> {
+        Self::from_url_with_resource_policy(url, crate::ResourcePolicy::default()).await
     }
 
     /// Loads an author stylesheet from a URL with an explicit resource policy.
@@ -93,20 +95,20 @@ impl Css {
     ///     follow_http_redirects: false,
     ///     ..Default::default()
     /// };
-    /// let stylesheet = quire::Css::from_url_async_with_resource_policy(url, policy).await?;
+    /// let stylesheet = quire::Css::from_url_with_resource_policy(url, policy).await?;
     /// # let _ = stylesheet;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn from_url_async_with_resource_policy(
+    pub async fn from_url_with_resource_policy(
         url: Url,
         resource_policy: crate::ResourcePolicy,
     ) -> crate::Result<Self> {
         let fetcher = crate::resource::ResourceFetcher::new(resource_policy)?;
-        Self::from_url_async_with_fetcher(url, &fetcher).await
+        Self::from_url_with_fetcher(url, &fetcher).await
     }
 
-    pub(crate) async fn from_url_async_with_fetcher(
+    pub(crate) async fn from_url_with_fetcher(
         url: Url,
         fetcher: &crate::resource::ResourceFetcher,
     ) -> crate::Result<Self> {
@@ -213,6 +215,7 @@ impl Css {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_base_path<P: AsRef<Path>>(mut self, base_path: P) -> crate::Result<Self> {
         self.base_url = Some(crate::resource::directory_url_from_path(
             base_path.as_ref(),
@@ -264,12 +267,12 @@ impl Css {
         let mut stylesheets = Vec::new();
         let mut seen = HashSet::new();
         let fetcher = crate::resource::ResourceFetcher::new(self.resource_policy)?;
-        self.collect_with_imports_async(&fetcher, &mut seen, &mut stylesheets)
+        self.collect_with_imports(&fetcher, &mut seen, &mut stylesheets)
             .await?;
         Ok(stylesheets)
     }
 
-    fn collect_with_imports_async<'a>(
+    fn collect_with_imports<'a>(
         &'a self,
         fetcher: &'a crate::resource::ResourceFetcher,
         seen: &'a mut HashSet<Url>,
@@ -284,13 +287,13 @@ impl Css {
                 self.layer_order_prefix(),
             ) {
                 if seen.insert(import.url.clone()) {
-                    match Css::from_url_async_with_fetcher(import.url.clone(), fetcher).await {
+                    match Css::from_url_with_fetcher(import.url.clone(), fetcher).await {
                         Ok(stylesheet) => {
                             stylesheet
                                 .with_origin(self.origin)
                                 .with_root_url(self.root_url.clone())
                                 .with_layer_context(import.layer_order_prefix, import.layer_name)
-                                .collect_with_imports_async(fetcher, seen, stylesheets)
+                                .collect_with_imports(fetcher, seen, stylesheets)
                                 .await?;
                         }
                         Err(error) if fetcher.allows_fetch_errors() => {

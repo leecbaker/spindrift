@@ -103,16 +103,20 @@ impl<'a> ElementCascadeContext<'a> {
         self.matching_rules.clear();
         for (stylesheet_index, stylesheet) in stylesheets.iter().enumerate() {
             for rule in rule_set(stylesheet) {
-                if let Some(scope_proximity) = selector_matches_with_scope_proximity_in_chain(
-                    &rule.selector,
-                    &rule.scopes,
-                    &self.chain,
-                    self.current_index(),
-                    &mut self.selector_caches,
-                ) {
+                if let Some((scope_proximity, matching_specificity)) =
+                    selector_matches_with_scope_proximity_in_chain(
+                        &rule.selector,
+                        &rule.scopes,
+                        &self.chain,
+                        self.current_index(),
+                        &mut self.selector_caches,
+                    )
+                {
                     self.matching_rules.push(MatchedRule {
                         origin: stylesheet.origin,
-                        specificity: stylesheet.specificity_override.unwrap_or(rule.specificity),
+                        specificity: stylesheet
+                            .specificity_override
+                            .unwrap_or(matching_specificity),
                         stylesheet_index,
                         rule,
                         scope_proximity,
@@ -201,6 +205,8 @@ fn style_for_element_with_signature_inner(
             &mut cascade.cascaded_declarations,
             &current,
             stylesheet_index,
+            &stylesheets[stylesheet_index],
+            ancestors,
         );
     }
     if let Some(inline_declarations) = &inline_declarations {
@@ -263,7 +269,222 @@ fn style_for_element_with_signature_inner(
         );
     }
     finalize_text_decoration_layers(&mut style);
+    apply_forced_color_used_values(&mut style, &current, parent, stylesheets);
     style
+}
+
+/// Apply CSS CssColor Adjustment's forced-colors substitutions at the boundary
+/// between cascade and layout. The renderer does not expose computed styles to
+/// script, so layout stores the resolved used colors while retaining a marker
+/// on direct system-color values until this point.
+/// <https://www.w3.org/TR/css-color-adjust-1/#forced-colors-mode>
+fn apply_forced_color_used_values(
+    style: &mut ComputedStyle,
+    current: &ElementSignature,
+    parent: Option<&ComputedStyle>,
+    stylesheets: &[Stylesheet],
+) {
+    let Some(palette) = stylesheets
+        .iter()
+        .find_map(|stylesheet| stylesheet.forced_colors.palette())
+    else {
+        return;
+    };
+
+    if style.forced_color_adjust == ForcedColorAdjust::None {
+        resolve_style_system_colors(style, palette);
+        return;
+    }
+    if style.forced_color_adjust == ForcedColorAdjust::PreserveParentColor {
+        if let Some(parent) = parent {
+            style.color = parent.color;
+        } else {
+            style.color = palette.canvas_text;
+        }
+        if current.namespace_url == "http://www.w3.org/2000/svg" {
+            if style.svg_fill_is_current_color {
+                style.svg_fill = Some(style.color);
+            }
+            if style.svg_stroke_is_current_color {
+                style.svg_stroke = Some(style.color);
+            }
+        }
+        resolve_style_system_colors(style, palette);
+        return;
+    }
+
+    let resolve_or = |color: CssColor, fallback: CssColor| match color.system_color() {
+        // Keep the system-color identity while substituting the active palette
+        // value. Descendants inherit that identity and must not treat the
+        // resulting concrete RGB value as an authored color to override.
+        Some(system) => CssColor::system(system, palette.color(system)),
+        None => fallback,
+    };
+    let foreground = if current.tag.eq_ignore_ascii_case("a") && current.attrs.contains_key("href")
+    {
+        palette.link_text
+    } else {
+        palette.canvas_text
+    };
+    style.color = resolve_or(style.color, foreground);
+    style.text_fill_color = style
+        .text_fill_color
+        .map(|color| resolve_or(color, style.color));
+    let had_nondefault_border_color = style.border_color != CssColor::BLACK
+        || [
+            style.border_colors.top,
+            style.border_colors.right,
+            style.border_colors.bottom,
+            style.border_colors.left,
+        ]
+        .into_iter()
+        .any(|color| color.system_color().is_some() || color != CssColor::BLACK);
+    style.border_color = resolve_or(style.border_color, palette.canvas_text);
+    style.border_colors = BorderColors {
+        top: resolve_or(style.border_colors.top, palette.canvas_text),
+        right: resolve_or(style.border_colors.right, palette.canvas_text),
+        bottom: resolve_or(style.border_colors.bottom, palette.canvas_text),
+        left: resolve_or(style.border_colors.left, palette.canvas_text),
+    };
+    // Preserve a visible visited-link border when the cascaded shorthand
+    // supplied only a non-default color. The forced-color used value is a
+    // one-CSS-pixel CanvasText indicator; an untouched link keeps no border.
+    if current.tag.eq_ignore_ascii_case("a")
+        && current.attrs.contains_key("href")
+        && style.border_styles == BorderStyles::NONE
+        && had_nondefault_border_color
+    {
+        let width = ComputedLengthPercentage::from_points(CSS_PX_TO_PT);
+        style.border_styles = BorderStyles {
+            top: BorderStyle::Solid,
+            right: BorderStyle::Solid,
+            bottom: BorderStyle::Solid,
+            left: BorderStyle::Solid,
+        };
+        style.border_widths = Edges {
+            top: CSS_PX_TO_PT,
+            right: CSS_PX_TO_PT,
+            bottom: CSS_PX_TO_PT,
+            left: CSS_PX_TO_PT,
+        };
+        style.border_width_values = CssEdges::all(width);
+        style.border_width = CSS_PX_TO_PT;
+    }
+    style.outline_color = resolve_or(style.outline_color, palette.canvas_text);
+    style.background_color = style
+        .background_color
+        .map(|color| match color.system_color() {
+            Some(system) => palette.color(system),
+            None => palette.canvas.with_alpha(color.alpha()),
+        });
+    style.background_color_is_current_color = false;
+    style.background_color_current_color_expression = None;
+    if current.namespace_url == "http://www.w3.org/2000/svg" {
+        style.svg_fill = style
+            .svg_fill
+            .map(|color| resolve_or(color, palette.canvas_text));
+        style.svg_stroke = style
+            .svg_stroke
+            .map(|color| resolve_or(color, palette.canvas_text));
+    }
+    style.text_emphasis_color = style
+        .text_emphasis_color
+        .map(|color| resolve_or(color, palette.canvas_text));
+    style.text_decoration.color = style
+        .text_decoration
+        .color
+        .map(|color| resolve_or(color, palette.canvas_text));
+    for decoration in &mut style.text_decoration_layers {
+        decoration.color = decoration
+            .color
+            .map(|color| resolve_or(color, palette.canvas_text));
+    }
+    style.row_rule.colors = GapRuleList::single(palette.canvas_text);
+    style.column_rule.colors = GapRuleList::single(palette.canvas_text);
+    style.box_shadow.clear();
+    style.text_shadow.clear();
+    // URL images are retained, except on ordinary inline boxes. Their
+    // backgrounds are split across line fragments and are not painted as the
+    // retained atomic-image case covered by the forced-colors rules.
+    // <https://www.w3.org/TR/css-color-adjust-1/#forced-colors-properties>
+    if !style_has_url_background_image(style)
+        || (style.display.is_inline_level() && !style.display.is_atomic_inline())
+    {
+        style.background_image = ComputedImage::None;
+        style.background_layers.clear();
+    }
+    apply_forced_color_used_values_to_pseudos(style, palette);
+}
+
+fn apply_forced_color_used_values_to_pseudos(
+    style: &mut ComputedStyle,
+    palette: ForcedColorPalette,
+) {
+    for pseudo in [
+        style.marker_style.as_deref_mut(),
+        style.before_style.as_deref_mut(),
+        style.after_style.as_deref_mut(),
+        style.footnote_call_style.as_deref_mut(),
+        style.footnote_marker_style.as_deref_mut(),
+        style.first_line_style.as_deref_mut(),
+        style.first_letter_style.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if pseudo.forced_color_adjust == ForcedColorAdjust::Auto {
+            pseudo.color = palette.canvas_text;
+            pseudo.background_color = pseudo
+                .background_color
+                .map(|color| palette.canvas.with_alpha(color.alpha()));
+            pseudo.border_color = palette.canvas_text;
+            pseudo.border_colors = BorderColors {
+                top: palette.canvas_text,
+                right: palette.canvas_text,
+                bottom: palette.canvas_text,
+                left: palette.canvas_text,
+            };
+            pseudo.outline_color = palette.canvas_text;
+            pseudo.box_shadow.clear();
+            pseudo.text_shadow.clear();
+        } else {
+            resolve_style_system_colors(pseudo, palette);
+        }
+    }
+}
+
+fn resolve_style_system_colors(style: &mut ComputedStyle, palette: ForcedColorPalette) {
+    let resolve = |color: CssColor| match color.system_color() {
+        Some(system) => CssColor::system(system, palette.color(system)),
+        None => color,
+    };
+    style.color = resolve(style.color);
+    style.border_color = resolve(style.border_color);
+    style.border_colors.top = resolve(style.border_colors.top);
+    style.border_colors.right = resolve(style.border_colors.right);
+    style.border_colors.bottom = resolve(style.border_colors.bottom);
+    style.border_colors.left = resolve(style.border_colors.left);
+    style.outline_color = resolve(style.outline_color);
+    style.background_color = style.background_color.map(resolve);
+    style.svg_fill = style.svg_fill.map(resolve);
+    style.svg_stroke = style.svg_stroke.map(resolve);
+    style.text_fill_color = style.text_fill_color.map(resolve);
+    style.text_emphasis_color = style.text_emphasis_color.map(resolve);
+    style.text_decoration.color = style.text_decoration.color.map(resolve);
+}
+
+fn background_image_contains_url(image: &ComputedImage) -> bool {
+    image
+        .as_image()
+        .is_some_and(|image| matches!(image.selected_image(), BackgroundImage::Url { .. }))
+}
+
+fn style_has_url_background_image(style: &ComputedStyle) -> bool {
+    background_image_contains_url(&style.background_image)
+        || style
+            .background_layers
+            .iter()
+            .any(|layer| background_image_contains_url(&layer.image))
 }
 
 /// The portions of one CSS animation instance needed for static rendering.
@@ -364,13 +585,23 @@ fn animation_snapshot_from_declarations(
         match declaration.name.as_ref() {
             "animation" => apply_animation_shorthand(&mut animation, value),
             "animation-name" => {
-                animation.name = value.split(',').next()?.trim().to_string();
+                animation.name =
+                    crate::css::component_values::split_css_top_level_delimiter(value, ',')
+                        .first()?
+                        .trim()
+                        .to_string();
             }
             "animation-duration" => {
-                animation.duration_seconds = parse_animation_time(value.split(',').next()?)?;
+                animation.duration_seconds = parse_animation_time(
+                    crate::css::component_values::split_css_top_level_delimiter(value, ',')
+                        .first()?,
+                )?;
             }
             "animation-delay" => {
-                animation.delay_seconds = parse_animation_time(value.split(',').next()?)?;
+                animation.delay_seconds = parse_animation_time(
+                    crate::css::component_values::split_css_top_level_delimiter(value, ',')
+                        .first()?,
+                )?;
             }
             _ => {}
         }
@@ -385,7 +616,11 @@ fn apply_animation_shorthand(animation: &mut AnimationSnapshot, value: &str) {
         delay_seconds: 0.0,
     };
     let mut time_count = 0;
-    for component in split_css_component_values(value.split(',').next().unwrap_or(value)) {
+    let first_animation = crate::css::component_values::split_css_top_level_delimiter(value, ',')
+        .into_iter()
+        .next()
+        .unwrap_or(value);
+    for component in split_css_component_values(first_animation) {
         if let Some(time) = parse_animation_time(component) {
             if time_count == 0 {
                 animation.duration_seconds = time;
@@ -630,6 +865,42 @@ fn push_dynamic_html_list_user_agent_declarations(
         return;
     }
 
+    // The obsolete HTML `font` element remains part of the HTML rendering
+    // rules. Its positive integer size maps to the legacy absolute-size
+    // ladder, independently of optional presentational-hint support.
+    // <https://html.spec.whatwg.org/multipage/rendering.html#phrasing-content-3>
+    if element.tag == "font"
+        && let Some(size) = element
+            .attrs
+            .get("size")
+            .and_then(|value| value.trim().parse::<u8>().ok())
+        && let Some(value) = match size {
+            1 => Some("xx-small"),
+            2 => Some("x-small"),
+            3 => Some("small"),
+            4 => Some("medium"),
+            5 => Some("large"),
+            6 => Some("xx-large"),
+            7 => Some("xxx-large"),
+            _ => None,
+        }
+    {
+        output.push(CascadedDeclaration {
+            name: std::borrow::Cow::Borrowed("font-size"),
+            value: std::borrow::Cow::Borrowed(value),
+            origin: StylesheetOrigin::UserAgent,
+            base_url: None,
+            root_url: None,
+            important: false,
+            layer_order: None,
+            specificity: 1,
+            scope_proximity: usize::MAX,
+            stylesheet_index,
+            rule_order: usize::MAX,
+            declaration_order: 0,
+        });
+    }
+
     let declaration = match element.tag.as_str() {
         "ol" => {
             let start = element
@@ -722,15 +993,40 @@ fn display_contents_computes_to_none_for_html_element(
 /// declarations depend on parsed attribute values are injected here with the
 /// same author-origin, zero-specificity cascade priority:
 /// <https://html.spec.whatwg.org/multipage/rendering.html#presentational-hints>.
-fn push_dynamic_html_presentational_hint_declarations(
-    output: &mut Vec<CascadedDeclaration<'_>>,
+fn push_dynamic_html_presentational_hint_declarations<'a>(
+    output: &mut Vec<CascadedDeclaration<'a>>,
     element: &ElementSignature,
     stylesheet_index: usize,
+    stylesheet: &'a Stylesheet,
+    ancestors: &[ElementSignature],
 ) {
-    if element.tag != "hr" {
-        return;
-    }
     let mut declaration_order = 0usize;
+    if element.tag == "hr" {
+        push_dynamic_hr_presentational_hint_declarations(
+            output,
+            element,
+            stylesheet_index,
+            stylesheet,
+            &mut declaration_order,
+        );
+    }
+    push_dynamic_table_presentational_hint_declarations(
+        output,
+        element,
+        stylesheet_index,
+        stylesheet,
+        ancestors,
+        &mut declaration_order,
+    );
+}
+
+fn push_dynamic_hr_presentational_hint_declarations<'a>(
+    output: &mut Vec<CascadedDeclaration<'a>>,
+    element: &ElementSignature,
+    stylesheet_index: usize,
+    stylesheet: &'a Stylesheet,
+    declaration_order: &mut usize,
+) {
     if let Some(width) = element
         .attrs
         .get("width")
@@ -739,7 +1035,8 @@ fn push_dynamic_html_presentational_hint_declarations(
         push_dynamic_html_presentational_hint_declaration(
             output,
             stylesheet_index,
-            &mut declaration_order,
+            stylesheet,
+            declaration_order,
             "width",
             width,
         );
@@ -757,7 +1054,8 @@ fn push_dynamic_html_presentational_hint_declarations(
                 push_dynamic_html_presentational_hint_declaration(
                     output,
                     stylesheet_index,
-                    &mut declaration_order,
+                    stylesheet,
+                    declaration_order,
                     "border-width",
                     format!("{}px", format_html_number(size as f32 / 2.0)),
                 );
@@ -766,7 +1064,8 @@ fn push_dynamic_html_presentational_hint_declarations(
             push_dynamic_html_presentational_hint_declaration(
                 output,
                 stylesheet_index,
-                &mut declaration_order,
+                stylesheet,
+                declaration_order,
                 "border-bottom-width",
                 "0".to_string(),
             );
@@ -774,7 +1073,8 @@ fn push_dynamic_html_presentational_hint_declarations(
             push_dynamic_html_presentational_hint_declaration(
                 output,
                 stylesheet_index,
-                &mut declaration_order,
+                stylesheet,
+                declaration_order,
                 "height",
                 format!("{}px", size - 2),
             );
@@ -789,23 +1089,174 @@ fn push_dynamic_html_presentational_hint_declarations(
         push_dynamic_html_presentational_hint_declaration(
             output,
             stylesheet_index,
-            &mut declaration_order,
+            stylesheet,
+            declaration_order,
             "border-color",
             color.clone(),
         );
         push_dynamic_html_presentational_hint_declaration(
             output,
             stylesheet_index,
-            &mut declaration_order,
+            stylesheet,
+            declaration_order,
             "color",
             color,
         );
     }
 }
 
-fn push_dynamic_html_presentational_hint_declaration(
-    output: &mut Vec<CascadedDeclaration<'_>>,
+/// Inject value-dependent HTML table hints.
+///
+/// The rendering rules express these as author-origin declarations with zero
+/// specificity. Keeping the values in cascade (rather than table layout)
+/// makes ordinary author CSS override them and keeps table display overrides
+/// independent from legacy markup:
+/// <https://html.spec.whatwg.org/multipage/rendering.html#tables-2>.
+fn push_dynamic_table_presentational_hint_declarations<'a>(
+    output: &mut Vec<CascadedDeclaration<'a>>,
+    element: &ElementSignature,
     stylesheet_index: usize,
+    stylesheet: &'a Stylesheet,
+    ancestors: &[ElementSignature],
+    declaration_order: &mut usize,
+) {
+    let is_table = element.tag == "table";
+    let is_cell = matches!(element.tag.as_str(), "td" | "th");
+    let is_row_group = matches!(element.tag.as_str(), "thead" | "tbody" | "tfoot");
+    let is_row = element.tag == "tr";
+    if !(is_table || is_cell || is_row_group || is_row) {
+        return;
+    }
+
+    if (is_table || is_cell)
+        && let Some(width) = element
+            .attrs
+            .get("width")
+            .and_then(|value| html_positive_dimension_property_value(value))
+    {
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            stylesheet,
+            declaration_order,
+            "width",
+            width,
+        );
+    }
+    if (is_table || is_cell || is_row_group || is_row)
+        && let Some(height) = element
+            .attrs
+            .get("height")
+            .and_then(|value| html_dimension_property_value(value))
+    {
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            stylesheet,
+            declaration_order,
+            "height",
+            height,
+        );
+    }
+    if is_table {
+        if let Some(spacing) = element
+            .attrs
+            .get("cellspacing")
+            .and_then(|value| html_non_negative_length_property_value(value))
+        {
+            push_dynamic_html_presentational_hint_declaration(
+                output,
+                stylesheet_index,
+                stylesheet,
+                declaration_order,
+                "border-spacing",
+                spacing,
+            );
+        }
+        if let Some(color) = element
+            .attrs
+            .get("bordercolor")
+            .and_then(|value| html_legacy_color_hint_value(value))
+        {
+            push_dynamic_html_presentational_hint_declaration(
+                output,
+                stylesheet_index,
+                stylesheet,
+                declaration_order,
+                "border-color",
+                color,
+            );
+        }
+        if element
+            .attrs
+            .get("border")
+            .and_then(|value| parse_html_non_negative_integer(value))
+            == Some(0)
+        {
+            push_dynamic_html_presentational_hint_declaration(
+                output,
+                stylesheet_index,
+                stylesheet,
+                declaration_order,
+                "border-style",
+                "none".to_string(),
+            );
+        }
+    }
+    if is_cell
+        && let Some(padding) = ancestors.iter().rev().find_map(|ancestor| {
+            (ancestor.tag == "table")
+                .then(|| ancestor.attrs.get("cellpadding"))
+                .flatten()
+                .and_then(|value| html_non_negative_length_property_value(value))
+        })
+    {
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            stylesheet,
+            declaration_order,
+            "padding",
+            padding,
+        );
+    }
+    if is_cell
+        && ancestors.iter().rev().any(|ancestor| {
+            ancestor.tag == "table"
+                && ancestor
+                    .attrs
+                    .get("border")
+                    .and_then(|value| parse_html_non_negative_integer(value))
+                    == Some(0)
+        })
+    {
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            stylesheet,
+            declaration_order,
+            "border-style",
+            "none".to_string(),
+        );
+    }
+    if let Some(background) = element.attrs.get("background")
+        && !background.trim_matches(is_html_space).is_empty()
+    {
+        push_dynamic_html_presentational_hint_declaration(
+            output,
+            stylesheet_index,
+            stylesheet,
+            declaration_order,
+            "background-image",
+            format!("url({background:?})"),
+        );
+    }
+}
+
+fn push_dynamic_html_presentational_hint_declaration<'a>(
+    output: &mut Vec<CascadedDeclaration<'a>>,
+    stylesheet_index: usize,
+    stylesheet: &'a Stylesheet,
     declaration_order: &mut usize,
     name: &'static str,
     value: String,
@@ -814,8 +1265,8 @@ fn push_dynamic_html_presentational_hint_declaration(
         name: std::borrow::Cow::Borrowed(name),
         value: std::borrow::Cow::Owned(value),
         origin: StylesheetOrigin::Author,
-        base_url: None,
-        root_url: None,
+        base_url: stylesheet.base_url.as_ref(),
+        root_url: stylesheet.root_url.as_ref(),
         important: false,
         layer_order: None,
         specificity: 0,
@@ -825,6 +1276,48 @@ fn push_dynamic_html_presentational_hint_declaration(
         declaration_order: *declaration_order,
     });
     *declaration_order += 1;
+}
+
+fn html_positive_dimension_property_value(value: &str) -> Option<String> {
+    let dimension = html_dimension_property_value(value)?;
+    html_dimension_number(value).filter(|number| *number > 0.0)?;
+    Some(dimension)
+}
+
+fn html_non_negative_length_property_value(value: &str) -> Option<String> {
+    let trimmed = value.trim_matches(is_html_space);
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(number) = trimmed.strip_suffix("pt")
+        && number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .is_some_and(|number| number >= 0.0)
+    {
+        return Some(trimmed.to_string());
+    }
+    html_dimension_property_value(trimmed)
+}
+
+fn html_dimension_number(value: &str) -> Option<f32> {
+    let value = value.trim_start_matches(is_html_space);
+    let mut end = 0usize;
+    let mut saw_digit = false;
+    let mut saw_dot = false;
+    for (index, character) in value.char_indices() {
+        if character.is_ascii_digit() {
+            saw_digit = true;
+            end = index + character.len_utf8();
+        } else if character == '.' && !saw_dot {
+            saw_dot = true;
+            end = index + character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    saw_digit.then(|| value[..end].parse().ok()).flatten()
 }
 
 fn html_dimension_property_value(value: &str) -> Option<String> {
@@ -877,14 +1370,14 @@ fn html_legacy_color_hint_value(value: &str) -> Option<String> {
         return None;
     }
     let color = parse_color(trimmed)?;
-    if color.a < 0.999 {
+    if color.alpha() < 0.999 {
         return None;
     }
     Some(format!(
         "#{:02x}{:02x}{:02x}",
-        css_color_channel(color.r),
-        css_color_channel(color.g),
-        css_color_channel(color.b)
+        css_color_channel(color.components()[0]),
+        css_color_channel(color.components()[1]),
+        css_color_channel(color.components()[2])
     ))
 }
 
@@ -1030,6 +1523,7 @@ fn apply_pseudo_rules_with_context<'a>(
 ) {
     apply_marker_rules_with_context(style, stylesheets, cascade, parent_ch_advance);
     apply_generated_pseudo_rules_with_context(style, stylesheets, cascade, parent_ch_advance);
+    apply_footnote_pseudo_rules_with_context(style, stylesheets, cascade, parent_ch_advance);
     apply_typographic_pseudo_rules_with_context(style, stylesheets, cascade, parent_ch_advance);
 }
 
@@ -1070,6 +1564,8 @@ fn apply_marker_rules_from_rule_set<'a>(
     marker_style.marker_style = None;
     marker_style.before_style = None;
     marker_style.after_style = None;
+    marker_style.footnote_call_style = None;
+    marker_style.footnote_marker_style = None;
     marker_style.first_line_style = None;
     marker_style.first_letter_style = None;
     marker_style.display = marker_style.display.with_list_item(false);
@@ -1138,6 +1634,8 @@ fn generated_pseudo_style_with_context<'a>(
     pseudo_style.before_style = None;
     pseudo_style.after_style = None;
     pseudo_style.marker_style = None;
+    pseudo_style.footnote_call_style = None;
+    pseudo_style.footnote_marker_style = None;
     pseudo_style.first_line_style = None;
     pseudo_style.first_letter_style = None;
     pseudo_style.counter_resets.clear();
@@ -1163,6 +1661,94 @@ fn generated_pseudo_style_with_context<'a>(
         marker_rule_set,
     );
     pseudo_style.content.is_generated().then_some(pseudo_style)
+}
+
+fn apply_footnote_pseudo_rules_with_context<'a>(
+    style: &mut ComputedStyle,
+    stylesheets: &'a [Stylesheet],
+    cascade: &mut ElementCascadeContext<'a>,
+    parent_ch_advance: LayoutLength,
+) {
+    if style.float != Float::Footnote {
+        style.footnote_call_style = None;
+        style.footnote_marker_style = None;
+        return;
+    }
+
+    // GCPM defines both pseudo-elements for every `float: footnote` element;
+    // unlike ::before/::after their counter content exists without an author
+    // rule.  Author declarations cascade over that generated default.
+    // https://www.w3.org/TR/css-gcpm-3/#footnotes
+    style.footnote_call_style = Some(Box::new(footnote_pseudo_style_with_context(
+        style,
+        stylesheets,
+        cascade,
+        |stylesheet| &stylesheet.footnote_call_rules,
+        Content::List {
+            parts: vec![GeneratedContentPart::Counter {
+                name: "footnote".to_string(),
+                style: None,
+            }],
+            alt: None,
+        },
+        parent_ch_advance,
+    )));
+    style.footnote_marker_style = Some(Box::new(footnote_pseudo_style_with_context(
+        style,
+        stylesheets,
+        cascade,
+        |stylesheet| &stylesheet.footnote_marker_rules,
+        Content::List {
+            parts: vec![
+                GeneratedContentPart::Counter {
+                    name: "footnote".to_string(),
+                    style: None,
+                },
+                GeneratedContentPart::Text(". ".to_string()),
+            ],
+            alt: None,
+        },
+        parent_ch_advance,
+    )));
+}
+
+fn footnote_pseudo_style_with_context<'a>(
+    originating_style: &ComputedStyle,
+    stylesheets: &'a [Stylesheet],
+    cascade: &mut ElementCascadeContext<'a>,
+    rule_set: fn(&Stylesheet) -> &[StyleRule],
+    default_content: Content,
+    parent_ch_advance: LayoutLength,
+) -> ComputedStyle {
+    let mut pseudo_style = pseudo_inherited_base_style(originating_style);
+    pseudo_style.content = default_content;
+    pseudo_style.display = Display::INLINE;
+    // The call and marker are generated inline boxes, not footnote floats.
+    pseudo_style.float = Float::None;
+    pseudo_style.before_style = None;
+    pseudo_style.after_style = None;
+    pseudo_style.marker_style = None;
+    pseudo_style.footnote_call_style = None;
+    pseudo_style.footnote_marker_style = None;
+    pseudo_style.first_line_style = None;
+    pseudo_style.first_letter_style = None;
+    pseudo_style.counter_resets.clear();
+    pseudo_style.counter_increments.clear();
+    pseudo_style.counter_sets.clear();
+    cascade.collect_matching_rules(stylesheets, rule_set);
+    cascade.rebuild_cascaded_declarations();
+    sort_cascaded_declarations(&mut cascade.cascaded_declarations);
+    apply_cascaded_declarations_with_inheritance_source_and_parent_ch_advance(
+        &mut pseudo_style,
+        &cascade.cascaded_declarations,
+        originating_style,
+        parent_ch_advance,
+        false,
+    );
+    pseudo_style
+        .quotes
+        .resolve_auto_language(originating_style.language.as_deref());
+    pseudo_style
 }
 
 fn apply_typographic_pseudo_rules_with_context<'a>(
@@ -1213,6 +1799,8 @@ fn typographic_pseudo_style_with_context<'a>(
     pseudo_style.before_style = None;
     pseudo_style.after_style = None;
     pseudo_style.marker_style = None;
+    pseudo_style.footnote_call_style = None;
+    pseudo_style.footnote_marker_style = None;
     pseudo_style.first_line_style = None;
     pseudo_style.first_letter_style = None;
     pseudo_style.counter_resets.clear();

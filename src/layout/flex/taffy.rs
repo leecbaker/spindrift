@@ -138,7 +138,11 @@ pub(super) fn flex_item_used_margin(
     let percentage_basis = logical_inline_percentage_basis(containing_style, available);
     percentage_basis
         .points()
-        .map(|basis| used_box_metrics(style, PercentageBasis::definite(layout_pt(basis))).margin)
+        .map(|basis| {
+            used_box_metrics(style, PercentageBasis::definite(layout_pt(basis)))
+                .margin
+                .to_css_edges()
+        })
         .unwrap_or(style.margin)
 }
 
@@ -170,8 +174,11 @@ fn logical_inline_percentage_basis(
     containing_style: &ComputedStyle,
     available: FlexAvailableSpace,
 ) -> FlexAvailablePercentageBasis {
-    if WritingModeAxes::new(containing_style.writing_mode, containing_style.direction)
-        .swaps_physical_axes()
+    if WritingModeAxes::new(
+        containing_style.writing_mode,
+        containing_style.used_direction(),
+    )
+    .swaps_physical_axes()
     {
         available.height_basis
     } else {
@@ -246,6 +253,16 @@ pub(super) fn flex_item_size_dimension(
         .shares_axis_with(context.dimension_axis)
     {
         if context.flex_basis_overrides_main_size {
+            return taffy_layout::Dimension::auto();
+        }
+        // An unresolved percentage main size is `auto` for flex-basis:auto.
+        // The flex-basis adapter below supplies the item's content-based
+        // fallback; passing Taffy a zero-length `size` here would instead
+        // suppress that fallback and clip the item's normal content.
+        // <https://www.w3.org/TR/css-flexbox-1/#flex-basis-property>
+        // <https://www.w3.org/TR/css-sizing-3/#percentages>
+        if matches!(value, css::ComputedLengthPercentageOrAuto::LengthPercentage(ref value) if value.needs_percentage_basis() && !context.percentage_basis.is_definite())
+        {
             return taffy_layout::Dimension::auto();
         }
         match value {
@@ -328,11 +345,11 @@ fn taffy_stretch_fit_dimension(context: FlexStretchFitContext) -> taffy_layout::
 /// Converts a CSS size to Taffy, resolving mixed length-percentages when possible.
 ///
 /// CSS Values allows `<length-percentage>` math such as `calc(50% + 10pt)`.
-/// Taffy 0.11 exposes length-only or percentage-only dimensions, so flex layout
-/// resolves mixed values at this bridge when the relevant flex container axis is
-/// definite. CSS Sizing leaves nonzero percentages unresolved when their basis
-/// is indefinite, so those values stay automatic for Taffy and use intrinsic
-/// measurement instead:
+/// Taffy's style interface cannot carry Quire's mixed CSS math representation
+/// or percentage-definiteness semantics, so flex layout resolves mixed values
+/// at this bridge when the relevant flex container axis is definite. CSS Sizing
+/// leaves nonzero percentages unresolved when their basis is indefinite, so
+/// those values stay automatic for Taffy and use intrinsic measurement instead:
 /// <https://www.w3.org/TR/css-values-4/#mixed-percentages>,
 /// <https://www.w3.org/TR/css-sizing-3/#percentage-sizing>, and
 /// <https://www.w3.org/TR/css-flexbox-1/#layout-algorithm>.
@@ -482,17 +499,21 @@ pub(super) fn measure_flex_item(
     _available_space: taffy_layout::Size<taffy_layout::AvailableSpace>,
     estimate: Option<&mut FlexItemEstimate>,
 ) -> taffy_layout::Size<f32> {
-    let estimate = estimate.cloned().unwrap_or(FlexItemEstimate {
-        metrics: IntrinsicItemMetrics::zero(),
-        first_horizontal_baseline: None,
-        last_horizontal_baseline: None,
+    let estimate = estimate.cloned().unwrap_or_else(|| {
+        FlexItemEstimate::new(
+            IntrinsicItemMetrics::zero(),
+            FlexItemBaselineEstimate::default(),
+        )
     });
+    // Taffy receives generic scalar metrics. This is the explicit Flex
+    // baseline transport boundary; all Flex recursion retains typed pairs.
+    let metrics = estimate.legacy_metrics();
     measure_intrinsic_item_leaf(
         known_dimensions,
-        estimate.preferred_aspect_ratio,
+        metrics.preferred_aspect_ratio,
         taffy_layout::Size {
-            width: estimate.width.points(),
-            height: estimate.height.points(),
+            width: metrics.width.points(),
+            height: metrics.height.points(),
         },
     )
 }
@@ -563,7 +584,12 @@ pub(super) fn flex_min_size_dimension(
     estimated_max_content: ContentBoxLength,
     context: FlexMinSizeDimensionContext,
 ) -> taffy_layout::Dimension {
-    if !min_size_uses_automatic_flex_minimum(specified.clone(), context.is_item_block_axis) {
+    let Some(automatic_minimum) = resolve_automatic_flex_minimum(
+        specified.clone(),
+        estimated_min_content,
+        estimated_max_content,
+        context,
+    ) else {
         return taffy_intrinsic_dimension_with_basis_and_stretch(
             specified,
             context.percentage_basis,
@@ -571,63 +597,145 @@ pub(super) fn flex_min_size_dimension(
             estimated_max_content,
             context.stretch,
         );
-    }
-    if context.is_main_axis {
-        if context.overflow.is_scrollable() {
-            taffy_layout::Dimension::length(0.0)
-        } else {
-            // CSS Flexbox 4.5: non-scrollable flex items use the content-based
-            // minimum size in the main axis, capped by a definite preferred main
-            // size. Cross-axis auto minimums remain automatic.
-            // The estimate's minimum contribution is normally the min-content
-            // contribution.  Its `min-*` constraint has already been folded
-            // into that estimate, however, so `calc-size(auto, …)` must peel
-            // back that raised floor before substituting `auto`; otherwise a
-            // value such as `size + 20px` is applied twice.
-            // <https://drafts.csswg.org/css-values-5/#calc-size>.
-            let content_size_suggestion = if specified.calc_size_with_auto_basis().is_some() {
-                estimated_min_content.min(estimated_max_content)
+    };
+    taffy_layout::Dimension::length(automatic_minimum.used_content_box.points())
+}
+
+/// The resolved content-based automatic minimum of one flex-item axis.
+///
+/// This record is deliberately shared by the Taffy adapter and Quire's
+/// post-layout safeguard.  CSS Flexbox defines a single automatic-minimum
+/// decision; keeping its suggestions and selected content-box result together
+/// prevents either consumer from silently selecting a different minimum.
+/// <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>
+#[derive(Debug, Clone, Copy)]
+pub(super) struct AutomaticFlexMinimum {
+    pub(super) content_size_suggestion: ContentBoxLength,
+    pub(super) transferred_size_suggestion: Option<ContentBoxLength>,
+    pub(super) specified_size_suggestion: Option<ContentBoxLength>,
+    pub(super) used_content_box: ContentBoxLength,
+}
+
+impl AutomaticFlexMinimum {
+    pub(super) fn from_suggestions(
+        content_size_suggestion: ContentBoxLength,
+        transferred_size_suggestion: Option<ContentBoxLength>,
+        specified_size_suggestion: Option<ContentBoxLength>,
+        is_replaced: bool,
+    ) -> Self {
+        let mut used_content_box = content_size_suggestion.max(content_box_pt(0.0));
+        if let Some(transferred) = transferred_size_suggestion {
+            let transferred = transferred.max(content_box_pt(0.0));
+            used_content_box = if is_replaced {
+                used_content_box.min(transferred)
             } else {
-                estimated_min_content
+                used_content_box.max(transferred)
             };
-            let mut automatic_minimum = content_size_suggestion.points().max(0.0);
-            if let Some(transferred) = context.transferred_size_suggestion {
-                let transferred = transferred.points().max(0.0);
-                automatic_minimum = if context.is_replaced {
-                    automatic_minimum.min(transferred)
-                } else {
-                    automatic_minimum.max(transferred)
-                };
-            }
-            if let Some(preferred_size) = context.definite_preferred_content_size {
-                automatic_minimum = automatic_minimum.min(preferred_size.points().max(0.0));
-            }
-            let automatic_minimum = specified
-                .calc_size_with_auto_basis()
-                .map(|value| {
-                    value
-                        .used_value(
-                            automatic_minimum,
-                            content_size_suggestion.points(),
-                            estimated_max_content.points(),
-                            automatic_minimum,
-                            context
-                                .stretch
-                                .available_margin_box_size
-                                .map(SemanticLengthExt::points)
-                                .unwrap_or(0.0),
-                            PercentageBasis::definite(layout_pt(
-                                context.percentage_basis.points().unwrap_or(0.0),
-                            )),
-                        )
-                        .points()
-                })
-                .unwrap_or(automatic_minimum);
-            taffy_layout::Dimension::length(automatic_minimum.max(0.0))
         }
-    } else {
-        taffy_layout::Dimension::auto()
+        if let Some(specified) = specified_size_suggestion {
+            used_content_box = used_content_box.min(specified.max(content_box_pt(0.0)));
+        }
+        Self {
+            content_size_suggestion,
+            transferred_size_suggestion,
+            specified_size_suggestion,
+            used_content_box,
+        }
     }
+
+    pub(super) fn debug_assert_consistent(self, is_replaced: bool) {
+        debug_assert!(self.used_content_box >= content_box_pt(0.0));
+        if let Some(specified) = self.specified_size_suggestion {
+            debug_assert!(self.used_content_box <= specified.max(content_box_pt(0.0)));
+        }
+        if let Some(transferred) = self.transferred_size_suggestion {
+            let transferred = transferred.max(content_box_pt(0.0));
+            if is_replaced {
+                debug_assert!(self.used_content_box <= transferred);
+            } else {
+                debug_assert!(
+                    self.used_content_box >= self.content_size_suggestion.max(content_box_pt(0.0))
+                );
+            }
+        }
+    }
+}
+
+/// Resolve Flexbox's automatic main-axis minimum, if this axis uses one.
+///
+/// A cross-axis automatic minimum remains `auto` for Taffy, and a scrollable
+/// main-axis item has a zero automatic minimum.  The returned value is always
+/// a non-negative content-box length; callers perform their explicit
+/// content-to-border-box conversion at their own backend boundary.
+/// <https://www.w3.org/TR/css-flexbox-1/#min-size-auto>
+pub(super) fn resolve_automatic_flex_minimum(
+    specified: css::ComputedLengthPercentageOrAuto,
+    estimated_min_content: ContentBoxLength,
+    estimated_max_content: ContentBoxLength,
+    context: FlexMinSizeDimensionContext,
+) -> Option<AutomaticFlexMinimum> {
+    if !min_size_uses_automatic_flex_minimum(specified.clone(), context.is_item_block_axis)
+        || !context.is_main_axis
+    {
+        return None;
+    }
+    if context.overflow.is_scrollable() {
+        return Some(AutomaticFlexMinimum {
+            content_size_suggestion: content_box_pt(0.0),
+            transferred_size_suggestion: None,
+            specified_size_suggestion: None,
+            used_content_box: content_box_pt(0.0),
+        });
+    }
+    // CSS Flexbox 4.5: non-scrollable flex items use the content-based
+    // minimum size in the main axis, capped by a definite preferred main
+    // size. Cross-axis auto minimums remain automatic.
+    // The estimate's minimum contribution is normally the min-content
+    // contribution. Its `min-*` constraint has already been folded into that
+    // estimate, however, so `calc-size(auto, …)` must peel back that raised
+    // floor before substituting `auto`; otherwise a value such as `size +
+    // 20px` is applied twice.
+    // <https://drafts.csswg.org/css-values-5/#calc-size>.
+    let content_size_suggestion = if specified.calc_size_with_auto_basis().is_some() {
+        estimated_min_content.min(estimated_max_content)
+    } else {
+        estimated_min_content
+    };
+    let selection = AutomaticFlexMinimum::from_suggestions(
+        content_size_suggestion,
+        context.transferred_size_suggestion,
+        context.definite_preferred_content_size,
+        context.is_replaced,
+    );
+    selection.debug_assert_consistent(context.is_replaced);
+    let automatic_minimum = selection.used_content_box.points();
+    let automatic_minimum = specified
+        .calc_size_with_auto_basis()
+        .map(|value| {
+            value
+                .used_value(
+                    automatic_minimum,
+                    content_size_suggestion.points(),
+                    estimated_max_content.points(),
+                    automatic_minimum,
+                    context
+                        .stretch
+                        .available_margin_box_size
+                        .map(SemanticLengthExt::points)
+                        .unwrap_or(0.0),
+                    PercentageBasis::definite(layout_pt(
+                        context.percentage_basis.points().unwrap_or(0.0),
+                    )),
+                )
+                .points()
+        })
+        .unwrap_or(automatic_minimum);
+    Some(AutomaticFlexMinimum {
+        content_size_suggestion,
+        transferred_size_suggestion: context.transferred_size_suggestion,
+        specified_size_suggestion: context.definite_preferred_content_size,
+        used_content_box: content_box_pt(automatic_minimum.max(0.0)),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -764,18 +872,18 @@ pub(super) fn taffy_flex_basis(
                 .clone()
                 .and_then(|limit| {
                     if limit.is_definitely_absolute() {
-                        Some(limit.length_max_zero().points())
+                        Some(content_box_pt(limit.length_max_zero().points()))
                     } else {
                         context.main_size_basis.points().and_then(|basis| {
                             limit
                                 .used_length_with_percentage_basis(PercentageBasis::definite(
                                     layout_pt(basis),
                                 ))
-                                .map(|length| length.points())
+                                .map(|length| content_box_pt(length.points()))
                         })
                     }
                 })
-                .unwrap_or(context.available_main_size);
+                .unwrap_or_else(|| flex_main_content_box_length(context.available_main_size));
             return taffy_layout::Dimension::length(
                 flex_auto_content_basis(
                     style,
@@ -858,32 +966,23 @@ fn flex_content_basis_with_aspect_ratio(
     } else {
         estimate.content_height
     };
-    let Some(ratio) = context.preferred_aspect_ratio.filter(|ratio| *ratio > 0.0) else {
-        return flex_auto_content_basis(style, fallback, context.direction);
-    };
-    let cross_content = if context.direction.is_row_axis() {
-        (!style.box_values.height.is_auto()).then_some(estimate.height)
-    } else {
-        (!style.box_values.width.is_auto()).then_some(estimate.width)
-    };
-    let Some(cross_content) = cross_content else {
-        return flex_auto_content_basis(style, fallback, context.direction);
-    };
-    let transferred = flex_aspect_ratio_transferred_content_main_size(
+    aspect_ratio_transferred_flex_basis(
         style,
-        cross_content,
+        estimate,
         context.direction,
-        ratio,
-    );
-    flex_aspect_ratio_basis_from_content_box(style, transferred, context.direction)
+        context.available_cross_size,
+        context.stretched_cross_size,
+        context.preferred_aspect_ratio,
+    )
+    .unwrap_or_else(|| flex_auto_content_basis(style, fallback, context.direction))
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FlexBasisContext {
     pub(super) direction: FlexDirection,
-    pub(super) available_main_size: f32,
-    pub(super) available_cross_size: Option<f32>,
-    pub(super) stretched_cross_size: Option<f32>,
+    pub(super) available_main_size: FlexMainSize,
+    pub(super) available_cross_size: Option<FlexCrossSize>,
+    pub(super) stretched_cross_size: Option<FlexCrossSize>,
     pub(super) main_size_basis: FlexAvailablePercentageBasis,
     pub(super) preferred_aspect_ratio: Option<f32>,
 }
@@ -899,8 +998,8 @@ fn aspect_ratio_transferred_flex_basis(
     style: &ComputedStyle,
     estimate: &FlexItemEstimate,
     direction: FlexDirection,
-    available_cross_size: Option<f32>,
-    stretched_cross_size: Option<f32>,
+    available_cross_size: Option<FlexCrossSize>,
+    stretched_cross_size: Option<FlexCrossSize>,
     preferred_aspect_ratio: Option<f32>,
 ) -> Option<LayoutLength> {
     aspect_ratio_transferred_content_main_size_with_cross_constraints(
@@ -933,8 +1032,8 @@ fn aspect_ratio_transferred_flex_basis(
 pub(super) fn aspect_ratio_transferred_content_main_size_with_cross_constraints(
     style: &ComputedStyle,
     direction: FlexDirection,
-    available_cross_size: Option<f32>,
-    stretched_cross_size: Option<f32>,
+    available_cross_size: Option<FlexCrossSize>,
+    stretched_cross_size: Option<FlexCrossSize>,
     preferred_aspect_ratio: Option<f32>,
     cross_min_content: ContentBoxLength,
     cross_max_content: ContentBoxLength,
@@ -957,7 +1056,8 @@ pub(super) fn aspect_ratio_transferred_content_main_size_with_cross_constraints(
     // <https://www.w3.org/TR/css-flexbox-1/#algo-main-item>.
     let unconstrained_cross =
         flex_aspect_ratio_transferred_cross_content_size(style, transferred, direction, ratio);
-    let cross_percentage_basis = percentage_basis_from_points(available_cross_size);
+    let cross_percentage_basis =
+        percentage_basis_from_points(available_cross_size.map(FlexCrossSize::points));
     let constrained_cross = if direction.is_row_axis() {
         constrain_height_with_intrinsic(
             style,
@@ -999,8 +1099,8 @@ pub(super) fn aspect_ratio_transferred_content_main_size_with_cross_constraints(
 pub(super) fn automatic_minimum_transferred_size_suggestion(
     style: &ComputedStyle,
     direction: FlexDirection,
-    available_cross_size: Option<f32>,
-    stretched_cross_size: Option<f32>,
+    available_cross_size: Option<FlexCrossSize>,
+    stretched_cross_size: Option<FlexCrossSize>,
     preferred_aspect_ratio: Option<f32>,
     cross_min_content: ContentBoxLength,
     cross_max_content: ContentBoxLength,
@@ -1018,7 +1118,8 @@ pub(super) fn automatic_minimum_transferred_size_suggestion(
     }
 
     let ratio = preferred_aspect_ratio?;
-    let percentage_basis = percentage_basis_from_points(available_cross_size);
+    let percentage_basis =
+        percentage_basis_from_points(available_cross_size.map(FlexCrossSize::points));
     let constrained_minimum_cross = if direction.is_row_axis() {
         constrain_height_with_intrinsic(
             style,
@@ -1061,8 +1162,8 @@ pub(super) fn automatic_minimum_transferred_size_suggestion(
 pub(super) fn aspect_ratio_transferred_content_main_size(
     style: &ComputedStyle,
     direction: FlexDirection,
-    available_cross_size: Option<f32>,
-    stretched_cross_size: Option<f32>,
+    available_cross_size: Option<FlexCrossSize>,
+    stretched_cross_size: Option<FlexCrossSize>,
     preferred_aspect_ratio: Option<f32>,
 ) -> Option<ContentBoxLength> {
     let ratio = preferred_aspect_ratio?;
@@ -1071,12 +1172,12 @@ pub(super) fn aspect_ratio_transferred_content_main_size(
             non_content_pt(style.padding.top + style.padding.bottom + vertical_border_width(style));
         let cross_content_height = used_content_box_height_or_auto_with_basis(
             style,
-            percentage_basis_from_points(available_cross_size),
+            percentage_basis_from_points(available_cross_size.map(FlexCrossSize::points)),
             cross_non_content,
         )
         .or_else(|| {
             stretched_cross_size
-                .map(|size| content_box_pt((size - cross_non_content.points()).max(0.0)))
+                .map(|size| content_box_pt((size.points() - cross_non_content.points()).max(0.0)))
         })?;
         Some(flex_aspect_ratio_transferred_content_main_size(
             style,
@@ -1090,12 +1191,12 @@ pub(super) fn aspect_ratio_transferred_content_main_size(
         );
         let cross_content_width = used_content_box_width_or_auto_with_basis(
             style,
-            percentage_basis_from_points(available_cross_size),
+            percentage_basis_from_points(available_cross_size.map(FlexCrossSize::points)),
             cross_non_content,
         )
         .or_else(|| {
             stretched_cross_size
-                .map(|size| content_box_pt((size - cross_non_content.points()).max(0.0)))
+                .map(|size| content_box_pt((size.points() - cross_non_content.points()).max(0.0)))
         })?;
         Some(flex_aspect_ratio_transferred_content_main_size(
             style,
@@ -1138,13 +1239,13 @@ fn taffy_flex_basis_from_main_size(
 fn fit_content_basis(
     min_content: ContentBoxLength,
     max_content: ContentBoxLength,
-    limit: f32,
+    limit: ContentBoxLength,
 ) -> ContentBoxLength {
     content_box_pt(
         max_content
             .points()
             .max(0.0)
-            .min(min_content.points().max(0.0).max(limit.max(0.0))),
+            .min(min_content.points().max(0.0).max(limit.points().max(0.0))),
     )
 }
 
@@ -1354,6 +1455,62 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_percentage_main_size_remains_auto_for_content_flex_basis() {
+        let value = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(0.01),
+        );
+        let context = FlexItemSizeDimensionContext {
+            flex_direction: FlexDirection::Column,
+            dimension_axis: FlexDirection::Column,
+            percentage_basis: PercentageBasis::indefinite(),
+            stretch: FlexStretchFitContext {
+                available_margin_box_size: None,
+                margin_size: layout_pt(0.0),
+                non_content_size: non_content_pt(0.0),
+                box_sizing: BoxSizing::ContentBox,
+            },
+            flex_basis_overrides_main_size: false,
+            auto_cross_uses_stretch_fit: false,
+            auto_cross_fit_content: None,
+        };
+
+        assert!(
+            flex_item_size_dimension(
+                value,
+                content_box_pt(10.0),
+                content_box_pt(10.0),
+                content_box_pt(20.0),
+                context,
+            )
+            .is_auto()
+        );
+    }
+
+    #[test]
+    fn flex_container_min_dimension_uses_the_supplied_physical_basis() {
+        let fifty_percent = css::ComputedLengthPercentageOrAuto::LengthPercentage(
+            css::ComputedLengthPercentage::from_percent(0.5),
+        );
+        let width_basis = flex_available_percentage_basis_from_points(
+            Some(200.0),
+            FlexAvailableSizeSource::ContainingBlock,
+        );
+        let height_basis = flex_available_percentage_basis_from_points(
+            Some(80.0),
+            FlexAvailableSizeSource::ContainingBlock,
+        );
+
+        assert_eq!(
+            taffy_min_dimension(fifty_percent.clone(), width_basis),
+            taffy_layout::Dimension::length(100.0)
+        );
+        assert_eq!(
+            taffy_min_dimension(fifty_percent, height_basis),
+            taffy_layout::Dimension::length(40.0)
+        );
+    }
+
+    #[test]
     fn flex_gap_resolves_percentages_only_with_definite_basis() {
         let percent_gap =
             css::ComputedGap::LengthPercentage(css::ComputedLengthPercentage::from_percent(0.5));
@@ -1386,7 +1543,7 @@ mod tests {
     fn test_flex_basis_context() -> FlexBasisContext {
         FlexBasisContext {
             direction: FlexDirection::Row,
-            available_main_size: 200.0,
+            available_main_size: FlexMainSize::new(200.0),
             available_cross_size: None,
             stretched_cross_size: None,
             main_size_basis: PercentageBasis::definite_from(
@@ -1398,8 +1555,8 @@ mod tests {
     }
 
     fn test_flex_estimate() -> FlexItemEstimate {
-        FlexItemEstimate {
-            metrics: IntrinsicItemMetrics {
+        FlexItemEstimate::new(
+            IntrinsicItemMetrics {
                 width: content_box_pt(60.0),
                 height: content_box_pt(30.0),
                 min_width: content_box_pt(20.0),
@@ -1410,9 +1567,8 @@ mod tests {
                 first_baseline: None,
                 last_baseline: None,
             },
-            first_horizontal_baseline: None,
-            last_horizontal_baseline: None,
-        }
+            FlexItemBaselineEstimate::default(),
+        )
     }
 
     #[test]
@@ -1514,7 +1670,7 @@ mod tests {
             &style,
             &test_flex_estimate(),
             FlexDirection::Column,
-            Some(300.0),
+            Some(FlexCrossSize::new(300.0)),
             None,
             Some(1.0),
         )
@@ -1539,7 +1695,7 @@ mod tests {
             &style,
             &test_flex_estimate(),
             FlexDirection::Column,
-            Some(300.0),
+            Some(FlexCrossSize::new(300.0)),
             None,
             Some(1.0),
         )
@@ -1557,13 +1713,16 @@ mod tests {
         style.box_values.max_width = css::ComputedLengthPercentageOrAuto::LengthPercentage(
             css::ComputedLengthPercentage::from_percent(1.0),
         );
-        let estimate = FlexItemEstimate::fixed(100.0, 100.0);
+        let estimate = FlexItemEstimate::fixed(
+            PhysicalContentWidth::new(content_box_pt(100.0)),
+            PhysicalContentHeight::new(content_box_pt(100.0)),
+        );
 
         let basis = aspect_ratio_transferred_flex_basis(
             &style,
             &estimate,
             FlexDirection::Column,
-            Some(100.0),
+            Some(FlexCrossSize::new(100.0)),
             None,
             Some(1.0),
         )

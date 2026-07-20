@@ -42,30 +42,43 @@ hyphenation = { version = "0.8.4", features = ["embed_all"] }
 icu_casemap = "2.2"
 icu_locale_core = "2.2"
 icu_properties = "2.2"
+icu_provider = { version = "2.2", features = ["logging"] }
 icu_segmenter = "2.2"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+jxl-oxide = { version = "0.12.6", features = ["image", "moxcms"] }
 log = "0.4"
-lcms2 = "6.1.1"
+moxcms = { version = "0.9", features = ["extended_range"] }
+palette = { version = "0.7.6", default-features = false, features = ["std"] }
 subsetter = { version = "0.2.6", default-features = false }
 markup5ever_rcdom = "0.39.0"
 miniz_oxide = "0.8.9"
 parley = "0.11"
 pdf-writer = "0.15"
 precomputed-hash = "0.1.1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+read-fonts = "0.40.2"
 sha2 = "0.10"
 selectors = "0.38"
 taffy = "0.12"
 thiserror = "2"
 tiny-skia-path = "0.12"
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "fs", "sync"] }
+# `sync` is supported on every Quire target. Runtime and filesystem support
+# are native-only; browser-Wasm currently compiles the library but does not
+# provide a resource-loading backend.
+tokio = { version = "1.52", default-features = false, features = ["sync"] }
 ttf-parser = "0.25"
 url = "2"
 usvg = { version = "0.47", default-features = false }
 woff2-patched = "0.4"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+tokio = { version = "1.52", default-features = false, features = ["rt", "fs"] }
+
 [dev-dependencies]
 criterion = "0.8.2"
+# Test attributes and the example/benchmark multi-threaded runtimes are not
+# required by the library or the command-line binary.
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread"] }
 
 [lints.rust]
 missing_docs = "deny"

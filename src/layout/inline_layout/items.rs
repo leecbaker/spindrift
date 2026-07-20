@@ -1,8 +1,5 @@
 use super::super::*;
-use super::graph::{
-    InlineLineEdgeEffect, InlineLineEdgeEffectKind, InlineLineFragment, MeasuredInlineItem,
-    remeasure_materialized_item,
-};
+use super::graph::{InlineLineFragment, MeasuredInlineItem};
 use super::mixed::InlineTextBoxMetrics;
 use crate::css::{BoxDecorationBreak, TextBoxTrim, TextEdgeMetric};
 use crate::layout::inline_collect::{
@@ -35,6 +32,27 @@ fn text_combine_upright_text(text: &str, style: &ComputedStyle) -> Option<String
         }
         css::TextCombineUpright::Digits(_) => None,
     }
+}
+
+/// Undo the full-width transform before compressing a multi-character tate-chu-yoko run.
+///
+/// A single full-width character already fills the em square and remains
+/// unchanged. For a longer composition, CSS Writing Modes first returns the
+/// full-width ASCII forms to their ordinary forms, so width-alternative
+/// OpenType features can select the appropriate compressed glyphs.
+/// <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+fn reverse_full_width_transform_for_text_combine(text: &str) -> String {
+    if text.chars().nth(1).is_none() {
+        return text.to_owned();
+    }
+    text.chars()
+        .map(|character| match character {
+            '\u{3000}' => ' ',
+            '\u{ff01}'..='\u{ff5e}' => char::from_u32(u32::from(character) - 0xfee0)
+                .expect("full-width ASCII maps to a valid scalar"),
+            _ => character,
+        })
+        .collect()
 }
 
 /// Returns whether two normalized text items may belong to one
@@ -95,12 +113,41 @@ impl<'a> LayoutBuilder<'a> {
 
     pub(in crate::layout) fn layout_inline_items(
         &mut self,
+        items: Vec<InlineItem>,
+        block_style: &ComputedStyle,
+        available_width: f32,
+        padding_left: f32,
+        hanging_indent: f32,
+        stylesheets: &[Stylesheet],
+    ) -> InlineLayoutOutcome {
+        self.layout_inline_items_with_first_formatted_line_policy(
+            items,
+            block_style,
+            available_width,
+            padding_left,
+            hanging_indent,
+            stylesheets,
+            true,
+        )
+    }
+
+    /// Lay out one anonymous inline run with its originating block's
+    /// first-formatted-line state.
+    ///
+    /// CSS 2.2 anonymous blocks created around mixed inline/block children
+    /// are layout artifacts. They must not make a later inline run become a
+    /// new first formatted line for `text-indent`:
+    /// <https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level>.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layout) fn layout_inline_items_with_first_formatted_line_policy(
+        &mut self,
         mut items: Vec<InlineItem>,
         block_style: &ComputedStyle,
         available_width: f32,
         padding_left: f32,
         hanging_indent: f32,
         stylesheets: &[Stylesheet],
+        initial_first_formatted_line: bool,
     ) -> InlineLayoutOutcome {
         // Inline line boxes consume the block's line-height and indentation
         // directly. Materialize their used CSS `zoom` scale at this boundary;
@@ -109,6 +156,23 @@ impl<'a> LayoutBuilder<'a> {
         let mut used_block_style = block_style.clone();
         used_block_style.apply_effective_zoom();
         let block_style = &used_block_style;
+        if initial_first_formatted_line
+            && block_style
+                .first_letter_style
+                .as_deref()
+                .is_some_and(|first_letter| !first_letter.initial_letter.is_normal())
+        {
+            self.discard_provisional_initial_letter_exclusions(block_style);
+        }
+        if block_style.writing_mode == WritingMode::HorizontalTb
+            && initial_first_formatted_line
+            && block_style
+                .first_letter_style
+                .as_deref()
+                .is_some_and(|first_letter| !first_letter.initial_letter.is_normal())
+        {
+            self.clear_initial_letter_exclusions_for_new_initial(block_style);
+        }
         normalize_inline_whitespace_items(&mut items);
         self.form_text_combine_upright_atoms(&mut items);
         insert_text_autospace_items(&mut self.font_system, &mut items);
@@ -116,6 +180,7 @@ impl<'a> LayoutBuilder<'a> {
         let context = InlineParagraphContext {
             block_style,
             stylesheets,
+            initial_first_formatted_line,
             available_width,
             padding_left,
             hanging_indent,
@@ -240,9 +305,22 @@ impl<'a> LayoutBuilder<'a> {
         self.form_text_combine_upright_atoms(&mut items);
         insert_text_autospace_items(&mut self.font_system, &mut items);
         trim_inline_item_edges(&mut items);
+        if block_style.writing_mode == WritingMode::HorizontalTb
+            && block_style
+                .first_letter_style
+                .as_deref()
+                .is_some_and(|first_letter| !first_letter.initial_letter.is_normal())
+        {
+            // This is the durable sequence-building path for a block's
+            // first formatted line. Clear a preceding in-flow initial before
+            // fitting this new one, while leaving ordinary following blocks
+            // free to wrap around the existing exclusion.
+            self.clear_initial_letter_exclusions_for_new_initial(block_style);
+        }
         let context = InlineParagraphContext {
             block_style,
             stylesheets: &[],
+            initial_first_formatted_line: true,
             available_width,
             padding_left,
             hanging_indent,
@@ -337,18 +415,49 @@ impl<'a> LayoutBuilder<'a> {
                 index = end;
                 continue;
             };
+            // CSS Text's source transformation precedes the text-combine
+            // full-width reversal. Apply it once to the composed source,
+            // then leave the nested horizontal sequence with already-used
+            // text so it cannot transform the run a second time.
+            // <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+            // <https://drafts.csswg.org/css-text-3/#text-transform-property>
+            let transformed_text = transform_text(&text, style);
+            let horizontal_text = reverse_full_width_transform_for_text_combine(&transformed_text);
 
             let mut horizontal_style = style.clone();
             horizontal_style.writing_mode = WritingMode::HorizontalTb;
             horizontal_style.text_orientation = css::TextOrientation::Mixed;
             horizontal_style.text_combine_upright = css::TextCombineUpright::None;
+            horizontal_style.text_transform = css::TextTransform::NONE;
+            // Tate-chu-yoko composes its horizontal run in a one-em square.
+            // Center the uncompressed run there before the paint-time scale
+            // maps an over-wide run back to that same square.
+            // <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+            horizontal_style.text_align = TextAlign::Center;
+            // For two through four typographic characters, CSS Writing Modes
+            // selects the matching OpenType width alternative before any
+            // residual geometric compression. Fonts may provide narrower,
+            // better-shaped forms than a uniform scale can produce.
+            // <https://drafts.csswg.org/css-writing-modes-4/#text-combine-layout>
+            let compression_feature = match horizontal_text.chars().count() {
+                2 => Some(*b"hwid"),
+                3 => Some(*b"twid"),
+                4 => Some(*b"qwid"),
+                _ => None,
+            };
+            if let Some(feature) = compression_feature {
+                horizontal_style
+                    .font_feature_settings
+                    .0
+                    .push(css::FontFeatureSetting::new(feature, 1));
+            }
             let horizontal_width = self
                 .font_system
-                .measure_text(&text, &horizontal_style)
+                .measure_text(&horizontal_text, &horizontal_style)
                 .max(horizontal_style.font_size)
                 .max(1.0);
             let horizontal_word = InlineWord {
-                text,
+                text: horizontal_text,
                 style: inline_style(&horizontal_style),
                 baseline_shift: 0.0,
                 visual_offset: InlineVisualOffset::zero(),
@@ -400,6 +509,7 @@ impl<'a> LayoutBuilder<'a> {
         let mut cursor = InlineLineSequenceCursor {
             paragraph_index: 0,
             line_index: 0,
+            physical_block_offset: 0.0,
             starts_after_forced_break: false,
             starts_after_preserved_segment_break: false,
             has_flow_side_effects: false,
@@ -713,7 +823,7 @@ impl<'a> LayoutBuilder<'a> {
         (records, TextBoxLineTrim::default())
     }
 
-    fn apply_line_block_start_trim_for_paint(
+    pub(in crate::layout) fn apply_line_block_start_trim_for_paint(
         &mut self,
         line: &InlineLineRecord,
         writing_mode: WritingMode,
@@ -761,31 +871,71 @@ impl<'a> LayoutBuilder<'a> {
         let mut painted = 0usize;
         while painted < sequence.records.len() {
             let mut oversized_line_left_final_page_space = false;
-            let mut fragment_count = sequence.fitting_line_count(
+            // A speculative multicolumn balance pass must reject a candidate
+            // height that would require relaxing widows/orphans. The committed
+            // pass may relax only after reaching a real empty fragmentainer.
+            let at_fragmentainer_start = self.cursor_is_at_page_top();
+            let allow_unavoidable_relaxation =
+                at_fragmentainer_start && self.multicol_balance_probe_depth == 0;
+            let selection = sequence.fragment_break_selection(
                 painted,
                 self.cursor_y - self.page_bottom(),
-                self.cursor_is_at_page_top(),
+                allow_unavoidable_relaxation,
                 block_style.orphans,
                 block_style.widows,
             );
+            let mut fragment_count = selection.line_count().unwrap_or(0);
             if fragment_count == 0
                 && self
                     .fragmentainer_override
                     .is_some_and(|override_| override_.relax_widows_orphans)
             {
-                fragment_count = sequence.fitting_line_count(
-                    painted,
-                    self.cursor_y - self.page_bottom(),
-                    self.cursor_is_at_page_top(),
-                    1,
-                    1,
-                );
+                fragment_count = sequence
+                    .fragment_break_selection(
+                        painted,
+                        self.cursor_y - self.page_bottom(),
+                        self.cursor_is_at_page_top(),
+                        1,
+                        1,
+                    )
+                    .line_count()
+                    .unwrap_or(0);
             }
             if fragment_count == 0 && self.out_of_flow_prebreak_suppression_depth > 0 {
                 fragment_count = 1;
             }
             if fragment_count == 0 {
+                if self.multicol_balance_probe_depth > 0 {
+                    if selection.is_no_room() && !at_fragmentainer_start {
+                        self.push_page();
+                        continue;
+                    }
+                    // Do not manufacture an unbounded sequence of temporary
+                    // columns while probing an invalid balance height. The
+                    // probe observes this as overflowing its current column.
+                    self.mark_current_page_flow_content();
+                    self.cursor_y = self.page_bottom() - css::CSS_PX_TO_PT;
+                    break;
+                }
+                // An isolated atomic inline (notably an inline-table) has
+                // already captured its own formatting context. When its line
+                // moves as a unit, replay the enclosing block's destination
+                // geometry rather than preserving the source page's canvas
+                // translation through the generic line-break path.
+                // <https://www.w3.org/TR/css-break-3/#box-splitting>
+                let continuation = (self.active_fragmentainer_kind() == FragmentainerKind::Page
+                    && sequence.records[painted].has_isolated_atomic_inline_fragment())
+                .then(|| self.block_page_break_continuation_context());
+                let source_page_count = self.pages.len();
                 self.push_page();
+                if self.pages.len() != source_page_count
+                    && let Some(continuation) = continuation
+                {
+                    self.replay_fragment_continuation_on_page(
+                        &continuation,
+                        self.current_page_context,
+                    );
+                }
                 continue;
             }
             let context = sequence.context(block_style);
@@ -797,6 +947,7 @@ impl<'a> LayoutBuilder<'a> {
             );
             let fragment_records = sequence.fragment_records_for_paint(painted, fragment_count);
             for line in &fragment_records {
+                stack.advance(line.block_before);
                 stack.apply(self);
                 self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
                 let line_top = self.cursor_y;
@@ -933,13 +1084,16 @@ impl<'a> LayoutBuilder<'a> {
                 self.content_left = column_left;
                 self.content_right = column_left + geometry.column_width;
                 self.cursor_y = column_block_top;
-                let fragment_count = sequence.fitting_line_count(
-                    painted,
-                    row_column_height,
-                    true,
-                    block_style.orphans,
-                    block_style.widows,
-                );
+                let fragment_count = sequence
+                    .fragment_break_selection(
+                        painted,
+                        row_column_height,
+                        true,
+                        block_style.orphans,
+                        block_style.widows,
+                    )
+                    .line_count()
+                    .unwrap_or(0);
                 if fragment_count == 0 {
                     continue;
                 }
@@ -952,6 +1106,7 @@ impl<'a> LayoutBuilder<'a> {
                 );
                 let fragment_records = sequence.fragment_records_for_paint(painted, fragment_count);
                 for line in &fragment_records {
+                    stack.advance(line.block_before);
                     stack.apply(self);
                     self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
                     self.paint_collected_inline_line(
@@ -1020,25 +1175,31 @@ impl<'a> LayoutBuilder<'a> {
         let mut painted = 0usize;
         let mut marker_painted = false;
         while painted < sequence.records.len() {
-            let mut fragment_count = sequence.fitting_line_count(
-                painted,
-                self.cursor_y - self.page_bottom(),
-                self.cursor_is_at_page_top(),
-                block_style.orphans,
-                block_style.widows,
-            );
+            let mut fragment_count = sequence
+                .fragment_break_selection(
+                    painted,
+                    self.cursor_y - self.page_bottom(),
+                    self.cursor_is_at_page_top(),
+                    block_style.orphans,
+                    block_style.widows,
+                )
+                .line_count()
+                .unwrap_or(0);
             if fragment_count == 0
                 && self
                     .fragmentainer_override
                     .is_some_and(|override_| override_.relax_widows_orphans)
             {
-                fragment_count = sequence.fitting_line_count(
-                    painted,
-                    self.cursor_y - self.page_bottom(),
-                    self.cursor_is_at_page_top(),
-                    1,
-                    1,
-                );
+                fragment_count = sequence
+                    .fragment_break_selection(
+                        painted,
+                        self.cursor_y - self.page_bottom(),
+                        self.cursor_is_at_page_top(),
+                        1,
+                        1,
+                    )
+                    .line_count()
+                    .unwrap_or(0);
             }
             if fragment_count == 0 && self.out_of_flow_prebreak_suppression_depth > 0 {
                 fragment_count = 1;
@@ -1056,6 +1217,7 @@ impl<'a> LayoutBuilder<'a> {
             );
             let fragment_records = sequence.fragment_records_for_paint(painted, fragment_count);
             for line in &fragment_records {
+                stack.advance(line.block_before);
                 stack.apply(self);
                 self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
                 if !marker_painted {
@@ -1147,6 +1309,7 @@ impl<'a> LayoutBuilder<'a> {
         let mut stack =
             InlineLineStackCursor::new(block_style, saved_left, saved_right, fragment_block_top);
         for line in &fragment_records {
+            stack.advance(line.block_before);
             let line_top = stack.cursor_y;
             let line_bottom = line_top - line.height();
             if line_top >= slice_bottom && line_bottom <= slice_top {
@@ -1196,6 +1359,7 @@ impl<'a> LayoutBuilder<'a> {
         );
         let fragment_records = sequence.fragment_records_for_paint(0, sequence.records.len());
         for line in &fragment_records {
+            stack.advance(line.block_before);
             stack.apply(self);
             self.apply_line_block_start_trim_for_paint(line, block_style.writing_mode);
             if let Some(prepared) =
@@ -1221,6 +1385,7 @@ impl<'a> LayoutBuilder<'a> {
         let paragraph_index = cursor.paragraph_index;
         let line_index = cursor.line_index;
         let starts_after_forced_break = cursor.starts_after_forced_break;
+        let is_first_formatted_line = context.initial_first_formatted_line && line_index == 0;
         trim_inline_item_edges(paragraph);
         if paragraph.is_empty() {
             if force_empty_line {
@@ -1230,17 +1395,18 @@ impl<'a> LayoutBuilder<'a> {
                     paragraph_line_index: 0,
                     fragment: None,
                     is_phantom: false,
-                    is_first_formatted_line: line_index == 0,
+                    is_first_formatted_line,
                     is_last_line_in_paragraph: true,
                     is_forced_empty: true,
                     starts_after_preserved_segment_break: cursor
                         .starts_after_preserved_segment_break,
                     clear_after: Clear::None,
+                    block_before: 0.0,
                     block_start_trim: 0.0,
                     block_end_trim: 0.0,
                     paragraph_last_hanging_width: 0.0,
-                    used_indent: used_line_indent(
-                        line_index,
+                    used_indent: used_line_indent_for_formatted_line(
+                        is_first_formatted_line,
                         starts_after_forced_break,
                         context.hanging_indent,
                         context.block_style,
@@ -1260,19 +1426,77 @@ impl<'a> LayoutBuilder<'a> {
         let paragraph_start_line_index = line_index;
         let graph =
             self.build_inline_opportunity_graph(paragraph.iter().cloned(), context.block_style);
-        let graph = if line_index == 0 {
+        let graph = if is_first_formatted_line {
             self.graph_with_first_letter_pseudo(&graph, context.block_style)
         } else {
             graph
         };
-        let selected_lines = self.select_inline_lines_from_graph(
+        // Collected-line layout is used for explicit breaks, columns, and
+        // fragmentation. Its first graph must participate in the same
+        // initial-letter selection lifecycle as the direct paragraph path;
+        // otherwise companion source is selected at the full measure and the
+        // exclusion appears only after that source has committed.
+        // <https://drafts.csswg.org/css-inline-3/#initial-letter-position>
+        if is_first_formatted_line {
+            self.register_provisional_initial_letter_exclusion(
+                &graph,
+                context,
+                line_index,
+                starts_after_forced_break,
+                false,
+            );
+        }
+        let selected_lines = self.select_inline_lines_from_graph_with_block_offset(
             &graph,
             context,
             line_index,
             starts_after_forced_break,
+            cursor.physical_block_offset,
         );
         let line_boxes = selected_lines.fragments;
         let next_line_index = selected_lines.next_line_index;
+        // A float-only source range has no in-flow fragment, but a following
+        // forced break still creates and advances an empty line box. Preserve
+        // that line in the collected representation used whenever explicit
+        // breaks require fragmentation-aware line painting.
+        // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+        // <https://drafts.csswg.org/css-inline-3/#line-boxes>
+        if force_empty_line && line_boxes.is_empty() {
+            output.push(InlineLineRecord {
+                paragraph_index,
+                block_line_index: next_line_index,
+                paragraph_line_index: 0,
+                fragment: None,
+                is_phantom: false,
+                is_first_formatted_line: context.initial_first_formatted_line
+                    && next_line_index == 0,
+                is_last_line_in_paragraph: true,
+                is_forced_empty: true,
+                starts_after_preserved_segment_break: cursor.starts_after_preserved_segment_break,
+                clear_after: Clear::None,
+                block_before: 0.0,
+                block_start_trim: 0.0,
+                block_end_trim: 0.0,
+                paragraph_last_hanging_width: 0.0,
+                used_indent: used_line_indent_for_formatted_line(
+                    context.initial_first_formatted_line && next_line_index == 0,
+                    starts_after_forced_break,
+                    context.hanging_indent,
+                    context.block_style,
+                    context.available_width,
+                ),
+                available_width: context.available_width,
+                line_height: context.block_style.line_height,
+            });
+            paragraph.clear();
+            return InlineLineSequenceCursor {
+                line_index: next_line_index + 1,
+                physical_block_offset: selected_lines.next_physical_block_offset,
+                has_flow_side_effects: cursor.has_flow_side_effects
+                    || selected_lines.has_float_side_effects,
+                ..cursor
+            };
+        }
         let paragraph_last_hanging_width = line_boxes
             .last()
             .map(|line_box| {
@@ -1294,13 +1518,15 @@ impl<'a> LayoutBuilder<'a> {
                     paragraph_line_index: next_record_line_index - paragraph_start_line_index,
                     fragment: None,
                     is_phantom: false,
-                    is_first_formatted_line: next_record_line_index == 0,
+                    is_first_formatted_line: context.initial_first_formatted_line
+                        && next_record_line_index == 0,
                     is_last_line_in_paragraph: false,
                     // Float exclusions can consume a physical line before a
                     // graph range fits the following available float band.
                     is_forced_empty: true,
                     starts_after_preserved_segment_break: false,
                     clear_after: Clear::None,
+                    block_before: 0.0,
                     block_start_trim: 0.0,
                     block_end_trim: 0.0,
                     paragraph_last_hanging_width,
@@ -1311,16 +1537,27 @@ impl<'a> LayoutBuilder<'a> {
                 next_record_line_index += 1;
             }
             let line_box_index = line_box.line_index;
-            // A fragment's specified line-height participates in the line
-            // box even when glyph metrics are smaller. This is especially
-            // important after CSS `zoom` has enlarged an inline descendant
-            // relative to the enclosing block.
+            // Atomic inline boxes contribute a margin-box extent outside the
+            // text metrics. Text fragments' specified `line-height` is
+            // already reflected in `line_box.metrics`; reapplying it here
+            // would discard a selected text-box edge or trim.
             // <https://drafts.csswg.org/css-inline-3/#line-height-property>
-            // <https://drafts.csswg.org/css-viewport/#zoom-property>
             let item_line_height = line_box
                 .fragment
                 .items()
                 .iter()
+                // An initial letter spans multiple lines through its own
+                // exclusion geometry; it must not make the originating
+                // collected line record taller than the parent strut.
+                // <https://drafts.csswg.org/css-inline-3/#initial-letter-position>
+                .filter(|item| {
+                    !LayoutBuilder::inline_line_item_is_initial_letter(&item.item)
+                        && matches!(
+                            &item.item,
+                            InlineLineItem::Atom(atom)
+                                if !matches!(atom.content(), InlineAtomContent::InlineEdge(_))
+                        )
+                })
                 .map(|item| inline_line_item_logical_block_size(&item.item, context.block_style))
                 .fold(0.0_f32, f32::max);
             let line_height = line_box
@@ -1337,12 +1574,14 @@ impl<'a> LayoutBuilder<'a> {
                 paragraph_line_index: line_box_index - paragraph_start_line_index,
                 fragment: Some(line_box.fragment),
                 is_phantom,
-                is_first_formatted_line: line_box_index == 0,
+                is_first_formatted_line: context.initial_first_formatted_line
+                    && line_box_index == 0,
                 is_last_line_in_paragraph: offset + 1 == line_count,
                 is_forced_empty: false,
                 starts_after_preserved_segment_break: offset == 0
                     && cursor.starts_after_preserved_segment_break,
                 clear_after: Clear::None,
+                block_before: 0.0,
                 block_start_trim: 0.0,
                 block_end_trim: 0.0,
                 paragraph_last_hanging_width,
@@ -1355,6 +1594,7 @@ impl<'a> LayoutBuilder<'a> {
         paragraph.clear();
         InlineLineSequenceCursor {
             line_index: next_line_index,
+            physical_block_offset: selected_lines.next_physical_block_offset,
             has_flow_side_effects: cursor.has_flow_side_effects
                 || selected_lines.has_float_side_effects,
             ..cursor
@@ -1387,9 +1627,24 @@ impl<'a> LayoutBuilder<'a> {
             .fragment
             .as_ref()
             .is_some_and(|fragment| fragment.suppress_float_adjust);
-        if !suppress_float_adjust {
+        // The selector has already resolved this line's page-local exclusion
+        // band. Re-query only after fragmentation moves the line to another
+        // page; a live query on the selected page would retroactively see
+        // exclusions committed by later selection work.
+        let selected_on_current_page = line.fragment.as_ref().is_some_and(|fragment| {
+            fragment.selected_float_page_index == self.current_float_page_index()
+        });
+        // Horizontal collected layout has a distinct float-placement replay
+        // path that can commit a same-page CSS float between selection and
+        // paint. Keep that established behavior intact; vertical lines are
+        // the logical-axis path where the frozen band prevents a second,
+        // physically projected adjustment.
+        let replay_selected_vertical_band = context.block_style.writing_mode
+            != WritingMode::HorizontalTb
+            && selected_on_current_page;
+        if !suppress_float_adjust && !replay_selected_vertical_band {
             if context.block_style.writing_mode == WritingMode::HorizontalTb {
-                let band = self.current_float_band(self.cursor_y, line_height);
+                let band = self.current_float_band(PageBlockSpan::new(self.cursor_y, line_height));
                 let left_offset = (band.left() - self.content_left - context.padding_left).max(0.0);
                 let right_offset = (self.content_right - band.right()).max(0.0);
                 if left_offset > 0.0 || right_offset > 0.0 {
@@ -1402,15 +1657,25 @@ impl<'a> LayoutBuilder<'a> {
             } else {
                 let band = self.current_logical_float_band(
                     context.block_style.writing_mode,
-                    context.block_style.direction,
-                    self.content_left + context.padding_left,
-                    line_height,
-                    self.cursor_y,
-                    context.available_width,
+                    context.block_style.used_direction(),
+                    FloatBandQuery {
+                        horizontal_slab: PageInlineSpan::new(
+                            self.content_left + context.padding_left,
+                            line_height,
+                        ),
+                        vertical_slab: vertical_physical_inline_span(
+                            context.block_style.writing_mode,
+                            context.block_style.used_direction(),
+                            PageTopBlockPosition::new(self.cursor_y),
+                            layout_pt(context.available_width),
+                        ),
+                    },
                 );
-                if band.inline_start() > 0.0 || band.inline_end() < context.available_width - 0.01 {
-                    paint_line.available_width = line.available_width.min(band.inline_end());
-                    paint_line.used_indent = line.used_indent.max(band.inline_start());
+                if band.inline_span.start() > 0.0
+                    || band.inline_span.end() < context.available_width - 0.01
+                {
+                    paint_line.available_width = line.available_width.min(band.inline_span.end());
+                    paint_line.used_indent = line.used_indent.max(band.inline_span.start());
                     paint_context.available_width = paint_line.available_width;
                 }
             }
@@ -1476,9 +1741,9 @@ impl<'a> LayoutBuilder<'a> {
             plaintext_direction_state,
         );
         let line_direction = if block_style.unicode_bidi == UnicodeBidi::Plaintext {
-            (*plaintext_direction_state).unwrap_or(block_style.direction)
+            (*plaintext_direction_state).unwrap_or(block_style.used_direction())
         } else {
-            block_style.direction
+            block_style.used_direction()
         };
         let mut metrics = line_box.metrics;
         // A left float shifts the physical left edge of an RTL line but does
@@ -1487,14 +1752,16 @@ impl<'a> LayoutBuilder<'a> {
         // LTR painting; do not apply it a second time as an RTL logical
         // indent after a replayed inline float.
         // <https://www.w3.org/TR/CSS22/visuren.html#floats>
-        let paint_indent = if line_box.suppress_float_adjust
-            && line_direction == Direction::Rtl
-            && line.used_indent > 0.0
-        {
-            0.0
-        } else {
-            line.used_indent
-        };
+        let paint_indent = line_box.source_paint_indent.unwrap_or_else(|| {
+            if line_box.suppress_float_adjust
+                && line_direction == Direction::Rtl
+                && line.used_indent > 0.0
+            {
+                0.0
+            } else {
+                line.used_indent
+            }
+        });
         let line_available_width = (line.available_width - paint_indent).max(0.0);
         let hanging_widths = hanging_punctuation_widths_for_line_items(
             &mut self.font_system,
@@ -1534,14 +1801,11 @@ impl<'a> LayoutBuilder<'a> {
         // inline box for painting. In particular, an inline background must
         // cover an ideographic space that hangs past the selected line edge.
         // <https://www.w3.org/TR/css-text-3/#white-space-phase-2>
-        let mut selected_paint_items = line_box.items().to_vec();
-        trim_selected_line_edge_source_effects(
-            &mut selected_paint_items,
-            &line_box.edge_effects.source_effects,
-            &mut self.font_system,
+        let mut line_items = self.visual_ordered_mixed_inline_line_items(
+            line_box.items(),
+            block_style,
+            &line_box.bidi_scope_continuations,
         );
-        let mut line_items =
-            self.visual_ordered_mixed_inline_line_items(&selected_paint_items, block_style);
         debug_assert!(line_box.edge_effects.source_effects.iter().all(|effect| {
             line_box
                 .items()
@@ -1559,22 +1823,26 @@ impl<'a> LayoutBuilder<'a> {
         if line_box.edge_effects.collapsed_end_trim_width > 0.0 {
             trim_visual_line_end_collapsible_spaces(&mut line_items, line_direction);
         }
-        // CSS Text Phase II leaves the selected source intact in the graph,
-        // but hanging source ranges do not generate line-fragment paint. This
-        // keeps an inline background from extending a shrink-to-fit box merely
-        // because its final whitespace hangs outside the line edge. The graph
-        // retains the original source ranges for extraction ownership.
+        // CSS Text Phase II excludes the hanging suffix from fitting and
+        // alignment, but it remains selected source for painting. In
+        // particular, inline backgrounds and decorations extend across that
+        // suffix even when it hangs beyond the formatted line measure.
         // <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
-        let paint_fragment = InlineLineFragment::new(
+        let mut paint_fragment = InlineLineFragment::new(
             line_items,
             metrics,
             hanging_widths,
             line_box.indent,
             line.available_width,
+            line_box.selected_float_page_index,
             line_box.suppress_float_adjust,
             line_text,
         )
-        .with_edge_effects(line_box.edge_effects.clone());
+        .with_edge_effects(line_box.edge_effects.clone())
+        .with_bidi_scope_continuations(line_box.bidi_scope_continuations.clone());
+        if let Some(source_paint_indent) = line_box.source_paint_indent {
+            paint_fragment = paint_fragment.with_source_paint_indent(source_paint_indent);
+        }
         self.prepare_inline_line_fragment(
             &paint_fragment,
             InlinePaintContext {
@@ -1585,6 +1853,7 @@ impl<'a> LayoutBuilder<'a> {
                 line_indent: paint_indent,
                 text_align,
                 is_first_line: line.is_first_formatted_line,
+                line_block_size: line.height(),
             },
         )
     }
@@ -1635,6 +1904,34 @@ impl<'a> LayoutBuilder<'a> {
             plaintext_direction_state,
         );
         paragraph.clear();
+        // A leading float is out of flow and therefore produces no selected
+        // in-flow fragment by itself. A following forced break nevertheless
+        // terminates an empty line box; otherwise each leading float causes
+        // the first `br` to disappear and following content is one line too
+        // close to the float.
+        // <https://www.w3.org/TR/CSS22/visuren.html#floats>
+        // <https://drafts.csswg.org/css-inline-3/#line-boxes>
+        if force_empty_line && !outcome.has_non_phantom_line {
+            if context.block_style.writing_mode == WritingMode::HorizontalTb
+                && self.cursor_y - context.block_style.line_height < self.page_bottom()
+            {
+                self.push_page();
+            }
+            let mut stack = InlineLineStackCursor::new(
+                context.block_style,
+                self.content_left,
+                self.content_right,
+                self.cursor_y,
+            );
+            stack.advance(context.block_style.line_height);
+            stack.apply(self);
+            return InlineLayoutOutcome {
+                next_line_index: outcome.next_line_index + 1,
+                clamp_line_slots: outcome.clamp_line_slots + 1,
+                has_non_phantom_line: true,
+                has_flow_effects: true,
+            };
+        }
         outcome
     }
 
@@ -1652,18 +1949,18 @@ impl<'a> LayoutBuilder<'a> {
         let cleared_top = self.clear_active_floats_top(
             clear,
             context.block_style.writing_mode,
-            context.block_style.direction,
-            self.cursor_y,
+            context.block_style.used_direction(),
+            PageTopBlockPosition::new(self.cursor_y),
         );
-        let clearance_moved =
-            self.pages.len() != before_clear_page_index || cleared_top < before_clear_top - 0.01;
+        let clearance_moved = self.pages.len() != before_clear_page_index
+            || cleared_top.points() < before_clear_top - 0.01;
         if clearance_moved {
             self.applied_clearance_count += 1;
         }
         self.cursor_y = if clearance_moved {
-            cleared_top - 0.01
+            cleared_top.toward_block_end(layout_pt(0.01)).points()
         } else {
-            cleared_top
+            cleared_top.points()
         };
         line_index
     }
@@ -1778,6 +2075,10 @@ impl InlineLayoutOutcome {
 struct InlineLineSequenceCursor {
     paragraph_index: usize,
     line_index: usize,
+    /// Extra physical block displacement selected by an earlier graph. This
+    /// survives explicit breaks because they split source graphs, not the
+    /// line stack's page-local coordinate system.
+    physical_block_offset: f32,
     starts_after_forced_break: bool,
     starts_after_preserved_segment_break: bool,
     has_flow_side_effects: bool,
@@ -1799,6 +2100,7 @@ fn clearance_only_inline_line_record(
         is_forced_empty: false,
         starts_after_preserved_segment_break: false,
         clear_after: clear,
+        block_before: 0.0,
         block_start_trim: 0.0,
         block_end_trim: 0.0,
         paragraph_last_hanging_width: 0.0,
@@ -1815,7 +2117,7 @@ fn clearance_only_inline_line_record(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct InlineLineStackCursor {
+pub(in crate::layout) struct InlineLineStackCursor {
     writing_mode: WritingMode,
     content_left: f32,
     content_right: f32,
@@ -1830,7 +2132,7 @@ impl InlineLineStackCursor {
     /// physical x in vertical writing:
     /// <https://www.w3.org/TR/css-inline-3/#line-box> and
     /// <https://www.w3.org/TR/css-writing-modes-4/#abstract-box>.
-    fn new(
+    pub(in crate::layout) fn new(
         block_style: &ComputedStyle,
         content_left: f32,
         content_right: f32,
@@ -1844,13 +2146,13 @@ impl InlineLineStackCursor {
         }
     }
 
-    fn apply(self, layout: &mut LayoutBuilder<'_>) {
+    pub(in crate::layout) fn apply(self, layout: &mut LayoutBuilder<'_>) {
         layout.content_left = self.content_left;
         layout.content_right = self.content_right;
         layout.cursor_y = self.cursor_y;
     }
 
-    fn advance(&mut self, line_block_size: f32) {
+    pub(in crate::layout) fn advance(&mut self, line_block_size: f32) {
         match self.writing_mode {
             WritingMode::HorizontalTb => {
                 self.cursor_y -= line_block_size;
@@ -1875,6 +2177,7 @@ impl InlineLineSequence {
         InlineParagraphContext {
             block_style,
             stylesheets: &[],
+            initial_first_formatted_line: true,
             available_width: self.available_width,
             padding_left: self.padding_left,
             hanging_indent: self.hanging_indent,
@@ -2097,8 +2400,9 @@ impl InlineLineSequence {
         slice_top: f32,
         slice_bottom: f32,
     ) -> Option<(usize, f32)> {
-        let mut line_top = block_top;
+        let mut line_block_start = block_top;
         for index in 0..self.records.len() {
+            let line_top = line_block_start - self.records[index].block_before;
             let line_height = if self.fragment_text_box_trim.is_empty() {
                 self.records[index].height()
             } else {
@@ -2106,9 +2410,9 @@ impl InlineLineSequence {
             };
             let line_bottom = line_top - line_height;
             if line_top >= slice_bottom && line_bottom <= slice_top {
-                return Some((index, line_top));
+                return Some((index, line_block_start));
             }
-            line_top = line_bottom;
+            line_block_start = line_bottom;
         }
         None
     }
@@ -2119,9 +2423,10 @@ impl InlineLineSequence {
         start_block_top: f32,
         slice_bottom: f32,
     ) -> usize {
-        let mut line_top = start_block_top;
+        let mut line_block_start = start_block_top;
         let mut count = 0;
         for record in &self.records[start_index..] {
+            let line_top = line_block_start - record.block_before;
             let line_bottom = line_top - record.height();
             if line_top < slice_bottom || line_bottom > start_block_top {
                 break;
@@ -2130,7 +2435,7 @@ impl InlineLineSequence {
             if line_bottom <= slice_bottom {
                 break;
             }
-            line_top = line_bottom;
+            line_block_start = line_bottom;
         }
         count
     }
@@ -2178,7 +2483,7 @@ impl InlineLineSequence {
                 line.block_end_trim = self.fragment_text_box_trim.block_end;
             }
         }
-        line.height()
+        line.block_advance()
     }
 
     fn multicolumn_height_paints_all_lines_from(
@@ -2194,11 +2499,11 @@ impl InlineLineSequence {
             if painted >= self.records.len() {
                 return true;
             }
-            let fragment_count =
-                self.fitting_line_count(painted, column_height, true, orphans, widows);
-            if fragment_count == 0 {
+            let selection =
+                self.fragment_break_selection(painted, column_height, false, orphans, widows);
+            let Some(fragment_count) = selection.line_count() else {
                 return false;
-            }
+            };
             painted += fragment_count;
         }
         painted >= self.records.len()
@@ -2262,24 +2567,26 @@ impl InlineLineSequence {
         Some((block_start_index, block_end_index))
     }
 
-    /// Return the number of selected line records that fit in a fragmentainer.
+    /// Select the next fragment's line records under the CSS Fragmentation
+    /// widows/orphans constraints.
     ///
-    /// The calculation is pure over the selected sequence so normal pagination,
-    /// table-cell slicing, and inline-block slice painting share the same line
-    /// heights and CSS Fragmentation widows/orphans decisions:
-    /// <https://www.w3.org/TR/css-break-3/#widows-orphans>.
-    ///
-    pub(in crate::layout) fn fitting_line_count(
+    /// A balancing probe passes `allow_unavoidable_relaxation: false`: a
+    /// candidate column height that cannot host a legal class-B break is not a
+    /// fitting balanced height. Painting permits the narrowly-scoped fallback
+    /// at a fragmentainer start so an undersized finite fragmentainer can
+    /// still make progress.
+    /// <https://www.w3.org/TR/css-break-3/#widows-orphans>
+    pub(in crate::layout) fn fragment_break_selection(
         &self,
         start_index: usize,
         available_height: f32,
-        at_fragmentainer_start: bool,
+        allow_unavoidable_relaxation: bool,
         orphans: usize,
         widows: usize,
-    ) -> usize {
-        let remaining_total = self.records.len().saturating_sub(start_index);
-        if remaining_total == 0 {
-            return 0;
+    ) -> InlineFragmentBreakSelection {
+        let remaining_record_count = self.records.len().saturating_sub(start_index);
+        if remaining_record_count == 0 {
+            return InlineFragmentBreakSelection::NoLines;
         }
 
         let mut fitting = 0;
@@ -2293,27 +2600,134 @@ impl InlineLineSequence {
         }
 
         if fitting == 0 {
-            return usize::from(at_fragmentainer_start);
+            return if allow_unavoidable_relaxation {
+                InlineFragmentBreakSelection::Relaxed(1)
+            } else {
+                InlineFragmentBreakSelection::NoRoom
+            };
         }
-        if fitting >= remaining_total {
-            return remaining_total;
+        if fitting >= remaining_record_count {
+            return InlineFragmentBreakSelection::Lines(remaining_record_count);
         }
 
         // CSS Fragmentation 3 defines `orphans` and `widows` as constraints on
-        // unforced line breaks inside a block container.
+        // in-flow line boxes at unforced breaks inside a block container.
+        // Float-only records are still kept in the selected record range so
+        // their placement is committed with surrounding flow, but an
+        // out-of-flow float is not itself an orphan or widow.
         // https://www.w3.org/TR/css-break-3/#widows-orphans
-        let orphans = orphans.min(remaining_total).max(1);
-        let widows = widows.min(remaining_total).max(1);
-        if fitting < orphans && !at_fragmentainer_start {
-            return 0;
+        let remaining_total = self.records[start_index..]
+            .iter()
+            .filter(|record| record.participates_in_widows_orphans())
+            .count();
+        let fitting_line_count = self.records[start_index..start_index + fitting]
+            .iter()
+            .filter(|record| record.participates_in_widows_orphans())
+            .count();
+        if fitting_line_count == 0 || remaining_total == 0 {
+            return InlineFragmentBreakSelection::Lines(fitting);
+        }
+        let orphans = orphans.max(1);
+        let widows = widows.max(1);
+        // A block with no spare line beyond either requirement has no legal
+        // class-B break. It must move as a unit when possible, rather than
+        // treating one satisfied orphan line as permission to strand a widow.
+        if remaining_total <= orphans || remaining_total <= widows {
+            return if allow_unavoidable_relaxation {
+                InlineFragmentBreakSelection::Relaxed(fitting)
+            } else {
+                InlineFragmentBreakSelection::KeepTogether
+            };
+        }
+        if fitting_line_count < orphans {
+            return if allow_unavoidable_relaxation {
+                InlineFragmentBreakSelection::Relaxed(fitting)
+            } else {
+                InlineFragmentBreakSelection::KeepTogether
+            };
+        }
+        let remaining_after_fitting = remaining_total - fitting_line_count;
+        if remaining_after_fitting >= widows {
+            return InlineFragmentBreakSelection::Lines(fitting);
         }
 
-        let remaining_after_break = remaining_total - fitting;
-        if remaining_after_break < widows && fitting > orphans {
-            return (remaining_total - widows).max(orphans);
+        let preferred = remaining_total.saturating_sub(widows);
+        if preferred >= orphans {
+            return InlineFragmentBreakSelection::Lines(self.record_count_through_in_flow_lines(
+                start_index,
+                fitting,
+                preferred.min(fitting_line_count),
+            ));
         }
 
-        fitting
+        // The source block is large enough for both requirements, but this
+        // particular continuation cannot satisfy them simultaneously. Keep
+        // the required preceding lines and leave as many following lines as
+        // possible, which is CSS Fragmentation's unforced-break relaxation.
+        InlineFragmentBreakSelection::Relaxed(self.record_count_through_in_flow_lines(
+            start_index,
+            fitting,
+            orphans,
+        ))
+    }
+
+    /// Include trailing float-only records after the selected in-flow line.
+    ///
+    /// Their paint/placement belongs to this fragmentainer, but they are not
+    /// line boxes for CSS Fragmentation's `orphans` and `widows` constraints.
+    fn record_count_through_in_flow_lines(
+        &self,
+        start_index: usize,
+        maximum_count: usize,
+        requested_line_count: usize,
+    ) -> usize {
+        let end_index = start_index
+            .saturating_add(maximum_count)
+            .min(self.records.len());
+        let mut count = 0;
+        let mut line_count = 0;
+        for record in &self.records[start_index..end_index] {
+            count += 1;
+            if record.participates_in_widows_orphans() {
+                line_count += 1;
+                if line_count == requested_line_count {
+                    break;
+                }
+            }
+        }
+        while start_index + count < end_index
+            && !self.records[start_index + count].participates_in_widows_orphans()
+        {
+            count += 1;
+        }
+        count
+    }
+}
+
+/// The result of choosing a class-B break for an inline formatting context.
+///
+/// `KeepTogether` is deliberately distinct from zero lines: balancing needs
+/// to reject that column height, while actual layout may advance to another
+/// fragmentainer before it is forced to relax the constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::layout) enum InlineFragmentBreakSelection {
+    NoLines,
+    NoRoom,
+    Lines(usize),
+    KeepTogether,
+    Relaxed(usize),
+}
+
+impl InlineFragmentBreakSelection {
+    pub(in crate::layout) fn line_count(self) -> Option<usize> {
+        match self {
+            Self::Lines(count) | Self::Relaxed(count) => Some(count),
+            Self::NoLines | Self::NoRoom | Self::KeepTogether => None,
+        }
+    }
+
+    fn is_no_room(self) -> bool {
+        self == Self::NoRoom
     }
 }
 
@@ -2340,6 +2754,11 @@ pub(in crate::layout) struct InlineLineRecord {
     /// Source-sensitive CSS Text Phase II line-start state.
     pub(in crate::layout) starts_after_preserved_segment_break: bool,
     pub(in crate::layout) clear_after: Clear,
+    /// Physical block-axis distance inserted before this line's line box.
+    ///
+    /// This models float retries that land at an analytic shape boundary
+    /// between ordinary line-height rows.
+    pub(in crate::layout) block_before: f32,
     pub(in crate::layout) block_start_trim: f32,
     pub(in crate::layout) block_end_trim: f32,
     pub(in crate::layout) paragraph_last_hanging_width: f32,
@@ -2349,6 +2768,10 @@ pub(in crate::layout) struct InlineLineRecord {
 }
 
 impl InlineLineRecord {
+    pub(in crate::layout) fn block_advance(&self) -> f32 {
+        self.block_before + self.height()
+    }
+
     pub(in crate::layout) fn height(&self) -> f32 {
         if self.is_phantom
             && !self
@@ -2367,6 +2790,13 @@ impl InlineLineRecord {
             .is_some_and(inline_line_fragment_has_layout_effects)
     }
 
+    fn participates_in_widows_orphans(&self) -> bool {
+        // A float-only source record contributes no in-flow line box. A
+        // mixed line that also contains text remains an in-flow line and is
+        // therefore counted normally.
+        !self.is_phantom || !self.has_inline_layout_effects()
+    }
+
     /// Whether this line carries an atomic formatting context whose paint was
     /// already isolated before line placement, such as an `inline-table`.
     ///
@@ -2381,7 +2811,7 @@ impl InlineLineRecord {
                 matches!(
                     item.item,
                     InlineLineItem::Atom(ref atom)
-                        if matches!(atom.content(), InlineAtomContent::InlineFragment(_))
+                        if matches!(atom.content(), InlineAtomContent::InlineFragment { .. })
                 )
             })
         })
@@ -2455,7 +2885,7 @@ fn inline_atom_is_phantom(atom: &InlineAtom) -> bool {
         | InlineAtomContent::Svg { .. }
         | InlineAtomContent::InlineBox { .. }
         | InlineAtomContent::TextCombineUpright { .. }
-        | InlineAtomContent::InlineFragment(_) => false,
+        | InlineAtomContent::InlineFragment { .. } => false,
     }
 }
 
@@ -2469,7 +2899,7 @@ fn inline_items_can_fragment_as_collected_lines(items: &[InlineItem]) -> bool {
         && items.iter().all(|item| {
             !matches!(
                 item,
-                InlineItem::Float(_) | InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd
+                InlineItem::PageScopeStart(_) | InlineItem::PageScopeEnd
             )
         })
 }
@@ -2551,47 +2981,6 @@ fn trim_visual_line_end_collapsible_spaces(
     }
 }
 
-/// Remove selected Phase II hanging source ranges before paint shaping.
-///
-/// The graph retains those ranges for source ownership, but their glyphs and
-/// inline backgrounds do not belong to the formatted line fragment. Re-shape
-/// the retained prefix so its advance and PDF text run agree with the selected
-/// CSS Text edge effect.
-/// <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
-fn trim_selected_line_edge_source_effects(
-    items: &mut Vec<MeasuredInlineItem>,
-    effects: &[InlineLineEdgeEffect],
-    font_system: &mut FontSystem,
-) {
-    for effect in effects.iter().rev() {
-        if !matches!(
-            effect.kind,
-            InlineLineEdgeEffectKind::PreWrapHang
-                | InlineLineEdgeEffectKind::UnconditionalSeparatorHang
-        ) {
-            continue;
-        }
-        let Some(item) = items.get_mut(effect.item_index) else {
-            continue;
-        };
-        let InlineLineItem::Fragment(fragment) = &mut item.item else {
-            continue;
-        };
-        if effect.source_range.end != fragment.text().len()
-            || !fragment.text().is_char_boundary(effect.source_range.start)
-        {
-            continue;
-        }
-        let retained = Rc::<str>::from(&fragment.text()[..effect.source_range.start]);
-        fragment.set_text(retained);
-        fragment.set_preserves_source_shaping(false);
-        remeasure_materialized_item(item, font_system);
-    }
-    items.retain(|item| {
-        !matches!(&item.item, InlineLineItem::Fragment(fragment) if fragment.text().is_empty())
-    });
-}
-
 #[cfg(test)]
 mod text_combine_upright_tests {
     use super::*;
@@ -2616,6 +3005,13 @@ mod text_combine_upright_tests {
             hanging_edges: InlineHangingEdges::default(),
             ancestor_inline_decorations: Vec::new().into(),
         }
+    }
+
+    #[test]
+    fn text_combine_reverses_full_width_ascii_only_for_multi_character_runs() {
+        assert_eq!(reverse_full_width_transform_for_text_combine("０"), "０");
+        assert_eq!(reverse_full_width_transform_for_text_combine("００"), "00");
+        assert_eq!(reverse_full_width_transform_for_text_combine("ＡＢ"), "AB");
     }
 
     #[test]

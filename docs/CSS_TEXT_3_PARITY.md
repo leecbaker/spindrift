@@ -37,14 +37,16 @@ except where existing code already implements draft properties.
 - Regular inline box edges are transparent to graph-backed CSS Text break
   discovery, so margin/border/padding edge atoms remain materialized for
   painting while line breaking sees the surrounding text.
-- Atomic-inline boundary opportunities use the paragraph's common inline
-  ancestor policy rather than the descendants' `white-space`; this keeps
-  sibling `pre` spans from suppressing the ancestor-owned wrap around replaced
-  content. The typed boundary resolver preserves UAX #14 `WORD JOINER`
-  controls on either side of an atomic object while using U+FFFC only as
-  transient UAX input. Out-of-flow static-position placeholders are instead
-  transparent to the surrounding text stream and never create a U+FFFC-style
-  opportunity.
+- Cross-element text and atomic-inline boundary opportunities take their
+  wrapping-mode policy from the nearest common lexical inline ancestor, rather
+  than from either descendant's `white-space`. This keeps sibling `pre` spans
+  from suppressing an ancestor-owned wrap, while retaining the participating
+  text runs' local `line-break`, `word-break`, and `overflow-wrap` behavior.
+  The typed boundary resolver uses U+FFFC only as transient UAX #14 input for
+  atomics, preserves the NBSP compatibility opportunity, and suppresses GL,
+  `WORD JOINER`, and ZWJ boundaries. Out-of-flow static-position placeholders
+  and regular inline box edges are transparent to the surrounding text stream
+  and never create U+FFFC-style opportunities.
 - Horizontal mixed inline bidi reordering now operates on measured inline
   items, preserving neutral text fragments such as collapsed spaces and keeping
   regular inline box edge atoms attached to the adjacent visual content that
@@ -65,11 +67,17 @@ except where existing code already implements draft properties.
   such as a font-internal ZWJ space glyph, while retaining positioned combining
   marks.
 - Forced segment breaks now flush before following zero-width bidi controls,
-  so an inline isolate or override begins on its own post-`br` line. Once a
-  mixed line has resolved UAX #9 visual order, its final measurement and text
-  paint shaping use one explicit visual-order guard instead of applying each
-  fragment's CSS bidi scope again. This preserves edge neutrals through empty
-  inline spans and keeps formatting controls out of emitted glyph runs.
+  so an inline isolate or override begins on its own post-`br` line.
+  Block-level `unicode-bidi: plaintext` instead keeps its inline stream free
+  of synthetic FSI/PDI controls and resolves each selected bidi paragraph with
+  UAX #9 P2/P3. This preserves contextual Arabic shaping through forced
+  paragraph boundaries while `text-align: start/end` uses the same per-line
+  direction. Once a mixed line has resolved UAX #9 visual order, final
+  measurement and text paint shaping clear each fragment's `unicode-bidi`
+  scope before applying one explicit visual-order guard. This preserves edge
+  neutrals and UAX #9 L4 mirrored punctuation through empty inline spans,
+  while joining scripts retain their logical shaping direction and formatting
+  controls stay out of emitted glyph runs.
 - Whitespace normalization is paragraph-scoped and runs before Text Level 4
   autospace insertion and graph construction. The processor owns segment-break
   transformation, cross-node collapse state, preserved tabs/spaces, forced
@@ -88,6 +96,15 @@ except where existing code already implements draft properties.
   UAX #14 `BK` and `NL` controls enter the same forced-break representation as
   explicit generated breaks, while LF and CR remain in CSS Text's separate
   segment-break transformation path.
+- Language-sensitive text behavior resolves the content writing system once
+  from BCP 47 language and ISO 15924 script subtags, with an explicit script
+  overriding a language default. Segment-break removal and ICU line-breaking
+  therefore agree that `ja-Hang` is Korean, while `en-Hrkt` is Japanese and
+  `ko-Hani` is Chinese. The line-break adapter supplies ICU's canonical `ja`
+  or `zh` locale only for Japanese/Chinese writing systems, preserving the
+  CSS Text `normal`/`loose` U+301C and U+30A0 opportunities without extending
+  them to Korean or untagged content. The targeted writing-system line-break
+  and segment-break WPT regressions pass.
 - CSS Tables anonymous-object fixup recognizes a whole whitespace-only inline
   sequence around table-internal children independently of its inherited
   `white-space` mode. Preserved source indentation (including indentation split
@@ -100,7 +117,12 @@ except where existing code already implements draft properties.
   width.
 - Preserved tab stops are re-shaped against the selected line's content edge
   before graph fitting and intrinsic measurement as well as during paint.
-  Break selection therefore sees the same tab advances as the resulting line.
+  Numeric `tab-size` values measure U+0020 using the nearest block container's
+  font and text spacing, while the tab's own computed value selects the
+  multiplier. Font matching treats glyph zero (`.notdef`) as missing coverage,
+  and preserved tabs are advance-only records: they affect layout and PDF text
+  positioning without painting or subsetting a synthetic missing glyph. Break
+  selection therefore sees the same tab advances as the resulting line.
 - Selected justified lines containing preserved tabs retain their tab-stop
   geometry rather than redistributing document spaces before those stops;
   source-range-level justification after a tab remains tracked as an open
@@ -111,10 +133,10 @@ except where existing code already implements draft properties.
   the line's remaining space.
 - Unicode space separators at a selected line end retain source-range ownership
   in the graph while their advance hangs in every legacy white-space mode
-  except `break-spaces`, including `pre` and `pre-wrap`. The selected paint
-  copy omits unconditional Unicode-separator ranges so an inline background or
-  decoration cannot extend a shrink-to-fit line merely because that suffix
-  hangs; conditional `pre-wrap` tails remain paintable.
+  except `break-spaces`, including `pre` and `pre-wrap`. Their source remains
+  in the selected paint sequence, so an inline background or decoration covers
+  the hanging separator even though the line's fitting measure excludes its
+  advance.
 - Selected-line edge scanning treats an interleaved sequence of Unicode other
   space separators and document spaces as one Phase II sequence across
   transparent inline edges. This keeps the complete sequence out of fitting
@@ -149,6 +171,17 @@ except where existing code already implements draft properties.
   units. It does not replace `break-spaces`' own after-space opportunities or
   manufacture a break beside a preserved separator; `line-break:anywhere` and
   `overflow-wrap:anywhere` retain their separate graph ownership.
+- Unicode other-space separators remain visible source content. In
+  `break-spaces`, their ordinary soft-wrap opportunity is after the separator;
+  a before-separator break is available only when an explicit line-break or
+  overflow-wrap policy supplies it. Legacy modes retain Phase II trailing
+  hanging without moving the separator to a line of its own. The hanging
+  suffix is excluded from fitting and alignment, but remains source for inline
+  backgrounds, decorations, and extraction.
+- Ordinary UAX #14 candidates are finalized only after ICU and Quire's CJK
+  fallback candidates have been combined. This retains the LB13 prohibition
+  on beginning a line with any `NS` Nonstarter, including ideographic and
+  kana iteration marks, without weakening explicit or emergency breaks.
 - Min-content graph segmentation treats ordinary UAX #14 ideographic breaks as
   eligible soft-wrap opportunities, while `word-break: keep-all` continues to
   suppress the CJK boundaries it forbids. Its UAX #14 tailoring retains the
@@ -167,10 +200,11 @@ except where existing code already implements draft properties.
   controls are transparent to text context, while real atoms, floats, and
   independent nested formatting contexts reset that context explicitly.
 - Float markers are out-of-flow positioning participants rather than CSS Text
-  soft-wrap opportunities. The mixed inline selector consults the graph's
-  actual non-forced opportunities before choosing its unbreakable-float path,
-  so a `white-space: normal` unbreakable word cannot be split at a float
-  boundary merely because its style permits wrapping elsewhere.
+  soft-wrap opportunities. The graph records a distinct float-placement
+  checkpoint, which lets mixed inline layout establish exclusions without
+  splitting `white-space: nowrap` or an ordinary unbroken word at that source
+  boundary. The selector consults legal soft-wrap opportunities separately
+  before choosing its unbreakable-float path.
 - When a temporary float band cannot contain a selected graph range that fits
   the unexcluded containing block, selection records each skipped physical
   line and retries that same range below the exclusion. Inline collection,
@@ -192,10 +226,25 @@ except where existing code already implements draft properties.
   trailing spaces, `pre-wrap` hanging spaces, soft-hyphen visibility,
   zero-width-space stripping, trailing tracking, and hanging space separators
   are applied from one graph path.
+- Language-resource discretionary spelling changes are resolved against both
+  dictionary opportunities and authored U+00AD boundaries. The source stream
+  remains unchanged until the selected line edge is materialized, so Dutch
+  `cafee&shy;tje` can use `café-` / `tje` without changing unbroken text or
+  extraction.
+- Graph-backed `letter-spacing` retains shaper glyph selection while resolving
+  all advances at final visual typographic boundaries. Terminal backend
+  advances are removed from both fitting and durable glyph data; nested inline
+  ownership uses the tracking-scope LCA, and UAX #9 visual order, controls,
+  Arabic joining, and Indic grapheme clusters share the same boundary policy.
+- Reused source-shaped slices validate that their glyph provenance covers every
+  paintable selected character. A conditional-hyphen control can otherwise
+  leave a truncated backend slice that under-measures the remaining source;
+  incomplete slices fall back to shaping the selected range before line
+  fitting and painting.
 - Prepared lines retain selected source-edge metadata separately from fitting
-  width. The paint copy omits unconditional Unicode-separator suffixes but
-  retains conditional `pre-wrap` tails, while alignment distinguishes the two
-  effects.
+  width. The paint copy retains both unconditional Unicode-separator suffixes
+  and conditional `pre-wrap` tails, while alignment excludes their advances
+  and distinguishes the two effects.
 - A selected `pre-wrap` soft break retains its authored spaces in graph line
   records while excluding their advance at the visual line end after bidi
   ordering. RTL paint starts before aligned content when that logical suffix is
@@ -227,6 +276,20 @@ except where existing code already implements draft properties.
   first formatted line across CSS 2 block-in-inline anonymous block splits. Its
   initial anonymous inline sequence receives the originating pseudo style, and
   later anonymous inline runs do not restart the same `::first-line`.
+- The originating block's first-formatted-line state is also carried into
+  anonymous inline runs for `text-indent`: a later run after an in-flow block
+  does not restart the parent's indent, while a real child block retains its
+  own inherited indent. First-line indents contribute to max-content sizing
+  but not min-content sizing, which preserves the CSS automatic minimum size
+  of anonymous flex and grid items.
+- Anonymous flex and grid item replay installs the assigned item content box
+  as its inline formatting-context basis, so the same text-indent-aware line
+  selection used for intrinsic sizing wraps against the resolved item width.
+- Prepared inline static-position placeholders retain their hypothetical
+  margin-box rectangle and prepared-line baseline in one shared line artifact.
+  Margin-box static rectangles anchor positioned boxes directly; baseline-mode
+  callers translate from the same prepared-line coordinate, keeping vertical
+  and indented horizontal static positions consistent.
 - Intrinsic sizing and layout estimates use sequence-backed measurements:
   inline measurements carry one `InlineLineSequence` plus graph min/max-content
   contributions, and block-size estimates, anonymous flex text, flex child
@@ -381,12 +444,14 @@ except where existing code already implements draft properties.
 - Selected soft-wrap ranges retain private source-cluster provenance from the
   unbroken shaped run. Styled shapers map clusters from their synthetic
   join-context buffer back to authored source coordinates before this is
-  retained. Bidi visual fragmentation then slices and composes those glyph runs
-  instead of re-shaping each visual fragment, preserving contextual Arabic
-  forms across transparent inline boundaries, `line-break:anywhere`, and
-  `overflow-wrap` wraps while keeping source text and PDF extraction unchanged.
-  Normalized backend ranges that cannot index the source safely fall back to
-  ordinary selected-range shaping.
+  retained. Bidi visual fragmentation composes safe scope-free glyph slices to
+  preserve contextual Arabic forms; a line containing generated CSS bidi
+  controls instead re-shapes its selected visual text under the internal
+  unscoped paint style, preserving UAX #9 L4 punctuation mirroring without a
+  second scope. This keeps source text and PDF extraction unchanged across
+  transparent inline boundaries, `line-break:anywhere`, and `overflow-wrap`
+  wraps. Normalized backend ranges that cannot index the source safely fall
+  back to ordinary selected-range shaping.
 - CSS Text edge-context smoke coverage includes inline `::before`/`::after`
   generated content with default inline display, inside text and image markers,
   generated marker segment-break transformation, page-margin forced breaks,
@@ -410,11 +475,11 @@ except where existing code already implements draft properties.
   fragmented inline boxes that combine true nested formatting contexts such as
   flex/table descendants with complex effects.
 - Narrow remaining white-space divergences to verified CSS Text phase edge
-  cases. The current local `css/css-text/white-space/` result is **385/412
-  raw runner passes**; after accounting for alternative-reference semantics,
-  19 cases remain. They group into preserved-space floats and intrinsic widths,
-  textarea/control normalization, `pre-wrap` justification and RTL alignment,
-  and CSS Text 4 balance/clamp selection.
+  cases. The current local `css/css-text/white-space/` result is **355/412
+  raw runner passes**; 9 raw failures have a matching alternative reference,
+  leaving 48 cases with no matching reference. They group into preserved-space
+  floats and intrinsic widths, textarea/control normalization, tabs,
+  `pre-wrap` justification, and CSS Text 4 balance/clamp selection.
 - Broaden script-sensitive justification coverage for remaining complex-script
   expansion cases beyond the current policy-owned cursive/control suppression.
 - Audit the full CSS Fonts `unicode-range` descriptor behavior beyond the
@@ -424,9 +489,9 @@ except where existing code already implements draft properties.
   sequence-backed block/flex/table estimate consumers.
 - The current local `css/css-text/line-break/` result is **51/51 passing**.
   Selected `pre-wrap` and Unicode-space tails remain represented by graph
-  source ranges. Conditional `pre-wrap` tails retain background paint, while
-  unconditionally hanging Unicode-space suffixes are omitted from the paint
-  copy; PDF text extraction still needs a dedicated source-range emission path.
+  source ranges and retain background paint while their advances are excluded
+  from fitting. PDF text extraction still needs a dedicated source-range
+  emission path.
 - Finish fallback transformed vertical glyph forms beyond font-provided
   `vert`/`vrt2` alternates, text-emphasis collision/line-box expansion,
   full `text-decoration-skip-box`/`text-decoration-skip-self` edge cases,
@@ -458,6 +523,6 @@ except where existing code already implements draft properties.
   graph/sequence path.
 - Visual reftest comparisons should use `AGENTS/pdf_comparison.md` when adding
   or refreshing WPT-derived CSS Text cases.
-- The measured 385/412 raw result above was produced with the workspace debug
-  executable rebuilt via `cargo build --bin quire` and the local WPT runner's
+- The measured 355/412 raw result above was produced with the workspace debug
+  executable and the local WPT runner's
   `css/css-text/white-space/` directory.

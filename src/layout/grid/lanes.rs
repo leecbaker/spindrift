@@ -44,6 +44,18 @@ struct GridLanesTrackGeometry {
 }
 
 impl GridLanesTrackGeometry {
+    fn from_resolved_subgrid_axis(axis: &ResolvedSubgridAxis) -> Option<Self> {
+        debug_assert_eq!(axis.line_offsets().len(), axis.track_count() + 1);
+        debug_assert_eq!(
+            axis.gutter_sizes().len(),
+            axis.track_count().saturating_sub(1)
+        );
+        (!axis.track_starts().is_empty()).then(|| Self {
+            starts: axis.track_starts().to_vec(),
+            ends: axis.track_ends().to_vec(),
+        })
+    }
+
     fn from_grid_layout_offsets(
         line_offsets: &[f32],
         gutters: &[GapDecorationGutter],
@@ -245,11 +257,23 @@ impl<'a> LayoutBuilder<'a> {
         style: &ComputedStyle,
         children: &[GridChild<'_>],
         stylesheets: &[Stylesheet],
-        width: f32,
+        width: PhysicalContentWidth,
         mut layout: GridLayout,
+        subgrid_context: Option<&ResolvedSubgridContext>,
     ) -> GridLayout {
-        let inline_percentage_basis = PercentageBasis::definite(layout_pt(width));
+        let inline_percentage_basis = PercentageBasis::definite(layout_pt(width.points()));
         let axis = GridLanesAxis::from_style(style);
+        let swaps_physical_grid_axes =
+            WritingModeAxes::new(style.writing_mode, style.direction).swaps_physical_axes();
+        let resolved_grid_axis = subgrid_context.and_then(|context| {
+            context.physical_axis(
+                match axis {
+                    GridLanesAxis::Columns => GridAxis::Column,
+                    GridLanesAxis::Rows => GridAxis::Row,
+                },
+                swaps_physical_grid_axes,
+            )
+        });
         let grid_axis_tracks = match axis {
             GridLanesAxis::Columns => &style.grid_template_columns,
             GridLanesAxis::Rows => &style.grid_template_rows,
@@ -264,16 +288,21 @@ impl<'a> LayoutBuilder<'a> {
         // authored geometry for the common fully-definite track case instead
         // of inheriting those unrelated implicit-track offsets.
         let grid_axis_size = match axis {
-            GridLanesAxis::Columns => width,
-            GridLanesAxis::Rows => layout.height,
+            GridLanesAxis::Columns => width.points(),
+            GridLanesAxis::Rows => layout.height.points(),
         };
         let grid_axis_percentage_basis = PercentageBasis::definite(layout_pt(grid_axis_size));
-        let grid_axis_gap = used_grid_lanes_gap(
-            match axis {
-                GridLanesAxis::Columns => style.column_gap.clone(),
-                GridLanesAxis::Rows => style.row_gap.clone(),
+        let grid_axis_gap = resolved_grid_axis.map_or_else(
+            || {
+                used_grid_lanes_gap(
+                    match axis {
+                        GridLanesAxis::Columns => style.column_gap.clone(),
+                        GridLanesAxis::Rows => style.row_gap.clone(),
+                    },
+                    grid_axis_percentage_basis,
+                )
             },
-            grid_axis_percentage_basis,
+            ResolvedSubgridAxis::taffy_gap,
         );
         let fixed_track_sizes =
             grid_lanes_definite_track_sizes(grid_axis_tracks, grid_axis_percentage_basis);
@@ -320,17 +349,26 @@ impl<'a> LayoutBuilder<'a> {
             GridLanesAxis::Columns => style.justify_content,
             GridLanesAxis::Rows => style.align_content,
         };
-        let geometry = fixed_track_sizes
-            .as_deref()
-            .and_then(|sizes| GridLanesTrackGeometry::from_track_sizes(sizes, grid_axis_gap))
-            .map(|geometry| {
-                geometry.with_content_alignment(grid_axis_content_alignment, grid_axis_size)
-            })
-            .or(auto_repeat_geometry)
-            .or(auto_row_geometry)
-            .or(auto_column_geometry)
+        let geometry = resolved_grid_axis
+            .and_then(GridLanesTrackGeometry::from_resolved_subgrid_axis)
             .or_else(|| {
-                GridLanesTrackGeometry::from_grid_layout_offsets(taffy_line_offsets, taffy_gutters)
+                fixed_track_sizes
+                    .as_deref()
+                    .and_then(|sizes| {
+                        GridLanesTrackGeometry::from_track_sizes(sizes, grid_axis_gap)
+                    })
+                    .map(|geometry| {
+                        geometry.with_content_alignment(grid_axis_content_alignment, grid_axis_size)
+                    })
+                    .or(auto_repeat_geometry)
+                    .or(auto_row_geometry)
+                    .or(auto_column_geometry)
+                    .or_else(|| {
+                        GridLanesTrackGeometry::from_grid_layout_offsets(
+                            taffy_line_offsets,
+                            taffy_gutters,
+                        )
+                    })
             });
         let Some(geometry) = geometry else {
             return layout;
@@ -343,7 +381,7 @@ impl<'a> LayoutBuilder<'a> {
         let stacking_gap = match axis {
             GridLanesAxis::Columns => used_grid_lanes_gap(
                 style.row_gap.clone(),
-                PercentageBasis::definite(layout_pt(layout.height)),
+                PercentageBasis::definite(layout_pt(layout.height.points())),
             ),
             GridLanesAxis::Rows => {
                 used_grid_lanes_gap(style.column_gap.clone(), inline_percentage_basis)
@@ -362,7 +400,9 @@ impl<'a> LayoutBuilder<'a> {
             css::GridAutoFlow::RowDense | css::GridAutoFlow::ColumnDense
         );
         let mut occupied = vec![Vec::<GridLanesOccupiedInterval>::new(); lane_count];
-        let grid_axis_line_names = grid_lanes_explicit_line_names(grid_axis_tracks);
+        let grid_axis_line_names = resolved_grid_axis
+            .map(|axis| axis.line_names().to_vec())
+            .or_else(|| grid_lanes_explicit_line_names(grid_axis_tracks));
 
         for index in order {
             let child = &children[index];
@@ -372,13 +412,28 @@ impl<'a> LayoutBuilder<'a> {
             // measurement for non-stretch self-alignment.
             let measured_item = &layout.items[index];
             let span = grid_lanes_span(axis, child, lane_count);
-            let (mut range, auto_placed) = match grid_lanes_fixed_range(
-                axis,
-                child,
-                lane_count,
-                span,
-                grid_axis_line_names.as_deref(),
-            ) {
+            let (mut range, auto_placed) = match resolved_grid_axis
+                .and_then(|resolved_axis| {
+                    let (start, end) = axis.placements(child);
+                    (!matches!(start, css::GridPlacement::Auto)
+                        || !matches!(end, css::GridPlacement::Auto))
+                    .then(|| resolved_axis.resolved_range(start, end, 1))
+                    .and_then(|range| {
+                        let range = range.track_range();
+                        let start = range.start;
+                        let end = range.end;
+                        (start < end && end <= lane_count).then_some(start..end)
+                    })
+                })
+                .or_else(|| {
+                    grid_lanes_fixed_range(
+                        axis,
+                        child,
+                        lane_count,
+                        span,
+                        grid_axis_line_names.as_deref(),
+                    )
+                }) {
                 Some(range) => (range, false),
                 None => (
                     grid_lanes_shortest_range(
@@ -560,13 +615,13 @@ impl<'a> LayoutBuilder<'a> {
             // <https://drafts.csswg.org/css-grid-3/#sizing-grid-containers>
             if used_length_percentage_or_auto(
                 style.box_values.height.clone(),
-                PercentageBasis::definite(layout_pt(layout.height)),
+                PercentageBasis::definite(layout_pt(layout.height.points())),
             )
             .is_none()
             {
-                layout.height = stacking_extent;
+                layout.height = PhysicalContentHeight::new(content_box_pt(stacking_extent));
             }
-            layout.row_line_offsets = vec![0.0, layout.height];
+            layout.row_line_offsets = vec![0.0, layout.height.points()];
         } else {
             // Row lanes establish the physical block-axis track geometry. A
             // two-dimensional Grid probe may create implicit rows from its
@@ -574,11 +629,17 @@ impl<'a> LayoutBuilder<'a> {
             if has_auto_row_geometry
                 && used_length_percentage_or_auto(
                     style.box_values.height.clone(),
-                    PercentageBasis::definite(layout_pt(layout.height)),
+                    PercentageBasis::definite(layout_pt(layout.height.points())),
                 )
                 .is_none()
             {
-                layout.height = geometry.ends.last().cloned().unwrap_or(layout.height);
+                layout.height = PhysicalContentHeight::new(content_box_pt(
+                    geometry
+                        .ends
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| layout.height.points()),
+                ));
                 layout.row_line_offsets = geometry.line_offsets();
             }
         }
@@ -587,8 +648,8 @@ impl<'a> LayoutBuilder<'a> {
         // offset in the definite container, so `start` and `end` retain their
         // physical content-alignment meaning.
         let (stacking_size, stacking_alignment) = match axis {
-            GridLanesAxis::Columns => (layout.height, style.align_content),
-            GridLanesAxis::Rows => (width, style.justify_content),
+            GridLanesAxis::Columns => (layout.height.points(), style.align_content),
+            GridLanesAxis::Rows => (width.points(), style.justify_content),
         };
         let stacking_offset =
             grid_lanes_content_alignment_offset(stacking_alignment, stacking_size, stacking_extent);
@@ -675,8 +736,8 @@ impl<'a> LayoutBuilder<'a> {
             child,
             stylesheets,
             available_width.points(),
-            grid_percentage_basis_from_points(
-                Some(available_width.points()),
+            grid_percentage_basis(
+                Some(available_width),
                 GridAvailableSizeSource::ContainerInlineSize,
             ),
             PercentageBasis::indefinite(),
@@ -738,8 +799,10 @@ impl<'a> LayoutBuilder<'a> {
                 child,
                 stylesheets,
                 grid_lanes_basis_points(inline_percentage_basis),
-                grid_percentage_basis_from_points(
-                    Some(grid_lanes_basis_points(inline_percentage_basis)),
+                grid_percentage_basis(
+                    inline_percentage_basis
+                        .value()
+                        .map(|value| content_box_pt(value.points())),
                     GridAvailableSizeSource::ContainerInlineSize,
                 ),
                 PercentageBasis::indefinite(),
@@ -844,8 +907,10 @@ impl<'a> LayoutBuilder<'a> {
                 child,
                 stylesheets,
                 grid_lanes_basis_points(inline_percentage_basis),
-                grid_percentage_basis_from_points(
-                    Some(grid_lanes_basis_points(inline_percentage_basis)),
+                grid_percentage_basis(
+                    inline_percentage_basis
+                        .value()
+                        .map(|value| content_box_pt(value.points())),
                     GridAvailableSizeSource::ContainerInlineSize,
                 ),
                 PercentageBasis::indefinite(),
@@ -1153,10 +1218,13 @@ fn grid_lanes_dense_backfill_position(
     tolerance: f32,
 ) -> Option<(std::ops::Range<usize>, f32)> {
     let normal_width = geometry.area_size(normal_range);
-    let mut candidates = vec![0.0];
-    for lane in occupied {
-        candidates.extend(lane.iter().map(|interval| interval.end));
-    }
+    let mut candidates = std::iter::once(0.0)
+        .chain(
+            occupied
+                .iter()
+                .flat_map(|lane| lane.iter().map(|interval| interval.end)),
+        )
+        .collect::<Vec<_>>();
     candidates.sort_by(f32::total_cmp);
     candidates.dedup_by(|a, b| (*a - *b).abs() < 0.01);
 

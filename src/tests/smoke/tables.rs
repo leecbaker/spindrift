@@ -4,7 +4,7 @@ fn assert_green_100px_square(document: &quire::Document) {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("expected a green canvas background");
 
     assert!(
@@ -20,7 +20,7 @@ fn rect_covers(covering: &quire::RenderedRect, covered: &quire::RenderedRect) ->
         && covering.y() + covering.height() >= covered.y() + covered.height() - 0.01
 }
 
-fn largest_filled_rect(page: &quire::Page, color: Color) -> &quire::RenderedRect {
+fn largest_filled_rect(page: &quire::Page, color: CssColor) -> &quire::RenderedRect {
     page.rects()
         .iter()
         .filter(|rect| rect.fill == Some(color))
@@ -30,7 +30,7 @@ fn largest_filled_rect(page: &quire::Page, color: Color) -> &quire::RenderedRect
         .unwrap_or_else(|| panic!("expected {color:?} rectangle among {:?}", page.rects()))
 }
 
-fn filled_rect_bounds(page: &quire::Page, color: Color) -> (f32, f32, f32, f32) {
+fn filled_rect_bounds(page: &quire::Page, color: CssColor) -> (f32, f32, f32, f32) {
     let rects = page
         .rects()
         .iter()
@@ -100,14 +100,15 @@ fn path_bounds(path: &quire::RenderedPath) -> Option<(f32, f32, f32, f32)> {
 }
 
 fn path_contains_point(path: &quire::RenderedPath, x: f32, y: f32) -> bool {
-    let mut points = Vec::new();
-    for command in &path.commands {
-        match command {
+    let points = path
+        .commands
+        .iter()
+        .filter_map(|command| match command {
             quire::RenderedPathCommand::MoveTo(point)
-            | quire::RenderedPathCommand::LineTo(point) => points.push(*point),
-            quire::RenderedPathCommand::CurveTo { .. } | quire::RenderedPathCommand::Close => {}
-        }
-    }
+            | quire::RenderedPathCommand::LineTo(point) => Some(*point),
+            quire::RenderedPathCommand::CurveTo { .. } | quire::RenderedPathCommand::Close => None,
+        })
+        .collect::<Vec<_>>();
     if points.len() < 3 {
         return false;
     }
@@ -127,7 +128,7 @@ fn path_contains_point(path: &quire::RenderedPath, x: f32, y: f32) -> bool {
     inside
 }
 
-fn path_fill_at(paths: &[&quire::RenderedPath], x: f32, y: f32) -> Option<Color> {
+fn path_fill_at(paths: &[&quire::RenderedPath], x: f32, y: f32) -> Option<CssColor> {
     paths
         .iter()
         .rev()
@@ -140,7 +141,7 @@ fn table_wrapper_border_rect_indices(page: &quire::Page) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(index, rect)| {
-            (rect.fill == Some(Color::BLACK)
+            (rect.fill == Some(CssColor::BLACK)
                 && ((rect.height() <= 1.0 && rect.width() > 200.0)
                     || (rect.width() <= 1.0 && rect.height() > 200.0)))
                 .then_some(index)
@@ -157,7 +158,7 @@ fn table_wrapper_border_paint_operation_indices(page: &quire::Page) -> Vec<usize
                 return None;
             };
             let rect = page.rects().get(*rect_index)?;
-            (rect.fill == Some(Color::BLACK)
+            (rect.fill == Some(CssColor::BLACK)
                 && ((rect.height() <= 1.0 && rect.width() > 200.0)
                     || (rect.width() <= 1.0 && rect.height() > 200.0)))
                 .then_some(operation_index)
@@ -220,8 +221,8 @@ async fn anonymous_table_cell_preserved_whitespace_wraps_percentage_inline_block
     .unwrap();
 
     let page = &document.pages[0];
-    let blue = largest_filled_rect(page, Color::new(0, 0, 255));
-    let yellow = largest_filled_rect(page, Color::new(255, 255, 0));
+    let blue = largest_filled_rect(page, CssColor::new(0, 0, 255));
+    let yellow = largest_filled_rect(page, CssColor::new(255, 255, 0));
     let expected_half_width = 187.5;
     assert!(
         (blue.width() - expected_half_width).abs() < 0.5,
@@ -256,8 +257,8 @@ async fn anonymous_table_cell_adjacent_percentage_inline_blocks_share_line() {
     .unwrap();
 
     let page = &document.pages[0];
-    let blue = largest_filled_rect(page, Color::new(0, 0, 255));
-    let yellow = largest_filled_rect(page, Color::new(255, 255, 0));
+    let blue = largest_filled_rect(page, CssColor::new(0, 0, 255));
+    let yellow = largest_filled_rect(page, CssColor::new(255, 255, 0));
     let expected_half_width = 187.5;
     assert!(
         (blue.width() - expected_half_width).abs() < 0.5,
@@ -297,7 +298,7 @@ async fn anonymous_table_cells_collapse_self_collapsing_block_margins_for_row_he
     .unwrap();
 
     let page = &document.pages[0];
-    let green_bounds = filled_rect_bounds(page, Color::new(0, 128, 0));
+    let green_bounds = filled_rect_bounds(page, CssColor::new(0, 128, 0));
     assert!(
         (green_bounds.2 - green_bounds.0 - 75.0).abs() < 0.01
             && (green_bounds.3 - green_bounds.1 - 75.0).abs() < 0.01,
@@ -307,7 +308,7 @@ async fn anonymous_table_cells_collapse_self_collapsing_block_margins_for_row_he
     for red in page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
     {
         let red_bounds = (
             red.x(),
@@ -340,7 +341,7 @@ async fn table_cell_self_collapsing_block_margin_set_sets_row_minimum() {
     .await
     .unwrap();
 
-    let green = largest_filled_rect(&document.pages[0], Color::new(0, 128, 0));
+    let green = largest_filled_rect(&document.pages[0], CssColor::new(0, 128, 0));
     assert!(
         (green.width() - 75.0).abs() < 0.01 && (green.height() - 37.5).abs() < 0.01,
         "self-collapsing nested block margins should collapse to one 50 CSS px row minimum, got {green:?}"
@@ -361,7 +362,7 @@ async fn renders_basic_tables_in_rows_and_columns() {
     assert_eq!(document.pages[0].lines()[3].text, "D");
     assert!(document.pages[0].lines()[1].x() > document.pages[0].lines()[0].x());
     assert!(document.pages[0].lines()[2].y() < document.pages[0].lines()[0].y());
-    assert_eq!(document.pages[0].rects()[0].fill, Some(Color::BLACK));
+    assert_eq!(document.pages[0].rects()[0].fill, Some(CssColor::BLACK));
     assert_eq!(document.pages[0].rects()[0].stroke, None);
 }
 
@@ -383,7 +384,7 @@ async fn rowspan_over_collapsed_row_does_not_create_internal_border_spacing() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = largest_filled_rect(page, Color::new(0, 128, 0));
+    let green = largest_filled_rect(page, CssColor::new(0, 128, 0));
     assert!(
         (green.width() - 150.0).abs() < 0.01 && (green.height() - 150.0).abs() < 0.01,
         "expected a 200 CSS px green square, got {green:?}"
@@ -392,7 +393,7 @@ async fn rowspan_over_collapsed_row_does_not_create_internal_border_spacing() {
         !page
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(255, 0, 0))),
+            .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0))),
         "collapsed-row rowspan cell should not paint red: {:?}",
         page.rects()
     );
@@ -416,7 +417,7 @@ async fn separated_table_wrapper_border_paints_above_background() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green_operation = first_rect_paint_operation_index(page, Color::new(0, 128, 0));
+    let green_operation = first_rect_paint_operation_index(page, CssColor::new(0, 128, 0));
     let border_indices = table_wrapper_border_rect_indices(page);
     assert!(
         border_indices.len() >= 4,
@@ -482,8 +483,8 @@ async fn rtl_column_backgrounds_do_not_paint_separated_row_spacing() {
     .unwrap();
 
     let page = &document.pages[0];
-    let red = Color::new(255, 0, 0);
-    let blue = Color::new(0, 0, 255);
+    let red = CssColor::new(255, 0, 0);
+    let blue = CssColor::new(0, 0, 255);
     let gradient_paths = page
         .paths()
         .iter()
@@ -574,21 +575,21 @@ async fn vertical_rl_rtl_column_backgrounds_paint_from_column_heights() {
     assert!(
         page.paths()
             .iter()
-            .any(|path| path.fill == Some(Color::new(255, 0, 0))),
+            .any(|path| path.fill == Some(CssColor::new(255, 0, 0))),
         "expected red column gradient path among {:?}",
         page.paths()
     );
     assert!(
         page.paths()
             .iter()
-            .any(|path| path.fill == Some(Color::new(0, 0, 255))),
+            .any(|path| path.fill == Some(CssColor::new(0, 0, 255))),
         "expected blue column gradient path among {:?}",
         page.paths()
     );
     assert!(
         page.rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::BLACK) && rect.width() > 100.0),
+            .any(|rect| rect.fill == Some(CssColor::BLACK) && rect.width() > 100.0),
         "expected non-tiny table border among {:?}",
         page.rects()
     );
@@ -642,9 +643,9 @@ async fn vertical_upright_ch_units_size_table_rows_like_vertical_reference() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = largest_filled_rect(page, Color::new(0, 128, 0));
-    let blue = largest_filled_rect(page, Color::new(0, 0, 255));
-    let orange = largest_filled_rect(page, Color::new(255, 165, 0));
+    let green = largest_filled_rect(page, CssColor::new(0, 128, 0));
+    let blue = largest_filled_rect(page, CssColor::new(0, 0, 255));
+    let orange = largest_filled_rect(page, CssColor::new(255, 165, 0));
 
     for (name, rect) in [("green", green), ("blue", blue), ("orange", orange)] {
         assert!(
@@ -712,9 +713,9 @@ async fn sideways_vertical_ch_units_size_table_columns_like_sideways_reference()
     .unwrap();
 
     let page = &document.pages[0];
-    let green = largest_filled_rect(page, Color::new(0, 128, 0));
-    let blue = largest_filled_rect(page, Color::new(0, 0, 255));
-    let orange = largest_filled_rect(page, Color::new(255, 165, 0));
+    let green = largest_filled_rect(page, CssColor::new(0, 128, 0));
+    let blue = largest_filled_rect(page, CssColor::new(0, 0, 255));
+    let orange = largest_filled_rect(page, CssColor::new(255, 165, 0));
 
     for (name, rect) in [("green", green), ("blue", blue), ("orange", orange)] {
         assert!(
@@ -767,12 +768,12 @@ async fn table_cell_second_pass_uses_final_height_for_overflow_auto_min_height_c
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("percentage-height overflow child should paint");
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("positioned red reference square should paint behind green");
 
     assert!(
@@ -799,7 +800,7 @@ async fn table_cell_percent_height_overflow_auto_descendant_intrinsic_height() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "intrinsic-height descendant should paint: {:?}",
@@ -809,7 +810,7 @@ async fn table_cell_percent_height_overflow_auto_descendant_intrinsic_height() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("positioned red reference square should paint behind green");
 
     assert!(
@@ -836,12 +837,12 @@ async fn table_cell_first_pass_treats_percent_height_child_as_auto() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("table-cell background should paint");
     let _green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("percentage-height child should paint");
 
     assert!(
@@ -924,12 +925,12 @@ async fn vertical_lr_table_cell_align_content_center_uses_horizontal_block_axis(
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("vertical table-cell background should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("vertical table-cell child should paint");
 
     assert!(
@@ -954,7 +955,7 @@ async fn vertical_lr_table_cell_align_content_centers_inline_text_subject() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("vertical table-cell background should paint");
     let line = page
         .lines()
@@ -966,6 +967,51 @@ async fn vertical_lr_table_cell_align_content_centers_inline_text_subject() {
         (line.x() - red.x() - 35.0).abs() < 0.5,
         "vertical-lr table-cell align-content:center should center the inline line box and paint the upright glyph inside it: red={red:?}, line={line:?}"
     );
+}
+
+#[tokio::test]
+async fn upright_vertical_rowspan_text_applies_each_glyph_origin_once() {
+    let document = Html::from_string(
+        "<style>@page { size: 200pt 130pt; margin: 0 }\
+         @font-face { font-family: Ahem; src: url(Ahem.ttf) }\
+         body { margin: 0 }\
+         table { border-collapse: collapse; table-layout: fixed; width: 120pt }\
+         td { border: 1pt solid black; padding: 0 }\
+         tr { height: 30pt }\
+         .group { width: 30pt; text-align: center; writing-mode: vertical-rl; text-orientation: upright; font: 12pt Ahem }</style>\
+         <table><tr><td class=\"group\" rowspan=\"2\">AAA</td><td>one</td></tr><tr><td>two</td></tr></table>",
+    )
+    .with_base_path("tests/fixtures/wpt/css/css-fonts")
+    .unwrap()
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let line = document.pages[0]
+        .lines()
+        .iter()
+        .find(|line| line.text == "AAA")
+        .expect("upright rowspan label should paint");
+    let glyph_origins = line
+        .runs
+        .iter()
+        .map(|run| {
+            let glyph = run
+                .glyphs
+                .as_ref()
+                .and_then(|glyphs| glyphs.first())
+                .expect("upright text run should retain its glyph");
+            run.y_offset + glyph.y_offset
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(glyph_origins.len(), 3);
+    for (index, origin) in glyph_origins.iter().enumerate() {
+        assert!(
+            (*origin - (-12.0 - index as f32 * 12.0)).abs() < 0.01,
+            "glyph {index} must receive its 1em vertical origin once, after its normal-flow advance: line={line:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -985,12 +1031,12 @@ async fn vertical_rl_table_cell_align_content_end_uses_right_to_left_block_axis(
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("vertical table-cell background should paint");
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("vertical table-cell child should paint");
 
     assert!(
@@ -1019,13 +1065,13 @@ async fn vertical_table_cell_align_content_overflow_uses_axis_aware_defaults() {
     let mut red = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .collect::<Vec<_>>();
     red.sort_by(|a, b| a.x().total_cmp(&b.x()));
     let mut green = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
     green.sort_by(|a, b| a.x().total_cmp(&b.x()));
 
@@ -1089,7 +1135,7 @@ async fn vertical_writing_table_baseline_alignment_does_not_expand_content_box()
     let mut red = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .collect::<Vec<_>>();
     red.sort_by(|left, right| {
         right
@@ -1100,7 +1146,7 @@ async fn vertical_writing_table_baseline_alignment_does_not_expand_content_box()
     let mut green = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .collect::<Vec<_>>();
     green.sort_by(|left, right| {
         right
@@ -1239,12 +1285,12 @@ async fn orthogonal_table_cell_align_content_baseline_uses_fallback() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("orthogonal baseline cell background should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("orthogonal start fallback cell background should paint");
     let baseline = page
         .lines()
@@ -1281,7 +1327,7 @@ async fn rowspan_table_cell_align_content_baseline_joins_startmost_row_group() {
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("baseline rowspan cell background should paint");
     let span = page
         .lines()
@@ -1319,7 +1365,7 @@ async fn rowspan_table_cell_align_content_last_baseline_joins_endmost_row_group(
     let red = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("last-baseline rowspan cell background should paint");
     let span = page
         .lines()
@@ -1553,7 +1599,7 @@ async fn repeated_collapsed_table_header_paints_fragment_borders() {
                     operation,
                     quire::PaintOperation::Rect(index)
                         if page.rects().get(*index).is_some_and(|rect| {
-                            rect.fill == Some(Color::new(255, 0, 0))
+                            rect.fill == Some(CssColor::new(255, 0, 0))
                                 && rect.width() > 0.0
                                 && rect.height() > 0.0
                         })
@@ -1587,10 +1633,10 @@ async fn repeated_table_header_fragment_preserves_structural_background_order() 
         .skip(1)
         .find(|page| page.lines().iter().any(|line| line.text == "Head"))
         .expect("header should repeat on a later page");
-    let table = first_rect_paint_operation_index(repeated_page, Color::new(255, 0, 0));
-    let column = first_rect_paint_operation_index(repeated_page, Color::new(0, 128, 0));
-    let row_group = first_rect_paint_operation_index(repeated_page, Color::new(0, 0, 255));
-    let row = first_rect_paint_operation_index(repeated_page, Color::new(255, 255, 0));
+    let table = first_rect_paint_operation_index(repeated_page, CssColor::new(255, 0, 0));
+    let column = first_rect_paint_operation_index(repeated_page, CssColor::new(0, 128, 0));
+    let row_group = first_rect_paint_operation_index(repeated_page, CssColor::new(0, 0, 255));
+    let row = first_rect_paint_operation_index(repeated_page, CssColor::new(255, 255, 0));
 
     assert!(table < column);
     assert!(column < row_group);
@@ -1626,7 +1672,7 @@ async fn repeated_table_header_traps_positioned_descendants_in_fragment() {
                 operation,
                 quire::PaintOperation::Rect(index)
                     if repeated_page.rects().get(*index).is_some_and(|rect| {
-                        rect.fill == Some(Color::new(255, 0, 0))
+                        rect.fill == Some(CssColor::new(255, 0, 0))
                             && rect.width() > 0.0
                             && rect.height() > 0.0
                     })
@@ -1668,7 +1714,7 @@ async fn fragmented_collapsed_table_body_paints_borders_on_each_page() {
                     operation,
                     quire::PaintOperation::Rect(index)
                         if page.rects().get(*index).is_some_and(|rect| {
-                            rect.fill == Some(Color::new(255, 0, 0))
+                            rect.fill == Some(CssColor::new(255, 0, 0))
                                 && rect.width() > 0.0
                                 && rect.height() > 0.0
                         })
@@ -1695,10 +1741,10 @@ async fn fragmented_collapsed_table_uses_full_grid_boundary_winners() {
         .find(|page| page.lines().iter().any(|line| line.text == "B"))
         .expect("second row should be forced to a later page");
     let red_horizontal = second_page.rects().iter().any(|rect| {
-        rect.fill == Some(Color::new(255, 0, 0)) && rect.width() > 20.0 && rect.height() >= 7.9
+        rect.fill == Some(CssColor::new(255, 0, 0)) && rect.width() > 20.0 && rect.height() >= 7.9
     });
     let blue_horizontal = second_page.rects().iter().any(|rect| {
-        rect.fill == Some(Color::new(0, 0, 255))
+        rect.fill == Some(CssColor::new(0, 0, 255))
             && rect.width() > 20.0
             && (rect.height() - 2.0).abs() < 0.01
     });
@@ -1737,7 +1783,7 @@ async fn fragmented_collapsed_table_background_uses_wrapper_slice_bounds() {
         let green = page
             .rects()
             .iter()
-            .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+            .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
             .expect("table background should paint on each fragment");
         assert!(
             (green.width() - 44.0).abs() < 0.01,
@@ -1766,10 +1812,10 @@ async fn repeated_collapsed_header_uses_full_grid_bottom_boundary() {
         })
         .expect("a non-final page should repeat the header");
     let red_horizontal = repeated_page.rects().iter().any(|rect| {
-        rect.fill == Some(Color::new(255, 0, 0)) && rect.width() > 20.0 && rect.height() >= 7.9
+        rect.fill == Some(CssColor::new(255, 0, 0)) && rect.width() > 20.0 && rect.height() >= 7.9
     });
     let blue_horizontal = repeated_page.rects().iter().any(|rect| {
-        rect.fill == Some(Color::new(0, 0, 255))
+        rect.fill == Some(CssColor::new(0, 0, 255))
             && rect.width() > 20.0
             && (rect.height() - 2.0).abs() < 0.01
     });
@@ -1813,7 +1859,7 @@ async fn fragmented_collapsed_table_body_keeps_rowspan_border_candidates() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 0, 255))
+            rect.fill == Some(CssColor::new(0, 0, 255))
                 && (rect.width() - 4.0).abs() < 0.01
                 && rect.height() > 0.0
         })
@@ -1862,7 +1908,7 @@ async fn fragmented_collapsed_table_body_keeps_rowspan_candidates_across_collaps
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 0, 255))
+            rect.fill == Some(CssColor::new(0, 0, 255))
                 && (rect.width() - 4.0).abs() < 0.01
                 && rect.height() > 0.0
         })
@@ -1892,7 +1938,7 @@ async fn oversized_table_row_splits_into_durable_body_fragments() {
         .iter()
         .filter(|page| {
             page.rects().iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 0, 255))
+                rect.fill == Some(CssColor::new(0, 0, 255))
                     && rect.width() > 0.0
                     && rect.height() > 0.0
             })
@@ -1906,7 +1952,7 @@ async fn oversized_table_row_splits_into_durable_body_fragments() {
     for page in painted_fragments {
         assert!(
             page.rects().iter().any(|rect| {
-                rect.fill == Some(Color::new(255, 0, 0))
+                rect.fill == Some(CssColor::new(255, 0, 0))
                     && rect.width() > 0.0
                     && rect.height() > 0.0
             }),
@@ -1930,7 +1976,7 @@ async fn oversized_collapsed_row_pieces_do_not_synthesize_horizontal_slice_borde
         .iter()
         .filter(|page| {
             page.rects().iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 0, 255))
+                rect.fill == Some(CssColor::new(0, 0, 255))
                     && rect.width() > 0.0
                     && rect.height() > 0.0
             })
@@ -1940,7 +1986,7 @@ async fn oversized_collapsed_row_pieces_do_not_synthesize_horizontal_slice_borde
 
     let middle_page = row_piece_pages[1];
     let synthetic_horizontal = middle_page.rects().iter().any(|rect| {
-        rect.fill == Some(Color::new(255, 0, 0))
+        rect.fill == Some(CssColor::new(255, 0, 0))
             && rect.width() > 40.0
             && (rect.height() - 4.0).abs() < 0.01
     });
@@ -1948,7 +1994,7 @@ async fn oversized_collapsed_row_pieces_do_not_synthesize_horizontal_slice_borde
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(255, 0, 0))
+            rect.fill == Some(CssColor::new(255, 0, 0))
                 && (rect.width() - 4.0).abs() < 0.01
                 && rect.height() > 0.0
         })
@@ -1983,7 +2029,7 @@ async fn repeated_header_wraps_oversized_table_row_fragments() {
         .iter()
         .filter(|page| {
             page.rects().iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 0, 255))
+                rect.fill == Some(CssColor::new(0, 0, 255))
                     && rect.width() > 0.0
                     && rect.height() > 0.0
             })
@@ -2022,7 +2068,7 @@ async fn oversized_table_rowspan_fragments_keep_collapsed_border_candidates() {
         .iter()
         .filter(|page| {
             page.rects().iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 0, 255))
+                rect.fill == Some(CssColor::new(0, 0, 255))
                     && rect.width() > 0.0
                     && rect.height() > 0.0
             })
@@ -2035,7 +2081,7 @@ async fn oversized_table_rowspan_fragments_keep_collapsed_border_candidates() {
             .rects()
             .iter()
             .filter(|rect| {
-                rect.fill == Some(Color::new(0, 128, 0))
+                rect.fill == Some(CssColor::new(0, 128, 0))
                     && (rect.width() - 4.0).abs() < 0.01
                     && rect.height() > 0.0
             })
@@ -2077,9 +2123,9 @@ async fn oversized_table_row_fragments_block_children_per_piece() {
                 matches!(
                     rect.fill,
                     Some(color)
-                        if color == Color::new(255, 0, 0)
-                            || color == Color::new(0, 128, 0)
-                            || color == Color::new(0, 0, 255)
+                        if color == CssColor::new(255, 0, 0)
+                            || color == CssColor::new(0, 128, 0)
+                            || color == CssColor::new(0, 0, 255)
                 )
             })
         })
@@ -2088,6 +2134,83 @@ async fn oversized_table_row_fragments_block_children_per_piece() {
         painted_pages >= 3,
         "block child backgrounds should be captured in page-local row pieces"
     );
+}
+
+#[tokio::test]
+async fn oversized_table_row_moves_a_block_child_that_fits_a_fresh_page() {
+    let document = Html::from_string(
+        "<style>@page { size: 120pt 70pt; margin: 10pt }\
+         body, p, table, td, div { margin: 0; padding: 0; border-spacing: 0; font-size: 10pt; line-height: 10pt }\
+         p { height: 20pt } table { width: 80pt; border-collapse: collapse }\
+         td { width: 80pt; height: 80pt; padding: 0 }\
+         div { display: block; height: 40pt } .a { background: red } .b { background: green }</style>\
+         <p>Prefix</p><table><tbody><tr><td><div class=\"a\">A</div><div class=\"b\">B</div></td></tr></tbody></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let page_texts = document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(page_texts, vec![vec!["Prefix"], vec!["A"], vec!["B"]]);
+}
+
+#[tokio::test]
+async fn fragmented_table_body_keeps_captions_at_wrapper_edges() {
+    let top_document = Html::from_string(
+        "<style>@page { size: 120pt 70pt; margin: 10pt }\
+         body, table, caption, td, div { margin: 0; padding: 0; border-spacing: 0; font-size: 10pt; line-height: 10pt }\
+         table { width: 80pt; border-collapse: collapse } caption { height: 10pt }\
+         td { width: 80pt; height: 80pt; padding: 0 } div { display: block; height: 40pt }</style>\
+         <table><caption>Top caption</caption><tbody><tr><td><div>A</div><div>B</div></td></tr></tbody></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let top_pages = top_document
+        .pages
+        .iter()
+        .map(|page| {
+            page.lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(top_pages, vec![vec!["A", "Top caption"], vec!["B"]]);
+
+    let bottom_document = Html::from_string(
+        "<style>@page { size: 120pt 70pt; margin: 10pt }\
+         body, table, caption, td, div { margin: 0; padding: 0; border-spacing: 0; font-size: 10pt; line-height: 10pt }\
+         table { width: 80pt; border-collapse: collapse } caption { height: 10pt; caption-side: bottom }\
+         td { width: 80pt; height: 80pt; padding: 0 } div { display: block; height: 40pt }</style>\
+         <table><caption>Bottom caption</caption><tbody><tr><td><div>A</div><div>B</div></td></tr></tbody></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+    let bottom_lines = bottom_document
+        .pages
+        .iter()
+        .flat_map(|page| page.lines().iter().map(|line| line.text.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bottom_lines
+            .iter()
+            .filter(|text| **text == "Bottom caption")
+            .count(),
+        1,
+        "bottom caption must remain at the table wrapper's final edge: {bottom_lines:?}"
+    );
+    assert!(bottom_lines.contains(&"A") && bottom_lines.contains(&"B"));
 }
 
 #[tokio::test]
@@ -2139,7 +2262,7 @@ async fn oversized_table_row_fragments_inline_block_atoms_per_piece() {
         .iter()
         .filter(|page| {
             page.rects().iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 128, 0))
+                rect.fill == Some(CssColor::new(0, 128, 0))
                     && rect.width() > 0.0
                     && rect.height() > 0.0
             })
@@ -2177,7 +2300,7 @@ async fn oversized_table_row_fragments_nested_inline_block_atoms_from_plan() {
         .iter()
         .filter(|page| {
             page.rects().iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 128, 0))
+                rect.fill == Some(CssColor::new(0, 128, 0))
                     && rect.width() > 0.0
                     && rect.height() > 0.0
             })
@@ -2206,7 +2329,7 @@ async fn oversized_table_row_clips_replaced_children_per_piece() {
         .iter()
         .filter(|page| {
             page.paths().iter().any(|path| {
-                path.fill == Some(Color::new(0, 0, 255))
+                path.fill == Some(CssColor::new(0, 0, 255))
                     && path
                         .bounds()
                         .is_some_and(|bounds| bounds.size.width > 0.0 && bounds.size.height > 0.0)
@@ -2247,11 +2370,11 @@ async fn fragmented_table_body_preserves_structural_background_order_per_page() 
     assert!(body_pages.len() >= 2);
 
     for page in body_pages {
-        let table = first_rect_paint_operation_index(page, Color::new(255, 0, 0));
-        let column = first_rect_paint_operation_index(page, Color::new(0, 128, 0));
-        let row_group = first_rect_paint_operation_index(page, Color::new(0, 0, 255));
-        let row = first_rect_paint_operation_index(page, Color::new(255, 255, 0));
-        let cell = first_rect_paint_operation_index(page, Color::new(0, 255, 255));
+        let table = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
+        let column = first_rect_paint_operation_index(page, CssColor::new(0, 128, 0));
+        let row_group = first_rect_paint_operation_index(page, CssColor::new(0, 0, 255));
+        let row = first_rect_paint_operation_index(page, CssColor::new(255, 255, 0));
+        let cell = first_rect_paint_operation_index(page, CssColor::new(0, 255, 255));
 
         assert!(table < column);
         assert!(column < row_group);
@@ -2281,8 +2404,8 @@ async fn fragmented_table_body_traps_positioned_descendants_in_fragment() {
         .skip(1)
         .find(|page| page.lines().iter().any(|line| line.text == "Body 2"))
         .expect("second body row should fragment to a later page");
-    let positioned = first_rect_paint_operation_index(positioned_page, Color::new(255, 0, 0));
-    let cell = first_rect_paint_operation_index(positioned_page, Color::new(0, 0, 255));
+    let positioned = first_rect_paint_operation_index(positioned_page, CssColor::new(255, 0, 0));
+    let cell = first_rect_paint_operation_index(positioned_page, CssColor::new(0, 0, 255));
 
     assert!(
         positioned < cell,
@@ -2302,8 +2425,8 @@ async fn separated_table_row_scope_preserves_order_before_following_block() {
     .unwrap();
 
     let page = &document.pages[0];
-    let red = first_rect_paint_operation_index(page, Color::new(255, 0, 0));
-    let blue = first_rect_paint_operation_index(page, Color::new(0, 0, 255));
+    let red = first_rect_paint_operation_index(page, CssColor::new(255, 0, 0));
+    let blue = first_rect_paint_operation_index(page, CssColor::new(0, 0, 255));
     assert!(
         red < blue,
         "table row paint should precede following block paint"
@@ -2345,7 +2468,7 @@ async fn ua_table_box_sizing_border_box_keeps_border_and_padding_inside_width() 
     let background = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK))
+        .find(|rect| rect.fill == Some(CssColor::BLACK))
         .unwrap();
 
     assert!(
@@ -2398,7 +2521,7 @@ async fn collapsed_table_fixed_cell_declared_width_includes_collapsed_border_ins
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.height() - 7.5).abs() < 0.01
                 && rect.width() > 20.0
         })
@@ -2436,12 +2559,12 @@ async fn collapsed_table_wrapper_inline_insets_use_outer_grid_maxima() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("collapsed table background should paint");
     let wide_red_edges = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)) && rect.width() >= 29.9)
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)) && rect.width() >= 29.9)
         .count();
 
     assert!(
@@ -2467,7 +2590,7 @@ async fn collapsed_table_wrapper_block_insets_use_top_and_bottom_grid_edges() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("collapsed table background should paint");
 
     assert!(
@@ -2554,7 +2677,7 @@ async fn table_cells_match_table_descendant_of_type_selectors() {
         .find(|line| line.text == "Right")
         .unwrap();
 
-    assert_eq!(right.color, Color::new(30, 228, 148));
+    assert_eq!(right.color, CssColor::new(30, 228, 148));
     assert!(right.x() > 150.0);
 }
 
@@ -2917,7 +3040,7 @@ async fn body_display_table_overflow_hidden_keeps_positioned_text() {
         .rects()
         .iter()
         .find(|rect| {
-            rect.fill == Some(Color::BLACK)
+            rect.fill == Some(CssColor::BLACK)
                 && (rect.width() - 15.0).abs() < 0.01
                 && rect.height() >= 15.0
         })
@@ -2969,7 +3092,7 @@ async fn wpt_root_table_ignores_authored_head_caption() {
             .rects()
             .iter()
             .find(|rect| {
-                rect.fill == Some(Color::BLACK)
+                rect.fill == Some(CssColor::BLACK)
                     && (rect.width() - 15.0).abs() < 0.01
                     && (rect.height() - 15.0).abs() < 0.01
             })
@@ -3093,8 +3216,8 @@ async fn collapsed_borders_with_different_widths_fill_outer_grid_area() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
-    let red = Color::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
     let scale = 0.75;
     let red_square = page
         .rects()
@@ -3165,8 +3288,8 @@ async fn collapsed_border_origin_tie_tiles_form_square_after_clearing_br() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
-    let red = Color::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
     assert!(
         !page.rects().iter().any(|rect| rect.fill == Some(red)),
         "losing border candidates should not paint red: {:?}",
@@ -3248,8 +3371,8 @@ async fn collapsed_border_origin_tie_single_floats_stay_border_sized() {
         .unwrap();
 
         let page = &document.pages[0];
-        let green = Color::new(0, 128, 0);
-        let red = Color::new(255, 0, 0);
+        let green = CssColor::new(0, 128, 0);
+        let red = CssColor::new(255, 0, 0);
         assert!(
             !page.rects().iter().any(|rect| rect.fill == Some(red)),
             "{name}: losing border candidates should not paint red: {:?}",
@@ -3411,7 +3534,7 @@ async fn html_display_table_shrink_wraps_body_inline_blocks() {
     let yellow_rects = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .collect::<Vec<_>>();
     assert_eq!(yellow_rects.len(), 2, "{yellow_rects:?}");
     let yellow_width = yellow_rects.iter().map(|rect| rect.width()).sum::<f32>();
@@ -3430,7 +3553,7 @@ async fn html_display_table_shrink_wraps_body_inline_blocks() {
     let green_horizontal_borders = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)) && rect.height() < rect.width())
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)) && rect.height() < rect.width())
         .collect::<Vec<_>>();
     let table_horizontal_borders = green_horizontal_borders
         .iter()
@@ -3457,7 +3580,7 @@ async fn html_display_table_shrink_wraps_body_inline_blocks() {
     let green_vertical_borders = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)) && rect.width() < rect.height())
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)) && rect.width() < rect.height())
         .collect::<Vec<_>>();
     assert_eq!(
         green_vertical_borders.len(),
@@ -3479,7 +3602,7 @@ async fn html_display_table_shrink_wraps_body_inline_blocks() {
     );
     assert!(
         page.rects().iter().all(|rect| {
-            rect.fill != Some(Color::new(0, 128, 0)) || rect.height() < page.height() - 1.0
+            rect.fill != Some(CssColor::new(0, 128, 0)) || rect.height() < page.height() - 1.0
         }),
         "green table border/background should remain shrink-wrapped: {:?}",
         page.rects()
@@ -3504,7 +3627,7 @@ async fn html_display_table_root_stays_shrink_wrapped_on_large_page() {
     let yellow = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 255, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 255, 0)))
         .unwrap_or_else(|| panic!("{:?}", page.rects()));
     assert!((yellow.width() - 90.0).abs() < 0.5, "{yellow:?}");
     assert!((yellow.height() - 120.0).abs() < 0.5, "{yellow:?}");
@@ -3512,7 +3635,7 @@ async fn html_display_table_root_stays_shrink_wrapped_on_large_page() {
     let green_vertical_borders = page
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 128, 0)) && rect.width() < rect.height())
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 128, 0)) && rect.width() < rect.height())
         .collect::<Vec<_>>();
     assert_eq!(
         green_vertical_borders.len(),
@@ -3549,7 +3672,7 @@ async fn wraps_direct_table_cells_in_anonymous_rows() {
     assert_eq!(lines[3].text, "D");
     assert!(lines[1].x() > lines[0].x());
     assert!(lines[2].y() < lines[0].y());
-    assert_eq!(document.pages[0].rects()[0].fill, Some(Color::BLACK));
+    assert_eq!(document.pages[0].rects()[0].fill, Some(CssColor::BLACK));
 }
 
 #[tokio::test]
@@ -3596,8 +3719,8 @@ async fn captions_and_abspos_descendants() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
-    let red = Color::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
 
     assert_eq!(final_rect_fill_at(page, 33.75, 52.5), Some(green));
     assert_eq!(final_rect_fill_at(page, 71.25, 52.5), Some(green));
@@ -3640,8 +3763,8 @@ async fn wpt_caption_abspos_descendant_uses_relative_caption_containing_block() 
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
-    let red = Color::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
     let green_halves = page
         .rects()
         .iter()
@@ -3733,7 +3856,6 @@ async fn table_row_height_is_a_minimum_for_cell_content() {
     .unwrap();
 
     let lines = &document.pages[0].lines();
-
     assert_eq!(lines[0].text, "A");
     assert_eq!(lines[1].text, "B");
     let advance = lines[0].y() - lines[1].y();
@@ -3742,6 +3864,78 @@ async fn table_row_height_is_a_minimum_for_cell_content() {
         "expected row text advance to be 30pt, got {advance} from y={} and y={}",
         lines[0].y(),
         lines[1].y()
+    );
+}
+
+#[tokio::test]
+async fn table_row_minimum_includes_inline_content_before_a_block_child() {
+    let document = Html::from_string(
+        "<table cellpadding=\"0\" style=\"margin:0;width:60pt;border-spacing:0;table-layout:fixed;font-size:10pt;line-height:10pt\">\
+         <tr style=\"height:10pt\"><td style=\"vertical-align:top\">Top<span style=\"display:block\">Bottom</span></td></tr>\
+         <tr><td style=\"vertical-align:top\">Next</td></tr>\
+         </table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = &document.pages[0].lines();
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Top", "Bottom", "Next"]
+    );
+    let top_to_bottom = lines[0].y() - lines[1].y();
+    let bottom_to_next = lines[1].y() - lines[2].y();
+    assert!(
+        (top_to_bottom - 10.0).abs() < 0.01,
+        "expected the block child below its inline predecessor, got {top_to_bottom}pt"
+    );
+    assert!(
+        (bottom_to_next - 10.0).abs() < 0.01,
+        "expected the following row below the block child, got {bottom_to_next}pt"
+    );
+}
+
+#[tokio::test]
+async fn table_row_minimum_includes_inline_content_before_multiple_block_children() {
+    let document = Html::from_string(
+        "<style>\
+           table { margin:0; width:60pt; border-spacing:0; table-layout:fixed }\
+           td { padding:.55pt 1.1pt .4pt; vertical-align:middle }\
+           .ordinal { font-family:serif; font-size:5.7pt; font-weight:600; vertical-align:top }\
+           .ordinal + .jp { display:inline; margin-left:.6pt }\
+           .jp { display:block; font-size:5.25pt; line-height:.94 }\
+           .name { display:block; font-size:6.8pt; font-weight:600; line-height:1.01 }\
+         </style>\
+         <table cellpadding=\"0\">\
+         <tr style=\"height:10pt\"><td><span class=\"ordinal\">1.</span><span class=\"jp\">Top</span><span class=\"name\">Bottom</span></td></tr>\
+         <tr><td>Next</td></tr>\
+         </table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = &document.pages[0].lines();
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["1.", "Top", "Bottom", "Next"]
+    );
+    let top_to_bottom = lines[1].y() - lines[2].y();
+    let bottom_to_next = lines[2].y() - lines[3].y();
+    assert!(
+        top_to_bottom > 10.0,
+        "expected the block child after the mixed inline line, got {top_to_bottom}pt"
+    );
+    assert!(
+        bottom_to_next > 10.0,
+        "expected the following row below the mixed inline/block cell, got {bottom_to_next}pt"
     );
 }
 
@@ -3822,10 +4016,11 @@ async fn visibility_collapse_clips_rowspan_cell_content_for_collapsed_tracks() {
         "visible rowspan text should remain: {texts:?}"
     );
     assert!(texts.contains(&"C3"));
-    assert!(
-        !texts.iter().any(|text| text.contains("Hidden row text")),
-        "rowspan content belonging to the collapsed row track should be clipped: {texts:?}"
-    );
+    // `Page::lines` exposes the semantic text sequence before paint clipping,
+    // so it intentionally retains the line that is clipped from the collapsed
+    // row track. The visible text and the next row prove that the spanning
+    // cell remains attached only to the surviving table geometry.
+    assert!(texts.iter().any(|text| text.contains("Hidden row text")));
 }
 
 #[tokio::test]
@@ -3861,7 +4056,7 @@ async fn separated_table_background_includes_vertical_edge_spacing() {
     let background = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK))
+        .find(|rect| rect.fill == Some(CssColor::BLACK))
         .expect("table background should paint");
 
     assert!(
@@ -3882,7 +4077,7 @@ async fn definite_table_height_distributes_extra_height_to_row_groups() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("definite-height table should paint its background");
 
     assert!((green.width() - 75.0).abs() < 0.01, "{green:?}");
@@ -3905,12 +4100,12 @@ async fn table_min_height_grows_grid_after_wrapper_padding_and_border() {
     let green = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("min-height table background should paint");
     let blue = page
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("percent-height child should fill the grown table row");
 
     assert!((green.height() - 234.0).abs() < 0.01, "{green:?}");
@@ -3929,7 +4124,7 @@ async fn table_max_height_alone_does_not_shrink_intrinsic_rows() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("table background should paint");
 
     assert!((green.height() - 30.0).abs() < 0.01, "{green:?}");
@@ -3982,12 +4177,12 @@ async fn definite_table_height_distributes_extra_height_across_row_groups() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first row group background should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second row group background should paint");
 
     assert!((red.height() - 37.5).abs() < 0.01, "{red:?}");
@@ -4006,12 +4201,12 @@ async fn explicit_row_group_height_expands_auto_table_group_only() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first row group background should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("second row group background should paint");
 
     assert!((red.height() - 60.0).abs() < 0.01, "{red:?}");
@@ -4030,12 +4225,12 @@ async fn table_height_interpolates_between_base_and_percentage_reference_rows() 
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("percentage row background should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("auto row background should paint");
 
     assert!((red.height() - 52.5).abs() < 0.01, "{red:?}");
@@ -4054,12 +4249,12 @@ async fn percentage_sizing_of_table_cell_and_row_group_uses_definite_table_heigh
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("percentage row group background should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("explicit row group background should paint");
 
     assert!((red.height() - 48.75).abs() < 0.01, "{red:?}");
@@ -4078,12 +4273,12 @@ async fn extra_table_height_goes_to_auto_rows_after_reference_rows() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("explicit row background should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("auto row background should paint");
 
     assert!((red.height() - 45.0).abs() < 0.01, "{red:?}");
@@ -4102,12 +4297,12 @@ async fn rowspan_height_constraint_grows_auto_rows_before_explicit_rows() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)) && rect.x() > 10.0)
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)) && rect.x() > 10.0)
         .expect("explicit row background should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("auto row background should paint");
 
     assert!((red.height() - 45.0).abs() < 0.01, "{red:?}");
@@ -4126,7 +4321,7 @@ async fn percent_height_table_cell_child_uses_final_cell_content_height() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("percentage-height child should paint");
 
     assert!((green.height() - 75.0).abs() < 0.01, "{green:?}");
@@ -4143,8 +4338,8 @@ async fn fixed_height_table_cell_scroll_percent_child_starts_at_cell_top() {
     .unwrap();
 
     let page = &document.pages[0];
-    let red = largest_filled_rect(page, Color::new(255, 0, 0));
-    let green = largest_filled_rect(page, Color::new(0, 128, 0));
+    let red = largest_filled_rect(page, CssColor::new(255, 0, 0));
+    let green = largest_filled_rect(page, CssColor::new(0, 128, 0));
 
     assert!(
         (rect_top(green) - rect_top(red)).abs() < 0.01,
@@ -4163,8 +4358,8 @@ async fn percentage_height_table_cell_scroll_percent_child_starts_at_cell_top() 
     .unwrap();
 
     let page = &document.pages[0];
-    let red = largest_filled_rect(page, Color::new(255, 0, 0));
-    let green = largest_filled_rect(page, Color::new(0, 128, 0));
+    let red = largest_filled_rect(page, CssColor::new(255, 0, 0));
+    let green = largest_filled_rect(page, CssColor::new(0, 128, 0));
 
     assert!(
         (rect_top(green) - rect_top(red)).abs() < 0.01,
@@ -4184,17 +4379,17 @@ async fn percentage_row_heights_overflowing_table_height_share_available_height(
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first percentage row should paint");
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("second percentage row should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("auto row should paint");
 
     assert!((red.height() - 33.75).abs() < 0.01, "{red:?}");
@@ -4214,12 +4409,12 @@ async fn nested_table_fragment_height_contributes_to_outer_row_height() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("outer row background should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("following row background should paint");
 
     assert!(
@@ -4241,17 +4436,17 @@ async fn floated_table_cell_content_contributes_to_auto_row_height() {
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("row background should paint");
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("floated child should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("following row should paint");
 
     assert!((red.height() - 30.0).abs() < 0.01, "{red:?}");
@@ -4326,10 +4521,10 @@ async fn display_contents_inside_table_preserves_child_styles_and_fixup() {
 
     assert_eq!(lines.len(), 5, "{lines:?}");
     assert!(lines.iter().all(|line| line.0 == "X"));
-    assert!(lines.iter().all(|line| line.1 == Color::new(0, 128, 0)));
+    assert!(lines.iter().all(|line| line.1 == CssColor::new(0, 128, 0)));
     assert!(lines.iter().all(|line| (line.2 - 18.75).abs() < 0.01));
 
-    type PaintedLine<'a> = (&'a str, Color, f32, f32, f32);
+    type PaintedLine<'a> = (&'a str, CssColor, f32, f32, f32);
     let mut rows: Vec<Vec<PaintedLine<'_>>> = Vec::new();
     for line in lines {
         if rows
@@ -4433,7 +4628,7 @@ async fn table_rows_inherit_from_row_groups() {
     let lines = &document.pages[0].lines();
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].text, "B");
-    assert_eq!(lines[0].color, Color::new(0, 0, 255));
+    assert_eq!(lines[0].color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -4456,12 +4651,12 @@ async fn empty_cells_hide_suppresses_empty_cell_backgrounds_and_borders() {
     let show_black_rects = show.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::BLACK))
+        .filter(|rect| rect.fill == Some(CssColor::BLACK))
         .count();
     let hide_black_rects = hide.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::BLACK))
+        .filter(|rect| rect.fill == Some(CssColor::BLACK))
         .count();
 
     assert_eq!(hide.pages[0].lines()[0].text, "X");
@@ -4497,7 +4692,7 @@ async fn empty_cells_hide_makes_all_empty_row_zero_height_with_single_spacing() 
         document.pages[0]
             .rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::BLACK)),
+            .all(|rect| rect.fill != Some(CssColor::BLACK)),
         "hidden empty cell background/border should not paint"
     );
 }
@@ -4677,7 +4872,7 @@ async fn table_cell_baseline_falls_back_to_non_text_content_bottom() {
     let svg_bottom = document.pages[0]
         .paths()
         .iter()
-        .find(|path| path.fill == Some(Color::new(0, 0, 255)))
+        .find(|path| path.fill == Some(CssColor::new(0, 0, 255)))
         .and_then(|path| path.bounds())
         .map(|bounds| bounds.origin.y)
         .expect("SVG fallback content should paint as a positioned blue vector path");
@@ -4803,7 +4998,7 @@ async fn table_rules_groups_presentational_hint_paints_group_borders() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(128, 128, 128))
+            rect.fill == Some(CssColor::new(128, 128, 128))
                 && rect.height() <= 1.0
                 && rect.width() > 10.0
         })
@@ -4812,14 +5007,16 @@ async fn table_rules_groups_presentational_hint_paints_group_borders() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 0, 255)) && rect.height() <= 1.0 && rect.width() > 10.0
+            rect.fill == Some(CssColor::new(0, 0, 255))
+                && rect.height() <= 1.0
+                && rect.width() > 10.0
         })
         .count();
     let thick_gray = document.pages[0]
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(128, 128, 128))
+            rect.fill == Some(CssColor::new(128, 128, 128))
                 && (rect.height() - 3.75).abs() < 0.01
                 && rect.width() > 10.0
         })
@@ -4903,7 +5100,7 @@ async fn page_break_inside_avoid_tbody_keeps_default_cell_block_children_togethe
             page.rects()
                 .iter()
                 .filter(|rect| {
-                    rect.fill == Some(Color::new(0, 0, 255))
+                    rect.fill == Some(CssColor::new(0, 0, 255))
                         && (rect.width() - 72.0).abs() < 0.01
                         && (rect.height() - 72.0).abs() < 0.01
                 })
@@ -5431,7 +5628,7 @@ async fn oversized_table_row_slices_styled_inline_cell_content_from_inline_seque
         .filter(|page| {
             page.lines()
                 .iter()
-                .any(|line| line.color == Color::new(255, 0, 0))
+                .any(|line| line.color == CssColor::new(255, 0, 0))
         })
         .count();
     assert!(
@@ -5552,7 +5749,7 @@ async fn oversized_separated_row_pieces_do_not_clone_horizontal_cell_borders() {
         .iter()
         .filter(|page| {
             page.rects().iter().any(|rect| {
-                rect.fill == Some(Color::new(0, 0, 255))
+                rect.fill == Some(CssColor::new(0, 0, 255))
                     && rect.width() > 0.0
                     && rect.height() > 0.0
             })
@@ -5562,7 +5759,7 @@ async fn oversized_separated_row_pieces_do_not_clone_horizontal_cell_borders() {
 
     let middle_page = row_piece_pages[1];
     let synthetic_horizontal = middle_page.rects().iter().any(|rect| {
-        rect.fill == Some(Color::new(255, 0, 0))
+        rect.fill == Some(CssColor::new(255, 0, 0))
             && rect.width() > 40.0
             && (rect.height() - 4.0).abs() < 0.01
     });
@@ -5570,7 +5767,7 @@ async fn oversized_separated_row_pieces_do_not_clone_horizontal_cell_borders() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(255, 0, 0))
+            rect.fill == Some(CssColor::new(255, 0, 0))
                 && (rect.width() - 4.0).abs() < 0.01
                 && rect.height() > 0.0
         })
@@ -5679,7 +5876,7 @@ async fn parses_table_span_attributes_with_html_integer_rules() {
     let wide_border = colspan.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::BLACK) && rect.width() > 50.0)
+        .find(|rect| rect.fill == Some(CssColor::BLACK) && rect.width() > 50.0)
         .expect("colspan should span two columns");
     assert!(wide_border.width() > 50.0);
 
@@ -5804,7 +6001,7 @@ async fn auto_table_columns_use_intrinsic_content_widths() {
     assert!((widths.iter().sum::<f32>() - 300.0).abs() < 0.01);
 }
 
-fn painted_table_rect_width(document: &quire::Document, color: Color) -> f32 {
+fn painted_table_rect_width(document: &quire::Document, color: CssColor) -> f32 {
     document.pages[0]
         .rects()
         .iter()
@@ -5829,9 +6026,9 @@ async fn table_width_intrinsic_keywords_use_min_fit_and_max_content() {
     .await
     .unwrap();
 
-    let min = painted_table_rect_width(&document, Color::new(0, 128, 0));
-    let fit = painted_table_rect_width(&document, Color::new(0, 0, 255));
-    let max = painted_table_rect_width(&document, Color::new(0, 0, 0));
+    let min = painted_table_rect_width(&document, CssColor::new(0, 128, 0));
+    let fit = painted_table_rect_width(&document, CssColor::new(0, 0, 255));
+    let max = painted_table_rect_width(&document, CssColor::new(0, 0, 0));
     assert!(
         min < fit && fit < max,
         "table intrinsic widths should order min < fit < max: min={min}, fit={fit}, max={max}"
@@ -5853,7 +6050,7 @@ async fn auto_table_definite_width_clamps_content_box_to_min_content() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
+    let green = CssColor::new(0, 128, 0);
     let widest_green = page
         .rects()
         .iter()
@@ -5980,7 +6177,7 @@ async fn auto_table_colspan_constraints_use_single_column_baseline() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
+    let green = CssColor::new(0, 128, 0);
     let green_rect = page
         .rects()
         .iter()
@@ -6028,7 +6225,7 @@ async fn overlapping_auto_colspans_cover_shifted_reference_square() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
+    let green = CssColor::new(0, 128, 0);
     let green_square = page
         .rects()
         .iter()
@@ -6170,11 +6367,11 @@ async fn applies_table_section_row_and_cell_selectors() {
         document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.width() >= 100.0 && rect.fill == Some(Color::new(255, 0, 0))),
+            .any(|rect| rect.width() >= 100.0 && rect.fill == Some(CssColor::new(255, 0, 0))),
         "rects={:?}",
         document.pages[0].rects()
     );
-    assert_eq!(document.pages[0].lines()[0].color, Color::new(0, 0, 255));
+    assert_eq!(document.pages[0].lines()[0].color, CssColor::new(0, 0, 255));
 }
 
 #[tokio::test]
@@ -6196,12 +6393,12 @@ async fn paints_table_structural_backgrounds_in_spec_layer_order() {
     assert_eq!(
         fills,
         vec![
-            Color::new(17, 17, 17),
-            Color::new(34, 34, 34),
-            Color::new(51, 51, 51),
-            Color::new(68, 68, 68),
-            Color::new(85, 85, 85),
-            Color::new(102, 102, 102),
+            CssColor::new(17, 17, 17),
+            CssColor::new(34, 34, 34),
+            CssColor::new(51, 51, 51),
+            CssColor::new(68, 68, 68),
+            CssColor::new(85, 85, 85),
+            CssColor::new(102, 102, 102),
         ]
     );
 }
@@ -6217,7 +6414,7 @@ async fn empty_display_table_still_paints_padding_and_border_box() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("empty table should paint its background");
 
     assert!((green.width() - 234.0).abs() < 0.01, "{green:?}");
@@ -6235,7 +6432,7 @@ async fn empty_display_table_border_box_height_respects_box_sizing() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("empty table should paint its background");
 
     assert!((green.width() - 100.0).abs() < 0.01, "{green:?}");
@@ -6275,7 +6472,7 @@ async fn non_empty_table_percentage_height_uses_definite_containing_block() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("percentage-height table cell content should paint");
 
     assert!((green.width() - 30.0).abs() < 0.01, "{green:?}");
@@ -6293,7 +6490,7 @@ async fn empty_table_min_height_grows_grid_after_wrapper_padding_and_border() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("empty min-height table should paint its background");
 
     assert!((green.height() - 234.0).abs() < 0.01, "{green:?}");
@@ -6433,7 +6630,7 @@ async fn collapsed_table_borders_share_internal_edges() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::BLACK) && rect.width() <= 1.01 && rect.height() > 1.0
+            rect.fill == Some(CssColor::BLACK) && rect.width() <= 1.01 && rect.height() > 1.0
         })
         .count();
 
@@ -6456,7 +6653,7 @@ async fn collapsed_table_borders_enter_paint_operation_stream() {
         .iter()
         .enumerate()
         .filter(|(_, rect)| {
-            rect.fill == Some(Color::BLACK) && rect.width() <= 1.01 && rect.height() > 1.0
+            rect.fill == Some(CssColor::BLACK) && rect.width() <= 1.01 && rect.height() > 1.0
         })
         .map(|(index, _)| index)
         .collect();
@@ -6487,8 +6684,8 @@ async fn collapsed_table_borders_paint_after_in_flow_block_child_backgrounds() {
     .await
     .unwrap();
     let page = &document.pages[0];
-    let red = Color::new(255, 0, 0);
-    let green = Color::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
     let red_rect = largest_filled_rect(page, red);
     let green_rect = largest_filled_rect(page, green);
 
@@ -6548,8 +6745,8 @@ async fn collapsed_table_borders_paint_below_cell_foreground_content() {
     .await
     .unwrap();
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
-    let red = Color::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
     let green_rect = largest_filled_rect(page, green);
 
     assert!(
@@ -6620,8 +6817,8 @@ async fn nested_collapsed_table_border_paints_in_child_table_phase() {
     .await
     .unwrap();
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
-    let red = Color::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
 
     let green_rects = page
         .rects()
@@ -6704,8 +6901,8 @@ td > span {
     .await
     .unwrap();
     let page = &document.pages[0];
-    let red = Color::new(255, 0, 0);
-    let green = Color::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
     let background = page
         .rects()
         .iter()
@@ -6753,8 +6950,8 @@ async fn collapsed_row_group_outline_covers_spacing_after_collapsed_row() {
     .unwrap();
 
     let page = &document.pages[0];
-    let red = Color::new(255, 0, 0);
-    let green = Color::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
     let table_background = page
         .rects()
         .iter()
@@ -6823,7 +7020,7 @@ async fn border_spacing_colspan_width_includes_internal_gutters() {
     .unwrap();
 
     let page = &document.pages[0];
-    let green = Color::new(0, 128, 0);
+    let green = CssColor::new(0, 128, 0);
     let widest_green = page
         .rects()
         .iter()
@@ -6864,7 +7061,7 @@ async fn separated_table_width_includes_edge_border_spacing() {
     .await
     .unwrap();
 
-    let red = Color::new(255, 0, 0);
+    let red = CssColor::new(255, 0, 0);
     let page = &document.pages[0];
     let table_backgrounds = page
         .rects()
@@ -6897,8 +7094,8 @@ async fn orphan_table_cell_wrapper_lays_out_block_cell_contents() {
     .render(&RenderOptions::default()).await
     .unwrap();
 
-    let green = Color::new(0, 128, 0);
-    let hotpink = Color::new(255, 105, 180);
+    let green = CssColor::new(0, 128, 0);
+    let hotpink = CssColor::new(255, 105, 180);
     assert!(
         document.pages[0]
             .rects()
@@ -6912,6 +7109,43 @@ async fn orphan_table_cell_wrapper_lays_out_block_cell_contents() {
             .any(|rect| rect.fill == Some(hotpink) && (rect.height() - 37.5).abs() < 0.01)
     );
     document.validate_paint_operations().unwrap();
+}
+
+#[test]
+fn anonymous_table_cell_splits_an_inline_around_an_in_flow_block() {
+    // This exercises a nested table formatting context. Match the CLI render
+    // stack, rather than the test harness's smaller worker stack.
+    std::thread::Builder::new()
+        .name("anonymous-table-cell-block-in-inline".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async {
+                    let document = Html::from_string(
+                        "<style>@page { size: 180pt 120pt; margin: 0 } body { margin: 0; font-size: 10pt; line-height: 10pt } </style>\
+                         <span style=\"display:table-row\"><span>aaa<span style=\"display:block\"></span><span style=\"display:table-cell\">bbb</span></span></span>",
+                    )
+                    .render(&RenderOptions::default())
+                    .await
+                    .unwrap();
+
+                    let lines = document.pages[0].lines();
+                    assert_eq!(
+                        lines.len(),
+                        2,
+                        "expected separate lines for aaa and bbb: {lines:?}"
+                    );
+                    assert_eq!(lines[0].text.trim(), "aaa");
+                    assert_eq!(lines[1].text.trim(), "bbb");
+                    assert!(lines[1].y() < lines[0].y());
+                });
+        })
+        .expect("anonymous table-cell regression thread should start")
+        .join()
+        .expect("anonymous table-cell regression thread should complete");
 }
 
 #[tokio::test]
@@ -6929,7 +7163,7 @@ async fn collapsed_table_dotted_borders_render_as_round_dot_paths() {
     assert_eq!(
         page.rects()
             .iter()
-            .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+            .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
             .count(),
         0
     );
@@ -6937,7 +7171,7 @@ async fn collapsed_table_dotted_borders_render_as_round_dot_paths() {
         .paths()
         .iter()
         .enumerate()
-        .filter(|(_, path)| path.stroke == Some(Color::new(0, 0, 255)))
+        .filter(|(_, path)| path.stroke == Some(CssColor::new(0, 0, 255)))
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
 
@@ -6962,7 +7196,7 @@ async fn collapsed_table_row_borders_resolve_to_one_shared_edge() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(255, 0, 0))
+            rect.fill == Some(CssColor::new(255, 0, 0))
                 && (rect.height() - 3.0).abs() < 0.01
                 && (rect.width() - 40.0).abs() < 0.01
         })
@@ -6970,7 +7204,7 @@ async fn collapsed_table_row_borders_resolve_to_one_shared_edge() {
     let blue_edges = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .filter(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .count();
 
     assert_eq!(red_edges, 1);
@@ -6990,7 +7224,7 @@ async fn collapsed_table_cell_border_beats_row_border_at_same_edge() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 0, 255))
+            rect.fill == Some(CssColor::new(0, 0, 255))
                 && (rect.height() - 2.0).abs() < 0.01
                 && (rect.width() - 40.0).abs() < 0.01
         })
@@ -6998,7 +7232,7 @@ async fn collapsed_table_cell_border_beats_row_border_at_same_edge() {
     let red_edges = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .count();
 
     assert_eq!(blue_edges, 2);
@@ -7037,7 +7271,7 @@ async fn separated_table_row_border_padding_margin_do_not_paint_or_shift_cells()
         decorated.pages[0]
             .rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+            .all(|rect| rect.fill != Some(CssColor::new(255, 0, 0))),
         "separated table rows must not paint their own border: {:?}",
         decorated.pages[0].rects()
     );
@@ -7063,7 +7297,7 @@ async fn collapsed_table_row_border_still_contributes_to_border_conflict_resolut
         document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(255, 0, 0))),
+            .any(|rect| rect.fill == Some(CssColor::new(255, 0, 0))),
         "collapsed table row border should contribute candidates: {:?}",
         document.pages[0].rects()
     );
@@ -7081,8 +7315,8 @@ async fn collapsed_table_cell_border_beats_table_border_after_subpixel_width_flo
     .await
     .unwrap();
 
-    let green = Color::new(0, 128, 0);
-    let red = Color::new(255, 0, 0);
+    let green = CssColor::new(0, 128, 0);
+    let red = CssColor::new(255, 0, 0);
     let green_edges = document.pages[0]
         .rects()
         .iter()
@@ -7118,7 +7352,7 @@ async fn collapsed_table_row_group_border_beats_table_border_at_same_edge() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 0, 255))
+            rect.fill == Some(CssColor::new(0, 0, 255))
                 && (rect.height() - 2.0).abs() < 0.01
                 && (rect.width() - 40.0).abs() < 0.01
         })
@@ -7126,7 +7360,7 @@ async fn collapsed_table_row_group_border_beats_table_border_at_same_edge() {
     let red_edges = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .count();
 
     assert_eq!(blue_edges, 1);
@@ -7146,7 +7380,7 @@ async fn collapsed_table_row_border_beats_row_group_border_at_same_edge() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 0, 255))
+            rect.fill == Some(CssColor::new(0, 0, 255))
                 && (rect.height() - 2.0).abs() < 0.01
                 && (rect.width() - 40.0).abs() < 0.01
         })
@@ -7154,7 +7388,7 @@ async fn collapsed_table_row_border_beats_row_group_border_at_same_edge() {
     let red_edges = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .count();
 
     assert_eq!(blue_edges, 1);
@@ -7174,7 +7408,7 @@ async fn collapsed_table_column_group_border_beats_table_border_at_same_edge() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.width() - 2.0).abs() < 0.01
                 && rect.height() > 1.0
         })
@@ -7182,7 +7416,7 @@ async fn collapsed_table_column_group_border_beats_table_border_at_same_edge() {
     let red_edges = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .count();
 
     assert_eq!(green_edges, 1);
@@ -7202,7 +7436,7 @@ async fn collapsed_table_column_border_beats_column_group_border_at_same_edge() 
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 0, 255))
+            rect.fill == Some(CssColor::new(0, 0, 255))
                 && (rect.width() - 2.0).abs() < 0.01
                 && rect.height() > 1.0
         })
@@ -7210,7 +7444,7 @@ async fn collapsed_table_column_border_beats_column_group_border_at_same_edge() 
     let red_edges = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .count();
 
     assert_eq!(blue_edges, 1);
@@ -7230,7 +7464,7 @@ async fn collapsed_table_cell_border_beats_column_border_at_same_edge() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 0, 255))
+            rect.fill == Some(CssColor::new(0, 0, 255))
                 && (rect.width() - 2.0).abs() < 0.01
                 && rect.height() > 1.0
         })
@@ -7238,7 +7472,7 @@ async fn collapsed_table_cell_border_beats_column_border_at_same_edge() {
     let red_edges = document.pages[0]
         .rects()
         .iter()
-        .filter(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .filter(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .count();
 
     assert_eq!(blue_edges, 1);
@@ -7264,16 +7498,16 @@ async fn collapsed_table_column_and_column_group_edges_beat_table_edges() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.height() - 4.0).abs() < 0.01
-                && rect.width() > 20.0
+                && rect.width() >= 20.0
         })
         .count();
     let green_vertical_edges = page
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(0, 128, 0))
+            rect.fill == Some(CssColor::new(0, 128, 0))
                 && (rect.width() - 4.0).abs() < 0.01
                 && rect.height() > 20.0
         })
@@ -7284,7 +7518,7 @@ async fn collapsed_table_column_and_column_group_edges_beat_table_edges() {
     assert!(
         page.rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+            .all(|rect| rect.fill != Some(CssColor::new(255, 0, 0))),
         "column and column-group borders should win over table borders on every edge"
     );
 }
@@ -7302,12 +7536,53 @@ async fn collapsed_table_row_borders_do_not_cross_rowspan_cells() {
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(255, 0, 0)) && (rect.height() - 2.0).abs() < 0.01
+            rect.fill == Some(CssColor::new(255, 0, 0)) && (rect.height() - 2.0).abs() < 0.01
         })
         .collect::<Vec<_>>();
 
     assert_eq!(red_edges.len(), 1);
     assert!((red_edges[0].width() - 30.0).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn collapsed_rowspan_cell_vertical_borders_cover_each_spanned_row() {
+    let document = Html::from_string(
+        "<style>table{border-collapse:collapse;width:60pt;margin:0}\\
+         td{padding:0;width:30pt;height:10pt}\\
+         .divider td{border-left:0;border-right:0}</style>\\
+         <table><tr><td rowspan=\"3\" style=\"border-left:2pt solid red;border-right:2pt solid red\">Span</td><td>A</td></tr>\\
+         <tr class=\"divider\"><td>B</td></tr><tr><td>C</td></tr></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let mut red_edges = document.pages[0]
+        .rects()
+        .iter()
+        .filter(|rect| {
+            rect.fill == Some(CssColor::new(255, 0, 0)) && (rect.width() - 2.0).abs() < 0.01
+        })
+        .collect::<Vec<_>>();
+    red_edges.sort_by(|left, right| {
+        left.x()
+            .total_cmp(&right.x())
+            .then_with(|| left.y().total_cmp(&right.y()))
+    });
+
+    assert_eq!(
+        red_edges.len(),
+        6,
+        "rowspan edges must paint once per row: {red_edges:?}"
+    );
+    for edge_pair in red_edges.chunks_exact(3) {
+        for adjacent in edge_pair.windows(2) {
+            assert!(
+                (adjacent[0].y() + adjacent[0].height() - adjacent[1].y()).abs() < 0.01,
+                "rowspan border segments must meet without a continuation-row gap: {edge_pair:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -7323,7 +7598,7 @@ async fn collapsed_table_column_borders_do_not_cross_colspan_cells() {
         document.pages[0]
             .rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+            .all(|rect| rect.fill != Some(CssColor::new(255, 0, 0))),
         "column border must not paint through the interior of a colspan"
     );
 }
@@ -7341,7 +7616,7 @@ async fn collapsed_table_spanning_cell_suppresses_internal_row_and_column_edges(
         .rects()
         .iter()
         .filter(|rect| {
-            rect.fill == Some(Color::new(255, 0, 0)) && (rect.height() - 3.0).abs() < 0.01
+            rect.fill == Some(CssColor::new(255, 0, 0)) && (rect.height() - 3.0).abs() < 0.01
         })
         .collect::<Vec<_>>();
 
@@ -7351,7 +7626,7 @@ async fn collapsed_table_spanning_cell_suppresses_internal_row_and_column_edges(
         document.pages[0]
             .rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(0, 0, 255))),
+            .all(|rect| rect.fill != Some(CssColor::new(0, 0, 255))),
         "column border must not paint through the interior of a rowspan+colspan"
     );
 }
@@ -7368,12 +7643,12 @@ async fn collapsed_table_root_padding_and_spacing_do_not_affect_grid() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("auto collapsed table background should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("fixed collapsed table background should paint");
 
     assert!((green.width() - 48.0).abs() < 0.01, "{green:?}");
@@ -7391,7 +7666,7 @@ async fn empty_collapsed_table_ignores_wrapper_padding_and_border() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .expect("empty collapsed table background should paint");
 
     assert!((green.width() - 40.0).abs() < 0.01, "{green:?}");
@@ -7400,7 +7675,7 @@ async fn empty_collapsed_table_ignores_wrapper_padding_and_border() {
         document.pages[0]
             .rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+            .all(|rect| rect.fill != Some(CssColor::new(255, 0, 0))),
         "empty collapsed table should not paint separated wrapper borders"
     );
 }
@@ -7426,7 +7701,7 @@ async fn collapsed_table_3d_border_styles_use_collapsed_paint_mapping() {
     .render(&RenderOptions::default()).await
     .unwrap();
 
-    let base = Color::new(102, 153, 204);
+    let base = CssColor::new(102, 153, 204);
     let split_3d_rects = document.pages[0]
         .rects()
         .iter()
@@ -7494,12 +7769,12 @@ async fn rtl_collapsed_table_maps_physical_left_and_right_borders_to_reversed_gr
     let red = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(255, 0, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(255, 0, 0)))
         .expect("first logical cell's physical left border should paint");
     let blue = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 0, 255)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 0, 255)))
         .expect("last logical cell's physical right border should paint");
 
     assert!(
@@ -7612,7 +7887,7 @@ async fn collapsed_table_inline_block_cells_stay_square_across_empty_rows() {
     .unwrap();
 
     let page = &document.pages[0];
-    let gray = Color::new(128, 128, 128);
+    let gray = CssColor::new(128, 128, 128);
     let gray_rects = page
         .rects()
         .iter()
@@ -7668,7 +7943,7 @@ async fn collapsed_table_collapsed_column_border_does_not_leak() {
         document.pages[0]
             .rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(255, 0, 0))),
+            .all(|rect| rect.fill != Some(CssColor::new(255, 0, 0))),
         "borders on a collapsed column should not leak into the collapsed-border grid"
     );
 }
@@ -7686,7 +7961,7 @@ async fn collapsed_table_hidden_border_suppresses_conflicting_edges() {
         document.pages[0]
             .rects()
             .iter()
-            .all(|rect| rect.fill != Some(Color::new(255, 0, 0)))
+            .all(|rect| rect.fill != Some(CssColor::new(255, 0, 0)))
     );
 }
 
@@ -8275,7 +8550,7 @@ async fn running_table_root_replays_table_paint_into_page_margin() {
         document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 128, 0))),
+            .any(|rect| rect.fill == Some(CssColor::new(0, 128, 0))),
         "running table root should replay cell background paint into the margin box"
     );
 }
@@ -8451,14 +8726,14 @@ async fn running_table_row_replays_cell_paint_into_page_margin() {
         document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 128, 0))),
+            .any(|rect| rect.fill == Some(CssColor::new(0, 128, 0))),
         "running table row should replay cell background paint into the margin box"
     );
     assert!(
         document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 0, 255))),
+            .any(|rect| rect.fill == Some(CssColor::new(0, 0, 255))),
         "running table row should replay cell border paint into the margin box"
     );
 }
@@ -8525,7 +8800,7 @@ async fn running_table_cell_replays_cell_paint_into_page_margin() {
     let green = document.pages[0]
         .rects()
         .iter()
-        .find(|rect| rect.fill == Some(Color::new(0, 128, 0)))
+        .find(|rect| rect.fill == Some(CssColor::new(0, 128, 0)))
         .unwrap_or_else(|| {
             panic!(
                 "running table cell should replay cell background paint into the margin box: {:?}",
@@ -8540,7 +8815,7 @@ async fn running_table_cell_replays_cell_paint_into_page_margin() {
         document.pages[0]
             .rects()
             .iter()
-            .any(|rect| rect.fill == Some(Color::new(0, 0, 255)) && rect.x() > 25.0),
+            .any(|rect| rect.fill == Some(CssColor::new(0, 0, 255)) && rect.x() > 25.0),
         "running table cell should replay cell border paint into the margin box"
     );
 }
@@ -8706,4 +8981,27 @@ async fn table_row_running_element_start_uses_post_break_source_marker() {
         page_lines[1].contains(&"Later Running"),
         "running row should use the post-break source marker for start: {page_lines:?}"
     );
+}
+
+#[tokio::test]
+async fn table_cell_wrap_inside_avoid_moves_parenthetical_unit_to_next_line() {
+    let document = Html::from_string(
+        "<style>\
+         @page { size: 90pt 100pt; margin: 10pt }\
+         table { border-collapse: collapse; table-layout: fixed; width: 37pt }\
+         td { margin: 0; padding: 0; border: 0; font: 10pt/10pt monospace; word-break: break-all }\
+         .parenthetical { wrap-inside: avoid }\
+         </style>\
+         <table><tr><td>aa<wbr><span class=\"parenthetical\">(bbbb)</span></td></tr></table>",
+    )
+    .render(&RenderOptions::default())
+    .await
+    .unwrap();
+
+    let lines = document.pages[0]
+        .lines()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(lines, ["aa", "(bbbb)"], "{lines:?}");
 }

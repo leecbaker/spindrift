@@ -19,11 +19,11 @@ mod text;
 mod timing;
 mod units;
 
-pub(crate) use css::Color;
-pub use css::{Css, MediaType};
+pub(crate) use css::CssColor;
+pub use css::{Css, ForcedColorPalette, ForcedColorsMode, MediaType};
 pub use document::{
     Bookmark, BookmarkState, Document, DocumentMetadata, FontEmbeddingMode, LinkAnnotation, Page,
-    PdfCompression, PdfOptions, PdfProfile,
+    PaintStrokeWidth, PdfCompression, PdfOptions, PdfProfile,
 };
 pub(crate) use document::{
     DocumentFont, PaintOperation, PaintPoint, PaintRect, RenderedGlyph, RenderedImage,

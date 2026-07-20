@@ -1,6 +1,6 @@
 use super::*;
 
-fn rects_with_fill(page: &quire::Page, fill: Color) -> Vec<&quire::RenderedRect> {
+fn rects_with_fill(page: &quire::Page, fill: CssColor) -> Vec<&quire::RenderedRect> {
     page.rects()
         .iter()
         .filter(|rect| rect.fill == Some(fill))
@@ -24,13 +24,13 @@ async fn zoomed_grid_scales_fixed_tracks_gaps_and_item_margins() {
     .unwrap();
 
     let page = &document.pages[0];
-    let grid = rects_with_fill(page, Color::new(0, 128, 0))
+    let grid = rects_with_fill(page, CssColor::new(0, 128, 0))
         .into_iter()
         .max_by(|left, right| left.width().total_cmp(&right.width()))
         .expect("zoomed grid background");
     assert!((grid.width() - 200.0).abs() < 0.01, "grid={grid:?}");
 
-    let items = rects_with_fill(page, Color::new(255, 0, 0));
+    let items = rects_with_fill(page, CssColor::new(255, 0, 0));
     assert_eq!(items.len(), 2, "items={items:?}");
     assert!(
         items.iter().any(|item| (item.width() - 12.0).abs() < 0.01),
@@ -58,7 +58,7 @@ async fn zoomed_inline_grid_uses_scaled_outer_geometry() {
     .unwrap();
 
     let page = &document.pages[0];
-    let grid = rects_with_fill(page, Color::new(0, 0, 255))
+    let grid = rects_with_fill(page, CssColor::new(0, 0, 255))
         .into_iter()
         .max_by(|left, right| left.width().total_cmp(&right.width()))
         .expect("zoomed inline-grid background");
@@ -81,7 +81,7 @@ async fn inherited_zoom_on_grid_item_is_applied_once() {
     .unwrap();
 
     let page = &document.pages[0];
-    let paint = rects_with_fill(page, Color::new(128, 0, 128))
+    let paint = rects_with_fill(page, CssColor::new(128, 0, 128))
         .into_iter()
         .next()
         .expect("inherited-zoom descendant background");

@@ -7,12 +7,49 @@ use std::collections::HashMap;
 /// <https://html.spec.whatwg.org/multipage/input.html#attr-input-type>.
 pub(crate) fn input_type(tag: &str, attrs: &HashMap<String, String>) -> Option<String> {
     (tag == "input").then(|| {
-        attrs
+        let value = attrs
             .get("type")
             .map(|value| value.to_ascii_lowercase())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "text".to_string())
+            .unwrap_or_else(|| "text".to_string());
+        match value.as_str() {
+            "hidden" | "text" | "search" | "tel" | "url" | "email" | "password" | "date"
+            | "month" | "week" | "time" | "datetime-local" | "number" | "range" | "color"
+            | "checkbox" | "radio" | "file" | "submit" | "image" | "reset" | "button" => value,
+            // The HTML missing-value and invalid-value defaults for `type`
+            // are the Text state.
+            // <https://html.spec.whatwg.org/multipage/input.html#attr-input-type>
+            _ => "text".to_string(),
+        }
     })
+}
+
+/// Return the static value used by HTML's `dir=auto` algorithm for inputs in
+/// an auto-directionality form-associated state.
+///
+/// The static renderer has no mutable IDL value, so the content attribute is
+/// the initial value exposed to layout:
+/// <https://html.spec.whatwg.org/multipage/dom.html#auto-directionality-form-associated-element>
+pub(crate) fn auto_directionality_input_value<'a>(
+    tag: &str,
+    attrs: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    matches!(
+        input_type(tag, attrs).as_deref(),
+        Some(
+            "hidden"
+                | "text"
+                | "search"
+                | "tel"
+                | "url"
+                | "email"
+                | "password"
+                | "submit"
+                | "reset"
+                | "button"
+        )
+    )
+    .then(|| attrs.get("value").map(String::as_str).unwrap_or(""))
 }
 
 /// HTML form-associated elements that can be disabled by `disabled` or a

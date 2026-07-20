@@ -1,5 +1,11 @@
 use super::*;
 
+/// Parse a CSS `<counter-style>` value.
+///
+/// Except for CSS Counter Styles' non-overridable built-ins, predefined names
+/// remain named styles so the cascaded UA or author `@counter-style` rule
+/// supplies every descriptor during formatting.
+/// <https://drafts.csswg.org/css-counter-styles-3/#predefined-counters>
 pub(crate) fn parse_list_style_type(value: &str) -> Option<ListStyleType> {
     let value = value.trim();
     if let Some(style) = parse_symbols_function(value) {
@@ -18,42 +24,6 @@ pub(crate) fn parse_list_style_type(value: &str) -> Option<ListStyleType> {
         "disclosure-open" => Some(ListStyleType::DisclosureOpen),
         "disclosure-closed" => Some(ListStyleType::DisclosureClosed),
         "decimal" => Some(ListStyleType::Decimal),
-        "decimal-leading-zero" => Some(ListStyleType::DecimalLeadingZero),
-        "arabic-indic" => Some(ListStyleType::Numeric(NumericCounterStyle::ArabicIndic)),
-        "armenian" | "upper-armenian" => {
-            Some(ListStyleType::Additive(AdditiveCounterStyle::Armenian))
-        }
-        "lower-armenian" => Some(ListStyleType::Additive(AdditiveCounterStyle::LowerArmenian)),
-        "bengali" => Some(ListStyleType::Numeric(NumericCounterStyle::Bengali)),
-        "cambodian" | "khmer" => Some(ListStyleType::Numeric(NumericCounterStyle::Cambodian)),
-        "cjk-decimal" => Some(ListStyleType::Numeric(NumericCounterStyle::CjkDecimal)),
-        "devanagari" => Some(ListStyleType::Numeric(NumericCounterStyle::Devanagari)),
-        "georgian" => Some(ListStyleType::Additive(AdditiveCounterStyle::Georgian)),
-        "gujarati" => Some(ListStyleType::Numeric(NumericCounterStyle::Gujarati)),
-        "gurmukhi" => Some(ListStyleType::Numeric(NumericCounterStyle::Gurmukhi)),
-        "hebrew" => Some(ListStyleType::Additive(AdditiveCounterStyle::Hebrew)),
-        "kannada" => Some(ListStyleType::Numeric(NumericCounterStyle::Kannada)),
-        "lao" => Some(ListStyleType::Numeric(NumericCounterStyle::Lao)),
-        "malayalam" => Some(ListStyleType::Numeric(NumericCounterStyle::Malayalam)),
-        "mongolian" => Some(ListStyleType::Numeric(NumericCounterStyle::Mongolian)),
-        "myanmar" => Some(ListStyleType::Numeric(NumericCounterStyle::Myanmar)),
-        "oriya" => Some(ListStyleType::Numeric(NumericCounterStyle::Oriya)),
-        "persian" => Some(ListStyleType::Numeric(NumericCounterStyle::Persian)),
-        "tamil" => Some(ListStyleType::Numeric(NumericCounterStyle::Tamil)),
-        "telugu" => Some(ListStyleType::Numeric(NumericCounterStyle::Telugu)),
-        "thai" => Some(ListStyleType::Numeric(NumericCounterStyle::Thai)),
-        "tibetan" => Some(ListStyleType::Numeric(NumericCounterStyle::Tibetan)),
-        "lower-alpha" | "lower-latin" => Some(ListStyleType::LowerAlpha),
-        "upper-alpha" | "upper-latin" => Some(ListStyleType::UpperAlpha),
-        "lower-greek" => Some(ListStyleType::LowerGreek),
-        "hiragana" => Some(ListStyleType::Hiragana),
-        "hiragana-iroha" => Some(ListStyleType::HiraganaIroha),
-        "katakana" => Some(ListStyleType::Katakana),
-        "katakana-iroha" => Some(ListStyleType::KatakanaIroha),
-        "cjk-earthly-branch" => Some(ListStyleType::CjkEarthlyBranch),
-        "cjk-heavenly-stem" => Some(ListStyleType::CjkHeavenlyStem),
-        "lower-roman" => Some(ListStyleType::LowerRoman),
-        "upper-roman" => Some(ListStyleType::UpperRoman),
         "none" => Some(ListStyleType::None),
         "inside" | "outside" => None,
         _ if is_counter_style_ident(value) => Some(ListStyleType::Named(lower)),
@@ -243,8 +213,12 @@ fn parse_font_family_component(value: &str, components: &mut Vec<(String, bool)>
     } else {
         value
     };
-    if !name.is_empty() {
-        components.push((name.to_string(), quoted));
+    let name = decode_css_escapes(name);
+    // `""` is a valid quoted CSS font-family name. It is distinct from an
+    // omitted component and can be targeted by `@font-face` and
+    // `@font-palette-values` rules.
+    if quoted || !name.is_empty() {
+        components.push((name, quoted));
     }
 }
 
@@ -663,10 +637,21 @@ pub(crate) fn parse_font_weight(value: &str, inherited: FontWeight) -> Option<Fo
 }
 
 pub(crate) fn parse_font_style(value: &str) -> Option<FontStyle> {
-    match value.trim().to_ascii_lowercase().as_str() {
+    let value = value.trim();
+    match value.to_ascii_lowercase().as_str() {
         "normal" => Some(FontStyle::Normal),
         "italic" => Some(FontStyle::Italic),
-        value if value == "oblique" || value.starts_with("oblique ") => Some(FontStyle::Oblique),
+        "oblique" => Some(FontStyle::DEFAULT_OBLIQUE),
+        _ if value.len() > "oblique ".len()
+            && value[.."oblique ".len()].eq_ignore_ascii_case("oblique ") =>
+        {
+            value["oblique ".len()..]
+                .trim()
+                .strip_suffix("deg")
+                .and_then(|angle| angle.trim().parse::<f32>().ok())
+                .filter(|angle| angle.is_finite() && (-90.0..=90.0).contains(angle))
+                .map(|angle| FontStyle::Oblique(angle.to_bits()))
+        }
         _ => None,
     }
 }
@@ -769,6 +754,37 @@ pub(crate) fn parse_font_feature_settings(value: &str) -> Option<FontFeatureSett
     }
     settings.sort_by_key(|setting| setting.tag);
     Some(FontFeatureSettings(settings))
+}
+
+/// Parse the inherited low-level variation-axis map. Later duplicate tags win
+/// and `normal` clears all explicit coordinates.
+/// <https://www.w3.org/TR/css-fonts-4/#font-variation-settings-def>
+pub(crate) fn parse_font_variation_settings(value: &str) -> Option<FontVariationSettings> {
+    let value = trim_css_value(value);
+    if value.eq_ignore_ascii_case("normal") {
+        return Some(FontVariationSettings::NORMAL);
+    }
+    let mut settings = Vec::<FontVariationSetting>::new();
+    for item in split_top_level_commas(value) {
+        let (tag, tail) = parse_css_string_token(item.trim())?;
+        let tag = parse_opentype_tag(&tag)?;
+        let value = tail.trim().parse::<f32>().ok()?;
+        if !value.is_finite() || tail.trim().split_ascii_whitespace().nth(1).is_some() {
+            return None;
+        }
+        if let Some(existing) = settings.iter_mut().find(|setting| setting.tag == tag) {
+            existing.value = value.to_bits();
+        } else {
+            settings.push(FontVariationSetting {
+                tag,
+                value: value.to_bits(),
+            });
+        }
+    }
+    (!settings.is_empty()).then(|| {
+        settings.sort_by_key(|setting| setting.tag);
+        FontVariationSettings(settings)
+    })
 }
 
 fn parse_opentype_tag(value: &str) -> Option<[u8; 4]> {
@@ -965,9 +981,14 @@ fn parse_font_feature_value_function_list(value: &str, name: &str) -> Option<Vec
     if !tail.trim().is_empty() {
         return None;
     }
-    let names = split_css_component_values(argument)
+    // CSS Fonts' `<custom-ident>#` alias lists accept comma separation as
+    // well as whitespace between component values. Split commas first so a
+    // compact `styleset(foo,bar)` does not become one invalid identifier.
+    // <https://www.w3.org/TR/css-fonts-4/#font-variant-alternates-prop>
+    let names = split_top_level_commas(argument)
         .into_iter()
-        .map(|name| name.to_ascii_lowercase())
+        .flat_map(split_css_component_values)
+        .map(decode_css_escapes)
         .filter(|name| font_feature_value_name_is_valid(name))
         .collect::<Vec<_>>();
     (!names.is_empty()).then_some(names)
